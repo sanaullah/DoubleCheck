@@ -1,0 +1,276 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"CrewPlannerService validateAndClamp",
+			() => {
+				var service = "";
+
+				beforeEach(
+					() => {
+						service = new app.models.services.CrewPlannerService();
+					}
+				);
+
+				it(
+					"keeps valid catalog roles and sorts by priority descending",
+					() => {
+						var result = service.validateAndClamp(
+								{
+									summary: "Auth and SQL risk",
+									tasks  : [
+										{
+											role     : "correctness",
+											priority : 50,
+											objective: "Check contracts",
+											brief    : "Look at return paths"
+										},
+										{
+											role     : "security",
+											priority : 90,
+											objective: "Injection",
+											brief    : "Focus on query strings"
+										},
+										{
+											role     : "cfml-conventions",
+											priority : 80,
+											objective: "CFML depth",
+											brief    : "Legacy patterns"
+										}
+									]
+								},
+								[
+									"security",
+									"correctness",
+									"architecture",
+									"testing",
+									"performance",
+									"boxlang-conventions",
+									"cfml-conventions"
+								],
+								[ "app/handlers/Orders.cfc"],
+								4
+							);
+
+						expect( result.ok ).toBeTrue();
+						expect( result.source ).toBe( "llm" );
+						expect( result.summary ).toBe( "Auth and SQL risk" );
+						expect( result.tasks ).toHaveLength( 3 );
+						expect( result.tasks[ 1 ].role ).toBe( "security" );
+						expect( result.tasks[ 2 ].role ).toBe( "cfml-conventions" );
+						expect( result.tasks[ 3 ].role ).toBe( "correctness" );
+						expect( result.error ).toBe( "" );
+					}
+				);
+
+				it(
+					"drops unknown roles such as privacy",
+					() => {
+						var result = service.validateAndClamp(
+								{
+									summary: "Mixed crew",
+									tasks  : [
+										{
+											role     : "security",
+											priority : 100,
+											objective: "Sec",
+											brief    : "Trust boundaries"
+										},
+										{
+											role     : "privacy",
+											priority : 99,
+											objective: "PII",
+											brief    : "Invented role"
+										},
+										{
+											role     : "correctness",
+											priority : 80,
+											objective: "Correct",
+											brief    : "Edge cases"
+										}
+									]
+								},
+								[
+									"security",
+									"correctness",
+									"architecture",
+									"testing",
+									"performance",
+									"boxlang-conventions",
+									"cfml-conventions"
+								],
+								[],
+								4
+							);
+
+						expect( result.ok ).toBeTrue();
+						expect( result.tasks ).toHaveLength( 2 );
+						expect( result.tasks.every( ( task ) => task.role != "privacy" ) ).toBeTrue();
+					}
+				);
+
+				it(
+					"clamps six tasks down to four by dropping lowest priorities",
+					() => {
+						var result = service.validateAndClamp(
+								{
+									summary: "Full catalog attempt",
+									tasks  : [
+										{
+											role     : "security",
+											priority : 100,
+											objective: "a",
+											brief    : "a"
+										},
+										{
+											role     : "correctness",
+											priority : 90,
+											objective: "b",
+											brief    : "b"
+										},
+										{
+											role     : "cfml-conventions",
+											priority : 80,
+											objective: "c",
+											brief    : "c"
+										},
+										{
+											role     : "testing",
+											priority : 70,
+											objective: "d",
+											brief    : "d"
+										},
+										{
+											role     : "architecture",
+											priority : 60,
+											objective: "e",
+											brief    : "e"
+										},
+										{
+											role     : "performance",
+											priority : 50,
+											objective: "f",
+											brief    : "f"
+										}
+									]
+								},
+								[
+									"security",
+									"correctness",
+									"architecture",
+									"testing",
+									"performance",
+									"boxlang-conventions",
+									"cfml-conventions"
+								],
+								[],
+								6
+							);
+
+						expect( result.ok ).toBeTrue();
+						expect( result.tasks ).toHaveLength( 4 );
+						expect( result.tasks[ 1 ].role ).toBe( "security" );
+						expect( result.tasks[ 4 ].role ).toBe( "testing" );
+					}
+				);
+
+				it(
+					"intersects emphasizeFiles with authorized paths only",
+					() => {
+						var result = service.validateAndClamp(
+								{
+									summary: "File emphasis",
+									tasks  : [
+										{
+											role          : "security",
+											priority      : 100,
+											objective     : "Sec",
+											brief         : "Queries",
+											emphasizeFiles: [ "app/handlers/Orders.cfc", "../escape.txt", "missing.cfc"]
+										},
+										{
+											role     : "correctness",
+											priority : 80,
+											objective: "Correct",
+											brief    : "Returns"
+										}
+									]
+								},
+								[ "security", "correctness"],
+								[ "app/handlers/Orders.cfc", "app/models/OrderService.cfc"],
+								4
+							);
+
+						expect( result.ok ).toBeTrue();
+						expect( result.tasks[ 1 ].emphasizeFiles ).toBe( [ "app/handlers/Orders.cfc"] );
+					}
+				);
+
+				it(
+					"rejects empty tasks or missing summary",
+					() => {
+						var emptyTasks = service.validateAndClamp(
+								{ summary: "No work", tasks: [] },
+								[ "security"],
+								[],
+								4
+							);
+						var missingSummary = service.validateAndClamp(
+								{
+									summary: "",
+									tasks  : [
+										{
+											role     : "security",
+											priority : 100,
+											objective: "Sec",
+											brief    : "Brief"
+										}
+									]
+								},
+								[ "security"],
+								[],
+								4
+							);
+
+						expect( emptyTasks.ok ).toBeFalse();
+						expect( missingSummary.ok ).toBeFalse();
+					}
+				);
+
+				it(
+					"truncates objective and brief to max lengths",
+					() => {
+						var longObjective = repeatString( "o", 400 );
+						var longBrief = repeatString( "b", 1200 );
+						var result = service.validateAndClamp(
+								{
+									summary: "Truncation",
+									tasks  : [
+										{
+											role     : "security",
+											priority : 100,
+											objective: longObjective,
+											brief    : longBrief
+										},
+										{
+											role     : "correctness",
+											priority : 80,
+											objective: "ok",
+											brief    : "ok"
+										}
+									]
+								},
+								[ "security", "correctness"],
+								[],
+								4
+							);
+
+						expect( result.ok ).toBeTrue();
+						expect( len( result.tasks[ 1 ].objective ) ).toBe( 240 );
+						expect( len( result.tasks[ 1 ].brief ) ).toBe( 800 );
+					}
+				);
+			}
+		);
+	}
+}

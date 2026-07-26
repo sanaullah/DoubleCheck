@@ -1,0 +1,200 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"ReviewPlannerService LLM crew proposals",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"builds tasks from an LLM crew proposal including briefs",
+					() => {
+						var model = getInstance( "ArchitectureModelService" ).build(
+								graphFixture(),
+								fileFixtures(),
+								"crew-llm"
+							);
+						var plan = getInstance( "ReviewPlannerService" ).plan(
+								model,
+								graphFixture(),
+								fileFixtures(),
+								{},
+								{},
+								{
+									ok     : true,
+									source : "llm",
+									summary: "SQL and CFML focus",
+									tasks  : [
+										{
+											role     : "security",
+											priority : 95,
+											objective: "Watch query construction",
+											brief    : "Inspect string-built SQL in Orders.cfc"
+										},
+										{
+											role     : "cfml-conventions",
+											priority : 85,
+											objective: "CFML depth",
+											brief    : "Modernization assist only with evidence"
+										}
+									]
+								}
+							);
+						var data = plan.getMemento();
+
+						expect( data.summary.crewSource ).toBe( "llm" );
+						expect( data.summary.crewSummary ).toBe( "SQL and CFML focus" );
+						expect( data.summary.selectedRoles ).toBe( [ "security", "cfml-conventions"] );
+						expect( data.tasks ).toHaveLength( 2 );
+						expect( data.tasks[ 1 ].brief ).toInclude( "string-built SQL" );
+						expect( data.tasks[ 1 ].objective ).toBe( "Watch query construction" );
+					}
+				);
+
+				it(
+					"falls back to a deterministic crew when the proposal is invalid",
+					() => {
+						var model = getInstance( "ArchitectureModelService" ).build(
+								graphFixture(),
+								fileFixtures(),
+								"crew-fallback"
+							);
+						var plan = getInstance( "ReviewPlannerService" ).plan(
+								model,
+								graphFixture(),
+								fileFixtures(),
+								{},
+								{},
+								{
+									ok     : false,
+									source : "none",
+									summary: "",
+									tasks  : [],
+									error  : "disabled"
+								}
+							);
+						var data = plan.getMemento();
+
+						expect( data.summary.crewSource ).toBe( "deterministic" );
+						expect( data.summary.crewSummary ).toBe( "Default crew" );
+						expect( data.summary.selectedRoles ).toInclude( "security" );
+						expect( data.summary.selectedRoles ).toInclude( "correctness" );
+						expect( data.tasks.every( ( task ) => task.brief == "" ) ).toBeTrue();
+					}
+				);
+			}
+		);
+	}
+
+	private struct function graphFixture() {
+		return {
+			summary: {
+				symbolCount    : 3,
+				dependencyCount: 2,
+				impactCount    : 1
+			},
+			symbols: [
+				{
+					id      : "handler-action",
+					filePath: "app/handlers/Reviews.bx",
+					kind    : "handler-action",
+					name    : "index",
+					line    : 2,
+					evidence: "function index()"
+				},
+				{
+					id      : "service-class",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "class",
+					name    : "ReviewService",
+					line    : 1,
+					evidence: "class"
+				},
+				{
+					id      : "test-spec",
+					filePath: "tests/specs/ReviewsSpec.bx",
+					kind    : "test",
+					name    : "reviews",
+					line    : 3,
+					evidence: "it"
+				}
+			],
+			dependencies: [
+				{
+					id        : "call-edge",
+					sourceFile: "app/handlers/Reviews.bx",
+					kind      : "calls",
+					target    : "reviewService.review",
+					targetFile: "app/models/ReviewService.bx",
+					line      : 3,
+					evidence  : "reviewService.review()"
+				},
+				{
+					id        : "test-edge",
+					sourceFile: "tests/specs/ReviewsSpec.bx",
+					kind      : "tests",
+					target    : "ReviewService",
+					targetFile: "app/models/ReviewService.bx",
+					line      : 2,
+					evidence  : "new ReviewService()"
+				}
+			],
+			impacts: [
+				{
+					changedFile  : "app/models/ReviewService.bx",
+					changedSymbol: "review",
+					impactedFile : "tests/specs/ReviewsSpec.bx",
+					reason       : "tests",
+					depth        : 1,
+					viaFile      : "app/models/ReviewService.bx"
+				}
+			]
+		};
+	}
+
+	private array function fileFixtures() {
+		return [
+			sourceFile(
+				"app/handlers/Reviews.bx",
+				"BoxLang",
+				"class { function index() { reviewService.review(); } }"
+			),
+			sourceFile(
+				"app/models/ReviewService.bx",
+				"BoxLang",
+				"class { function review() { return 'SENSITIVE_SOURCE_BODY'; } }"
+			),
+			sourceFile(
+				"tests/specs/ReviewsSpec.bx",
+				"BoxLang",
+				"class { function testReviews() {} }"
+			)
+		];
+	}
+
+	private struct function sourceFile( required string filePath, required string language, required string content ) {
+		var lines = listToArray(
+			arguments.content,
+			char( 10 ),
+			true,
+			true
+		);
+		return {
+			filePath   : arguments.filePath,
+			language   : arguments.language,
+			contentHash: lCase( hash( arguments.content, "SHA-256" ) ),
+			content    : arguments.content,
+			lines      : lines,
+			sizeBytes  : len( arguments.content ),
+			lineCount  : lines.len()
+		};
+	}
+}

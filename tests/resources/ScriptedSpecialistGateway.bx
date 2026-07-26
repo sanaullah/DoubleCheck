@@ -1,0 +1,179 @@
+class {
+	variables.active = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+	variables.peak = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+	variables.calls = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+	variables.delayMs = 0;
+	variables.failRoles = [];
+	variables.responses = {};
+
+	function init( numeric delayMs = 0, array failRoles = [], struct responses = {} ) {
+		variables.delayMs = arguments.delayMs;
+		variables.failRoles = arguments.failRoles;
+		variables.responses = arguments.responses;
+		return this;
+	}
+
+	boolean function isEnabled() {
+		return true;
+	}
+
+	string function getProviderKey() {
+		return "scripted-provider";
+	}
+
+	struct function circuitStatus() {
+		return { failures: 0, openUntil: 0, open: false };
+	}
+
+	void function resetCircuit() {
+
+
+		// no-op for scripted gateway
+	}
+
+	any function run(
+		required struct definition,
+		required array tools,
+		required string input,
+		struct control      = {},
+		function onProgress = ( detail ) => {
+
+		}
+	) {
+		var currentActive = variables.active.incrementAndGet();
+		updatePeak( currentActive );
+		variables.calls.incrementAndGet();
+		try {
+			if ( variables.failRoles.findNoCase( arguments.definition.role ) ) {
+				throw(
+					type    = "ScriptedProviderFailure",
+					message = "Scripted provider failure"
+				);
+			}
+			arguments.onProgress(
+					{
+						stage  : "provider-run",
+						message: "Starting scripted specialist",
+						observe: {
+							kind           : "agent",
+							observationType: "span",
+							title          : arguments.definition.name ?: "scripted",
+							preview        : "role: #arguments.definition.role#\nprovider: scripted-provider",
+							input          : "role: #arguments.definition.role#\nprovider: scripted-provider",
+							output         : "",
+							truncated      : false,
+							characters     : 0,
+							model          : "scripted",
+							modelParameters: {
+								provider: "scripted-provider",
+								model   : "scripted"
+							},
+							meta: {
+								role    : arguments.definition.role,
+								provider: "scripted-provider",
+								io      : "input"
+							}
+						}
+					}
+				);
+			arguments.onProgress(
+					{
+						stage  : "prompt-sent",
+						message: "Sending scripted payload",
+						observe: {
+							kind           : "prompt",
+							observationType: "span",
+							title          : "Task payload sent",
+							preview        : left( arguments.input, 400 ),
+							input          : left( arguments.input, 400 ),
+							output         : "",
+							truncated      : len( arguments.input ) > 400,
+							characters     : len( arguments.input ),
+							modelParameters: { characters: len( arguments.input ) },
+							meta           : {
+								characters: len( arguments.input ),
+								io        : "input"
+							}
+						}
+					}
+				);
+			var remaining = variables.delayMs;
+			while ( remaining > 0 ) {
+				if ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) {
+					throw(
+						type    = "RunCancelled",
+						message = "Scripted provider cancelled"
+					);
+				}
+				arguments.onProgress(
+						{
+							stage         : "provider-stream",
+							charactersSeen: variables.delayMs - remaining
+						}
+					);
+				var slice = min( 20, remaining );
+				sleep( slice );
+				remaining -= slice;
+			}
+			var response = variables.responses.keyExists( arguments.definition.role )
+				? duplicate( variables.responses[ arguments.definition.role ] )
+				: { summary: "No findings.", findings: [] };
+			arguments.onProgress(
+					{
+						stage  : "provider-complete",
+						message: "Scripted response ready",
+						observe: {
+							kind           : "response",
+							observationType: "span",
+							title          : "Raw agent response",
+							preview        : "summary: #response.summary ?: ""#\nfindings: #( response.findings ?: [] ).len()#",
+							input : "",
+							output: "summary: #response.summary ?: ""#\nfindings: #( response.findings ?: [] ).len()#",
+							truncated      : false,
+							characters     : len( response.summary ?: "" ),
+							modelParameters: {
+								provider    : "scripted-provider",
+								findingCount: ( response.findings ?: [] ).len()
+							},
+							meta: {
+								findingCount: ( response.findings ?: [] ).len(),
+								io          : "output"
+							}
+						}
+					}
+				);
+			response._execution = {
+				attempts: 1,
+				provider: "scripted-provider",
+				streamed: true
+			};
+			return response;
+		} finally {
+			variables.active.decrementAndGet();
+		}
+	}
+
+	numeric function callCount() {
+		return variables.calls.get();
+	}
+
+	numeric function peakConcurrency() {
+		return variables.peak.get();
+	}
+
+	numeric function contextPackCharacterBudget( numeric promptCharacters = 0, numeric maxTokens = 0 ) {
+		return 4000;
+	}
+
+	private void function updatePeak( required numeric value ) {
+		while ( true ) {
+			var previous = variables.peak.get();
+			if ( arguments.value <= previous ) {
+				return;
+			}
+			if ( variables.peak.compareAndSet( previous, arguments.value ) ) {
+				return;
+			}
+		}
+	}
+}

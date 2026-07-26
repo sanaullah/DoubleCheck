@@ -1,0 +1,257 @@
+/**
+ * Attaches rule playbooks and optional fix patches to findings.
+ * LLM patches are accepted only when confidence and evidence gates pass.
+ */
+
+@singleton
+class {
+	property name="playbookCatalog" inject="RulePlaybookCatalog";
+	variables.minPatchConfidence = .8;
+
+	function init() {
+		if ( isNull( variables.playbookCatalog ?: javacast( "null", "" ) ) ) {
+			variables.playbookCatalog = new app.models.services.RulePlaybookCatalog();
+		}
+		return this;
+	}
+
+	/**
+	 * Enrich a finding with playbook and optional fixPatch.
+	 *
+	 * @finding Finding struct (mutated copy returned)
+	 * @candidateFixPatch Optional specialist/AI patch { before, after, confidence }
+	 */
+	struct function enrich( required struct finding, any candidateFixPatch = javacast( "null", "" ) ) {
+		var result = duplicate( arguments.finding );
+		structDelete( result, "playbook" );
+		structDelete( result, "fixPatch" );
+
+		var playbook = playbookCatalog.get( result.ruleId ?: "" );
+		if ( !isNull( playbook ) ) {
+			result.playbook = playbook;
+		}
+
+		result.suggestion = sanitizeSuggestion( result.suggestion ?: "", result.evidence ?: "" );
+
+		var templatePatch = deterministicTemplatePatch( result );
+		if ( !isNull( templatePatch ) ) {
+			result.fixPatch = templatePatch;
+		}
+
+		if ( !isNull( arguments.candidateFixPatch ) && isStruct( arguments.candidateFixPatch ) ) {
+			var accepted = acceptCandidatePatch( result.evidence ?: "", arguments.candidateFixPatch );
+			if ( !isNull( accepted ) ) {
+				result.fixPatch = accepted;
+			}
+		}
+
+		return result;
+	}
+
+	array function enrichAll( required array findings ) {
+		return arguments.findings.map( ( finding ) => enrich( finding ) );
+	}
+
+	string function serializeSolution( required struct finding ) {
+		var payload = {};
+		if ( arguments.finding.keyExists( "playbook" ) && isStruct( arguments.finding.playbook ) ) {
+			payload.playbook = arguments.finding.playbook;
+		}
+		if ( arguments.finding.keyExists( "fixPatch" ) && isStruct( arguments.finding.fixPatch ) ) {
+			payload.fixPatch = arguments.finding.fixPatch;
+		}
+		if ( !structCount( payload ) ) {
+			return "";
+		}
+		return jsonSerialize( payload );
+	}
+
+	struct function deserializeSolution( required string solutionJson ) {
+		if ( !len( trim( arguments.solutionJson ) ) ) {
+			return {};
+		}
+		try {
+			var parsed = jsonDeserialize( arguments.solutionJson );
+			if ( !isStruct( parsed ) ) {
+				return {};
+			}
+			var restored = {};
+			if ( isStruct( parsed.playbook ?: "" ) ) {
+				restored.playbook = parsed.playbook;
+			}
+			if ( isStruct( parsed.fixPatch ?: "" ) ) {
+				restored.fixPatch = parsed.fixPatch;
+			}
+			return restored;
+		} catch (any ignore) {
+			return {};
+		}
+	}
+
+	private any function deterministicTemplatePatch( required struct finding ) {
+		var ruleId = arguments.finding.ruleId ?: "";
+		var evidence = trim( arguments.finding.evidence ?: "" );
+		if ( !len( evidence ) ) {
+			return javacast( "null", "" );
+		}
+		// Minified / packed lines are too risky for mechanical rewrites.
+		if ( len( evidence ) > 180 || looksMinifiedPath( arguments.finding.filePath ?: "" ) ) {
+			return javacast( "null", "" );
+		}
+		if ( ruleId == "errors/empty-catch" && reFind( "\{\s*\}", evidence ) ) {
+			var family = languageFamily( arguments.finding.filePath ?: "" );
+			if ( family == "javascript" ) {
+				return {
+					before: evidence,
+					after : reReplace(
+						evidence,
+						"\{\s*\}",
+						"{ console.error(e); throw e; }",
+						"one"
+					),
+					confidence: .85
+				};
+			}
+			if ( family == "cfml" || family == "boxlang" ) {
+				return {
+					before: evidence,
+					after : reReplace(
+						evidence,
+						"\{\s*\}",
+						"{ writeLog( type=""error"", text=e.message ); rethrow; }",
+						"one"
+					),
+					confidence: .9
+				};
+			}
+			// Unknown language: playbook only — do not invent a patch dialect.
+			return javacast( "null", "" );
+		}
+		return javacast( "null", "" );
+	}
+
+	private string function languageFamily( required string filePath ) {
+		var normalized = replace(
+			lCase( arguments.filePath ),
+			"\",
+			"/",
+			"all"
+		);
+		var fileName = listLast( normalized, "/" );
+		var extension = listLen( fileName, "." ) > 1 ? listLast( fileName, "." ) : "";
+		switch ( extension ) {
+			case "js":
+
+			case "jsx":
+
+			case "mjs":
+
+			case "cjs":
+
+			case "ts":
+
+			case "tsx":
+				return "javascript";
+			case "cfc":
+
+			case "cfm":
+
+			case "cfml":
+				return "cfml";
+			case "bx":
+
+			case "bxm":
+
+			case "bxs":
+				return "boxlang";
+			default:
+				// Heuristic when path is missing: CF/BoxLang-looking catch signatures.
+				return "";
+		}
+	}
+
+	private boolean function looksMinifiedPath( required string filePath ) {
+		var normalized = lCase( arguments.filePath );
+		return reFindNoCase( "\.(min|pack)\.(js|mjs|cjs)$", normalized ) > 0 || findNoCase( ".min.", normalized ) > 0 ||
+			findNoCase( ".pack.", normalized ) > 0;
+	}
+
+	private any function acceptCandidatePatch( required string evidence, required struct candidate ) {
+		var before = trim( arguments.candidate.before ?: "" );
+		var after = trim( arguments.candidate.after ?: "" );
+		var confidence = isNumeric( arguments.candidate.confidence ?: "" ) ? val( arguments.candidate.confidence ) : 0;
+		if ( !len( before ) || !len( after ) || confidence < variables.minPatchConfidence ) {
+			return javacast( "null", "" );
+		}
+		if ( !evidenceMatches( arguments.evidence, before ) ) {
+			return javacast( "null", "" );
+		}
+		if ( isUnsafeFixPatch( after ) ) {
+			return javacast( "null", "" );
+		}
+		return {
+			before    : before,
+			after     : after,
+			confidence: min( 1, confidence )
+		};
+	}
+
+	/**
+	 * Reject known-bad LLM patch shapes (wrong CFML encoding / nested cfoutput).
+	 */
+	private boolean function isUnsafeFixPatch( required string after ) {
+		var text = arguments.after;
+		// Nested cfoutput inside a rewritten attribute/URL is almost always invalid.
+		if ( reFindNoCase( "<\s*cfoutput\b", text ) ) {
+			return true;
+		}
+		// htmlFormat / HTMLEditFormat are not correct for URL query values.
+		if (
+			reFindNoCase( "htmlFormat\s*=", text ) || reFindNoCase( "\bHTMLEditFormat\s*\(", text ) ||
+				reFindNoCase( "\bhtmlEditFormat\s*\(", text )
+		) {
+			if ( reFindNoCase( "\?[^=]+=", text ) || reFindNoCase( "\b(action|href|src|location)\s*=", text ) || find( "&", text ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private string function sanitizeSuggestion( required string suggestion, required string evidence ) {
+		var text = trim( arguments.suggestion );
+		if ( !len( text ) ) {
+			return text;
+		}
+		var looksLikeUrlContext = reFindNoCase( "\b(action|href|src|location)\s*=", arguments.evidence ) ||
+				find( "?", arguments.evidence ) ||
+			find( "&", arguments.evidence );
+		var recommendsHtmlFormat = reFindNoCase(
+			"htmlFormat|HTMLEditFormat|htmlEditFormat|<cfoutput",
+			text
+		);
+		if ( looksLikeUrlContext && recommendsHtmlFormat ) {
+			return "Encode each query-string value with encodeForURL() (or URLEncodedFormat on older ColdFusion). Do not nest <cfoutput> tags inside the attribute, and do not use htmlFormat for URL parameters.";
+		}
+		return text;
+	}
+
+	private boolean function evidenceMatches( required string evidence, required string before ) {
+		var left = collapseWhitespace( arguments.evidence );
+		var right = collapseWhitespace( arguments.before );
+		if ( !len( left ) || !len( right ) ) {
+			return false;
+		}
+		return left == right || findNoCase( right, left ) || findNoCase( left, right );
+	}
+
+	private string function collapseWhitespace( required string value ) {
+		return trim(
+			reReplace(
+				arguments.value,
+				"\s+",
+				" ",
+				"all"
+			)
+		);
+	}
+}

@@ -1,0 +1,193 @@
+/**
+ * Langfuse-style explorer for ai-flight traces.
+ */
+class {
+	property name="store" inject="TraceStoreService@aiFlight";
+
+	property name="listener" inject="AiFlightListener@aiFlight";
+
+	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
+
+	function preHandler( event, rc, prc ) {
+		if ( !flag( moduleSettings.viewerEnabled ?: true ) ) {
+			event.renderData(
+					type       = "plain",
+					data       = "ai-flight viewer disabled",
+					statusCode = 404
+				);
+			event.noRender();
+			return;
+		}
+		prc.pollSeconds = int( val( moduleSettings.pollSeconds ?: 2 ) );
+		prc.moduleEntry = "ai-flight";
+
+		// Host toModuleRouting does not always apply module defaultLayout — force ours
+		// so DoubleCheck Main.bxm + app.js do not wrap this explorer.
+		if ( !reFindNoCase( "^api", event.getCurrentAction() ) ) {
+			event.setLayout( name = "Flight", module = "aiFlight" );
+		} else {
+			event.noLayout();
+		}
+	}
+
+	function index( event, rc, prc ) {
+		prc.pageTitle = "AiFlight";
+		prc.traces = store.listTraces( argumentCollection = listFilterArgs( rc ) );
+		prc.filters = filterStruct( rc );
+		prc.selectedTraceId = trim( rc.id ?: "" );
+		event.setView( "flight/index" );
+	}
+
+	function trace( event, rc, prc ) {
+		// Old deep links → same workspace with hash (no separate page)
+		var id = trim( rc.id ?: "" );
+		relocate( url = "/ai-flight/##trace/#urlEncodedFormat( id )#" );
+	}
+
+	function apiSessions( event, rc, prc ) {
+		event.renderData(
+				type = "json",
+				data = { sessions: store.listSessions( limit = int( val( rc.limit ?: 50 ) ) ) }
+			);
+	}
+
+	function apiSession( event, rc, prc ) {
+		var detail = store.getSession( trim( rc.id ?: "" ) );
+		if ( !detail.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = detail );
+	}
+
+	function apiTraces( event, rc, prc ) {
+		var rows = store.listTraces( argumentCollection = listFilterArgs( rc ) );
+		event.renderData( type = "json", data = { traces: rows } );
+	}
+
+	function apiTrace( event, rc, prc ) {
+		var detail = store.getTraceDetail( trim( rc.id ?: "" ) );
+		if ( !detail.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = detail );
+	}
+
+	function apiStatus( event, rc, prc ) {
+		listener.registerWithRuntime();
+		event.renderData(
+				type = "json",
+				data = {
+					listener: listener.getStatus(),
+					dbPath  : store.getDbPath(),
+					traces  : arrayLen( store.listTraces( limit = 1 ) )
+				}
+			);
+	}
+
+	/**
+	 * Dev probe: fire synthetic bx-ai announces and return resulting traces.
+	 */
+	function apiProbe( event, rc, prc ) {
+		listener.registerWithRuntime();
+		var before = arrayLen( store.listTraces( limit = 50 ) );
+
+		// 1) Direct invoke — proves persist path
+		listener.onAIChatRequest(
+				{
+					dataPacket: {
+						model   : "probe-model",
+						messages: [ { role: "user", content: "direct hello" }]
+					},
+					provider: "probe-direct"
+				}
+			);
+		listener.onAIChatResponse(
+				{
+					response: "direct world",
+					provider: "probe-direct",
+					model   : "probe-model"
+				}
+			);
+		var afterDirect = arrayLen( store.listTraces( limit = 50 ) );
+
+		// 2) Via BoxAnnounce — proves interceptor bus
+		BoxAnnounce(
+			"onAIChatRequest",
+			{
+				dataPacket: {
+					model   : "probe-model",
+					messages: [ { role: "user", content: "announce hello" }]
+				},
+				provider: "probe-announce"
+			}
+		);
+		BoxAnnounce(
+			"onAIChatResponse",
+			{
+				response: "announce world",
+				provider: "probe-announce",
+				model   : "probe-model"
+			}
+		);
+		var afterAnnounce = arrayLen( store.listTraces( limit = 50 ) );
+
+		event.renderData(
+				type = "json",
+				data = {
+					before       : before,
+					afterDirect  : afterDirect,
+					afterAnnounce: afterAnnounce,
+					traces       : store.listTraces( limit = 5 ),
+					listener     : listener.getStatus()
+				}
+			);
+	}
+
+	private boolean function flag( required any value ) {
+		return listFindNoCase( "true,yes,1,on", toString( arguments.value ) ) > 0;
+	}
+
+	private struct function filterStruct( required struct rc ) {
+		return {
+			status       : trim( arguments.rc.status ?: "" ),
+			q            : trim( arguments.rc.q ?: "" ),
+			hasTools     : flag( arguments.rc.hasTools ?: false ),
+			hasErrors    : flag( arguments.rc.hasErrors ?: false ),
+			model        : trim( arguments.rc.model ?: "" ),
+			userId       : trim( arguments.rc.userId ?: "" ),
+			environment  : trim( arguments.rc.environment ?: "" ),
+			obsType      : trim( arguments.rc.obsType ?: "" ),
+			minDurationMs: trim( arguments.rc.minDurationMs ?: "" ),
+			maxDurationMs: trim( arguments.rc.maxDurationMs ?: "" ),
+			minCost      : trim( arguments.rc.minCost ?: "" )
+		};
+	}
+
+	private struct function listFilterArgs( required struct rc ) {
+		var f = filterStruct( arguments.rc );
+		return {
+			limit        : int( val( arguments.rc.limit ?: 50 ) ),
+			status       : f.status,
+			search       : f.q,
+			hasTools     : f.hasTools,
+			hasErrors    : f.hasErrors,
+			model        : f.model,
+			userId       : f.userId,
+			environment  : f.environment,
+			obsType      : f.obsType,
+			minDurationMs: val( f.minDurationMs ),
+			maxDurationMs: val( f.maxDurationMs ),
+			minCost      : val( f.minCost )
+		};
+	}
+}

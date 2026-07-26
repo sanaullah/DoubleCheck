@@ -1,0 +1,137 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Seeded review-quality gate",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"passes through the deterministic AI gateway and exact-span corpus",
+					() => {
+						var evaluationService = getInstance( "EvaluationService" );
+						var findingService = getInstance( "FindingService" );
+						var corpus = evaluationService.loadCorpus( expandPath( "/tests/fixtures/review-corpus/v1" ) );
+						var corpusCase = corpus.cases[ 1 ];
+						var fakeGateway = new tests.resources.DeterministicAIChatGateway( corpusCase.fakeResponse );
+						var reviewService = prepareMock( new app.models.services.AIReviewService() );
+						reviewService.$property(
+								"findingService",
+								"variables",
+								findingService
+							);
+						reviewService.$property(
+								"chatGateway",
+								"variables",
+								fakeGateway
+							);
+						reviewService.$property(
+								"secretRedactionService",
+								"variables",
+								new app.models.services.SecretRedactionService()
+							);
+						reviewService.$property(
+								"provider",
+								"variables",
+								"deterministic-fake"
+							);
+						reviewService.$property(
+								"baseURL",
+								"variables",
+								""
+							);
+						reviewService.$property(
+								"apiKey",
+								"variables",
+								""
+							);
+						reviewService.$property(
+								"model",
+								"variables",
+								"corpus-v1"
+							);
+						reviewService.$property(
+								"timeout",
+								"variables",
+								1
+							);
+						reviewService.$property(
+								"maxPromptCharacters",
+								"variables",
+								60000
+							);
+						reviewService.$property(
+								"contextWindow",
+								"variables",
+								128000
+							);
+
+						var aiResult = reviewService.review( corpusCase.files );
+						var findings = findingService.deduplicate( findingService.deterministic( corpusCase.files ).append( aiResult.findings,
+										true ) );
+						var gate = evaluationService.evaluate(
+								corpusCase.expected,
+								findings,
+								corpusCase.files,
+								corpus.thresholds
+							);
+						var requests = fakeGateway.getRequests();
+						var serializedPrompt = jsonSerialize( requests[ 1 ].prompt );
+
+						expect( corpus.version ).toBe( "boxlang-review-corpus-v1" );
+						expect( aiResult.enabled ).toBeTrue();
+						expect( aiResult.findings ).toHaveLength( 1 );
+						expect( requests ).toHaveLength( 1 );
+						expect( serializedPrompt ).toInclude( "[REDACTED SENSITIVE CONTENT]" );
+						expect( serializedPrompt ).notToInclude( "seeded-test-key-123456" );
+						expect( gate.passed ).toBeTrue( arrayToList( gate.failures, "; " ) );
+						expect( gate.metrics.truePositives ).toBe( 3 );
+						expect( gate.metrics.falsePositives ).toBe( 0 );
+						expect( gate.metrics.falseNegatives ).toBe( 0 );
+						expect( gate.metrics.precision ).toBe( 1 );
+						expect( gate.metrics.recall ).toBe( 1 );
+						expect( gate.metrics.f1 ).toBe( 1 );
+						expect( gate.metrics.citationValidity ).toBe( 1 );
+						expect( gate.metrics.duplicateRate ).toBe( 0 );
+					}
+				);
+
+				it(
+					"fails closed when an unexpected finding is introduced",
+					() => {
+						var evaluationService = getInstance( "EvaluationService" );
+						var corpus = evaluationService.loadCorpus( expandPath( "/tests/fixtures/review-corpus/v1" ) );
+						var corpusCase = corpus.cases[ 1 ];
+						var unexpected = {
+							fingerprint: lCase( hash( "unexpected", "SHA-256" ) ),
+							ruleId     : "unexpected/finding",
+							filePath   : corpusCase.files[ 1 ].filePath,
+							startLine  : 1,
+							endLine    : 1,
+							evidence   : trim( corpusCase.files[ 1 ].lines[ 1 ] )
+						};
+						var gate = evaluationService.evaluate(
+								corpusCase.expected,
+								[ unexpected],
+								corpusCase.files,
+								corpus.thresholds
+							);
+
+						expect( gate.passed ).toBeFalse();
+						expect( gate.metrics.falsePositives ).toBe( 1 );
+						expect( gate.metrics.falseNegatives ).toBe( 3 );
+						expect( gate.failures ).notToBeEmpty();
+					}
+				);
+			}
+		);
+	}
+}

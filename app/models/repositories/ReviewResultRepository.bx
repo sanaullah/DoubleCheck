@@ -1,0 +1,335 @@
+/**
+ * SQLite persistence for run findings, file artifacts, and result summaries.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	property name="findingSolutionService" inject="FindingSolutionService";
+
+	function init() {
+		if (
+			isNull(
+				variables.findingSolutionService ?: javacast( "null", "" )
+			)
+		) {
+			variables.findingSolutionService = new app.models.services.FindingSolutionService();
+		}
+		return this;
+	}
+
+	void function replaceArtifacts( required string runId, required array artifacts ) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"DELETE FROM review_artifacts WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			for ( var artifact in arguments.artifacts ) {
+				queryExecute(
+					"
+						INSERT INTO review_artifacts (
+							run_id, file_path, language, content_hash, size_bytes, line_count, created_at
+						) VALUES (
+							:runId, :filePath, :language, :contentHash, :sizeBytes, :lineCount, :createdAt
+						)
+					",
+					{
+						runId      : arguments.runId,
+						filePath   : artifact.filePath,
+						language   : artifact.language,
+						contentHash: artifact.contentHash,
+						sizeBytes  : artifact.sizeBytes,
+						lineCount  : artifact.lineCount,
+						createdAt  : timestamp()
+					},
+					{ datasource: datasource }
+				);
+			}
+		}
+	}
+
+	void function replaceFindings( required string runId, required array findings ) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"DELETE FROM review_findings WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			for ( var finding in arguments.findings ) {
+				queryExecute(
+					"
+						INSERT OR IGNORE INTO review_findings (
+							id, run_id, fingerprint, category, rule_id, severity, confidence,
+							title, message, file_path, start_line, end_line, evidence,
+							suggestion, source, solution_json, created_at
+						) VALUES (
+							:id, :runId, :fingerprint, :category, :ruleId, :severity, :confidence,
+							:title, :message, :filePath, :startLine, :endLine, :evidence,
+							:suggestion, :source, :solutionJson, :createdAt
+						)
+					",
+					{
+						id          : finding.id,
+						runId       : arguments.runId,
+						fingerprint : finding.fingerprint,
+						category    : finding.category,
+						ruleId      : finding.ruleId,
+						severity    : finding.severity,
+						confidence  : finding.confidence,
+						title       : finding.title,
+						message     : finding.message,
+						filePath    : finding.filePath,
+						startLine   : finding.startLine,
+						endLine     : finding.endLine,
+						evidence    : finding.evidence,
+						suggestion  : finding.suggestion,
+						source      : finding.source,
+						solutionJson: findingSolutionService.serializeSolution( finding ),
+						createdAt   : timestamp()
+					},
+					{ datasource: datasource }
+				);
+			}
+		}
+	}
+
+	void function saveSummary(
+		required string runId,
+		required string summary,
+		required array languages,
+		required numeric filesScanned,
+		required numeric bytesScanned,
+		required numeric findingsCount,
+		required boolean aiEnabled,
+		numeric aiFilesReviewed    = 0,
+		numeric aiCharactersSent   = 0,
+		string reviewScope         = "",
+		string repositoryRevision  = "",
+		string baseRevision        = "",
+		string headRevision        = "",
+		boolean discoveryTruncated = false
+	) {
+		queryExecute(
+			"
+				INSERT INTO review_summaries (
+					run_id, summary, languages, files_scanned, bytes_scanned,
+					findings_count, ai_enabled, ai_files_reviewed, ai_characters_sent,
+					review_scope, repository_revision, base_revision, head_revision,
+					discovery_truncated, created_at
+				) VALUES (
+					:runId, :summary, :languages, :filesScanned, :bytesScanned,
+					:findingsCount, :aiEnabled, :aiFilesReviewed, :aiCharactersSent,
+					:reviewScope, :repositoryRevision, :baseRevision, :headRevision,
+					:discoveryTruncated, :createdAt
+				)
+				ON CONFLICT ( run_id ) DO UPDATE SET
+					summary = excluded.summary,
+					languages = excluded.languages,
+					files_scanned = excluded.files_scanned,
+					bytes_scanned = excluded.bytes_scanned,
+					findings_count = excluded.findings_count,
+					ai_enabled = excluded.ai_enabled,
+					ai_files_reviewed = excluded.ai_files_reviewed,
+					ai_characters_sent = excluded.ai_characters_sent,
+					review_scope = excluded.review_scope,
+					repository_revision = excluded.repository_revision,
+					base_revision = excluded.base_revision,
+					head_revision = excluded.head_revision,
+					discovery_truncated = excluded.discovery_truncated,
+					created_at = excluded.created_at
+			",
+			{
+				runId             : arguments.runId,
+				summary           : arguments.summary,
+				languages         : jsonSerialize( arguments.languages ),
+				filesScanned      : arguments.filesScanned,
+				bytesScanned      : arguments.bytesScanned,
+				findingsCount     : arguments.findingsCount,
+				aiEnabled         : arguments.aiEnabled ? 1 : 0,
+				aiFilesReviewed   : arguments.aiFilesReviewed,
+				aiCharactersSent  : arguments.aiCharactersSent,
+				reviewScope       : arguments.reviewScope,
+				repositoryRevision: arguments.repositoryRevision,
+				baseRevision      : arguments.baseRevision,
+				headRevision      : arguments.headRevision,
+				discoveryTruncated: arguments.discoveryTruncated ? 1 : 0,
+				createdAt         : timestamp()
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	struct function getResult( required string runId ) {
+		var summaryQuery = queryExecute(
+			"SELECT * FROM review_summaries WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var findingsQuery = queryExecute(
+			"
+				SELECT * FROM review_findings
+				WHERE run_id = :runId
+				ORDER BY
+					CASE severity
+						WHEN 'critical' THEN 1
+						WHEN 'high' THEN 2
+						WHEN 'medium' THEN 3
+						WHEN 'low' THEN 4
+						ELSE 5
+					END,
+					file_path,
+					start_line
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var findings = [];
+		for ( var row = 1; row <= findingsQuery.recordCount; row++ ) {
+			findings.append( hydrateFinding( findingsQuery, row ) );
+		}
+		if ( !summaryQuery.recordCount ) {
+			var emptyResult = {
+				summary           : "",
+				languages         : [],
+				filesScanned      : 0,
+				bytesScanned      : 0,
+				findingsCount     : findings.len(),
+				aiEnabled         : false,
+				aiFilesReviewed   : 0,
+				aiCharactersSent  : 0,
+				reviewScope       : "",
+				repositoryRevision: "",
+				baseRevision      : "",
+				headRevision      : "",
+				discoveryTruncated: false,
+				findings          : findings
+			};
+			emptyResult.snapshot = buildSnapshotManifest( arguments.runId, findings );
+			return emptyResult;
+		}
+		var result = {
+			summary           : summaryQuery.summary[ 1 ],
+			languages         : jsonDeserialize( summaryQuery.languages[ 1 ] ),
+			filesScanned      : summaryQuery.files_scanned[ 1 ],
+			bytesScanned      : summaryQuery.bytes_scanned[ 1 ],
+			findingsCount     : summaryQuery.findings_count[ 1 ],
+			aiEnabled         : summaryQuery.ai_enabled[ 1 ] == 1,
+			aiFilesReviewed   : summaryQuery.ai_files_reviewed[ 1 ],
+			aiCharactersSent  : summaryQuery.ai_characters_sent[ 1 ],
+			reviewScope       : summaryQuery.review_scope[ 1 ],
+			repositoryRevision: summaryQuery.repository_revision[ 1 ],
+			baseRevision      : summaryQuery.base_revision[ 1 ],
+			headRevision      : summaryQuery.head_revision[ 1 ],
+			discoveryTruncated: summaryQuery.discovery_truncated[ 1 ] == 1,
+			findings          : findings
+		};
+		result.snapshot = buildSnapshotManifest( arguments.runId, findings );
+		return result;
+	}
+
+	private struct function buildSnapshotManifest( required string runId, required array findings ) {
+		var artifacts = queryExecute(
+			"
+				SELECT file_path, language, content_hash, size_bytes, line_count
+				FROM review_artifacts
+				WHERE run_id = :runId
+				ORDER BY file_path
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var files = [];
+		var digestParts = [];
+		for ( var row = 1; row <= artifacts.recordCount; row++ ) {
+			var item = {
+				filePath   : artifacts.file_path[ row ],
+				language   : artifacts.language[ row ],
+				contentHash: artifacts.content_hash[ row ],
+				sizeBytes  : artifacts.size_bytes[ row ],
+				lineCount  : artifacts.line_count[ row ]
+			};
+			files.append( item );
+			digestParts.append( "#item.filePath#:#item.contentHash#" );
+		}
+		var evidence = arguments.findings.map(
+				( finding ) => {
+					return {
+						fingerprint : finding.fingerprint,
+						evidenceHash: hash( finding.evidence ?: "", "SHA-256" )
+					};
+				}
+			);
+		var digest = hash( digestParts.toList( "|" ) & "|" & jsonSerialize( evidence ), "SHA-256" );
+		return {
+			version       : "snapshot-manifest-v1",
+			id            : digest,
+			immutable     : true,
+			fileCount     : files.len(),
+			files         : files,
+			evidenceHashes: evidence
+		};
+	}
+
+	private struct function hydrateFinding( required query record, required numeric row ) {
+		var finding = {
+			id         : record.id[ row ],
+			fingerprint: record.fingerprint[ row ],
+			category   : record.category[ row ],
+			ruleId     : record.rule_id[ row ],
+			severity   : record.severity[ row ],
+			confidence : record.confidence[ row ],
+			title      : record.title[ row ],
+			message    : record.message[ row ],
+			filePath   : record.file_path[ row ],
+			startLine  : record.start_line[ row ],
+			endLine    : record.end_line[ row ],
+			evidence   : record.evidence[ row ],
+			suggestion : record.suggestion[ row ],
+			source     : record.source[ row ]
+		};
+		var solutionJson = "";
+		try {
+			solutionJson = record.solution_json[ row ] ?: "";
+		} catch (any missingColumn) {
+			solutionJson = "";
+		}
+		var solution = findingSolutionService.deserializeSolution( solutionJson );
+		var source = lCase( finding.source ?: "" );
+		// Deterministic solutions are recomputed so language-aware templates stay correct
+		// even when an older run persisted a wrong dialect patch.
+		if ( source == "deterministic" ) {
+			finding = findingSolutionService.enrich( finding );
+		} else {
+			if ( solution.keyExists( "playbook" ) ) {
+				finding.playbook = solution.playbook;
+			}
+			if ( solution.keyExists( "fixPatch" ) && isStruct( solution.fixPatch ) ) {
+				var accepted = findingSolutionService.enrich(
+						{
+							ruleId    : finding.ruleId,
+							evidence  : finding.evidence,
+							filePath  : finding.filePath,
+							suggestion: finding.suggestion
+						},
+						solution.fixPatch
+					);
+				if ( accepted.keyExists( "fixPatch" ) ) {
+					finding.fixPatch = accepted.fixPatch;
+				}
+				if ( accepted.keyExists( "playbook" ) && !finding.keyExists( "playbook" ) ) {
+					finding.playbook = accepted.playbook;
+				}
+			}
+			if ( !finding.keyExists( "playbook" ) && !finding.keyExists( "fixPatch" ) ) {
+				finding = findingSolutionService.enrich( finding );
+			}
+		}
+		return finding;
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

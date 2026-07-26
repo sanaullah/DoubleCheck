@@ -1,0 +1,773 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "DoubleCheck API",
+    "version": "0.1.0",
+    "description": "Local code-review REST API. Deterministic review works without an AI key;\nspecialists deepen when `OPENAI_API_BASE` / `OPENAI_API_KEY` / `DEFAULT_MODEL`\nare configured.\n\nInteractive UI: `/apidocs/`  \nAuto-generated from routes: `/cbswagger/json`  \nProduct overview: `readme.md`\n"
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "This CommandBox server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health"
+    },
+    {
+      "name": "Session"
+    },
+    {
+      "name": "Runs"
+    },
+    {
+      "name": "AI"
+    },
+    {
+      "name": "Local"
+    }
+  ],
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Health check",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/capabilities": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Feature capabilities for the UI",
+        "operationId": "getCapabilities",
+        "responses": {
+          "200": {
+            "description": "Capability snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ai/smoke": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Smoke-test the configured LLM provider",
+        "operationId": "aiSmoke",
+        "responses": {
+          "200": {
+            "description": "Provider reachable"
+          },
+          "400": {
+            "description": "AI not configured or smoke failed"
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "get": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "Local workspace identity",
+        "operationId": "getSession",
+        "responses": {
+          "200": {
+            "description": "Session payload"
+          }
+        }
+      }
+    },
+    "/api/v1/runs": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "List review runs",
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectId"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated runs"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Create a review run",
+        "operationId": "createRun",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunRequest"
+              },
+              "examples": {
+                "workingTree": {
+                  "summary": "Working-tree review",
+                  "value": {
+                    "projectId": "default",
+                    "projectPath": "C:/path/to/repo",
+                    "mode": "working-tree",
+                    "policy": {
+                      "allowedRoles": [
+                        "security",
+                        "correctness"
+                      ]
+                    },
+                    "budgets": {
+                      "maxTasks": 4,
+                      "maxTokens": 8000,
+                      "maxTokensPerTask": 3000
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Run accepted (queued/running)",
+            "headers": {
+              "Location": {
+                "description": "URL of the new run",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "422": {
+            "description": "Invalid project path or run input"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/runId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Get run status (includes result when available)",
+        "operationId": "getRun",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run memento",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Cancel a run",
+        "operationId": "cancelRun",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancel requested"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/events": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "SSE progress stream",
+        "operationId": "streamRunEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "text/event-stream of run events",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/event-log": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Persisted event log (non-SSE)",
+        "operationId": "getRunEventLog",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event array"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/traces": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Specialist observability traces",
+        "operationId": "getRunTraces",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trace payload"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/result": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Final review result (findings, baselines, architecture)",
+        "operationId": "getRunResult",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Result payload"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/export": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Export result as markdown, json, or sarif",
+        "operationId": "exportRun",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "markdown",
+                "json",
+                "sarif"
+              ],
+              "default": "markdown"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exported document"
+          }
+        }
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Filtered review history with aggregate execution metrics",
+        "operationId": "listReviewHistory",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectId"
+          },
+          {
+            "name": "projectPath",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "working-tree",
+                "revision-diff",
+                "full"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical run summaries, page metadata, and page trends"
+          }
+        }
+      }
+    },
+    "/api/v1/history/{id}/comparison": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Finding movement against the prior compatible run",
+        "operationId": "compareReviewHistory",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runId"
+          },
+          {
+            "$ref": "#/components/parameters/projectId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "New, unchanged, resolved, reopened, and severity movement"
+          },
+          "404": {
+            "description": "Run not found"
+          }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "List local workspace projects",
+        "operationId": "listProjects",
+        "responses": {
+          "200": {
+            "description": "Projects"
+          }
+        }
+      }
+    },
+    "/api/v1/workers": {
+      "get": {
+        "tags": [
+          "Local"
+        ],
+        "summary": "Worker registry",
+        "operationId": "listWorkers",
+        "responses": {
+          "200": {
+            "description": "Workers"
+          }
+        }
+      }
+    },
+    "/api/v1/quality": {
+      "get": {
+        "tags": [
+          "Local"
+        ],
+        "summary": "Quality / evaluation gate status",
+        "operationId": "getQuality",
+        "responses": {
+          "200": {
+            "description": "Gate status"
+          }
+        }
+      }
+    },
+    "/cbswagger": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Auto-generated OpenAPI document (default format)",
+        "operationId": "cbswaggerDefault",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON or YAML"
+          }
+        }
+      }
+    },
+    "/cbswagger/json": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Auto-generated OpenAPI JSON from ColdBox routes",
+        "operationId": "cbswaggerJson",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3 JSON"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "runId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "projectId": {
+        "name": "projectId",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "example": "ok"
+              },
+              "version": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "checks": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "CapabilitiesResponse": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "apiVersion": {
+                "type": "string",
+                "example": "v1"
+              },
+              "runModes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "working-tree",
+                    "revision-diff",
+                    "full"
+                  ]
+                }
+              },
+              "aiExecution": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "optional": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "CreateRunRequest": {
+        "type": "object",
+        "required": [
+          "projectPath"
+        ],
+        "properties": {
+          "projectId": {
+            "type": "string",
+            "default": "default"
+          },
+          "projectPath": {
+            "type": "string",
+            "description": "Absolute path to the repository root"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "working-tree",
+              "revision-diff",
+              "full"
+            ],
+            "default": "working-tree"
+          },
+          "baseRevision": {
+            "type": "string"
+          },
+          "headRevision": {
+            "type": "string",
+            "default": "HEAD"
+          },
+          "policy": {
+            "type": "object",
+            "properties": {
+              "reviewGoal": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Optional user focus supplied to the specialist crew planner"
+              },
+              "allowedRoles": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "budgets": {
+            "type": "object",
+            "properties": {
+              "maxTasks": {
+                "type": "integer"
+              },
+              "maxTokens": {
+                "type": "integer"
+              },
+              "maxTokensPerTask": {
+                "type": "integer"
+              },
+              "maxDurationMs": {
+                "type": "integer"
+              },
+              "maxIterationsPerTask": {
+                "type": "integer"
+              },
+              "maxToolOutputCharacters": {
+                "type": "integer"
+              },
+              "maxCostUsd": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      },
+      "RunEnvelope": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "partial",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              "currentPhase": {
+                "type": "string"
+              },
+              "progress": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "projectPath": {
+                "type": "string"
+              },
+              "result": {
+                "type": "object",
+                "description": "Present on show/result when available",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

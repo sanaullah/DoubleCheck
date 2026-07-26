@@ -1,0 +1,150 @@
+/**
+ * Validates and applies project-scoped finding review decisions.
+ */
+
+@singleton
+class {
+	property name="reviewRepository" inject="FindingReviewRepository";
+
+	property name="resultRepository" inject="ReviewResultRepository";
+
+	property name="runRepository" inject="ReviewRunRepository";
+	variables.allowedStates = [
+		"new",
+		"acknowledged",
+		"reviewed",
+		"dismissed",
+		"resolved",
+		"reopened"
+	];
+
+	struct function update(
+		required any run,
+		required string fingerprint,
+		required struct input,
+		required struct context
+	) {
+		var key = lCase( trim( arguments.fingerprint ) );
+		var finding = findInRun( arguments.run.getId(), key );
+		if ( !finding.count() ) {
+			throw(
+				type    = "FindingNotFound",
+				message = "Finding not found in this review run"
+			);
+		}
+		var state = lCase(
+			trim(
+				arguments.input.reviewState ?: arguments.input.state ?: ""
+			)
+		);
+		if ( !variables.allowedStates.contains( state ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "reviewState must be new, acknowledged, reviewed, dismissed, resolved, or reopened"
+			);
+		}
+		var note = trim( toString( arguments.input.note ?: "" ) );
+		if ( len( note ) > 2000 ) {
+			throw(
+				type    = "ValidationException",
+				message = "Finding review note must be 2000 characters or fewer"
+			);
+		}
+		var expectedVersion = int( val( arguments.input.expectedVersion ?: 0 ) );
+		var review = reviewRepository.setState(
+				tenantId        = arguments.run.getTenantId(),
+				projectId       = arguments.run.getProjectId(),
+				projectPath     = arguments.run.getProjectPath(),
+				fingerprint     = key,
+				reviewState     = state,
+				expectedVersion = expectedVersion,
+				note            = note,
+				changedBy       = arguments.context.principalId ?: "",
+				runId           = arguments.run.getId()
+			);
+		review.history = reviewHistory( arguments.run, key );
+		return review;
+	}
+
+	struct function applyToResult( required any run, required struct result ) {
+		var reviews = reviewRepository.listForProject(
+				arguments.run.getTenantId(),
+				arguments.run.getProjectId(),
+				arguments.run.getProjectPath()
+			);
+		var enriched = [];
+		for ( var finding in arguments.result.findings ?: [] ) {
+			var key = lCase( finding.fingerprint ?: "" );
+			var copied = duplicate( finding );
+			copied.review = reviews[ key ] ?: defaultReview();
+			enriched.append( copied );
+		}
+		arguments.result.findings = enriched;
+		return arguments.result;
+	}
+
+	void function reopenResolvedForRun( required any run, required array findings ) {
+		var reviews = reviewRepository.listForProject(
+				arguments.run.getTenantId(),
+				arguments.run.getProjectId(),
+				arguments.run.getProjectPath()
+			);
+		for ( var finding in arguments.findings ) {
+			var key = lCase( finding.fingerprint ?: "" );
+			if (
+				reviews.keyExists( key ) && reviews[ key ].state == "resolved" && len( reviews[ key ].updatedAt ?: "" ) &&
+					reviews[ key ].updatedAt < arguments.run.getCreatedAt()
+			) {
+				try {
+					reviewRepository.setState(
+							tenantId        = arguments.run.getTenantId(),
+							projectId       = arguments.run.getProjectId(),
+							projectPath     = arguments.run.getProjectPath(),
+							fingerprint     = key,
+							reviewState     = "reopened",
+							expectedVersion = reviews[ key ].version,
+							note            = "Automatically reopened when the finding returned in a later review.",
+							changedBy       = "system",
+							runId           = arguments.run.getId()
+						);
+				} catch ("FindingReviewConflict" ignored) {
+
+
+					// A concurrent human decision wins.
+				}
+			}
+		}
+	}
+
+	private struct function findInRun( required string runId, required string fingerprint ) {
+		for ( var finding in resultRepository.getResult( arguments.runId ).findings ?: [] ) {
+			if ( lCase( finding.fingerprint ?: "" ) == arguments.fingerprint ) {
+				return finding;
+			}
+		}
+		return {};
+	}
+
+	private array function reviewHistory( required any run, required string fingerprint ) {
+		var reviews = reviewRepository.listForProject(
+				arguments.run.getTenantId(),
+				arguments.run.getProjectId(),
+				arguments.run.getProjectPath()
+			);
+		if ( !reviews.keyExists( arguments.fingerprint ) ) {
+			return [];
+		}
+		return reviews[ arguments.fingerprint ].history ?: [];
+	}
+
+	private struct function defaultReview() {
+		return {
+			state    : "new",
+			note     : "",
+			version  : 0,
+			updatedBy: "",
+			updatedAt: "",
+			history  : []
+		};
+	}
+}

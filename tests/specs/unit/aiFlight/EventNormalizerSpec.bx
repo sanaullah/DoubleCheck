@@ -1,0 +1,87 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"AiFlight EventNormalizer",
+			() => {
+				beforeEach(
+					() => {
+						variables.normalizer = new aiFlight.models.EventNormalizer();
+						variables.normalizer.moduleSettings = {
+							previewChars       : 100,
+							includePayloadJson : true,
+							captureCreateEvents: false,
+							eventAllowlist     : [],
+							eventDenylist      : []
+						};
+						variables.normalizer.sanitizer = new aiFlight.models.PayloadSanitizer();
+					}
+				);
+
+				it(
+					"maps chat request/response to generation observations",
+					() => {
+						var start = variables.normalizer.forEvent(
+								"onAIChatRequest",
+								{
+									dataPacket: {
+										model   : "m1",
+										messages: [ { role: "system", content: "You are a bot" }, { role: "user", content: "hello" }]
+									},
+									provider: "openai"
+								}
+							);
+						expect( start.type ).toBe( "generation" );
+						expect( start.name ).toBe( "generate-response" );
+						expect( start.traceName ).toBe( "generate-response" );
+						expect( start.openGen ).toBeTrue();
+						expect( start.inputText ).toBe( "hello" );
+						expect( start.inputText ).notToInclude( "You are a bot" );
+
+						var done = variables.normalizer.forEvent(
+								"onAIChatResponse",
+								{
+									response: {
+										choices: [ { message: { role: "assistant", content: "world" } }],
+										usage  : {
+											prompt_tokens    : 3,
+											completion_tokens: 1,
+											total_tokens     : 4,
+											cost             : .0001
+										}
+									},
+									provider: "openai",
+									model   : "m1"
+								}
+							);
+						expect( done.closeGen ).toBeTrue();
+						expect( done.name ).toBe( "generate-response" );
+						expect( done.outputText ).toBe( "world" );
+						expect( done.usage.cost ).toBe( .0001 );
+					}
+				);
+
+				it(
+					"skips create events when captureCreateEvents is false",
+					() => {
+						expect( variables.normalizer.shouldCapture( "onAIAgentCreate" ) ).toBeFalse();
+						expect( variables.normalizer.shouldCapture( "onAIChatRequest" ) ).toBeTrue();
+					}
+				);
+
+				it(
+					"maps agent run to open/close trace spans",
+					() => {
+						var start = variables.normalizer.forEvent( "beforeAIAgentRun", { input: "task" } );
+						expect( start.openTrace ).toBeTrue();
+						expect( start.openSpan ).toBeTrue();
+						expect( start.type ).toBe( "span" );
+						var done = variables.normalizer.forEvent( "afterAIAgentRun", { response: "done" } );
+						expect( done.closeTrace ).toBeTrue();
+						expect( done.closeSpan ).toBeTrue();
+					}
+				);
+			}
+		);
+	}
+}

@@ -1,0 +1,224 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"FindingSolutionService",
+			() => {
+				var service = "";
+
+				beforeEach(
+					() => {
+						service = new app.models.services.FindingSolutionService();
+					}
+				);
+
+				it(
+					"attaches a catalog playbook for known deterministic rules",
+					() => {
+						var enriched = service.enrich(
+								{
+									ruleId    : "secrets/hardcoded-credential",
+									evidence  : "password = ""secret-value-here""",
+									suggestion: "Move the value to an environment variable."
+								}
+							);
+
+						expect( enriched.keyExists( "playbook" ) ).toBeTrue();
+						expect( enriched
+								.playbook
+								.steps
+								.len() ).toBeGT( 0 );
+						expect( enriched.keyExists( "fixPatch" ) ).toBeFalse();
+					}
+				);
+
+				it(
+					"attaches a BoxLang-style fixPatch for empty-catch in .bx files",
+					() => {
+						var evidence = "catch ( any e ) {}";
+						var enriched = service.enrich(
+								{
+									ruleId    : "errors/empty-catch",
+									filePath  : "app/models/Service.bx",
+									evidence  : evidence,
+									suggestion: "Handle the expected failure."
+								}
+							);
+
+						expect( enriched.keyExists( "fixPatch" ) ).toBeTrue();
+						expect( enriched.fixPatch.before ).toBe( evidence );
+						expect( enriched.fixPatch.after ).toInclude( "rethrow" );
+						expect( enriched.fixPatch.after ).toInclude( "writeLog" );
+						expect( enriched.fixPatch.confidence ).toBeGTE( .8 );
+					}
+				);
+
+				it(
+					"attaches a JavaScript-style fixPatch for empty-catch in .js files",
+					() => {
+						var evidence = "catch (e) {}";
+						var enriched = service.enrich(
+								{
+									ruleId    : "errors/empty-catch",
+									filePath  : "public/assets/app.js",
+									evidence  : evidence,
+									suggestion: "Handle the expected failure."
+								}
+							);
+
+						expect( enriched.keyExists( "fixPatch" ) ).toBeTrue();
+						expect( enriched.fixPatch.after ).toInclude( "console.error" );
+						expect( enriched.fixPatch.after ).notToInclude( "writeLog" );
+						expect( enriched.fixPatch.after ).notToInclude( "rethrow" );
+					}
+				);
+
+				it(
+					"skips templated fixPatch for minified or oversized evidence lines",
+					() => {
+						var evidence = "catch(a){}" & repeatString( "x", 250 );
+						var enriched = service.enrich(
+								{
+									ruleId    : "errors/empty-catch",
+									filePath  : "vendor/lib.min.js",
+									evidence  : evidence,
+									suggestion: "Handle the expected failure."
+								}
+							);
+
+						expect( enriched.keyExists( "playbook" ) ).toBeTrue();
+						expect( enriched.keyExists( "fixPatch" ) ).toBeFalse();
+					}
+				);
+
+				it(
+					"accepts a high-confidence specialist fixPatch when before matches evidence",
+					() => {
+						var evidence = "eval( userInput );";
+						var enriched = service.enrich(
+								{
+									ruleId    : "execution/dynamic-code",
+									evidence  : evidence,
+									suggestion: "Use allow-listed dispatch."
+								},
+								{
+									before    : evidence,
+									after     : "dispatch( userInput );",
+									confidence: .91
+								}
+							);
+
+						expect( enriched.fixPatch.after ).toBe( "dispatch( userInput );" );
+						expect( enriched.fixPatch.confidence ).toBe( .91 );
+					}
+				);
+
+				it(
+					"rejects specialist fixPatch below confidence threshold",
+					() => {
+						var evidence = "eval( userInput );";
+						var enriched = service.enrich(
+								{
+									ruleId    : "execution/dynamic-code",
+									evidence  : evidence,
+									suggestion: "Use allow-listed dispatch."
+								},
+								{
+									before    : evidence,
+									after     : "dispatch( userInput );",
+									confidence: .5
+								}
+							);
+
+						expect( enriched.keyExists( "fixPatch" ) ).toBeFalse();
+						expect( enriched.keyExists( "playbook" ) ).toBeTrue();
+					}
+				);
+
+				it(
+					"rejects specialist fixPatch when before does not match evidence",
+					() => {
+						var enriched = service.enrich(
+								{
+									ruleId    : "execution/dynamic-code",
+									evidence  : "eval( userInput );",
+									suggestion: "Use allow-listed dispatch."
+								},
+								{
+									before    : "totally different line",
+									after     : "dispatch( userInput );",
+									confidence: .95
+								}
+							);
+
+						expect( enriched.keyExists( "fixPatch" ) ).toBeFalse();
+					}
+				);
+
+				it(
+					"rejects CFML fixPatch that nests cfoutput or uses htmlFormat in URLs",
+					() => {
+						var evidence = "action=""block_entrydb.cfm?frmAction=##trim(frmAction)##&recID=##trim(recID)##""";
+						var enriched = service.enrich(
+								{
+									ruleId    : "cfml/xss-reflected-form-action",
+									filePath  : "_block_entry.cfm",
+									evidence  : evidence,
+									suggestion: "Encode URL parameters."
+								},
+								{
+									before    : evidence,
+									after     : "action=""block_entrydb.cfm?frmAction=<cfoutput htmlFormat=""yes"">##trim(frmAction)##</cfoutput>&recID=<cfoutput htmlFormat=""yes"">##trim(recID)##</cfoutput>""",
+									confidence: .95
+								}
+							);
+
+						expect( enriched.keyExists( "fixPatch" ) ).toBeFalse();
+					}
+				);
+
+				it(
+					"accepts CFML fixPatch that uses encodeForURL in query strings",
+					() => {
+						var evidence = "action=""block_entrydb.cfm?frmAction=##trim(frmAction)##""";
+						var after = "action=""block_entrydb.cfm?frmAction=##encodeForURL( trim( frmAction ) )##""";
+						var enriched = service.enrich(
+								{
+									ruleId    : "cfml/xss-reflected-form-action",
+									filePath  : "_block_entry.cfm",
+									evidence  : evidence,
+									suggestion: "Encode URL parameters."
+								},
+								{
+									before    : evidence,
+									after     : after,
+									confidence: .9
+								}
+							);
+
+						expect( enriched.fixPatch.after ).toInclude( "encodeForURL" );
+					}
+				);
+
+				it(
+					"serializes and deserializes solution fields",
+					() => {
+						var finding = service.enrich(
+								{
+									ruleId    : "errors/empty-catch",
+									filePath  : "app/Service.bx",
+									evidence  : "catch ( any e ) {}",
+									suggestion: "Handle it."
+								}
+							);
+						var json = service.serializeSolution( finding );
+						expect( len( json ) ).toBeGT( 2 );
+						var restored = service.deserializeSolution( json );
+						expect( restored.keyExists( "playbook" ) ).toBeTrue();
+						expect( restored.keyExists( "fixPatch" ) ).toBeTrue();
+					}
+				);
+			}
+		);
+	}
+}

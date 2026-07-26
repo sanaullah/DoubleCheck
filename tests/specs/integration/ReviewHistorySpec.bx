@@ -1,0 +1,229 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Richer review history",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"filters runs and returns aggregate history metrics",
+					() => {
+						var marker = lCase( createUUID() );
+						var runId = "history-list-#marker#";
+						var path = "C:/history/#marker#";
+						try {
+							seedRun(
+								runId,
+								path,
+								"full",
+								"succeeded",
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										-2,
+										now()
+									),
+									"iso"
+								),
+								[ finding( "fp-high", "high" ), finding( "fp-low", "low" )]
+							);
+							var response = this.get( "/api/v1/history?mode=full&q=#marker#&limit=10" );
+							expect( response.getResponse() ).toHaveStatus( 200 );
+							var body = jsonDeserialize( response.getRenderedContent() );
+							expect( body.data ).toHaveLength( 1 );
+							expect( body.data[ 1 ].run.id ).toBe( runId );
+							expect( body.data[ 1 ]
+									.metrics
+									.findings
+									.total ).toBe( 2 );
+							expect( body.data[ 1 ]
+									.metrics
+									.findings
+									.high ).toBe( 1 );
+							expect( body.data[ 1 ]
+									.metrics
+									.findings
+									.low ).toBe( 1 );
+							expect( body.meta.total ).toBe( 1 );
+							expect( body
+									.meta
+									.trends
+									.totalFindings ).toBe( 2 );
+						} finally {
+							cleanupRuns( [ runId] );
+						}
+					}
+				);
+
+				it(
+					"classifies resolved, reopened, and severity movement",
+					() => {
+						var marker = lCase( createUUID() );
+						var path = "C:/history-compare/#marker#";
+						var oldestId = "history-oldest-#marker#";
+						var baselineId = "history-baseline-#marker#";
+						var currentId = "history-current-#marker#";
+						try {
+							seedRun(
+								oldestId,
+								path,
+								"full",
+								"succeeded",
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										-30,
+										now()
+									),
+									"iso"
+								),
+								[ finding( "fp-reopened", "medium" )]
+							);
+							seedRun(
+								baselineId,
+								path,
+								"full",
+								"partial",
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										-20,
+										now()
+									),
+									"iso"
+								),
+								[ finding( "fp-raised", "low" ), finding( "fp-resolved", "high" )]
+							);
+							seedRun(
+								currentId,
+								path,
+								"full",
+								"succeeded",
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										-10,
+										now()
+									),
+									"iso"
+								),
+								[ finding( "fp-raised", "high" ), finding( "fp-reopened", "medium" ), finding( "fp-new", "low" )]
+							);
+							var response = this.get( "/api/v1/history/#currentId#/comparison" );
+							expect( response.getResponse() ).toHaveStatus( 200 );
+							var comparison = jsonDeserialize( response.getRenderedContent() ).data;
+							expect( comparison.baseline.runId ).toBe( baselineId );
+							expect( comparison.counts.new ).toBe( 1 );
+							expect( comparison.counts.reopened ).toBe( 1 );
+							expect( comparison.counts.resolved ).toBe( 1 );
+							expect( comparison.counts.severityRaised ).toBe( 1 );
+							expect( comparison.execution ).toHaveKey( "delta" );
+							expect( comparison.execution.delta ).toHaveKey( "specialistCoverage" );
+							expect( comparison.movements.map( ( item ) => item.type ) ).toInclude( "reopened" );
+						} finally {
+							cleanupRuns( [ oldestId, baselineId, currentId] );
+						}
+					}
+				);
+
+				it(
+					"returns a quiet comparison when no compatible baseline exists",
+					() => {
+						var marker = lCase( createUUID() );
+						var runId = "history-no-baseline-#marker#";
+						try {
+							seedRun(
+								runId,
+								"C:/history-none/#marker#",
+								"working-tree",
+								"succeeded",
+								dateTimeFormat( now(), "iso" ),
+								[ finding( "fp-only", "medium" )]
+							);
+							var comparison = jsonDeserialize( this.get( "/api/v1/history/#runId#/comparison" ).getRenderedContent() ).data;
+							expect( isNull( comparison.baseline ) ).toBeTrue();
+							expect( comparison.movements ).toBeEmpty();
+						} finally {
+							cleanupRuns( [ runId] );
+						}
+					}
+				);
+			}
+		);
+	}
+
+	private struct function finding( required string fingerprint, required string severity ) {
+		return {
+			id         : lCase( createUUID() ),
+			fingerprint: arguments.fingerprint,
+			category   : "correctness",
+			ruleId     : "history/#arguments.fingerprint#",
+			severity   : arguments.severity,
+			confidence : .9,
+			title      : arguments.fingerprint,
+			message    : arguments.fingerprint,
+			filePath   : "app/#arguments.fingerprint#.bx",
+			startLine  : 1,
+			endLine    : 1,
+			evidence   : "evidence",
+			suggestion : "fix it",
+			source     : "deterministic"
+		};
+	}
+
+	private void function seedRun(
+		required string runId,
+		required string projectPath,
+		required string mode,
+		required string status,
+		required string createdAt,
+		required array findings
+	) {
+		getInstance( "ReviewRunRepository" ).create(
+				{
+					id          : arguments.runId,
+					projectPath : arguments.projectPath,
+					mode        : arguments.mode,
+					baseRevision: "",
+					headRevision: "",
+					status      : arguments.status,
+					progress    : 100,
+					currentPhase: "completed",
+					message     : "History fixture",
+					createdAt   : arguments.createdAt,
+					updatedAt   : arguments.createdAt
+				}
+			);
+		var resultRepository = getInstance( "ReviewResultRepository" );
+		resultRepository.replaceFindings( arguments.runId, arguments.findings );
+		resultRepository.saveSummary(
+				runId              = arguments.runId,
+				summary            = "History fixture",
+				languages          = [ "BoxLang"],
+				filesScanned       = arguments.findings.len(),
+				bytesScanned       = 100,
+				findingsCount      = arguments.findings.len(),
+				aiEnabled          = false,
+				reviewScope        = arguments.mode,
+				repositoryRevision = "fixture"
+			);
+	}
+
+	private void function cleanupRuns( required array runIds ) {
+		for ( var runId in arguments.runIds ) {
+			queryExecute(
+				"DELETE FROM review_runs WHERE id = :runId",
+				{ runId: runId }
+			);
+		}
+	}
+}

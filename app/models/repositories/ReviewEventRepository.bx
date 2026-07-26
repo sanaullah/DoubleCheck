@@ -1,0 +1,70 @@
+/**
+ * SQLite persistence for run event log rows used by SSE replay.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	struct function append( required string runId, required string eventType, required struct payload ) {
+		var createdAt = timestamp();
+		var result = queryExecute(
+			"
+				INSERT INTO review_events ( run_id, event_type, payload, created_at )
+				VALUES ( :runId, :eventType, :payload, :createdAt )
+				RETURNING sequence
+			",
+			{
+				runId    : arguments.runId,
+				eventType: arguments.eventType,
+				payload  : jsonSerialize( arguments.payload ),
+				createdAt: createdAt
+			},
+			{ datasource: datasource }
+		);
+		return {
+			sequence : result.sequence[ 1 ],
+			runId    : arguments.runId,
+			eventType: arguments.eventType,
+			payload  : arguments.payload,
+			createdAt: createdAt
+		};
+	}
+
+	array function after( required string runId, numeric afterSequence = 0, numeric limit = 100 ) {
+		// Always read forward from afterSequence. Callers that need a tail window
+		// should pass a high afterSequence or raise limit (event-log uses up to 500).
+		var records = queryExecute(
+			"
+				SELECT sequence, run_id, event_type, payload, created_at
+				FROM review_events
+				WHERE run_id = :runId AND sequence > :afterSequence
+				ORDER BY sequence
+				LIMIT :limit
+			",
+			{
+				runId        : arguments.runId,
+				afterSequence: { value: arguments.afterSequence, sqltype: "INTEGER" },
+				limit        : { value: arguments.limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var events = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			events.append(
+					{
+						sequence : records.sequence[ row ],
+						runId    : records.run_id[ row ],
+						eventType: records.event_type[ row ],
+						payload  : jsonDeserialize( records.payload[ row ] ),
+						createdAt: records.created_at[ row ]
+					}
+				);
+		}
+		return events;
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

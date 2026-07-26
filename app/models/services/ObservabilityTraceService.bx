@@ -1,0 +1,315 @@
+/**
+ * Projects the complete persisted review event stream into local,
+ * Langfuse-inspired trace artifacts.
+ */
+
+@singleton
+class {
+	property name="eventService" inject="ReviewEventService";
+
+	/**
+	 * Build a Langfuse-style trace export from the complete run lifecycle.
+	 */
+	struct function exportTraces( required string runId, numeric limit = 500 ) {
+		var records = eventService.after(
+				arguments.runId,
+				0,
+				min( 1000, max( 1, int( arguments.limit ) ) )
+			);
+		var observations = [];
+		var summary = {
+			observationCount: 0,
+			generations     : 0,
+			tools           : 0,
+			spans           : 0,
+			phases          : 0,
+			events          : 0,
+			fallbacks       : 0,
+			retries         : 0,
+			roles           : [],
+			totalDurationMs : 0,
+			totalTokens     : 0,
+			promptTokens    : 0,
+			completionTokens: 0
+		};
+		var roleSet = {};
+
+		for ( var item in records ) {
+			var detail = {};
+			if (
+				isStruct( item.payload ?: "" ) && isStruct( item.payload.data ?: "" ) &&
+					isStruct(
+						item
+								.payload
+								.data
+								.detail ?:
+							""
+					)
+			) {
+				detail = item
+					.payload
+					.data
+					.detail;
+			}
+			var role = toString( detail.role ?: "" );
+			if ( len( role ) ) {
+				roleSet[ role ] = true;
+			}
+			var row = ( item.eventType ?: "" ) == "review.specialist.observe"
+				? observeRow(
+					item,
+					detail,
+					role
+				)
+				: lifecycleRow(
+					item,
+					detail,
+					role
+				);
+			if ( !row.count() ) {
+				continue;
+			}
+			if ( !len( row.input ) && !len( row.output ) && len( row.preview ) ) {
+				if ( listFindNoCase( "response,fallback", row.kind ) ) {
+					row.output = row.preview;
+				} else {
+					row.input = row.preview;
+				}
+			}
+			observations.append( row );
+			summary.observationCount++;
+			switch ( row.observationType ) {
+				case "generation":
+					summary.generations++;
+					break;
+				case "tool":
+					summary.tools++;
+					break;
+				case "span":
+					summary.spans++;
+					break;
+				case "phase":
+					summary.phases++;
+					break;
+				default:
+					summary.events++;
+			}
+			if ( row.kind == "fallback" ) {
+				summary.fallbacks++;
+			}
+			if ( row.kind == "retry" ) {
+				summary.retries++;
+			}
+			summary.totalDurationMs += int( val( row.durationMs ?: 0 ) );
+			summary.promptTokens += int( val( row.usage.promptTokens ?: 0 ) );
+			summary.completionTokens += int( val( row.usage.completionTokens ?: 0 ) );
+			summary.totalTokens += int( val( row.usage.totalTokens ?: 0 ) );
+		}
+
+		summary.roles = roleSet.keyArray().sort( "textnocase" );
+		return {
+			version     : "doublecheck-traces-v1",
+			style       : "langfuse-inspired",
+			scope       : "full-run",
+			runId       : arguments.runId,
+			exportedAt  : dateTimeFormat( now(), "iso" ),
+			summary     : summary,
+			observations: observations
+		};
+	}
+
+	private struct function observeRow( required struct item, required struct detail, required string role ) {
+		var observe = isStruct( arguments.detail.observe ?: "" ) ? arguments.detail.observe : {};
+		if ( !len( observe.kind ?: "" ) ) {
+			return {};
+		}
+		var meta = isStruct( observe.meta ?: "" ) ? observe.meta : {};
+		var kind = observe.kind ?: "";
+		var retryReason = lCase( toString( meta.reason ?: "" ) );
+		var retryTitle = lCase( toString( observe.title ?: "" ) );
+		if (
+			kind == "fallback" &&
+				(
+					listFindNoCase(
+							"invalid-json,empty-content,tool-call-markup",
+							retryReason
+						) ||
+						find( "retry", retryTitle )
+				)
+		) {
+			kind = "retry";
+		}
+		var durationMs = isNumeric( observe.durationMs ?: "" )
+			? int( val( observe.durationMs ) )
+			: ( isNumeric( meta.durationMs ?: "" ) ? int( val( meta.durationMs ) ) : 0 );
+		return {
+			sequence : arguments.item.sequence,
+			timestamp: arguments
+						.item
+						.payload
+						.timestamp ?:
+					arguments.item.createdAt ?:
+				"",
+			eventType      : arguments.item.eventType ?: "",
+			role           : arguments.role,
+			taskId         : arguments.detail.taskId ?: "",
+			stage          : arguments.detail.stage ?: "",
+			kind           : kind,
+			observationType: observe.observationType ?: observationTypeFor( kind ),
+			name           : observe.title ?: observe.kind ?: "observation",
+			input          : observe.input ?: "",
+			output         : observe.output ?: "",
+			preview        : observe.preview ?: "",
+			model          : observe.model ?: ( meta.model ?: "" ),
+			modelParameters: isStruct( observe.modelParameters ?: "" ) ? observe.modelParameters : {},
+			metadata       : meta,
+			usage          : isStruct( observe.usage ?: "" ) ? observe.usage : {},
+			durationMs     : durationMs,
+			truncated      : structKeyExists( observe, "truncated" ) && !!observe.truncated,
+			characters     : structKeyExists( observe, "characters" ) ? ( observe.characters ?: 0 ) : 0
+		};
+	}
+
+	private struct function lifecycleRow( required struct item, required struct detail, required string role ) {
+		var eventType = arguments.item.eventType ?: "";
+		if ( !len( eventType ) ) {
+			return {};
+		}
+		var data = isStruct(
+				arguments
+						.item
+						.payload
+						.data ?:
+					""
+			)
+			? arguments
+				.item
+				.payload
+				.data
+			: {};
+		var run = isStruct( data.run ?: "" ) ? data.run : {};
+		var message = toString( arguments.detail.message ?: run.message ?: eventType );
+		var metadata = {
+			eventType: eventType,
+			status   : arguments.detail.status ?: run.status ?: "",
+			phase    : run.currentPhase ?: "",
+			progress : run.progress ?: "",
+			mode     : run.mode ?: ""
+		};
+		for ( var key in [
+			"filesScanned",
+			"bytesScanned",
+			"languages",
+			"scope",
+			"symbolCount",
+			"dependencyCount",
+			"impactCount",
+			"taskCount",
+			"taskLimit",
+			"roles",
+			"selectedRoles",
+			"source",
+			"count",
+			"completedTasks",
+			"failedTasks",
+			"findingCount",
+			"attempt",
+			"charactersSeen"
+		] ) {
+			if ( structKeyExists( arguments.detail, key ) ) {
+				metadata[ key ] = arguments.detail[ key ];
+			}
+		}
+		var kind = eventType == "run.error" ? "fallback" : ( findNoCase( "review.specialist", eventType ) ? "agent" : "phase" );
+		var observationType = eventType == "review.specialists"
+			? "span"
+			: (
+				listFindNoCase(
+						"review.specialist.progress,run.error,run.cancelled",
+						eventType
+					)
+					? "event"
+					: "phase"
+			);
+		return {
+			sequence : arguments.item.sequence,
+			timestamp: arguments
+						.item
+						.payload
+						.timestamp ?:
+					arguments.item.createdAt ?:
+				"",
+			eventType      : eventType,
+			role           : arguments.role,
+			taskId         : arguments.detail.taskId ?: "",
+			stage          : arguments.detail.stage ?: run.currentPhase ?: "",
+			kind           : kind,
+			observationType: observationType,
+			name           : lifecycleName(
+				eventType,
+				arguments.detail,
+				run
+			),
+			input          : "",
+			output         : message,
+			preview        : message,
+			model          : "",
+			modelParameters: {},
+			metadata       : metadata,
+			usage          : {},
+			durationMs     : 0,
+			truncated      : false,
+			characters     : len( message )
+		};
+	}
+
+	private string function lifecycleName( required string eventType, required struct detail, required struct run ) {
+		switch ( arguments.eventType ) {
+			case "run.status":
+				return "Run accepted";
+			case "phase.started":
+
+			case "task.progress":
+				return arguments.run.message ?: arguments.run.currentPhase ?: "Run progress";
+			case "review.indexed":
+				return "Files indexed";
+			case "review.graph":
+				return "Architecture graph built";
+			case "review.plan":
+				return "Review plan ready";
+			case "review.findings":
+				return "Findings retained";
+			case "review.specialist.progress":
+				return arguments.detail.message ?: arguments.detail.stage ?: "Specialist progress";
+			case "review.specialists":
+				return "Specialists finished";
+			case "review.completed":
+
+			case "run.completed":
+				return "Review completed";
+			case "run.cancelled":
+				return "Review cancelled";
+			case "run.error":
+				return "Review failed";
+			default:
+				return arguments.eventType;
+		}
+	}
+
+	private string function observationTypeFor( required string kind ) {
+		switch ( arguments.kind ) {
+			case "llm":
+				return "generation";
+			case "tool":
+				return "tool";
+			case "prompt":
+
+			case "response":
+
+			case "agent":
+				return "span";
+			default:
+				return "event";
+		}
+	}
+}

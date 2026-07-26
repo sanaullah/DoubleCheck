@@ -1,0 +1,99 @@
+/**
+ * HTML workspace: serves the review UI and ensures schema is ready on load.
+ *
+ * @see SchemaService
+ */
+class extends="coldbox.system.EventHandler" {
+	property name="schemaService" inject="SchemaService";
+
+	property name="reviewRunService" inject="ReviewRunService";
+
+	property name="defaultProjectPath" inject="coldbox:setting:defaultProjectPath";
+
+	property name="workerRegistryService" inject="WorkerRegistryService";
+
+	property name="workerEnabled" inject="coldbox:setting:workerEnabled";
+
+	property name="qualityGateService" inject="QualityGateService";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	/**
+	 * Default Action
+	 */
+	function index( event, rc, prc ) {
+		prc.defaultProjectPath = defaultProjectPath;
+		event.setView( "main/index" );
+	}
+
+	/**
+	 * --------------------------------------------------------------------------
+	 * Implicit Actions
+	 * --------------------------------------------------------------------------
+	 * Wired in config/ColdBox.bx (applicationStartHandler, requestStartHandler,
+	 * exceptionHandler).
+	 */
+
+	function onAppInit( event, rc, prc ) {
+		schemaService.ensureSchema();
+		qualityGateService.runSeededGate();
+		if ( workerEnabled ) {
+			workerRegistryService.heartbeat( "starting", { review: true, sqliteQueue: true } );
+		}
+		reviewRunService.recoverPendingRuns();
+	}
+
+	function onRequestStart( event, rc, prc ) {
+
+	}
+
+	function onException( event, rc, prc ) {
+		var exception = prc.exception;
+		var exceptionType = exception.type ?: "";
+		if ( !len( exceptionType ) ) {
+			try {
+				exceptionType = exception.getType();
+			} catch (any ignored) {
+				exceptionType = "";
+			}
+		}
+		var statusCode = 500;
+		var code = "internal_error";
+		var message = "The request could not be completed";
+		var errorReference = lCase( createUUID() );
+		if ( exceptionType == "ValidationException" ) {
+			statusCode = 422;
+			code = "validation_failed";
+			message = exception.message;
+		}
+		var logContext = {
+			reference : errorReference,
+			type      : exceptionType,
+			event     : event.getCurrentEvent(),
+			message   : secretRedactionService.redactText( toString( exception.message ?: "" ) ),
+			stackTrace: secretRedactionService.redactText( toString( exception.stackTrace ?: "" ) )
+		};
+		if ( statusCode >= 500 ) {
+			log.error(
+					"Unhandled request exception [#errorReference#]",
+					logContext
+				);
+		} else {
+			log.warn(
+					"Handled request exception [#errorReference#]",
+					logContext
+				);
+		}
+		var errorData = { code: code, message: message };
+		if ( statusCode >= 500 ) {
+			errorData.reference = errorReference;
+		}
+		event.renderData(
+				type       = "json",
+				statusCode = statusCode,
+				data       = { error: errorData }
+			);
+	}
+}

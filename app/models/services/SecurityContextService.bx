@@ -1,0 +1,95 @@
+/**
+ * Local identity, path checks, and a single in-memory default project.
+ *
+ * Local-first: no tenants DB, API-key auth, or multi-project SaaS.
+ */
+
+@singleton
+class {
+	property name="defaultProjectPath" inject="coldbox:setting:defaultProjectPath";
+	variables.localTenantId = "default";
+	variables.localTenantName = "Local";
+	variables.localPrincipalId = "local-developer";
+	variables.localProjectId = "default";
+	variables.localProjectName = "Local project";
+
+	struct function authenticate( required event ) {
+		return developmentContext();
+	}
+
+	void function authorize( required struct context, required string permission, string projectId = "" ) {
+		// Local developer is always admin; permission strings are kept for call-site clarity.
+		if ( len( arguments.projectId ) ) {
+			projectFor( arguments.context, arguments.projectId );
+		}
+	}
+
+	struct function projectFor( required struct context, string projectId = "" ) {
+		var selectedId = len( arguments.projectId ) ? arguments.projectId : variables.localProjectId;
+		var project = localProject();
+		if ( selectedId != project.id && selectedId != "default" ) {
+			// Accept unknown ids as the local project so old UI state still works.
+			project.id = selectedId;
+		}
+		return project;
+	}
+
+	string function authorizeProjectPath( required struct context, string projectId = "", required string candidatePath ) {
+		if ( !len( trim( arguments.candidatePath ) ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "projectPath is required"
+			);
+		}
+		projectFor( arguments.context, arguments.projectId );
+		return canonicalPath( arguments.candidatePath );
+	}
+
+	array function projectsFor( required struct context ) {
+		return [ localProject()];
+	}
+
+	struct function defaultContext() {
+		return developmentContext();
+	}
+
+	private struct function localProject() {
+		var rootPath = "";
+		try {
+			if ( len( trim( defaultProjectPath ) ) ) {
+				rootPath = canonicalPath( defaultProjectPath );
+			}
+		} catch (any ignore) {
+			rootPath = trim( defaultProjectPath );
+		}
+		return {
+			id      : variables.localProjectId,
+			tenantId: variables.localTenantId,
+			name    : variables.localProjectName,
+			rootPath: rootPath,
+			status  : "active"
+		};
+	}
+
+	private struct function developmentContext() {
+		return {
+			principalId: variables.localPrincipalId,
+			tenantId   : variables.localTenantId,
+			tenantName : variables.localTenantName,
+			name       : "Local developer",
+			role       : "admin",
+			authMethod : "local"
+		};
+	}
+
+	private string function canonicalPath( required string candidatePath ) {
+		var candidate = createObject( "java", "java.io.File" ).init( arguments.candidatePath ).getCanonicalFile();
+		if ( !candidate.exists() || !candidate.isDirectory() ) {
+			throw(
+				type    = "ValidationException",
+				message = "Project path must be an existing directory"
+			);
+		}
+		return candidate.getCanonicalPath();
+	}
+}

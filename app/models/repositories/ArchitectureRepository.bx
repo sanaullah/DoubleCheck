@@ -1,0 +1,285 @@
+/**
+ * SQLite persistence for architecture models, plans, diffs, and reusable caches.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	void function save(
+		required string runId,
+		required struct architecture,
+		required struct plan,
+		struct architectureDiff = {},
+		string cacheKey         = "",
+		boolean reused          = false
+	) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"
+					INSERT INTO review_architecture_models (
+						run_id, model_version, repository_revision,
+						fingerprint, model_json, cache_key, reused,
+						baseline_fingerprint, diff_json, created_at
+					) VALUES (
+						:runId, :modelVersion, :repositoryRevision,
+						:fingerprint, :modelJson, :cacheKey, :reused,
+						:baselineFingerprint, :diffJson, :createdAt
+					)
+					ON CONFLICT ( run_id ) DO UPDATE SET
+						model_version = excluded.model_version,
+						repository_revision = excluded.repository_revision,
+						fingerprint = excluded.fingerprint,
+						model_json = excluded.model_json,
+						cache_key = excluded.cache_key,
+						reused = excluded.reused,
+						baseline_fingerprint = excluded.baseline_fingerprint,
+						diff_json = excluded.diff_json,
+						created_at = excluded.created_at
+				",
+				{
+					runId              : arguments.runId,
+					modelVersion       : arguments.architecture.version,
+					repositoryRevision : arguments.architecture.repositoryRevision,
+					fingerprint        : arguments.architecture.fingerprint,
+					modelJson          : jsonSerialize( arguments.architecture ),
+					cacheKey           : arguments.cacheKey,
+					reused             : arguments.reused ? 1 : 0,
+					baselineFingerprint: arguments.architectureDiff.baselineFingerprint ?: "",
+					diffJson           : jsonSerialize(
+						arguments.architectureDiff.count() ? arguments.architectureDiff : emptyDiff()
+					),
+					createdAt: timestamp()
+				},
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO review_plans (
+						run_id, plan_version, model_fingerprint,
+						policy_fingerprint, budget_fingerprint,
+						fingerprint, task_count, plan_json, created_at
+					) VALUES (
+						:runId, :planVersion, :modelFingerprint,
+						:policyFingerprint, :budgetFingerprint,
+						:fingerprint, :taskCount, :planJson, :createdAt
+					)
+					ON CONFLICT ( run_id ) DO UPDATE SET
+						plan_version = excluded.plan_version,
+						model_fingerprint = excluded.model_fingerprint,
+						policy_fingerprint = excluded.policy_fingerprint,
+						budget_fingerprint = excluded.budget_fingerprint,
+						fingerprint = excluded.fingerprint,
+						task_count = excluded.task_count,
+						plan_json = excluded.plan_json,
+						created_at = excluded.created_at
+				",
+				{
+					runId            : arguments.runId,
+					planVersion      : arguments.plan.version,
+					modelFingerprint : arguments.plan.modelFingerprint,
+					policyFingerprint: arguments.plan.policyFingerprint ?: "",
+					budgetFingerprint: arguments.plan.budgetFingerprint ?: "",
+					fingerprint      : arguments.plan.fingerprint,
+					taskCount        : arguments
+						.plan
+						.tasks
+						.len(),
+					planJson         : jsonSerialize( arguments.plan ),
+					createdAt        : timestamp()
+				},
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	struct function get( required string runId ) {
+		var modelRecord = queryExecute(
+			"
+				SELECT model_json, diff_json, reused, cache_key
+				FROM review_architecture_models
+				WHERE run_id = :runId
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var planRecord = queryExecute(
+			"
+				SELECT plan_json
+				FROM review_plans
+				WHERE run_id = :runId
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		return {
+			architecture: modelRecord.recordCount ? jsonDeserialize( modelRecord.model_json[ 1 ] ) : emptyArchitecture(),
+			architectureDiff    : modelRecord.recordCount ? jsonDeserialize( modelRecord.diff_json[ 1 ] ) : emptyDiff(),
+			architectureReused  : modelRecord.recordCount ? modelRecord.reused[ 1 ] == 1 : false,
+			architectureCacheKey: modelRecord.recordCount ? modelRecord.cache_key[ 1 ] : "",
+			plan                : planRecord.recordCount ? jsonDeserialize( planRecord.plan_json[ 1 ] ) : emptyPlan()
+		};
+	}
+
+	any function findReusable(
+		required string projectPath,
+		required string repositoryRevision,
+		required string cacheKey
+	) {
+		if ( !len( trim( arguments.repositoryRevision ) ) || !len( trim( arguments.cacheKey ) ) ) {
+			return javacast( "null", "" );
+		}
+		var record = queryExecute(
+			"
+				SELECT model_json
+				FROM architecture_model_cache
+				WHERE project_path = :projectPath
+					AND repository_revision = :repositoryRevision
+					AND cache_key = :cacheKey
+				LIMIT 1
+			",
+			{
+				projectPath       : arguments.projectPath,
+				repositoryRevision: arguments.repositoryRevision,
+				cacheKey          : arguments.cacheKey
+			},
+			{ datasource: datasource }
+		);
+		return record.recordCount ? jsonDeserialize( record.model_json[ 1 ] ) : javacast( "null", "" );
+	}
+
+	void function saveReusable(
+		required string projectPath,
+		required string repositoryRevision,
+		required string cacheKey,
+		required string inputFingerprint,
+		required struct architecture
+	) {
+		if ( !len( trim( arguments.repositoryRevision ) ) || !len( trim( arguments.cacheKey ) ) ) {
+			return;
+		}
+		queryExecute(
+			"
+				INSERT INTO architecture_model_cache (
+					cache_key, project_path, repository_revision,
+					model_version, input_fingerprint, model_json, created_at
+				) VALUES (
+					:cacheKey, :projectPath, :repositoryRevision,
+					:modelVersion, :inputFingerprint, :modelJson, :createdAt
+				)
+				ON CONFLICT ( cache_key ) DO NOTHING
+			",
+			{
+				cacheKey          : arguments.cacheKey,
+				projectPath       : arguments.projectPath,
+				repositoryRevision: arguments.repositoryRevision,
+				modelVersion      : arguments.architecture.version,
+				inputFingerprint  : arguments.inputFingerprint,
+				modelJson         : jsonSerialize( arguments.architecture ),
+				createdAt         : timestamp()
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	any function findBaseline( required string runId ) {
+		var record = queryExecute(
+			"
+				SELECT model.model_json
+				FROM review_runs current_run
+				INNER JOIN review_runs prior_run
+					ON prior_run.project_path = current_run.project_path
+				INNER JOIN review_architecture_models model
+					ON model.run_id = prior_run.id
+				WHERE current_run.id = :runId
+					AND prior_run.id <> current_run.id
+					AND prior_run.status IN ( 'succeeded', 'partial' )
+				ORDER BY COALESCE(
+					prior_run.completed_at,
+					prior_run.updated_at,
+					prior_run.created_at
+				) DESC
+				LIMIT 1
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		return record.recordCount ? jsonDeserialize( record.model_json[ 1 ] ) : javacast( "null", "" );
+	}
+
+	private struct function emptyArchitecture() {
+		return {
+			version           : "",
+			fingerprint       : "",
+			repositoryRevision: "",
+			facts             : [],
+			components        : [],
+			summary           : {
+				componentCount : 0,
+				factCount      : 0,
+				fileFacts      : 0,
+				symbolFacts    : 0,
+				dependencyFacts: 0,
+				inferredFacts  : 0,
+				truncated      : false
+			},
+			enrichment: {
+				enabled   : false,
+				used      : false,
+				version   : "",
+				provider  : "",
+				model     : "",
+				addedFacts: 0,
+				error     : ""
+			}
+		};
+	}
+
+	private struct function emptyDiff() {
+		return {
+			version            : "",
+			baselineFingerprint: "",
+			currentFingerprint : "",
+			added              : [],
+			removed            : [],
+			unchanged          : [],
+			summary            : {
+				addedCount    : 0,
+				removedCount  : 0,
+				unchangedCount: 0,
+				hasBaseline   : false
+			}
+		};
+	}
+
+	private struct function emptyPlan() {
+		return {
+			version           : "",
+			fingerprint       : "",
+			modelFingerprint  : "",
+			policyFingerprint : "",
+			budgetFingerprint : "",
+			contextFingerprint: "",
+			tasks             : [],
+			summary           : {
+				taskCount         : 0,
+				selectedRoles     : [],
+				changedSymbolCount: 0,
+				contextFileCount  : 0,
+				contextCharacters : 0,
+				contextRangeCount : 0,
+				contextLineCount  : 0,
+				contextVersion    : "",
+				contextTruncated  : false,
+				taskLimit         : 0,
+				tokenBudget       : 0,
+				allocatedTokens   : 0,
+				remainingTokens   : 0
+			}
+		};
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

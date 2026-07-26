@@ -1,0 +1,822 @@
+/**
+ * Runs planned specialist tasks in parallel bounds, validates evidence ranges, aggregates findings.
+ *
+ * @see SpecialistAgentFactory
+ * @see SpecialistAgentGateway
+ * @see ControlledRepositoryToolService
+ */
+
+@singleton
+class {
+	property name="gateway" inject="SpecialistAgentGateway";
+
+	property name="factory" inject="SpecialistAgentFactory";
+
+	property name="toolService" inject="ControlledRepositoryToolService";
+
+	property name="contextPackRenderer" inject="ContextPackRenderer";
+
+	property name="findingService" inject="FindingService";
+
+	property name="maxFindings" inject="coldbox:setting:specialistMaxFindingsPerTask";
+
+	property name="maxSummaryCharacters" inject="coldbox:setting:specialistMaxSummaryCharacters";
+
+	property name="executorThreads" inject="coldbox:setting:specialistExecutorThreads";
+
+	property name="inputUsdPerMillion" inject="coldbox:setting:specialistInputUsdPerMillion";
+
+	property name="outputUsdPerMillion" inject="coldbox:setting:specialistOutputUsdPerMillion";
+
+	property name="observabilityEnabled" inject="coldbox:setting:observabilityEnabled";
+
+	property name="observabilityPreviewCharacters" inject="coldbox:setting:observabilityPreviewCharacters";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.activeRuns = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+
+	boolean function isEnabled() {
+		return gateway.isEnabled();
+	}
+
+	struct function review(
+		required struct plan,
+		required array files,
+		required struct graph,
+		struct options = {}
+	) {
+		if (
+			!isEnabled() ||
+				!arguments
+					.plan
+					.tasks
+					.len()
+		) {
+			return emptyResult();
+		}
+		var executionItems = [];
+		var executorName = ensureExecutor();
+		for ( var task in arguments.plan.tasks ) {
+			if ( isCancelled( arguments.options ) ) {
+				cancelAll( executionItems );
+				throw( type = "RunCancelled", message = "Run was cancelled" );
+			}
+			executionItems.append(
+					launchTask(
+						task,
+						arguments.files,
+						arguments.graph,
+						arguments.options,
+						executorName
+					)
+				);
+		}
+		var runKey = trim( arguments.options.runId ?: "" );
+		if ( len( runKey ) ) {
+			variables.activeRuns.put( runKey, executionItems );
+		}
+
+		try {
+			var agentResults = [];
+			var findings = [];
+			var charactersSent = 0;
+			for ( var item in executionItems ) {
+				if ( isCancelled( arguments.options ) ) {
+					cancelAll( executionItems );
+					throw( type = "RunCancelled", message = "Run was cancelled" );
+				}
+				var taskResult = awaitTask( item, arguments.options );
+				var resultData = taskResult.result.getMemento();
+				agentResults.append( resultData );
+				findings.append( resultData.findings, true );
+				charactersSent += taskResult.charactersSent;
+				checkpoint( arguments.options, resultData );
+				progress(
+					arguments.options,
+					item.task,
+					{
+						stage  : "task-completed",
+						status : resultData.status,
+						message: resultData.status == "succeeded"
+							? ( len( resultData.summary ) ? left( resultData.summary, 160 ) : "Completed with no findings" )
+							: ( len( resultData.error ) ? resultData.error : resultData.status )
+					},
+					true
+				);
+			}
+			var failedCount = agentResults.filter( ( item ) => item.status != "succeeded" ).len();
+			return {
+				enabled       : true,
+				results       : agentResults,
+				findings      : findingService.deduplicate( findings ),
+				summary       : summaries( agentResults ),
+				error         : failedCount ? "One or more specialist reviews were unavailable" : "",
+				filesReviewed : uniqueContextFiles( arguments.plan.tasks ),
+				charactersSent: charactersSent,
+				completedTasks: agentResults.len() - failedCount,
+				failedTasks   : failedCount
+			};
+		} finally {
+			if ( len( runKey ) ) {
+				variables.activeRuns.remove( runKey );
+			}
+		}
+	}
+
+	void function cancelRun( required string runId ) {
+		if ( variables.activeRuns.containsKey( arguments.runId ) ) {
+			var items = variables.activeRuns.remove( arguments.runId );
+			cancelAll( items );
+		}
+	}
+
+	struct function executeTask(
+		required struct task,
+		required array files,
+		required struct graph,
+		struct control = {},
+		struct options = {}
+	) {
+		var startedAt = getTickCount();
+		assertNotCancelled( arguments.control, arguments.options );
+		var toolSession = toolService.createSession(
+				arguments.task,
+				arguments.files,
+				arguments.graph,
+				arguments.control
+			);
+		var definition = factory.definition( arguments.task );
+		if ( isStruct( arguments.options.provenance ?: "" ) ) {
+			for ( var provenanceKey in arguments.options.provenance ) {
+				definition.provenance[ provenanceKey ] = arguments.options.provenance[ provenanceKey ];
+			}
+		}
+		var input = factory.input( arguments.task );
+		var promptCharacters = len( definition.instructions ) + len( definition.description ) + len( input );
+		try {
+			var packBudget = min(
+				gateway.contextPackCharacterBudget( len( input ) + 2000, definition.maxTokens ),
+				numericSetting(
+					arguments
+							.task
+							.budget
+							.maxCharacters ?:
+						14000,
+					14000
+				)
+			);
+			var contextPack = contextPackRenderer.render(
+					arguments.task,
+					arguments.files,
+					packBudget,
+					arguments.control
+				);
+			toolService.recordContextPack( toolSession, contextPack );
+			promptCharacters += contextPack.characters;
+			var estimatedCost = estimateMaximumCost( definition.instructions & char( 10 ) & definition.description & char( 10 ) & input & char( 10 ) & contextPack.text,
+				definition.maxTokens );
+			definition.provenance.estimatedMaximumCostUsd = estimatedCost;
+			definition.provenance.tokenLimit = definition.maxTokens;
+			definition.provenance.iterationLimit = definition.maxIterations;
+			definition.provenance.contextPack = {
+				version        : contextPack.version,
+				fingerprint    : contextPack.fingerprint,
+				characters     : contextPack.characters,
+				estimatedTokens: contextPack.estimatedTokens,
+				includedRanges : contextPack.includedRanges.len(),
+				omittedRanges  : contextPack.omittedRanges.len(),
+				redactionCount : contextPack.redactionCount,
+				truncated      : contextPack.truncated
+			};
+			if (
+				estimatedCost >
+					numericDecimal(
+						arguments
+								.task
+								.budget
+								.maxCostUsd ?:
+							estimatedCost,
+						estimatedCost
+					)
+			) {
+				return failedTask(
+					arguments.task,
+					definition,
+					toolSession,
+					"budget_exceeded",
+					"Specialist cost budget exceeded",
+					promptCharacters,
+					startedAt
+				);
+			}
+			var currentTask = arguments.task;
+			var currentOptions = arguments.options;
+			var response = gateway.run(
+					definition,
+					toolService.buildAITools( toolSession ),
+					input,
+					arguments.control,
+					( detail ) => progress(
+						currentOptions,
+						currentTask,
+						detail
+					),
+					contextPack.text
+				);
+			assertNotCancelled( arguments.control, arguments.options );
+			var validResponse = validateResponse( response, arguments.task );
+			if ( isTrue( observabilityEnabled ) ) {
+				var acceptedPreview = previewText(
+					{
+						summary : validResponse.summary ?: "",
+						findings: validResponse.findings ?: []
+					}
+				);
+				var contextPackCharacters = 0;
+				if (
+					isStruct( definition.provenance.contextPack ?: "" ) &&
+						isNumeric(
+							definition
+									.provenance
+									.contextPack
+									.characters ?:
+								""
+						)
+				) {
+					contextPackCharacters = int(
+						val( definition
+								.provenance
+								.contextPack
+								.characters )
+					);
+				}
+				progress(
+					currentOptions,
+					currentTask,
+					{
+						stage  : "response-accepted",
+						status : "running",
+						message: "Accepted structured specialist response",
+						observe: {
+							kind           : "response",
+							observationType: "span",
+							title          : "Normalized specialist JSON",
+							preview        : acceptedPreview,
+							input          : "",
+							output         : acceptedPreview,
+							truncated      : findNoCase( "[truncated]", acceptedPreview ) > 0,
+							// Prompt size prepared for the specialist call (not preview length).
+							characters     : promptCharacters,
+							model          : definition.provenance.model ?: "",
+							modelParameters: {
+								provider: response._execution?.provider ?: "",
+								attempts: response._execution?.attempts ?: 1,
+								model   : definition.provenance.model ?: ""
+							},
+							meta: {
+								findingCount         : ( validResponse.findings ?: [] ).len(),
+								attempts             : response._execution?.attempts ?: 1,
+								provider             : response._execution?.provider ?: "",
+								budgetCeilingUsd     : definition.provenance.estimatedMaximumCostUsd ?: 0,
+								promptCharacters     : promptCharacters,
+								previewCharacters    : len( acceptedPreview ),
+								contextPackCharacters: contextPackCharacters,
+								contextPackTruncated : isStruct( definition.provenance.contextPack ?: "" ) &&
+									isTrue(
+										definition
+												.provenance
+												.contextPack
+												.truncated ?:
+											false
+									),
+								contextPackRanges: isStruct( definition.provenance.contextPack ?: "" )
+									? int(
+										val(
+											definition
+													.provenance
+													.contextPack
+													.includedRanges ?:
+												0
+										)
+									)
+									: 0,
+								thinContext: contextPackCharacters > 0 && contextPackCharacters < 1500,
+								io         : "output"
+							}
+						}
+					},
+					true
+				);
+			}
+			var normalized = findingService.normalizeAI( validResponse, arguments.files );
+			var provenance = duplicate( definition.provenance );
+			provenance.attempts = response._execution?.attempts ?: 1;
+			for ( var finding in normalized ) {
+				finding.source = "specialist/#arguments.task.role#";
+				finding.provenance = duplicate( provenance );
+				finding.provenance.taskId = arguments.task.id;
+			}
+			var result = new app.models.domain.AgentResult(
+				{
+					version: "agent-result-v1",
+					taskId : arguments.task.id,
+					role   : arguments.task.role,
+					status : "succeeded",
+					summary: left(
+						trim( validResponse.summary ?: "" ),
+						numericSetting( maxSummaryCharacters, 2000 )
+					),
+					findings  : normalized,
+					toolAudit : toolService.audit( toolSession ),
+					provenance: provenance,
+					error     : "",
+					durationMs: getTickCount() - startedAt
+				}
+			);
+			return {
+				result        : result,
+				charactersSent: promptCharacters
+			};
+		} catch ("RunCancelled" cancelled) {
+			toolService.cancel( toolSession );
+			rethrow;
+		} catch (any error) {
+			logSpecialistError(
+				"Specialist task failed",
+				error,
+				{
+					taskId: arguments.task.id,
+					role  : arguments.task.role
+				}
+			);
+			var failureStatus = error.type == "SpecialistCircuitOpen" ? "circuit_open" : "failed";
+			var failureMessage = friendlyFailureMessage( error );
+			return failedTask(
+				arguments.task,
+				definition,
+				toolSession,
+				failureStatus,
+				failureMessage,
+				promptCharacters,
+				startedAt
+			);
+		}
+	}
+
+	private struct function launchTask(
+		required struct task,
+		required array files,
+		required struct graph,
+		required struct options,
+		required string executorName
+	) {
+		var currentTask = arguments.task;
+		var currentFiles = arguments.files;
+		var currentGraph = arguments.graph;
+		var currentOptions = arguments.options;
+		var control = { cancelled: false };
+		progress(
+			currentOptions,
+			currentTask,
+			{
+				stage  : "task-started",
+				status : "running",
+				message: "Queued for specialist execution",
+				observe: {
+					kind           : "agent",
+					observationType: "span",
+					title          : "Specialist task queued",
+					preview        : previewText(
+						{
+							taskId        : currentTask.id,
+							role          : currentTask.role,
+							objective     : currentTask.objective ?: "",
+							budget        : currentTask.budget ?: {},
+							contextFiles  : ( currentTask.context.files ?: [] ).len(),
+							changedSymbols: ( currentTask.context.changedSymbols ?: [] ).len()
+						}
+					),
+					input: previewText(
+						{
+							taskId        : currentTask.id,
+							role          : currentTask.role,
+							objective     : currentTask.objective ?: "",
+							budget        : currentTask.budget ?: {},
+							contextFiles  : ( currentTask.context.files ?: [] ).len(),
+							changedSymbols: ( currentTask.context.changedSymbols ?: [] ).len()
+						}
+					),
+					output         : "",
+					truncated      : false,
+					characters     : 0,
+					modelParameters: { role: currentTask.role },
+					meta           : {
+						taskId: currentTask.id,
+						role  : currentTask.role,
+						io    : "input"
+					}
+				}
+			},
+			true
+		);
+		var future = asyncRun(
+			() => executeTask(
+				currentTask,
+				currentFiles,
+				currentGraph,
+				control,
+				currentOptions
+			),
+			arguments.executorName
+		).orTimeout(
+				numericSetting( currentTask.budget.maxDurationMs ?: 120000, 120000 ),
+				"milliseconds"
+			);
+		return {
+			task      : currentTask,
+			control   : control,
+			future    : future,
+			startedAt : getTickCount(),
+			durationMs: numericSetting( currentTask.budget.maxDurationMs ?: 120000, 120000 )
+		};
+	}
+
+	private struct function awaitTask( required struct item, required struct options ) {
+		while (
+			!arguments
+				.item
+				.future
+				.isDone()
+		) {
+			if ( isCancelled( arguments.options ) ) {
+				arguments
+					.item
+					.control
+					.cancelled = true;
+				arguments
+					.item
+					.future
+					.cancel( true );
+				throw( type = "RunCancelled", message = "Run was cancelled" );
+			}
+			sleep( 20 );
+		}
+		try {
+			return arguments
+				.item
+				.future
+				.get();
+		} catch (any error) {
+			logSpecialistError(
+				"Specialist future failed or timed out",
+				error,
+				{
+					taskId    : arguments
+						.item
+						.task
+						.id,
+					role      : arguments
+						.item
+						.task
+						.role,
+					durationMs: getTickCount() - arguments.item.startedAt
+				}
+			);
+			arguments
+				.item
+				.control
+				.cancelled = true;
+			arguments
+				.item
+				.future
+				.cancel( true );
+			var definition = factory.definition( arguments.item.task );
+			var emptySession = toolService.createSession(
+					arguments.item.task,
+					[],
+					{ symbols: [], dependencies: [], impacts: [] },
+					arguments.item.control
+				);
+			var elapsedMs = getTickCount() - arguments.item.startedAt;
+			var budgetMs = arguments.item.durationMs ?: 0;
+			var rawMessage = trim( toString( error.message ?: "" ) );
+			var isTimeout = elapsedMs >= max( budgetMs - 250, 0 ) || findNoCase( "timeout", rawMessage ) > 0 ||
+					findNoCase( "timed out", rawMessage ) > 0 ||
+				findNoCase( "DeadlineExceeded", toString( error.type ?: "" ) ) > 0;
+			var failureMessage = isTimeout
+				? "Specialist task deadline exceeded after #elapsedMs# ms (budget #budgetMs# ms). Local LLMs often need a higher Specialist deadline."
+				: ( len( rawMessage ) ? "Specialist task interrupted: #rawMessage#" : "Specialist task interrupted" );
+			return failedTask(
+				arguments.item.task,
+				definition,
+				emptySession,
+				isTimeout ? "timed_out" : "failed",
+				failureMessage,
+				0,
+				arguments.item.startedAt
+			);
+		}
+	}
+
+	private struct function failedTask(
+		required struct task,
+		required struct definition,
+		required struct toolSession,
+		required string status,
+		required string message,
+		required numeric charactersSent,
+		required numeric startedAt
+	) {
+		var failedResult = new app.models.domain.AgentResult(
+			{
+				version   : "agent-result-v1",
+				taskId    : arguments.task.id,
+				role      : arguments.task.role,
+				status    : arguments.status,
+				summary   : "",
+				findings  : [],
+				toolAudit : toolService.audit( arguments.toolSession ),
+				provenance: arguments.definition.provenance,
+				error     : arguments.message,
+				durationMs: getTickCount() - arguments.startedAt
+			}
+		);
+		return {
+			result        : failedResult,
+			charactersSent: arguments.charactersSent
+		};
+	}
+
+	private struct function validateResponse( required any response, required struct task ) {
+		var payload = arguments.response;
+		if ( isSimpleValue( payload ) ) {
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not structured (raw text)"
+			);
+		}
+		if ( !isStruct( payload ) ) {
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not structured (#getMetadata( payload ).name ?: "unknown"#)"
+			);
+		}
+		if ( !isArray( payload.findings ?: "" ) ) {
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not structured (missing findings array)"
+			);
+		}
+		var allowedCandidates = [];
+		var limit = numericSetting( maxFindings, 20 );
+		for ( var candidate in payload.findings ) {
+			if ( isStruct( candidate ) && isAuthorizedSpan( candidate, arguments.task ) ) {
+				allowedCandidates.append( candidate );
+			}
+			if ( allowedCandidates.len() >= limit ) {
+				break;
+			}
+		}
+		return {
+			summary : isSimpleValue( payload.summary ?: "" ) ? payload.summary : "",
+			findings: allowedCandidates
+		};
+	}
+
+	private boolean function isAuthorizedSpan( required struct candidate, required struct task ) {
+		var filePath = normalizePath( candidate.filePath ?: "" );
+		var startLine = isNumeric( candidate.startLine ?: "" ) ? int( candidate.startLine ) : 0;
+		var endLine = isNumeric( candidate.endLine ?: "" ) ? int( candidate.endLine ) : startLine;
+		for ( var contextFile in arguments
+			.task
+			.context
+			.files ) {
+			if ( normalizePath( contextFile.filePath ) != filePath ) {
+				continue;
+			}
+			return contextFile.ranges.some(
+					( rangeItem ) => startLine >= rangeItem.startLine && endLine >= startLine && endLine <= rangeItem.endLine
+				);
+		}
+		return false;
+	}
+
+	private string function ensureExecutor() {
+		var providerKey = gateway.getProviderKey();
+		var threadLimit = numericSetting( executorThreads, 3 );
+		var executorName = "specialist-v2-" & left( lCase( hash( providerKey, "SHA-256" ) ), 12 ) & "-" & threadLimit;
+		try {
+			executorGet( executorName );
+		} catch (any missingExecutor) {
+			try {
+				executorNew(
+					type       = "fixed",
+					name       = executorName,
+					maxThreads = threadLimit
+				);
+			} catch (any concurrentCreation) {
+				executorGet( executorName );
+			}
+		}
+		return executorName;
+	}
+
+	private numeric function estimateMaximumCost( required string input, required numeric maximumOutputTokens ) {
+		var inputTokens = aiTokens( arguments.input );
+		return int(
+				(
+						( inputTokens * numericDecimal( inputUsdPerMillion, 100 ) ) +
+							( arguments.maximumOutputTokens * numericDecimal( outputUsdPerMillion, 100 ) )
+					) *
+					1000000
+			) /
+			1000000000000;
+	}
+
+	private void function progress(
+		required struct options,
+		required struct task,
+		required struct detail,
+		boolean force = false
+	) {
+		if ( isCustomFunction( arguments.options.onProgress ?: "" ) ) {
+			try {
+				arguments.options.onProgress(
+						arguments.task,
+						arguments.detail,
+						arguments.force
+					);
+			} catch (any ignoredProgressFailure) {
+				// Progress and observability are best effort. A transient event
+				// persistence collision must not invalidate completed analysis.
+				logSpecialistError(
+					"Specialist progress callback failed",
+					ignoredProgressFailure,
+					{ taskId: arguments.task.id, role: arguments.task.role }
+				);
+			}
+		}
+	}
+
+	private void function checkpoint( required struct options, required struct result ) {
+		if ( isCustomFunction( arguments.options.onCheckpoint ?: "" ) ) {
+			arguments.options.onCheckpoint( arguments.result );
+		}
+	}
+
+	private boolean function isCancelled( required struct options ) {
+		return isCustomFunction( arguments.options.isCancelled ?: "" ) && arguments.options.isCancelled();
+	}
+
+	private void function assertNotCancelled( required struct control, required struct options ) {
+		if ( ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) || isCancelled( arguments.options ) ) {
+			arguments.control.cancelled = true;
+			throw( type = "RunCancelled", message = "Run was cancelled" );
+		}
+	}
+
+	private string function friendlyFailureMessage( required any error ) {
+		if ( ( arguments.error.type ?: "" ) == "SpecialistCircuitOpen" ) {
+			return "Specialist provider circuit is open";
+		}
+		var raw = trim( toString( arguments.error.message ?: "" ) );
+		if ( !len( raw ) ) {
+			return "Specialist review unavailable";
+		}
+		if ( findNoCase( "tool-call markup", raw ) || findNoCase( "<|tool_call", raw ) || findNoCase( "functions.read_", raw ) ) {
+			return "Specialist review unavailable: model returned tool-call markup instead of JSON. Retrying with embedded source context.";
+		}
+		if ( findNoCase( "not valid JSON", raw ) ) {
+			return "Specialist review unavailable: model response was not valid JSON (often truncated by reasoning-token use — raise max tokens per task)";
+		}
+		if ( findNoCase( "response is empty", raw ) || findNoCase( "empty after retry", raw ) ) {
+			return "Specialist review unavailable: model returned empty content (reasoning models need a higher token budget)";
+		}
+		if ( findNoCase( "circuit is open", raw ) ) {
+			return "Specialist provider circuit is open";
+		}
+		if (
+			findNoCase( "exceed_context_size", raw ) || findNoCase( "exceeds the available context size", raw ) ||
+				findNoCase( "n_ctx", raw )
+		) {
+			return "Specialist review unavailable: prompt exceeds the model context window. Raise AI_CONTEXT_WINDOW / server context size, or lower max tokens per task and plan context budgets.";
+		}
+		return "Specialist review unavailable: " & left( raw, 160 );
+	}
+
+	private void function cancelAll( required array items ) {
+		for ( var item in arguments.items ) {
+			item.control.cancelled = true;
+			item.future.cancel( true );
+		}
+	}
+
+	private struct function emptyResult() {
+		return {
+			enabled       : false,
+			results       : [],
+			findings      : [],
+			summary       : "",
+			error         : "",
+			filesReviewed : 0,
+			charactersSent: 0,
+			completedTasks: 0,
+			failedTasks   : 0
+		};
+	}
+
+	private string function summaries( required array results ) {
+		return arguments
+			.results
+			.filter( ( item ) => len( item.summary ) )
+			.map( ( item ) => "#item.role#: #item.summary#" )
+			.toList( " " );
+	}
+
+	private numeric function uniqueContextFiles( required array tasks ) {
+		var paths = {};
+		for ( var task in arguments.tasks ) {
+			for ( var file in task.context.files ) {
+				paths[ lCase( normalizePath( file.filePath ) ) ] = true;
+			}
+		}
+		return paths.count();
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, int( val( arguments.value ) ) ) : arguments.fallback;
+	}
+
+	private numeric function numericDecimal( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 0, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+
+	private string function previewText( required any body ) {
+		if ( !isTrue( observabilityEnabled ) ) {
+			return "";
+		}
+		if ( isSimpleValue( arguments.body ) ) {
+			var simple = toString( arguments.body );
+			var limit = max(
+				200,
+				isNumeric( observabilityPreviewCharacters ) ? int( val( observabilityPreviewCharacters ) ) : 1600
+			);
+			if ( len( simple ) > limit ) {
+				return left( simple, limit ) & char( 10 ) & "[truncated]";
+			}
+			return simple;
+		}
+		if ( isStruct( arguments.body ) ) {
+			var lines = [];
+			for ( var key in arguments.body ) {
+				var value = arguments.body[ key ];
+				if ( isNull( value ) || isSimpleValue( value ) ) {
+					lines.append( "#key#: #isNull( value ) ? "" : value#" );
+				} else if ( isArray( value ) ) {
+					lines.append( "#key#: [array:#arrayLen( value )#]" );
+				} else {
+					lines.append( "#key#: [complex]" );
+				}
+			}
+			var text = lines.toList( char( 10 ) );
+			var maxChars = max(
+				200,
+				isNumeric( observabilityPreviewCharacters ) ? int( val( observabilityPreviewCharacters ) ) : 1600
+			);
+			if ( len( text ) > maxChars ) {
+				return left( text, maxChars ) & char( 10 ) & "[truncated]";
+			}
+			return text;
+		}
+		return "[complex payload]";
+	}
+
+	private void function logSpecialistError( required string message, required any error, struct context = {} ) {
+		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
+			return;
+		}
+		var detail = duplicate( arguments.context );
+		detail.type = arguments.error.type ?: "";
+		detail.message = secretRedactionService.redactText( arguments.error.message ?: "" );
+		detail.stackTrace = secretRedactionService.redactText( arguments.error.stackTrace ?: "" );
+		log.error( arguments.message, detail );
+	}
+
+	private boolean function isTrue( required any value ) {
+		if ( isBoolean( arguments.value ) ) {
+			return arguments.value;
+		}
+		return listFindNoCase( "true,1,yes,on", trim( toString( arguments.value ) ) ) > 0;
+	}
+}

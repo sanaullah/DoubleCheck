@@ -1,0 +1,369 @@
+class {
+
+	/**
+	 * Configure the ColdBox App For Production
+	 * https://coldbox.ortusbooks.com/getting-started/configuration
+	 */
+	function configure() {
+		var openAIBaseURL = getSystemSetting( "OPENAI_API_BASE", "" );
+		var isLocalAi = reFindNoCase( "localhost|127\.0\.0\.1", openAIBaseURL ) > 0;
+		// Local LM Studio / Ollama need much longer per-task walls than cloud APIs.
+		var defaultRunDurationMs = isLocalAi ? 900000 : 120000;
+		var maxRunDurationMs = isLocalAi ? 1800000 : 600000;
+		var defaultAiTimeoutSeconds = isLocalAi ? 600 : 120;
+		var applicationRoot = createObject( "java", "java.io.File" ).init(
+				getDirectoryFromPath( getCurrentTemplatePath() ) & "../.."
+			).getCanonicalFile();
+		/**
+		 * --------------------------------------------------------------------------
+		 * ColdBox Directives
+		 * --------------------------------------------------------------------------
+		 * Here you can configure ColdBox for operation. Remember tha these directives below
+		 * are for PRODUCTION. If you want different settings for other environments make sure
+		 * you create the appropriate functions and define the environment in your .env or
+		 * in the `environments` struct.
+		 */
+		variables.coldbox = {
+			// Application Setup
+			appName                 : getSystemSetting( "APPNAME", "Your app name here" ),
+			eventName               : "event",
+			// Development Settings
+			reinitPassword          : "",
+			reinitKey               : "fwreinit",
+			handlersIndexAutoReload : true,
+			// Implicit Events
+			defaultEvent            : "Main.index",
+			requestStartHandler     : "Main.onRequestStart",
+			requestEndHandler       : "",
+			applicationStartHandler : "Main.onAppInit",
+			applicationEndHandler   : "",
+			sessionStartHandler     : "",
+			sessionEndHandler       : "",
+			missingTemplateHandler  : "",
+			// Extension Points
+			applicationHelper       : "/app/helpers/ApplicationHelper.bxm",
+			viewsHelper             : "",
+			modulesExternalLocation : [ "/modules"],
+			viewsExternalLocation   : "",
+			layoutsExternalLocation : "",
+			handlersExternalLocation: "",
+			requestContextDecorator : "",
+			controllerDecorator     : "",
+			// Error/Exception Handling
+			invalidHTTPMethodHandler: "",
+			exceptionHandler        : "main.onException",
+			invalidEventHandler     : "",
+			customErrorTemplate     : "",
+			// Application Aspects
+			handlerCaching          : false,
+			eventCaching            : false,
+			viewCaching             : false,
+			// Will automatically do a mapDirectory() on your `models` for you.
+			autoMapModels           : true,
+			// Auto converts a json body payload into the RC
+			jsonPayloadToRC         : true
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Custom Settings
+		 * --------------------------------------------------------------------------
+		 */
+		variables.settings = {
+			appVersion           : "0.1.0",
+			datasource           : "doublecheck",
+			runEventPollInterval : 250,
+			runEventKeepAlive    : 15000,
+			runEventStreamTimeout: 300000,
+			runPageSize          : 20,
+			runPageSizeMax       : 100,
+			runExecutor          : "review-runs",
+			runMaxConcurrent     : getSystemSetting( "DOUBLECHECK_RUN_MAX_CONCURRENT", 2 ),
+			runLeaseSeconds      : getSystemSetting( "DOUBLECHECK_RUN_LEASE_SECONDS", 300 ),
+			environment          : lCase( getSystemSetting( "ENVIRONMENT", "development" ) ),
+			workerId             : getSystemSetting( "DOUBLECHECK_WORKER_ID", createUUID() ),
+			workerEnabled        : isTruthy( getSystemSetting( "DOUBLECHECK_WORKER_ENABLED", true ) ),
+			workerLeaseSeconds   : getSystemSetting( "DOUBLECHECK_WORKER_LEASE_SECONDS", 60 ),
+			workerPollSeconds    : getSystemSetting( "DOUBLECHECK_WORKER_POLL_SECONDS", 2 ),
+			evaluationCorpusPath : getSystemSetting(
+				"DOUBLECHECK_EVALUATION_CORPUS",
+				applicationRoot.getCanonicalPath() & "/resources/evaluation-corpus/v1"
+			),
+			scanMaxFiles                   : getSystemSetting( "DOUBLECHECK_SCAN_MAX_FILES", 250 ),
+			scanMaxBytes                   : getSystemSetting( "DOUBLECHECK_SCAN_MAX_BYTES", 2097152 ),
+			scanMaxFileBytes               : getSystemSetting( "DOUBLECHECK_SCAN_MAX_FILE_BYTES", 131072 ),
+			scanMaxEntries                 : getSystemSetting( "DOUBLECHECK_SCAN_MAX_ENTRIES", 5000 ),
+			graphResultLimit               : getSystemSetting( "DOUBLECHECK_GRAPH_RESULT_LIMIT", 1000 ),
+			graphImpactMaxDepth            : getSystemSetting( "DOUBLECHECK_GRAPH_IMPACT_MAX_DEPTH", 3 ),
+			graphImpactMaxNodes            : getSystemSetting( "DOUBLECHECK_GRAPH_IMPACT_MAX_NODES", 2000 ),
+			architectureFactLimit          : getSystemSetting( "DOUBLECHECK_ARCHITECTURE_FACT_LIMIT", 500 ),
+			architectureEnrichmentFactLimit: getSystemSetting( "DOUBLECHECK_ARCHITECTURE_ENRICHMENT_FACT_LIMIT", 200 ),
+			architectureEnrichmentMaxCharacters: getSystemSetting(
+				"DOUBLECHECK_ARCHITECTURE_ENRICHMENT_MAX_CHARACTERS",
+				30000
+			),
+			architectureEnrichmentMaxFacts: getSystemSetting( "DOUBLECHECK_ARCHITECTURE_ENRICHMENT_MAX_FACTS", 50 ),
+			planMaxTasks                     : getSystemSetting( "DOUBLECHECK_PLAN_MAX_TASKS", 6 ),
+			planMaxContextFiles              : getSystemSetting( "DOUBLECHECK_PLAN_MAX_CONTEXT_FILES", 20 ),
+			planMaxContextCharacters         : getSystemSetting( "DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS", 30000 ),
+			planMaxChangedSymbols            : getSystemSetting( "DOUBLECHECK_PLAN_MAX_CHANGED_SYMBOLS", 50 ),
+			planContextBeforeLines           : getSystemSetting( "DOUBLECHECK_PLAN_CONTEXT_BEFORE_LINES", 3 ),
+			planContextAfterLines            : getSystemSetting( "DOUBLECHECK_PLAN_CONTEXT_AFTER_LINES", 12 ),
+			planMaxContextLines              : getSystemSetting( "DOUBLECHECK_PLAN_MAX_CONTEXT_LINES", 1000 ),
+			planMaxRangesPerFile             : getSystemSetting( "DOUBLECHECK_PLAN_MAX_RANGES_PER_FILE", 12 ),
+			planMaxLinesPerRange             : getSystemSetting( "DOUBLECHECK_PLAN_MAX_LINES_PER_RANGE", 80 ),
+			planContextMergeGap              : getSystemSetting( "DOUBLECHECK_PLAN_CONTEXT_MERGE_GAP", 2 ),
+			runDefaultTokenBudget            : getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_TOKEN_BUDGET", 12000 ),
+			runMaxTokenBudget                : getSystemSetting( "DOUBLECHECK_RUN_MAX_TOKEN_BUDGET", 24000 ),
+			runDefaultTokensPerTask          : getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_TOKENS_PER_TASK", 3000 ),
+			runMaxTokensPerTask              : getSystemSetting( "DOUBLECHECK_RUN_MAX_TOKENS_PER_TASK", 6000 ),
+			specialistMaxToolCalls           : getSystemSetting( "DOUBLECHECK_SPECIALIST_MAX_TOOL_CALLS", 8 ),
+			specialistMaxToolOutputCharacters: getSystemSetting(
+				"DOUBLECHECK_SPECIALIST_MAX_TOOL_OUTPUT_CHARACTERS",
+				12000
+			),
+			specialistMaxSearchMatches    : getSystemSetting( "DOUBLECHECK_SPECIALIST_MAX_SEARCH_MATCHES", 20 ),
+			specialistToolTimeoutMs       : getSystemSetting( "DOUBLECHECK_SPECIALIST_TOOL_TIMEOUT_MS", 2000 ),
+			specialistMaxFindingsPerTask  : getSystemSetting( "DOUBLECHECK_SPECIALIST_MAX_FINDINGS_PER_TASK", 20 ),
+			specialistMaxSummaryCharacters: getSystemSetting( "DOUBLECHECK_SPECIALIST_MAX_SUMMARY_CHARACTERS", 2000 ),
+			specialistExecutorThreads        : getSystemSetting( "DOUBLECHECK_SPECIALIST_EXECUTOR_THREADS", 1 ),
+			specialistMaxRetries             : getSystemSetting( "DOUBLECHECK_SPECIALIST_MAX_RETRIES", 2 ),
+			specialistRetryBackoffMs         : getSystemSetting( "DOUBLECHECK_SPECIALIST_RETRY_BACKOFF_MS", 100 ),
+			specialistCircuitFailureThreshold: getSystemSetting( "DOUBLECHECK_SPECIALIST_CIRCUIT_FAILURE_THRESHOLD", 3 ),
+			specialistCircuitCooldownMs: getSystemSetting( "DOUBLECHECK_SPECIALIST_CIRCUIT_COOLDOWN_MS", 30000 ),
+			specialistEventCoalesceMs    : getSystemSetting( "DOUBLECHECK_SPECIALIST_EVENT_COALESCE_MS", 250 ),
+			specialistInputUsdPerMillion : getSystemSetting( "DOUBLECHECK_SPECIALIST_INPUT_USD_PER_MILLION", 5 ),
+			specialistOutputUsdPerMillion: getSystemSetting( "DOUBLECHECK_SPECIALIST_OUTPUT_USD_PER_MILLION", 15 ),
+			observabilityEnabled          : getSystemSetting( "DOUBLECHECK_OBSERVABILITY_ENABLED", true ),
+			observabilityPreviewCharacters: getSystemSetting( "DOUBLECHECK_OBSERVABILITY_PREVIEW_CHARACTERS", 1600 ),
+			runDefaultDurationMs: getSystemSetting(
+				"DOUBLECHECK_RUN_DEFAULT_DURATION_MS",
+				defaultRunDurationMs
+			),
+			runMaxDurationMs: getSystemSetting( "DOUBLECHECK_RUN_MAX_DURATION_MS", maxRunDurationMs ),
+			runDefaultIterationsPerTask   : getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_ITERATIONS_PER_TASK", 8 ),
+			runMaxIterationsPerTask       : getSystemSetting( "DOUBLECHECK_RUN_MAX_ITERATIONS_PER_TASK", 20 ),
+			runDefaultToolOutputCharacters: getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_TOOL_OUTPUT_CHARACTERS", 48000 ),
+			runMaxToolOutputCharacters: getSystemSetting( "DOUBLECHECK_RUN_MAX_TOOL_OUTPUT_CHARACTERS", 120000 ),
+			runDefaultCostUsd : getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_COST_USD", 5 ),
+			runMaxCostUsd     : getSystemSetting( "DOUBLECHECK_RUN_MAX_COST_USD", 50 ),
+			defaultProjectPath: applicationRoot.getCanonicalPath(),
+			aiProvider        : getSystemSetting(
+				"AI_PROVIDER",
+				len( openAIBaseURL ) ? "openai-compatible" : "openai"
+			),
+			aiBaseURL            : openAIBaseURL,
+			aiApiKey             : getSystemSetting( "OPENAI_API_KEY", getSystemSetting( "AI_API_KEY", "" ) ),
+			aiModel              : getSystemSetting( "DEFAULT_MODEL", getSystemSetting( "AI_MODEL", "" ) ),
+			aiTimeout            : getSystemSetting( "AI_TIMEOUT", defaultAiTimeoutSeconds ),
+			aiLocalProvider      : isLocalAi,
+			// Local engines (LM Studio / llama.cpp) often default to 8192; raise via
+			// AI_CONTEXT_WINDOW or the server UI when loading larger models.
+			aiContextWindow      : getSystemSetting( "AI_CONTEXT_WINDOW", isLocalAi ? 8192 : 128000 ),
+			aiMaxPromptCharacters: getSystemSetting( "AI_MAX_PROMPT_CHARACTERS", 60000 )
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Environment Detection
+		 * --------------------------------------------------------------------------
+		 * By default we look in your `.env` file for an `environment` key, if not,
+		 * then we look into this structure or if you have a function called `detectEnvironment()`
+		 * If you use this setting, then each key is the name of the environment and the value is
+		 * the regex patterns to match against cgi.http_host.
+		 *
+		 * Uncomment to use, but make sure your .env ENVIRONMENT key is also removed.
+		 */
+		// environments = { development : "localhost,^127\.0\.0\.1" };
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Module Loading Directives
+		 * --------------------------------------------------------------------------
+		 */
+		variables.modules = {
+			// An array of modules names to load, empty means all of them
+			include: [],
+			// An array of modules names to NOT load, empty means none
+			exclude: []
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Application Logging (https://logbox.ortusbooks.com)
+		 * --------------------------------------------------------------------------
+		 * By Default we log to the console, but you can add many appenders or destinations to log to.
+		 * You can also choose the logging level of the root logger, or even the actual appender.
+		 */
+		variables.logBox = {
+			appenders: {
+				coldboxTracer: {
+					class   : "coldbox.system.logging.appenders.ConsoleAppender",
+					levelMin: "INFO",
+					levelMax: "FATAL"
+				},
+				filelog: {
+					class     : "coldbox.system.logging.appenders.RollingFileAppender",
+					levelMin  : "INFO",
+					levelMax  : "FATAL",
+					properties: {
+						fileName       : "doublecheck",
+						filePath       : applicationRoot.getCanonicalPath() & "/app/logs",
+						fileMaxSize    : 5000,
+						fileMaxArchives: 10
+					}
+				}
+			},
+			root: {
+				levelMin : "INFO",
+				levelMax : "FATAL",
+				appenders: "coldboxTracer,filelog"
+			},
+			categories: {
+				"coldbox.system": {
+					levelMin : "WARN",
+					levelMax : "FATAL",
+					appenders: "coldboxTracer,filelog"
+				}
+			}
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Layout Settings
+		 * --------------------------------------------------------------------------
+		 */
+		variables.layoutSettings = { defaultLayout: "", defaultView: "" };
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Custom Interception Points
+		 * --------------------------------------------------------------------------
+		 */
+		variables.interceptorSettings = { customInterceptionPoints: [] };
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Application Interceptors
+		 * --------------------------------------------------------------------------
+		 * Remember that the order of declaration is the order they will be registered and fired
+		 */
+		variables.interceptors = [];
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Module Settings
+		 * --------------------------------------------------------------------------
+		 * Each module has it's own configuration structures, so make sure you follow
+		 * the module's instructions on settings.
+		 *
+		 * Each key is the name of the module:
+		 *
+		 * myModule = {
+		 *
+		 * }
+		 */
+		variables.moduleSettings = {
+			cfmigrations: {
+				managers: {
+					default: {
+						manager            : "cfmigrations.models.QBMigrationManager",
+						migrationsDirectory: "/resources/database/migrations",
+						seedsDirectory     : "/resources/database/seeds",
+						seedEnvironments   : "development",
+						properties         : {
+							defaultGrammar : "SQLiteGrammar@qb",
+							datasource     : "doublecheck",
+							useTransactions: true
+						}
+					}
+				}
+			},
+			cbswagger: {
+				routes             : [ "api"],
+				excludeRoutesPrefix: [ "cbswagger"],
+				excludeRoutes      : [],
+				excludeEvents      : [],
+				defaultFormat      : "json",
+				samplesPath        : applicationRoot.getCanonicalPath() & "/resources/apidocs",
+				cacheEnabled       : false,
+				info               : {
+					title         : "DoubleCheck API",
+					description   : "Local code-review REST API (v1). Deterministic review works without an AI key; specialists deepen when OPENAI_* is configured. See readme.md.",
+					termsOfService: "",
+					contact       : {
+						name : "DoubleCheck",
+						url  : "https://github.com/search?q=DoubleCheck",
+						email: ""
+					},
+					license: {
+						name: "See repository license",
+						url : ""
+					},
+					version: "0.1.0"
+				},
+				servers: [
+					{
+						url        : "/",
+						description: "This CommandBox server (relative)"
+					}
+				],
+				tags: [
+					{
+						name       : "Health",
+						description: "Liveness and capability discovery"
+					},
+					{ name: "Session", description: "Local workspace identity" },
+					{
+						name       : "Runs",
+						description: "Review run lifecycle, SSE, export"
+					},
+					{ name: "AI", description: "Provider smoke tests" },
+					{ name: "Local", description: "Workers and quality gates" }
+				],
+				components: {},
+				security  : []
+			}
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * Flash Scope Settings
+		 * --------------------------------------------------------------------------
+		 * The available scopes are : session, client, cluster, ColdBoxCache, or a full instantiation CFC path
+		 */
+		variables.flash = {
+			scope       : "session",
+			properties  : {}, // constructor properties for the flash scope implementation
+			inflateToRC : true, // automatically inflate flash data into the RC scope
+			inflateToPRC: false, // automatically inflate flash data into the PRC scope
+			autoPurge   : true, // automatically purge flash data for you
+			autoSave    : true // automatically save flash scopes at end of a request and on relocations.
+		};
+
+		/**
+		 * --------------------------------------------------------------------------
+		 * App Conventions
+		 * --------------------------------------------------------------------------
+		 */
+		variables.conventions = {
+			handlersLocation: "handlers",
+			viewsLocation   : "views",
+			layoutsLocation : "layouts",
+			modelsLocation  : "models",
+			eventAction     : "index"
+		};
+	}
+
+	/**
+	 * Development environment
+	 */
+	function development() {
+		// coldbox.customErrorTemplate = "/coldbox/system/exceptions/BugReport.cfm"; // static bug reports
+		variables.coldbox.customErrorTemplate = "/coldbox/system/exceptions/Whoops.cfm";
+	}
+
+	private boolean function isTruthy( required any value ) {
+		return [ "true", "yes", "1", "on"].contains( lCase( trim( toString( arguments.value ) ) ) );
+	}
+}

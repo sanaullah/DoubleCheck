@@ -1,0 +1,1013 @@
+/**
+ * Orchestrates the full review pipeline: scan → graph → plan → deterministic → specialists → persist.
+ *
+ * Primary entry from ApiRuns.create; see .docs/codebase-flow.md when present.
+ *
+ * @see RepositoryScannerService
+ * @see SpecialistReviewService
+ * @see FindingService
+ */
+
+@singleton
+class {
+	property name="runRepository" inject="ReviewRunRepository";
+
+	property name="eventService" inject="ReviewEventService";
+
+	property name="scannerService" inject="RepositoryScannerService";
+
+	property name="findingService" inject="FindingService";
+
+	property name="aiReviewService" inject="AIReviewService";
+
+	property name="resultRepository" inject="ReviewResultRepository";
+
+	property name="architectureIndexService" inject="ArchitectureIndexService";
+
+	property name="graphRepository" inject="AnalysisGraphRepository";
+
+	property name="architectureModelService" inject="ArchitectureModelService";
+
+	property name="architectureEnrichmentService" inject="ArchitectureEnrichmentService";
+
+	property name="architectureDiffService" inject="ArchitectureDiffService";
+
+	property name="reviewPlannerService" inject="ReviewPlannerService";
+
+	property name="specialistReviewService" inject="SpecialistReviewService";
+
+	property name="specialistResultRepository" inject="SpecialistResultRepository";
+
+	property name="architectureRepository" inject="ArchitectureRepository";
+
+	property name="reviewPolicyService" inject="ReviewPolicyService";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	property name="workerRegistryService" inject="WorkerRegistryService";
+
+	property name="findingBaselineService" inject="FindingBaselineService";
+
+	property name="findingReviewService" inject="FindingReviewService";
+
+	property name="coverageAssessmentService" inject="CoverageAssessmentService";
+
+	property name="crewPlannerService" inject="CrewPlannerService";
+
+	property name="runExecutor" inject="coldbox:setting:runExecutor";
+
+	property name="runMaxConcurrent" inject="coldbox:setting:runMaxConcurrent";
+
+	property name="runLeaseSeconds" inject="coldbox:setting:runLeaseSeconds";
+
+	property name="specialistEventCoalesceMs" inject="coldbox:setting:specialistEventCoalesceMs";
+
+	property name="workerId" inject="coldbox:setting:workerId";
+
+	property name="workerEnabled" inject="coldbox:setting:workerEnabled";
+
+	property name="log" inject="logbox:logger:{this}";
+	variables.terminalStatuses = [ "succeeded", "partial", "failed", "cancelled"];
+	variables.activeFutures = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+	variables.activeLeaseTokens = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+	variables.executorReady = false;
+
+	any function create( required struct input, struct context = {} ) {
+		var securityContext = arguments.context.count() ? duplicate( arguments.context ) : securityContextService.defaultContext();
+		securityContextService.authorize( securityContext, "runs:create" );
+		var projectId = trim( input.projectId ?: "" );
+		var project = securityContextService.projectFor( securityContext, projectId );
+		var projectPath = securityContextService.authorizeProjectPath(
+				securityContext,
+				project.id,
+				input.projectPath ?: ""
+			);
+		var mode = lCase( trim( input.mode ?: "full" ) );
+		if ( ![ "working-tree", "revision-diff", "full"].contains( mode ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "mode must be 'working-tree', 'revision-diff', or 'full'"
+			);
+		}
+		var baseRevision = trim( input.baseRevision ?: "" );
+		var headRevision = trim( input.headRevision ?: "HEAD" );
+		if ( mode == "revision-diff" && !len( baseRevision ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "baseRevision is required for revision-diff mode"
+			);
+		}
+		var runContract = reviewPolicyService.normalize( arguments.input );
+
+		var nowValue = timestamp();
+		var run = runRepository.create(
+				{
+					id          : lCase( createUUID() ),
+					tenantId    : securityContext.tenantId,
+					projectId   : project.id,
+					projectPath : projectPath,
+					mode        : mode,
+					baseRevision: baseRevision,
+					headRevision: headRevision,
+					status      : "queued",
+					progress    : 0,
+					currentPhase: "queued",
+					message     : "Run accepted",
+					policy      : runContract.policy,
+					budgets     : runContract.budgets,
+					sourceRunId : input.sourceRunId ?: "",
+					createdAt   : nowValue,
+					updatedAt   : nowValue
+				}
+			);
+
+		eventService.publish(
+				run.getId(),
+				"run.status",
+				{ run: run.getMemento() }
+			);
+		if ( workerEnabled ) {
+			enqueue( run.getId() );
+		}
+		return run;
+	}
+
+	any function rerunScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped(
+			arguments.id,
+			arguments.context,
+			arguments.projectId
+		);
+		if ( isNull( source ) ) {
+			return javacast( "null", "" );
+		}
+		var rerun = create(
+			{
+				projectId   : source.getProjectId(),
+				projectPath : source.getProjectPath(),
+				mode        : source.getMode(),
+				baseRevision: source.getBaseRevision(),
+				headRevision: source.getHeadRevision(),
+				policy      : source.getPolicy(),
+				budgets     : source.getBudgets(),
+				sourceRunId : source.getId()
+			},
+			arguments.context
+		);
+		eventService.publish(
+				rerun.getId(),
+				"run.rerun",
+				{ sourceRunId: source.getId(), runId: rerun.getId() }
+			);
+		return rerun;
+	}
+
+	any function followUpScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped(
+			arguments.id,
+			arguments.context,
+			arguments.projectId
+		);
+		if ( isNull( source ) ) {
+			return javacast( "null", "" );
+		}
+		var coverage = getResult( source.getId() ).coverage;
+		if ( !( coverage.followUp.available ?: false ) || !( coverage.followUp.roles ?: [] ).len() ) {
+			throw(
+				type    = "ValidationException",
+				message = "This review has no specialist coverage gaps eligible for follow-up"
+			);
+		}
+		var policy = duplicate( source.getPolicy() );
+		policy.allowedRoles = coverage.followUp.roles;
+		policy.reviewGoal = "Targeted follow-up for unresolved coverage gaps from run #source.getId()#.";
+		var budgets = duplicate( source.getBudgets() );
+		budgets.maxTasks = min(
+			int( budgets.maxTasks ?: coverage.followUp.maxTasks ),
+			coverage.followUp.maxTasks
+		);
+		var followUp = create(
+			{
+				projectId   : source.getProjectId(),
+				projectPath : source.getProjectPath(),
+				mode        : source.getMode(),
+				baseRevision: source.getBaseRevision(),
+				headRevision: source.getHeadRevision(),
+				policy      : policy,
+				budgets     : budgets,
+				sourceRunId : source.getId()
+			},
+			arguments.context
+		);
+		eventService.publish(
+				followUp.getId(),
+				"run.follow-up",
+				{
+					sourceRunId: source.getId(),
+					roles      : coverage.followUp.roles,
+					maxTasks   : coverage.followUp.maxTasks
+				}
+			);
+		return followUp;
+	}
+
+	void function recoverPendingRuns() {
+		if ( !workerEnabled ) {
+			return;
+		}
+		workerRegistryService.heartbeat( "ready", { review: true, sqliteQueue: true } );
+		for ( var runId in runRepository.recoverableIds( timestamp() ) ) {
+			enqueue( runId );
+		}
+	}
+
+	any function get( required string id ) {
+		return runRepository.find( arguments.id );
+	}
+
+	any function getScoped( required string id, required struct context, string projectId = "" ) {
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				arguments.projectId
+			);
+		return runRepository.findScoped(
+				arguments.id,
+				arguments.context.tenantId,
+				arguments.projectId
+			);
+	}
+
+	struct function getResult( required string id ) {
+		var result = resultRepository.getResult( arguments.id );
+		result.graph = graphRepository.getGraph( arguments.id );
+		var architectureBundle = architectureRepository.get( arguments.id );
+		result.architecture = architectureBundle.architecture;
+		result.architectureDiff = architectureBundle.architectureDiff;
+		result.architectureReused = architectureBundle.architectureReused;
+		result.plan = architectureBundle.plan;
+		result.specialists = specialistResultRepository.get( arguments.id );
+		result.coverage = coverageAssessmentService.assess( result );
+
+		var run = runRepository.find( arguments.id );
+		if ( isNull( run ) ) {
+			return findingBaselineService.applyToResult( result );
+		}
+		var baselineRun = runRepository.findPriorEligibleBaseline(
+				run.getProjectPath(),
+				run.getMode(),
+				run.getCreatedAt(),
+				run.getId(),
+				run.getTenantId(),
+				run.getProjectId()
+			);
+		if ( isNull( baselineRun ) ) {
+			return findingReviewService.applyToResult( run, findingBaselineService.applyToResult( result ) );
+		}
+		var baselineFindings = resultRepository.getResult( baselineRun.getId() ).findings ?: [];
+		return findingReviewService.applyToResult(
+				run,
+				findingBaselineService.applyToResult(
+						result           = result,
+						baselineMeta     = {
+							runId    : baselineRun.getId(),
+							status   : baselineRun.getStatus(),
+							createdAt: baselineRun.getCreatedAt()
+						},
+						baselineFindings = baselineFindings
+					)
+			);
+	}
+
+	struct function getResultScoped( required string id, required struct context ) {
+		var run = getScoped( arguments.id, arguments.context );
+		if ( isNull( run ) ) {
+			return {};
+		}
+		return getResult( run.getId() );
+	}
+
+	struct function list( numeric page = 1, numeric limit = 20 ) {
+		var safePage = max( 1, int( arguments.page ) );
+		var safeLimit = min( 100, max( 1, int( arguments.limit ) ) );
+		var result = runRepository.list( limit = safeLimit, offset = ( safePage - 1 ) * safeLimit );
+		return {
+			data: result.data.map( ( run ) => run.getMemento() ),
+			meta: {
+				page      : safePage,
+				limit     : safeLimit,
+				total     : result.total,
+				totalPages: result.total ? ceiling( result.total / safeLimit ) : 0
+			}
+		};
+	}
+
+	struct function listScoped(
+		required struct context,
+		string projectId = "",
+		numeric page     = 1,
+		numeric limit    = 20
+	) {
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				arguments.projectId
+			);
+		var safePage = max( 1, int( arguments.page ) );
+		var safeLimit = min( 100, max( 1, int( arguments.limit ) ) );
+		var result = runRepository.listScoped(
+				tenantId  = arguments.context.tenantId,
+				projectId = arguments.projectId,
+				limit     = safeLimit,
+				offset    = ( safePage - 1 ) * safeLimit
+			);
+		return {
+			data: result.data.map( ( run ) => run.getMemento() ),
+			meta: {
+				page      : safePage,
+				limit     : safeLimit,
+				total     : result.total,
+				totalPages: result.total ? ceiling( result.total / safeLimit ) : 0
+			}
+		};
+	}
+
+	any function cancel( required string id ) {
+		var run = this.get( arguments.id );
+		if ( isNull( run ) ) {
+			return javacast( "null", "" );
+		}
+		if ( isTerminal( run.getStatus() ) ) {
+			return run;
+		}
+
+		var updated = runRepository.updateState(
+				id                = arguments.id,
+				status            = run.getStatus(),
+				progress          = run.getProgress(),
+				currentPhase      = run.getCurrentPhase(),
+				message           = "Cancellation requested",
+				cancelRequestedAt = timestamp()
+			);
+		eventService.publish(
+				arguments.id,
+				"run.status",
+				{ run: updated.getMemento() }
+			);
+		if ( variables.activeFutures.containsKey( arguments.id ) ) {
+			specialistReviewService.cancelRun( arguments.id );
+			variables
+				.activeFutures
+				.get( arguments.id )
+				.cancel( true );
+		}
+		return updated;
+	}
+
+	any function cancelScoped( required string id, required struct context ) {
+		var scopedRun = getScoped( arguments.id, arguments.context );
+		if ( isNull( scopedRun ) ) {
+			return javacast( "null", "" );
+		}
+		securityContextService.authorize(
+				arguments.context,
+				"runs:cancel",
+				scopedRun.getProjectId()
+			);
+		var result = cancel( scopedRun.getId() );
+		return result;
+	}
+
+	boolean function isTerminal( required string status ) {
+		return variables.terminalStatuses.contains( lCase( arguments.status ) );
+	}
+
+	private void function executeRun( required string runId, required string leaseToken ) {
+		try {
+			var run = runRepository.claim(
+					arguments.runId,
+					timestamp(),
+					leaseTimestamp(),
+					workerId,
+					arguments.leaseToken
+				);
+			if ( isNull( run ) ) {
+				return;
+			}
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 5,
+				phase     = "indexing",
+				message   = "Discovering reviewable source files",
+				startedAt = timestamp(),
+				eventType = "phase.started"
+			);
+			var scan = scannerService.scan(
+					projectPath  = run.getProjectPath(),
+					mode         = run.getMode(),
+					baseRevision = run.getBaseRevision(),
+					headRevision = run.getHeadRevision()
+				);
+			renewOwnedLease( arguments.runId, arguments.leaseToken );
+			if ( [ "working-tree-unavailable", "revision-diff-unavailable"].contains( scan.scope ) ) {
+				var unavailableMessage = scan.scope == "working-tree-unavailable"
+					? "Git working-tree state is unavailable. No files were reviewed. Choose Full baseline explicitly to review the repository."
+					: "#scan.error#. No files were reviewed.";
+				resultRepository.saveSummary(
+						runId              = arguments.runId,
+						summary            = unavailableMessage,
+						languages          = [],
+						filesScanned       = 0,
+						bytesScanned       = 0,
+						findingsCount      = 0,
+						aiEnabled          = false,
+						reviewScope        = scan.scope,
+						baseRevision       = scan.baseRevision,
+						headRevision       = scan.headRevision,
+						repositoryRevision = scan.repositoryRevision
+					);
+				var unavailable = transition(
+					runId       = arguments.runId,
+					status      = "partial",
+					progress    = 100,
+					phase       = "completed",
+					message     = scan.scope == "working-tree-unavailable"
+						? "Working-tree review unavailable; choose Full baseline"
+						: "Revision-diff review unavailable",
+					completedAt = timestamp(),
+					eventType   = "run.completed"
+				);
+				eventService.publish(
+						arguments.runId,
+						"review.completed",
+						{
+							run   : unavailable.getMemento(),
+							result: this.getResult( arguments.runId )
+						}
+					);
+				return;
+			}
+			resultRepository.replaceArtifacts( arguments.runId, scan.files );
+			publishDetail(
+				arguments.runId,
+				"review.indexed",
+				{
+					filesScanned      : scan.files.len(),
+					bytesScanned      : scan.totalBytes,
+					languages         : scan.languages,
+					scope             : scan.scope,
+					skipped           : scan.skipped,
+					discoveryTruncated: scan.discoveryTruncated
+				}
+			);
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 20,
+				phase     = "architecture-index",
+				message   = "Building the content-addressed BoxLang symbol graph",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			var graphMetrics = architectureIndexService.index( arguments.runId, scan.files );
+			publishDetail(
+				arguments.runId,
+				"review.graph",
+				graphMetrics
+			);
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 30,
+				phase     = "architecture-planning",
+				message   = "Deriving evidence-backed architecture facts and a bounded review plan",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			var graph = graphRepository.getGraph( arguments.runId );
+			var deterministicArchitectureModel = architectureModelService.build(
+					graph,
+					scan.files,
+					scan.repositoryRevision
+				);
+			var architectureCacheKey = architectureEnrichmentService.cacheKey( deterministicArchitectureModel, run.getProjectPath() );
+			var reusableArchitecture = architectureRepository.findReusable(
+					run.getProjectPath(),
+					scan.repositoryRevision,
+					architectureCacheKey
+				);
+			var architectureReused = !isNull( reusableArchitecture );
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 32,
+				phase     = "architecture-planning",
+				message   = architectureReused
+					? "Reusing cached architecture; planning review crew"
+					: "Enriching architecture and planning review crew",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			var architectureModel = architectureReused
+				? new app.models.domain.ArchitectureModel( reusableArchitecture )
+				: architectureEnrichmentService.enrich( deterministicArchitectureModel ).model;
+			var architectureMemento = architectureModel.getMemento();
+			if ( !architectureReused && !len( architectureMemento.enrichment.error ) ) {
+				architectureRepository.saveReusable(
+						run.getProjectPath(),
+						scan.repositoryRevision,
+						architectureCacheKey,
+						deterministicArchitectureModel.getFingerprint(),
+						architectureMemento
+					);
+			}
+			var baselineArchitecture = architectureRepository.findBaseline( arguments.runId );
+			var architectureDiff = architectureDiffService.compare( architectureModel, baselineArchitecture );
+			var crewProposal = {
+				ok     : false,
+				source : "none",
+				summary: "",
+				tasks  : [],
+				error  : ""
+			};
+			if ( specialistReviewService.isEnabled() ) {
+				crewProposal = crewPlannerService.propose(
+						architectureModel,
+						graph,
+						scan.files,
+						{
+							authorizedRoles: run.getPolicy().allowedRoles ?: [],
+							taskLimit      : run.getBudgets().maxTasks ?: 4,
+							reviewGoal     : run.getPolicy().reviewGoal ?: ""
+						}
+					);
+			}
+			var reviewPlan = reviewPlannerService.plan(
+					architectureModel,
+					graph,
+					scan.files,
+					run.getPolicy(),
+					run.getBudgets(),
+					crewProposal
+				);
+			var planMemento = reviewPlan.getMemento();
+			architectureRepository.save(
+					arguments.runId,
+					architectureMemento,
+					planMemento,
+					architectureDiff,
+					architectureCacheKey,
+					architectureReused
+				);
+			publishDetail(
+				arguments.runId,
+				"review.plan",
+				{
+					modelVersion   : architectureMemento.version,
+					factCount      : architectureMemento.summary.factCount,
+					inferredFacts  : architectureMemento.summary.inferredFacts,
+					enrichmentUsed : architectureMemento.enrichment.used,
+					modelReused    : architectureReused,
+					diffAdded      : architectureDiff.summary.addedCount,
+					diffRemoved    : architectureDiff.summary.removedCount,
+					planVersion    : planMemento.version,
+					taskCount      : planMemento.summary.taskCount,
+					taskLimit      : planMemento.summary.taskLimit,
+					tokenBudget    : planMemento.summary.tokenBudget,
+					allocatedTokens: planMemento.summary.allocatedTokens,
+					selectedRoles  : planMemento.summary.selectedRoles,
+					crewSource     : planMemento.summary.crewSource ?: "deterministic",
+					crewSummary    : planMemento.summary.crewSummary ?: "Default crew",
+					tasks          : planMemento.tasks.map(
+							( task ) => {
+								return {
+									role     : task.role,
+									priority : task.priority,
+									objective: task.objective,
+									brief    : task.brief ?: ""
+								};
+							}
+						),
+					contextFiles    : planMemento.summary.contextFileCount,
+					contextRanges   : planMemento.summary.contextRangeCount,
+					contextLines    : planMemento.summary.contextLineCount,
+					contextTruncated: planMemento.summary.contextTruncated,
+					roles           : planMemento.summary.selectedRoles
+				}
+			);
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 40,
+				phase     = "deterministic-analysis",
+				message   = "Running evidence-based deterministic checks",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			renewOwnedLease( arguments.runId, arguments.leaseToken );
+			var findings = findingService.deterministic( scan.files );
+			publishDetail(
+				arguments.runId,
+				"review.findings",
+				{ source: "deterministic", count: findings.len() }
+			);
+
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 55,
+				phase     = "specialist-review",
+				message   = specialistReviewService.isEnabled()
+					? "Running bounded specialist agents with controlled read-only tools"
+					: "Specialist AI is not configured; retaining deterministic review",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			renewOwnedLease( arguments.runId, arguments.leaseToken );
+			var specialistRunId = arguments.runId;
+			var specialistResult = specialistReviewService.review(
+					planMemento,
+					scan.files,
+					graph,
+					{
+						runId     : specialistRunId,
+						provenance: {
+							policyFingerprint: planMemento.policyFingerprint,
+							budgetFingerprint: planMemento.budgetFingerprint,
+							planFingerprint  : planMemento.fingerprint,
+							analyzerVersion  : graph.summary.parserVersion
+						},
+						isCancelled : () => runRepository.isCancellationRequested( specialistRunId ),
+						onCheckpoint: ( result ) => specialistResultRepository.upsert( specialistRunId, result ),
+						onProgress  : ( task, detail, force ) => {
+							eventService.publishCoalesced(
+									specialistRunId,
+									"review.specialist.progress",
+									task.id,
+									{
+										run   : runRepository.find( specialistRunId ).getMemento(),
+										detail: {
+											taskId        : task.id,
+											role          : task.role,
+											stage         : detail.stage,
+											status        : detail.status ?: "",
+											attempt       : detail.attempt ?: 0,
+											charactersSeen: detail.charactersSeen ?: 0,
+											message       : detail.message ?: ""
+										}
+									},
+									specialistEventCoalesceMs,
+									force
+								);
+							if ( structKeyExists( detail, "observe" ) && isStruct( detail.observe ) ) {
+								eventService.publish(
+										specialistRunId,
+										"review.specialist.observe",
+										{
+											detail: {
+												taskId : task.id,
+												role   : task.role,
+												stage  : detail.stage ?: "",
+												status : detail.status ?: "",
+												message: detail.message ?: "",
+												observe: detail.observe
+											}
+										}
+									);
+							}
+						}
+					}
+				);
+			specialistResultRepository.replace( arguments.runId, specialistResult.results );
+			findings.append( specialistResult.findings, true );
+			publishDetail(
+				arguments.runId,
+				"review.specialists",
+				{
+					enabled       : specialistResult.enabled,
+					taskCount     : specialistResult.results.len(),
+					completedTasks: specialistResult.completedTasks,
+					failedTasks   : specialistResult.failedTasks,
+					findingCount  : specialistResult.findings.len(),
+					results       : specialistResult.results.map(
+							( item ) => {
+								return {
+									role    : item.role,
+									status  : item.status,
+									summary : left( item.summary ?: "", 200 ),
+									error   : left( item.error ?: "", 240 ),
+									findings: item.findings ?: []
+								};
+							}
+						)
+				}
+			);
+			var aiResult = specialistResult.enabled
+				? {
+					enabled       : true,
+					findings      : specialistResult.findings,
+					summary       : specialistResult.summary,
+					error         : specialistResult.error,
+					filesReviewed : specialistResult.filesReviewed,
+					charactersSent: specialistResult.charactersSent
+				}
+				: aiReviewService.review( scan.files );
+			if ( !specialistResult.enabled ) {
+				findings.append( aiResult.findings, true );
+			}
+			findings = findingService.deduplicate( findings );
+			publishDetail(
+				arguments.runId,
+				"review.findings",
+				{
+					source : specialistResult.enabled ? "specialist-agents" : "bx-ai",
+					count  : aiResult.findings.len(),
+					enabled: aiResult.enabled,
+					error  : len( aiResult.error ) ? "AI review unavailable" : ""
+				}
+			);
+
+			transition(
+				runId     = arguments.runId,
+				status    = "running",
+				progress  = 85,
+				phase     = "verifying",
+				message   = "Persisting verified findings and fingerprints",
+				eventType = "task.progress"
+			);
+			checkCancellation( arguments.runId );
+			renewOwnedLease( arguments.runId, arguments.leaseToken );
+			resultRepository.replaceFindings( arguments.runId, findings );
+			findingReviewService.reopenResolvedForRun( run, findings );
+			var summary = len( aiResult.summary )
+				? aiResult.summary
+				: buildSummary(
+					scan,
+					findings,
+					aiResult
+				);
+			resultRepository.saveSummary(
+					runId              = arguments.runId,
+					summary            = summary,
+					languages          = scan.languages,
+					filesScanned       = scan.files.len(),
+					bytesScanned       = scan.totalBytes,
+					findingsCount      = findings.len(),
+					aiEnabled          = aiResult.enabled,
+					aiFilesReviewed    = aiResult.filesReviewed,
+					aiCharactersSent   = aiResult.charactersSent,
+					reviewScope        = scan.scope,
+					repositoryRevision = scan.repositoryRevision,
+					baseRevision       = scan.baseRevision,
+					headRevision       = scan.headRevision,
+					discoveryTruncated = scan.discoveryTruncated
+				);
+			var finalStatus = len( aiResult.error ) || scan.discoveryTruncated ? "partial" : "succeeded";
+			var completedMessage = "";
+			if ( scan.discoveryTruncated ) {
+				completedMessage = "#scan.files.len()# files reviewed; discovery entry limit reached";
+			} else if ( len( aiResult.error ) ) {
+				completedMessage = "#scan.files.len()# files reviewed; #findings.len()# verified findings (AI review unavailable)";
+			} else {
+				completedMessage = "#scan.files.len()# files reviewed; #findings.len()# verified findings";
+			}
+			var completed = transition(
+				runId       = arguments.runId,
+				status      = finalStatus,
+				progress    = 100,
+				phase       = "completed",
+				message     = completedMessage,
+				completedAt = timestamp(),
+				eventType   = "run.completed"
+			);
+			eventService.publish(
+					arguments.runId,
+					"review.completed",
+					{
+						run   : completed.getMemento(),
+						result: this.getResult( arguments.runId )
+					}
+				);
+		} catch ("RunCancelled" error) {
+			completeCancelled( arguments.runId );
+		} catch ("LeaseLostException" error) {
+			log.warn(
+					"Review worker #workerId# stopped run #arguments.runId# after losing its lease"
+				);
+			return;
+		} catch (any error) {
+			if ( runRepository.isCancellationRequested( arguments.runId ) ) {
+				completeCancelled( arguments.runId );
+				return;
+			}
+			var errorReference = lCase( createUUID() );
+			runRepository.setErrorReference( arguments.runId, errorReference );
+			log.error(
+					"Review run #arguments.runId# failed (reference #errorReference#)",
+					error
+				);
+			transition(
+				runId       = arguments.runId,
+				status      = "failed",
+				progress    = 100,
+				phase       = "failed",
+				message     = "Run failed. Reference: #errorReference#",
+				completedAt = timestamp(),
+				eventType   = "run.error"
+			);
+		}
+	}
+
+	private void function enqueue( required string runId ) {
+		ensureExecutor();
+		if ( variables.activeFutures.containsKey( arguments.runId ) ) {
+			return;
+		}
+		var queuedRun = runRepository.find( arguments.runId );
+		if ( !isNull( queuedRun ) && lCase( queuedRun.getStatus() ) == "queued" ) {
+			var announced = runRepository.updateState(
+					id           = arguments.runId,
+					status       = "queued",
+					progress     = queuedRun.getProgress(),
+					currentPhase = queuedRun.getCurrentPhase(),
+					message      = "Queued for local worker"
+				);
+			eventService.publish(
+					arguments.runId,
+					"task.progress",
+					{ run: announced.getMemento() }
+				);
+		}
+		var queuedRunId = arguments.runId;
+		var leaseToken = lCase( createUUID() );
+		variables.activeLeaseTokens.put( queuedRunId, leaseToken );
+		var future = asyncRun(
+			() => {
+				try {
+					executeRun( queuedRunId, leaseToken );
+				} finally {
+					variables.activeFutures.remove( queuedRunId );
+					variables.activeLeaseTokens.remove( queuedRunId );
+				}
+			},
+			runExecutor
+		);
+		variables.activeFutures.put( arguments.runId, future );
+	}
+
+	private void function ensureExecutor() {
+		if ( variables.executorReady ) {
+			return;
+		}
+		try {
+			executorGet( runExecutor );
+		} catch (any missingExecutor) {
+			executorNew(
+				type       = "fixed",
+				name       = runExecutor,
+				maxThreads = runMaxConcurrent
+			);
+		}
+		variables.executorReady = true;
+	}
+
+	private void function checkCancellation( required string runId ) {
+		if ( runRepository.isCancellationRequested( arguments.runId ) ) {
+			throw( type = "RunCancelled", message = "Run was cancelled" );
+		}
+	}
+
+	private void function publishDetail( required string runId, required string eventType, required struct detail ) {
+		var run = runRepository.find( arguments.runId );
+		eventService.publish(
+				arguments.runId,
+				arguments.eventType,
+				{ run: run.getMemento(), detail: arguments.detail }
+			);
+	}
+
+	private string function buildSummary( required struct scan, required array findings, required struct aiResult ) {
+		var scopeMessage = "Review scope: #arguments.scan.scope#.";
+		if ( arguments.scan.discoveryTruncated ) {
+			scopeMessage &= " Discovery stopped at the configured entry limit.";
+		}
+		var aiMessage = arguments.aiResult.enabled
+			? ( len( arguments.aiResult.error ) ? " The optional AI review did not complete." : " BoxLang AI review completed." )
+			: " Configure AI_PROVIDER and AI_API_KEY to add model-assisted correlation.";
+		return "#arguments
+			.scan
+			.files
+			.len()# files across #arguments
+			.scan
+			.languages
+			.len()# languages were indexed. #"#arguments.findings.len()# evidence-backed findings were retained. #scopeMessage##aiMessage#"#";
+	}
+
+	private any function transition(
+		required string runId,
+		required string status,
+		required numeric progress,
+		required string phase,
+		required string message,
+		required string eventType,
+		string startedAt   = "",
+		string completedAt = ""
+	) {
+		assertOwnedLease( arguments.runId );
+		var run = runRepository.updateState(
+				id           = arguments.runId,
+				status       = arguments.status,
+				progress     = arguments.progress,
+				currentPhase = arguments.phase,
+				message      = arguments.message,
+				startedAt    = arguments.startedAt,
+				completedAt  = arguments.completedAt
+			);
+		eventService.publish(
+				arguments.runId,
+				arguments.eventType,
+				{ run: run.getMemento() }
+			);
+		return run;
+	}
+
+	private void function renewOwnedLease( required string runId, required string leaseToken ) {
+		if (
+			!runRepository.renewLease(
+					arguments.runId,
+					leaseTimestamp(),
+					workerId,
+					arguments.leaseToken
+				)
+		) {
+			throw(
+				type    = "LeaseLostException",
+				message = "The review worker no longer owns this run lease"
+			);
+		}
+		workerRegistryService.heartbeat( "busy", { review: true, sqliteQueue: true } );
+	}
+
+	private void function assertOwnedLease( required string runId ) {
+		if ( !variables.activeLeaseTokens.containsKey( arguments.runId ) ) {
+			return;
+		}
+		if (
+			!runRepository.ownsLease(
+					arguments.runId,
+					workerId,
+					variables.activeLeaseTokens.get( arguments.runId )
+				)
+		) {
+			throw(
+				type    = "LeaseLostException",
+				message = "The review worker no longer owns this run lease"
+			);
+		}
+	}
+
+	private void function completeCancelled( required string runId ) {
+		transition(
+			runId       = arguments.runId,
+			status      = "cancelled",
+			progress    = 100,
+			phase       = "cancelled",
+			message     = "Run cancelled",
+			completedAt = timestamp(),
+			eventType   = "run.cancelled"
+		);
+	}
+
+	private string function validateProjectPath( required string projectPath ) {
+		if ( !len( trim( arguments.projectPath ) ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "projectPath is required"
+			);
+		}
+		var candidate = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
+		if ( !candidate.exists() || !candidate.isDirectory() ) {
+			throw(
+				type    = "ValidationException",
+				message = "projectPath must be an existing directory"
+			);
+		}
+		return candidate.getPath();
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+
+	private string function leaseTimestamp() {
+		return dateTimeFormat(
+			dateAdd(
+				"s",
+				runLeaseSeconds,
+				now()
+			),
+			"iso"
+		);
+	}
+}

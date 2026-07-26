@@ -1,0 +1,105 @@
+# DoubleCheck Agent Guide
+
+DoubleCheck is a local desktop “second pair of eyes” for developers working in
+BoxLang, ColdFusion, JavaScript, and Java. Keep changes focused on that product.
+
+## Source of Truth
+
+Read only what the task needs:
+
+1. `readme.md` for product scope, setup, and supported languages.
+2. The relevant code and tests.
+3. `.docs/PRODUCT.md` and `.docs/codebase-flow.md` when present and useful.
+
+`.docs/` is gitignored local context and may not exist on another checkout. Do
+not make the application or committed documentation depend on it. Do not invent
+product claims when the README and code do not support them.
+
+Framework reference material and implementation skills live under `.agents/`.
+Load a specific guideline or skill only when the task requires it; do not treat
+the generated catalogs as project requirements.
+
+## Hard Product Boundaries
+
+- Local-only application; SQLite and analysis run on the user's machine.
+- Desktop-only workspace; narrow-window breakage is preferable to a separate
+  mobile experience.
+- Supported languages are BoxLang, ColdFusion, JavaScript, and Java only.
+- Basic review must work without an AI key. LLM specialists are optional.
+- This is a review and modernization assistant, not an automatic migrator.
+- Capability claims must reflect behavior that exists and is measured.
+
+Do not add:
+
+- SaaS or hosted multi-tenant architecture
+- accounts, login walls, tenant auth, billing, quotas, or hosted retention
+- a hosted PR-bot platform
+- mobile navigation, phone layouts, or responsive breakpoint redesigns
+- support claims or feature work for other programming languages
+- speculative framework layers, future “phases,” or duplicate product paths
+
+`prefers-reduced-motion` and ordinary desktop accessibility improvements remain
+in scope.
+
+## Architecture
+
+- `app/` — ColdBox application code
+- `app/handlers/` — HTTP handlers and versioned `/api/v1/*` endpoints
+- `app/models/services/` — review runs, findings, parsers, graph and architecture
+  analysis, planners, specialists, and quality gates
+- `app/config/` — ColdBox configuration and routes
+- `public/` — web root and desktop UI
+- `resources/apidocs/` — OpenAPI source
+- `resources/database/` — SQLite migrations
+- `tests/` — TestBox suites
+
+The database path comes from `DOUBLECHECK_DB_PATH` and defaults to
+`./.db/doublecheck.db`. `Setup.bx` creates `.env` only when it is missing.
+`SchemaService` creates the database and schema on first start when needed.
+
+Keep application code outside the public web root. Preserve the modern
+`app/`/`public/` separation and the mappings and aliases in `server.json`.
+
+## Implementation Rules
+
+- Prefer the smallest change that completes the requested behavior.
+- Extend the existing service, handler, view, and test patterns before creating
+  new abstractions.
+- Keep one clear implementation path per feature; remove or avoid parallel
+  legacy paths when safe and within scope.
+- Base UI work on the existing wide desktop composition. Do not add
+  `@media (max-width: ...)` rules to restack it for phones or tablets.
+- Use `prc` for internal request data and `rc` only for user input. Validate
+  untrusted `rc` values.
+- Use dependency injection rather than manually resolving services.
+- Keep API changes under `/api/v1/*` and update OpenAPI material when the
+  contract changes.
+- Use migrations for schema changes. Do not commit local database files,
+  secrets, generated runtime state, or `.env`.
+- Preserve basic non-LLM behavior when adding or changing AI-assisted features.
+- Follow nearby BoxLang/CFML formatting and naming rather than applying a broad
+  unrelated rewrite.
+
+## Verification
+
+Use the narrowest useful check during development, then run the relevant suite.
+Common commands:
+
+```powershell
+box install
+box run-script setup
+box server start
+box testbox run
+box run-script format
+```
+
+Do not overwrite an existing `.env`. Before handing off:
+
+- test changed behavior and important failure paths
+- confirm local-only and no-key behavior still works where affected
+- update tests and API documentation when behavior or contracts change
+- report checks that were run and any checks that could not be run
+
+Do not run `coldbox ai refresh` merely to update this file. `AGENTS.md` is
+deliberately maintained as concise project guidance; generated framework
+inventories belong under `.agents/`.

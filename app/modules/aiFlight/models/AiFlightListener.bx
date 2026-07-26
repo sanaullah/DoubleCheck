@@ -1,0 +1,795 @@
+/**
+ * BoxLang interceptor listener for bx-ai lifecycle events.
+ * Registered via BoxRegisterInterceptor — bx-ai uses BoxAnnounce, not ColdBox announce.
+ */
+
+@singleton
+class {
+	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
+
+	property name="store" inject="TraceStoreService@aiFlight";
+
+	property name="normalizer" inject="EventNormalizer@aiFlight";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="registered" type="boolean" default="false";
+
+	property name="activeTraces" type="struct";
+
+	property name="openObservations" type="struct";
+
+	property name="openSpans" type="struct";
+
+	property name="observationStarts" type="struct";
+
+	property name="inflightGens" type="struct";
+
+	property name="lastError" type="string" default="";
+
+	property name="handleCount" type="numeric" default="0";
+
+	function onDIComplete() {
+		variables.registered = false;
+		variables.activeTraces = {};
+		variables.openObservations = {
+			generation: {},
+			tool      : {},
+			span      : {}
+		};
+		variables.openSpans = {};
+		variables.observationStarts = {};
+		variables.inflightGens = {};
+		variables.lastError = "";
+		variables.handleCount = 0;
+	}
+
+	array function eventNames() {
+		return [
+			"beforeAIAgentRun",
+			"afterAIAgentRun",
+			"onAIAgentCreate",
+			"beforeAIModelInvoke",
+			"afterAIModelInvoke",
+			"onAIModelCreate",
+			"onAIProviderCreate",
+			"onMissingAiProvider",
+			"onAIChatRequest",
+			"onAIChatRequestCreate",
+			"onAIChatResponse",
+			"onAIRateLimitHit",
+			"onAIError",
+			"beforeAIEmbed",
+			"afterAIEmbed",
+			"onAIEmbedRequest",
+			"onAIEmbedResponse",
+			"beforeAIPipelineRun",
+			"afterAIPipelineRun",
+			"beforeAIToolExecute",
+			"afterAIToolExecute",
+			"onAIToolCreate",
+			"onAiLoaderCreate",
+			"onAiMemoryCreate",
+			"onAIMessageCreate",
+			"onAITransformerCreate",
+			"onAITokenCount",
+			"onHybridMemoryAdd",
+			"onVectorSearch",
+			"beforeAISpeech",
+			"afterAISpeech",
+			"beforeAITranscription",
+			"afterAITranscription",
+			"beforeAITranslation",
+			"afterAITranslation",
+			"beforeAIImageGeneration",
+			"afterAIImageGeneration",
+			"onAIImageRequest",
+			"onAIImageResponse",
+			"onMCPServerCreate",
+			"onMCPServerPause",
+			"onMCPServerRemove",
+			"onMCPServerResume",
+			"onMCPRequest",
+			"onMCPResponse",
+			"onMCPError",
+			"onMCPClientRequest",
+			"onMCPClientResponse",
+			"onMCPClientError",
+			"onAIToolRegistryRegister",
+			"onAIToolRegistryUnregister",
+			"onAIAgentRegistryRegister",
+			"onAIAgentRegistryUnregister",
+			"beforeAIWebSearch",
+			"afterAIWebSearch",
+			"onAIWebSearchRequest",
+			"onAIWebSearchResponse",
+			"onAIWebSearchError"
+		];
+	}
+
+	void function registerWithRuntime() {
+		if ( variables.registered ) {
+			return;
+		}
+		// Drop any prior registration of this instance (e.g. after fwreinit left orphans)
+		try {
+			BoxUnregisterInterceptor( this, eventNames() );
+		} catch (any e) {
+
+
+			// first load — nothing to remove
+		}
+		BoxRegisterInterceptor( this, eventNames() );
+		variables.registered = true;
+	}
+
+	struct function getStatus() {
+		return {
+			registered : variables.registered ? true : false,
+			eventCount : arrayLen( eventNames() ),
+			activeKeys : structKeyArray( variables.activeTraces ),
+			handleCount: int( val( variables.handleCount ?: 0 ) ),
+			lastError  : variables.lastError ?: ""
+		};
+	}
+
+	void function unregisterFromRuntime() {
+		if ( !variables.registered ) {
+			return;
+		}
+		try {
+			BoxUnregisterInterceptor( this );
+		} catch (any e) {
+			try {
+				BoxUnregisterInterceptor( this, arrayToList( eventNames() ) );
+			} catch (any e2) {
+
+
+				// best effort
+			}
+		}
+		variables.registered = false;
+	}
+
+	// ——— Named listeners (BoxLang invokes these by event name) ———
+
+	function beforeAIAgentRun( interceptData ) {
+		handle( "beforeAIAgentRun", asStruct( interceptData ) );
+	}
+
+	function afterAIAgentRun( interceptData ) {
+		handle( "afterAIAgentRun", asStruct( interceptData ) );
+	}
+
+	function onAIAgentCreate( interceptData ) {
+		handle( "onAIAgentCreate", asStruct( interceptData ) );
+	}
+
+	function beforeAIModelInvoke( interceptData ) {
+		handle( "beforeAIModelInvoke", asStruct( interceptData ) );
+	}
+
+	function afterAIModelInvoke( interceptData ) {
+		handle( "afterAIModelInvoke", asStruct( interceptData ) );
+	}
+
+	function onAIModelCreate( interceptData ) {
+		handle( "onAIModelCreate", asStruct( interceptData ) );
+	}
+
+	function onAIProviderCreate( interceptData ) {
+		handle( "onAIProviderCreate", asStruct( interceptData ) );
+	}
+
+	function onMissingAiProvider( interceptData ) {
+		handle( "onMissingAiProvider", asStruct( interceptData ) );
+	}
+
+	function onAIChatRequest( interceptData ) {
+		handle( "onAIChatRequest", asStruct( interceptData ) );
+	}
+
+	function onAIChatRequestCreate( interceptData ) {
+		handle( "onAIChatRequestCreate", asStruct( interceptData ) );
+	}
+
+	function onAIChatResponse( interceptData ) {
+		handle( "onAIChatResponse", asStruct( interceptData ) );
+	}
+
+	function onAIRateLimitHit( interceptData ) {
+		handle( "onAIRateLimitHit", asStruct( interceptData ) );
+	}
+
+	function onAIError( interceptData ) {
+		handle( "onAIError", asStruct( interceptData ) );
+	}
+
+	function beforeAIEmbed( interceptData ) {
+		handle( "beforeAIEmbed", asStruct( interceptData ) );
+	}
+
+	function afterAIEmbed( interceptData ) {
+		handle( "afterAIEmbed", asStruct( interceptData ) );
+	}
+
+	function onAIEmbedRequest( interceptData ) {
+		handle( "onAIEmbedRequest", asStruct( interceptData ) );
+	}
+
+	function onAIEmbedResponse( interceptData ) {
+		handle( "onAIEmbedResponse", asStruct( interceptData ) );
+	}
+
+	function beforeAIPipelineRun( interceptData ) {
+		handle( "beforeAIPipelineRun", asStruct( interceptData ) );
+	}
+
+	function afterAIPipelineRun( interceptData ) {
+		handle( "afterAIPipelineRun", asStruct( interceptData ) );
+	}
+
+	function beforeAIToolExecute( interceptData ) {
+		handle( "beforeAIToolExecute", asStruct( interceptData ) );
+	}
+
+	function afterAIToolExecute( interceptData ) {
+		handle( "afterAIToolExecute", asStruct( interceptData ) );
+	}
+
+	function onAIToolCreate( interceptData ) {
+		handle( "onAIToolCreate", asStruct( interceptData ) );
+	}
+
+	function onAiLoaderCreate( interceptData ) {
+		handle( "onAiLoaderCreate", asStruct( interceptData ) );
+	}
+
+	function onAiMemoryCreate( interceptData ) {
+		handle( "onAiMemoryCreate", asStruct( interceptData ) );
+	}
+
+	function onAIMessageCreate( interceptData ) {
+		handle( "onAIMessageCreate", asStruct( interceptData ) );
+	}
+
+	function onAITransformerCreate( interceptData ) {
+		handle( "onAITransformerCreate", asStruct( interceptData ) );
+	}
+
+	function onAITokenCount( interceptData ) {
+		handle( "onAITokenCount", asStruct( interceptData ) );
+	}
+
+	function onHybridMemoryAdd( interceptData ) {
+		handle( "onHybridMemoryAdd", asStruct( interceptData ) );
+	}
+
+	function onVectorSearch( interceptData ) {
+		handle( "onVectorSearch", asStruct( interceptData ) );
+	}
+
+	function beforeAISpeech( interceptData ) {
+		handle( "beforeAISpeech", asStruct( interceptData ) );
+	}
+
+	function afterAISpeech( interceptData ) {
+		handle( "afterAISpeech", asStruct( interceptData ) );
+	}
+
+	function beforeAITranscription( interceptData ) {
+		handle( "beforeAITranscription", asStruct( interceptData ) );
+	}
+
+	function afterAITranscription( interceptData ) {
+		handle( "afterAITranscription", asStruct( interceptData ) );
+	}
+
+	function beforeAITranslation( interceptData ) {
+		handle( "beforeAITranslation", asStruct( interceptData ) );
+	}
+
+	function afterAITranslation( interceptData ) {
+		handle( "afterAITranslation", asStruct( interceptData ) );
+	}
+
+	function beforeAIImageGeneration( interceptData ) {
+		handle( "beforeAIImageGeneration", asStruct( interceptData ) );
+	}
+
+	function afterAIImageGeneration( interceptData ) {
+		handle( "afterAIImageGeneration", asStruct( interceptData ) );
+	}
+
+	function onAIImageRequest( interceptData ) {
+		handle( "onAIImageRequest", asStruct( interceptData ) );
+	}
+
+	function onAIImageResponse( interceptData ) {
+		handle( "onAIImageResponse", asStruct( interceptData ) );
+	}
+
+	function onMCPServerCreate( interceptData ) {
+		handle( "onMCPServerCreate", asStruct( interceptData ) );
+	}
+
+	function onMCPServerPause( interceptData ) {
+		handle( "onMCPServerPause", asStruct( interceptData ) );
+	}
+
+	function onMCPServerRemove( interceptData ) {
+		handle( "onMCPServerRemove", asStruct( interceptData ) );
+	}
+
+	function onMCPServerResume( interceptData ) {
+		handle( "onMCPServerResume", asStruct( interceptData ) );
+	}
+
+	function onMCPRequest( interceptData ) {
+		handle( "onMCPRequest", asStruct( interceptData ) );
+	}
+
+	function onMCPResponse( interceptData ) {
+		handle( "onMCPResponse", asStruct( interceptData ) );
+	}
+
+	function onMCPError( interceptData ) {
+		handle( "onMCPError", asStruct( interceptData ) );
+	}
+
+	function onMCPClientRequest( interceptData ) {
+		handle( "onMCPClientRequest", asStruct( interceptData ) );
+	}
+
+	function onMCPClientResponse( interceptData ) {
+		handle( "onMCPClientResponse", asStruct( interceptData ) );
+	}
+
+	function onMCPClientError( interceptData ) {
+		handle( "onMCPClientError", asStruct( interceptData ) );
+	}
+
+	function onAIToolRegistryRegister( interceptData ) {
+		handle( "onAIToolRegistryRegister", asStruct( interceptData ) );
+	}
+
+	function onAIToolRegistryUnregister( interceptData ) {
+		handle( "onAIToolRegistryUnregister", asStruct( interceptData ) );
+	}
+
+	function onAIAgentRegistryRegister( interceptData ) {
+		handle( "onAIAgentRegistryRegister", asStruct( interceptData ) );
+	}
+
+	function onAIAgentRegistryUnregister( interceptData ) {
+		handle( "onAIAgentRegistryUnregister", asStruct( interceptData ) );
+	}
+
+	function beforeAIWebSearch( interceptData ) {
+		handle( "beforeAIWebSearch", asStruct( interceptData ) );
+	}
+
+	function afterAIWebSearch( interceptData ) {
+		handle( "afterAIWebSearch", asStruct( interceptData ) );
+	}
+
+	function onAIWebSearchRequest( interceptData ) {
+		handle( "onAIWebSearchRequest", asStruct( interceptData ) );
+	}
+
+	function onAIWebSearchResponse( interceptData ) {
+		handle( "onAIWebSearchResponse", asStruct( interceptData ) );
+	}
+
+	function onAIWebSearchError( interceptData ) {
+		handle( "onAIWebSearchError", asStruct( interceptData ) );
+	}
+
+	/**
+	 * Generic entry used when BoxLang invokes by method name matching the event.
+	 * Each named listener below delegates here.
+	 */
+	private void function handle( required string eventName, required struct interceptData ) {
+		variables.handleCount = int( val( variables.handleCount ?: 0 ) ) + 1;
+		try {
+			if ( !flag( moduleSettings.enabled ?: true ) ) {
+				return;
+			}
+			if ( !normalizer.shouldCapture( arguments.eventName ) ) {
+				return;
+			}
+			var mapped = normalizer.forEvent( arguments.eventName, arguments.interceptData );
+			persistMapped( mapped, arguments.interceptData );
+			variables.lastError = "";
+		} catch (any e) {
+			variables.lastError = "#arguments.eventName#: #e.message# #e.detail ?: ""#";
+			try {
+				log.warn(
+						"ai-flight handle(#arguments.eventName#) failed: #e.message#"
+					);
+			} catch (any logErr) {
+
+
+				// ignore logger failures
+			}
+		}
+	}
+
+	private boolean function flag( any value ) {
+		return yesNoFormat( isNull( arguments.value ) ? false : arguments.value ) == "Yes";
+	}
+
+	private void function persistMapped( required struct mapped, required struct interceptData ) {
+		var sessionKey = sessionIdFor( arguments.interceptData );
+		var requestKey = requestKeyFor( arguments.interceptData, sessionKey );
+		var hasOpenSpan = len( variables.openSpans[ requestKey ] ?: "" );
+		var traceId = variables.activeTraces[ requestKey ] ?: "";
+		var isMergeOnly = flag( arguments.mapped.mergeUsage ?: false );
+		var openStandaloneGen = flag( arguments.mapped.openGen ?: false ) && flag( arguments.mapped.openTrace ?: false ) && !hasOpenSpan;
+
+		if ( !len( traceId ) && isMergeOnly && !flag( arguments.mapped.openTrace ?: false ) ) {
+			return;
+		}
+
+		// Standalone generations each get their own trace, shared session
+		if ( openStandaloneGen || ( ( flag( arguments.mapped.openTrace ?: false ) || !len( traceId ) ) && !hasOpenSpan ) ) {
+			var trace = store.createTrace(
+					{
+						name       : arguments.mapped.traceName ?: arguments.mapped.name ?: "ai",
+						sessionId  : sessionKey,
+						userId     : toString( arguments.interceptData.userId ?: "" ),
+						environment: toString(
+							arguments.interceptData.environment ?: arguments.interceptData.env ?: ""
+						),
+						provider    : arguments.mapped.provider ?: "",
+						model       : arguments.mapped.model ?: "",
+						inputPreview: arguments.mapped.inputText ?: "",
+						status      : "running",
+						metadata    : (
+								structKeyExists( arguments.interceptData, "metadata" ) && isStruct( arguments.interceptData.metadata )
+							)
+							? arguments.interceptData.metadata
+							: {}
+					}
+				);
+			traceId = trace.id;
+			if ( !openStandaloneGen ) {
+				variables.activeTraces[ requestKey ] = traceId;
+			}
+		} else if ( hasOpenSpan && !len( traceId ) ) {
+			// should not happen; span always sets activeTraces
+			return;
+		} else if ( hasOpenSpan ) {
+			traceId = variables.activeTraces[ requestKey ];
+		}
+
+		var observationId = "";
+		var openKey = openBucketKey( arguments.mapped );
+		var parentId = currentParentId( requestKey, arguments.mapped );
+		var flight = {};
+
+		if ( flag( arguments.mapped.openSpan ?: false ) ) {
+			observationId = createUUID();
+			variables.openObservations.span[ requestKey ] = observationId;
+			variables.openSpans[ requestKey ] = observationId;
+			variables.observationStarts[ observationId ] = getTickCount();
+			variables.activeTraces[ requestKey ] = traceId;
+		} else if ( openStandaloneGen ) {
+			observationId = createUUID();
+			variables.observationStarts[ observationId ] = getTickCount();
+			if ( !structKeyExists( variables.inflightGens, sessionKey ) ) {
+				variables.inflightGens[ sessionKey ] = [];
+			}
+			variables.inflightGens[ sessionKey ].append(
+					{
+						traceId      : traceId,
+						observationId: observationId,
+						startTick    : variables.observationStarts[ observationId ]
+					}
+				);
+		} else if ( flag( arguments.mapped.openGen ?: false ) || flag( arguments.mapped.openTool ?: false ) ) {
+			observationId = createUUID();
+			variables.openObservations[ openKey ][ requestKey ] = observationId;
+			variables.observationStarts[ observationId ] = getTickCount();
+		} else if ( flag( arguments.mapped.closeGen ?: false ) && !hasOpenSpan ) {
+			flight = popInflightGen( sessionKey );
+			if ( !flight.count() ) {
+				flight = recoverInflightGen( sessionKey, arguments.mapped );
+			}
+			if ( flight.count() ) {
+				traceId = flight.traceId;
+				observationId = flight.observationId;
+				if ( int( val( flight.startTick ?: 0 ) ) > 0 ) {
+					variables.observationStarts[ observationId ] = flight.startTick;
+				}
+			}
+		} else if (
+			flag( arguments.mapped.closeSpan ?: false ) || flag( arguments.mapped.closeGen ?: false ) ||
+					flag( arguments.mapped.closeTool ?: false ) ||
+				flag( arguments.mapped.mergeUsage ?: false )
+		) {
+			if ( flag( arguments.mapped.closeSpan ?: false ) ) {
+				observationId = variables.openObservations.span[ requestKey ] ?: "";
+			} else if ( flag( arguments.mapped.mergeUsage ?: false ) && !hasOpenSpan ) {
+				flight = peekInflightGen( sessionKey );
+				if ( !flight.count() ) {
+					flight = recoverInflightGen( sessionKey, arguments.mapped );
+				}
+				if ( flight.count() ) {
+					traceId = flight.traceId;
+					observationId = flight.observationId;
+				}
+			} else {
+				observationId = variables.openObservations[ openKey ][ requestKey ] ?: "";
+			}
+		}
+
+		if ( flag( arguments.mapped.mergeUsage ?: false ) && len( observationId ) ) {
+			store.updateObservation(
+					observationId,
+					{
+						usage : arguments.mapped.usage ?: {},
+						status: "ok"
+					}
+				);
+			store.addTraceUsage( traceId, arguments.mapped.usage ?: {} );
+			return;
+		}
+
+		if ( flag( arguments.mapped.mergeUsage ?: false ) && !len( observationId ) ) {
+			return;
+		}
+
+		if ( !len( traceId ) ) {
+			return;
+		}
+
+		var closing = flag( arguments.mapped.closeSpan ?: false ) || flag( arguments.mapped.closeGen ?: false ) ||
+			flag( arguments.mapped.closeTool ?: false );
+
+		var durationMs = 0;
+		if ( closing && len( observationId ) && structKeyExists( variables.observationStarts, observationId ) ) {
+			durationMs = max(
+				0,
+				getTickCount() - variables.observationStarts[ observationId ]
+			);
+		} else if ( closing && len( observationId ) && flag( flight.recovered ?: false ) ) {
+			durationMs = durationFromIso( flight.startIso ?: "" );
+		}
+
+		var obs = {
+			id                 : len( observationId ) ? observationId : createUUID(),
+			traceId            : traceId,
+			parentObservationId: parentId,
+			type               : arguments.mapped.type ?: "event",
+			name               : arguments.mapped.name ?: arguments.mapped.sourceEvent,
+			status             : (
+					!closing &&
+						(
+							flag( arguments.mapped.openGen ?: false ) || flag( arguments.mapped.openTool ?: false ) ||
+								flag( arguments.mapped.openSpan ?: false )
+						)
+				)
+				? "running"
+				: ( arguments.mapped.status ?: "ok" ),
+			model      : arguments.mapped.model ?: "",
+			provider   : arguments.mapped.provider ?: "",
+			inputText  : arguments.mapped.inputText ?: "",
+			outputText : arguments.mapped.outputText ?: "",
+			usage      : arguments.mapped.usage ?: {},
+			level      : arguments.mapped.level ?: "DEFAULT",
+			sourceEvent: arguments.mapped.sourceEvent,
+			payload    : arguments.mapped.payload ?: {},
+			startTime  : arguments.mapped.startTime ?: "",
+			endTime    : arguments.mapped.endTime ?: "",
+			durationMs : durationMs
+		};
+
+		if ( closing && len( observationId ) ) {
+			store.upsertObservation( obs );
+			if ( flag( arguments.mapped.closeSpan ?: false ) ) {
+				structDelete( variables.openObservations.span, requestKey );
+				structDelete( variables.openSpans, requestKey );
+			} else if ( !( flag( arguments.mapped.closeGen ?: false ) && !hasOpenSpan ) ) {
+				structDelete( variables.openObservations[ openKey ], requestKey );
+			}
+			structDelete( variables.observationStarts, observationId );
+			if ( structKeyExists( arguments.mapped, "usage" ) ) {
+				store.addTraceUsage( traceId, arguments.mapped.usage );
+			}
+		} else {
+			store.upsertObservation( obs );
+		}
+
+		if ( flag( arguments.mapped.markError ?: false ) ) {
+			store.completeTrace(
+					id           = traceId,
+					status       = "error",
+					errorMessage = arguments.mapped.outputText ?: "AI error",
+					durationMs   = durationMs
+				);
+		}
+
+		if ( flag( arguments.mapped.closeTrace ?: false ) ) {
+			store.completeTrace(
+					id            = traceId,
+					status        = arguments.mapped.status == "error" ? "error" : "ok",
+					outputPreview = arguments.mapped.outputText ?: "",
+					durationMs    = durationMs,
+					usage         = arguments.mapped.usage ?: {}
+				);
+			if ( !( flag( arguments.mapped.closeGen ?: false ) && !hasOpenSpan ) ) {
+				structDelete( variables.activeTraces, requestKey );
+				structDelete( variables.openSpans, requestKey );
+				structDelete( variables.openObservations.generation, requestKey );
+				structDelete( variables.openObservations.tool, requestKey );
+				structDelete( variables.openObservations.span, requestKey );
+			}
+		}
+	}
+
+	private struct function popInflightGen( required string sessionKey ) {
+		var stack = variables.inflightGens[ arguments.sessionKey ] ?: [];
+		if ( !arrayLen( stack ) ) {
+			return {};
+		}
+		var item = stack[ arrayLen( stack ) ];
+		arrayDeleteAt( stack, arrayLen( stack ) );
+		variables.inflightGens[ arguments.sessionKey ] = stack;
+		return item;
+	}
+
+	private struct function peekInflightGen( required string sessionKey ) {
+		var stack = variables.inflightGens[ arguments.sessionKey ] ?: [];
+		if ( !arrayLen( stack ) ) {
+			return {};
+		}
+		return stack[ arrayLen( stack ) ];
+	}
+
+	/**
+	 * Re-attach a close/token event after fwreinit cleared inflightGens.
+	 * Prefer session+name, then session, then name-only latest running generation.
+	 */
+	private struct function recoverInflightGen( required string sessionKey, required struct mapped ) {
+		var name = trim(
+			toString( arguments.mapped.traceName ?: arguments.mapped.name ?: "" )
+		);
+		var trace = {};
+		if ( len( arguments.sessionKey ) && len( name ) ) {
+			trace = store.findLatestRunningTrace( sessionId = arguments.sessionKey, name = name );
+		}
+		if ( !trace.count() && len( arguments.sessionKey ) ) {
+			trace = store.findLatestRunningTrace( sessionId = arguments.sessionKey );
+		}
+		if ( !trace.count() && len( name ) ) {
+			trace = store.findLatestRunningTrace( name = name );
+		}
+		if ( !trace.count() ) {
+			trace = store.findLatestRunningTrace();
+		}
+		if ( !trace.count() ) {
+			return {};
+		}
+		var obs = store.findRunningGeneration( trace.id );
+		var observationId = len( toString( obs.id ?: "" ) ) ? toString( obs.id ) : createUUID();
+		var startIso = toString( obs.startTime ?: trace.startedAt ?: "" );
+		return {
+			traceId      : trace.id,
+			observationId: observationId,
+			startTick    : 0,
+			startIso     : startIso,
+			recovered    : true
+		};
+	}
+
+	private numeric function durationFromIso( required string startIso ) {
+		var raw = trim( arguments.startIso );
+		if ( !len( raw ) ) {
+			return 0;
+		}
+		try {
+			var cleaned = replaceNoCase(
+				replace(
+					raw,
+					"T",
+					" "
+				),
+				"Z",
+				""
+			);
+			if ( find( ".", cleaned ) ) {
+				cleaned = listFirst( cleaned, "." );
+			}
+			var started = parseDateTime( cleaned );
+			return max(
+				0,
+				dateDiff(
+						"s",
+						started,
+						now()
+					) *
+					1000
+			);
+		} catch (any e) {
+			return 0;
+		}
+	}
+
+	private string function sessionIdFor( required struct interceptData ) {
+		var conversationId = toString( arguments.interceptData.conversationId ?: "" );
+		if ( len( conversationId ) ) {
+			return conversationId;
+		}
+		if ( !structKeyExists( request, "aiFlightSessionId" ) ) {
+			request.aiFlightSessionId = createUUID();
+		}
+		return request.aiFlightSessionId;
+	}
+
+	private string function requestKeyFor( required struct interceptData, string sessionKey = "" ) {
+		var parts = [
+			toString( arguments.interceptData.conversationId ?: "" ),
+			toString( arguments.interceptData.userId ?: "" ),
+			toString( arguments.interceptData.requestId ?: "" )
+		];
+		var joined = parts.toList( "|" );
+		if (
+			len( replace(
+					joined,
+					"|",
+					"",
+					"all"
+				) )
+		) {
+			return joined;
+		}
+		if ( !structKeyExists( request, "aiFlightTraceKey" ) ) {
+			request.aiFlightTraceKey = len( arguments.sessionKey ) ? arguments.sessionKey : createUUID();
+		}
+		return request.aiFlightTraceKey;
+	}
+
+	private string function currentParentId( required string requestKey, required struct mapped ) {
+		if ( flag( arguments.mapped.openSpan ?: false ) ) {
+			return "";
+		}
+		if ( flag( arguments.mapped.openGen ?: false ) ) {
+			return variables.openSpans[ arguments.requestKey ] ?: "";
+		}
+		if ( flag( arguments.mapped.openTool ?: false ) ) {
+			var genId = variables.openObservations.generation[ arguments.requestKey ] ?: "";
+			if ( len( genId ) ) {
+				return genId;
+			}
+			return variables.openSpans[ arguments.requestKey ] ?: "";
+		}
+		return "";
+	}
+
+	private string function openBucketKey( required struct mapped ) {
+		if (
+			( arguments.mapped.type ?: "" ) == "tool" || flag( arguments.mapped.openTool ?: false ) ||
+				flag( arguments.mapped.closeTool ?: false )
+		) {
+			return "tool";
+		}
+		if (
+			( arguments.mapped.type ?: "" ) == "generation" || flag( arguments.mapped.openGen ?: false ) ||
+				flag( arguments.mapped.closeGen ?: false )
+		) {
+			return "generation";
+		}
+		return "span";
+	}
+
+	private struct function asStruct( required any data ) {
+		if ( isNull( arguments.data ) ) {
+			return {};
+		}
+		if ( isStruct( arguments.data ) ) {
+			return arguments.data;
+		}
+		return { value: arguments.data };
+	}
+}

@@ -1,0 +1,385 @@
+/**
+ * Exports a run result as Markdown, JSON, or SARIF.
+ */
+
+@singleton
+class {
+	variables.supportedFormats = [ "json", "markdown", "sarif"];
+	variables.sarifLevels = {
+		critical: "error",
+		high    : "error",
+		medium  : "warning",
+		low     : "note",
+		info    : "note"
+	};
+
+	/**
+	 * Build a downloadable report for a completed review run.
+	 *
+	 * @run Run memento from ReviewRun.getMemento()
+	 * @result Aggregated result from ReviewRunService.getResult()
+	 * @format One of json, markdown, sarif
+	 */
+	struct function export( required struct run, required struct result, string format = "markdown" ) {
+		var normalized = lCase( trim( arguments.format ) );
+		if ( !variables.supportedFormats.contains( normalized ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "Unsupported export format. Use json, markdown, or sarif."
+			);
+		}
+
+		var runToken = left(
+			reReplace(
+				arguments.run.id ?: "report",
+				"[^a-zA-Z0-9]",
+				"",
+				"all"
+			),
+			12
+		);
+		if ( !len( runToken ) ) {
+			runToken = "report";
+		}
+
+		switch ( normalized ) {
+			case "json":
+				return package(
+					normalized,
+					"application/json",
+					"doublecheck-#runToken#.json",
+					toJson( arguments.run, arguments.result )
+				);
+			case "sarif":
+				return package(
+					normalized,
+					"application/sarif+json",
+					"doublecheck-#runToken#.sarif.json",
+					toSarif( arguments.run, arguments.result )
+				);
+			default:
+				return package(
+					normalized,
+					"text/markdown; charset=utf-8",
+					"doublecheck-#runToken#.md",
+					toMarkdown( arguments.run, arguments.result )
+				);
+		}
+	}
+
+	array function supportedFormats() {
+		return duplicate( variables.supportedFormats );
+	}
+
+	string function toJson( required struct run, required struct result ) {
+		return jsonSerialize(
+			{
+				schemaVersion: "doublecheck-report-v1",
+				generatedAt  : dateTimeFormat( now(), "iso" ),
+				run          : {
+					id          : arguments.run.id ?: "",
+					projectPath : arguments.run.projectPath ?: "",
+					mode        : arguments.run.mode ?: "",
+					status      : arguments.run.status ?: "",
+					baseRevision: arguments.run.baseRevision ?: "",
+					headRevision: arguments.run.headRevision ?: "",
+					createdAt   : arguments.run.createdAt ?: "",
+					completedAt : arguments.run.completedAt ?: ""
+				},
+				summary: {
+					text              : arguments.result.summary ?: "",
+					languages         : duplicate( arguments.result.languages ?: [] ),
+					filesScanned      : arguments.result.filesScanned ?: 0,
+					bytesScanned      : arguments.result.bytesScanned ?: 0,
+					findingsCount     : arguments.result.findingsCount ?: 0,
+					aiEnabled         : arguments.result.aiEnabled ?: false,
+					aiFilesReviewed   : arguments.result.aiFilesReviewed ?: 0,
+					aiCharactersSent  : arguments.result.aiCharactersSent ?: 0,
+					reviewScope       : arguments.result.reviewScope ?: "",
+					repositoryRevision: arguments.result.repositoryRevision ?: "",
+					baseRevision      : arguments.result.baseRevision ?: "",
+					headRevision      : arguments.result.headRevision ?: ""
+				},
+				findings: ( arguments.result.findings ?: [] ).map(
+						( finding ) => {
+							var row = {
+								id         : finding.id ?: "",
+								fingerprint: finding.fingerprint ?: "",
+								category   : finding.category ?: "",
+								ruleId     : finding.ruleId ?: "",
+								severity   : finding.severity ?: "",
+								confidence : finding.confidence ?: 0,
+								title      : finding.title ?: "",
+								message    : finding.message ?: "",
+								filePath   : finding.filePath ?: "",
+								startLine  : finding.startLine ?: 0,
+								endLine    : finding.endLine ?: 0,
+								evidence   : finding.evidence ?: "",
+								suggestion : finding.suggestion ?: "",
+								source     : finding.source ?: ""
+							};
+							if ( len( finding.baselineStatus ?: "" ) ) {
+								row.baselineStatus = finding.baselineStatus;
+							}
+							if ( isStruct( finding.playbook ?: "" ) ) {
+								row.playbook = finding.playbook;
+							}
+							if ( isStruct( finding.fixPatch ?: "" ) ) {
+								row.fixPatch = finding.fixPatch;
+							}
+							return row;
+						}
+					),
+				baseline: !isNull( arguments.result.baseline ?: javacast( "null", "" ) )
+					? duplicate( arguments.result.baseline )
+					: javacast( "null", "" ),
+				fixedFindings: duplicate( arguments.result.fixedFindings ?: [] )
+			}
+		);
+	}
+
+	string function toMarkdown( required struct run, required struct result ) {
+		var findings = arguments.result.findings ?: [];
+		var lines = [];
+		lines.append( mdHeading( 2, "DoubleCheck Review Report" ) );
+		lines.append( "" );
+		lines.append( "- **Run:** `" & ( arguments.run.id ?: "" ) & "`" );
+		lines.append(
+				"- **Repository:** `" & escapeMarkdown( arguments.run.projectPath ?: "" ) & "`"
+			);
+		lines.append( "- **Mode:** `" & ( arguments.run.mode ?: "" ) & "`" );
+		lines.append( "- **Status:** `" & ( arguments.run.status ?: "" ) & "`" );
+		lines.append(
+				"- **Scope:** `" & escapeMarkdown( arguments.result.reviewScope ?: "-" ) & "`"
+			);
+		if ( len( arguments.result.repositoryRevision ?: "" ) ) {
+			lines.append( "- **Revision:** `" & arguments.result.repositoryRevision & "`" );
+		}
+		lines.append(
+				"- **Files scanned:** `" & ( arguments.result.filesScanned ?: 0 ) & "`"
+			);
+		lines.append(
+				"- **Languages:** `" & arrayToList( arguments.result.languages ?: [], ", " ) & "`"
+			);
+		lines.append( "- **Findings:** `" & findings.len() & "`" );
+		if ( !isNull( arguments.result.baseline ?: javacast( "null", "" ) ) ) {
+			var baseline = arguments.result.baseline;
+			var counts = baseline.counts ?: {};
+			lines.append( "- **Baseline:** `" & ( counts.new ?: 0 ) & " new · " & ( counts.unchanged ?: 0 ) & " unchanged · " & (
+						counts.fixed ?: 0
+					) & " fixed` vs run `" & ( baseline.runId ?: "" ) & "` (`" & ( baseline.status ?: "" ) & "`)" );
+		} else {
+			lines.append( "- **Baseline:** `No prior run to compare`" );
+		}
+		lines.append( "" );
+		lines.append( mdHeading( 3, "Summary" ) );
+		lines.append( "" );
+		lines.append(
+				escapeMarkdown( arguments.result.summary ?: "No summary available." )
+			);
+		lines.append( "" );
+
+		if ( !findings.len() ) {
+			lines.append( mdHeading( 3, "Findings" ) );
+			lines.append( "" );
+			lines.append( "No evidence-backed findings were retained." );
+			return arrayToList( lines, char( 10 ) );
+		}
+
+		lines.append( mdHeading( 3, "Findings" ) );
+		lines.append( "" );
+		var index = 1;
+		for ( var finding in findings ) {
+			lines.append(
+					mdHeading( 4, index & ". " & escapeMarkdown( finding.title ?: "Untitled finding" ) )
+				);
+			lines.append( "" );
+			lines.append( "- **Severity:** `" & ( finding.severity ?: "info" ) & "` · **Source:** `" & (
+						finding.source ?: ""
+					) & "` · **Rule:** `" & ( finding.ruleId ?: "" ) & "`" );
+			lines.append(
+					"- **Location:** `" & escapeMarkdown( finding.filePath ?: "" ) & ":" & ( finding.startLine ?: 0 ) & "`"
+				);
+			if ( len( finding.fingerprint ?: "" ) ) {
+				lines.append( "- **Fingerprint:** `" & finding.fingerprint & "`" );
+			}
+			if ( len( finding.baselineStatus ?: "" ) ) {
+				lines.append( "- **Baseline status:** `" & finding.baselineStatus & "`" );
+			}
+			lines.append( "" );
+			lines.append( escapeMarkdown( finding.message ?: "" ) );
+			if ( len( finding.evidence ?: "" ) ) {
+				lines.append( "" );
+				lines.append( "```" );
+				lines.append( finding.evidence );
+				lines.append( "```" );
+			}
+			if ( len( finding.suggestion ?: "" ) ) {
+				lines.append( "" );
+				lines.append( "**Suggestion:** " & escapeMarkdown( finding.suggestion ) );
+			}
+			if ( isStruct( finding.playbook ?: "" ) && isArray( finding.playbook.steps ?: "" ) ) {
+				lines.append( "" );
+				lines.append( "**How to fix:**" );
+				var stepIndex = 1;
+				for ( var step in finding.playbook.steps ) {
+					lines.append( stepIndex & ". " & escapeMarkdown( step ) );
+					stepIndex++;
+				}
+				if ( len( finding.playbook.example ?: "" ) ) {
+					lines.append( "" );
+					lines.append( "Example:" );
+					lines.append( "```" );
+					lines.append( finding.playbook.example );
+					lines.append( "```" );
+				}
+			}
+			if ( isStruct( finding.fixPatch ?: "" ) ) {
+				lines.append( "" );
+				lines.append( "**Suggested change:**" );
+				lines.append( "" );
+				lines.append( "Before:" );
+				lines.append( "```" );
+				lines.append( finding.fixPatch.before ?: "" );
+				lines.append( "```" );
+				lines.append( "" );
+				lines.append( "After:" );
+				lines.append( "```" );
+				lines.append( finding.fixPatch.after ?: "" );
+				lines.append( "```" );
+			}
+			lines.append( "" );
+			index++;
+		}
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	string function toSarif( required struct run, required struct result ) {
+		var findings = arguments.result.findings ?: [];
+		var rulesById = {};
+		var results = [];
+
+		for ( var finding in findings ) {
+			var ruleId = len( finding.ruleId ?: "" ) ? finding.ruleId : "doublecheck/unspecified";
+			if ( !structKeyExists( rulesById, ruleId ) ) {
+				rulesById[ ruleId ] = {
+					id              : ruleId,
+					name            : finding.title ?: ruleId,
+					shortDescription: { text: finding.title ?: ruleId },
+					fullDescription : { text: finding.message ?: ( finding.title ?: ruleId ) },
+					properties      : {
+						category: finding.category ?: "",
+						tags    : [ finding.category ?: "doublecheck"]
+					}
+				};
+			}
+
+			var startLine = max( 1, int( finding.startLine ?: 1 ) );
+			var endLine = max( startLine, int( finding.endLine ?: startLine ) );
+			results.append(
+					{
+						ruleId   : ruleId,
+						level    : variables.sarifLevels[ finding.severity ?: "info" ] ?: "note",
+						message  : { text: finding.message ?: ( finding.title ?: ruleId ) },
+						locations: [
+							{
+								physicalLocation: {
+									artifactLocation: { uri: finding.filePath ?: "" },
+									region          : {
+										startLine: startLine,
+										endLine  : endLine
+									}
+								}
+							}
+						],
+						fingerprints: { "doublecheck/v1": finding.fingerprint ?: "" },
+						properties  : {
+							title         : finding.title ?: "",
+							category      : finding.category ?: "",
+							confidence    : finding.confidence ?: 0,
+							source        : finding.source ?: "",
+							evidence      : finding.evidence ?: "",
+							suggestion    : finding.suggestion ?: "",
+							findingId     : finding.id ?: "",
+							baselineStatus: finding.baselineStatus ?: "",
+							fixPatchAfter : isStruct( finding.fixPatch ?: "" ) ? ( finding.fixPatch.after ?: "" ) : ""
+						}
+					}
+				);
+		}
+
+		var rules = [];
+		for ( var key in rulesById ) {
+			rules.append( rulesById[ key ] );
+		}
+
+		return jsonSerialize(
+			{
+				"$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+				version  : "2.1.0",
+				runs     : [
+					{
+						tool: {
+							driver: {
+								name          : "DoubleCheck",
+								version       : "1.0.0",
+								informationUri: "https://github.com/ortus-solutions",
+								rules         : rules
+							}
+						},
+						invocations: [
+							{
+								executionSuccessful: true,
+								commandLine        : "doublecheck review",
+								arguments          : [ arguments.run.mode ?: "working-tree", arguments.run.projectPath ?: ""]
+							}
+						],
+						properties: {
+							runId             : arguments.run.id ?: "",
+							projectPath       : arguments.run.projectPath ?: "",
+							mode              : arguments.run.mode ?: "",
+							status            : arguments.run.status ?: "",
+							reviewScope       : arguments.result.reviewScope ?: "",
+							repositoryRevision: arguments.result.repositoryRevision ?: "",
+							filesScanned      : arguments.result.filesScanned ?: 0,
+							findingsCount     : findings.len()
+						},
+						results: results
+					}
+				]
+			}
+		);
+	}
+
+	private struct function package(
+		required string format,
+		required string contentType,
+		required string fileName,
+		required string content
+	) {
+		return {
+			format     : arguments.format,
+			contentType: arguments.contentType,
+			fileName   : arguments.fileName,
+			content    : arguments.content
+		};
+	}
+
+	private string function mdHeading( required numeric level, required string text ) {
+		return repeatString( char( 35 ), arguments.level ) & " " & arguments.text;
+	}
+
+	private string function escapeMarkdown( required string value ) {
+		return replace(
+			replace(
+				arguments.value,
+				"`",
+				"'",
+				"all"
+			),
+			char( 13 ),
+			"",
+			"all"
+		);
+	}
+}

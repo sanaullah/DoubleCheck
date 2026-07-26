@@ -1,0 +1,634 @@
+/**
+ * Read-optimized historical run summaries and fingerprint comparisons.
+ *
+ * Existing run, result, specialist, and observability records remain the
+ * sources of truth. Nothing in this service writes derived history state.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	property name="runRepository" inject="ReviewRunRepository";
+
+	property name="resultRepository" inject="ReviewResultRepository";
+
+	property name="observabilityTraceService" inject="ObservabilityTraceService";
+
+	struct function listScoped( required struct context, struct filters = {} ) {
+		var projectId = trim( arguments.filters.projectId ?: "" );
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				projectId
+			);
+		var page = max( 1, int( val( arguments.filters.page ?: 1 ) ) );
+		var limit = min(
+			100,
+			max( 1, int( val( arguments.filters.limit ?: 20 ) ) )
+		);
+		var whereParts = [ "r.tenant_id = :tenantId"];
+		var params = {
+			tenantId: arguments.context.tenantId,
+			limit   : { value: limit, sqltype: "INTEGER" },
+			offset  : { value: ( page - 1 ) * limit, sqltype: "INTEGER" }
+		};
+
+		addExactFilter(
+			whereParts,
+			params,
+			"r.project_id",
+			"projectId",
+			projectId
+		);
+		addExactFilter(
+			whereParts,
+			params,
+			"r.project_path",
+			"projectPath",
+			trim( arguments.filters.projectPath ?: "" )
+		);
+		addAllowlistedFilter(
+			whereParts,
+			params,
+			"r.mode",
+			"mode",
+			lCase( trim( arguments.filters.mode ?: "" ) ),
+			[ "working-tree", "revision-diff", "full"]
+		);
+		addAllowlistedFilter(
+			whereParts,
+			params,
+			"r.status",
+			"status",
+			lCase( trim( arguments.filters.status ?: "" ) ),
+			[
+				"queued",
+				"running",
+				"succeeded",
+				"partial",
+				"failed",
+				"cancelled"
+			]
+		);
+		if ( len( trim( arguments.filters.from ?: "" ) ) ) {
+			whereParts.append( "r.created_at >= :fromDate" );
+			params.fromDate = trim( arguments.filters.from );
+		}
+		if ( len( trim( arguments.filters.to ?: "" ) ) ) {
+			whereParts.append( "r.created_at <= :toDate" );
+			params.toDate = trim( arguments.filters.to );
+		}
+		var search = trim( arguments.filters.q ?: "" );
+		if ( len( search ) ) {
+			whereParts.append(
+					"( lower(r.project_path) LIKE :search OR lower(r.id) LIKE :search OR lower(r.message) LIKE :search )"
+				);
+			params.search = "%#lCase( search )#%";
+		}
+
+		var sortMap = {
+			created : "r.created_at",
+			duration: "r.completed_at",
+			findings: "COALESCE(s.findings_count, 0)",
+			status  : "r.status"
+		};
+		var sort = lCase( trim( arguments.filters.sort ?: "created" ) );
+		var direction = lCase( trim( arguments.filters.direction ?: "desc" ) ) == "asc" ? "ASC" : "DESC";
+		var orderColumn = sortMap[ sort ] ?: sortMap.created;
+		var whereSql = whereParts.toList( " AND " );
+		var records = queryExecute(
+			"
+				SELECT
+					r.*,
+					s.files_scanned,
+					s.bytes_scanned,
+					s.findings_count,
+					s.languages,
+					s.ai_enabled,
+					COALESCE(f.critical_count, 0) AS critical_count,
+					COALESCE(f.high_count, 0) AS high_count,
+					COALESCE(f.medium_count, 0) AS medium_count,
+					COALESCE(f.low_count, 0) AS low_count,
+					COALESCE(f.info_count, 0) AS info_count,
+					COALESCE(sp.task_count, 0) AS specialist_count,
+					COALESCE(sp.completed_count, 0) AS specialist_completed,
+					COALESCE(sp.failed_count, 0) AS specialist_failed,
+					COALESCE(sp.roles, '') AS specialist_roles
+				FROM review_runs r
+				LEFT JOIN review_summaries s ON s.run_id = r.id
+				LEFT JOIN (
+					SELECT run_id,
+						SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS critical_count,
+						SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) AS high_count,
+						SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) AS medium_count,
+						SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS low_count,
+						SUM(CASE WHEN severity = 'info' THEN 1 ELSE 0 END) AS info_count
+					FROM review_findings
+					GROUP BY run_id
+				) f ON f.run_id = r.id
+				LEFT JOIN (
+					SELECT run_id,
+						COUNT(*) AS task_count,
+						SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS completed_count,
+						SUM(CASE WHEN status <> 'succeeded' THEN 1 ELSE 0 END) AS failed_count,
+						GROUP_CONCAT(DISTINCT role) AS roles
+					FROM review_specialist_results
+					GROUP BY run_id
+				) sp ON sp.run_id = r.id
+				WHERE #whereSql#
+				ORDER BY #orderColumn# #direction#, r.id #direction#
+				LIMIT :limit OFFSET :offset
+			",
+			params,
+			{ datasource: datasource }
+		);
+		var totalQuery = queryExecute(
+			"SELECT COUNT(*) AS total FROM review_runs r WHERE #whereSql#",
+			filterParams( params ),
+			{ datasource: datasource }
+		);
+		var rows = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			rows.append( hydrateRow( records, row ) );
+		}
+		return {
+			data: rows,
+			meta: {
+				page      : page,
+				limit     : limit,
+				total     : totalQuery.total[ 1 ],
+				totalPages: totalQuery.total[ 1 ] ? ceiling( totalQuery.total[ 1 ] / limit ) : 0,
+				trends    : summarize( rows )
+			}
+		};
+	}
+
+	struct function compareScoped( required string runId, required struct context, string projectId = "" ) {
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				arguments.projectId
+			);
+		var run = runRepository.findScoped(
+				arguments.runId,
+				arguments.context.tenantId,
+				arguments.projectId
+			);
+		if ( isNull( run ) ) {
+			return {};
+		}
+		var baselineRun = runRepository.findPriorEligibleBaseline(
+				run.getProjectPath(),
+				run.getMode(),
+				run.getCreatedAt(),
+				run.getId(),
+				run.getTenantId(),
+				run.getProjectId()
+			);
+		if ( isNull( baselineRun ) ) {
+			return {
+				runId    : run.getId(),
+				baseline : javacast( "null", "" ),
+				counts   : emptyCounts(),
+				movements: [],
+				execution: {
+					current : metricsForRun( run.getId(), arguments.context ),
+					baseline: javacast( "null", "" ),
+					delta   : {}
+				}
+			};
+		}
+		var current = resultRepository.getResult( run.getId() ).findings ?: [];
+		var baseline = resultRepository.getResult( baselineRun.getId() ).findings ?: [];
+		var currentByFingerprint = indexFindings( current );
+		var baselineByFingerprint = indexFindings( baseline );
+		var movements = [];
+		var counts = emptyCounts();
+
+		for ( var fingerprint in currentByFingerprint ) {
+			var finding = currentByFingerprint[ fingerprint ];
+			if ( baselineByFingerprint.keyExists( fingerprint ) ) {
+				var prior = baselineByFingerprint[ fingerprint ];
+				var movement = severityMovement( prior.severity ?: "", finding.severity ?: "" );
+				counts.unchanged++;
+				if ( movement == "severityRaised" ) {
+					counts.severityRaised++;
+				} else if ( movement == "severityLowered" ) {
+					counts.severityLowered++;
+				}
+				movements.append(
+						movementRow(
+							movement,
+							finding,
+							prior.severity ?: ""
+						)
+					);
+			} else {
+				var reopened = existedBefore(
+					run,
+					baselineRun.getCreatedAt(),
+					fingerprint
+				);
+				var type = reopened ? "reopened" : "new";
+				counts[ type ]++;
+				movements.append( movementRow( type, finding ) );
+			}
+		}
+		for ( var fingerprint in baselineByFingerprint ) {
+			if ( !currentByFingerprint.keyExists( fingerprint ) ) {
+				counts.resolved++;
+				movements.append(
+						movementRow( "resolved", baselineByFingerprint[ fingerprint ] )
+					);
+			}
+		}
+		var currentMetrics = metricsForRun( run.getId(), arguments.context );
+		var baselineMetrics = metricsForRun( baselineRun.getId(), arguments.context );
+		return {
+			runId   : run.getId(),
+			baseline: {
+				runId    : baselineRun.getId(),
+				status   : baselineRun.getStatus(),
+				createdAt: baselineRun.getCreatedAt()
+			},
+			counts   : counts,
+			movements: movements,
+			execution: {
+				current : currentMetrics,
+				baseline: baselineMetrics,
+				delta   : metricDelta( currentMetrics, baselineMetrics )
+			}
+		};
+	}
+
+	private struct function metricsForRun( required string runId, required struct context ) {
+		var result = listScoped( arguments.context, { q: arguments.runId, page: 1, limit: 100 } );
+		for ( var item in result.data ) {
+			if ( item.run.id == arguments.runId ) {
+				return item.metrics;
+			}
+		}
+		return {};
+	}
+
+	private struct function metricDelta( required struct current, required struct baseline ) {
+		return {
+			durationMs: int( val( arguments.current.durationMs ?: 0 ) ) - int( val( arguments.baseline.durationMs ?: 0 ) ),
+			totalTokens: int(
+					val(
+						arguments
+								.current
+								.ai
+								.totalTokens ?:
+							0
+					)
+				) -
+				int(
+					val(
+						arguments
+								.baseline
+								.ai
+								.totalTokens ?:
+							0
+					)
+				),
+			retries: int(
+					val(
+						arguments
+								.current
+								.ai
+								.retries ?:
+							0
+					)
+				) -
+				int(
+					val(
+						arguments
+								.baseline
+								.ai
+								.retries ?:
+							0
+					)
+				),
+			failures: int(
+					val(
+						arguments
+								.current
+								.ai
+								.failures ?:
+							0
+					)
+				) -
+				int(
+					val(
+						arguments
+								.baseline
+								.ai
+								.failures ?:
+							0
+					)
+				),
+			specialistCoverage: val(
+					arguments
+							.current
+							.specialists
+							.coverage ?:
+						0
+				) -
+				val(
+					arguments
+							.baseline
+							.specialists
+							.coverage ?:
+						0
+				)
+		};
+	}
+
+	private struct function hydrateRow( required query records, required numeric row ) {
+		var startedAt = nullable(
+			records,
+			"started_at",
+			row
+		);
+		var completedAt = nullable(
+			records,
+			"completed_at",
+			row
+		);
+		var durationMs = 0;
+		var durationAvailable = len( startedAt ) && len( completedAt );
+		if ( durationAvailable ) {
+			try {
+				durationMs = dateDiff(
+					"l",
+					parseDateTime( startedAt ),
+					parseDateTime( completedAt )
+				);
+			} catch (any ignored) {
+				durationAvailable = false;
+			}
+		}
+		var traces = observabilityTraceService.exportTraces( records.id[ row ], 1000 );
+		var providers = {};
+		var models = {};
+		for ( var observation in traces.observations ) {
+			var provider = observation.modelParameters.provider ?: observation.metadata.provider ?: "";
+			if ( len( trim( toString( provider ) ) ) ) {
+				providers[ toString( provider ) ] = true;
+			}
+			if ( len( trim( observation.model ?: "" ) ) ) {
+				models[ observation.model ] = true;
+			}
+		}
+		var roles = len( records.specialist_roles[ row ] ) ? listToArray( records.specialist_roles[ row ] ) : [];
+		roles.sort( "textnocase" );
+		return {
+			run: {
+				id         : records.id[ row ],
+				projectId  : records.project_id[ row ],
+				projectPath: records.project_path[ row ],
+				mode       : records.mode[ row ],
+				status     : records.status[ row ],
+				progress   : records.progress[ row ],
+				message    : records.message[ row ],
+				createdAt  : records.created_at[ row ],
+				startedAt  : startedAt,
+				completedAt: completedAt
+			},
+			metrics: {
+				durationMs       : durationMs,
+				durationAvailable: durationAvailable,
+				filesScanned     : numericOrNull(
+					records,
+					"files_scanned",
+					row
+				),
+				findings: {
+					total: numericOrNull(
+						records,
+						"findings_count",
+						row
+					),
+					critical: records.critical_count[ row ],
+					high    : records.high_count[ row ],
+					medium  : records.medium_count[ row ],
+					low     : records.low_count[ row ],
+					info    : records.info_count[ row ]
+				},
+				specialists: {
+					selected : roles,
+					total    : records.specialist_count[ row ],
+					completed: records.specialist_completed[ row ],
+					failed   : records.specialist_failed[ row ],
+					coverage : records.specialist_count[ row ] ? records.specialist_completed[ row ] / records.specialist_count[ row ] : 0
+				},
+				ai: {
+					providers       : providers.keyArray().sort( "textnocase" ),
+					models          : models.keyArray().sort( "textnocase" ),
+					promptTokens    : traces.summary.promptTokens,
+					completionTokens: traces.summary.completionTokens,
+					totalTokens     : traces.summary.totalTokens,
+					retries         : traces.summary.retries,
+					failures        : records.specialist_failed[ row ] + ( records.status[ row ] == "failed" ? 1 : 0 ),
+					available       : traces.summary.observationCount > 0
+				}
+			}
+		};
+	}
+
+	private struct function summarize( required array rows ) {
+		var summary = {
+			runCount        : arguments.rows.len(),
+			totalFindings   : 0,
+			critical        : 0,
+			high            : 0,
+			totalTokens     : 0,
+			retries         : 0,
+			failures        : 0,
+			medianDurationMs: javacast( "null", "" )
+		};
+		var durations = [];
+		for ( var item in arguments.rows ) {
+			summary.totalFindings += int(
+				val(
+					item
+							.metrics
+							.findings
+							.total ?:
+						0
+				)
+			);
+			summary.critical += item
+				.metrics
+				.findings
+				.critical;
+			summary.high += item
+				.metrics
+				.findings
+				.high;
+			summary.totalTokens += item
+				.metrics
+				.ai
+				.totalTokens;
+			summary.retries += item
+				.metrics
+				.ai
+				.retries;
+			summary.failures += item
+				.metrics
+				.ai
+				.failures;
+			if ( item.metrics.durationAvailable ) {
+				durations.append( item.metrics.durationMs );
+			}
+		}
+		if ( durations.len() ) {
+			durations.sort( "numeric" );
+			var middle = ceiling( durations.len() / 2 );
+			summary.medianDurationMs = durations.len() % 2
+				? durations[ middle ]
+				: int( ( durations[ middle ] + durations[ middle + 1 ] ) / 2 );
+		}
+		return summary;
+	}
+
+	private boolean function existedBefore(
+		required any run,
+		required string beforeCreatedAt,
+		required string fingerprint
+	) {
+		var found = queryExecute(
+			"
+				SELECT 1
+				FROM review_findings f
+				INNER JOIN review_runs r ON r.id = f.run_id
+				WHERE r.tenant_id = :tenantId
+					AND r.project_id = :projectId
+					AND r.project_path = :projectPath
+					AND r.mode = :mode
+					AND r.status IN ( 'succeeded', 'partial' )
+					AND r.created_at < :beforeCreatedAt
+					AND lower(f.fingerprint) = :fingerprint
+				LIMIT 1
+			",
+			{
+				tenantId       : arguments.run.getTenantId(),
+				projectId      : arguments.run.getProjectId(),
+				projectPath    : arguments.run.getProjectPath(),
+				mode           : arguments.run.getMode(),
+				beforeCreatedAt: arguments.beforeCreatedAt,
+				fingerprint    : lCase( arguments.fingerprint )
+			},
+			{ datasource: datasource }
+		);
+		return found.recordCount > 0;
+	}
+
+	private struct function indexFindings( required array findings ) {
+		var indexed = {};
+		for ( var finding in arguments.findings ) {
+			var key = lCase( trim( finding.fingerprint ?: "" ) );
+			if ( len( key ) ) {
+				indexed[ key ] = finding;
+			}
+		}
+		return indexed;
+	}
+
+	private string function severityMovement( required string previous, required string current ) {
+		var rank = {
+			critical: 5,
+			high    : 4,
+			medium  : 3,
+			low     : 2,
+			info    : 1
+		};
+		var priorRank = rank[ lCase( arguments.previous ) ] ?: 0;
+		var currentRank = rank[ lCase( arguments.current ) ] ?: 0;
+		if ( currentRank > priorRank ) {
+			return "severityRaised";
+		}
+		if ( currentRank < priorRank ) {
+			return "severityLowered";
+		}
+		return "unchanged";
+	}
+
+	private struct function movementRow( required string type, required struct finding, string previousSeverity = "" ) {
+		return {
+			type            : arguments.type,
+			fingerprint     : arguments.finding.fingerprint ?: "",
+			title           : arguments.finding.title ?: "",
+			filePath        : arguments.finding.filePath ?: "",
+			startLine       : arguments.finding.startLine ?: 0,
+			severity        : arguments.finding.severity ?: "",
+			previousSeverity: arguments.previousSeverity
+		};
+	}
+
+	private struct function emptyCounts() {
+		return {
+			new            : 0,
+			unchanged      : 0,
+			resolved       : 0,
+			reopened       : 0,
+			severityRaised : 0,
+			severityLowered: 0
+		};
+	}
+
+	private void function addExactFilter(
+		required array clauses,
+		required struct params,
+		required string column,
+		required string key,
+		required string value
+	) {
+		if ( len( arguments.value ) ) {
+			arguments.clauses.append( "#arguments.column# = :#arguments.key#" );
+			arguments.params[ arguments.key ] = arguments.value;
+		}
+	}
+
+	private void function addAllowlistedFilter(
+		required array clauses,
+		required struct params,
+		required string column,
+		required string key,
+		required string value,
+		required array allowed
+	) {
+		if ( arguments.allowed.contains( arguments.value ) ) {
+			addExactFilter(
+				arguments.clauses,
+				arguments.params,
+				arguments.column,
+				arguments.key,
+				arguments.value
+			);
+		}
+	}
+
+	private struct function filterParams( required struct params ) {
+		var result = duplicate( arguments.params );
+		result.delete( "limit" );
+		result.delete( "offset" );
+		return result;
+	}
+
+	private any function numericOrNull( required query records, required string column, required numeric row ) {
+		return isNull( arguments.records[ arguments.column ][ arguments.row ] )
+			? javacast( "null", "" )
+			: arguments.records[ arguments.column ][ arguments.row ];
+	}
+
+	private string function nullable( required query records, required string column, required numeric row ) {
+		return isNull( arguments.records[ arguments.column ][ arguments.row ] )
+			? ""
+			: toString( arguments.records[ arguments.column ][ arguments.row ] );
+	}
+}

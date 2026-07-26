@@ -1,0 +1,139 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Immutable review policy and run budgets",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"normalizes stable allowlisted policy and bounded budgets",
+					() => {
+						var service = getInstance( "ReviewPolicyService" );
+						var first = service.normalize(
+								{
+									policy: {
+										allowedRoles: [ "testing", "security", "testing"],
+										reviewGoal  : "  Focus on authorization boundaries.  "
+									},
+									budgets: {
+										maxTasks        : 2,
+										maxTokens       : 1500,
+										maxTokensPerTask: 1000
+									}
+								}
+							);
+						var repeated = service.normalize(
+								{
+									policy: {
+										allowedRoles: [ "security", "testing"],
+										reviewGoal  : "Focus on authorization boundaries."
+									},
+									budgets: {
+										maxTasks        : 2,
+										maxTokens       : 1500,
+										maxTokensPerTask: 1000
+									}
+								}
+							);
+
+						expect( first.policy.version ).toBe( "review-policy-v1" );
+						expect( first.policy.allowedRoles ).toBe( [ "security", "testing"] );
+						expect( first.policy.reviewGoal ).toBe( "Focus on authorization boundaries." );
+						expect( first.policy.fingerprint ).toBe( repeated.policy.fingerprint );
+						expect( first.budgets.version ).toBe( "run-budgets-v2" );
+						expect( first.budgets.maxDurationMs ).toBe( getController().getSetting( "runDefaultDurationMs" ) );
+						expect( first.budgets.maxIterationsPerTask ).toBe( 8 );
+						expect( first.budgets.maxToolOutputCharacters ).toBe( 48000 );
+						expect( first.budgets.maxCostUsd ).toBe( 5 );
+						expect( first.budgets.fingerprint ).toBe( repeated.budgets.fingerprint );
+					}
+				);
+
+				it(
+					"rejects a review goal over 500 characters",
+					() => {
+						var service = getInstance( "ReviewPolicyService" );
+						expect(
+							() => service.normalize( { policy: { reviewGoal: repeatString( "x", 501 ) } } )
+						).toThrow();
+					}
+				);
+
+				it(
+					"persists the snapshot and rejects database mutation",
+					() => {
+						var service = getInstance( "ReviewPolicyService" );
+						var repository = getInstance( "ReviewRunRepository" );
+						var contract = service.normalize(
+								{
+									policy : { allowedRoles: [ "correctness"] },
+									budgets: {
+										maxTasks        : 1,
+										maxTokens       : 512,
+										maxTokensPerTask: 512
+									}
+								}
+							);
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						try {
+							var run = repository.create(
+									{
+										id          : runId,
+										projectPath : "C:/immutable-contract-fixture",
+										mode        : "working-tree",
+										baseRevision: "",
+										headRevision: "HEAD",
+										status      : "queued",
+										progress    : 0,
+										currentPhase: "queued",
+										message     : "Contract test",
+										policy      : contract.policy,
+										budgets     : contract.budgets,
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+
+							expect( run.getPolicy().fingerprint ).toBe( contract.policy.fingerprint );
+							expect( run.getBudgets().maxTokens ).toBe( 512 );
+							expect(
+								() => queryExecute(
+									"
+										UPDATE review_runs
+										SET budgets_json = :budgets
+										WHERE id = :runId
+									",
+									{
+										budgets: jsonSerialize(
+											{
+												version  : "changed",
+												maxTokens: 9999
+											}
+										),
+										runId: runId
+									}
+								)
+							).toThrow();
+							expect( repository.find( runId ).getBudgets().fingerprint ).toBe( contract.budgets.fingerprint );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id = :runId",
+								{ runId: runId }
+							);
+						}
+					}
+				);
+			}
+		);
+	}
+}

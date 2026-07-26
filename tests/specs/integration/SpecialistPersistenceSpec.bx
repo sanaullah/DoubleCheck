@@ -1,0 +1,119 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Specialist persistence",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"persists artifact references and audit metadata without tool output",
+					() => {
+						var runId = lCase( createUUID() );
+						var taskId = lCase( hash( "persisted-task", "SHA-256" ) );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var repository = getInstance( "SpecialistResultRepository" );
+						try {
+							runRepository.create(
+									{
+										id          : runId,
+										projectPath : "C:/phase-four-fixture",
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "",
+										status      : "running",
+										progress    : 55,
+										currentPhase: "specialist-review",
+										message     : "Persistence test",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							repository.replace(
+									runId,
+									[
+										{
+											version : "agent-result-v1",
+											taskId  : taskId,
+											role    : "security",
+											status  : "succeeded",
+											summary : "Bounded result",
+											findings: [
+												{
+													id         : "finding-1",
+													fingerprint: "fingerprint-1",
+													evidence   : "SENSITIVE_TOOL_OUTPUT"
+												}
+											],
+											toolAudit: [
+												{
+													sequence        : 1,
+													toolName        : "read_indexed_range",
+													inputFingerprint: "input-hash",
+													status          : "succeeded",
+													outputCharacters: 120,
+													durationMs      : 5
+												}
+											],
+											provenance: {
+												promptVersion: "specialist-prompt-v1",
+												provider     : "fake",
+												model        : "fake-model",
+												role         : "security"
+											},
+											error     : "",
+											durationMs: 10
+										}
+									]
+								);
+							repository.upsert(
+									runId,
+									{
+										version   : "agent-result-v1",
+										taskId    : lCase( hash( "checkpoint-task", "SHA-256" ) ),
+										role      : "correctness",
+										status    : "timed_out",
+										summary   : "",
+										findings  : [],
+										toolAudit : [],
+										provenance: {
+											promptVersion: "specialist-prompt-v1",
+											provider     : "fake",
+											model        : "fake-model",
+											role         : "correctness"
+										},
+										error     : "Specialist task deadline exceeded",
+										durationMs: 50
+									}
+								);
+							var persisted = repository.get( runId );
+							var encoded = jsonSerialize( persisted );
+
+							expect( persisted.results ).toHaveLength( 2 );
+							expect( persisted.summary.toolCalls ).toBe( 1 );
+							expect( persisted.summary.completedTasks ).toBe( 1 );
+							expect( persisted.summary.failedTasks ).toBe( 1 );
+							expect( persisted.results[ 1 ].findings[ 1 ].fingerprint ).toBe( "fingerprint-1" );
+							expect( encoded ).notToInclude( "SENSITIVE_TOOL_OUTPUT" );
+							expect( persisted.results[ 1 ].toolAudit[ 1 ].toolName ).toBe( "read_indexed_range" );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id = :runId",
+								{ runId: runId }
+							);
+						}
+					}
+				);
+			}
+		);
+	}
+}

@@ -1,0 +1,3376 @@
+const state = {
+	activeRun: null,
+	eventSource: null,
+	session: null,
+	statusPoll: null,
+	closingStream: false,
+	finishingRunId: "",
+	didAutoResume: false,
+	terminal: new Set(["succeeded", "partial", "failed", "cancelled"]),
+	specialists: {},
+	crew: {
+		summary: "",
+		source: ""
+	},
+	observations: [],
+	observeFilter: "all",
+	observeRoleFilter: "all",
+	observeSearch: "",
+	lastEventSequence: 0,
+	lastTimelineKey: "",
+	seenEventSequences: new Set(),
+	observeRenderTimer: null,
+	streamConnectedRunId: "",
+	findings: [],
+	selectedFindingId: "",
+	findingSearch: "",
+	findingSeverity: "all",
+	findingReviewState: "all",
+	findingSort: "priority",
+	pendingFindingFingerprint: "",
+	architectureSearch: "",
+	architectureKind: "all",
+	architectureGraph: null,
+	history: {
+		page: 1,
+		totalPages: 0,
+		rows: [],
+		loading: false
+	},
+	commandMetrics: {
+		files: 0,
+		languages: [],
+		findings: 0,
+		specialistCompleted: 0,
+		specialistTotal: 0
+	}
+};
+
+const statusLabels = {
+	queued: "Queued",
+	running: "Working",
+	succeeded: "Succeeded",
+	partial: "Completed with warnings",
+	failed: "Failed",
+	cancelled: "Cancelled",
+	Idle: "Idle"
+};
+
+const phaseLabels = {
+	queued: "Waiting to start",
+	indexing: "Discovering files",
+	"architecture-index": "Building symbol graph",
+	planning: "Architecture + crew",
+	deterministic: "Deterministic checks",
+	specialists: "Specialist agents",
+	"specialist-review": "Specialist agents",
+	"deterministic-analysis": "Deterministic checks",
+	"architecture-planning": "Architecture + crew",
+	persisting: "Saving findings",
+	completed: "Completed",
+	cancelled: "Cancelled",
+	failed: "Failed"
+};
+
+const eventLabels = {
+	"run.status": "Status",
+	"phase.started": "Phase",
+	"task.progress": "Progress",
+	"review.indexed": "Indexed",
+	"review.graph": "Graph",
+	"review.plan": "Plan",
+	"review.specialist.progress": "Agent",
+	"review.specialist.observe": "Trace",
+	"review.specialists": "Agents",
+	"review.findings": "Findings",
+	"review.completed": "Completed",
+	"run.completed": "Completed",
+	"run.cancelled": "Cancelled",
+	"run.error": "Error",
+	"stream.error": "Stream",
+	"stream.waiting": "Reconnect"
+};
+
+const pipelineOrder = [
+	"scan",
+	"architecture",
+	"planning",
+	"deterministic",
+	"specialists",
+	"completion"
+];
+
+const phasePipelineStage = {
+	queued: "scan",
+	indexing: "scan",
+	"architecture-index": "architecture",
+	planning: "planning",
+	"architecture-planning": "planning",
+	deterministic: "deterministic",
+	"deterministic-analysis": "deterministic",
+	specialists: "specialists",
+	"specialist-review": "specialists",
+	persisting: "completion",
+	completed: "completion",
+	cancelled: "completion",
+	failed: "completion"
+};
+
+function specialistWarningText(result = {}) {
+	const failures = (result.specialists?.results || [])
+		.filter((item) => item.status && item.status !== "succeeded")
+		.map((item) => `${item.role}: ${item.error || item.status}`);
+	if (!failures.length) return "";
+	const realFailures = failures.filter((text) => !/circuit is open/i.test(text));
+	if (realFailures.length) {
+		return `Specialist issues: ${realFailures.join(" · ")}`;
+	}
+	return "AI specialists were paused after recent provider failures. Start another review to retry; deterministic findings are still kept.";
+}
+
+const stageLabels = {
+	"task-started": "Starting",
+	"provider-attempt": "Calling provider",
+	"provider-run": "Running specialist",
+	"provider-llm": "Calling model",
+	"provider-llm-done": "Model responded",
+	"provider-stream": "Streaming response",
+	"provider-complete": "Provider finished",
+	"provider-chat-fallback": "Completing via chat",
+	"provider-retry": "Retrying provider",
+	"provider-chat-request": "Chat request",
+	"provider-chat-response": "Chat response",
+	"tool-call": "Using tool",
+	"tool-done": "Tool finished",
+	"prompt-sent": "Prompt sent",
+	"response-accepted": "Response accepted",
+	"task-completed": "Task finished",
+	queued: "Queued",
+	running: "Working",
+	succeeded: "Succeeded",
+	failed: "Failed",
+	timed_out: "Timed out",
+	circuit_open: "Provider paused",
+	budget_exceeded: "Budget exceeded"
+};
+
+function resetSpecialistBoard() {
+	state.specialists = {};
+	state.crew = { summary: "", source: "" };
+	if (elements.specialistGrid) elements.specialistGrid.innerHTML = "";
+	if (elements.specialistBoard) elements.specialistBoard.hidden = true;
+	if (elements.crewSummary) {
+		elements.crewSummary.hidden = true;
+		elements.crewSummary.textContent = "";
+	}
+	if (elements.crewSourceBadge) {
+		elements.crewSourceBadge.hidden = true;
+		elements.crewSourceBadge.textContent = "";
+	}
+	if (elements.crewBoardTitle) {
+		elements.crewBoardTitle.textContent = "Assigned specialists";
+	}
+	resetObservability();
+}
+
+function seedCrewFromPlan(detail = {}) {
+	if (!detail || typeof detail !== "object") return;
+	const crewSource = detail.crewSource || detail.source || "";
+	const crewSummary = detail.crewSummary || detail.summary || "";
+	if (crewSource || crewSummary) {
+		state.crew = {
+			source: crewSource || state.crew.source || "",
+			summary: crewSummary || state.crew.summary || ""
+		};
+	}
+	const tasks = Array.isArray(detail.tasks) ? detail.tasks : [];
+	if (tasks.length) {
+		tasks.forEach((task) => {
+			if (!task?.role) return;
+			upsertSpecialist(task.role, {
+				status: task.status || "queued",
+				stage: task.stage || "queued",
+				message: task.message || "Queued from crew plan",
+				brief: task.brief || "",
+				objective: task.objective || ""
+			});
+		});
+		return;
+	}
+	const roles = detail.roles || detail.selectedRoles || [];
+	roles.forEach((role) => {
+		upsertSpecialist(role, {
+			status: "queued",
+			stage: "queued",
+			message: "Queued from review plan"
+		});
+	});
+}
+
+function updateCrewBoardHeading() {
+	if (elements.crewSummary) {
+		if (state.crew.summary) {
+			elements.crewSummary.hidden = false;
+			elements.crewSummary.textContent = state.crew.summary;
+		} else {
+			elements.crewSummary.hidden = true;
+			elements.crewSummary.textContent = "";
+		}
+	}
+	if (elements.crewSourceBadge) {
+		if (state.crew.source) {
+			elements.crewSourceBadge.hidden = false;
+			elements.crewSourceBadge.textContent = state.crew.source === "llm"
+				? "Planned crew"
+				: "Default crew";
+		} else {
+			elements.crewSourceBadge.hidden = true;
+			elements.crewSourceBadge.textContent = "";
+		}
+	}
+	if (elements.crewBoardTitle) {
+		const count = Object.keys(state.specialists || {}).length;
+		elements.crewBoardTitle.textContent = count
+			? `${count} assigned specialist${count === 1 ? "" : "s"}`
+			: "Assigned specialists";
+	}
+}
+
+function resetObservability() {
+	state.observations = [];
+	state.observeRoleFilter = "all";
+	state.lastEventSequence = 0;
+	state.lastTimelineKey = "";
+	state.seenEventSequences = new Set();
+	state.streamConnectedRunId = "";
+	if (state.observeRenderTimer) {
+		clearTimeout(state.observeRenderTimer);
+		state.observeRenderTimer = null;
+	}
+	if (elements.observeFeed) elements.observeFeed.innerHTML = "";
+	if (elements.observePanel) elements.observePanel.hidden = true;
+	if (elements.jumpTrace) elements.jumpTrace.hidden = true;
+	if (elements.observeRoleFilters) {
+		elements.observeRoleFilters.hidden = true;
+		elements.observeRoleFilters.innerHTML = "";
+	}
+	if (elements.observeSummary) {
+		elements.observeSummary.hidden = true;
+		elements.observeSummary.innerHTML = "";
+	}
+	if (elements.observeStageMap) {
+		elements.observeStageMap.hidden = true;
+		elements.observeStageMap.innerHTML = "";
+	}
+	if (elements.observeRunContext) {
+		elements.observeRunContext.textContent =
+			"Select a review to inspect its phases, spans, generations, tool calls, timing, failures, inputs, and outputs.";
+	}
+	if (elements.observeTraceStatus) {
+		elements.observeTraceStatus.textContent = "Idle";
+		elements.observeTraceStatus.dataset.status = "idle";
+	}
+	if (elements.traceCount) elements.traceCount.textContent = "0 observations";
+}
+
+function showObservabilityPanel() {
+	if (!elements.observePanel) return;
+	const count = state.observations.length;
+	const hasRun = Boolean(state.activeRun);
+	elements.observePanel.hidden = !(count || hasRun);
+	if (elements.jumpTrace) {
+		elements.jumpTrace.hidden = !hasRun;
+	}
+	if (elements.traceCount) {
+		elements.traceCount.textContent = `${count} observation${count === 1 ? "" : "s"}`;
+	}
+	renderObserveIdentity();
+	scheduleObservabilityRender();
+}
+
+function seedClientObservation(clientKey, entry = {}) {
+	if (!clientKey) return;
+	if (state.observations.some((item) => item.clientKey === clientKey)) return;
+	pushTimeline({
+		...entry,
+		clientKey,
+		kind: entry.kind || "phase",
+		observationType: entry.observationType || "phase"
+	});
+}
+
+function ensureRunAcceptedObservation(run) {
+	if (!run?.id) return;
+	const clientKey = `run-accepted:${run.id}`;
+	if (
+		state.observations.some(
+			(item) =>
+				item.clientKey === clientKey ||
+				item.title === "Run accepted"
+		)
+	) {
+		return;
+	}
+	const preview = run.message || `${scopeLabel(run.mode)} · ${friendlyStatus(run.status || "queued")}`;
+	seedClientObservation(clientKey, {
+		title: "Run accepted",
+		preview,
+		output: preview,
+		meta: {
+			status: friendlyStatus(run.status || "queued"),
+			mode: run.mode || ""
+		},
+		at: run.createdAt || new Date().toISOString()
+	});
+}
+
+function ensureStreamObservation(run, reconnected = false) {
+	if (!run?.id) return;
+	const clientKey = reconnected
+		? `stream-reconnected:${run.id}`
+		: `stream-connected:${run.id}`;
+	seedClientObservation(clientKey, {
+		title: reconnected ? "Live stream reconnected" : "Live stream connected",
+		preview: reconnected
+			? "Reconnected to local SSE progress stream"
+			: "Listening on local SSE progress stream",
+		output: reconnected
+			? "Reconnected to local SSE progress stream"
+			: "Listening on local SSE progress stream",
+		meta: { status: "Live" },
+		at: new Date().toISOString()
+	});
+}
+
+function scheduleObservabilityRender() {
+	if (state.observeRenderTimer) {
+		clearTimeout(state.observeRenderTimer);
+	}
+	state.observeRenderTimer = setTimeout(() => {
+		state.observeRenderTimer = null;
+		renderObservability();
+	}, 120);
+}
+
+function rememberEventSequence(sequence) {
+	const seq = Number(sequence) || 0;
+	if (!seq) return true;
+	if (state.seenEventSequences.has(seq)) return false;
+	state.seenEventSequences.add(seq);
+	state.lastEventSequence = Math.max(state.lastEventSequence || 0, seq);
+	return true;
+}
+
+function observationTypeFor(kind = "", explicit = "") {
+	if (explicit) return explicit;
+	switch (kind) {
+		case "llm": return "generation";
+		case "tool": return "tool";
+		case "prompt":
+		case "response":
+		case "agent": return "span";
+		case "fallback": return "event";
+		case "phase": return "phase";
+		default: return kind || "event";
+	}
+}
+
+function pushTimeline(entry = {}) {
+	const kind = entry.kind || "phase";
+	const observationType = observationTypeFor(kind, entry.observationType);
+	const title = entry.title || "Update";
+	const input = entry.input || "";
+	const output = entry.output || "";
+	const preview = entry.preview || entry.message || input || output || "";
+	const key = `${observationType}|${kind}|${entry.role || ""}|${title}|${preview.slice(0, 120)}`;
+	if (key === state.lastTimelineKey && (kind === "phase" || observationType === "phase")) {
+		return;
+	}
+	state.lastTimelineKey = key;
+
+	const round = entry.meta?.round ?? entry.modelParameters?.round;
+	const mode = entry.meta?.mode || entry.modelParameters?.mode || "";
+	const toolName = entry.meta?.toolName || entry.modelParameters?.toolName || "";
+	const pairKey =
+		observationType === "generation" && round != null
+			? `gen:${entry.role || ""}:${mode || "agent"}:${round}`
+			: observationType === "tool" && toolName
+				? `tool:${entry.role || ""}:${toolName}:${entry.meta?.toolCallId || ""}`
+				: "";
+
+	if (pairKey) {
+		const existing = state.observations.find((item) => item.pairKey === pairKey);
+		if (existing) {
+			if (input) existing.input = input;
+			if (output) existing.output = output;
+			if (preview && !existing.preview) existing.preview = preview;
+			existing.truncated = existing.truncated || !!entry.truncated;
+			existing.characters = Math.max(existing.characters || 0, entry.characters || 0);
+			existing.meta = { ...existing.meta, ...(entry.meta || {}) };
+			existing.modelParameters = {
+				...existing.modelParameters,
+				...(entry.modelParameters || {})
+			};
+			existing.usage = { ...existing.usage, ...(entry.usage || {}) };
+			if (entry.durationMs) existing.durationMs = entry.durationMs;
+			if (entry.model) existing.model = entry.model;
+			if (output) existing.title = existing.title.replace(/^LLM request/, "LLM generation");
+			if (output && existing.title.startsWith("Tool call")) {
+				existing.title = existing.title.replace(/^Tool call/, "Tool");
+			}
+			if (existing.startedAtMs && entry.at) {
+				const end = Date.parse(entry.at);
+				if (!Number.isNaN(end) && !existing.durationMs) {
+					existing.durationMs = Math.max(0, end - existing.startedAtMs);
+				}
+			}
+			existing.at = entry.at || existing.at || new Date().toISOString();
+			showObservabilityPanel();
+			return;
+		}
+	}
+
+	const at = entry.at || new Date().toISOString();
+	const observation = {
+		id: `${Date.now()}-${state.observations.length}-${Math.random().toString(16).slice(2, 6)}`,
+		clientKey: entry.clientKey || "",
+		pairKey,
+		role: entry.role || "",
+		stage: entry.stage || "",
+		message: entry.message || "",
+		kind,
+		observationType,
+		title,
+		preview,
+		input,
+		output,
+		truncated: !!entry.truncated,
+		characters: entry.characters || 0,
+		model: entry.model || entry.meta?.model || "",
+		modelParameters: entry.modelParameters || {},
+		usage: entry.usage || {},
+		durationMs: entry.durationMs || entry.meta?.durationMs || 0,
+		startedAtMs: observationType === "generation" && !output ? Date.parse(at) || Date.now() : 0,
+		meta: entry.meta || {},
+		at,
+		expanded: false
+	};
+	state.observations.unshift(observation);
+	if (state.observations.length > 250) {
+		state.observations.length = 250;
+	}
+	showObservabilityPanel();
+}
+
+function appendObservation(detail = {}) {
+	const observe = detail.observe;
+	if (!observe || !observe.kind) return;
+	const meta = observe.meta || {};
+	const modelParameters = observe.modelParameters || {};
+	let input = observe.input || "";
+	let output = observe.output || "";
+	const preview = observe.preview || "";
+	if (!input && !output && preview) {
+		if (meta.io === "output" || observe.kind === "response" || observe.kind === "fallback") {
+			output = preview;
+		} else {
+			input = preview;
+		}
+	}
+	// Keep a visible body even when older/partial events omit input/output keys.
+	if (!input && !output && !preview && observe.characters) {
+		output = `(Payload body missing; recorded size ${observe.characters} characters.)`;
+	}
+	pushTimeline({
+		role: detail.role || "",
+		stage: detail.stage || "",
+		message: detail.message || "",
+		kind: observe.kind,
+		observationType: observe.observationType || "",
+		title: observe.title || observe.kind,
+		preview: preview || input || output || detail.message || "",
+		input,
+		output,
+		truncated: !!observe.truncated,
+		characters: observe.characters || 0,
+		model: observe.model || meta.model || "",
+		modelParameters,
+		usage: observe.usage || {},
+		durationMs: observe.durationMs || meta.durationMs || 0,
+		meta
+	});
+	upsertSpecialist(detail.role, {
+		message: `${observe.kind}: ${observe.title || detail.message || observe.kind}`
+	});
+}
+
+function timelineFromEvent(type, payload = {}, message = "") {
+	const run = payload?.data?.run || {};
+	const detail = payload?.data?.detail || {};
+	const at = payload?.timestamp || new Date().toISOString();
+	const phase = run.currentPhase || "";
+	const progress = run.progress != null ? `${run.progress}%` : "";
+
+	if (type === "review.specialist.observe") {
+		return;
+	}
+	if (type === "review.specialist.progress" && detail.role) {
+		const stage = detail.stage || "";
+		const keepStages = new Set([
+			"task-started",
+			"task-completed",
+			"provider-complete",
+			"provider-chat-fallback",
+			"provider-retry",
+			"response-accepted"
+		]);
+		if (!keepStages.has(stage)) {
+			return;
+		}
+		pushTimeline({
+			kind: "agent",
+			observationType: "event",
+			role: detail.role,
+			stage,
+			title: stageLabels[stage] || stage || "Agent update",
+			preview: detail.message || message,
+			output: detail.message || message,
+			meta: {
+				status: detail.status || "",
+				attempt: detail.attempt || "",
+				progress
+			},
+			at
+		});
+		return;
+	}
+	if (type === "review.specialists" && detail) {
+		pushTimeline({
+			kind: "agent",
+			observationType: "span",
+			title: "Specialists finished",
+			preview: message,
+			output: message,
+			meta: {
+				completed: detail.completedTasks,
+				failed: detail.failedTasks,
+				findings: detail.findingCount
+			},
+			at
+		});
+		(detail.results || []).forEach((item) => {
+			pushTimeline({
+				kind: item.status === "succeeded" ? "response" : "fallback",
+				observationType: item.status === "succeeded" ? "span" : "event",
+				role: item.role || "",
+				title: item.status === "succeeded" ? "Specialist succeeded" : "Specialist failed",
+				preview: item.error || item.summary || item.status || "",
+				output: item.error || item.summary || item.status || "",
+				meta: { findings: (item.findings || []).length },
+				at
+			});
+		});
+		return;
+	}
+	if (type === "review.plan" && detail) {
+		const crewSource = detail.crewSource || "deterministic";
+		const crewSummary = detail.crewSummary || "";
+		const crewLabel = crewSource === "llm" ? "Planned crew" : "Default crew";
+		seedCrewFromPlan(detail);
+		pushTimeline({
+			kind: "phase",
+			observationType: "phase",
+			title: crewSummary ? `Crew: ${crewSummary}` : "Review plan ready",
+			preview: message,
+			output: message,
+			meta: {
+				tasks: `${detail.taskCount}/${detail.taskLimit || 0}`,
+				roles: (detail.roles || detail.selectedRoles || []).join(", "),
+				crew: crewLabel,
+				tokens: `${detail.allocatedTokens || 0}/${detail.tokenBudget || 0}`
+			},
+			at
+		});
+		return;
+	}
+	if (type === "review.indexed" && detail) {
+		pushTimeline({
+			kind: "phase",
+			observationType: "phase",
+			title: "Files indexed",
+			preview: message,
+			output: message,
+			meta: {
+				files: detail.filesScanned,
+				languages: (detail.languages || []).join(", "),
+				scope: detail.scope || ""
+			},
+			at
+		});
+		return;
+	}
+	if (type === "review.graph" && detail) {
+		pushTimeline({
+			kind: "phase",
+			observationType: "phase",
+			title: "Architecture graph built",
+			preview: message,
+			output: message,
+			meta: {
+				symbols: detail.symbolCount,
+				deps: detail.dependencyCount,
+				impacts: detail.impactCount || 0
+			},
+			at
+		});
+		return;
+	}
+	if (type === "review.findings" && detail) {
+		pushTimeline({
+			kind: "phase",
+			observationType: "phase",
+			title: "Findings retained",
+			preview: message,
+			output: message,
+			meta: { source: detail.source, count: detail.count },
+			at
+		});
+		return;
+	}
+	if (type === "phase.started" || type === "task.progress" || type === "run.status") {
+		const phaseTitle = friendlyPhase(phase);
+		const detailMessage = run.message || message || "";
+		// Prefer the concrete run message over vague phase labels like "Waiting to start".
+		const title = detailMessage && phaseTitle && detailMessage !== phaseTitle
+			? detailMessage
+			: (detailMessage || phaseTitle || friendlyEvent(type));
+		pushTimeline({
+			kind: "phase",
+			observationType: "phase",
+			title,
+			preview: detailMessage || phaseTitle,
+			output: detailMessage || phaseTitle,
+			meta: {
+				status: friendlyStatus(run.status || ""),
+				phase: phaseTitle || phase || "",
+				progress
+			},
+			at
+		});
+		return;
+	}
+	if (type === "run.completed" || type === "review.completed" || type === "run.cancelled" || type === "run.error") {
+		pushTimeline({
+			kind: type === "run.error" ? "fallback" : "phase",
+			observationType: type === "run.error" ? "event" : "phase",
+			title: friendlyEvent(type),
+			preview: run.message || message,
+			output: run.message || message,
+			meta: { status: friendlyStatus(run.status || ""), progress },
+			at
+		});
+	}
+}
+
+function formatObserveParams(item) {
+	const params = {
+		...(item.modelParameters || {}),
+		...(item.meta || {})
+	};
+	if (item.model && !params.model) params.model = item.model;
+	if (item.role && !params.role) params.role = item.role;
+	if (item.characters && params.promptCharacters == null) {
+		params.characters = item.characters;
+	}
+	if (item.truncated) params.truncated = true;
+	if (item.durationMs) params.durationMs = `${item.durationMs} ms`;
+	const usage = item.usage || {};
+	if (usage.promptTokens) params.promptTokens = usage.promptTokens;
+	if (usage.completionTokens) params.completionTokens = usage.completionTokens;
+	if (usage.totalTokens) params.totalTokens = usage.totalTokens;
+	// Legacy runs labeled a budget ceiling as estimatedCostUsd and preview size as characters.
+	if (params.estimatedCostUsd != null && params.budgetCeilingUsd == null) {
+		params.budgetCeilingUsd = params.estimatedCostUsd;
+	}
+	delete params.estimatedCostUsd;
+	delete params.io;
+	if (
+		params.previewCharacters != null &&
+		params.characters != null &&
+		Number(params.characters) === Number(params.previewCharacters) &&
+		params.promptCharacters == null
+	) {
+		delete params.characters;
+	}
+	return Object.entries(params).filter(([, value]) => value !== "" && value != null);
+}
+
+function observeMatchesSearch(item, query) {
+	if (!query) return true;
+	const haystack = [
+		item.role,
+		item.kind,
+		item.observationType,
+		item.title,
+		item.model,
+		item.input,
+		item.output,
+		item.preview,
+		JSON.stringify(item.meta || {}),
+		JSON.stringify(item.modelParameters || {})
+	].join("\n").toLowerCase();
+	return haystack.includes(query);
+}
+
+function isFailureObservation(item = {}) {
+	const title = String(item.title || "").toLowerCase();
+	const preview = String(item.preview || item.message || item.output || "").toLowerCase();
+	const status = String(item.meta?.status || "").toLowerCase();
+	if (title.includes("failed") || title.includes("unavailable")) return true;
+	if (status === "failed" || status === "timed_out" || status === "circuit_open" || status === "budget_exceeded") {
+		return true;
+	}
+	if (
+		preview.includes("deadline exceeded") ||
+		preview.includes("not valid json") ||
+		preview.includes("response is empty") ||
+		preview.includes("empty content") ||
+		preview.includes("specialist review unavailable") ||
+		preview.includes("circuit is open") ||
+		preview.includes("tool-call markup")
+	) {
+		return true;
+	}
+	const type = item.observationType || observationTypeFor(item.kind);
+	if (type === "generation") {
+		const output = String(item.output || "").trim();
+		const titleText = String(item.title || "");
+		// Completed response rows with no usable content.
+		if (!output && /generation|response|chat review/i.test(titleText) && !/request/i.test(titleText)) {
+			return true;
+		}
+		if (output && /response|generation|chat/i.test(titleText)) {
+			if (/not valid json|response is empty|empty content|tool-call markup|deadline exceeded/i.test(output)) {
+				return true;
+			}
+			if (!looksLikeJsonObject(output) && output.length < 24 && /error|failed|empty/i.test(output)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+function isRetryObservation(item = {}) {
+	if (item.kind === "retry") return true;
+	const title = String(item.title || "").toLowerCase();
+	const reason = String(item.meta?.reason || "").toLowerCase();
+	return (
+		(item.kind === "fallback" || item.observationType === "event") &&
+		(
+			title.includes("retry") ||
+			["invalid-json", "empty-content", "tool-call-markup"].includes(reason)
+		)
+	);
+}
+
+function looksLikeJsonObject(text) {
+	const trimmed = String(text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+	return trimmed.startsWith("{") && trimmed.includes("}");
+}
+
+function failureSortKey(item) {
+	if (!isFailureObservation(item)) return 1;
+	const title = String(item.title || "").toLowerCase();
+	if (title.includes("specialist failed") || item.kind === "fallback") return 0;
+	return 0.5;
+}
+
+function observabilityStats(rows) {
+	const stats = {
+		total: rows.length,
+		generations: 0,
+		tools: 0,
+		spans: 0,
+		events: 0,
+		phases: 0,
+		fallbacks: 0,
+		retries: 0,
+		failures: 0,
+		durationMs: 0,
+		tokens: 0,
+		roles: new Set()
+	};
+	rows.forEach((item) => {
+		const type = item.observationType || observationTypeFor(item.kind);
+		if (type === "generation") stats.generations++;
+		else if (type === "tool") stats.tools++;
+		else if (type === "span") stats.spans++;
+		else if (type === "phase") stats.phases++;
+		else stats.events++;
+		if (item.kind === "fallback") stats.fallbacks++;
+		if (isRetryObservation(item)) stats.retries++;
+		if (isFailureObservation(item)) stats.failures++;
+		stats.durationMs += Number(item.durationMs) || 0;
+		stats.tokens += Number(item.usage?.totalTokens || item.meta?.totalTokens || 0) || 0;
+		if (item.role) stats.roles.add(item.role);
+	});
+	return stats;
+}
+
+function renderObserveSummary(rows) {
+	if (!elements.observeSummary) return;
+	if (!rows.length) {
+		elements.observeSummary.hidden = true;
+		elements.observeSummary.innerHTML = "";
+		return;
+	}
+	const stats = observabilityStats(rows);
+	elements.observeSummary.hidden = false;
+	elements.observeSummary.innerHTML = `
+		<span><strong>${stats.total}</strong> observations</span>
+		<span><strong>${stats.generations}</strong> generations</span>
+		<span><strong>${stats.tools}</strong> tools</span>
+		<span><strong>${stats.phases}</strong> phases</span>
+		<span><strong>${stats.spans}</strong> spans</span>
+		<span><strong>${stats.retries}</strong> retries</span>
+		<span><strong>${stats.failures}</strong> failures</span>
+		<span><strong>${stats.roles.size}</strong> roles</span>
+		<span><strong>${stats.durationMs ? `${stats.durationMs} ms` : "—"}</strong> latency</span>
+		<span><strong>${stats.tokens || "—"}</strong> tokens</span>
+	`;
+}
+
+function renderObserveIdentity() {
+	const run = state.activeRun;
+	if (elements.observeTraceStatus) {
+		if (!run) {
+			elements.observeTraceStatus.textContent = "Idle";
+			elements.observeTraceStatus.dataset.status = "idle";
+		} else if (state.terminal.has(run.status)) {
+			elements.observeTraceStatus.textContent = friendlyStatus(run.status);
+			elements.observeTraceStatus.dataset.status = run.status;
+		} else if (run.status === "queued") {
+			elements.observeTraceStatus.textContent = "Queued";
+			elements.observeTraceStatus.dataset.status = "queued";
+		} else if (state.eventSource) {
+			elements.observeTraceStatus.textContent = "Live";
+			elements.observeTraceStatus.dataset.status = "running";
+		} else {
+			elements.observeTraceStatus.textContent = friendlyStatus(run.status || "running");
+			elements.observeTraceStatus.dataset.status = run.status || "running";
+		}
+	}
+	if (!elements.observeRunContext) return;
+	if (!run) {
+		elements.observeRunContext.textContent =
+			"Select a review to inspect its phases, spans, generations, tool calls, timing, failures, inputs, and outputs.";
+		return;
+	}
+	const created = run.createdAt ? new Date(run.createdAt) : null;
+	const createdLabel = created && !Number.isNaN(created.getTime())
+		? created.toLocaleString()
+		: "time unavailable";
+	elements.observeRunContext.textContent = [
+		`Trace ${run.id}`,
+		run.projectPath || "local repository",
+		scopeLabel(run.mode),
+		presetLabelForRun(run),
+		createdLabel
+	].join(" · ");
+}
+
+function renderObserveStageMap(rows) {
+	if (!elements.observeStageMap) return;
+	const phases = rows.filter((item) =>
+		(item.observationType || observationTypeFor(item.kind)) === "phase"
+	);
+	elements.observeStageMap.innerHTML = "";
+	if (!phases.length) {
+		elements.observeStageMap.hidden = true;
+		return;
+	}
+	const seen = new Set();
+	phases.forEach((item) => {
+		const stageKey = String(
+			item.meta?.phase || item.meta?.status || item.title || item.id
+		).trim().toLowerCase();
+		if (!stageKey || seen.has(stageKey)) return;
+		seen.add(stageKey);
+		const stage = document.createElement("div");
+		stage.className = `observe-stage${isFailureObservation(item) ? " is-failure" : ""}`;
+		const title = document.createElement("strong");
+		title.textContent = item.title || friendlyPhase(item.meta?.phase) || "Review phase";
+		const detail = document.createElement("small");
+		const duration = Number(item.durationMs) || 0;
+		detail.textContent = duration
+			? `${duration} ms`
+			: (item.meta?.status || item.meta?.phase || "recorded");
+		stage.appendChild(title);
+		stage.appendChild(detail);
+		elements.observeStageMap.appendChild(stage);
+	});
+	elements.observeStageMap.hidden = !elements.observeStageMap.childElementCount;
+}
+
+function renderObserveRoleFilters() {
+	if (!elements.observeRoleFilters) return;
+	const roles = [...new Set(
+		state.observations.map((item) => item.role).filter(Boolean)
+	)].sort((a, b) => a.localeCompare(b));
+	if (!roles.length) {
+		elements.observeRoleFilters.hidden = true;
+		elements.observeRoleFilters.innerHTML = "";
+		if (state.observeRoleFilter !== "all") {
+			state.observeRoleFilter = "all";
+		}
+		return;
+	}
+	if (
+		state.observeRoleFilter !== "all" &&
+		!roles.includes(state.observeRoleFilter)
+	) {
+		state.observeRoleFilter = "all";
+	}
+	elements.observeRoleFilters.hidden = false;
+	elements.observeRoleFilters.innerHTML = "";
+	const buttons = [
+		{ value: "all", label: "All roles" },
+		...roles.map((role) => ({ value: role, label: role }))
+	];
+	buttons.forEach((item) => {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "observe-filter";
+		button.dataset.observeRole = item.value;
+		button.textContent = item.label;
+		button.classList.toggle("is-active", state.observeRoleFilter === item.value);
+		elements.observeRoleFilters.appendChild(button);
+	});
+}
+
+function filteredObservations() {
+	const filter = state.observeFilter || "all";
+	const roleFilter = state.observeRoleFilter || "all";
+	const query = (state.observeSearch || "").trim().toLowerCase();
+	const rows = state.observations.filter((item) => {
+		if (roleFilter !== "all" && item.role !== roleFilter) {
+			return false;
+		}
+		if (filter === "failures") {
+			if (!isFailureObservation(item)) return false;
+		} else if (filter !== "all" && item.observationType !== filter && item.kind !== filter) {
+			return false;
+		}
+		return observeMatchesSearch(item, query);
+	});
+	return rows.slice().sort((left, right) => {
+		if (filter === "failures" || filter === "all") {
+			const failDelta = failureSortKey(left) - failureSortKey(right);
+			if (failDelta !== 0) return failDelta;
+		}
+		const leftAt = Date.parse(left.at || "") || 0;
+		const rightAt = Date.parse(right.at || "") || 0;
+		return rightAt - leftAt;
+	});
+}
+
+function createObserveIoBlock(label, text, tone = "") {
+	const block = document.createElement("div");
+	block.className = `observe-io-block ${tone}`.trim();
+	block.innerHTML = `
+		<div class="observe-section-heading">
+			<div class="observe-section-label"></div>
+			<button type="button" class="observe-copy">Copy</button>
+		</div>
+		<pre></pre>
+	`;
+	block.querySelector(".observe-section-label").textContent = label;
+	block.querySelector("pre").textContent = text;
+	block.querySelector(".observe-copy").addEventListener("click", async (event) => {
+		event.stopPropagation();
+		const button = event.currentTarget;
+		try {
+			await navigator.clipboard.writeText(text);
+			button.textContent = "Copied";
+			setTimeout(() => {
+				button.textContent = "Copy";
+			}, 1200);
+		} catch (error) {
+			button.textContent = "Failed";
+			setTimeout(() => {
+				button.textContent = "Copy";
+			}, 1200);
+		}
+	});
+	return block;
+}
+
+function renderObservability() {
+	if (!elements.observePanel || !elements.observeFeed) return;
+	const filter = state.observeFilter || "all";
+	const roleFilter = state.observeRoleFilter || "all";
+	const query = (state.observeSearch || "").trim().toLowerCase();
+	renderObserveRoleFilters();
+	const rows = filteredObservations();
+	elements.observePanel.hidden = false;
+	if (elements.observeExport) {
+		elements.observeExport.hidden = !state.activeRun?.id;
+	}
+	renderObserveIdentity();
+	renderObserveSummary(rows);
+	renderObserveStageMap(state.observations);
+	const previousScroll = elements.observeFeed.scrollTop;
+	elements.observeFeed.innerHTML = "";
+	if (!rows.length) {
+		const empty = document.createElement("li");
+		empty.className = "empty-state";
+		const parts = [];
+		if (filter === "failures") parts.push("failure");
+		else if (filter !== "all") parts.push(filter);
+		if (roleFilter !== "all") parts.push(roleFilter);
+		empty.textContent = filter === "all" && roleFilter === "all" && !query
+			? (state.activeRun
+				? "Waiting for first server event…"
+				: "Start or select a run to inspect generations, tool calls, inputs, and outputs.")
+			: `No matching ${parts.length ? parts.join(" ") + " " : ""}observations.`;
+		elements.observeFeed.appendChild(empty);
+		return;
+	}
+
+	const groups = new Map();
+	rows.forEach((item) => {
+		const type = item.observationType || observationTypeFor(item.kind);
+		const key = item.role || (type === "phase" ? "run lifecycle" : "general");
+		if (!groups.has(key)) groups.set(key, []);
+		groups.get(key).push(item);
+	});
+
+	const orderedGroups = [...groups.entries()];
+	if (filter === "failures") {
+		orderedGroups.sort((left, right) => {
+			const leftFail = left[1].filter(isFailureObservation).length;
+			const rightFail = right[1].filter(isFailureObservation).length;
+			return rightFail - leftFail || left[0].localeCompare(right[0]);
+		});
+	}
+
+	orderedGroups.forEach(([groupName, items]) => {
+		const header = document.createElement("li");
+		header.className = "observe-group";
+		const failCount = items.filter(isFailureObservation).length;
+		header.textContent = failCount
+			? `${groupName} · ${failCount} failure${failCount === 1 ? "" : "s"}`
+			: groupName;
+		elements.observeFeed.appendChild(header);
+
+		items.forEach((item) => {
+			const li = document.createElement("li");
+			const type = item.observationType || observationTypeFor(item.kind);
+			const failed = isFailureObservation(item);
+			const retry = isRetryObservation(item);
+			li.className = `observe-item kind-${item.kind} type-${type}${failed ? " is-failure" : ""}${retry ? " is-retry" : ""}`;
+			li.dataset.id = item.id;
+			const stamp = item.at ? new Date(item.at) : null;
+			const timeText = stamp && !Number.isNaN(stamp.getTime()) ? stamp.toLocaleTimeString() : "";
+			const params = formatObserveParams(item);
+			const hasInput = !!(item.input && String(item.input).trim());
+			const hasOutput = !!(item.output && String(item.output).trim());
+			const hasPreview = !!(item.preview && String(item.preview).trim());
+			const open = item.expanded === true;
+			const latency = item.durationMs ? `${item.durationMs} ms` : "";
+			const tokens = item.usage?.totalTokens || item.meta?.totalTokens || "";
+
+			li.innerHTML = `
+				<button type="button" class="observe-summary">
+					<span class="observe-kind"></span>
+					<strong class="observe-role"></strong>
+					<span class="observe-fail-badge" hidden>Failure</span>
+					<span class="observe-title"></span>
+					<span class="observe-model"></span>
+					<span class="observe-latency"></span>
+					<span class="observe-time"></span>
+				</button>
+				<div class="observe-body"></div>
+			`;
+			li.querySelector(".observe-kind").textContent = type;
+			li.querySelector(".observe-role").textContent = item.role || item.kind || "trace";
+			const failBadge = li.querySelector(".observe-fail-badge");
+			if (failed) failBadge.hidden = false;
+			li.querySelector(".observe-title").textContent = item.title;
+			li.querySelector(".observe-model").textContent = [
+				item.model || params.find(([k]) => k === "model")?.[1] || "",
+				tokens ? `${tokens} tok` : ""
+			].filter(Boolean).join(" · ");
+			li.querySelector(".observe-latency").textContent = latency;
+			li.querySelector(".observe-time").textContent = timeText;
+
+			const body = li.querySelector(".observe-body");
+			body.hidden = !open;
+			li.classList.toggle("is-open", open);
+
+			if (params.length) {
+				const meta = document.createElement("div");
+				meta.className = "observe-params";
+				const heading = document.createElement("div");
+				heading.className = "observe-section-label";
+				heading.textContent = "Parameters";
+				meta.appendChild(heading);
+				const grid = document.createElement("dl");
+				grid.className = "observe-param-grid";
+				params.slice(0, 16).forEach(([key, value]) => {
+					const dt = document.createElement("dt");
+					dt.textContent = key;
+					const dd = document.createElement("dd");
+					dd.textContent = String(value);
+					grid.appendChild(dt);
+					grid.appendChild(dd);
+				});
+				meta.appendChild(grid);
+				body.appendChild(meta);
+			}
+
+			const io = document.createElement("div");
+			io.className = "observe-io";
+			if (hasInput) io.appendChild(createObserveIoBlock("Input", item.input, "input"));
+			if (hasOutput) io.appendChild(createObserveIoBlock("Output", item.output, "output"));
+			if (!hasInput && !hasOutput && hasPreview) {
+				io.appendChild(createObserveIoBlock("Payload", item.preview));
+			}
+			if (!hasInput && !hasOutput && !hasPreview) {
+				io.appendChild(createObserveIoBlock(
+					"Payload",
+					"(No payload captured for this step. Newer runs record full LLM input/output.)"
+				));
+			}
+			if (io.childNodes.length) body.appendChild(io);
+
+			li.querySelector(".observe-summary").addEventListener("click", () => {
+				item.expanded = !li.classList.contains("is-open");
+				li.classList.toggle("is-open", item.expanded);
+				body.hidden = !item.expanded;
+			});
+			elements.observeFeed.appendChild(li);
+		});
+	});
+	elements.observeFeed.scrollTop = previousScroll;
+}
+
+async function exportObservabilityTraces() {
+	if (!state.activeRun?.id) return;
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/traces?download=true`
+		);
+		const blob = new Blob([JSON.stringify(payload.data || payload, null, 2)], {
+			type: "application/json"
+		});
+		const url = URL.createObjectURL(blob);
+		const anchor = document.createElement("a");
+		anchor.href = url;
+		anchor.download = `doublecheck-traces-${state.activeRun.id.slice(0, 8)}.json`;
+		anchor.click();
+		URL.revokeObjectURL(url);
+	} catch (error) {
+		if (elements.message) {
+			elements.message.textContent = error.message || "Trace export failed";
+			elements.message.dataset.tone = "danger";
+		}
+	}
+}
+
+function upsertSpecialist(role, patch = {}) {
+	if (!role) return;
+	state.specialists = state.specialists || {};
+	state.specialists[role] = {
+		role,
+		stage: "queued",
+		status: "running",
+		message: "Scheduled in review plan",
+		attempt: 0,
+		...(state.specialists[role] || {}),
+		...patch
+	};
+	renderSpecialistBoard();
+}
+
+function specialistProgress(item = {}) {
+	if (item.status === "succeeded") return 100;
+	if (["failed", "timed_out", "circuit_open", "budget_exceeded"].includes(item.status)) return 100;
+	return {
+		queued: 5,
+		"task-started": 12,
+		"provider-attempt": 22,
+		"prompt-sent": 30,
+		"provider-run": 40,
+		"provider-llm": 50,
+		"provider-stream": 66,
+		"tool-call": 72,
+		"tool-done": 78,
+		"provider-llm-done": 84,
+		"provider-complete": 92,
+		"response-accepted": 96,
+		"task-completed": 100
+	}[item.stage] || 18;
+}
+
+function renderSpecialistBoard() {
+	if (!elements.specialistBoard || !elements.specialistGrid) return;
+	const roles = Object.keys(state.specialists || {});
+	elements.specialistBoard.hidden = !roles.length;
+	updateCrewBoardHeading();
+	elements.specialistGrid.innerHTML = "";
+	roles.forEach((role) => {
+		const item = state.specialists[role];
+		const tone = item.status === "succeeded"
+			? "ok"
+			: ["failed", "circuit_open", "budget_exceeded"].includes(item.status)
+				? "danger"
+				: "info";
+		const card = document.createElement("article");
+		card.className = `specialist-card tone-${tone}`;
+		card.innerHTML = `
+			<header>
+				<strong class="specialist-role"></strong>
+				<span class="specialist-status"></span>
+			</header>
+			<p class="specialist-brief" hidden></p>
+			<p class="specialist-stage"></p>
+			<p class="specialist-message"></p>
+			<div class="specialist-meta">
+				<span class="specialist-attempt"></span>
+				<span class="specialist-output"></span>
+			</div>
+			<div class="specialist-progress-track" aria-hidden="true">
+				<div class="specialist-progress-bar"></div>
+			</div>
+		`;
+		card.querySelector(".specialist-role").textContent = role;
+		card.querySelector(".specialist-status").textContent = stageLabels[item.status] || item.status || "Working";
+		const briefEl = card.querySelector(".specialist-brief");
+		if (item.brief) {
+			briefEl.hidden = false;
+			briefEl.textContent = item.brief;
+		}
+		card.querySelector(".specialist-stage").textContent = stageLabels[item.stage] || item.stage || "Working";
+		card.querySelector(".specialist-message").textContent = item.message || "";
+		card.querySelector(".specialist-attempt").textContent = item.attempt
+			? `Attempt ${item.attempt}`
+			: "Awaiting provider";
+		card.querySelector(".specialist-output").textContent = item.charactersSeen
+			? `${item.charactersSeen} chars`
+			: "";
+		card.querySelector(".specialist-progress-bar").style.width = `${specialistProgress(item)}%`;
+		elements.specialistGrid.appendChild(card);
+	});
+}
+
+function renderSpecialistResults(result = {}) {
+	if (!elements.specialistResults) return;
+	const rows = result.specialists?.results || [];
+	const coverage = result.coverage || null;
+	if (!rows.length && !coverage) {
+		elements.specialistResults.hidden = true;
+		elements.specialistResults.innerHTML = "";
+		return;
+	}
+	elements.specialistResults.hidden = false;
+	elements.specialistResults.innerHTML = `<h3>Specialist outcomes</h3>`;
+	if (coverage) {
+		const coverageCard = document.createElement("article");
+		coverageCard.className = `specialist-outcome ${coverage.gapCount ? "bad" : "ok"}`;
+		coverageCard.innerHTML = `
+			<header><strong>Coverage</strong><span></span></header>
+			<p class="outcome-summary"></p>
+			<p class="outcome-error"></p>
+		`;
+		coverageCard.querySelector("span").textContent =
+			`${coverage.completionPercent}% · ${coverage.completedTasks}/${coverage.plannedTasks} tasks`;
+		coverageCard.querySelector(".outcome-summary").textContent = coverage.gapCount
+			? `${coverage.gapCount} gap${coverage.gapCount === 1 ? "" : "s"} remain. A follow-up is bounded to ${coverage.followUp?.maxTasks || 0} tasks.`
+			: "Every planned specialist task produced a retained result.";
+		coverageCard.querySelector(".outcome-error").textContent = (coverage.gaps || [])
+			.slice(0, 3)
+			.map((gap) => `${gap.role}: ${gap.reason}`)
+			.join(" · ");
+		if (coverage.followUp?.available && coverage.followUp?.roles?.length) {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "secondary-button";
+			button.textContent = `Run targeted follow-up (${coverage.followUp.maxTasks})`;
+			button.addEventListener("click", async () => {
+				if (!state.activeRun?.id) return;
+				button.disabled = true;
+				button.textContent = "Starting follow-up…";
+				try {
+					const payload = await request(
+						`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/follow-up`,
+						{ method: "POST", body: "{}" }
+					);
+					watchRun(payload.data);
+					loadHistory();
+				} catch (error) {
+					button.disabled = false;
+					button.textContent = "Retry targeted follow-up";
+					coverageCard.querySelector(".outcome-error").textContent = error.message;
+				}
+			});
+			coverageCard.appendChild(button);
+		}
+		elements.specialistResults.appendChild(coverageCard);
+	}
+	rows.forEach((item) => {
+		const card = document.createElement("article");
+		const ok = item.status === "succeeded";
+		card.className = `specialist-outcome ${ok ? "ok" : "bad"}`;
+		card.innerHTML = `
+			<header>
+				<strong></strong>
+				<span></span>
+			</header>
+			<p class="outcome-summary"></p>
+			<p class="outcome-error"></p>
+		`;
+		card.querySelector("strong").textContent = item.role || "specialist";
+		card.querySelector("span").textContent = ok
+			? `Succeeded · ${(item.findings || []).length} findings`
+			: (stageLabels[item.status] || item.status || "Failed");
+		card.querySelector(".outcome-summary").textContent = item.summary || (ok ? "No summary." : "");
+		card.querySelector(".outcome-error").textContent = item.error || "";
+		elements.specialistResults.appendChild(card);
+		upsertSpecialist(item.role, {
+			status: item.status || (ok ? "succeeded" : "failed"),
+			stage: "task-completed",
+			message: item.error || item.summary || (ok ? "Completed" : "Failed")
+		});
+	});
+}
+
+const elements = {
+	form: document.querySelector("#run-form"),
+	formMessage: document.querySelector("#form-message"),
+	mode: document.querySelector("#run-mode"),
+	modeHint: document.querySelector("#mode-hint"),
+	reviewGoal: document.querySelector("#review-goal"),
+	reviewGoalCount: document.querySelector("#review-goal-count"),
+	presetSummary: document.querySelector("#preset-summary"),
+	advancedSummary: document.querySelector("#advanced-summary-value"),
+	readinessDetail: document.querySelector("#review-readiness-detail"),
+	revisionFields: document.querySelector("#revision-fields"),
+	baseRevision: document.querySelector("#base-revision"),
+	cancel: document.querySelector("#cancel-button"),
+	jumpTrace: document.querySelector("#jump-trace-button"),
+	jumpFindings: document.querySelector("#jump-findings-button"),
+	commandExport: document.querySelector("#command-export-button"),
+	commandRunContext: document.querySelector("#command-run-context"),
+	pipelineSteps: document.querySelector("#pipeline-steps"),
+	commandFiles: document.querySelector("#command-files"),
+	commandLanguages: document.querySelector("#command-languages"),
+	commandScope: document.querySelector("#command-scope"),
+	commandFindings: document.querySelector("#command-findings"),
+	commandSpecialists: document.querySelector("#command-specialists"),
+	commandBudget: document.querySelector("#command-budget"),
+	refresh: document.querySelector("#refresh-button"),
+	history: document.querySelector("#run-history"),
+	historyFilters: document.querySelector("#history-filters"),
+	historyClear: document.querySelector("#history-clear"),
+	historyTrends: document.querySelector("#history-trends"),
+	historyPagination: document.querySelector("#history-pagination"),
+	historyPrevious: document.querySelector("#history-previous"),
+	historyNext: document.querySelector("#history-next"),
+	historyPageLabel: document.querySelector("#history-page-label"),
+	historyComparison: document.querySelector("#history-comparison"),
+	historyComparisonTitle: document.querySelector("#history-comparison-title"),
+	historyComparisonClose: document.querySelector("#history-comparison-close"),
+	comparisonCounts: document.querySelector("#comparison-counts"),
+	comparisonMovements: document.querySelector("#comparison-movements"),
+	title: document.querySelector("#active-title"),
+	status: document.querySelector("#active-status"),
+	phase: document.querySelector("#active-phase"),
+	progress: document.querySelector("#active-progress"),
+	message: document.querySelector("#active-message"),
+	bar: document.querySelector("#progress-bar"),
+	feed: document.querySelector("#event-feed"),
+	specialistBoard: document.querySelector("#specialist-board"),
+	specialistGrid: document.querySelector("#specialist-grid"),
+	crewSummary: document.querySelector("#crew-summary"),
+	crewSourceBadge: document.querySelector("#crew-source-badge"),
+	crewBoardTitle: document.querySelector("#crew-board-title"),
+	specialistResults: document.querySelector("#specialist-results"),
+	observePanel: document.querySelector("#observe-panel"),
+	observeFeed: document.querySelector("#observe-feed"),
+	observeFilters: document.querySelector("#observe-filters"),
+	observeRoleFilters: document.querySelector("#observe-role-filters"),
+	observeSummary: document.querySelector("#observe-summary"),
+	observeStageMap: document.querySelector("#observe-stage-map"),
+	observeRunContext: document.querySelector("#observe-run-context"),
+	observeTraceStatus: document.querySelector("#observe-trace-status"),
+	traceCount: document.querySelector("#trace-count"),
+	observeSearch: document.querySelector("#observe-search"),
+	observeExport: document.querySelector("#observe-export"),
+	summary: document.querySelector("#result-summary"),
+	resultFiles: document.querySelector("#result-files"),
+	resultLanguages: document.querySelector("#result-languages"),
+	resultCount: document.querySelector("#result-count"),
+	resultAiCoverage: document.querySelector("#result-ai-coverage"),
+	resultScope: document.querySelector("#result-scope"),
+	resultGraph: document.querySelector("#result-graph"),
+	resultPlan: document.querySelector("#result-plan"),
+	resultSpecialists: document.querySelector("#result-specialists"),
+	baselineSummary: document.querySelector("#baseline-summary"),
+	fixedFindings: document.querySelector("#fixed-findings"),
+	fixedFindingsList: document.querySelector("#fixed-findings-list"),
+	findings: document.querySelector("#findings-list"),
+	findingDetail: document.querySelector("#finding-detail"),
+	findingSearch: document.querySelector("#finding-search"),
+	findingSeverity: document.querySelector("#finding-severity"),
+	findingReviewState: document.querySelector("#finding-review-state"),
+	findingSort: document.querySelector("#finding-sort"),
+	findingSeveritySummary: document.querySelector("#finding-severity-summary"),
+	architectureSearch: document.querySelector("#architecture-search"),
+	architectureKind: document.querySelector("#architecture-kind"),
+	architectureSummary: document.querySelector("#architecture-summary"),
+	architectureResults: document.querySelector("#architecture-results"),
+	architectureSnapshot: document.querySelector("#architecture-snapshot"),
+	exportActions: document.querySelector("#export-actions"),
+	aiBadge: document.querySelector("#ai-badge"),
+	healthDot: document.querySelector("#health-dot"),
+	healthLabel: document.querySelector("#health-label"),
+	projectId: document.querySelector("#project-id"),
+	projectPath: document.querySelector("#project-path")
+	,settingsForm: document.querySelector("#settings-form")
+	,settingsReset: document.querySelector("#settings-reset")
+	,settingsStatus: document.querySelector("#settings-status")
+};
+
+const reviewPresets = {
+	quick: {
+		label: "Quick",
+		summary: "Focused review of correctness, security, and testing with a smaller context budget.",
+		roles: [ "security", "correctness", "testing" ],
+		budgets: {
+			maxTasks: 3,
+			maxTokens: 4000,
+			maxTokensPerTask: 2000,
+			maxDurationMs: 300000,
+			maxIterationsPerTask: 4,
+			maxToolOutputCharacters: 24000,
+			maxCostUsd: 1
+		}
+	},
+	balanced: {
+		label: "Balanced",
+		summary: "Balanced review with broad focus and sensible local limits.",
+		roles: [
+			"security",
+			"correctness",
+			"testing",
+			"architecture",
+			"performance",
+			"boxlang-conventions",
+			"cfml-conventions"
+		],
+		budgets: {
+			maxTasks: 6,
+			maxTokens: 12000,
+			maxTokensPerTask: 6000,
+			maxDurationMs: 900000,
+			maxIterationsPerTask: 8,
+			maxToolOutputCharacters: 48000,
+			maxCostUsd: 5
+		}
+	},
+	deep: {
+		label: "Deep",
+		summary: "Maximum available context, tool depth, and specialist budget for a thorough review.",
+		roles: [
+			"security",
+			"correctness",
+			"testing",
+			"architecture",
+			"performance",
+			"boxlang-conventions",
+			"cfml-conventions"
+		],
+		budgets: {
+			maxTasks: 6,
+			maxTokens: 24000,
+			maxTokensPerTask: 6000,
+			maxDurationMs: 1800000,
+			maxIterationsPerTask: 16,
+			maxToolOutputCharacters: 96000,
+			maxCostUsd: 10
+		}
+	}
+};
+
+function selectedPreset() {
+	const value = elements.form?.querySelector("[name='reviewPreset']:checked")?.value || "balanced";
+	return reviewPresets[value] || reviewPresets.balanced;
+}
+
+function updateNewReviewSummary() {
+	const preset = selectedPreset();
+	const modeLabels = {
+		"working-tree": "Working tree",
+		"revision-diff": "Revision comparison",
+		full: "Full baseline"
+	};
+	const maxTasks = Number(elements.form?.elements.maxTasks?.value || 0);
+	const maxTokens = Number(elements.form?.elements.maxTokens?.value || 0);
+	const maxCost = Number(elements.form?.elements.maxCostUsd?.value || 0);
+	if (elements.presetSummary) {
+		elements.presetSummary.textContent = preset.summary;
+	}
+	if (elements.advancedSummary) {
+		const tokenLabel = maxTokens >= 1000
+			? `${Number((maxTokens / 1000).toFixed(1))}k`
+			: String(maxTokens);
+		elements.advancedSummary.textContent = `${maxTasks} tasks · ${tokenLabel} tokens · $${maxCost} max`;
+	}
+	if (elements.readinessDetail) {
+		elements.readinessDetail.textContent =
+			`${modeLabels[elements.mode?.value] || "Working tree"} · ${preset.label} · Read-only`;
+	}
+	if (elements.reviewGoalCount) {
+		elements.reviewGoalCount.textContent = `${elements.reviewGoal?.value.length || 0} / 500`;
+	}
+}
+
+function applyReviewPreset(name) {
+	const preset = reviewPresets[name];
+	if (!preset || !elements.form) return;
+	elements.form.querySelectorAll("[name='allowedRole']").forEach((input) => {
+		input.checked = preset.roles.includes(input.value);
+	});
+	Object.entries(preset.budgets).forEach(([field, value]) => {
+		const input = elements.form.elements[field];
+		if (input) input.value = String(value);
+	});
+	updateNewReviewSummary();
+}
+
+async function request(url, options = {}) {
+	const response = await fetch(url, {
+		...options,
+		headers: {
+			"Content-Type": "application/json",
+			...(options.headers || {})
+		}
+	});
+	const payload = await response.json().catch(() => ({}));
+	if (!response.ok) {
+		const restMessages = Array.isArray(payload?.messages)
+			? payload.messages
+					.map((item) => String(item || "").replace(/^An exception occurred:\s*/i, ""))
+					.filter(Boolean)
+					.join(" ")
+			: "";
+		const message =
+			payload?.error?.message ||
+			payload?.message ||
+			(typeof payload?.error === "string" ? payload.error : "") ||
+			restMessages ||
+			`Request failed (${response.status})`;
+		const error = new Error(message);
+		error.status = response.status;
+		error.code = payload?.error?.code || "";
+		throw error;
+	}
+	return payload;
+}
+
+function renderSession(session) {
+	state.session = session;
+	if (elements.form) {
+		elements.form.hidden = false;
+	}
+}
+
+async function loadSession() {
+	try {
+		const payload = await request("/api/v1/session");
+		renderSession(payload.data);
+		await loadProjects();
+		await loadRuns();
+	} catch (error) {
+		if (elements.formMessage) {
+			elements.formMessage.textContent = error.message;
+			elements.formMessage.dataset.tone = "danger";
+		}
+	}
+}
+
+async function loadProjects() {
+	try {
+		const payload = await request("/api/v1/projects");
+		const projects = payload.data || [];
+		const previousPath = (elements.projectPath?.value || "").trim();
+		elements.projectId.innerHTML = "";
+		projects.forEach((project) => {
+			const option = document.createElement("option");
+			option.value = project.id;
+			option.textContent = project.name;
+			option.dataset.rootPath = project.rootPath;
+			elements.projectId.appendChild(option);
+		});
+		// Keep a typed/restored path; only default when the field is empty.
+		if (projects.length && !previousPath) {
+			elements.projectPath.value = projects[0].rootPath;
+		}
+	} catch (error) {
+		elements.projectId.innerHTML = `<option value="">${error.message}</option>`;
+	}
+}
+
+function friendlyStatus(status) {
+	return statusLabels[status] || status || "Idle";
+}
+
+function friendlyPhase(phase) {
+	return phaseLabels[phase] || phase || "—";
+}
+
+function friendlyEvent(type) {
+	return eventLabels[type] || type || "Update";
+}
+
+function stopStatusPoll() {
+	if (state.statusPoll) {
+		clearInterval(state.statusPoll);
+		state.statusPoll = null;
+	}
+}
+
+function resetCommandMetrics() {
+	state.commandMetrics = {
+		files: 0,
+		languages: [],
+		findings: 0,
+		specialistCompleted: 0,
+		specialistTotal: 0
+	};
+}
+
+function presetLabelForRun(run = {}) {
+	const budgets = run.budgets || {};
+	const tokenBudget = Number(budgets.maxTokens || 0);
+	if (tokenBudget && tokenBudget <= 4000) return "Quick";
+	if (tokenBudget >= 24000) return "Deep";
+	return "Balanced";
+}
+
+function scopeLabel(mode = "") {
+	return {
+		"working-tree": "Working tree",
+		"revision-diff": "Revision diff",
+		full: "Full baseline"
+	}[mode] || mode || "—";
+}
+
+function updatePipeline(run) {
+	if (!elements.pipelineSteps) return;
+	const status = run?.status || "Idle";
+	const activeStage = phasePipelineStage[run?.currentPhase] || "scan";
+	const activeIndex = pipelineOrder.indexOf(activeStage);
+	const terminalSuccess = status === "succeeded" || status === "partial";
+	elements.pipelineSteps.querySelectorAll("[data-pipeline-stage]").forEach((item) => {
+		const stage = item.dataset.pipelineStage;
+		const index = pipelineOrder.indexOf(stage);
+		const label = item.querySelector("small");
+		item.classList.remove("is-complete", "is-active", "is-failed", "is-skipped");
+		if (!run) {
+			label.textContent = "Pending";
+			return;
+		}
+		if (terminalSuccess || index < activeIndex) {
+			item.classList.add("is-complete");
+			label.textContent = "Completed";
+		} else if (index === activeIndex) {
+			if (status === "failed") {
+				item.classList.add("is-failed");
+				label.textContent = "Failed";
+			} else if (status === "cancelled") {
+				item.classList.add("is-skipped");
+				label.textContent = "Cancelled";
+			} else {
+				item.classList.add("is-active");
+				label.textContent = status === "queued" ? "Queued" : "In progress";
+			}
+		} else {
+			label.textContent = "Pending";
+		}
+	});
+}
+
+function updateCommandMetrics(run = state.activeRun) {
+	const metrics = state.commandMetrics || {};
+	if (elements.commandFiles) {
+		elements.commandFiles.textContent = metrics.files || "—";
+	}
+	if (elements.commandLanguages) {
+		elements.commandLanguages.textContent = (metrics.languages || []).join(", ") || "—";
+	}
+	if (elements.commandScope) {
+		elements.commandScope.textContent = scopeLabel(run?.mode);
+	}
+	if (elements.commandFindings) {
+		elements.commandFindings.textContent = Number.isFinite(Number(metrics.findings))
+			? String(metrics.findings)
+			: "—";
+	}
+	if (elements.commandSpecialists) {
+		const total = Number(metrics.specialistTotal || 0);
+		const completed = Number(metrics.specialistCompleted || 0);
+		elements.commandSpecialists.textContent = total ? `${completed}/${total}` : "—";
+	}
+	if (elements.commandBudget) {
+		const budgets = run?.budgets || {};
+		const tokens = Number(budgets.maxTokens || 0);
+		const cost = Number(budgets.maxCostUsd || 0);
+		const tokenLabel = tokens >= 1000 ? `${Number((tokens / 1000).toFixed(1))}k` : tokens;
+		elements.commandBudget.textContent = tokens
+			? `${tokenLabel} tokens${cost ? ` · $${cost}` : ""}`
+			: "—";
+	}
+}
+
+function setRun(run) {
+	state.activeRun = run;
+	const status = run?.status || "Idle";
+	elements.title.textContent = run ? `Review ${run.id.slice(0, 8)}` : "No active review";
+	elements.status.textContent = friendlyStatus(status);
+	elements.status.dataset.status = status;
+	elements.phase.textContent = friendlyPhase(run?.currentPhase);
+	elements.progress.textContent = `${run?.progress || 0}%`;
+	elements.bar.style.width = `${run?.progress || 0}%`;
+	elements.bar.dataset.status = status;
+	elements.cancel.hidden = !run || state.terminal.has(status);
+	if (elements.jumpTrace) {
+		elements.jumpTrace.hidden = !run;
+	}
+	if (elements.jumpFindings) {
+		elements.jumpFindings.hidden = !run;
+	}
+	if (elements.commandExport) {
+		elements.commandExport.hidden = !run || !state.terminal.has(status);
+	}
+	if (elements.commandRunContext) {
+		elements.commandRunContext.textContent = run
+			? `${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
+			: "Start a review to monitor its pipeline and evidence.";
+	}
+	updatePipeline(run);
+	updateCommandMetrics(run);
+	renderObserveIdentity();
+	if (elements.exportActions) {
+		elements.exportActions.hidden = !run || !state.terminal.has(status);
+	}
+	document.querySelectorAll(".history-row").forEach((row) => {
+		row.classList.toggle("is-active", Boolean(run && row.dataset.runId === run.id));
+	});
+	if (elements.message) {
+		if (!run) {
+			elements.message.textContent = "Start a review to watch live progress here.";
+			elements.message.dataset.tone = "idle";
+		} else if (status === "failed") {
+			elements.message.textContent = run.message || "The review failed.";
+			elements.message.dataset.tone = "danger";
+		} else if (status === "partial") {
+			elements.message.textContent = run.message
+				? `${run.message} Check the findings panel below for details.`
+				: "Review finished with warnings. Check the findings panel below.";
+			elements.message.dataset.tone = "warning";
+		} else if (status === "succeeded") {
+			elements.message.textContent = run.message
+				? `${run.message} Scroll down to review findings.`
+				: "Review completed successfully. Scroll down to review findings.";
+			elements.message.dataset.tone = "ok";
+		} else if (status === "cancelled") {
+			elements.message.textContent = run.message || "Review cancelled.";
+			elements.message.dataset.tone = "muted";
+		} else if (status === "queued") {
+			elements.message.textContent = run.message || "Waiting for a worker to pick up this review…";
+			elements.message.dataset.tone = "info";
+		} else {
+			elements.message.textContent = run.message || "Review is in progress…";
+			elements.message.dataset.tone = "info";
+		}
+	}
+}
+
+function appendEvent(type, payload) {
+	if (elements.feed.querySelector(".empty-state")) elements.feed.innerHTML = "";
+	const item = document.createElement("li");
+	item.dataset.eventType = type;
+	const run = payload?.data?.run;
+	item.innerHTML = `
+		<span class="event-type"></span>
+		<span class="event-message"></span>
+		<span class="event-time"></span>
+	`;
+	item.querySelector(".event-type").textContent = friendlyEvent(type);
+	const detail = payload?.data?.detail;
+	let message = run?.message || payload?.message || "Lifecycle update";
+	if (type === "review.indexed" && detail) {
+		message = `${detail.filesScanned} files indexed · ${(detail.languages || []).join(", ") || "no source languages"}`;
+		state.commandMetrics.files = detail.filesScanned || 0;
+		state.commandMetrics.languages = detail.languages || [];
+		updateCommandMetrics();
+	}
+	if (type === "review.findings" && detail) {
+		message = `${detail.count} ${detail.source} findings retained`;
+		state.commandMetrics.findings = detail.count || 0;
+		updateCommandMetrics();
+	}
+	if (type === "review.graph" && detail) {
+		message = `${detail.symbolCount} symbols · ${detail.dependencyCount} dependencies · ${detail.impactCount || 0} impacts · ${detail.cacheHits} cache hits`;
+	}
+	if (type === "review.plan" && detail) {
+		const reused = detail.modelReused ? " · reused model" : "";
+		const crewBit = detail.crewSummary
+			? ` · crew: ${detail.crewSummary}`
+			: "";
+		message = `${detail.factCount} architecture facts (${detail.inferredFacts || 0} enriched) · ${detail.taskCount}/${detail.taskLimit || 0} tasks · ${detail.contextRanges || 0} ranges/${detail.contextLineCount || detail.contextLines || 0} lines · ${detail.allocatedTokens || 0}/${detail.tokenBudget || 0} tokens · +${detail.diffAdded || 0}/-${detail.diffRemoved || 0} diff${reused}${crewBit}`;
+		state.commandMetrics.specialistTotal = detail.taskCount || 0;
+		state.commandMetrics.specialistCompleted = 0;
+		updateCommandMetrics();
+		seedCrewFromPlan(detail);
+	}
+	if (type === "review.specialist.progress" && detail) {
+		const attempt = detail.attempt ? ` · attempt ${detail.attempt}` : "";
+		const stageText = stageLabels[detail.stage] || detail.stage || "Working";
+		const detailMessage = detail.message || stageText;
+		message = `${detail.role}: ${detailMessage}${attempt}`;
+		upsertSpecialist(detail.role, {
+			stage: detail.stage || "running",
+			status: detail.status || (detail.stage === "task-completed" ? "succeeded" : "running"),
+			attempt: detail.attempt || 0,
+			charactersSeen: detail.charactersSeen || 0,
+			message: detailMessage
+		});
+		if (elements.message) {
+			elements.message.textContent = message;
+			elements.message.dataset.tone = "info";
+		}
+	}
+	if (type === "review.specialist.observe" && detail) {
+		appendObservation(detail);
+		const obs = detail.observe || {};
+		message = `${detail.role || "agent"}: ${obs.kind || "trace"} · ${obs.title || detail.message || "update"}`;
+		item.classList.add("is-muted");
+		item.classList.add("is-trace");
+		if (elements.message && obs.title) {
+			elements.message.textContent = `${detail.role || "agent"}: ${obs.title}`;
+			elements.message.dataset.tone = "info";
+		}
+	}
+	if (type === "review.specialists" && detail) {
+		message = `${detail.completedTasks}/${detail.taskCount} specialist tasks completed · ${detail.findingCount} findings`;
+		state.commandMetrics.specialistCompleted = detail.completedTasks || 0;
+		state.commandMetrics.specialistTotal = detail.taskCount || 0;
+		state.commandMetrics.findings = detail.findingCount || state.commandMetrics.findings;
+		updateCommandMetrics();
+		(detail.results || []).forEach((item) => {
+			const ok = item.status === "succeeded";
+			upsertSpecialist(item.role, {
+				status: item.status || (ok ? "succeeded" : "failed"),
+				stage: "task-completed",
+				message: item.error || item.summary || (ok ? "Completed" : "Failed")
+			});
+		});
+	}
+	if (type === "run.error") {
+		message = run?.message || detail?.message || "Review failed";
+		item.classList.add("is-error");
+	}
+	if (type === "run.completed" || type === "review.completed") {
+		item.classList.add("is-done");
+	}
+	if (type === "stream.error" || type === "stream.waiting") {
+		item.classList.add("is-muted");
+	}
+	item.querySelector(".event-message").textContent = message;
+	const stamp = payload?.timestamp ? new Date(payload.timestamp) : new Date();
+	item.querySelector(".event-time").textContent = Number.isNaN(stamp.getTime())
+		? ""
+		: stamp.toLocaleTimeString();
+	elements.feed.prepend(item);
+	timelineFromEvent(type, payload, message);
+}
+
+function renderResult(result = {}) {
+	const scope = result.reviewScope || "";
+	const unavailable = scope === "working-tree-unavailable" || scope === "revision-diff-unavailable";
+	elements.summary.textContent = result.summary || "The review has not produced a summary yet.";
+	elements.summary.dataset.tone = unavailable ? "warning" : (result.findingsCount ? "ok" : "idle");
+	elements.resultFiles.textContent = result.filesScanned || 0;
+	elements.resultLanguages.textContent = (result.languages || []).join(", ") || "—";
+	elements.resultCount.textContent = result.findingsCount || 0;
+	state.commandMetrics.files = result.filesScanned || state.commandMetrics.files || 0;
+	state.commandMetrics.languages = result.languages || state.commandMetrics.languages || [];
+	state.commandMetrics.findings = result.findingsCount || 0;
+	const aiFiles = result.aiFilesReviewed || 0;
+	const totalFiles = result.filesScanned || 0;
+	elements.resultAiCoverage.textContent = result.aiEnabled
+		? `${aiFiles}/${totalFiles} files · ${result.aiCharactersSent || 0} chars`
+		: "Not used";
+	elements.aiBadge.textContent = result.aiEnabled
+		? `bx-ai ${aiFiles}/${totalFiles} + deterministic`
+		: "Deterministic";
+	const revision = result.repositoryRevision
+		? ` · ${result.repositoryRevision.slice(0, 12)}`
+		: "";
+	elements.resultScope.textContent = `${result.reviewScope || "—"}${revision}`;
+	const graph = result.graph?.summary || {};
+	elements.resultGraph.textContent = `${graph.symbolCount || 0} symbols · ${graph.dependencyCount || 0} edges · ${graph.impactCount || 0} impacts`;
+	const architecture = result.architecture?.summary || {};
+	const architectureDiff = result.architectureDiff?.summary || {};
+	const plan = result.plan?.summary || {};
+	const reused = result.architectureReused ? " · reused" : "";
+	elements.resultPlan.textContent = `${architecture.factCount || 0} facts (${architecture.inferredFacts || 0} enriched) · ${plan.taskCount || 0}/${plan.taskLimit || 0} tasks · ${plan.contextRangeCount || 0} ranges/${plan.contextLineCount || 0} lines · ${plan.allocatedTokens || 0}/${plan.tokenBudget || 0} tokens · +${architectureDiff.addedCount || 0}/-${architectureDiff.removedCount || 0}${reused}`;
+	seedCrewFromPlan({
+		crewSource: plan.crewSource || "",
+		crewSummary: plan.crewSummary || "",
+		selectedRoles: plan.selectedRoles || [],
+		roles: plan.selectedRoles || [],
+		tasks: (result.plan?.tasks || []).map((task) => ({
+			role: task.role,
+			brief: task.brief || "",
+			objective: task.objective || "",
+			status: "queued",
+			stage: "queued",
+			message: "From review plan"
+		}))
+	});
+	const specialists = result.specialists?.summary || {};
+	state.commandMetrics.specialistCompleted = specialists.completedTasks || 0;
+	state.commandMetrics.specialistTotal = specialists.taskCount || 0;
+	updateCommandMetrics();
+	elements.resultSpecialists.textContent = `${specialists.completedTasks || 0}/${specialists.taskCount || 0} complete · ${specialists.failedTasks || 0} failed · ${specialists.toolCalls || 0} tool calls`;
+	const specialistWarning = specialistWarningText(result);
+	if (specialistWarning) {
+		elements.summary.textContent = `${result.summary || "Review finished."} ${specialistWarning}`;
+		elements.summary.dataset.tone = "warning";
+	}
+	renderSpecialistResults(result);
+	renderArchitectureExplorer(result);
+	renderBaselineSummary(result);
+	state.findings = result.findings || [];
+	if (state.pendingFindingFingerprint) {
+		const pending = state.findings.find(
+			(finding) => finding.fingerprint === state.pendingFindingFingerprint
+		);
+		if (pending) state.selectedFindingId = pending.id;
+		state.pendingFindingFingerprint = "";
+	}
+	if (!state.findings.some((finding) => finding.id === state.selectedFindingId)) {
+		state.selectedFindingId = state.findings[0]?.id || "";
+	}
+	renderFindingsWorkspace(unavailable);
+	renderFixedFindings(result);
+}
+
+function findingPriority(finding) {
+	return {
+		critical: 0,
+		high: 1,
+		medium: 2,
+		low: 3,
+		info: 4
+	}[finding.severity] ?? 5;
+}
+
+function filteredFindings() {
+	const search = state.findingSearch.trim().toLowerCase();
+	const rows = state.findings.filter((finding) => {
+		if (state.findingSeverity !== "all" && finding.severity !== state.findingSeverity) {
+			return false;
+		}
+		if (
+			state.findingReviewState !== "all" &&
+			(finding.review?.state || "new") !== state.findingReviewState
+		) {
+			return false;
+		}
+		if (!search) return true;
+		return [
+			finding.title,
+			finding.message,
+			finding.filePath,
+			finding.ruleId,
+			finding.category,
+			finding.source
+		].some((value) => String(value || "").toLowerCase().includes(search));
+	});
+	return rows.sort((left, right) => {
+		if (state.findingSort === "confidence") {
+			return Number(right.confidence || 0) - Number(left.confidence || 0);
+		}
+		if (state.findingSort === "file") {
+			return String(left.filePath || "").localeCompare(String(right.filePath || ""));
+		}
+		return findingPriority(left) - findingPriority(right) ||
+			Number(right.confidence || 0) - Number(left.confidence || 0);
+	});
+}
+
+function renderFindingSeveritySummary() {
+	if (!elements.findingSeveritySummary) return;
+	const severities = ["critical", "high", "medium", "low", "info"];
+	elements.findingSeveritySummary.innerHTML = "";
+	severities.forEach((severity) => {
+		const count = state.findings.filter((finding) => finding.severity === severity).length;
+		if (!count) return;
+		const item = document.createElement("button");
+		item.type = "button";
+		item.className = `severity-total severity-${severity}`;
+		item.dataset.findingSeverity = severity;
+		item.innerHTML = `<span>${severity}</span><strong>${count}</strong>`;
+		item.classList.toggle("is-active", state.findingSeverity === severity);
+		elements.findingSeveritySummary.appendChild(item);
+	});
+}
+
+function renderFindingsWorkspace(unavailable = false) {
+	if (!elements.findings || !elements.findingDetail) return;
+	renderFindingSeveritySummary();
+	const findings = filteredFindings();
+	elements.findings.innerHTML = "";
+	if (!findings.length) {
+		const empty = document.createElement("p");
+		empty.className = "empty-state";
+		empty.textContent = state.findings.length
+			? "No findings match the current filters."
+			: unavailable
+				? "No files were reviewed. Switch Review mode to Full baseline and start again."
+				: "No evidence-backed findings were retained.";
+		elements.findings.appendChild(empty);
+		renderFindingDetail(null);
+		return;
+	}
+	if (!findings.some((finding) => finding.id === state.selectedFindingId)) {
+		state.selectedFindingId = findings[0].id;
+	}
+	findings.forEach((finding) => {
+		const card = document.createElement("article");
+		card.className = `finding-card severity-${finding.severity}`;
+		card.dataset.findingId = finding.id;
+		card.tabIndex = 0;
+		card.setAttribute("role", "button");
+		card.setAttribute("aria-pressed", finding.id === state.selectedFindingId ? "true" : "false");
+		card.classList.toggle("is-selected", finding.id === state.selectedFindingId);
+		card.innerHTML = `
+			<div class="finding-heading">
+				<span class="severity"></span>
+				<strong class="finding-title"></strong>
+				<span class="finding-source"></span>
+			</div>
+			<p class="finding-location"></p>
+			<p class="finding-message"></p>
+			<div class="finding-card-meta">
+				<span class="finding-confidence"></span>
+				<span class="finding-rule"></span>
+				<span class="finding-review-badge"></span>
+			</div>
+		`;
+		card.querySelector(".severity").textContent = finding.severity;
+		const title = card.querySelector(".finding-title");
+		title.textContent = finding.title;
+		if (finding.baselineStatus === "new" || finding.baselineStatus === "unchanged") {
+			const badge = document.createElement("span");
+			badge.className = `baseline-status is-${finding.baselineStatus}`;
+			badge.textContent = finding.baselineStatus === "new" ? "New" : "Unchanged";
+			title.appendChild(badge);
+		}
+		card.querySelector(".finding-source").textContent = finding.source;
+		card.querySelector(".finding-location").textContent = `${finding.filePath}:${finding.startLine}`;
+		card.querySelector(".finding-message").textContent = finding.message;
+		card.querySelector(".finding-confidence").textContent = `${Math.round(Number(finding.confidence || 0) * 100)}% confidence`;
+		card.querySelector(".finding-rule").textContent = finding.ruleId || finding.category || "";
+		const reviewBadge = card.querySelector(".finding-review-badge");
+		reviewBadge.textContent = finding.review?.state || "new";
+		reviewBadge.dataset.state = finding.review?.state || "new";
+		elements.findings.appendChild(card);
+	});
+	renderFindingDetail(findings.find((finding) => finding.id === state.selectedFindingId) || findings[0]);
+}
+
+function renderFindingDetail(finding) {
+	if (!elements.findingDetail) return;
+	elements.findingDetail.innerHTML = "";
+	if (!finding) {
+		elements.findingDetail.innerHTML = '<p class="empty-state">Select a finding to inspect its evidence and recommendation.</p>';
+		return;
+	}
+	const detail = document.createElement("div");
+	detail.className = `finding-detail-content severity-${finding.severity}`;
+	detail.innerHTML = `
+		<div class="finding-detail-heading">
+			<span class="severity"></span>
+			<span class="finding-detail-id"></span>
+		</div>
+		<h3></h3>
+		<div class="finding-confidence-track" aria-label="Finding confidence">
+			<span></span><i></i>
+		</div>
+		<section>
+			<h4>Impact</h4>
+			<p class="finding-detail-message"></p>
+		</section>
+		<section>
+			<h4>Evidence location</h4>
+			<p class="finding-location"></p>
+			<pre><code></code></pre>
+		</section>
+		<section class="finding-analysis-source">
+			<h4>Analysis source</h4>
+			<p></p>
+		</section>
+		<section>
+			<h4>Recommendation</h4>
+			<div class="finding-solution"></div>
+		</section>
+		<section class="finding-review-panel">
+			<h4>Review decision</h4>
+			<div class="finding-review-fields">
+				<label>Status
+					<select class="finding-review-select">
+						<option value="new">New</option>
+						<option value="acknowledged">Acknowledged</option>
+						<option value="reviewed">Reviewed</option>
+						<option value="dismissed">Dismissed</option>
+						<option value="resolved">Resolved</option>
+						<option value="reopened">Reopened</option>
+					</select>
+				</label>
+				<label>Note
+					<textarea class="finding-review-note" maxlength="2000" rows="3" placeholder="Optional decision context"></textarea>
+				</label>
+				<button type="button" class="secondary finding-review-save">Save decision</button>
+				<p class="finding-review-status" role="status"></p>
+			</div>
+			<div class="finding-review-history"></div>
+		</section>
+	`;
+	detail.querySelector(".severity").textContent = finding.severity;
+	detail.querySelector(".finding-detail-id").textContent = finding.id ? `ID ${finding.id.slice(0, 8)}` : "";
+	detail.querySelector("h3").textContent = finding.title || "Finding";
+	const confidence = Math.round(Number(finding.confidence || 0) * 100);
+	detail.querySelector(".finding-confidence-track span").textContent = `Confidence ${confidence}%`;
+	detail.querySelector(".finding-confidence-track i").style.width = `${confidence}%`;
+	detail.querySelector(".finding-detail-message").textContent = finding.message || "";
+	detail.querySelector(".finding-location").textContent = `${finding.filePath || "—"}:${finding.startLine || 0}${finding.endLine && finding.endLine !== finding.startLine ? `–${finding.endLine}` : ""}`;
+	detail.querySelector("code").textContent = finding.evidence || "No source excerpt retained.";
+	detail.querySelector(".finding-analysis-source p").textContent =
+		`${finding.source || "deterministic"} · ${finding.ruleId || finding.category || "review rule"}`;
+	renderFindingSolution(detail.querySelector(".finding-solution"), finding);
+	const review = finding.review || { state: "new", note: "", version: 0, history: [] };
+	detail.querySelector(".finding-review-select").value = review.state || "new";
+	detail.querySelector(".finding-review-note").value = review.note || "";
+	renderFindingReviewHistory(detail.querySelector(".finding-review-history"), review.history || []);
+	detail.querySelector(".finding-review-save").addEventListener("click", () => {
+		saveFindingReview(finding, detail);
+	});
+	elements.findingDetail.appendChild(detail);
+}
+
+function renderFindingReviewHistory(container, history) {
+	container.innerHTML = "";
+	if (!history.length) return;
+	const heading = document.createElement("h5");
+	heading.textContent = "Decision history";
+	container.appendChild(heading);
+	const list = document.createElement("ol");
+	history.slice(0, 10).forEach((entry) => {
+		const item = document.createElement("li");
+		const actor = entry.changedBy ? ` by ${entry.changedBy}` : "";
+		item.textContent = `${entry.state}${actor} · ${formatDate(entry.createdAt)}${entry.note ? ` — ${entry.note}` : ""}`;
+		list.appendChild(item);
+	});
+	container.appendChild(list);
+}
+
+async function saveFindingReview(finding, detail) {
+	if (!state.activeRun?.id || !finding.fingerprint) return;
+	const button = detail.querySelector(".finding-review-save");
+	const status = detail.querySelector(".finding-review-status");
+	button.disabled = true;
+	status.textContent = "Saving…";
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/findings/${encodeURIComponent(finding.fingerprint)}/review`,
+			{
+				method: "PUT",
+				body: JSON.stringify({
+					reviewState: detail.querySelector(".finding-review-select").value,
+					note: detail.querySelector(".finding-review-note").value,
+					expectedVersion: finding.review?.version || 0
+				})
+			}
+		);
+		finding.review = payload.data;
+		status.textContent = "Decision saved.";
+		renderFindingsWorkspace();
+	} catch (error) {
+		status.textContent = error.message || "Could not save the decision.";
+	} finally {
+		button.disabled = false;
+	}
+}
+
+function renderArchitectureExplorer(result = null) {
+	if (result) state.architectureGraph = {
+		graph: result.graph || {},
+		snapshot: result.snapshot || {}
+	};
+	if (!elements.architectureResults) return;
+	const graph = state.architectureGraph?.graph || {};
+	const snapshot = state.architectureGraph?.snapshot || {};
+	const summary = graph.summary || {};
+	elements.architectureSnapshot.textContent = snapshot.id
+		? `Snapshot ${snapshot.id.slice(0, 12)}`
+		: "No snapshot";
+	elements.architectureSnapshot.title = snapshot.id || "";
+	elements.architectureSummary.innerHTML = "";
+	[
+		["Files", snapshot.fileCount || summary.filesAnalyzed || 0],
+		["Symbols", summary.symbolCount || 0],
+		["Dependencies", summary.dependencyCount || 0],
+		["Impacts", summary.impactCount || 0]
+	].forEach(([label, value]) => {
+		const item = document.createElement("div");
+		item.innerHTML = `<span></span><strong></strong>`;
+		item.querySelector("span").textContent = label;
+		item.querySelector("strong").textContent = value;
+		elements.architectureSummary.appendChild(item);
+	});
+	const query = state.architectureSearch.toLowerCase().trim();
+	const kind = state.architectureKind;
+	const facts = [];
+	if (kind === "all" || kind === "symbols") {
+		(graph.symbols || []).forEach((item) => facts.push({
+			type: "symbol",
+			title: `${item.kind || "symbol"} · ${item.name || "unnamed"}`,
+			location: `${item.filePath || "—"}:${item.line || 0}`,
+			detail: item.evidence || ""
+		}));
+	}
+	if (kind === "all" || kind === "dependencies") {
+		(graph.dependencies || []).forEach((item) => facts.push({
+			type: "dependency",
+			title: `${item.kind || "dependency"} · ${item.target || "unknown target"}`,
+			location: `${item.sourceFile || "—"}:${item.line || 0}`,
+			detail: item.targetFile ? `Resolves to ${item.targetFile}` : (item.evidence || "")
+		}));
+	}
+	if (kind === "all" || kind === "impacts") {
+		(graph.impacts || []).forEach((item) => facts.push({
+			type: "impact",
+			title: `${item.changedSymbol || item.changedFile || "Change"} → ${item.impactedFile || "unknown"}`,
+			location: `Depth ${item.depth || 0}${item.viaFile ? ` via ${item.viaFile}` : ""}`,
+			detail: item.reason || ""
+		}));
+	}
+	const visible = facts.filter((fact) => !query ||
+		[fact.type, fact.title, fact.location, fact.detail].some((value) =>
+			String(value || "").toLowerCase().includes(query)
+		)
+	);
+	elements.architectureResults.innerHTML = "";
+	if (!visible.length) {
+		elements.architectureResults.innerHTML =
+			'<p class="empty-state">No architecture facts match this view.</p>';
+		return;
+	}
+	visible.slice(0, 250).forEach((fact) => {
+		const card = document.createElement("article");
+		card.className = "architecture-fact";
+		card.innerHTML = `<span class="architecture-fact-type"></span><strong></strong><p></p><small></small>`;
+		card.querySelector(".architecture-fact-type").textContent = fact.type;
+		card.querySelector("strong").textContent = fact.title;
+		card.querySelector("p").textContent = fact.detail;
+		card.querySelector("small").textContent = fact.location;
+		elements.architectureResults.appendChild(card);
+	});
+}
+
+function playbookSteps(playbook) {
+	if (!playbook) return [];
+	const steps = playbook.steps;
+	if (Array.isArray(steps)) return steps;
+	if (steps && typeof steps === "object") {
+		return Object.keys(steps)
+			.sort((a, b) => Number(a) - Number(b))
+			.map((key) => steps[key])
+			.filter((step) => typeof step === "string" && step.length);
+	}
+	return [];
+}
+
+function renderFindingSolution(container, finding) {
+	if (!container) return;
+	container.innerHTML = "";
+	const playbook = finding.playbook;
+	const patch = finding.fixPatch;
+	const steps = playbookSteps(playbook);
+	const hasPlaybook = steps.length > 0;
+	const hasPatch = patch && patch.after;
+
+	if (hasPlaybook) {
+		const how = document.createElement("div");
+		how.className = "finding-playbook";
+		const heading = document.createElement("h4");
+		heading.textContent = "How to fix";
+		how.appendChild(heading);
+		const list = document.createElement("ol");
+		steps.forEach((step) => {
+			const item = document.createElement("li");
+			item.textContent = step;
+			list.appendChild(item);
+		});
+		how.appendChild(list);
+		if (playbook.example) {
+			const example = document.createElement("pre");
+			example.className = "finding-playbook-example";
+			const code = document.createElement("code");
+			code.textContent = playbook.example;
+			example.appendChild(code);
+			how.appendChild(example);
+		}
+		container.appendChild(how);
+	} else if (finding.suggestion) {
+		const how = document.createElement("div");
+		how.className = "finding-playbook";
+		const heading = document.createElement("h4");
+		heading.textContent = "How to fix";
+		how.appendChild(heading);
+		const body = document.createElement("p");
+		body.className = "finding-suggestion-body";
+		body.textContent = finding.suggestion;
+		how.appendChild(body);
+		container.appendChild(how);
+	} else if (!hasPatch) {
+		const how = document.createElement("div");
+		how.className = "finding-playbook";
+		const body = document.createElement("p");
+		body.className = "finding-suggestion-body";
+		body.textContent = "No suggested change.";
+		how.appendChild(body);
+		container.appendChild(how);
+	}
+
+	if (hasPatch) {
+		const block = document.createElement("div");
+		block.className = "finding-fix-patch";
+		const heading = document.createElement("h4");
+		heading.textContent = "Suggested change";
+		block.appendChild(heading);
+
+		const beforeLabel = document.createElement("p");
+		beforeLabel.className = "patch-label";
+		beforeLabel.textContent = "Before";
+		block.appendChild(beforeLabel);
+		const beforePre = document.createElement("pre");
+		const beforeCode = document.createElement("code");
+		beforeCode.textContent = patch.before || "";
+		beforePre.appendChild(beforeCode);
+		block.appendChild(beforePre);
+
+		const afterLabel = document.createElement("p");
+		afterLabel.className = "patch-label";
+		afterLabel.textContent = "After";
+		block.appendChild(afterLabel);
+		const afterPre = document.createElement("pre");
+		const afterCode = document.createElement("code");
+		afterCode.textContent = patch.after || "";
+		afterPre.appendChild(afterCode);
+		block.appendChild(afterPre);
+
+		const copyBtn = document.createElement("button");
+		copyBtn.type = "button";
+		copyBtn.className = "secondary finding-copy-patch";
+		copyBtn.textContent = "Copy after";
+		copyBtn.addEventListener("click", async () => {
+			try {
+				await navigator.clipboard.writeText(patch.after || "");
+				copyBtn.textContent = "Copied";
+				setTimeout(() => {
+					copyBtn.textContent = "Copy after";
+				}, 1500);
+			} catch (error) {
+				copyBtn.textContent = "Copy failed";
+			}
+		});
+		block.appendChild(copyBtn);
+		container.appendChild(block);
+	}
+}
+
+function renderBaselineSummary(result = {}) {
+	if (!elements.baselineSummary) return;
+	elements.baselineSummary.innerHTML = "";
+	const baseline = result.baseline;
+	if (!baseline) {
+		elements.baselineSummary.hidden = false;
+		elements.baselineSummary.textContent = "No prior run to compare (same path and mode).";
+		return;
+	}
+	const counts = baseline.counts || {};
+	elements.baselineSummary.hidden = false;
+	const when = baseline.createdAt ? new Date(baseline.createdAt).toLocaleString() : baseline.runId;
+	elements.baselineSummary.innerHTML = `
+		<span class="baseline-chip is-new"></span>
+		<span class="baseline-chip is-unchanged"></span>
+		<span class="baseline-chip is-fixed"></span>
+		<span class="baseline-vs"></span>
+	`;
+	elements.baselineSummary.querySelector(".is-new").textContent = `${counts.new || 0} new`;
+	elements.baselineSummary.querySelector(".is-unchanged").textContent = `${counts.unchanged || 0} unchanged`;
+	elements.baselineSummary.querySelector(".is-fixed").textContent = `${counts.fixed || 0} fixed`;
+	elements.baselineSummary.querySelector(".baseline-vs").textContent = `vs prior run · ${when}`;
+}
+
+function renderFixedFindings(result = {}) {
+	if (!elements.fixedFindings || !elements.fixedFindingsList) return;
+	const fixed = result.fixedFindings || [];
+	elements.fixedFindingsList.innerHTML = "";
+	if (!result.baseline || !fixed.length) {
+		elements.fixedFindings.hidden = true;
+		return;
+	}
+	elements.fixedFindings.hidden = false;
+	elements.fixedFindings.open = false;
+	fixed.forEach((item) => {
+		const row = document.createElement("div");
+		row.className = "fixed-finding-item";
+		row.textContent = `${item.title || item.ruleId || "Finding"} · ${item.filePath || "—"}${item.severity ? ` · ${item.severity}` : ""}`;
+		elements.fixedFindingsList.appendChild(row);
+	});
+}
+
+async function loadResult(runId) {
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/result`);
+		renderResult(payload.data.result);
+		return payload.data.result;
+	} catch (error) {
+		elements.summary.textContent = error.message;
+		elements.summary.dataset.tone = "danger";
+		return null;
+	}
+}
+
+async function reloadRunActivity(run, { clear = true } = {}) {
+	if (clear) {
+		if (elements.feed) elements.feed.innerHTML = "";
+		state.observations = [];
+		state.lastTimelineKey = "";
+		state.lastEventSequence = 0;
+	}
+	return loadEventHistory(run, { replace: clear });
+}
+
+async function catchUpEvents(run) {
+	if (!run?.id) return state.lastEventSequence || 0;
+	const after = state.lastEventSequence || 0;
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(run.id)}/event-log?after=${encodeURIComponent(after)}&limit=500`
+		);
+		const rows = payload.data || [];
+		let added = 0;
+		rows.forEach((item) => {
+			if (!rememberEventSequence(item.sequence)) return;
+			if (!item.eventType || !item.payload) return;
+			try {
+				appendEvent(item.eventType, item.payload);
+				added++;
+			} catch (error) {
+				console.warn("Failed to render event", item.eventType, error);
+			}
+		});
+		if (added) showObservabilityPanel();
+		return state.lastEventSequence || 0;
+	} catch (error) {
+		console.warn("Event catch-up failed", error);
+		return state.lastEventSequence || 0;
+	}
+}
+
+function finishRun(run) {
+	if (state.finishingRunId === run.id) {
+		setRun(run);
+		return;
+	}
+	state.finishingRunId = run.id;
+	stopStatusPoll();
+	state.closingStream = true;
+	setRun(run);
+	if (state.eventSource) {
+		state.eventSource.close();
+		state.eventSource = null;
+	}
+	const hasAgentTraces = state.observations.some((item) =>
+		["generation", "tool", "span"].includes(item.observationType) ||
+		["prompt", "llm", "response", "fallback", "agent"].includes(item.kind)
+	);
+	const catchUpPromise = hasAgentTraces
+		? catchUpEvents(run).then(() => {
+			showObservabilityPanel();
+			return state.lastEventSequence || 0;
+		})
+		: reloadRunActivity(run, { clear: true });
+
+	catchUpPromise
+		.catch((error) => {
+			console.warn("Could not reload run activity", error);
+		})
+		.finally(() => {
+			loadResult(run.id).then(() => {
+				document.querySelector("#results-panel")?.scrollIntoView({
+					behavior: "smooth",
+					block: "start"
+				});
+			});
+			loadRuns();
+			setTimeout(() => {
+				state.closingStream = false;
+				if (state.finishingRunId === run.id) {
+					state.finishingRunId = "";
+				}
+			}, 500);
+		});
+}
+
+async function pollActiveRun() {
+	if (!state.activeRun || state.terminal.has(state.activeRun.status)) {
+		stopStatusPoll();
+		return;
+	}
+	try {
+		await catchUpEvents(state.activeRun);
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}`);
+		const run = payload.data;
+		setRun(run);
+		if (state.terminal.has(run.status)) {
+			const waiting = elements.feed.querySelector('[data-event-type="stream.waiting"]');
+			if (waiting) waiting.remove();
+			finishRun(run);
+		}
+	} catch (error) {
+		if (elements.message) {
+			elements.message.textContent = `Status check failed: ${error.message}`;
+			elements.message.dataset.tone = "danger";
+		}
+	}
+}
+
+function watchRun(run) {
+	stopStatusPoll();
+	state.closingStream = true;
+	state.finishingRunId = "";
+	if (state.eventSource) {
+		state.eventSource.close();
+		state.eventSource = null;
+	}
+	state.closingStream = false;
+	state.streamConnectedRunId = "";
+	resetCommandMetrics();
+	setRun(run);
+	if (elements.feed) elements.feed.innerHTML = "";
+	resetSpecialistBoard();
+	if (elements.message) {
+		elements.message.textContent = run.message || "Loading live activity…";
+		elements.message.dataset.tone = "info";
+	}
+	// Prove life immediately — do not wait for event-log / SSE.
+	state.observations = [];
+	state.lastTimelineKey = "";
+	state.seenEventSequences = new Set();
+	state.lastEventSequence = 0;
+	ensureRunAcceptedObservation(run);
+	showObservabilityPanel();
+	loadEventHistory(run, { replace: true }).then((lastSequence) => {
+		if (state.activeRun?.id !== run.id) return;
+		ensureRunAcceptedObservation(run);
+		showObservabilityPanel();
+		if (state.terminal.has(run.status)) {
+			finishRun(run);
+			return;
+		}
+		openEventStream(run, lastSequence);
+	}).catch((error) => {
+		appendEvent("stream.error", {
+			timestamp: new Date().toISOString(),
+			message: error.message || "Could not load run events"
+		});
+		ensureRunAcceptedObservation(run);
+		showObservabilityPanel();
+		if (!state.terminal.has(run.status)) {
+			openEventStream(run, 0);
+		} else {
+			finishRun(run);
+		}
+	});
+}
+
+async function loadEventHistory(run, { replace = true } = {}) {
+	const payload = await request(
+		`/api/v1/runs/${encodeURIComponent(run.id)}/event-log?limit=500`
+	);
+	const rows = payload.data || [];
+	if (replace) {
+		if (elements.feed) elements.feed.innerHTML = "";
+		state.observations = [];
+		state.lastTimelineKey = "";
+		state.seenEventSequences = new Set();
+		state.lastEventSequence = 0;
+	}
+	rows.forEach((item) => {
+		if (!rememberEventSequence(item.sequence)) return;
+		if (!item.eventType || !item.payload) return;
+		try {
+			appendEvent(item.eventType, item.payload);
+		} catch (error) {
+			console.warn("Failed to render historical event", item.eventType, error);
+		}
+	});
+	if (replace && !rows.length) {
+		appendEvent("run.status", {
+			timestamp: new Date().toISOString(),
+			data: { run }
+		});
+	}
+	ensureRunAcceptedObservation(run);
+	showObservabilityPanel();
+	return state.lastEventSequence || 0;
+}
+
+function openEventStream(run, afterSequence = 0) {
+	if (state.eventSource) {
+		state.closingStream = true;
+		state.eventSource.close();
+		state.eventSource = null;
+		state.closingStream = false;
+	}
+	const source = new EventSource(
+		`/api/v1/runs/${encodeURIComponent(run.id)}/events?after=${encodeURIComponent(afterSequence)}`
+	);
+	state.eventSource = source;
+	const reconnected = state.streamConnectedRunId === run.id;
+	ensureStreamObservation(run, reconnected);
+	state.streamConnectedRunId = run.id;
+	renderObserveIdentity();
+	const eventTypes = [
+		"run.status", "phase.started", "task.progress", "review.indexed",
+		"review.graph", "review.plan", "review.specialist.progress",
+		"review.specialist.observe", "review.specialists",
+		"review.findings", "review.completed", "run.completed",
+		"run.cancelled", "run.error"
+	];
+	eventTypes.forEach((type) => source.addEventListener(type, (event) => {
+		try {
+			if (state.activeRun?.id !== run.id) return;
+			const rawPayload = String(event.data || "").trim();
+			// BoxLang's SSE keep-alive can surface as event data on some
+			// runtimes/proxies. It is a transport comment, not a JSON event.
+			if (!rawPayload || rawPayload.startsWith(":")) return;
+			const sequence = Number(event.lastEventId) || 0;
+			if (sequence && !rememberEventSequence(sequence)) {
+				return;
+			}
+			const payload = JSON.parse(rawPayload);
+			const waiting = elements.feed.querySelector('[data-event-type="stream.waiting"]');
+			if (waiting) {
+				waiting.remove();
+				ensureStreamObservation(run, true);
+			}
+			appendEvent(type, payload);
+			if (payload?.data?.run) {
+				setRun(payload.data.run);
+				if (state.terminal.has(payload.data.run.status)) {
+					finishRun(payload.data.run);
+				}
+			}
+		} catch (error) {
+			appendEvent("stream.error", {
+				timestamp: new Date().toISOString(),
+				message: error.message || "Bad event payload"
+			});
+		}
+	}));
+	source.onerror = () => {
+		if (state.closingStream) {
+			return;
+		}
+		if (state.activeRun && state.terminal.has(state.activeRun.status)) {
+			source.close();
+			catchUpEvents(state.activeRun).finally(() => {
+				if (state.activeRun) finishRun(state.activeRun);
+			});
+			return;
+		}
+		if (!elements.feed.querySelector('[data-event-type="stream.waiting"]')) {
+			appendEvent("stream.waiting", {
+				timestamp: new Date().toISOString(),
+				message: "Reconnecting to live updates…"
+			});
+		}
+		catchUpEvents(state.activeRun);
+		pollActiveRun();
+	};
+	state.statusPoll = setInterval(pollActiveRun, 2000);
+}
+
+async function loadRuns() {
+	if (!elements.history || state.history.loading) return;
+	state.history.loading = true;
+	elements.history.innerHTML = `<tr><td colspan="8" class="empty-state">Loading review history…</td></tr>`;
+	try {
+		const params = historyQueryParams();
+		const payload = await request(`/api/v1/history?${params.toString()}`);
+		const rows = payload.data || [];
+		const meta = payload.meta || {};
+		state.history.rows = rows;
+		state.history.totalPages = meta.totalPages || 0;
+		elements.history.innerHTML = rows.length
+			? ""
+			: `<tr><td colspan="8" class="empty-state">${hasHistoryFilters() ? "No reviews match these filters." : "No runs yet."}</td></tr>`;
+		renderHistoryTrends(meta.trends || {});
+		renderHistoryPagination(meta);
+		rows.forEach((item) => {
+			const run = item.run || {};
+			const metrics = item.metrics || {};
+			const row = document.createElement("tr");
+			row.className = "history-row";
+			if (state.activeRun?.id === run.id) {
+				row.classList.add("is-active");
+			}
+			row.dataset.runId = run.id;
+			row.innerHTML = `
+				<td class="repo"></td>
+				<td class="mode"></td>
+				<td><span class="status-badge"></span></td>
+				<td class="history-severity"><div class="history-severity-chips"></div></td>
+				<td class="history-specialists"></td>
+				<td class="history-execution"></td>
+				<td class="created"></td>
+				<td class="actions">
+					<div class="history-actions">
+						<button type="button" class="secondary-button history-compare">Compare</button>
+						<button type="button" class="secondary-button history-rerun">Rerun</button>
+						<button type="button" class="secondary-button history-trace">Trace</button>
+						<button type="button" class="secondary-button history-open">Open</button>
+					</div>
+				</td>
+			`;
+			row.querySelector(".repo").textContent = run.projectPath;
+			row.querySelector(".repo").title = run.projectPath || "";
+			row.querySelector(".mode").textContent = scopeLabel(run.mode);
+			const badge = row.querySelector(".status-badge");
+			badge.textContent = friendlyStatus(run.status);
+			badge.classList.add(run.status);
+			badge.title = run.message || run.status;
+			renderHistorySeverity(row.querySelector(".history-severity"), metrics.findings || {});
+			renderHistorySpecialists(row.querySelector(".history-specialists"), metrics.specialists || {});
+			renderHistoryExecution(row.querySelector(".history-execution"), metrics);
+			row.querySelector(".created").textContent = new Date(run.createdAt).toLocaleString();
+			const open = () => watchRun(run);
+			row.addEventListener("click", open);
+			row.querySelector(".history-open").addEventListener("click", (event) => {
+				event.stopPropagation();
+				open();
+			});
+			row.querySelector(".history-compare").addEventListener("click", (event) => {
+				event.stopPropagation();
+				loadHistoryComparison(run);
+			});
+			row.querySelector(".history-rerun").addEventListener("click", async (event) => {
+				event.stopPropagation();
+				const button = event.currentTarget;
+				button.disabled = true;
+				button.textContent = "Starting…";
+				try {
+					const payload = await request(
+						`/api/v1/runs/${encodeURIComponent(run.id)}/rerun`,
+						{ method: "POST", body: "{}" }
+					);
+					watchRun(payload.data);
+					loadHistory();
+				} catch (error) {
+					button.disabled = false;
+					button.textContent = "Rerun";
+					window.alert(error.message || "Could not start the rerun.");
+				}
+			});
+			row.querySelector(".history-trace").addEventListener("click", (event) => {
+				event.stopPropagation();
+				watchRun(run);
+				window.setTimeout(() => {
+					elements.observePanel?.scrollIntoView({ behavior: "smooth", block: "start" });
+				}, 250);
+			});
+			elements.history.appendChild(row);
+		});
+		// Only auto-resume when the URL explicitly asks for a run (?run=<id>).
+		// Refresh must not pick a folder path or jump into an in-flight review.
+		if (!state.activeRun && !state.didAutoResume) {
+			const resumeId = new URLSearchParams(window.location.search).get("run");
+			if (resumeId) {
+				const match = rows.map((item) => item.run).find((run) => run.id === resumeId);
+				if (match) {
+					state.didAutoResume = true;
+					watchRun(match);
+				}
+			}
+		}
+	} catch (error) {
+		elements.history.innerHTML = `<tr><td colspan="8" class="empty-state">${error.message}</td></tr>`;
+	} finally {
+		state.history.loading = false;
+	}
+}
+
+function historyQueryParams() {
+	const params = new URLSearchParams();
+	const values = elements.historyFilters
+		? Object.fromEntries(new FormData(elements.historyFilters))
+		: {};
+	Object.entries(values).forEach(([key, value]) => {
+		const normalized = String(value || "").trim();
+		if (!normalized) return;
+		if (key === "from") {
+			params.set(key, `${normalized}T00:00:00Z`);
+		} else if (key === "to") {
+			params.set(key, `${normalized}T23:59:59Z`);
+		} else {
+			params.set(key, normalized);
+		}
+	});
+	params.set("page", String(state.history.page));
+	params.set("limit", "20");
+	return params;
+}
+
+function hasHistoryFilters() {
+	if (!elements.historyFilters) return false;
+	return [...new FormData(elements.historyFilters).values()]
+		.some((value) => String(value || "").trim());
+}
+
+function renderHistoryTrends(trends = {}) {
+	if (!elements.historyTrends) return;
+	const values = [
+		trends.runCount ?? 0,
+		trends.totalFindings ?? 0,
+		(trends.high || 0) + (trends.critical || 0),
+		trends.medianDurationMs == null ? "Unavailable" : formatDuration(trends.medianDurationMs),
+		formatCompactNumber(trends.totalTokens || 0),
+		`${trends.retries || 0} / ${trends.failures || 0}`
+	];
+	[...elements.historyTrends.querySelectorAll("strong")].forEach((node, index) => {
+		node.textContent = values[index];
+	});
+}
+
+function renderHistoryPagination(meta = {}) {
+	if (!elements.historyPagination) return;
+	const totalPages = meta.totalPages || 0;
+	elements.historyPagination.hidden = totalPages <= 1;
+	elements.historyPageLabel.textContent = `Page ${meta.page || 1} of ${Math.max(1, totalPages)} · ${meta.total || 0} runs`;
+	elements.historyPrevious.disabled = (meta.page || 1) <= 1;
+	elements.historyNext.disabled = !totalPages || (meta.page || 1) >= totalPages;
+}
+
+function renderHistorySeverity(target, findings = {}) {
+	const severities = ["critical", "high", "medium", "low"];
+	const chips = target.querySelector(".history-severity-chips") || target;
+	chips.innerHTML = "";
+	severities.forEach((severity) => {
+		const count = Number(findings[severity] || 0);
+		if (!count) return;
+		const chip = document.createElement("span");
+		chip.className = `severity-chip ${severity}`;
+		chip.textContent = `${count} ${severity[0].toUpperCase()}`;
+		chip.title = `${count} ${severity} findings`;
+		chips.appendChild(chip);
+	});
+	if (!chips.childElementCount) {
+		chips.textContent = findings.total == null ? "Unavailable" : "No findings";
+	}
+}
+
+function renderHistorySpecialists(target, specialists = {}) {
+	if (!specialists.total) {
+		target.textContent = "Deterministic";
+		return;
+	}
+	target.textContent = `${specialists.completed || 0}/${specialists.total} complete`;
+	target.title = `${(specialists.selected || []).join(", ") || "Specialists"}${specialists.failed ? ` · ${specialists.failed} failed` : ""}`;
+	if (specialists.failed) target.dataset.tone = "danger";
+}
+
+function renderHistoryExecution(target, metrics = {}) {
+	const ai = metrics.ai || {};
+	const model = ai.models?.[0] || ai.providers?.[0] || (ai.available ? "AI recorded" : "No AI telemetry");
+	const duration = metrics.durationAvailable ? formatDuration(metrics.durationMs) : "duration unavailable";
+	const tokens = ai.totalTokens ? `${formatCompactNumber(ai.totalTokens)} tokens` : "tokens unavailable";
+	target.textContent = `${duration} · ${model}`;
+	target.title = `${tokens} · ${ai.retries || 0} retries · ${ai.failures || 0} failures`;
+}
+
+function formatDuration(value) {
+	const milliseconds = Number(value || 0);
+	if (milliseconds < 1000) return `${milliseconds} ms`;
+	const seconds = Math.round(milliseconds / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes}m ${seconds % 60}s`;
+}
+
+function formatCompactNumber(value) {
+	return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 })
+		.format(Number(value || 0));
+}
+
+async function loadHistoryComparison(run) {
+	if (!elements.historyComparison) return;
+	elements.historyComparison.hidden = false;
+	elements.historyComparisonTitle.textContent = `Comparing ${run.projectPath || run.id}`;
+	elements.comparisonCounts.innerHTML = `<p class="empty-state">Loading compatible baseline…</p>`;
+	elements.comparisonMovements.innerHTML = "";
+	elements.historyComparison.scrollIntoView({ behavior: "smooth", block: "nearest" });
+	try {
+		const payload = await request(`/api/v1/history/${encodeURIComponent(run.id)}/comparison`);
+		renderHistoryComparison(run, payload.data || {});
+	} catch (error) {
+		elements.comparisonCounts.innerHTML = `<p class="empty-state">${error.message}</p>`;
+	}
+}
+
+function renderHistoryComparison(run, comparison = {}) {
+	const counts = comparison.counts || {};
+	elements.comparisonCounts.innerHTML = "";
+	if (!comparison.baseline) {
+		elements.comparisonCounts.innerHTML = `<p class="empty-state">No prior compatible run (same repository and mode).</p>`;
+		elements.comparisonMovements.innerHTML = "";
+		return;
+	}
+	const labels = [
+		["new", "New"],
+		["unchanged", "Unchanged"],
+		["resolved", "Resolved"],
+		["reopened", "Reopened"],
+		["severityRaised", "Severity raised"],
+		["severityLowered", "Severity lowered"]
+	];
+	labels.forEach(([key, label]) => {
+		const chip = document.createElement("span");
+		chip.className = `comparison-chip is-${key}`;
+		chip.textContent = `${counts[key] || 0} ${label}`;
+		elements.comparisonCounts.appendChild(chip);
+	});
+	const baselineWhen = new Date(comparison.baseline.createdAt).toLocaleString();
+	const note = document.createElement("span");
+	note.className = "comparison-baseline-note";
+	note.textContent = `vs ${baselineWhen}`;
+	elements.comparisonCounts.appendChild(note);
+	const delta = comparison.execution?.delta || {};
+	const executionNote = document.createElement("div");
+	executionNote.className = "comparison-execution-delta";
+	executionNote.textContent = [
+		`Duration ${formatSignedDuration(delta.durationMs)}`,
+		`Tokens ${formatSignedNumber(delta.totalTokens)}`,
+		`Retries ${formatSignedNumber(delta.retries)}`,
+		`Failures ${formatSignedNumber(delta.failures)}`,
+		`Specialist coverage ${formatSignedPercent(delta.specialistCoverage)}`
+	].join(" · ");
+	elements.comparisonCounts.appendChild(executionNote);
+
+	elements.comparisonMovements.innerHTML = "";
+	(comparison.movements || []).forEach((movement) => {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "comparison-movement";
+		button.innerHTML = `
+			<span class="movement-type"></span>
+			<strong class="movement-title"></strong>
+			<small class="movement-location"></small>
+			<span class="movement-severity"></span>
+		`;
+		button.querySelector(".movement-type").textContent = movement.type;
+		button.querySelector(".movement-title").textContent = movement.title || movement.fingerprint;
+		button.querySelector(".movement-location").textContent = `${movement.filePath || "Unknown file"}${movement.startLine ? `:${movement.startLine}` : ""}`;
+		button.querySelector(".movement-severity").textContent = movement.previousSeverity
+			? `${movement.previousSeverity} → ${movement.severity}`
+			: movement.severity || "";
+		button.addEventListener("click", async () => {
+			let evidenceRun = run;
+			if (movement.type === "resolved" && comparison.baseline?.runId) {
+				try {
+					const payload = await request(
+						`/api/v1/runs/${encodeURIComponent(comparison.baseline.runId)}`
+					);
+					evidenceRun = payload.data || run;
+				} catch (error) {
+					const message = document.createElement("p");
+					message.className = "empty-state";
+					message.textContent = error.message;
+					elements.comparisonMovements.prepend(message);
+					return;
+				}
+			}
+			state.pendingFindingFingerprint = movement.fingerprint || "";
+			watchRun(evidenceRun);
+			window.setTimeout(() => {
+				document.querySelector("#evidence-panel")?.scrollIntoView({ behavior: "smooth" });
+			}, 250);
+		});
+		elements.comparisonMovements.appendChild(button);
+	});
+	if (!elements.comparisonMovements.childElementCount) {
+		elements.comparisonMovements.innerHTML = `<p class="empty-state">No finding movement recorded.</p>`;
+	}
+}
+
+function formatSignedNumber(value) {
+	const number = Number(value || 0);
+	return `${number > 0 ? "+" : ""}${formatCompactNumber(number)}`;
+}
+
+function formatSignedDuration(value) {
+	const number = Number(value || 0);
+	return `${number > 0 ? "+" : number < 0 ? "−" : ""}${formatDuration(Math.abs(number))}`;
+}
+
+function formatSignedPercent(value) {
+	const number = Math.round(Number(value || 0) * 100);
+	return `${number > 0 ? "+" : ""}${number}%`;
+}
+
+async function loadHealth() {
+	try {
+		const payload = await request("/api/v1/health");
+		elements.healthDot.className = "status-dot ok";
+		elements.healthLabel.textContent = `${payload.data.status} · SQLite`;
+	} catch (error) {
+		elements.healthDot.className = "status-dot error";
+		elements.healthLabel.textContent = "System unavailable";
+	}
+}
+
+const settingsKey = "doubleCheck.preferences.v1";
+
+function readLocalSettings() {
+	try {
+		return {
+			defaultPreset: "balanced",
+			defaultMode: "full",
+			rememberProject: false,
+			projectPath: "",
+			...JSON.parse(localStorage.getItem(settingsKey) || "{}")
+		};
+	} catch {
+		return { defaultPreset: "balanced", defaultMode: "full", rememberProject: false, projectPath: "" };
+	}
+}
+
+function applyLocalSettings() {
+	const settings = readLocalSettings();
+	if (elements.settingsForm) {
+		elements.settingsForm.elements.defaultPreset.value = settings.defaultPreset;
+		elements.settingsForm.elements.defaultMode.value = settings.defaultMode;
+		elements.settingsForm.elements.rememberProject.checked = !!settings.rememberProject;
+	}
+	const presetInput = elements.form?.querySelector(
+		`[name="reviewPreset"][value="${settings.defaultPreset}"]`
+	);
+	if (presetInput) {
+		presetInput.checked = true;
+		applyReviewPreset(settings.defaultPreset);
+	}
+	if (elements.mode && settings.defaultMode) {
+		elements.mode.value = settings.defaultMode;
+	}
+	if (settings.rememberProject && settings.projectPath && elements.projectPath) {
+		elements.projectPath.value = settings.projectPath;
+	}
+	updateRevisionFields();
+	updateNewReviewSummary();
+}
+
+elements.settingsForm?.addEventListener("submit", (event) => {
+	event.preventDefault();
+	const formData = new FormData(elements.settingsForm);
+	const rememberProject = formData.get("rememberProject") === "on";
+	localStorage.setItem(settingsKey, JSON.stringify({
+		defaultPreset: formData.get("defaultPreset") || "balanced",
+		defaultMode: formData.get("defaultMode") || "full",
+		rememberProject,
+		projectPath: rememberProject ? (elements.projectPath?.value || "").trim() : ""
+	}));
+	elements.settingsStatus.textContent = "Settings saved on this device.";
+	applyLocalSettings();
+});
+
+elements.settingsReset?.addEventListener("click", () => {
+	localStorage.removeItem(settingsKey);
+	elements.settingsStatus.textContent = "Settings reset.";
+	applyLocalSettings();
+});
+
+elements.form?.addEventListener("submit", async (event) => {
+	event.preventDefault();
+	elements.formMessage.textContent = "";
+	const formData = new FormData(elements.form);
+	const body = Object.fromEntries(formData);
+	body.policy = {
+		allowedRoles: formData.getAll("allowedRole"),
+		reviewGoal: String(formData.get("reviewGoal") || "").trim()
+	};
+	body.budgets = {
+		maxTasks: Number(formData.get("maxTasks")),
+		maxTokens: Number(formData.get("maxTokens")),
+		maxTokensPerTask: Number(formData.get("maxTokensPerTask")),
+		maxDurationMs: Number(formData.get("maxDurationMs")),
+		maxIterationsPerTask: Number(formData.get("maxIterationsPerTask")),
+		maxToolOutputCharacters: Number(formData.get("maxToolOutputCharacters")),
+		maxCostUsd: Number(formData.get("maxCostUsd"))
+	};
+	delete body.allowedRole;
+	delete body.reviewGoal;
+	delete body.reviewPreset;
+	delete body.maxTasks;
+	delete body.maxTokens;
+	delete body.maxTokensPerTask;
+	delete body.maxDurationMs;
+	delete body.maxIterationsPerTask;
+	delete body.maxToolOutputCharacters;
+	delete body.maxCostUsd;
+	try {
+		const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(body) });
+		watchRun(payload.data);
+		loadRuns();
+	} catch (error) {
+		elements.formMessage.textContent = error.message;
+	}
+});
+
+elements.projectId?.addEventListener("change", () => {
+	const selected = elements.projectId.selectedOptions[0];
+	if (selected?.dataset?.rootPath) {
+		elements.projectPath.value = selected.dataset.rootPath;
+	}
+});
+
+function updateRevisionFields() {
+	const mode = elements.mode?.value || "full";
+	const revisionMode = mode === "revision-diff";
+	if (elements.revisionFields) elements.revisionFields.hidden = !revisionMode;
+	if (elements.baseRevision) elements.baseRevision.required = revisionMode;
+	if (elements.modeHint) {
+		if (mode === "working-tree") {
+			elements.modeHint.textContent = "Working tree needs a Git repository with changed files. For a plain folder or clean tree, choose Full baseline.";
+		} else if (mode === "revision-diff") {
+			elements.modeHint.textContent = "Compare two Git revisions. Provide a base branch/commit and optional head (defaults to HEAD).";
+		} else {
+			elements.modeHint.textContent = "Full baseline scans the folder/repository contents with ignore and size limits.";
+		}
+	}
+	updateNewReviewSummary();
+}
+
+elements.mode?.addEventListener("change", updateRevisionFields);
+elements.reviewGoal?.addEventListener("input", updateNewReviewSummary);
+elements.form?.querySelectorAll("[name='reviewPreset']").forEach((input) => {
+	input.addEventListener("change", () => {
+		if (input.checked) applyReviewPreset(input.value);
+	});
+});
+[
+	"maxTasks",
+	"maxTokens",
+	"maxTokensPerTask",
+	"maxDurationMs",
+	"maxIterationsPerTask",
+	"maxToolOutputCharacters",
+	"maxCostUsd"
+].forEach((name) => {
+	elements.form?.elements[name]?.addEventListener("input", updateNewReviewSummary);
+});
+
+elements.cancel?.addEventListener("click", async () => {
+	if (!state.activeRun) return;
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}`, { method: "DELETE" });
+		setRun(payload.data);
+	} catch (error) {
+		elements.formMessage.textContent = error.message;
+	}
+});
+
+elements.jumpTrace?.addEventListener("click", () => {
+	elements.observePanel?.scrollIntoView({
+		behavior: "smooth",
+		block: "start"
+	});
+});
+
+elements.jumpFindings?.addEventListener("click", () => {
+	document.querySelector("#results-panel")?.scrollIntoView({
+		behavior: "smooth",
+		block: "start"
+	});
+});
+
+elements.commandExport?.addEventListener("click", () => {
+	downloadExport("markdown");
+});
+
+elements.refresh?.addEventListener("click", loadRuns);
+elements.historyFilters?.addEventListener("submit", (event) => {
+	event.preventDefault();
+	state.history.page = 1;
+	loadRuns();
+});
+elements.historyClear?.addEventListener("click", () => {
+	elements.historyFilters?.reset();
+	state.history.page = 1;
+	loadRuns();
+});
+elements.historyPrevious?.addEventListener("click", () => {
+	if (state.history.page <= 1) return;
+	state.history.page--;
+	loadRuns();
+});
+elements.historyNext?.addEventListener("click", () => {
+	if (state.history.page >= state.history.totalPages) return;
+	state.history.page++;
+	loadRuns();
+});
+elements.historyComparisonClose?.addEventListener("click", () => {
+	elements.historyComparison.hidden = true;
+});
+
+elements.observeFilters?.addEventListener("click", (event) => {
+	const button = event.target.closest("[data-observe-filter]");
+	if (!button) return;
+	state.observeFilter = button.dataset.observeFilter || "all";
+	elements.observeFilters.querySelectorAll(".observe-filter").forEach((item) => {
+		item.classList.toggle("is-active", item === button);
+	});
+	renderObservability();
+});
+
+elements.observeRoleFilters?.addEventListener("click", (event) => {
+	const button = event.target.closest("[data-observe-role]");
+	if (!button) return;
+	state.observeRoleFilter = button.dataset.observeRole || "all";
+	renderObservability();
+});
+
+elements.observeSearch?.addEventListener("input", (event) => {
+	state.observeSearch = event.target.value || "";
+	renderObservability();
+});
+
+elements.observeExport?.addEventListener("click", () => {
+	exportObservabilityTraces();
+});
+
+elements.findingSearch?.addEventListener("input", (event) => {
+	state.findingSearch = event.target.value || "";
+	renderFindingsWorkspace();
+});
+
+elements.findingSeverity?.addEventListener("change", (event) => {
+	state.findingSeverity = event.target.value || "all";
+	renderFindingsWorkspace();
+});
+
+elements.findingReviewState?.addEventListener("change", (event) => {
+	state.findingReviewState = event.target.value || "all";
+	renderFindingsWorkspace();
+});
+
+elements.architectureSearch?.addEventListener("input", (event) => {
+	state.architectureSearch = event.target.value || "";
+	renderArchitectureExplorer();
+});
+
+elements.architectureKind?.addEventListener("change", (event) => {
+	state.architectureKind = event.target.value || "all";
+	renderArchitectureExplorer();
+});
+
+elements.findingSort?.addEventListener("change", (event) => {
+	state.findingSort = event.target.value || "priority";
+	renderFindingsWorkspace();
+});
+
+elements.findingSeveritySummary?.addEventListener("click", (event) => {
+	const button = event.target.closest("[data-finding-severity]");
+	if (!button) return;
+	state.findingSeverity = state.findingSeverity === button.dataset.findingSeverity
+		? "all"
+		: button.dataset.findingSeverity;
+	if (elements.findingSeverity) elements.findingSeverity.value = state.findingSeverity;
+	renderFindingsWorkspace();
+});
+
+elements.findings?.addEventListener("click", (event) => {
+	const card = event.target.closest("[data-finding-id]");
+	if (!card) return;
+	state.selectedFindingId = card.dataset.findingId || "";
+	renderFindingsWorkspace();
+});
+
+elements.findings?.addEventListener("keydown", (event) => {
+	if (event.key !== "Enter" && event.key !== " ") return;
+	const card = event.target.closest("[data-finding-id]");
+	if (!card) return;
+	event.preventDefault();
+	state.selectedFindingId = card.dataset.findingId || "";
+	renderFindingsWorkspace();
+});
+
+async function downloadExport(format) {
+	if (!state.activeRun) return;
+	try {
+		const response = await fetch(
+			`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/export?exportFormat=${encodeURIComponent(format)}`
+		);
+		if (!response.ok) {
+			const payload = await response.json().catch(() => ({}));
+			throw new Error(payload?.error?.message || `Export failed (${response.status})`);
+		}
+		const blob = await response.blob();
+		const disposition = response.headers.get("Content-Disposition") || "";
+		const match = disposition.match(/filename="?([^"]+)"?/i);
+		const fileName = match?.[1] || `doublecheck-report.${format === "sarif" ? "sarif.json" : format === "json" ? "json" : "md"}`;
+		const url = URL.createObjectURL(blob);
+		const link = document.createElement("a");
+		link.href = url;
+		link.download = fileName;
+		document.body.appendChild(link);
+		link.click();
+		link.remove();
+		URL.revokeObjectURL(url);
+	} catch (error) {
+		elements.summary.textContent = error.message;
+	}
+}
+
+elements.exportActions?.addEventListener("click", (event) => {
+	const button = event.target.closest("[data-export-format]");
+	if (!button) return;
+	downloadExport(button.dataset.exportFormat);
+});
+
+loadHealth();
+applyLocalSettings();
+loadSession();
+renderResult();
+updateRevisionFields();
+updateNewReviewSummary();

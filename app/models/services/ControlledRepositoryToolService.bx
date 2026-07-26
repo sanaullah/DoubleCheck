@@ -1,0 +1,560 @@
+/**
+ * Allowlisted read-only tools for specialists; redacts secrets and enforces range auth.
+ *
+ * @see SpecialistReviewService
+ */
+
+@singleton
+class {
+	property name="maxCalls" inject="coldbox:setting:specialistMaxToolCalls";
+
+	property name="maxOutputCharacters" inject="coldbox:setting:specialistMaxToolOutputCharacters";
+
+	property name="maxSearchMatches" inject="coldbox:setting:specialistMaxSearchMatches";
+
+	property name="toolTimeoutMs" inject="coldbox:setting:specialistToolTimeoutMs";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.toolVersion = "controlled-repository-tools-v1";
+	variables.allowedTools = [ "read_indexed_range", "search_indexed_code", "lookup_symbols", "lookup_dependencies", "lookup_tests"];
+
+	struct function createSession(
+		required struct task,
+		required array files,
+		required struct graph,
+		struct control = {}
+	) {
+		var indexedFiles = {};
+		for ( var file in arguments.files ) {
+			indexedFiles[ normalizePath( file.filePath ) ] = file;
+		}
+		return {
+			version     : variables.toolVersion,
+			taskId      : arguments.task.id,
+			contextFiles: duplicate( arguments
+					.task
+					.context
+					.files ),
+			files    : indexedFiles,
+			graph    : arguments.graph,
+			calls    : 0,
+			callLimit: min(
+				numericSetting( variables.maxCalls, 8 ),
+				numericSetting(
+					arguments
+							.task
+							.budget
+							.maxIterations ?:
+						8,
+					8
+				)
+			),
+			outputCharacters  : 0,
+			evidenceCharacters: 0,
+			outputLimit       : min(
+				numericSetting( variables.maxOutputCharacters, 12000 ) *
+					numericSetting(
+						arguments
+								.task
+								.budget
+								.maxIterations ?:
+							8,
+						8
+					),
+				numericSetting(
+					arguments
+							.task
+							.budget
+							.maxToolOutputCharacters ?:
+						48000,
+					48000
+				)
+			),
+			seen     : {},
+			audit    : [],
+			cancelled: false,
+			control  : arguments.control
+		};
+	}
+
+	array function buildAITools( required struct toolSession ) {
+		var controlledService = this;
+		var currentSession = arguments.toolSession;
+		return [
+			aiTool(
+				"read_indexed_range",
+				"Read one pre-authorized indexed line range. The path and lines must be present in the task context.",
+				( filePath, startLine, endLine ) => controlledService.execute(
+						currentSession,
+						"read_indexed_range",
+						{
+							filePath : filePath,
+							startLine: startLine,
+							endLine  : endLine
+						}
+					)
+			)
+				.describeFilePath( "Exact relative path from task context" )
+				.describeStartLine( "Authorized one-based start line" )
+				.describeEndLine( "Authorized one-based end line" ),
+			aiTool(
+				"search_indexed_code",
+				"Search literal text only inside pre-authorized indexed ranges.",
+				( query ) => controlledService.execute(
+						currentSession,
+						"search_indexed_code",
+						{ query: query }
+					)
+			).describeQuery( "Literal text between 2 and 100 characters" ),
+			aiTool(
+				"lookup_symbols",
+				"List indexed symbols from files authorized for this task.",
+				( name ) => controlledService.execute(
+						currentSession,
+						"lookup_symbols",
+						{ name: name }
+					)
+			).describeName( "Optional case-insensitive symbol name filter" ),
+			aiTool(
+				"lookup_dependencies",
+				"List resolved dependency edges touching authorized task files.",
+				( filePath ) => controlledService.execute(
+						currentSession,
+						"lookup_dependencies",
+						{ filePath: filePath }
+					)
+			).describeFilePath( "Exact relative path from task context" ),
+			aiTool(
+				"lookup_tests",
+				"List TestBox symbols and test edges in authorized task files.",
+				( filePath ) => controlledService.execute(
+						currentSession,
+						"lookup_tests",
+						{ filePath: filePath }
+					)
+			).describeFilePath( "Exact relative path from task context" )
+		];
+	}
+
+	any function execute( required struct toolSession, required string toolName, struct input = {} ) {
+		var startedAt = getTickCount();
+		var normalizedTool = lCase( trim( arguments.toolName ) );
+		var signature = stableHash( normalizedTool & "|" & jsonSerialize( arguments.input ) );
+		try {
+			if (
+				arguments.toolSession.cancelled ||
+					(
+						arguments
+								.toolSession
+								.control
+								.keyExists( "cancelled" ) &&
+							arguments
+								.toolSession
+								.control
+								.cancelled
+					)
+			) {
+				policyError( "Tool session is cancelled" );
+			}
+			if ( !variables.allowedTools.contains( normalizedTool ) ) {
+				policyError( "Tool is not allowlisted" );
+			}
+			if ( arguments.toolSession.calls >= arguments.toolSession.callLimit ) {
+				policyError( "Tool call limit reached" );
+			}
+			if (
+				arguments
+					.toolSession
+					.seen
+					.keyExists( signature )
+			) {
+				policyError( "Repeated tool call rejected" );
+			}
+			arguments.toolSession.seen[ signature ] = true;
+			arguments.toolSession.calls++;
+			var output = dispatch(
+				arguments.toolSession,
+				normalizedTool,
+				arguments.input
+			);
+			if ( getTickCount() - startedAt > numericSetting( variables.toolTimeoutMs, 2000 ) ) {
+				policyError( "Tool execution timeout" );
+			}
+			var bounded = boundOutput( arguments.toolSession, output );
+			var outputCharacters = len( jsonSerialize( bounded ) );
+			arguments.toolSession.outputCharacters += outputCharacters;
+			appendAudit(
+				arguments.toolSession,
+				normalizedTool,
+				signature,
+				"succeeded",
+				outputCharacters,
+				getTickCount() - startedAt
+			);
+			return bounded;
+		} catch (any error) {
+			appendAudit(
+				arguments.toolSession,
+				normalizedTool,
+				signature,
+				"rejected",
+				0,
+				getTickCount() - startedAt
+			);
+			rethrow;
+		}
+	}
+
+	array function audit( required struct toolSession ) {
+		return duplicate( arguments.toolSession.audit );
+	}
+
+	void function recordContextPack( required struct toolSession, required struct contextPack ) {
+		arguments.toolSession.evidenceCharacters += arguments.contextPack.characters;
+		appendAudit(
+			arguments.toolSession,
+			"context_pack",
+			arguments.contextPack.fingerprint,
+			"succeeded",
+			arguments.contextPack.characters,
+			arguments.contextPack.durationMs
+		);
+	}
+
+	void function cancel( required struct toolSession ) {
+		arguments.toolSession.cancelled = true;
+		if (
+			arguments
+				.toolSession
+				.control
+				.keyExists( "cancelled" )
+		) {
+			arguments
+				.toolSession
+				.control
+				.cancelled = true;
+		}
+	}
+
+	private any function dispatch( required struct toolSession, required string toolName, required struct input ) {
+		switch ( arguments.toolName ) {
+			case "read_indexed_range":
+				return readRange( arguments.toolSession, arguments.input );
+			case "search_indexed_code":
+				return searchCode( arguments.toolSession, arguments.input );
+			case "lookup_symbols":
+				return lookupSymbols( arguments.toolSession, arguments.input );
+			case "lookup_dependencies":
+				return lookupDependencies( arguments.toolSession, arguments.input );
+			case "lookup_tests":
+				return lookupTests( arguments.toolSession, arguments.input );
+		}
+		policyError( "Tool is not allowlisted" );
+	}
+
+	private struct function readRange( required struct toolSession, required struct input ) {
+		var filePath = normalizePath( arguments.input.filePath ?: "" );
+		var startLine = integerInput( arguments.input.startLine ?: "", "startLine" );
+		var endLine = integerInput( arguments.input.endLine ?: "", "endLine" );
+		var authorization = authorizeRange(
+			arguments.toolSession,
+			filePath,
+			startLine,
+			endLine
+		);
+		var file = authorization.file;
+		var lines = [];
+		for ( var lineNumber = startLine; lineNumber <= endLine; lineNumber++ ) {
+			lines.append(
+					{
+						line: lineNumber,
+						text: secretRedactionService.redactLine( file.lines[ lineNumber ] )
+					}
+				);
+		}
+		return {
+			filePath   : filePath,
+			contentHash: file.contentHash,
+			startLine  : startLine,
+			endLine    : endLine,
+			lines      : lines
+		};
+	}
+
+	private array function searchCode( required struct toolSession, required struct input ) {
+		var queryText = trim( arguments.input.query ?: "" );
+		if ( len( queryText ) < 2 || len( queryText ) > 100 ) {
+			policyError( "Search query must contain 2 to 100 characters" );
+		}
+		var matches = [];
+		var maximumMatches = numericSetting( variables.maxSearchMatches, 20 );
+		for ( var contextFile in arguments.toolSession.contextFiles ) {
+			var filePath = normalizePath( contextFile.filePath );
+			if (
+				!arguments
+					.toolSession
+					.files
+					.keyExists( filePath )
+			) {
+				continue;
+			}
+			var file = arguments.toolSession.files[ filePath ];
+			for ( var rangeItem in contextFile.ranges ) {
+				for ( var lineNumber = rangeItem.startLine; lineNumber <= rangeItem.endLine; lineNumber++ ) {
+					if ( findNoCase( queryText, file.lines[ lineNumber ] ) ) {
+						matches.append(
+								{
+									filePath: filePath,
+									line    : lineNumber,
+									text    : secretRedactionService.redactLine( file.lines[ lineNumber ] )
+								}
+							);
+					}
+					if ( matches.len() >= maximumMatches ) {
+						return matches;
+					}
+				}
+			}
+		}
+		return matches;
+	}
+
+	private array function lookupSymbols( required struct toolSession, required struct input ) {
+		var nameFilter = trim( arguments.input.name ?: "" );
+		var allowedFiles = allowedFileSet( arguments.toolSession );
+		return arguments
+			.toolSession
+			.graph
+			.symbols
+			.filter(
+				( item ) => allowedFiles.keyExists( normalizePath( item.filePath ) ) &&
+					( !len( nameFilter ) || findNoCase( nameFilter, item.name ) )
+			)
+			.map(
+				( item ) => {
+					return {
+						id      : item.id,
+						filePath: item.filePath,
+						kind    : item.kind,
+						name    : item.name,
+						line    : item.line
+					};
+				}
+			);
+	}
+
+	private array function lookupDependencies( required struct toolSession, required struct input ) {
+		var filePath = authorizeFilePath( arguments.toolSession, arguments.input.filePath ?: "" );
+		var allowedFiles = allowedFileSet( arguments.toolSession );
+		return arguments
+			.toolSession
+			.graph
+			.dependencies
+			.filter(
+				( item ) => normalizePath( item.sourceFile ) == filePath &&
+					( !len( item.targetFile ?: "" ) || allowedFiles.keyExists( normalizePath( item.targetFile ) ) )
+			)
+			.map(
+				( item ) => {
+					return {
+						id        : item.id,
+						sourceFile: item.sourceFile,
+						kind      : item.kind,
+						target    : item.target,
+						targetFile: item.targetFile ?: "",
+						line      : item.line
+					};
+				}
+			);
+	}
+
+	private struct function lookupTests( required struct toolSession, required struct input ) {
+		var filePath = authorizeFilePath( arguments.toolSession, arguments.input.filePath ?: "" );
+		return {
+			symbols: arguments
+				.toolSession
+				.graph
+				.symbols
+				.filter(
+					( item ) => normalizePath( item.filePath ) == filePath && [ "test", "test-suite"].contains( item.kind )
+				)
+				.map(
+					( item ) => {
+						return {
+							id  : item.id,
+							kind: item.kind,
+							name: item.name,
+							line: item.line
+						};
+					}
+				),
+			dependencies: arguments
+				.toolSession
+				.graph
+				.dependencies
+				.filter(
+					( item ) => normalizePath( item.sourceFile ) == filePath && item.kind == "tests"
+				)
+				.map(
+					( item ) => {
+						return {
+							id        : item.id,
+							target    : item.target,
+							targetFile: item.targetFile ?: "",
+							line      : item.line
+						};
+					}
+				)
+		};
+	}
+
+	private struct function authorizeRange(
+		required struct toolSession,
+		required string filePath,
+		required numeric startLine,
+		required numeric endLine
+	) {
+		if ( arguments.endLine < arguments.startLine ) {
+			policyError( "endLine must not precede startLine" );
+		}
+		var normalizedPath = authorizeFilePath( arguments.toolSession, arguments.filePath );
+		var contextFile = contextFile( arguments.toolSession, normalizedPath );
+		var requestedStartLine = arguments.startLine;
+		var requestedEndLine = arguments.endLine;
+		var authorized = contextFile.ranges.some(
+				( item ) => requestedStartLine >= item.startLine && requestedEndLine <= item.endLine
+			);
+		if ( !authorized ) {
+			policyError( "Requested lines are outside task context" );
+		}
+		var file = arguments.toolSession.files[ normalizedPath ];
+		if ( file.contentHash != contextFile.contentHash || arguments.endLine > file.lines.len() ) {
+			policyError( "Indexed artifact identity does not match task context" );
+		}
+		return { file: file, contextFile: contextFile };
+	}
+
+	private string function authorizeFilePath( required struct toolSession, required string filePath ) {
+		var normalizedPath = normalizePath( trim( arguments.filePath ) );
+		if (
+			!len( normalizedPath ) || left( normalizedPath, 1 ) == "/" || reFind( "^[A-Za-z]:", normalizedPath ) ||
+				reFind( "(^|/)\.\.(/|$)", normalizedPath )
+		) {
+			policyError( "Path is not an authorized relative artifact path" );
+		}
+		var allowed = allowedFileSet( arguments.toolSession );
+		if (
+			!allowed.keyExists( normalizedPath ) ||
+				!arguments
+					.toolSession
+					.files
+					.keyExists( normalizedPath )
+		) {
+			policyError( "Path is outside task context" );
+		}
+		return normalizedPath;
+	}
+
+	private struct function contextFile( required struct toolSession, required string filePath ) {
+		for ( var item in arguments.toolSession.contextFiles ) {
+			if ( normalizePath( item.filePath ) == arguments.filePath ) {
+				return item;
+			}
+		}
+		policyError( "Path is outside task context" );
+	}
+
+	private struct function allowedFileSet( required struct toolSession ) {
+		var allowed = {};
+		for ( var item in arguments.toolSession.contextFiles ) {
+			allowed[ normalizePath( item.filePath ) ] = true;
+		}
+		return allowed;
+	}
+
+	private any function boundOutput( required struct toolSession, required any output ) {
+		var encoded = jsonSerialize( arguments.output );
+		var remainingCharacters = arguments.toolSession.outputLimit - arguments.toolSession.outputCharacters;
+		if ( remainingCharacters <= 0 ) {
+			policyError( "Tool output budget reached" );
+		}
+		var maximumCharacters = min(
+			numericSetting( variables.maxOutputCharacters, 12000 ),
+			remainingCharacters
+		);
+		if ( len( encoded ) <= maximumCharacters ) {
+			return arguments.output;
+		}
+		var sliceLength = max( 0, maximumCharacters - 50 );
+		var truncated = {
+			truncated: true,
+			output   : sliceLength ? left( encoded, sliceLength ) : ""
+		};
+		while ( len( jsonSerialize( truncated ) ) > maximumCharacters && sliceLength > 0 ) {
+			sliceLength = max(
+				0,
+				sliceLength - ( len( jsonSerialize( truncated ) ) - maximumCharacters )
+			);
+			truncated.output = sliceLength ? left( encoded, sliceLength ) : "";
+		}
+		if ( len( jsonSerialize( truncated ) ) > maximumCharacters ) {
+			policyError( "Tool output budget reached" );
+		}
+		return truncated;
+	}
+
+	private void function appendAudit(
+		required struct toolSession,
+		required string toolName,
+		required string signature,
+		required string status,
+		required numeric outputCharacters,
+		required numeric durationMs
+	) {
+		arguments
+			.toolSession
+			.audit
+			.append(
+				{
+					sequence: arguments
+							.toolSession
+							.audit
+							.len() +
+						1,
+					toolName        : arguments.toolName,
+					inputFingerprint: arguments.signature,
+					status          : arguments.status,
+					outputCharacters: arguments.outputCharacters,
+					durationMs      : arguments.durationMs
+				}
+			);
+	}
+
+	private numeric function integerInput( required any value, required string field ) {
+		if ( !isNumeric( arguments.value ) || val( arguments.value ) != int( val( arguments.value ) ) || int( arguments.value ) < 1 ) {
+			policyError( "#arguments.field# must be a positive integer" );
+		}
+		return int( arguments.value );
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, int( val( arguments.value ) ) ) : arguments.fallback;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+
+	private void function policyError( required string message ) {
+		throw( type = "ToolPolicyException", message = arguments.message );
+	}
+}

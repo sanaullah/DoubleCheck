@@ -1,0 +1,202 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run();
+	{
+		describe(
+			"Local-first controls",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"scopes run reads by tenant_id and project_id columns",
+					() => {
+						var repository = getInstance( "ReviewRunRepository" );
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						try {
+							repository.create(
+									{
+										id          : runId,
+										tenantId    : "tenant-a",
+										projectId   : "project-a",
+										projectPath : "C:/fixture",
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "HEAD",
+										status      : "queued",
+										progress    : 0,
+										currentPhase: "queued",
+										message     : "Scoped fixture",
+										policy      : {},
+										budgets     : {},
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+
+							expect(
+								repository.findScoped(
+										runId,
+										"tenant-a",
+										"project-a"
+									)
+							).notToBeNull();
+							expect(
+								repository.findScoped(
+										runId,
+										"tenant-b",
+										"project-a"
+									)
+							).toBeNull();
+							expect(
+								repository.findScoped(
+										runId,
+										"tenant-a",
+										"project-b"
+									)
+							).toBeNull();
+						} finally {
+							queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: runId } );
+						}
+					}
+				);
+
+				it(
+					"prevents stale workers from renewing or committing a stolen lease",
+					() => {
+						var repository = getInstance( "ReviewRunRepository" );
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						try {
+							repository.create(
+									{
+										id          : runId,
+										tenantId    : "default",
+										projectId   : "default",
+										projectPath : "C:/fixture",
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "HEAD",
+										status      : "queued",
+										progress    : 0,
+										currentPhase: "queued",
+										message     : "Lease fixture",
+										policy      : {},
+										budgets     : {},
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							repository.claim(
+									runId,
+									nowValue,
+									dateTimeFormat(
+										dateAdd(
+											"s",
+											30,
+											now()
+										),
+										"iso"
+									),
+									"worker-a",
+									"token-a"
+								);
+							expect(
+								repository.ownsLease(
+										runId,
+										"worker-a",
+										"token-a"
+									)
+							).toBeTrue();
+							queryExecute(
+								"
+									UPDATE review_runs
+									SET lease_expires_at = :expired
+									WHERE id = :id
+								",
+								{
+									id     : runId,
+									expired: dateTimeFormat(
+										dateAdd(
+											"s",
+											-30,
+											now()
+										),
+										"iso"
+									)
+								}
+							);
+							repository.claim(
+									runId,
+									dateTimeFormat( now(), "iso" ),
+									dateTimeFormat(
+										dateAdd(
+											"s",
+											30,
+											now()
+										),
+										"iso"
+									),
+									"worker-b",
+									"token-b"
+								);
+							expect(
+								repository.renewLease(
+										runId,
+										dateTimeFormat(
+											dateAdd(
+												"s",
+												60,
+												now()
+											),
+											"iso"
+										),
+										"worker-a",
+										"token-a"
+									)
+							).toBeFalse();
+							expect(
+								repository.ownsLease(
+										runId,
+										"worker-b",
+										"token-b"
+									)
+							).toBeTrue();
+						} finally {
+							queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: runId } );
+						}
+					}
+				);
+
+				it(
+					"promotes only the passing measured BoxLang corpus tier",
+					() => {
+						var gate = getInstance( "QualityGateService" ).runSeededGate();
+						var languages = getInstance( "QualityGateService" ).advertisedLanguages( "parser-test" );
+
+						expect( gate.passed ).toBeTrue();
+						expect( gate.capabilityTier ).toBe( "parsed-dependency-aware" );
+						expect( languages[ 1 ].name ).toBe( "BoxLang" );
+						expect( languages[ 1 ].measured ).toBeTrue();
+						expect( languages[ 1 ].tier ).toBe( "parsed-dependency-aware" );
+						expect( languages[ 2 ].measured ).toBeFalse();
+						expect( languages[ 2 ].tier ).toBe( "discovery-only" );
+						expect;
+						( languages.map );
+						( ( item ) -> item.name; );
+					}
+				).toBe(
+						[ "BoxLang", "CFML", "JavaScript", "Java"]
+					);
+			}
+		);
+	}
+}

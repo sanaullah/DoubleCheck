@@ -1,0 +1,139 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"FindingBaselineService",
+			() => {
+				var service = "";
+
+				beforeEach(
+					() => {
+						service = new app.models.services.FindingBaselineService();
+					}
+				);
+
+				it(
+					"classifies new, unchanged, and fixed fingerprints",
+					() => {
+						var compared = service.classify(
+								[
+									{
+										fingerprint: "aaa",
+										title      : "Still here",
+										filePath   : "a.bx",
+										ruleId     : "r1",
+										severity   : "high"
+									},
+									{
+										fingerprint: "bbb",
+										title      : "Brand new",
+										filePath   : "b.bx",
+										ruleId     : "r2",
+										severity   : "medium"
+									}
+								],
+								[
+									{
+										fingerprint: "aaa",
+										title      : "Still here",
+										filePath   : "a.bx",
+										ruleId     : "r1",
+										severity   : "high"
+									},
+									{
+										fingerprint: "ccc",
+										title      : "Gone now",
+										filePath   : "c.bx",
+										ruleId     : "r3",
+										severity   : "low"
+									}
+								],
+								{
+									runId    : "baseline-run",
+									status   : "succeeded",
+									createdAt: "2026-07-25T10:00:00.000-04:00"
+								}
+							);
+
+						expect( compared.baseline.runId ).toBe( "baseline-run" );
+						expect( compared
+								.baseline
+								.counts
+								.new ).toBe( 1 );
+						expect( compared
+								.baseline
+								.counts
+								.unchanged ).toBe( 1 );
+						expect( compared
+								.baseline
+								.counts
+								.fixed ).toBe( 1 );
+						expect( compared.findings[ 1 ].baselineStatus ).toBe( "unchanged" );
+						expect( compared.findings[ 2 ].baselineStatus ).toBe( "new" );
+						expect( compared.fixedFindings ).toHaveLength( 1 );
+						expect( compared.fixedFindings[ 1 ].fingerprint ).toBe( "ccc" );
+						expect( compared.fixedFindings[ 1 ].title ).toBe( "Gone now" );
+					}
+				);
+
+				it(
+					"clears baseline fields when no prior run exists",
+					() => {
+						var result = service.applyToResult(
+								{
+									summary : "none",
+									findings: [ { fingerprint: "aaa", title: "Only" }]
+								}
+							);
+
+						expect( isNull( result.baseline ) ).toBeTrue();
+						expect( result.fixedFindings ).toBeEmpty();
+						expect( result.findings[ 1 ].keyExists( "baselineStatus" ) ).toBeFalse();
+					}
+				);
+
+				it(
+					"preserves playbook and fixPatch when classifying against a baseline",
+					() => {
+						var compared = service.classify(
+								[
+									{
+										fingerprint: "aaa",
+										title      : "Still here",
+										filePath   : "a.bx",
+										ruleId     : "errors/empty-catch",
+										severity   : "medium",
+										suggestion : "Handle it",
+										playbook   : { steps: [ "Log and rethrow"] },
+										fixPatch   : {
+											before    : "catch ( any e ) {}",
+											after     : "catch ( any e ) { rethrow; }",
+											confidence: .9
+										}
+									}
+								],
+								[
+									{
+										fingerprint: "aaa",
+										title      : "Still here",
+										filePath   : "a.bx",
+										ruleId     : "errors/empty-catch",
+										severity   : "medium"
+									}
+								],
+								{
+									runId    : "baseline-run",
+									status   : "succeeded",
+									createdAt: "2026-07-25T10:00:00.000-04:00"
+								}
+							);
+
+						expect( compared.findings[ 1 ].baselineStatus ).toBe( "unchanged" );
+						expect( compared.findings[ 1 ].playbook.steps[ 1 ] ).toBe( "Log and rethrow" );
+						expect( compared.findings[ 1 ].fixPatch.after ).toInclude( "rethrow" );
+					}
+				);
+			}
+		);
+	}
+}

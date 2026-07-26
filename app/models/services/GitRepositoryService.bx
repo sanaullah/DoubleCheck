@@ -1,0 +1,278 @@
+/**
+ * Git plumbing for working-tree and revision-diff file lists used by the scanner.
+ */
+
+@singleton
+class {
+
+	struct function inspect( required any root ) {
+		try {
+			var repository = executeText( arguments.root, [ "rev-parse", "--show-toplevel"] );
+			if ( repository.exitCode != 0 || !len( repository.output ) ) {
+				return {
+					available         : false,
+					repositoryRoot    : "",
+					repositoryRevision: ""
+				};
+			}
+			var revision = resolveRevision( arguments.root, "HEAD" );
+			return {
+				available         : true,
+				repositoryRoot    : repository.output,
+				repositoryRevision: revision.valid ? revision.resolved : ""
+			};
+		} catch (any unavailableGit) {
+			return {
+				available         : false,
+				repositoryRoot    : "",
+				repositoryRevision: ""
+			};
+		}
+	}
+
+	struct function workingTreePaths( required any root, required numeric maxEntries ) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: ""
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no"],
+			arguments.maxEntries * 2
+		);
+		if ( result.exitCode != 0 ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: repository.repositoryRevision
+			};
+		}
+
+		var paths = [];
+		var index = 1;
+		while ( index <= result.tokens.len() && paths.len() < arguments.maxEntries ) {
+			var entry = result.tokens[ index ];
+			index++;
+			if ( len( entry ) < 4 ) {
+				continue;
+			}
+			var status = left( entry, 2 );
+			var relativePath = mid(
+				entry,
+				4,
+				len( entry ) - 3
+			);
+			paths.append( arguments.root.getPath() & "/" & relativePath );
+			if ( ( findNoCase( "R", status ) || findNoCase( "C", status ) ) && index <= result.tokens.len() ) {
+				index++;
+			}
+		}
+		return {
+			available         : true,
+			paths             : paths,
+			truncated         : result.truncated || paths.len() >= arguments.maxEntries,
+			repositoryRevision: repository.repositoryRevision
+		};
+	}
+
+	struct function fullPaths( required any root, required numeric maxEntries ) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: ""
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+			arguments.maxEntries
+		);
+		var rootPath = arguments.root.getPath();
+		return {
+			available         : result.exitCode == 0,
+			paths             : result.exitCode == 0 ? result.tokens.map( ( path ) => rootPath & "/" & path ) : [],
+			truncated         : result.truncated,
+			repositoryRevision: repository.repositoryRevision
+		};
+	}
+
+	struct function revisionPaths(
+		required any root,
+		required string baseRevision,
+		required numeric maxEntries,
+		string headRevision = "HEAD"
+	) {
+		var base = resolveRevision( arguments.root, arguments.baseRevision );
+		var head = resolveRevision( arguments.root, arguments.headRevision );
+		var repository = inspect( arguments.root );
+		if ( !base.valid || !head.valid ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				baseRevision      : base.valid ? base.resolved : "",
+				headRevision      : head.valid ? head.resolved : "",
+				repositoryRevision: head.valid ? head.resolved : "",
+				error             : !base.valid ? "The base revision could not be resolved" : "The head revision could not be resolved"
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "#base.resolved#...#head.resolved#"],
+			arguments.maxEntries
+		);
+		var rootPath = arguments.root.getPath();
+		return {
+			available         : result.exitCode == 0,
+			paths             : result.exitCode == 0 ? result.tokens.map( ( path ) => rootPath & "/" & path ) : [],
+			truncated         : result.truncated,
+			baseRevision      : base.resolved,
+			headRevision      : head.resolved,
+			repositoryRevision: head.resolved,
+			error             : result.exitCode == 0 ? "" : "Git revision diff failed"
+		};
+	}
+
+	struct function readBlob(
+		required any root,
+		required string revision,
+		required string relativePath,
+		required numeric maxBytes
+	) {
+		var safePath = replace(
+			arguments.relativePath,
+			"\",
+			"/",
+			"all"
+		);
+		if (
+			!reFind( "^[a-fA-F0-9]{40,64}$", arguments.revision ) || !len( safePath ) || left( safePath, 1 ) == "/" ||
+					find( char( 0 ), safePath ) ||
+				listToArray( safePath, "/" ).contains( ".." )
+		) {
+			return {
+				available: false,
+				oversized: false,
+				content  : "",
+				sizeBytes: 0
+			};
+		}
+
+		try {
+			var objectName = "#lCase( arguments.revision )#:#safePath#";
+			var sizeResult = executeText( arguments.root, [ "cat-file", "-s", objectName] );
+			if ( sizeResult.exitCode != 0 || !isNumeric( sizeResult.output ) ) {
+				return {
+					available: false,
+					oversized: false,
+					content  : "",
+					sizeBytes: 0
+				};
+			}
+			var sizeBytes = inputBaseN( sizeResult.output, 10 );
+			if ( sizeBytes > arguments.maxBytes ) {
+				return {
+					available: false,
+					oversized: true,
+					content  : "",
+					sizeBytes: sizeBytes
+				};
+			}
+
+			var process = startGit( arguments.root, [ "cat-file", "blob", objectName] );
+			var bytes = process.getInputStream().readNBytes( javaCast( "int", arguments.maxBytes + 1 ) );
+			var exitCode = process.waitFor();
+			if ( exitCode != 0 || bytes.len() > arguments.maxBytes ) {
+				return {
+					available: false,
+					oversized: bytes.len() > arguments.maxBytes,
+					content  : "",
+					sizeBytes: bytes.len()
+				};
+			}
+			var content = createObject( "java", "java.lang.String" ).init( bytes,
+					createObject( "java", "java.nio.charset.StandardCharsets" ).UTF_8 ).toString();
+			return {
+				available: true,
+				oversized: false,
+				content  : content,
+				sizeBytes: sizeBytes
+			};
+		} catch (any unavailableBlob) {
+			return {
+				available: false,
+				oversized: false,
+				content  : "",
+				sizeBytes: 0
+			};
+		}
+	}
+
+	private struct function resolveRevision( required any root, required string revision ) {
+		var candidate = trim( arguments.revision );
+		if ( !len( candidate ) || left( candidate, 1 ) == "-" || !reFind( "^[A-Za-z0-9._/@{}~^:+-]+$", candidate ) ) {
+			return { valid: false, resolved: "" };
+		}
+		try {
+			var result = executeText( arguments.root, [ "rev-parse", "--verify", "#candidate#^{commit}"] );
+			return {
+				valid   : result.exitCode == 0 && reFind( "^[a-fA-F0-9]{40,64}$", result.output ),
+				resolved: result.exitCode == 0 ? lCase( result.output ) : ""
+			};
+		} catch (any unavailableGit) {
+			return { valid: false, resolved: "" };
+		}
+	}
+
+	private struct function executeText( required any root, required array gitArguments ) {
+		var process = startGit( arguments.root, arguments.gitArguments );
+		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( "\\A" );
+		var output = scanner.hasNext() ? trim( scanner.next() ) : "";
+		scanner.close();
+		var exitCode = process.waitFor();
+		return { exitCode: exitCode, output: output };
+	}
+
+	private struct function executeTokens( required any root, required array gitArguments, required numeric maxTokens ) {
+		var process = startGit( arguments.root, arguments.gitArguments );
+		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( char( 0 ) );
+		var tokens = [];
+		var truncated = false;
+		while ( scanner.hasNext() ) {
+			if ( tokens.len() >= arguments.maxTokens ) {
+				truncated = true;
+				process.destroyForcibly();
+				break;
+			}
+			var token = scanner.next();
+			if ( len( token ) ) {
+				tokens.append( token );
+			}
+		}
+		scanner.close();
+		var exitCode = process.waitFor();
+		return {
+			exitCode : truncated ? 0 : exitCode,
+			tokens   : tokens,
+			truncated: truncated
+		};
+	}
+
+	private any function startGit( required any root, required array gitArguments ) {
+		var command = [ "git", "-C", arguments.root.getPath()];
+		command.append( arguments.gitArguments, true );
+		return createObject( "java", "java.lang.ProcessBuilder" )
+			.init( javaCast( "string[]", command ) )
+			.redirectErrorStream( true )
+			.start();
+	}
+}

@@ -1,0 +1,271 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"GitRepositoryService",
+			() => {
+				it(
+					"uses Git's exclude rules for a bounded full repository listing",
+					() => {
+						var fixture = createFixture();
+						try {
+							directoryCreate(
+								fixture.path & "/ignored",
+								true,
+								true
+							);
+							fileWrite( fixture.path & "/ignored/secret.bx", "secret" );
+							fileWrite( fixture.path & "/src/untracked file.bx", "untracked" );
+
+							var result = new app.models.services.GitRepositoryService().fullPaths( fixture.root, 100 );
+							var normalized = result.paths.map(
+									( path ) => replace(
+										path,
+										"\",
+										"/",
+										"all"
+									)
+								);
+
+							expect( result.available ).toBeTrue();
+							expect(
+								normalized.some( ( path ) => right( path, 21 ) == "src/untracked file.bx" )
+							).toBeTrue();
+							expect( normalized.some( ( path ) => findNoCase( "/ignored/", path ) ) ).toBeFalse();
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"discovers modified and untracked working-tree files",
+					() => {
+						var fixture = createFixture();
+						try {
+							fileWrite( fixture.path & "/src/main.bx", "version three" );
+							fileWrite( fixture.path & "/src/new file.bx", "new" );
+
+							var result = new app.models.services.GitRepositoryService().workingTreePaths( fixture.root, 100 );
+							var normalized = result.paths.map(
+									( path ) => replace(
+										path,
+										"\",
+										"/",
+										"all"
+									)
+								);
+
+							expect( result.available ).toBeTrue();
+							expect( normalized.some( ( path ) => right( path, 11 ) == "src/main.bx" ) ).toBeTrue();
+							expect(
+								normalized.some( ( path ) => right( path, 15 ) == "src/new file.bx" )
+							).toBeTrue();
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"resolves a clean base-to-HEAD revision diff",
+					() => {
+						var fixture = createFixture();
+						try {
+							var result = new app.models.services.GitRepositoryService().revisionPaths(
+									root         = fixture.root,
+									baseRevision = fixture.baseRevision,
+									headRevision = "HEAD",
+									maxEntries   = 100
+								);
+							var normalized = result.paths.map(
+									( path ) => replace(
+										path,
+										"\",
+										"/",
+										"all"
+									)
+								);
+
+							expect( result.available ).toBeTrue();
+							expect( result.baseRevision ).toBe( fixture.baseRevision );
+							expect( result.headRevision ).toBe( fixture.headRevision );
+							expect(
+								normalized.some( ( path ) => right( path, 14 ) == "src/feature.bx" )
+							).toBeTrue();
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"keeps revision evidence stable when tracked source is dirty",
+					() => {
+						var fixture = createFixture();
+						try {
+							fileWrite( fixture.path & "/src/main.bx", "dirty source" );
+							var result = new app.models.services.GitRepositoryService().revisionPaths(
+									root         = fixture.root,
+									baseRevision = fixture.baseRevision,
+									headRevision = "HEAD",
+									maxEntries   = 100
+								);
+
+							expect( result.available ).toBeTrue();
+							var blob = new app.models.services.GitRepositoryService().readBlob(
+									root         = fixture.root,
+									revision     = result.headRevision,
+									relativePath = "src/main.bx",
+									maxBytes     = 1024
+								);
+							expect( blob.available ).toBeTrue();
+							expect( blob.content ).toBe( "version two" );
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"scans a historical head without reading checked-out source",
+					() => {
+						var fixture = createFixture();
+						try {
+							fileWrite( fixture.path & "/src/main.bx", "version three" );
+							runGit( fixture.path, [ "add", "."] );
+							runGit( fixture.path, [ "commit", "--quiet", "-m", "later head"] );
+
+							var scanner = prepareMock( new app.models.services.RepositoryScannerService() );
+							scanner.$property(
+									"maxFiles",
+									"variables",
+									20
+								);
+							scanner.$property(
+									"maxBytes",
+									"variables",
+									524288
+								);
+							scanner.$property(
+									"maxFileBytes",
+									"variables",
+									131072
+								);
+							scanner.$property(
+									"maxEntries",
+									"variables",
+									500
+								);
+							scanner.$property(
+									"gitRepositoryService",
+									"variables",
+									new app.models.services.GitRepositoryService()
+								);
+
+							var result = scanner.scan(
+									projectPath  = fixture.path,
+									mode         = "revision-diff",
+									baseRevision = fixture.baseRevision,
+									headRevision = fixture.headRevision
+								);
+							var mainFile = result.files.filter( ( file ) => file.filePath == "src/main.bx" );
+
+							expect( result.scope ).toBe( "revision-diff" );
+							expect( result.repositoryRevision ).toBe( fixture.headRevision );
+							expect( mainFile ).toHaveLength( 1 );
+							expect( mainFile[ 1 ].content ).toBe( "version two" );
+							expect( mainFile[ 1 ].absolutePath ).toBeEmpty();
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+			}
+		);
+	}
+
+	private struct function createFixture() {
+		var path = getTempDirectory() & "doublecheck-git-" & replace(
+			lCase( createUUID() ),
+			"-",
+			"",
+			"all"
+		);
+		directoryCreate(
+			path,
+			true,
+			true
+		);
+		runGit( path, [ "init", "--quiet"] );
+		runGit(
+			path,
+			[ "config", "user.email", "tests@doublecheck.local"]
+		);
+		runGit( path, [ "config", "user.name", "DoubleCheck Tests"] );
+		directoryCreate(
+			path & "/src",
+			true,
+			true
+		);
+		fileWrite( path & "/.gitignore", "ignored/" & char( 10 ) );
+		fileWrite( path & "/src/main.bx", "version one" );
+		runGit( path, [ "add", "."] );
+		runGit( path, [ "commit", "--quiet", "-m", "base"] );
+		var baseRevision = runGit( path, [ "rev-parse", "HEAD"] ).output;
+
+		fileWrite( path & "/src/main.bx", "version two" );
+		fileWrite( path & "/src/feature.bx", "feature" );
+		runGit( path, [ "add", "."] );
+		runGit( path, [ "commit", "--quiet", "-m", "head"] );
+		var headRevision = runGit( path, [ "rev-parse", "HEAD"] ).output;
+
+		var fixture = {};
+		fixture[ "path" ] = path;
+		fixture[ "root" ] = createObject( "java", "java.io.File" ).init( path ).getCanonicalFile();
+		fixture[ "baseRevision" ] = baseRevision;
+		fixture[ "headRevision" ] = headRevision;
+		return fixture;
+	}
+
+	private struct function runGit( required string path, required array gitArguments ) {
+		var command = [ "git", "-C", arguments.path];
+		command.append( arguments.gitArguments, true );
+		var process = createObject( "java", "java.lang.ProcessBuilder" )
+			.init( javaCast( "string[]", command ) )
+			.redirectErrorStream( true )
+			.start();
+		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( "\\A" );
+		var output = scanner.hasNext() ? trim( scanner.next() ) : "";
+		scanner.close();
+		var exitCode = process.waitFor();
+		if ( exitCode != 0 ) {
+			throw(
+				type    = "GitFixtureException",
+				message = "Git fixture command failed: #output#"
+			);
+		}
+		return { output: output, exitCode: exitCode };
+	}
+
+	private void function removeFixture( required string path ) {
+		var canonical = createObject( "java", "java.io.File" ).init( arguments.path ).getCanonicalFile();
+		var tempRoot = createObject( "java", "java.io.File" ).init( getTempDirectory() ).getCanonicalFile();
+		if (
+			canonical.toPath().startsWith( tempRoot.toPath() ) && findNoCase( "doublecheck-git-", canonical.getName() ) == 1 &&
+				directoryExists( canonical.getPath() )
+		) {
+			var entries = directoryList(
+				canonical.getPath(),
+				true,
+				"query"
+			);
+			for ( var row = 1; row <= entries.recordCount; row++ ) {
+				createObject( "java", "java.io.File" ).init( entries.directory[ row ] & "/" & entries.name[ row ] ).setWritable( true,
+						false );
+			}
+			canonical.setWritable( true, false );
+			directoryDelete( canonical.getPath(), true );
+		}
+	}
+}

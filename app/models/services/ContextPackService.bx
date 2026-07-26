@@ -1,0 +1,480 @@
+/**
+ * Selects bounded file/line ranges for specialist context packs (token/character budgets).
+ *
+ * @see ReviewPlannerService
+ */
+
+@singleton
+class {
+	property name="maxFiles" inject="coldbox:setting:planMaxContextFiles";
+
+	property name="maxCharacters" inject="coldbox:setting:planMaxContextCharacters";
+
+	property name="maxChangedSymbols" inject="coldbox:setting:planMaxChangedSymbols";
+
+	property name="beforeLines" inject="coldbox:setting:planContextBeforeLines";
+
+	property name="afterLines" inject="coldbox:setting:planContextAfterLines";
+
+	property name="maxLines" inject="coldbox:setting:planMaxContextLines";
+
+	property name="maxRangesPerFile" inject="coldbox:setting:planMaxRangesPerFile";
+
+	property name="maxLinesPerRange" inject="coldbox:setting:planMaxLinesPerRange";
+
+	property name="mergeGap" inject="coldbox:setting:planContextMergeGap";
+	variables.contextVersion = "symbol-range-artifact-refs-v2";
+
+	struct function build( required struct graph, required array files ) {
+		var changedSymbols = boundedSymbols( arguments.graph.symbols );
+		var wantedPaths = wantedPaths(
+			arguments.graph,
+			arguments.files,
+			changedSymbols
+		);
+		var candidates = collectCandidates(
+			arguments.graph,
+			arguments.files,
+			wantedPaths
+		);
+		var selected = selectRanges(
+			arguments.files,
+			wantedPaths,
+			candidates
+		);
+		return {
+			version    : variables.contextVersion,
+			fingerprint: stableHash( variables.contextVersion & "|" & selected
+					.files
+					.map(
+						( file ) => file.contentHash & ":" & file
+							.ranges
+							.map( ( rangeItem ) => rangeItem.id )
+							.toList( "," )
+					)
+					.toList( "|" ) ),
+			changedSymbols: changedSymbols,
+			files         : selected.files,
+			summary       : {
+				fileCount     : selected.files.len(),
+				rangeCount    : selected.rangeCount,
+				lineCount     : selected.lineCount,
+				characters    : selected.characters,
+				candidateCount: selected.candidateCount,
+				truncated     : selected.truncated
+			}
+		};
+	}
+
+	private array function boundedSymbols( required array symbols ) {
+		var result = [];
+		for ( var item in arguments.symbols ) {
+			if (
+				!listFindNoCase(
+					"class,interface,function,handler-action,route,test,test-suite",
+					item.kind
+				)
+			) {
+				continue;
+			}
+			result.append(
+					{
+						id      : item.id,
+						filePath: item.filePath,
+						kind    : item.kind,
+						name    : item.name,
+						line    : item.line
+					}
+				);
+			if ( result.len() >= numericSetting( variables.maxChangedSymbols, 50 ) ) {
+				break;
+			}
+		}
+		return result;
+	}
+
+	private struct function wantedPaths( required struct graph, required array files, required array changedSymbols ) {
+		var wanted = {};
+		for ( var item in arguments.changedSymbols ) {
+			wanted[ item.filePath ] = "changed-symbol";
+		}
+		for ( var impact in arguments.graph.impacts ) {
+			if ( !wanted.keyExists( impact.changedFile ) ) {
+				wanted[ impact.changedFile ] = "changed-symbol";
+			}
+			if ( !wanted.keyExists( impact.impactedFile ) ) {
+				wanted[ impact.impactedFile ] = isTestFile( impact.impactedFile ) ? "test-impact" : "impact-cone";
+			}
+		}
+		if ( !wanted.count() ) {
+			for ( var file in arguments.files ) {
+				wanted[ file.filePath ] = "changed-file";
+			}
+		}
+		return wanted;
+	}
+
+	private struct function collectCandidates( required struct graph, required array files, required struct wantedPaths ) {
+		var byFile = {};
+		var fileLines = {};
+		for ( var file in arguments.files ) {
+			fileLines[ file.filePath ] = file.lineCount ?: file.lines.len();
+		}
+		var symbolsByFile = {};
+		for ( var item in arguments.graph.symbols ) {
+			if ( !arguments.wantedPaths.keyExists( item.filePath ) || !fileLines.keyExists( item.filePath ) ) {
+				continue;
+			}
+			if ( !symbolsByFile.keyExists( item.filePath ) ) {
+				symbolsByFile[ item.filePath ] = [];
+			}
+			symbolsByFile[ item.filePath ].append( item );
+		}
+		for ( var filePath in symbolsByFile ) {
+			appendSymbolBodyCandidates(
+				byFile,
+				symbolsByFile[ filePath ],
+				filePath,
+				fileLines[ filePath ],
+				arguments.wantedPaths[ filePath ]
+			);
+		}
+		for ( var edge in arguments.graph.dependencies ) {
+			if ( !arguments.wantedPaths.keyExists( edge.sourceFile ) || !fileLines.keyExists( edge.sourceFile ) ) {
+				continue;
+			}
+			var relevant = edge.kind == "tests" || len( edge.targetFile ?: "" ) || isTestFile( edge.sourceFile );
+			if ( !relevant ) {
+				continue;
+			}
+			appendCandidate(
+				byFile,
+				rangeReference(
+					edge.sourceFile,
+					edge.line,
+					fileLines[ edge.sourceFile ],
+					edge.kind == "tests" ? "test-edge" : "dependency-edge",
+					[],
+					[ edge.id]
+				)
+			);
+		}
+		return byFile;
+	}
+
+	/**
+	 * Expand declaration-only graph symbols to body ranges: from beforeLines
+	 * above the signature through the next symbol (or maxLinesPerRange).
+	 * Point windows of ~before+after lines otherwise leave only signatures.
+	 */
+	private void function appendSymbolBodyCandidates(
+		required struct byFile,
+		required array symbols,
+		required string filePath,
+		required numeric fileLineCount,
+		required string reason
+	) {
+		var ordered = duplicate( arguments.symbols );
+		ordered.sort(
+				( first, second ) => int( val( first.line ?: 0 ) ) - int( val( second.line ?: 0 ) )
+			);
+		var declarationLines = [];
+		var seenLines = {};
+		for ( var orderedItem in ordered ) {
+			var declarationLine = max( 1, int( val( orderedItem.line ?: 0 ) ) );
+			if ( seenLines.keyExists( declarationLine ) ) {
+				continue;
+			}
+			seenLines[ declarationLine ] = true;
+			declarationLines.append( declarationLine );
+		}
+		var maximumRangeLines = numericSetting( variables.maxLinesPerRange, 80 );
+		var before = numericSetting(
+			variables.beforeLines,
+			3,
+			true
+		);
+		var after = numericSetting(
+			variables.afterLines,
+			12,
+			true
+		);
+		for ( var index = 1; index <= ordered.len(); index++ ) {
+			var item = ordered[ index ];
+			var line = max( 1, int( val( item.line ?: 0 ) ) );
+			var nextDeclaration = arguments.fileLineCount + 1;
+			for ( var declaration in declarationLines ) {
+				if ( declaration > line ) {
+					nextDeclaration = declaration;
+					break;
+				}
+			}
+			var startLine = max( 1, line - before );
+			var bodyEnd = max( line, nextDeclaration - 1 );
+			var endLine = min( arguments.fileLineCount, max( line + after, bodyEnd ) );
+			endLine = min( endLine, startLine + maximumRangeLines - 1 );
+			if ( endLine < startLine ) {
+				endLine = startLine;
+			}
+			appendCandidate(
+				arguments.byFile,
+				{
+					filePath : arguments.filePath,
+					startLine: startLine,
+					endLine  : endLine,
+					reasons  : [ arguments.reason],
+					symbolIds: [ item.id],
+					recordIds: [ item.id]
+				}
+			);
+		}
+	}
+
+	private void function appendCandidate( required struct byFile, required struct candidate ) {
+		if ( !arguments.byFile.keyExists( arguments.candidate.filePath ) ) {
+			arguments.byFile[ arguments.candidate.filePath ] = [];
+		}
+		arguments.byFile[ arguments.candidate.filePath ].append( arguments.candidate );
+	}
+
+	private struct function rangeReference(
+		required string filePath,
+		required numeric line,
+		required numeric fileLineCount,
+		required string reason,
+		required array symbolIds,
+		required array recordIds
+	) {
+		var maximumLine = max( 1, arguments.fileLineCount );
+		return {
+			filePath : arguments.filePath,
+			startLine: max(
+				1,
+				arguments.line -
+					numericSetting(
+						variables.beforeLines,
+						3,
+						true
+					)
+			),
+			endLine: min(
+				maximumLine,
+				arguments.line +
+					numericSetting(
+						variables.afterLines,
+						12,
+						true
+					)
+			),
+			reasons  : [ arguments.reason],
+			symbolIds: duplicate( arguments.symbolIds ),
+			recordIds: duplicate( arguments.recordIds )
+		};
+	}
+
+	private struct function selectRanges( required array files, required struct wantedPaths, required struct candidates ) {
+		var result = [];
+		var characters = 0;
+		var selectedLines = 0;
+		var selectedRanges = 0;
+		var candidateCount = 0;
+		var maximumFiles = numericSetting( variables.maxFiles, 20 );
+		var maximumCharacters = numericSetting( variables.maxCharacters, 30000 );
+		var maximumLines = numericSetting( variables.maxLines, 1000 );
+		var maximumRanges = numericSetting( variables.maxRangesPerFile, 12 );
+		var truncated = false;
+		for ( var file in arguments.files ) {
+			if ( !arguments.wantedPaths.keyExists( file.filePath ) || result.len() >= maximumFiles ) {
+				if ( arguments.wantedPaths.keyExists( file.filePath ) ) {
+					truncated = true;
+				}
+				continue;
+			}
+			if ( !file.lines.len() ) {
+				truncated = true;
+				continue;
+			}
+			var ranges = arguments.candidates.keyExists( file.filePath ) ? mergeRanges( arguments.candidates[ file.filePath ] ) : [];
+			candidateCount += ranges.len();
+			if ( !ranges.len() ) {
+				// Non-BoxLang / no-symbol files: authorize sequential chunks
+				// through the file (not only the first maxLinesPerRange lines).
+				ranges = headlessFileRanges(
+					file,
+					arguments.wantedPaths[ file.filePath ],
+					maximumRanges
+				);
+				candidateCount += ranges.len();
+				var fileLen = max( 1, int( val( file.lineCount ?: file.lines.len() ) ) );
+				if ( !ranges.len() || ranges[ ranges.len() ].endLine < fileLen ) {
+					truncated = true;
+				}
+			}
+			var fileRanges = [];
+			var fileCharacters = 0;
+			for ( var rangeItem in ranges ) {
+				if ( fileRanges.len() >= maximumRanges ) {
+					truncated = true;
+					break;
+				}
+				var rangeLines = rangeItem.endLine - rangeItem.startLine + 1;
+				var rangeCharacters = estimateCharacters( file, rangeItem );
+				if ( selectedLines + rangeLines > maximumLines || characters + rangeCharacters > maximumCharacters ) {
+					truncated = true;
+					continue;
+				}
+				var finalRange = duplicate( rangeItem );
+				finalRange.id = stableHash(
+					"#file.filePath#:#finalRange.startLine#:#"#finalRange.endLine#:"##finalRange.recordIds.toList( "," )#"
+				);
+				finalRange.lineCount = rangeLines;
+				finalRange.estimatedCharacters = rangeCharacters;
+				fileRanges.append( finalRange );
+				fileCharacters += rangeCharacters;
+				characters += rangeCharacters;
+				selectedLines += rangeLines;
+				selectedRanges++;
+			}
+			if ( !fileRanges.len() ) {
+				continue;
+			}
+			result.append(
+					{
+						filePath   : file.filePath,
+						language   : file.language,
+						contentHash: file.contentHash,
+						sizeBytes  : file.sizeBytes ?: len( file.content ?: "" ),
+						lineCount  : file.lineCount ?: file.lines.len(),
+						reason     : arguments.wantedPaths[ file.filePath ],
+						symbolIds  : uniqueIds(
+							fileRanges.reduce( ( ids, item ) => ids.append( item.symbolIds, true ), [] )
+						),
+						ranges             : fileRanges,
+						estimatedCharacters: fileCharacters
+					}
+				);
+		}
+		return {
+			files         : result,
+			rangeCount    : selectedRanges,
+			lineCount     : selectedLines,
+			characters    : characters,
+			candidateCount: candidateCount,
+			truncated     : truncated || selectedRanges < candidateCount
+		};
+	}
+
+	private array function headlessFileRanges( required struct file, required string reason, required numeric maximumRanges ) {
+		var fileLen = max(
+			1,
+			int(
+				val(
+					arguments.file.lineCount ?:
+						arguments
+							.file
+							.lines
+							.len()
+				)
+			)
+		);
+		var chunkSize = numericSetting( variables.maxLinesPerRange, 80 );
+		var ranges = [];
+		var lineCursor = 1;
+		while ( lineCursor <= fileLen && ranges.len() < max( 1, int( arguments.maximumRanges ) ) ) {
+			var endLine = min( fileLen, lineCursor + chunkSize - 1 );
+			ranges.append(
+					{
+						filePath : arguments.file.filePath,
+						startLine: lineCursor,
+						endLine  : endLine,
+						reasons  : [ arguments.reason],
+						symbolIds: [],
+						recordIds: []
+					}
+				);
+			lineCursor = endLine + 1;
+		}
+		return ranges;
+	}
+
+	private array function mergeRanges( required array ranges ) {
+		var sortedRanges = duplicate( arguments.ranges );
+		sortedRanges.sort(
+				( first, second ) => first.startLine == second.startLine
+					? first.endLine - second.endLine
+					: first.startLine - second.startLine
+			);
+		var merged = [];
+		var maximumRangeLines = numericSetting( variables.maxLinesPerRange, 80 );
+		var allowedGap = numericSetting(
+			variables.mergeGap,
+			2,
+			true
+		);
+		for ( var item in sortedRanges ) {
+			if ( !merged.len() ) {
+				merged.append( duplicate( item ) );
+				continue;
+			}
+			var previous = merged.last();
+			var combinedEnd = max( previous.endLine, item.endLine );
+			var combinedLines = combinedEnd - previous.startLine + 1;
+			if ( item.startLine <= previous.endLine + allowedGap + 1 && combinedLines <= maximumRangeLines ) {
+				previous.endLine = combinedEnd;
+				previous.reasons = uniqueIds( previous.reasons.append( item.reasons, true ) );
+				previous.symbolIds = uniqueIds( previous.symbolIds.append( item.symbolIds, true ) );
+				previous.recordIds = uniqueIds( previous.recordIds.append( item.recordIds, true ) );
+			} else {
+				merged.append( duplicate( item ) );
+			}
+		}
+		return merged;
+	}
+
+	private numeric function estimateCharacters( required struct file, required struct rangeItem ) {
+		var total = 0;
+		for ( var lineNumber = arguments.rangeItem.startLine; lineNumber <= arguments.rangeItem.endLine; lineNumber++ ) {
+			total += len( arguments.file.lines[ lineNumber ] ) + 1;
+		}
+		return total;
+	}
+
+	private array function uniqueIds( required array values ) {
+		var seen = {};
+		var result = [];
+		for ( var item in arguments.values ) {
+			var key = toString( item );
+			if ( seen.keyExists( key ) ) {
+				continue;
+			}
+			seen[ key ] = true;
+			result.append( item );
+		}
+		result.sort( "textnocase" );
+		return result;
+	}
+
+	private boolean function isTestFile( required string filePath ) {
+		return reFindNoCase(
+				"(^|/)tests/|(?:spec|test)\.bx$",
+				replace(
+					arguments.filePath,
+					"\",
+					"/",
+					"all"
+				)
+			) >
+			0;
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback, boolean allowZero = false ) {
+		if ( !isNumeric( arguments.value ) ) {
+			return arguments.fallback;
+		}
+		return arguments.allowZero ? max( 0, int( val( arguments.value ) ) ) : max( 1, int( val( arguments.value ) ) );
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

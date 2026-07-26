@@ -1,0 +1,420 @@
+/**
+ * Builds and stores the content-addressed BoxLang symbol/dependency graph for a run.
+ *
+ * @see BoxLangParserService
+ * @see AnalysisGraphRepository
+ */
+
+@singleton
+class {
+	property name="parserService" inject="BoxLangParserService";
+
+	property name="graphRepository" inject="AnalysisGraphRepository";
+
+	property name="impactMaxDepth" inject="coldbox:setting:graphImpactMaxDepth";
+
+	property name="impactMaxNodes" inject="coldbox:setting:graphImpactMaxNodes";
+	variables.impactMaxDepth = 3;
+	variables.impactMaxNodes = 2000;
+
+	struct function index( required string runId, required array files ) {
+		var parsedFiles = [];
+		var metrics = {
+			parserVersion   : parserService.getVersion(),
+			filesAnalyzed   : 0,
+			parserExecutions: 0,
+			cacheHits       : 0,
+			symbolCount     : 0,
+			dependencyCount : 0,
+			impactCount     : 0,
+			baselineRunId   : ""
+		};
+
+		for ( var file in arguments.files ) {
+			if ( !parserService.supports( file ) ) {
+				continue;
+			}
+			metrics.filesAnalyzed++;
+			var parsed = graphRepository.findCached( file.contentHash, metrics.parserVersion );
+			if ( isNull( parsed ) ) {
+				parsed = parserService.parse( file );
+				graphRepository.saveCached(
+						contentHash   = file.contentHash,
+						parserVersion = metrics.parserVersion,
+						language      = file.language,
+						parsed        = parsed
+					);
+				metrics.parserExecutions++;
+			} else {
+				metrics.cacheHits++;
+			}
+			parsedFiles.append(
+					materialize(
+						file,
+						parsed,
+						metrics.parserVersion
+					)
+				);
+		}
+
+		var baseline = graphRepository.findBaselineGraph( arguments.runId, numericSetting( variables.impactMaxNodes, 2000 ) );
+		metrics.baselineRunId = baseline.runId;
+
+		var currentSymbols = flattenSymbols( parsedFiles );
+		var currentDependencies = flattenDependencies( parsedFiles );
+		var allSymbols = baseline.symbols.duplicate();
+		allSymbols.append( currentSymbols, true );
+		var allDependencies = baseline.dependencies.duplicate();
+		allDependencies.append( currentDependencies, true );
+
+		resolveTargets( allSymbols, allDependencies );
+		var derivedTestEdges = deriveTestEdges( allDependencies );
+		allDependencies.append( derivedTestEdges, true );
+		persistCurrentResolution(
+			parsedFiles,
+			allDependencies,
+			derivedTestEdges
+		);
+
+		var impacts = len( baseline.runId )
+			? buildImpactCone(
+				parsedFiles.map( ( item ) => item.filePath ),
+				currentSymbols,
+				allDependencies
+			)
+			: [];
+
+		metrics.symbolCount = flattenSymbols( parsedFiles ).len();
+		metrics.dependencyCount = flattenDependencies( parsedFiles ).len();
+		metrics.impactCount = impacts.len();
+		graphRepository.replaceRunGraph(
+				arguments.runId,
+				parsedFiles,
+				impacts,
+				metrics
+			);
+		return metrics;
+	}
+
+	array function buildImpactCone(
+		required array changedFiles,
+		required array graphSymbols,
+		required array graphDependencies
+	) {
+		var reverseEdges = {};
+		for ( var edge in arguments.graphDependencies ) {
+			if ( !edge.keyExists( "targetFile" ) || !len( edge.targetFile ) || edge.targetFile == edge.sourceFile ) {
+				continue;
+			}
+			if ( !reverseEdges.keyExists( edge.targetFile ) ) {
+				reverseEdges[ edge.targetFile ] = [];
+			}
+			reverseEdges[ edge.targetFile ].append( edge );
+		}
+
+		var symbolsByFile = {};
+		for ( var item in arguments.graphSymbols ) {
+			if ( !arrayFindNoCase( arguments.changedFiles, item.filePath ) ) {
+				continue;
+			}
+			if ( !listFindNoCase( "class,interface,function,handler-action", item.kind ) ) {
+				continue;
+			}
+			if ( !symbolsByFile.keyExists( item.filePath ) ) {
+				symbolsByFile[ item.filePath ] = [];
+			}
+			symbolsByFile[ item.filePath ].append( item.name );
+		}
+
+		var impacts = [];
+		var maximumDepth = numericSetting( variables.impactMaxDepth, 3 );
+		var maximumNodes = numericSetting( variables.impactMaxNodes, 2000 );
+		for ( var changedFile in arguments.changedFiles ) {
+			var seedSymbols = symbolsByFile.keyExists( changedFile ) ? symbolsByFile[ changedFile ] : [ changedFile];
+			for ( var changedSymbol in seedSymbols ) {
+				var queue = [ { file: changedFile, depth: 0 }];
+				var visited = { "#changedFile#": true };
+				while ( queue.len() && impacts.len() < maximumNodes ) {
+					var current = queue.shift();
+					if ( current.depth >= maximumDepth || !reverseEdges.keyExists( current.file ) ) {
+						continue;
+					}
+					for ( var edge in reverseEdges[ current.file ] ) {
+						if ( visited.keyExists( edge.sourceFile ) ) {
+							continue;
+						}
+						visited[ edge.sourceFile ] = true;
+						var depth = current.depth + 1;
+						impacts.append(
+								{
+									id: stableImpactId(
+										changedFile,
+										changedSymbol,
+										edge.sourceFile,
+										depth
+									),
+									changedFile  : changedFile,
+									changedSymbol: changedSymbol,
+									impactedFile : edge.sourceFile,
+									reason       : edge.kind,
+									depth        : depth,
+									viaFile      : current.file
+								}
+							);
+						queue.append( { file: edge.sourceFile, depth: depth } );
+						if ( impacts.len() >= maximumNodes ) {
+							break;
+						}
+					}
+				}
+				if ( impacts.len() >= maximumNodes ) {
+					break;
+				}
+			}
+			if ( impacts.len() >= maximumNodes ) {
+				break;
+			}
+		}
+		return impacts;
+	}
+
+	private void function resolveTargets( required array symbols, required array dependencies ) {
+		var typeFiles = {};
+		var propertiesByLocation = {};
+		for ( var item in arguments.symbols ) {
+			if ( listFindNoCase( "class,interface", item.kind ) ) {
+				typeFiles[ normalizeTarget( item.name ) ] = item.filePath;
+			}
+			if ( item.kind == "property" ) {
+				propertiesByLocation[ "#item.filePath#:#item.line#" ] = item.name;
+			}
+		}
+
+		var aliases = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( edge.kind != "injects" ) {
+				continue;
+			}
+			var location = "#edge.sourceFile#:#edge.line#";
+			var targetFile = resolveTypeFile( edge.target, typeFiles );
+			if ( len( targetFile ) && propertiesByLocation.keyExists( location ) ) {
+				aliases[ "#edge.sourceFile#:#lCase( propertiesByLocation[ location ] )#" ] = targetFile;
+			}
+		}
+
+		for ( var edge in arguments.dependencies ) {
+			var targetFile = edge.keyExists( "targetFile" ) ? edge.targetFile : "";
+			if ( !len( targetFile ) && edge.kind == "calls" ) {
+				var receiver = listFirst( edge.target, "." );
+				var aliasKey = "#edge.sourceFile#:#lCase( receiver )#";
+				if ( aliases.keyExists( aliasKey ) ) {
+					targetFile = aliases[ aliasKey ];
+				} else {
+					targetFile = resolveTypeFile( receiver, typeFiles );
+				}
+			}
+			if ( !len( targetFile ) ) {
+				targetFile = resolveTypeFile( edge.target, typeFiles );
+			}
+			edge.targetFile = targetFile;
+		}
+	}
+
+	private array function deriveTestEdges( required array dependencies ) {
+		var derived = [];
+		var seen = {};
+		for ( var edge in arguments.dependencies ) {
+			if (
+				!isTestFile( edge.sourceFile ) || !edge.keyExists( "targetFile" ) || !len( edge.targetFile ) ||
+					isTestFile( edge.targetFile )
+			) {
+				continue;
+			}
+			var key = "#edge.sourceFile#:#edge.targetFile#";
+			if ( seen.keyExists( key ) ) {
+				continue;
+			}
+			seen[ key ] = true;
+			derived.append(
+					{
+						id: stableId(
+							edge.sourceFile,
+							"dependency",
+							"tests",
+							edge.targetFile,
+							edge.line
+						),
+						sourceFile: edge.sourceFile,
+						kind      : "tests",
+						target    : edge.target,
+						targetFile: edge.targetFile,
+						line      : edge.line,
+						evidence  : edge.evidence
+					}
+				);
+		}
+		return derived;
+	}
+
+	private void function persistCurrentResolution(
+		required array parsedFiles,
+		required array allDependencies,
+		required array derivedTestEdges
+	) {
+		var filesByPath = {};
+		for ( var parsedFile in arguments.parsedFiles ) {
+			filesByPath[ parsedFile.filePath ] = parsedFile;
+		}
+		for ( var edge in arguments.allDependencies ) {
+			if ( !filesByPath.keyExists( edge.sourceFile ) ) {
+				continue;
+			}
+			for ( var currentEdge in filesByPath[ edge.sourceFile ].dependencies ) {
+				if ( currentEdge.id == edge.id ) {
+					currentEdge.targetFile = edge.targetFile;
+					break;
+				}
+			}
+		}
+		for ( var edge in arguments.derivedTestEdges ) {
+			if ( !filesByPath.keyExists( edge.sourceFile ) ) {
+				continue;
+			}
+			var alreadyPresent = false;
+			for ( var currentEdge in filesByPath[ edge.sourceFile ].dependencies ) {
+				if ( currentEdge.id == edge.id ) {
+					alreadyPresent = true;
+					break;
+				}
+			}
+			if ( !alreadyPresent ) {
+				filesByPath[ edge.sourceFile ].dependencies.append( edge );
+			}
+		}
+	}
+
+	private array function flattenSymbols( required array parsedFiles ) {
+		var items = [];
+		for ( var parsedFile in arguments.parsedFiles ) {
+			for ( var item in parsedFile.symbols ) {
+				var copy = duplicate( item );
+				copy.filePath = parsedFile.filePath;
+				items.append( copy );
+			}
+		}
+		return items;
+	}
+
+	private array function flattenDependencies( required array parsedFiles ) {
+		var items = [];
+		for ( var parsedFile in arguments.parsedFiles ) {
+			for ( var item in parsedFile.dependencies ) {
+				var copy = duplicate( item );
+				copy.sourceFile = parsedFile.filePath;
+				items.append( copy );
+			}
+		}
+		return items;
+	}
+
+	private struct function materialize( required struct file, required struct parsed, required string parserVersion ) {
+		var symbols = [];
+		var seenSymbolIds = {};
+		for ( var item in arguments.parsed.symbols ) {
+			var symbolItem = duplicate( item );
+			symbolItem.id = stableId(
+				arguments.file.filePath,
+				"symbol",
+				item.kind,
+				item.name,
+				item.line
+			);
+			if ( seenSymbolIds.keyExists( symbolItem.id ) ) {
+				continue;
+			}
+			seenSymbolIds[ symbolItem.id ] = true;
+			symbols.append( symbolItem );
+		}
+		var dependencies = [];
+		var seenDependencyIds = {};
+		for ( var item in arguments.parsed.dependencies ) {
+			var dependencyItem = duplicate( item );
+			dependencyItem.id = stableId(
+				arguments.file.filePath,
+				"dependency",
+				item.kind,
+				item.target,
+				item.line
+			);
+			if ( seenDependencyIds.keyExists( dependencyItem.id ) ) {
+				continue;
+			}
+			seenDependencyIds[ dependencyItem.id ] = true;
+			dependencyItem.targetFile = "";
+			dependencies.append( dependencyItem );
+		}
+		return {
+			filePath     : arguments.file.filePath,
+			contentHash  : arguments.file.contentHash,
+			parserVersion: arguments.parserVersion,
+			symbols      : symbols,
+			dependencies : dependencies
+		};
+	}
+
+	private string function resolveTypeFile( required string target, required struct typeFiles ) {
+		var normalized = normalizeTarget( arguments.target );
+		return arguments.typeFiles.keyExists( normalized ) ? arguments.typeFiles[ normalized ] : "";
+	}
+
+	private string function normalizeTarget( required string target ) {
+		var withoutModule = listFirst( trim( arguments.target ), "@" );
+		return lCase( listLast( withoutModule, "." ) );
+	}
+
+	private boolean function isTestFile( required string filePath ) {
+		return reFindNoCase(
+				"(^|/)tests/|(?:spec|test)\.bx$",
+				replace(
+					arguments.filePath,
+					"\",
+					"/",
+					"all"
+				)
+			) >
+			0;
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableImpactId(
+		required string changedFile,
+		required string changedSymbol,
+		required string impactedFile,
+		required numeric depth
+	) {
+		return lCase(
+			hash(
+				"#arguments.changedFile#:#arguments.changedSymbol#:#arguments.impactedFile#:#arguments.depth#",
+				"SHA-256"
+			)
+		);
+	}
+
+	private string function stableId(
+		required string filePath,
+		required string recordType,
+		required string kind,
+		required string name,
+		required numeric line
+	) {
+		return lCase(
+			hash(
+				"#arguments.filePath#:#arguments.recordType#:#arguments.kind#:#arguments.name#:#arguments.line#",
+				"SHA-256"
+			)
+		);
+	}
+}

@@ -1,0 +1,344 @@
+/**
+ * Builds an immutable, budgeted specialist plan from architecture + context packs.
+ *
+ * @see ContextPackService
+ * @see ReviewPolicyService
+ */
+
+@singleton
+class {
+	property name="maxTasks" inject="coldbox:setting:planMaxTasks";
+
+	property name="contextPackService" inject="ContextPackService";
+	variables.planVersion = "review-plan-v2";
+	variables.maxTasks = 6;
+	variables.allowedRoles = [
+		"correctness",
+		"security",
+		"architecture",
+		"testing",
+		"performance",
+		"boxlang-conventions",
+		"cfml-conventions"
+	];
+
+	app.models.domain.ReviewPlan function plan(
+		required app.models.domain.ArchitectureModel architectureModel,
+		required struct graph,
+		required array files,
+		struct policy       = {},
+		struct budgets      = {},
+		struct crewProposal = {}
+	) {
+		var model = arguments.architectureModel.getMemento();
+		var authorizedRoles = authorizedRoles( arguments.policy );
+		var crewSelections = crewSelections( arguments.crewProposal, authorizedRoles );
+		var useLlmCrew = crewSelections.len() > 0;
+		var selectedRoles = useLlmCrew
+			? []
+			: selectRoles(
+				authorizedRoles,
+				model,
+				arguments.graph,
+				arguments.files
+			);
+		var contextPack = contextPackService.build( arguments.graph, arguments.files );
+		var changedSymbols = contextPack.changedSymbols;
+		var contextFiles = contextPack.files;
+		var tasks = [];
+		var taskLimit = min(
+			numericSetting( variables.maxTasks, 6 ),
+			numericSetting( arguments.budgets.maxTasks ?: variables.maxTasks, 6 )
+		);
+		var totalTokenBudget = numericSetting(
+			arguments.budgets.maxTokens ?: taskLimit * 3000,
+			taskLimit * 3000
+		);
+		var tokensPerTask = numericSetting( arguments.budgets.maxTokensPerTask ?: 3000, 3000 );
+		var policyFingerprint = arguments.policy.fingerprint ?: "";
+		var budgetFingerprint = arguments.budgets.fingerprint ?: "";
+		var remainingTokens = totalTokenBudget;
+		var durationLimit = numericSetting( arguments.budgets.maxDurationMs ?: 120000, 120000 );
+		var iterationLimit = numericSetting( arguments.budgets.maxIterationsPerTask ?: 8, 8 );
+		var toolOutputLimit = numericSetting( arguments.budgets.maxToolOutputCharacters ?: 48000, 48000 );
+		var totalCostLimit = numericDecimal( arguments.budgets.maxCostUsd ?: 5, 5 );
+		// Pre-flight cost estimates are worst-case ceilings for a single task.
+		// Do not divide the run budget here or every multi-role review fails the gate.
+		var costPerTask = totalCostLimit;
+		var roleQueue = useLlmCrew
+			? crewSelections
+			: selectedRoles.map(
+					( role ) => {
+						return {
+							role          : role,
+							priority      : rolePriority( role ),
+							objective     : roleObjective( role ),
+							brief         : "",
+							emphasizeFiles: []
+						};
+					}
+				);
+		roleQueue.sort(
+				( first, second ) => {
+					var firstPriority = isNumeric( first.priority ?: "" ) ? int( first.priority ) : rolePriority( first.role );
+					var secondPriority = isNumeric( second.priority ?: "" ) ? int( second.priority ) : rolePriority( second.role );
+					return secondPriority - firstPriority;
+				}
+			);
+		for ( var selection in roleQueue ) {
+			if ( tasks.len() >= taskLimit || remainingTokens <= 0 ) {
+				break;
+			}
+			var role = selection.role;
+			var allocatedTokens = min( tokensPerTask, remainingTokens );
+			var taskId = stableHash(
+				"#variables.planVersion#:#model.fingerprint#:#role#:#"#policyFingerprint#:#budgetFingerprint#:"##"#contextPack.fingerprint#:#allocatedTokens#"#"
+			);
+			var taskContextFiles = contextFilesForSelection( contextFiles, selection.emphasizeFiles ?: [] );
+			tasks.append(
+					{
+						id      : taskId,
+						type    : "specialist-review",
+						role    : role,
+						priority: isNumeric( selection.priority ?: "" ) ? int( selection.priority ) : rolePriority( role ),
+						objective: len( trim( selection.objective ?: "" ) ) ? trim( selection.objective ) : roleObjective( role ),
+						brief  : trim( selection.brief ?: "" ),
+						context: {
+							changedSymbols     : duplicate( changedSymbols ),
+							files              : duplicate( taskContextFiles ),
+							impactCount        : arguments
+								.graph
+								.impacts
+								.len(),
+							architectureFactIds: factIdsForRole( role, model.facts )
+						},
+						budget: {
+							maxFiles               : taskContextFiles.len(),
+							maxCharacters          : contextPack.summary.characters,
+							maxTokens              : allocatedTokens,
+							maxDurationMs          : durationLimit,
+							maxIterations          : iterationLimit,
+							maxToolOutputCharacters: toolOutputLimit,
+							maxCostUsd             : costPerTask
+						}
+					}
+				);
+			remainingTokens -= allocatedTokens;
+		}
+		tasks.sort( ( first, second ) => second.priority - first.priority );
+		var fingerprint = stableHash( variables.planVersion & "|" & model.fingerprint & "|" & tasks.map( ( item
+						 ) => item.id ).toList( "," ) );
+		var crewSource = useLlmCrew ? "llm" : "deterministic";
+		var crewSummary = useLlmCrew ? trim( arguments.crewProposal.summary ?: "Planned crew" ) : "Default crew";
+		return new app.models.domain.ReviewPlan(
+			{
+				version           : variables.planVersion,
+				fingerprint       : fingerprint,
+				modelFingerprint  : model.fingerprint,
+				policyFingerprint : policyFingerprint,
+				budgetFingerprint : budgetFingerprint,
+				contextFingerprint: contextPack.fingerprint,
+				tasks             : tasks,
+				summary           : {
+					taskCount         : tasks.len(),
+					selectedRoles     : tasks.map( ( item ) => item.role ),
+					crewSource        : crewSource,
+					crewSummary       : crewSummary,
+					changedSymbolCount: changedSymbols.len(),
+					contextFileCount  : contextFiles.len(),
+					contextCharacters : contextFiles.reduce( ( total, item ) => total + item.estimatedCharacters, 0 ),
+					contextRangeCount : contextPack.summary.rangeCount,
+					contextLineCount  : contextPack.summary.lineCount,
+					contextVersion    : contextPack.version,
+					contextTruncated  : contextPack.summary.truncated,
+					taskLimit         : taskLimit,
+					tokenBudget       : totalTokenBudget,
+					allocatedTokens   : totalTokenBudget - remainingTokens,
+					remainingTokens   : remainingTokens
+				}
+			}
+		);
+	}
+
+	private array function crewSelections( required struct crewProposal, required array authorizedRoles ) {
+		if ( !( arguments.crewProposal.ok ?: false ) ) {
+			return [];
+		}
+		var rawTasks = isArray( arguments.crewProposal.tasks ?: "" ) ? arguments.crewProposal.tasks : [];
+		if ( !rawTasks.len() ) {
+			return [];
+		}
+		var authorized = arguments.authorizedRoles;
+		var selections = [];
+		for ( var item in rawTasks ) {
+			var role = lCase( trim( item.role ?: "" ) );
+			if ( !len( role ) || authorized.findNoCase( role ) == 0 ) {
+				continue;
+			}
+			selections.append(
+					{
+						role          : role,
+						priority      : isNumeric( item.priority ?: "" ) ? int( item.priority ) : rolePriority( role ),
+						objective     : trim( item.objective ?: "" ),
+						brief         : trim( item.brief ?: "" ),
+						emphasizeFiles: isArray( item.emphasizeFiles ?: "" ) ? item.emphasizeFiles : []
+					}
+				);
+		}
+		return selections;
+	}
+
+	private array function contextFilesForSelection( required array contextFiles, required array emphasizeFiles ) {
+		if ( !arguments.emphasizeFiles.len() ) {
+			return arguments.contextFiles;
+		}
+		var wanted = {};
+		for ( var path in arguments.emphasizeFiles ) {
+			wanted[ lCase(
+				replace(
+					trim( path ),
+					"\",
+					"/",
+					"all"
+				)
+			) ] = true;
+		}
+		var focused = [];
+		var remainder = [];
+		for ( var file in arguments.contextFiles ) {
+			var key = lCase(
+				replace(
+					trim( file.filePath ?: "" ),
+					"\",
+					"/",
+					"all"
+				)
+			);
+			if ( wanted.keyExists( key ) ) {
+				focused.append( file );
+			} else {
+				remainder.append( file );
+			}
+		}
+		// Emphasized paths first, then the rest of the shared pack (boost, don't replace).
+		return focused.len() ? focused.append( remainder, true ) : arguments.contextFiles;
+	}
+
+	private array function authorizedRoles( required struct policy ) {
+		var requested = isArray( arguments.policy.allowedRoles ?: "" ) ? arguments.policy.allowedRoles : variables.allowedRoles;
+		return variables.allowedRoles.filter( ( role ) => requested.findNoCase( role ) > 0 );
+	}
+
+	private array function selectRoles(
+		required array authorized,
+		required struct model,
+		required struct graph,
+		required array files
+	) {
+		var wanted = [ "security", "correctness"];
+		if ( arguments.files.some( ( file ) => ( file.language ?: "" ) == "CFML" ) ) {
+			wanted.append( "cfml-conventions" );
+		}
+		if (
+			arguments
+				.graph
+				.symbols
+				.len()
+		) {
+			wanted.append( "boxlang-conventions" );
+		}
+		if ( model.summary.dependencyFacts > 0 || model.summary.componentCount > 1 ) {
+			wanted.append( "architecture" );
+		}
+		if (
+			arguments
+						.graph
+						.dependencies
+						.some( ( edge ) => edge.kind == "tests" ) ||
+					arguments
+						.model
+						.components
+						.some( ( component ) => component.name == "tests" ) ||
+				arguments
+					.graph
+					.impacts
+					.some(
+						( impact ) => reFindNoCase( "(^|/)tests?/", impact.impactedFile )
+					)
+		) {
+			wanted.append( "testing" );
+		}
+		if (
+			arguments
+				.graph
+				.dependencies
+				.some( ( edge ) => edge.kind == "calls" )
+		) {
+			wanted.append( "performance" );
+		}
+		var authorized = arguments.authorized;
+		return wanted.filter( ( role ) => authorized.findNoCase( role ) > 0 );
+	}
+
+	private boolean function roleMatchesFact( required string role, required struct fact ) {
+		switch ( arguments.role ) {
+			case "testing":
+				return findNoCase( "test", arguments.fact.type ) > 0;
+			case "architecture":
+				return findNoCase( "dependency/", arguments.fact.type ) == 1;
+			case "performance":
+				return arguments.fact.type == "dependency/calls";
+			default:
+				return true;
+		}
+	}
+
+	private array function factIdsForRole( required string role, required array facts ) {
+		var ids = [];
+		for ( var item in arguments.facts ) {
+			if ( roleMatchesFact( arguments.role, item ) ) {
+				ids.append( item.id );
+			}
+			if ( ids.len() >= 20 ) {
+				break;
+			}
+		}
+		return ids;
+	}
+
+	private numeric function rolePriority( required string role ) {
+		return {
+			security             : 100,
+			correctness          : 90,
+			"cfml-conventions"   : 85,
+			testing              : 80,
+			architecture         : 70,
+			performance          : 60,
+			"boxlang-conventions": 50
+		}[ arguments.role ];
+	}
+
+	private string function roleObjective( required string role ) {
+		return {
+			security             : "Review changed symbols and reachable code for exploitable security defects.",
+			correctness          : "Review changed behavior and dependencies for concrete correctness defects.",
+			"cfml-conventions"   : "LLM in-depth ColdFusion review plus evidence-backed modernization assist.",
+			testing              : "Review impacted tests and identify evidence-backed regression gaps.",
+			architecture         : "Review component boundaries and changed dependency relationships.",
+			performance          : "Review changed call paths for bounded, evidence-backed performance risks.",
+			"boxlang-conventions": "Review changed BoxLang and ColdBox code against framework conventions."
+		}[ arguments.role ];
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+
+	private numeric function numericDecimal( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( .000001, val( arguments.value ) ) : arguments.fallback;
+	}
+}

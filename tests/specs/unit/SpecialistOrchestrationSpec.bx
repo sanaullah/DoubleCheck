@@ -1,0 +1,476 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"Bounded specialist orchestration",
+			() => {
+				it(
+					"runs specialists concurrently on a fixed provider pool",
+					() => {
+						var gateway = new tests.resources.ScriptedSpecialistGateway( delayMs = 120 );
+						var fixture = orchestrationFixture( gateway, 2 );
+						var plan = {
+							tasks: [ taskFixture( "security", 500 ), taskFixture( "correctness", 500 ), taskFixture( "testing", 500 )]
+						};
+						var result = fixture.service.review(
+								plan,
+								fixture.files,
+								fixture.graph
+							);
+						expect( result.results ).toHaveLength( 3 );
+						expect( result.completedTasks ).toBe( 3 );
+						expect( gateway.peakConcurrency() ).toBe( 2 );
+					}
+				);
+
+				it(
+					"enforces hard task deadlines and interrupts provider work",
+					() => {
+						var gateway = new tests.resources.ScriptedSpecialistGateway( delayMs = 300 );
+						var fixture = orchestrationFixture( gateway, 2 );
+						var task = taskFixture( "security", 40 );
+						var startedAt = getTickCount();
+						var result = fixture.service.review(
+								{ tasks: [ task] },
+								fixture.files,
+								fixture.graph
+							);
+
+						expect( result.results[ 1 ].status ).toBe( "timed_out" );
+						expect( result.failedTasks ).toBe( 1 );
+						expect( getTickCount() - startedAt ).toBeLT( 250 );
+					}
+				);
+
+				it(
+					"checkpoints successful partial results when another task fails",
+					() => {
+						var gateway = new tests.resources.ScriptedSpecialistGateway( failRoles = [ "security"] );
+						var fixture = orchestrationFixture( gateway, 2 );
+						var checkpoints = [];
+						var result = fixture.service.review(
+								{ tasks: [ taskFixture( "security", 500 ), taskFixture( "correctness", 500 )] },
+								fixture.files,
+								fixture.graph,
+								{
+									provenance: {
+										policyFingerprint: "policy-1",
+										budgetFingerprint: "budget-1",
+										planFingerprint  : "plan-1",
+										analyzerVersion  : "parser-1"
+									},
+									onCheckpoint: ( item ) => checkpoints.append( item )
+								}
+							);
+
+						expect( result.results ).toHaveLength( 2 );
+						expect( result.completedTasks ).toBe( 1 );
+						expect( result.failedTasks ).toBe( 1 );
+						expect( checkpoints ).toHaveLength( 2 );
+						expect( checkpoints.some( ( item ) => item.status == "succeeded" ) ).toBeTrue();
+						expect( checkpoints[ 1 ].provenance.policyFingerprint ).toBe( "policy-1" );
+						expect( checkpoints[ 1 ].provenance.analyzerVersion ).toBe( "parser-1" );
+					}
+				);
+
+				it(
+					"propagates run cancellation to active specialist futures",
+					() => {
+						var gateway = new tests.resources.ScriptedSpecialistGateway( delayMs = 300 );
+						var fixture = orchestrationFixture( gateway, 2 );
+						var startedAt = getTickCount();
+
+						expect(
+							() => fixture.service.review(
+									{ tasks: [ taskFixture( "security", 1000 ), taskFixture( "correctness", 1000 )] },
+									fixture.files,
+									fixture.graph,
+									{ isCancelled: () => getTickCount() - startedAt > 50 }
+								)
+						).toThrow( type = "RunCancelled" );
+						expect( getTickCount() - startedAt ).toBeLT( 250 );
+					}
+				);
+
+				it(
+					"stops before provider execution when the cost reservation exceeds budget",
+					() => {
+						var gateway = new tests.resources.ScriptedSpecialistGateway();
+						var fixture = orchestrationFixture( gateway, 2 );
+						var task = taskFixture( "security", 500 );
+						task.budget.maxCostUsd = .000001;
+						var result = fixture.service.review(
+								{ tasks: [ task] },
+								fixture.files,
+								fixture.graph
+							);
+
+						expect( result.results[ 1 ].status ).toBe( "budget_exceeded" );
+						expect( gateway.callCount() ).toBe( 0 );
+					}
+				);
+
+				it(
+					"retries transient provider failures and opens the circuit",
+					() => {
+						var attempts = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+						var gateway = configuredNativeGateway();
+						gateway.$(
+								method   = "invokeAgent",
+								callback = (
+									definition,
+									tools,
+									input,
+									params,
+									options,
+									control,
+									onProgress
+								) => {
+									if ( attempts.incrementAndGet() < 3 ) {
+										throw( type = "ProviderFailure", message = "retry" );
+									}
+									return "{""summary"":""ok"",""findings"":[]}";
+								}
+							);
+						var response = gateway.run(
+								definitionFixture(),
+								[],
+								"input"
+							);
+						expect( response.summary ).toBe( "ok" );
+						expect( response._execution.attempts ).toBe( 3 );
+						expect( gateway.circuitStatus().open ).toBeFalse();
+
+						var failing = configuredNativeGateway();
+						failing.$property(
+								"maxRetries",
+								"variables",
+								0
+							);
+						failing.$property(
+								"circuitFailureThreshold",
+								"variables",
+								2
+							);
+						failing.$(
+								method   = "invokeAgent",
+								callback = (
+									definition,
+									tools,
+									input,
+									params,
+									options,
+									control,
+									onProgress
+								) => {
+									throw( type = "ProviderFailure", message = "down" );
+								}
+							);
+						expect(
+							() => failing.run(
+									definitionFixture(),
+									[],
+									"input"
+								)
+						).toThrow( type = "ProviderFailure" );
+						expect(
+							() => failing.run(
+									definitionFixture(),
+									[],
+									"input"
+								)
+						).toThrow( type = "ProviderFailure" );
+						expect( failing.circuitStatus().open ).toBeTrue();
+						expect(
+							() => failing.run(
+									definitionFixture(),
+									[],
+									"input"
+								)
+						).toThrow( type = "SpecialistCircuitOpen" );
+					}
+				);
+
+				it(
+					"coalesces streamed progress without persisting streamed content",
+					() => {
+						var appendCount = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+						var repository = prepareMock( new app.models.repositories.ReviewEventRepository() );
+						repository.$(
+								method   = "append",
+								callback = ( runId, eventType, payload ) => {
+									var sequence = appendCount.incrementAndGet();
+									return {
+										sequence : sequence,
+										runId    : runId,
+										eventType: eventType,
+										payload  : payload,
+										createdAt: ""
+									};
+								}
+							);
+						var service = prepareMock( new app.models.services.ReviewEventService() );
+						service.$property(
+								"eventRepository",
+								"variables",
+								repository
+							);
+						var first = service.publishCoalesced(
+								"run-1",
+								"review.specialist.progress",
+								"task-1",
+								{ charactersSeen: 10 },
+								10000
+							);
+						var suppressed = service.publishCoalesced(
+								"run-1",
+								"review.specialist.progress",
+								"task-1",
+								{ charactersSeen: 20 },
+								10000
+							);
+						var finalEvent = service.publishCoalesced(
+								"run-1",
+								"review.specialist.progress",
+								"task-1",
+								{ charactersSeen: 30 },
+								10000,
+								true
+							);
+
+						expect( first.published ).toBeTrue();
+						expect( suppressed.published ).toBeFalse();
+						expect( finalEvent.published ).toBeTrue();
+						expect( appendCount.get() ).toBe( 2 );
+						expect( jsonSerialize( finalEvent ) ).notToInclude( "streamed source" );
+					}
+				);
+			}
+		);
+	}
+
+	private struct function orchestrationFixture( required any gateway, required numeric threads ) {
+		var file = {
+			filePath   : "app/models/Example.bx",
+			language   : "BoxLang",
+			contentHash: lCase( hash( "function run() {}", "SHA-256" ) ),
+			lines      : [ "function run() {}"]
+		};
+		var toolService = prepareMock( new app.models.services.ControlledRepositoryToolService() );
+		toolService.$property(
+				"maxCalls",
+				"variables",
+				8
+			);
+		toolService.$property(
+				"maxOutputCharacters",
+				"variables",
+				12000
+			);
+		toolService.$property(
+				"maxSearchMatches",
+				"variables",
+				20
+			);
+		toolService.$property(
+				"toolTimeoutMs",
+				"variables",
+				2000
+			);
+		toolService.$property(
+				"secretRedactionService",
+				"variables",
+				new app.models.services.SecretRedactionService()
+			);
+		var factory = prepareMock( new app.models.services.SpecialistAgentFactory() );
+		factory.$property(
+				"provider",
+				"variables",
+				"scripted-provider"
+			);
+		factory.$property(
+				"model",
+				"variables",
+				"scripted-model"
+			);
+		var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
+		renderer.$property(
+				"secretRedactionService",
+				"variables",
+				new app.models.services.SecretRedactionService()
+			);
+		var service = prepareMock( new app.models.services.SpecialistReviewService() );
+		service.$property(
+				"gateway",
+				"variables",
+				arguments.gateway
+			);
+		service.$property(
+				"factory",
+				"variables",
+				factory
+			);
+		service.$property(
+				"toolService",
+				"variables",
+				toolService
+			);
+		service.$property(
+				"contextPackRenderer",
+				"variables",
+				renderer
+			);
+		service.$property(
+				"findingService",
+				"variables",
+				new app.models.services.FindingService()
+			);
+		service.$property(
+				"secretRedactionService",
+				"variables",
+				new app.models.services.SecretRedactionService()
+			);
+		service.$property(
+				"maxFindings",
+				"variables",
+				20
+			);
+		service.$property(
+				"maxSummaryCharacters",
+				"variables",
+				2000
+			);
+		service.$property(
+				"executorThreads",
+				"variables",
+				arguments.threads
+			);
+		service.$property(
+				"inputUsdPerMillion",
+				"variables",
+				100
+			);
+		service.$property(
+				"outputUsdPerMillion",
+				"variables",
+				100
+			);
+		service.$property(
+				"observabilityEnabled",
+				"variables",
+				false
+			);
+		service.$property(
+				"observabilityPreviewCharacters",
+				"variables",
+				800
+			);
+		return {
+			service: service,
+			files  : [ file],
+			graph  : {
+				symbols     : [],
+				dependencies: [],
+				impacts     : []
+			}
+		};
+	}
+
+	private struct function taskFixture( required string role, required numeric durationMs ) {
+		return {
+			id       : lCase( hash( "#arguments.role#-task", "SHA-256" ) ),
+			role     : arguments.role,
+			objective: "Review #arguments.role#.",
+			budget   : {
+				maxFiles               : 1,
+				maxCharacters          : 100,
+				maxTokens              : 128,
+				maxDurationMs          : arguments.durationMs,
+				maxIterations          : 4,
+				maxToolOutputCharacters: 4000,
+				maxCostUsd             : 1
+			},
+			context: {
+				changedSymbols     : [],
+				impactCount        : 0,
+				architectureFactIds: [],
+				files              : [
+					{
+						filePath   : "app/models/Example.bx",
+						contentHash: lCase( hash( "function run() {}", "SHA-256" ) ),
+						language   : "BoxLang",
+						ranges     : [
+							{
+								id       : "range-1",
+								startLine: 1,
+								endLine  : 1
+							}
+						]
+					}
+				]
+			}
+		};
+	}
+
+	private any function configuredNativeGateway() {
+		var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+		gateway.$property(
+				"provider",
+				"variables",
+				"fake-provider"
+			);
+		gateway.$property(
+				"apiKey",
+				"variables",
+				"fake-key"
+			);
+		gateway.$property(
+				"baseURL",
+				"variables",
+				""
+			);
+		gateway.$property(
+				"model",
+				"variables",
+				"fake-model"
+			);
+		gateway.$property(
+				"timeout",
+				"variables",
+				1
+			);
+		gateway.$property(
+				"maxRetries",
+				"variables",
+				2
+			);
+		gateway.$property(
+				"retryBackoffMs",
+				"variables",
+				1
+			);
+		gateway.$property(
+				"circuitFailureThreshold",
+				"variables",
+				10
+			);
+		gateway.$property(
+				"circuitCooldownMs",
+				"variables",
+				30000
+			);
+		return gateway;
+	}
+
+	private struct function definitionFixture() {
+		return {
+			name         : "TestAgent",
+			description  : "Test",
+			instructions : "Return JSON.",
+			taskId       : "task-1",
+			role         : "security",
+			maxTokens    : 128,
+			maxIterations: 2
+		};
+	}
+}

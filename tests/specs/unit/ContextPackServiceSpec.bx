@@ -1,0 +1,246 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"Symbol-aware artifact context packs",
+			() => {
+				it(
+					"merges bounded symbol and dependency ranges without source bodies",
+					() => {
+						var service = contextService();
+						var file = sourceFile();
+						var graph = graphFixture();
+						var first = service.build( graph, [ file] );
+						var repeated = service.build( graph, [ file] );
+						var contextFile = first.files[ 1 ];
+
+						expect( first.version ).toBe( "symbol-range-artifact-refs-v2" );
+						expect( first.fingerprint ).toBe( repeated.fingerprint );
+						expect( contextFile.ranges ).toHaveLength( 2 );
+						// Declaration at line 5 expands at least through the
+						// signature window; the next symbol at line 7 owns the
+						// following body chunk (capped by maxLinesPerRange).
+						expect( contextFile.ranges[ 1 ].startLine ).toBe( 3 );
+						expect( contextFile.ranges[ 1 ].endLine ).toBe( 7 );
+						expect( contextFile.ranges[ 1 ].symbolIds ).toInclude( "symbol-function" );
+						expect( contextFile.ranges[ 2 ].startLine ).toBe( 5 );
+						expect( contextFile.ranges[ 2 ].endLine ).toBe( 24 );
+						expect( contextFile.ranges[ 2 ].symbolIds ).toInclude( "symbol-test" );
+						expect( contextFile.ranges[ 2 ].recordIds ).toInclude( "dependency-call" );
+						expect( first.summary.lineCount ).toBe( 25 );
+						expect( first.summary.characters ).toBeLT( len( file.content ) );
+						expect( jsonSerialize( first ) ).notToInclude( "SENSITIVE_SOURCE_BODY" );
+						expect( jsonSerialize( first ) ).notToInclude( "content"":" );
+					}
+				);
+
+				it(
+					"expands a lone function past the signature into its body",
+					() => {
+						var service = contextService();
+						service.$property(
+								"maxLinesPerRange",
+								"variables",
+								40
+							);
+						var file = sourceFile();
+						var graph = {
+							summary: {},
+							symbols: [
+								{
+									id      : "symbol-only-function",
+									filePath: file.filePath,
+									kind    : "function",
+									name    : "review",
+									line    : 5
+								}
+							],
+							dependencies: [],
+							impacts     : []
+						};
+						var result = service.build( graph, [ file] );
+						var rangeItem = result.files[ 1 ].ranges[ 1 ];
+
+						expect( rangeItem.startLine ).toBe( 3 );
+						// File has 30 lines; next-symbol is EOF so the body
+						// fills through the end of the file (not signature+12).
+						expect( rangeItem.endLine ).toBe( 30 );
+						expect( rangeItem.endLine ).toBeGT( 5 + 12 );
+					}
+				);
+
+				it(
+					"chunks headless files beyond the first range window",
+					() => {
+						var service = contextService();
+						service.$property(
+								"maxLinesPerRange",
+								"variables",
+								10
+							);
+						service.$property(
+								"maxRangesPerFile",
+								"variables",
+								4
+							);
+						var lines = [];
+						for ( var lineNumber = 1; lineNumber <= 45; lineNumber++ ) {
+							lines.append( "line #lineNumber#" );
+						}
+						var content = lines.toList( char( 10 ) );
+						var file = {
+							filePath   : "app/legacy/LegacyService.cfc",
+							language   : "ColdFusion",
+							contentHash: lCase( hash( content, "SHA-256" ) ),
+							content    : content,
+							lines      : lines,
+							sizeBytes  : len( content ),
+							lineCount  : lines.len()
+						};
+						var graph = {
+							summary     : {},
+							symbols     : [],
+							dependencies: [],
+							impacts     : []
+						};
+						var result = service.build( graph, [ file] );
+
+						expect( result.files ).toHaveLength( 1 );
+						expect( result.files[ 1 ].ranges ).toHaveLength( 4 );
+						expect( result.files[ 1 ].ranges[ 1 ].startLine ).toBe( 1 );
+						expect( result.files[ 1 ].ranges[ 1 ].endLine ).toBe( 10 );
+						expect( result.files[ 1 ].ranges[ 4 ].startLine ).toBe( 31 );
+						expect( result.files[ 1 ].ranges[ 4 ].endLine ).toBe( 40 );
+						expect( result.summary.truncated ).toBeTrue();
+					}
+				);
+
+				it(
+					"marks the context pack truncated when the range cap is reached",
+					() => {
+						var service = contextService();
+						service.$property(
+								"maxRangesPerFile",
+								"variables",
+								1
+							);
+						var result = service.build( graphFixture(), [ sourceFile()] );
+
+						expect( result.files[ 1 ].ranges ).toHaveLength( 1 );
+						expect( result.summary.truncated ).toBeTrue();
+						expect( result.summary.rangeCount ).toBe( 1 );
+					}
+				);
+			}
+		);
+	}
+
+	private any function contextService() {
+		var service = prepareMock( new app.models.services.ContextPackService() );
+		service.$property(
+				"maxFiles",
+				"variables",
+				20
+			);
+		service.$property(
+				"maxCharacters",
+				"variables",
+				30000
+			);
+		service.$property(
+				"maxChangedSymbols",
+				"variables",
+				50
+			);
+		service.$property(
+				"beforeLines",
+				"variables",
+				2
+			);
+		service.$property(
+				"afterLines",
+				"variables",
+				2
+			);
+		service.$property(
+				"maxLines",
+				"variables",
+				100
+			);
+		service.$property(
+				"maxRangesPerFile",
+				"variables",
+				12
+			);
+		service.$property(
+				"maxLinesPerRange",
+				"variables",
+				20
+			);
+		service.$property(
+				"mergeGap",
+				"variables",
+				0
+			);
+		return service;
+	}
+
+	private struct function graphFixture() {
+		return {
+			summary: {},
+			symbols: [
+				{
+					id      : "symbol-function",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "function",
+					name    : "review",
+					line    : 5
+				},
+				{
+					id      : "symbol-handler",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "handler-action",
+					name    : "review",
+					line    : 5
+				},
+				{
+					id      : "symbol-test",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "test",
+					name    : "reviews code",
+					line    : 7
+				}
+			],
+			dependencies: [
+				{
+					id        : "dependency-call",
+					sourceFile: "app/models/ReviewService.bx",
+					kind      : "calls",
+					target    : "result.save",
+					targetFile: "app/models/Result.bx",
+					line      : 20
+				}
+			],
+			impacts: []
+		};
+	}
+
+	private struct function sourceFile() {
+		var lines = [];
+		for ( var lineNumber = 1; lineNumber <= 30; lineNumber++ ) {
+			lines.append(
+					lineNumber == 15 ? "SENSITIVE_SOURCE_BODY" : "line #lineNumber#"
+				);
+		}
+		var content = lines.toList( char( 10 ) );
+		return {
+			filePath   : "app/models/ReviewService.bx",
+			language   : "BoxLang",
+			contentHash: lCase( hash( content, "SHA-256" ) ),
+			content    : content,
+			lines      : lines,
+			sizeBytes  : len( content ),
+			lineCount  : lines.len()
+		};
+	}
+}

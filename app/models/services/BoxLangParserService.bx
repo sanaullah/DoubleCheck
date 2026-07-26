@@ -1,0 +1,384 @@
+/**
+ * Parses BoxLang sources into symbols, dependencies, and impact edges for the graph.
+ */
+
+@singleton
+class {
+	variables.parserVersion = "boxlang-symbol-parser-v2";
+
+	string function getVersion() {
+		return variables.parserVersion;
+	}
+
+	boolean function supports( required struct file ) {
+		return arguments.file.language == "BoxLang";
+	}
+
+	struct function parse( required struct file ) {
+		var symbols = [];
+		var dependencies = [];
+		var normalizedPath = replace(
+			arguments.file.filePath,
+			"\",
+			"/",
+			"all"
+		);
+		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.bx$", normalizedPath ) > 0;
+		var className = listFirst( listLast( normalizedPath, "/" ), "." );
+
+		for ( var lineNumber = 1; lineNumber <=
+			arguments
+				.file
+				.lines
+				.len(); lineNumber++ ) {
+			var sourceLine = arguments.file.lines[ lineNumber ];
+			var trimmed = trim( sourceLine );
+			if ( !len( trimmed ) || reFind( "^(//|/\*|\*|<!--)", trimmed ) ) {
+				continue;
+			}
+
+			var classMatch = match(
+				"^\s*(?:abstract\s+|final\s+)?(class|interface)\b(.*)$",
+				sourceLine
+			);
+			if ( classMatch.find() ) {
+				symbols.append(
+						symbol(
+							classMatch.group( 1 ).lCase(),
+							className,
+							lineNumber,
+							sourceLine
+						)
+					);
+				addAttributeDependency(
+					dependencies,
+					sourceLine,
+					"extends",
+					"extends",
+					lineNumber
+				);
+				if (
+					reFindNoCase(
+						"\b(?:testbox\.system\.BaseSpec|coldbox\.system\.testing\.BaseTestCase)\b",
+						sourceLine
+					)
+				) {
+					isTest = true;
+				}
+				var implemented = attribute( sourceLine, "implements" );
+				if ( len( implemented ) ) {
+					for ( var contract in listToArray( implemented, "," ) ) {
+						dependencies.append(
+								dependency(
+									"implements",
+									trim( contract ),
+									lineNumber,
+									sourceLine
+								)
+							);
+					}
+				}
+			}
+
+			var functionMatch = match(
+				"^\s*(?:(?:public|private|protected|remote|package|static|final|abstract)\s+)*(?:([A-Za-z_][A-Za-z0-9_.]*)\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)",
+				sourceLine
+			);
+			var declaredFunction = "";
+			if ( functionMatch.find() ) {
+				declaredFunction = functionMatch.group( 2 );
+				var returnType = isNull( functionMatch.group( 1 ) ) ? "" : functionMatch.group( 1 );
+				symbols.append(
+						symbol(
+							"function",
+							declaredFunction,
+							lineNumber,
+							sourceLine
+						)
+					);
+				if ( isHandler && !isLifecycleFunction( declaredFunction ) ) {
+					symbols.append(
+							symbol(
+								"handler-action",
+								declaredFunction,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+				if ( isTest && ( reFindNoCase( "^test", declaredFunction ) || reFindNoCase( "@test\b", sourceLine ) ) ) {
+					symbols.append(
+							symbol(
+								"test",
+								declaredFunction,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+				addTypeDependency(
+					dependencies,
+					returnType,
+					lineNumber,
+					sourceLine
+				);
+				addParameterTypes(
+					dependencies,
+					functionMatch.group( 3 ),
+					lineNumber,
+					sourceLine
+				);
+			}
+
+			if ( reFindNoCase( "^\s*property\b", sourceLine ) ) {
+				var propertyName = attribute( sourceLine, "name" );
+				if ( len( propertyName ) ) {
+					symbols.append(
+							symbol(
+								"property",
+								propertyName,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+				addAttributeDependency(
+					dependencies,
+					sourceLine,
+					"inject",
+					"injects",
+					lineNumber
+				);
+				addTypeDependency(
+					dependencies,
+					attribute( sourceLine, "type" ),
+					lineNumber,
+					sourceLine
+				);
+			}
+
+			var importMatch = match( "^\s*import\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
+			if ( importMatch.find() ) {
+				dependencies.append(
+						dependency(
+							"imports",
+							importMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+
+			var routeMatch = match( "\broute\s*\(\s*[""']([^""']+)[""']", sourceLine );
+			if ( routeMatch.find() ) {
+				symbols.append(
+						symbol(
+							"route",
+							routeMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+
+			var constructionMatch = match( "\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
+			while ( constructionMatch.find() ) {
+				dependencies.append(
+						dependency(
+							"constructs",
+							constructionMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+
+			if ( isTest ) {
+				addTestBoxSymbols(
+					symbols,
+					sourceLine,
+					lineNumber
+				);
+			}
+
+			addCallDependencies(
+				dependencies,
+				sourceLine,
+				lineNumber,
+				declaredFunction
+			);
+		}
+
+		return {
+			parserVersion: variables.parserVersion,
+			symbols      : symbols,
+			dependencies : dependencies
+		};
+	}
+
+	private void function addTestBoxSymbols(
+		required array symbols,
+		required string sourceLine,
+		required numeric lineNumber
+	) {
+		var testMatch = match(
+			"\b(describe|feature|story|scenario|given|when|it|then)\s*\(\s*[""']([^""']+)[""']",
+			arguments.sourceLine
+		);
+		while ( testMatch.find() ) {
+			var testFunction = lCase( testMatch.group( 1 ) );
+			arguments.symbols.append(
+					symbol(
+						listFindNoCase(
+								"describe,feature,story,scenario,given,when",
+								testFunction
+							)
+							? "test-suite"
+							: "test",
+						testMatch.group( 2 ),
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private void function addCallDependencies(
+		required array dependencies,
+		required string sourceLine,
+		required numeric lineNumber,
+		string declaredFunction = ""
+	) {
+		var ignored = "if,for,while,switch,catch,function,new,return,throw,class,interface,property,import,route,describe,feature,story,scenario,given,when,it,then,beforeEach,afterEach,aroundEach,beforeAll,afterAll";
+		var callMatch = match(
+			"\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\(",
+			arguments.sourceLine
+		);
+		while ( callMatch.find() ) {
+			var target = callMatch.group( 1 );
+			var leafName = listLast( target, "." );
+			if ( listFindNoCase( ignored, leafName ) || ( len( arguments.declaredFunction ) && leafName == arguments.declaredFunction ) ) {
+				continue;
+			}
+			arguments.dependencies.append(
+					dependency(
+						"calls",
+						target,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private void function addParameterTypes(
+		required array dependencies,
+		required string parameters,
+		required numeric lineNumber,
+		required string sourceLine
+	) {
+		for ( var parameter in listToArray( arguments.parameters, "," ) ) {
+			var parameterMatch = match(
+				"^\s*(?:required\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s+[A-Za-z_][A-Za-z0-9_]*",
+				parameter
+			);
+			if ( parameterMatch.find() ) {
+				addTypeDependency(
+					arguments.dependencies,
+					parameterMatch.group( 1 ),
+					arguments.lineNumber,
+					arguments.sourceLine
+				);
+			}
+		}
+	}
+
+	private void function addTypeDependency(
+		required array dependencies,
+		required string target,
+		required numeric lineNumber,
+		required string sourceLine
+	) {
+		var builtInTypes = "any,array,binary,boolean,class,date,function,guid,numeric,query,string,struct,uuid,void,xml";
+		if ( len( trim( arguments.target ) ) && !listFindNoCase( builtInTypes, trim( arguments.target ) ) ) {
+			arguments.dependencies.append(
+					dependency(
+						"type-reference",
+						trim( arguments.target ),
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private boolean function isLifecycleFunction( required string name ) {
+		return listFindNoCase(
+				"onAppInit,onRequestStart,onRequestEnd,onSessionStart,onSessionEnd,onException",
+				arguments.name
+			) >
+			0;
+	}
+
+	private struct function symbol(
+		required string kind,
+		required string name,
+		required numeric line,
+		required string evidence
+	) {
+		return {
+			kind    : arguments.kind,
+			name    : arguments.name,
+			line    : arguments.line,
+			evidence: left( trim( arguments.evidence ), 500 )
+		};
+	}
+
+	private struct function dependency(
+		required string kind,
+		required string target,
+		required numeric line,
+		required string evidence
+	) {
+		return {
+			kind    : arguments.kind,
+			target  : arguments.target,
+			line    : arguments.line,
+			evidence: left( trim( arguments.evidence ), 500 )
+		};
+	}
+
+	private void function addAttributeDependency(
+		required array dependencies,
+		required string sourceLine,
+		required string attributeName,
+		required string kind,
+		required numeric lineNumber
+	) {
+		var target = attribute( arguments.sourceLine, arguments.attributeName );
+		if ( len( target ) ) {
+			arguments.dependencies.append(
+					dependency(
+						arguments.kind,
+						target,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private string function attribute( required string sourceLine, required string attributeName ) {
+		var attributeMatch = match(
+			"\b#arguments.attributeName#\s*=\s*[""']([^""']+)[""']",
+			arguments.sourceLine
+		);
+		return attributeMatch.find() ? attributeMatch.group( 1 ) : "";
+	}
+
+	private any function match( required string expression, required string source ) {
+		return createObject( "java", "java.util.regex.Pattern" ).compile( arguments.expression,
+				createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE ).matcher( arguments.source );
+	}
+}

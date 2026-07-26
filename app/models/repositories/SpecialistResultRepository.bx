@@ -1,0 +1,252 @@
+/**
+ * SQLite persistence for per-task specialist results during/after a run.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	void function replace( required string runId, required array results ) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"DELETE FROM review_tool_audits WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"DELETE FROM review_specialist_results WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			for ( var result in arguments.results ) {
+				var findingReferences = result.findings.map(
+						( finding ) => {
+							return {
+								id         : finding.id,
+								fingerprint: finding.fingerprint
+							};
+						}
+					);
+				queryExecute(
+					"
+						INSERT INTO review_specialist_results (
+							run_id, task_id, role, result_version, status,
+							summary, finding_refs_json, provenance_json,
+							error, duration_ms, created_at
+						) VALUES (
+							:runId, :taskId, :role, :resultVersion, :status,
+							:summary, :findingRefsJson, :provenanceJson,
+							:error, :durationMs, :createdAt
+						)
+					",
+					{
+						runId          : arguments.runId,
+						taskId         : result.taskId,
+						role           : result.role,
+						resultVersion  : result.version,
+						status         : result.status,
+						summary        : result.summary,
+						findingRefsJson: jsonSerialize( findingReferences ),
+						provenanceJson : jsonSerialize( result.provenance ),
+						error          : result.error,
+						durationMs     : result.durationMs,
+						createdAt      : timestamp()
+					},
+					{ datasource: datasource }
+				);
+				for ( var audit in result.toolAudit ) {
+					queryExecute(
+						"
+							INSERT INTO review_tool_audits (
+								run_id, task_id, sequence, tool_name,
+								input_fingerprint, status, output_characters,
+								duration_ms, created_at
+							) VALUES (
+								:runId, :taskId, :sequence, :toolName,
+								:inputFingerprint, :status, :outputCharacters,
+								:durationMs, :createdAt
+							)
+						",
+						{
+							runId           : arguments.runId,
+							taskId          : result.taskId,
+							sequence        : audit.sequence,
+							toolName        : audit.toolName,
+							inputFingerprint: audit.inputFingerprint,
+							status          : audit.status,
+							outputCharacters: audit.outputCharacters,
+							durationMs      : audit.durationMs,
+							createdAt       : timestamp()
+						},
+						{ datasource: datasource }
+					);
+				}
+			}
+		}
+	}
+
+	void function upsert( required string runId, required struct result ) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"
+					DELETE FROM review_tool_audits
+					WHERE run_id = :runId AND task_id = :taskId
+				",
+				{
+					runId : arguments.runId,
+					taskId: arguments.result.taskId
+				},
+				{ datasource: datasource }
+			);
+			var findingReferences = arguments
+				.result
+				.findings
+				.map(
+					( finding ) => {
+						return {
+							id         : finding.id,
+							fingerprint: finding.fingerprint
+						};
+					}
+				);
+			queryExecute(
+				"
+					INSERT INTO review_specialist_results (
+						run_id, task_id, role, result_version, status,
+						summary, finding_refs_json, provenance_json,
+						error, duration_ms, created_at
+					) VALUES (
+						:runId, :taskId, :role, :resultVersion, :status,
+						:summary, :findingRefsJson, :provenanceJson,
+						:error, :durationMs, :createdAt
+					)
+					ON CONFLICT ( run_id, task_id ) DO UPDATE SET
+						role = excluded.role,
+						result_version = excluded.result_version,
+						status = excluded.status,
+						summary = excluded.summary,
+						finding_refs_json = excluded.finding_refs_json,
+						provenance_json = excluded.provenance_json,
+						error = excluded.error,
+						duration_ms = excluded.duration_ms,
+						created_at = excluded.created_at
+				",
+				{
+					runId          : arguments.runId,
+					taskId         : arguments.result.taskId,
+					role           : arguments.result.role,
+					resultVersion  : arguments.result.version,
+					status         : arguments.result.status,
+					summary        : arguments.result.summary,
+					findingRefsJson: jsonSerialize( findingReferences ),
+					provenanceJson : jsonSerialize( arguments.result.provenance ),
+					error          : arguments.result.error,
+					durationMs     : arguments.result.durationMs,
+					createdAt      : timestamp()
+				},
+				{ datasource: datasource }
+			);
+			for ( var audit in arguments.result.toolAudit ) {
+				queryExecute(
+					"
+						INSERT INTO review_tool_audits (
+							run_id, task_id, sequence, tool_name,
+							input_fingerprint, status, output_characters,
+							duration_ms, created_at
+						) VALUES (
+							:runId, :taskId, :sequence, :toolName,
+							:inputFingerprint, :status, :outputCharacters,
+							:durationMs, :createdAt
+						)
+					",
+					{
+						runId           : arguments.runId,
+						taskId          : arguments.result.taskId,
+						sequence        : audit.sequence,
+						toolName        : audit.toolName,
+						inputFingerprint: audit.inputFingerprint,
+						status          : audit.status,
+						outputCharacters: audit.outputCharacters,
+						durationMs      : audit.durationMs,
+						createdAt       : timestamp()
+					},
+					{ datasource: datasource }
+				);
+			}
+		}
+	}
+
+	struct function get( required string runId ) {
+		var records = queryExecute(
+			"
+				SELECT task_id, role, result_version, status, summary,
+					finding_refs_json, provenance_json, error, duration_ms
+				FROM review_specialist_results
+				WHERE run_id = :runId
+				ORDER BY rowid
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var audits = queryExecute(
+			"
+				SELECT task_id, sequence, tool_name, input_fingerprint,
+					status, output_characters, duration_ms
+				FROM review_tool_audits
+				WHERE run_id = :runId
+				ORDER BY task_id, sequence
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var auditByTask = {};
+		for ( var row = 1; row <= audits.recordCount; row++ ) {
+			var taskId = audits.task_id[ row ];
+			if ( !auditByTask.keyExists( taskId ) ) {
+				auditByTask[ taskId ] = [];
+			}
+			auditByTask[ taskId ].append(
+					{
+						sequence        : audits.sequence[ row ],
+						toolName        : audits.tool_name[ row ],
+						inputFingerprint: audits.input_fingerprint[ row ],
+						status          : audits.status[ row ],
+						outputCharacters: audits.output_characters[ row ],
+						durationMs      : audits.duration_ms[ row ]
+					}
+				);
+		}
+		var results = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var taskId = records.task_id[ row ];
+			results.append(
+					{
+						version   : records.result_version[ row ],
+						taskId    : taskId,
+						role      : records.role[ row ],
+						status    : records.status[ row ],
+						summary   : records.summary[ row ],
+						findings  : jsonDeserialize( records.finding_refs_json[ row ] ),
+						toolAudit : auditByTask[ taskId ] ?: [],
+						provenance: jsonDeserialize( records.provenance_json[ row ] ),
+						error     : records.error[ row ],
+						durationMs: records.duration_ms[ row ]
+					}
+				);
+		}
+		return {
+			version: "specialist-results-v1",
+			results: results,
+			summary: {
+				taskCount     : results.len(),
+				completedTasks: results.filter( ( item ) => item.status == "succeeded" ).len(),
+				failedTasks   : results.filter( ( item ) => item.status != "succeeded" ).len(),
+				toolCalls     : audits.recordCount
+			}
+		};
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

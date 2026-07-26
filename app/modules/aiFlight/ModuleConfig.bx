@@ -1,0 +1,81 @@
+/**
+ * AiFlight — local Langfuse-style explorer for bx-ai events.
+ * Independent of DoubleCheck review observability.
+ */
+class {
+	this.title = "AiFlight";
+	this.author = "Sana Ullah";
+	this.webURL = "";
+	this.description = "Local Langfuse-style observability for bx-ai interceptor events";
+	this.version = "0.1.0";
+	this.entryPoint = "aiflight";
+	this.modelNamespace = "aiFlight";
+	this.cfmapping = "aiFlight";
+	this.autoMapModels = true;
+	this.dependencies = [];
+
+	function configure() {
+		settings = {
+			enabled            : true,
+			viewerEnabled      : true,
+			dbPath             : "",
+			previewChars       : 2000,
+			maxTraces          : 500,
+			captureCreateEvents: false,
+			includePayloadJson : true,
+			pollSeconds        : 2,
+			environment        : "local",
+			staleRunningMinutes: 5,
+			eventAllowlist     : [],
+			eventDenylist      : []
+		};
+
+		layoutSettings = { defaultLayout: "Flight" };
+
+		// Routes live in config/Router.bx (ColdBox module convention)
+		routes = [];
+		interceptors = [];
+	}
+
+	function onLoad() {
+		try {
+			var moduleSettings = controller.getModuleSettings( "aiFlight" );
+			if ( !len( trim( moduleSettings.dbPath ?: "" ) ) ) {
+				moduleSettings.dbPath = expandPath( "#modulePath#/.db/ai-flight.db" );
+			}
+
+			var store = wirebox.getInstance( "TraceStoreService@aiFlight" );
+			store.ensureSchema();
+			store.abandonStaleRunningTraces();
+		} catch (any e) {
+			log.error(
+					"AiFlight: failed to initialize SQLite schema: #e.message#",
+					e
+				);
+		}
+
+		try {
+			var listener = wirebox.getInstance( "AiFlightListener@aiFlight" );
+			listener.registerWithRuntime();
+			log.info(
+					"AiFlight loaded — listening for bx-ai events; viewer at /ai-flight/"
+				);
+		} catch (any e) {
+			log.warn(
+					"AiFlight: could not register BoxLang interceptors (is bx-ai available?): #e.message#"
+				);
+		}
+	}
+
+	function onUnload() {
+		try {
+			var listener = wirebox.getInstance( "AiFlightListener@aiFlight" );
+			listener.unregisterFromRuntime();
+		} catch (any e) {
+
+
+			// best effort
+		}
+		log.info( "AiFlight unloaded" );
+	}
+}

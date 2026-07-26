@@ -1,0 +1,163 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Report export API",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"advertises Markdown, JSON, and SARIF export capability",
+					() => {
+						var event = this.get( "/api/v1/capabilities" );
+						expect( event.getResponse() ).toHaveStatus( 200 );
+						var body = jsonDeserialize( event.getRenderedContent() );
+						expect( body
+								.data
+								.review
+								.reportExport ).toBe( "markdown-json-sarif-v1" );
+					}
+				);
+
+				it(
+					"downloads Markdown and JSON exports for a persisted run",
+					() => {
+						var runId = lCase( createUUID() );
+						var findingId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var resultRepository = getInstance( "ReviewResultRepository" );
+
+						try {
+							runRepository.create(
+									{
+										id          : runId,
+										projectPath : expandPath( "/app" ),
+										mode        : "working-tree",
+										baseRevision: "",
+										headRevision: "",
+										status      : "succeeded",
+										progress    : 100,
+										currentPhase: "completed",
+										message     : "Export fixture",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							resultRepository.replaceFindings(
+									runId,
+									[
+										{
+											id         : findingId,
+											fingerprint: repeatString( "b", 64 ),
+											category   : "security",
+											ruleId     : "secrets/hardcoded-credential",
+											severity   : "high",
+											confidence : .9,
+											title      : "Export fixture finding",
+											message    : "Evidence-backed finding for export tests.",
+											filePath   : "app/handlers/Main.bx",
+											startLine  : 4,
+											endLine    : 4,
+											evidence   : "password = ""fixture-secret""",
+											suggestion : "Use an environment variable.",
+											source     : "deterministic"
+										}
+									]
+								);
+							resultRepository.saveSummary(
+									runId              = runId,
+									summary            = "Export fixture summary",
+									languages          = [ "BoxLang"],
+									filesScanned       = 1,
+									bytesScanned       = 100,
+									findingsCount      = 1,
+									aiEnabled          = false,
+									reviewScope        = "working-tree",
+									repositoryRevision = "deadbeef"
+								);
+
+							var markdownEvent = this.get(
+									"/api/v1/runs/#runId#/export",
+									{ exportFormat: "markdown" }
+								);
+							expect( markdownEvent.getResponse() ).toHaveStatus( 200 );
+							var markdown = markdownEvent.getRenderedContent();
+							expect( markdown ).toInclude( "## DoubleCheck Review Report" );
+							expect( markdown ).toInclude( "app/handlers/Main.bx:4" );
+							expect( markdown ).toInclude( "Export fixture finding" );
+
+							var jsonEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "json" } );
+							expect( jsonEvent.getResponse() ).toHaveStatus( 200 );
+							var payload = jsonDeserialize( jsonEvent.getRenderedContent() );
+							expect( payload.schemaVersion ).toBe( "doublecheck-report-v1" );
+							expect( payload.findings ).toHaveLength( 1 );
+							expect( payload.findings[ 1 ].fingerprint ).toBe( repeatString( "b", 64 ) );
+
+							var sarifEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "sarif" } );
+							expect( sarifEvent.getResponse() ).toHaveStatus( 200 );
+							var sarif = jsonDeserialize( sarifEvent.getRenderedContent() );
+							expect( sarif.version ).toBe( "2.1.0" );
+							expect( sarif.runs[ 1 ].results ).toHaveLength( 1 );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_findings WHERE run_id = :runId",
+								{ runId: runId }
+							);
+							queryExecute(
+								"DELETE FROM review_summaries WHERE run_id = :runId",
+								{ runId: runId }
+							);
+							queryExecute(
+								"DELETE FROM review_runs WHERE id = :runId",
+								{ runId: runId }
+							);
+						}
+					}
+				);
+
+				it(
+					"rejects an unsupported export format",
+					() => {
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+
+						try {
+							runRepository.create(
+									{
+										id          : runId,
+										projectPath : expandPath( "/app" ),
+										mode        : "working-tree",
+										baseRevision: "",
+										headRevision: "",
+										status      : "succeeded",
+										progress    : 100,
+										currentPhase: "completed",
+										message     : "Export validation fixture",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							var event = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "xml" } );
+							expect( event.getRenderData().statusCode ).toBe( 422 );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id = :runId",
+								{ runId: runId }
+							);
+						}
+					}
+				);
+			}
+		);
+	}
+}

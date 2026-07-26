@@ -1,0 +1,438 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Architecture modeling and planning",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"builds evidence-backed facts and bounded artifact context packs",
+					() => {
+						var modelService = getInstance( "ArchitectureModelService" );
+						var plannerService = getInstance( "ReviewPlannerService" );
+						var graph = graphFixture();
+						var files = fileFixtures();
+						var model = modelService.build(
+								graph,
+								files,
+								"revision-123"
+							);
+						var plan = plannerService.plan(
+								model,
+								graph,
+								files
+							);
+						var repeatedModel = modelService.build(
+								graph,
+								files,
+								"revision-123"
+							);
+						var repeatedPlan = plannerService.plan(
+								repeatedModel,
+								graph,
+								files
+							);
+						var changedFiles = fileFixtures();
+						changedFiles[ 1 ].contentHash = lCase( hash( "changed-content", "SHA-256" ) );
+						var changedModel = modelService.build(
+								graph,
+								changedFiles,
+								"revision-123"
+							);
+						var modelData = model.getMemento();
+						var planData = plan.getMemento();
+
+						expect( modelData.version ).toBe( "architecture-model-v1" );
+						expect( modelData.fingerprint ).toHaveLength( 64 );
+						expect( modelData.summary.factCount ).toBeGT( 0 );
+						expect(
+							modelData.facts.every(
+									( fact ) => !fact.inferred && fact.evidence.len() > 0 && len( fact.evidence[ 1 ].filePath ) > 0
+								)
+						).toBeTrue();
+						expect( planData.version ).toBe( "review-plan-v2" );
+						expect( repeatedModel.getFingerprint() ).toBe( model.getFingerprint() );
+						expect( changedModel.getFingerprint() ).notToBe( model.getFingerprint() );
+						expect( repeatedPlan.getFingerprint() ).toBe( plan.getFingerprint() );
+						expect( planData.summary.taskCount ).toBeGT( 0 );
+						expect( planData.summary.taskCount ).toBeLTE( 6 );
+						expect( planData.summary.selectedRoles ).toInclude( "security" );
+						expect( planData.summary.selectedRoles ).toInclude( "testing" );
+						expect( planData.summary.contextFileCount ).toBeLTE( 20 );
+						expect( planData.summary.contextRangeCount ).toBeGT( 0 );
+						expect( planData.summary.contextLineCount ).toBeGT( 0 );
+						expect( planData.contextFingerprint ).toHaveLength( 64 );
+						expect(
+							planData.tasks.every(
+									( task ) => task
+										.context
+										.files
+										.every(
+											( file ) => isArray( file.ranges ) && file.ranges.len() > 0 &&
+												file.ranges.every(
+														( rangeItem ) => rangeItem.startLine > 0 && rangeItem.endLine >= rangeItem.startLine
+													)
+										)
+								)
+						).toBeTrue();
+						expect( jsonSerialize( planData ) ).notToInclude( "SENSITIVE_SOURCE_BODY" );
+						expect(
+							planData.tasks.every(
+									( task ) => [
+											"correctness",
+											"security",
+											"architecture",
+											"testing",
+											"performance",
+											"boxlang-conventions",
+											"cfml-conventions"
+										].findNoCase( task.role ) >
+										0
+								)
+						).toBeTrue();
+					}
+				);
+
+				it(
+					"enforces role policy and persists the versioned model and plan",
+					() => {
+						var modelService = getInstance( "ArchitectureModelService" );
+						var plannerService = getInstance( "ReviewPlannerService" );
+						var architectureRepository = getInstance( "ArchitectureRepository" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var graph = graphFixture();
+						var files = fileFixtures();
+						var model = modelService.build(
+								graph,
+								files,
+								"revision-456"
+							);
+						var plan = plannerService.plan(
+								model,
+								graph,
+								files,
+								{
+									allowedRoles: [ "testing", "not-authorized"],
+									fingerprint : "policy-test"
+								},
+								{
+									maxTasks        : 1,
+									maxTokens       : 500,
+									maxTokensPerTask: 500,
+									fingerprint     : "budget-test"
+								}
+							);
+						var runId = lCase( createUUID() );
+						var baselineRunId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+
+						try {
+							runRepository.create(
+									{
+										id          : baselineRunId,
+										projectPath : "C:/phase-three-fixture",
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "revision-455",
+										status      : "succeeded",
+										progress    : 100,
+										currentPhase: "completed",
+										message     : "Baseline complete",
+										createdAt   : nowValue,
+										completedAt : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							architectureRepository.save(
+									baselineRunId,
+									model.getMemento(),
+									plan.getMemento()
+								);
+							runRepository.create(
+									{
+										id          : runId,
+										projectPath : "C:/phase-three-fixture",
+										mode        : "working-tree",
+										baseRevision: "",
+										headRevision: "",
+										status      : "running",
+										progress    : 30,
+										currentPhase: "architecture-planning",
+										message     : "Planning test",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							architectureRepository.save(
+									runId,
+									model.getMemento(),
+									plan.getMemento()
+								);
+							architectureRepository.saveReusable(
+									"C:/phase-three-fixture",
+									"revision-456",
+									"architecture-cache-test",
+									model.getFingerprint(),
+									model.getMemento()
+								);
+							var persisted = architectureRepository.get( runId );
+							var reusable = architectureRepository.findReusable(
+									"C:/phase-three-fixture",
+									"revision-456",
+									"architecture-cache-test"
+								);
+							var baseline = architectureRepository.findBaseline( runId );
+							var result = getInstance( "ReviewRunService" ).getResult( runId );
+
+							expect( plan.getMemento().tasks ).toHaveLength( 1 );
+							expect( plan.getMemento().tasks[ 1 ].role ).toBe( "testing" );
+							expect( plan.getMemento().tasks[ 1 ].budget.maxTokens ).toBe( 500 );
+							expect( plan.getMemento().summary.allocatedTokens ).toBe( 500 );
+							expect( plan.getMemento().policyFingerprint ).toBe( "policy-test" );
+							expect( plan.getMemento().budgetFingerprint ).toBe( "budget-test" );
+							expect( persisted.architecture.fingerprint ).toBe( model.getFingerprint() );
+							expect( persisted.plan.fingerprint ).toBe( plan.getFingerprint() );
+							expect( persisted
+									.plan
+									.summary
+									.taskCount ).toBe( 1 );
+							expect( reusable.fingerprint ).toBe( model.getFingerprint() );
+							expect( baseline.fingerprint ).toBe( model.getFingerprint() );
+							expect( persisted
+									.architectureDiff
+									.summary
+									.hasBaseline ).toBeFalse();
+							expect( result.architecture.fingerprint ).toBe( model.getFingerprint() );
+							expect( result.architectureReused ).toBeFalse();
+							expect( result
+									.plan
+									.summary
+									.taskCount ).toBe( 1 );
+						} finally {
+							queryExecute(
+								"DELETE FROM architecture_model_cache WHERE cache_key = :cacheKey",
+								{ cacheKey: "architecture-cache-test" }
+							);
+							queryExecute(
+								"DELETE FROM review_runs WHERE id IN ( :runId, :baselineRunId )",
+								{
+									runId        : runId,
+									baselineRunId: baselineRunId
+								}
+							);
+						}
+					}
+				);
+
+				it(
+					"accepts only cited structured enrichment and computes stable fact diffs",
+					() => {
+						var baseModel = getInstance( "ArchitectureModelService" ).build(
+								graphFixture(),
+								fileFixtures(),
+								"revision-enrichment"
+							);
+						var baseData = baseModel.getMemento();
+						var citedFactId = baseData.facts[ 1 ].id;
+						var fakeGateway = new tests.resources.DeterministicAIChatGateway(
+							{
+								statements: [
+									{
+										type           : "boundary",
+										name           : "Handler service boundary",
+										statement      : "The handler delegates review work.",
+										confidence     : .9,
+										evidenceFactIds: [ citedFactId]
+									},
+									{
+										type           : "data-flow",
+										name           : "Unsupported flow",
+										statement      : "An unsupported flow exists.",
+										confidence     : 1,
+										evidenceFactIds: [ "not-a-real-fact"]
+									}
+								]
+							}
+						);
+						var enrichmentService = prepareMock( new app.models.services.ArchitectureEnrichmentService() );
+						enrichmentService.$property(
+								"chatGateway",
+								"variables",
+								fakeGateway
+							);
+						enrichmentService.$property(
+								"provider",
+								"variables",
+								"deterministic-fake"
+							);
+						enrichmentService.$property(
+								"baseURL",
+								"variables",
+								""
+							);
+						enrichmentService.$property(
+								"apiKey",
+								"variables",
+								""
+							);
+						enrichmentService.$property(
+								"model",
+								"variables",
+								"corpus-v1"
+							);
+						enrichmentService.$property(
+								"timeout",
+								"variables",
+								1
+							);
+						enrichmentService.$property(
+								"factLimit",
+								"variables",
+								200
+							);
+						enrichmentService.$property(
+								"maxPromptCharacters",
+								"variables",
+								30000
+							);
+						enrichmentService.$property(
+								"maxInferredFacts",
+								"variables",
+								50
+							);
+
+						var result = enrichmentService.enrich( baseModel );
+						var enriched = result.model.getMemento();
+						var inferred = enriched.facts.filter( ( fact ) => fact.inferred );
+						var diff = getInstance( "ArchitectureDiffService" ).compare( result.model, baseModel );
+						var prompt = jsonSerialize( fakeGateway.getRequests()[ 1 ].prompt );
+
+						expect( result.addedFacts ).toBe( 1 );
+						expect( enriched.summary.inferredFacts ).toBe( 1 );
+						expect( inferred ).toHaveLength( 1 );
+						expect( inferred[ 1 ].origin ).toBe( "bx-ai" );
+						expect( inferred[ 1 ].evidenceFactIds ).toInclude( citedFactId );
+						expect( inferred[ 1 ].evidence ).notToBeEmpty();
+						expect( prompt ).notToInclude( "SENSITIVE_SOURCE_BODY" );
+						expect( diff.summary.addedCount ).toBe( 1 );
+						expect( diff.summary.removedCount ).toBe( 0 );
+						expect( diff.summary.hasBaseline ).toBeTrue();
+					}
+				);
+			}
+		);
+	}
+
+	private struct function graphFixture() {
+		return {
+			summary: {
+				symbolCount    : 3,
+				dependencyCount: 2,
+				impactCount    : 1
+			},
+			symbols: [
+				{
+					id      : "handler-action",
+					filePath: "app/handlers/Reviews.bx",
+					kind    : "handler-action",
+					name    : "index",
+					line    : 2,
+					evidence: "function index()"
+				},
+				{
+					id      : "service-class",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "class",
+					name    : "ReviewService",
+					line    : 1,
+					evidence: "class"
+				},
+				{
+					id      : "test-spec",
+					filePath: "tests/specs/ReviewsSpec.bx",
+					kind    : "test",
+					name    : "reviews",
+					line    : 3,
+					evidence: "it"
+				}
+			],
+			dependencies: [
+				{
+					id        : "call-edge",
+					sourceFile: "app/handlers/Reviews.bx",
+					kind      : "calls",
+					target    : "reviewService.review",
+					targetFile: "app/models/ReviewService.bx",
+					line      : 3,
+					evidence  : "reviewService.review()"
+				},
+				{
+					id        : "test-edge",
+					sourceFile: "tests/specs/ReviewsSpec.bx",
+					kind      : "tests",
+					target    : "ReviewService",
+					targetFile: "app/models/ReviewService.bx",
+					line      : 2,
+					evidence  : "new ReviewService()"
+				}
+			],
+			impacts: [
+				{
+					changedFile  : "app/models/ReviewService.bx",
+					changedSymbol: "review",
+					impactedFile : "tests/specs/ReviewsSpec.bx",
+					reason       : "tests",
+					depth        : 1,
+					viaFile      : "app/models/ReviewService.bx"
+				}
+			]
+		};
+	}
+
+	private array function fileFixtures() {
+		return [
+			sourceFile(
+				"app/handlers/Reviews.bx",
+				"BoxLang",
+				"class { function index() { reviewService.review(); } }"
+			),
+			sourceFile(
+				"app/models/ReviewService.bx",
+				"BoxLang",
+				"class { function review() { return 'SENSITIVE_SOURCE_BODY'; } }"
+			),
+			sourceFile(
+				"tests/specs/ReviewsSpec.bx",
+				"BoxLang",
+				"class { function testReviews() {} }"
+			)
+		];
+	}
+
+	private struct function sourceFile( required string filePath, required string language, required string content ) {
+		var lines = listToArray(
+			arguments.content,
+			char( 10 ),
+			true,
+			true
+		);
+		return {
+			filePath   : arguments.filePath,
+			language   : arguments.language,
+			contentHash: lCase( hash( arguments.content, "SHA-256" ) ),
+			content    : arguments.content,
+			lines      : lines,
+			sizeBytes  : len( arguments.content ),
+			lineCount  : lines.len()
+		};
+	}
+}

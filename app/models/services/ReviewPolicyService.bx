@@ -1,0 +1,192 @@
+/**
+ * Validates and fingerprints allowlisted roles and run budgets from the create payload.
+ */
+
+@singleton
+class {
+	property name="maxTasks" inject="coldbox:setting:planMaxTasks";
+
+	property name="defaultTokenBudget" inject="coldbox:setting:runDefaultTokenBudget";
+
+	property name="maxTokenBudget" inject="coldbox:setting:runMaxTokenBudget";
+
+	property name="defaultTokensPerTask" inject="coldbox:setting:runDefaultTokensPerTask";
+
+	property name="maxTokensPerTask" inject="coldbox:setting:runMaxTokensPerTask";
+
+	property name="defaultDurationMs" inject="coldbox:setting:runDefaultDurationMs";
+
+	property name="maxDurationMs" inject="coldbox:setting:runMaxDurationMs";
+
+	property name="defaultIterationsPerTask" inject="coldbox:setting:runDefaultIterationsPerTask";
+
+	property name="maxIterationsPerTask" inject="coldbox:setting:runMaxIterationsPerTask";
+
+	property name="defaultToolOutputCharacters" inject="coldbox:setting:runDefaultToolOutputCharacters";
+
+	property name="maxToolOutputCharacters" inject="coldbox:setting:runMaxToolOutputCharacters";
+
+	property name="defaultCostUsd" inject="coldbox:setting:runDefaultCostUsd";
+
+	property name="maxCostUsd" inject="coldbox:setting:runMaxCostUsd";
+	variables.policyVersion = "review-policy-v1";
+	variables.budgetVersion = "run-budgets-v2";
+	variables.allowedRoles = [
+		"correctness",
+		"security",
+		"architecture",
+		"testing",
+		"performance",
+		"boxlang-conventions",
+		"cfml-conventions"
+	];
+
+	struct function normalize( struct input = {} ) {
+		var requestedPolicy = arguments.input.policy ?: {};
+		var requestedBudgets = arguments.input.budgets ?: {};
+		if ( !isStruct( requestedPolicy ) ) {
+			validationError( "policy must be an object" );
+		}
+		if ( !isStruct( requestedBudgets ) ) {
+			validationError( "budgets must be an object" );
+		}
+		var roles = normalizeRoles( requestedPolicy.allowedRoles ?: [] );
+		var reviewGoal = normalizeReviewGoal( requestedPolicy.reviewGoal ?: "" );
+		var taskLimit = boundedInteger(
+			requestedBudgets.maxTasks ?: maxTasks,
+			"budgets.maxTasks",
+			1,
+			maxTasks
+		);
+		var tokenLimit = boundedInteger(
+			requestedBudgets.maxTokens ?: defaultTokenBudget,
+			"budgets.maxTokens",
+			128,
+			maxTokenBudget
+		);
+		var perTaskLimit = boundedInteger(
+			requestedBudgets.maxTokensPerTask ?: defaultTokensPerTask,
+			"budgets.maxTokensPerTask",
+			128,
+			maxTokensPerTask
+		);
+		if ( perTaskLimit > tokenLimit ) {
+			validationError(
+				"budgets.maxTokensPerTask cannot exceed budgets.maxTokens"
+			);
+		}
+		var durationLimit = boundedInteger(
+			requestedBudgets.maxDurationMs ?: defaultDurationMs,
+			"budgets.maxDurationMs",
+			1000,
+			maxDurationMs
+		);
+		var iterationLimit = boundedInteger(
+			requestedBudgets.maxIterationsPerTask ?: defaultIterationsPerTask,
+			"budgets.maxIterationsPerTask",
+			1,
+			maxIterationsPerTask
+		);
+		var toolOutputLimit = boundedInteger(
+			requestedBudgets.maxToolOutputCharacters ?: defaultToolOutputCharacters,
+			"budgets.maxToolOutputCharacters",
+			1000,
+			maxToolOutputCharacters
+		);
+		var costLimit = boundedDecimal(
+			requestedBudgets.maxCostUsd ?: defaultCostUsd,
+			"budgets.maxCostUsd",
+			.01,
+			maxCostUsd
+		);
+		var policy = {
+			version     : variables.policyVersion,
+			allowedRoles: roles,
+			reviewGoal  : reviewGoal
+		};
+		policy.fingerprint = stableHash( policy.version & "|" & roles.toList( "," ) & "|" & reviewGoal );
+		var budgets = {
+			version                : variables.budgetVersion,
+			maxTasks               : taskLimit,
+			maxTokens              : tokenLimit,
+			maxTokensPerTask       : perTaskLimit,
+			maxDurationMs          : durationLimit,
+			maxIterationsPerTask   : iterationLimit,
+			maxToolOutputCharacters: toolOutputLimit,
+			maxCostUsd             : costLimit
+		};
+		budgets.fingerprint = stableHash( budgets.version & "|" & budgets.maxTasks & "|" & budgets.maxTokens & "|" & budgets.maxTokensPerTask & "|" & budgets.maxDurationMs & "|" & budgets.maxIterationsPerTask & "|" & budgets.maxToolOutputCharacters & "|" & budgets.maxCostUsd );
+		return { policy: policy, budgets: budgets };
+	}
+
+	private array function normalizeRoles( required any requestedRoles ) {
+		if ( !isArray( arguments.requestedRoles ) ) {
+			validationError( "policy.allowedRoles must be an array" );
+		}
+		var requested = arguments.requestedRoles;
+		if ( !requested.len() ) {
+			return duplicate( variables.allowedRoles );
+		}
+		for ( var role in requested ) {
+			if ( !isSimpleValue( role ) || !variables.allowedRoles.contains( lCase( trim( role ) ) ) ) {
+				validationError( "policy.allowedRoles contains an unsupported role" );
+			}
+		}
+		var normalized = variables.allowedRoles.filter( ( role ) => requested.findNoCase( role ) > 0 );
+		if ( !normalized.len() ) {
+			validationError( "policy.allowedRoles must select at least one role" );
+		}
+		return normalized;
+	}
+
+	private string function normalizeReviewGoal( required any value ) {
+		if ( !isSimpleValue( arguments.value ) ) {
+			validationError( "policy.reviewGoal must be text" );
+		}
+		var goal = trim( toString( arguments.value ) );
+		if ( len( goal ) > 500 ) {
+			validationError( "policy.reviewGoal must be 500 characters or fewer" );
+		}
+		return goal;
+	}
+
+	private numeric function boundedInteger(
+		required any value,
+		required string field,
+		required numeric minimum,
+		required numeric maximum
+	) {
+		if (
+			!isNumeric( arguments.value ) || val( arguments.value ) != int( val( arguments.value ) ) ||
+					val( arguments.value ) < arguments.minimum ||
+				val( arguments.value ) > arguments.maximum
+		) {
+			validationError(
+				"#arguments.field# must be an integer between #arguments.minimum# and #arguments.maximum#"
+			);
+		}
+		return int( val( arguments.value ) );
+	}
+
+	private void function validationError( required string message ) {
+		throw( type = "ValidationException", message = arguments.message );
+	}
+
+	private numeric function boundedDecimal(
+		required any value,
+		required string field,
+		required numeric minimum,
+		required numeric maximum
+	) {
+		if ( !isNumeric( arguments.value ) || val( arguments.value ) < arguments.minimum || val( arguments.value ) > arguments.maximum ) {
+			validationError(
+				"#arguments.field# must be between #arguments.minimum# and #arguments.maximum#"
+			);
+		}
+		return int( val( arguments.value ) * 1000000 ) / 1000000;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

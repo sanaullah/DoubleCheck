@@ -1,0 +1,68 @@
+/**
+ * Publishes run events for SSE (including coalesced specialist progress).
+ *
+ * @see ReviewEventRepository
+ */
+
+@singleton
+class {
+	property name="eventRepository" inject="ReviewEventRepository";
+	variables.coalesceClock = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+
+	struct function publish( required string runId, required string eventType, required struct data ) {
+		var payload = {
+			schemaVersion: 1,
+			runId        : arguments.runId,
+			timestamp    : timestamp(),
+			data         : arguments.data
+		};
+		return eventRepository.append(
+				arguments.runId,
+				arguments.eventType,
+				payload
+			);
+	}
+
+	array function after( required string runId, numeric afterSequence = 0, numeric limit = 100 ) {
+		return eventRepository.after(
+				runId         = arguments.runId,
+				afterSequence = arguments.afterSequence,
+				limit         = arguments.limit
+			);
+	}
+
+	struct function publishCoalesced(
+		required string runId,
+		required string eventType,
+		required string key,
+		required struct data,
+		numeric intervalMs = 250,
+		boolean force      = false
+	) {
+		var clockKey = "#arguments.runId#:#arguments.eventType#:#arguments.key#";
+		var fresh = createObject( "java", "java.util.concurrent.atomic.AtomicLong" ).init( 0 );
+		var existing = variables.coalesceClock.putIfAbsent( clockKey, fresh );
+		var clock = isNull( existing ) ? fresh : existing;
+		var nowMs = createObject( "java", "java.lang.System" ).currentTimeMillis();
+		while ( true ) {
+			var previous = clock.get();
+			if ( !arguments.force && nowMs - previous < max( 1, int( arguments.intervalMs ) ) ) {
+				return { published: false };
+			}
+			if ( clock.compareAndSet( previous, nowMs ) ) {
+				break;
+			}
+		}
+		var eventRecord = publish(
+			arguments.runId,
+			arguments.eventType,
+			arguments.data
+		);
+		eventRecord.published = true;
+		return eventRecord;
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

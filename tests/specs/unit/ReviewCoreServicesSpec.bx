@@ -1,0 +1,179 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"Finding and repository scan services",
+			() => {
+				it(
+					"creates stable evidence fingerprints and rejects unresolvable AI findings",
+					() => {
+						var service = new app.models.services.FindingService();
+						var files = [
+							{
+								filePath: "src/example.js",
+								lines   : [ "const value = 1;", "// TODO: replace the placeholder"]
+							}
+						];
+						var deterministic = service.deterministic( files );
+						expect( deterministic ).toHaveLength( 1 );
+						expect( deterministic[ 1 ].fingerprint ).toHaveLength( 64 );
+						expect( deterministic[ 1 ].filePath ).toBe( "src/example.js" );
+
+						var normalized = service.normalizeAI(
+								{
+									findings: [
+										{
+											title     : "Valid evidence",
+											message   : "This is anchored to supplied source.",
+											filePath  : "src/example.js",
+											startLine : 1,
+											endLine   : 1,
+											severity  : "low",
+											confidence: .8
+										},
+										{
+											title    : "Invented file",
+											message  : "This must be rejected.",
+											filePath : "../../outside.js",
+											startLine: 1
+										}
+									]
+								},
+								files
+							);
+						expect( normalized ).toHaveLength( 1 );
+						expect( normalized[ 1 ].evidence ).toBe( "const value = 1;" );
+					}
+				);
+
+				it(
+					"indexes bounded source without returning absolute paths",
+					() => {
+						var scanner = prepareMock( new app.models.services.RepositoryScannerService() );
+						scanner.$property(
+								"maxFiles",
+								"variables",
+								20
+							);
+						scanner.$property(
+								"maxBytes",
+								"variables",
+								524288
+							);
+						scanner.$property(
+								"maxFileBytes",
+								"variables",
+								131072
+							);
+						scanner.$property(
+								"maxEntries",
+								"variables",
+								500
+							);
+						scanner.$property(
+								"gitRepositoryService",
+								"variables",
+								new app.models.services.GitRepositoryService()
+							);
+						var result = scanner.scan( expandPath( "/app" ), "full" );
+						expect( result.files.len() ).toBeGT( 0 );
+						expect( result.files.len() ).toBeLTE( 20 );
+						expect( result.files[ 1 ].filePath ).notToInclude( expandPath( "/app" ) );
+						expect( result.languages ).toInclude( "BoxLang" );
+					}
+				);
+
+				it(
+					"discovers Java through the normal full scan and ignores unsupported sources",
+					() => {
+						var marker = lCase(
+							replace(
+								createUUID(),
+								"-",
+								"",
+								"all"
+							)
+						);
+						var root = getTempDirectory() & "doublecheck-languages-#marker#";
+						directoryCreate( root );
+						try {
+							fileWrite( root & "/Example.java", "class Example {}" );
+							fileWrite( root & "/ignored.py", "print( 'ignored' )" );
+
+							var scanner = prepareMock( new app.models.services.RepositoryScannerService() );
+							scanner.$property(
+									"maxFiles",
+									"variables",
+									20
+								);
+							scanner.$property(
+									"maxBytes",
+									"variables",
+									524288
+								);
+							scanner.$property(
+									"maxFileBytes",
+									"variables",
+									131072
+								);
+							scanner.$property(
+									"maxEntries",
+									"variables",
+									500
+								);
+							scanner.$property(
+									"gitRepositoryService",
+									"variables",
+									new app.models.services.GitRepositoryService()
+								);
+
+							var result = scanner.scan( root, "full" );
+
+							expect( result.files ).toHaveLength( 1 );
+							expect( result.files[ 1 ].filePath ).toBe( "Example.java" );
+							expect( result.files[ 1 ].language ).toBe( "Java" );
+							expect( result.languages ).toBe( [ "Java"] );
+						} finally {
+							directoryDelete( root, true );
+						}
+					}
+				);
+
+				it(
+					"does not silently expand a working-tree review when Git is unavailable",
+					() => {
+						var scanner = prepareMock( new app.models.services.RepositoryScannerService() );
+						scanner.$property(
+								"maxFiles",
+								"variables",
+								20
+							);
+						scanner.$property(
+								"maxBytes",
+								"variables",
+								524288
+							);
+						scanner.$property(
+								"maxFileBytes",
+								"variables",
+								131072
+							);
+						scanner.$property(
+								"maxEntries",
+								"variables",
+								500
+							);
+						scanner.$property(
+								"gitRepositoryService",
+								"variables",
+								new app.models.services.GitRepositoryService()
+							);
+						var result = scanner.scan( expandPath( "/app" ), "working-tree" );
+						expect( result.scope ).toBe( "working-tree-unavailable" );
+						expect( result.files ).toBeEmpty();
+					}
+				);
+			}
+		);
+	}
+}

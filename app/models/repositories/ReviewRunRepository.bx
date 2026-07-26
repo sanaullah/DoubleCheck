@@ -1,0 +1,381 @@
+/**
+ * SQLite persistence for review run lifecycle (create, claim, lease, cancel, list).
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	any function create( required struct data ) {
+		var record = duplicate( arguments.data );
+		record.tenantId = record.tenantId ?: "default";
+		record.projectId = record.projectId ?: "default";
+		record.policyJson = jsonSerialize( record.policy ?: {} );
+		record.budgetsJson = jsonSerialize( record.budgets ?: {} );
+		record.sourceRunId = record.sourceRunId ?: "";
+		queryExecute(
+			"
+				INSERT INTO review_runs (
+					id, tenant_id, project_id, project_path, mode, base_revision, head_revision,
+					status, progress, current_phase,
+					message, policy_json, budgets_json, source_run_id, created_at, updated_at
+				) VALUES (
+					:id, :tenantId, :projectId, :projectPath, :mode, :baseRevision, :headRevision,
+					:status, :progress, :currentPhase,
+					:message, :policyJson, :budgetsJson, :sourceRunId, :createdAt, :updatedAt
+				)
+			",
+			record,
+			{ datasource: datasource }
+		);
+		return this.find( arguments.data.id );
+	}
+
+	any function find( required string id ) {
+		var result = queryExecute(
+			"SELECT * FROM review_runs WHERE id = :id",
+			{ id: arguments.id },
+			{ datasource: datasource }
+		);
+		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
+	}
+
+	any function findScoped( required string id, required string tenantId, string projectId = "" ) {
+		var result = queryExecute(
+			"
+				SELECT *
+				FROM review_runs
+				WHERE id = :id
+					AND tenant_id = :tenantId
+					AND ( :projectId = '' OR project_id = :projectId )
+			",
+			{
+				id       : arguments.id,
+				tenantId : arguments.tenantId,
+				projectId: arguments.projectId
+			},
+			{ datasource: datasource }
+		);
+		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
+	}
+
+	any function claim(
+		required string id,
+		required string nowValue,
+		required string leaseExpiresAt,
+		string workerId   = "",
+		string leaseToken = ""
+	) {
+		var claimed = queryExecute(
+			"
+				UPDATE review_runs
+				SET status = 'running',
+					lease_expires_at = :leaseExpiresAt,
+					worker_id = :workerId,
+					lease_token = :leaseToken,
+					attempt_count = attempt_count + 1,
+					updated_at = :nowValue
+				WHERE id = :id
+					AND (
+						status = 'queued'
+						OR (
+							status = 'running'
+							AND ( lease_expires_at IS NULL OR lease_expires_at < :nowValue )
+						)
+					)
+				RETURNING id
+			",
+			{
+				id            : arguments.id,
+				nowValue      : arguments.nowValue,
+				leaseExpiresAt: arguments.leaseExpiresAt,
+				workerId      : arguments.workerId,
+				leaseToken    : arguments.leaseToken
+			},
+			{ datasource: datasource }
+		);
+		return claimed.recordCount ? this.find( arguments.id ) : javacast( "null", "" );
+	}
+
+	array function recoverableIds( required string nowValue ) {
+		var records = queryExecute(
+			"
+				SELECT id
+				FROM review_runs
+				WHERE status = 'queued'
+					OR (
+						status = 'running'
+						AND ( lease_expires_at IS NULL OR lease_expires_at < :nowValue )
+					)
+				ORDER BY created_at
+			",
+			{ nowValue: arguments.nowValue },
+			{ datasource: datasource }
+		);
+		return records.recordCount ? records.columnData( "id" ) : [];
+	}
+
+	boolean function renewLease(
+		required string id,
+		required string leaseExpiresAt,
+		string workerId   = "",
+		string leaseToken = ""
+	) {
+		var renewed = queryExecute(
+			"
+				UPDATE review_runs
+				SET lease_expires_at = :leaseExpiresAt, updated_at = :updatedAt
+				WHERE id = :id AND status = 'running'
+					AND ( :workerId = '' OR worker_id = :workerId )
+					AND ( :leaseToken = '' OR lease_token = :leaseToken )
+				RETURNING id
+			",
+			{
+				id            : arguments.id,
+				leaseExpiresAt: arguments.leaseExpiresAt,
+				updatedAt     : timestamp(),
+				workerId      : arguments.workerId,
+				leaseToken    : arguments.leaseToken
+			},
+			{ datasource: datasource }
+		);
+		return renewed.recordCount > 0;
+	}
+
+	boolean function ownsLease( required string id, required string workerId, required string leaseToken ) {
+		var record = queryExecute(
+			"
+				SELECT id
+				FROM review_runs
+				WHERE id = :id
+					AND status = 'running'
+					AND worker_id = :workerId
+					AND lease_token = :leaseToken
+					AND lease_expires_at > :nowValue
+			",
+			{
+				id        : arguments.id,
+				workerId  : arguments.workerId,
+				leaseToken: arguments.leaseToken,
+				nowValue  : timestamp()
+			},
+			{ datasource: datasource }
+		);
+		return record.recordCount > 0;
+	}
+
+	void function setErrorReference( required string id, required string errorReference ) {
+		queryExecute(
+			"UPDATE review_runs SET error_reference = :errorReference WHERE id = :id",
+			{
+				id            : arguments.id,
+				errorReference: arguments.errorReference
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	struct function list( numeric limit = 20, numeric offset = 0 ) {
+		var records = queryExecute(
+			"SELECT * FROM review_runs ORDER BY created_at DESC LIMIT :limit OFFSET :offset",
+			{
+				limit : { value: arguments.limit, sqltype: "INTEGER" },
+				offset: { value: arguments.offset, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var total = queryExecute(
+			"SELECT COUNT(*) AS total FROM review_runs",
+			{},
+			{ datasource: datasource }
+		);
+		var data = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			data.append( hydrate( records, row ) );
+		}
+		return { data: data, total: total.total[ 1 ] };
+	}
+
+	struct function listScoped(
+		required string tenantId,
+		string projectId = "",
+		numeric limit    = 20,
+		numeric offset   = 0
+	) {
+		var parameters = {
+			tenantId : arguments.tenantId,
+			projectId: arguments.projectId,
+			limit    : { value: arguments.limit, sqltype: "INTEGER" },
+			offset   : { value: arguments.offset, sqltype: "INTEGER" }
+		};
+		var whereSql = "tenant_id = :tenantId AND ( :projectId = '' OR project_id = :projectId )";
+		var records = queryExecute(
+			"SELECT * FROM review_runs WHERE #whereSql# ORDER BY created_at DESC LIMIT :limit OFFSET :offset",
+			parameters,
+			{ datasource: datasource }
+		);
+		var total = queryExecute(
+			"SELECT COUNT(*) AS total FROM review_runs WHERE #whereSql#",
+			{
+				tenantId : arguments.tenantId,
+				projectId: arguments.projectId
+			},
+			{ datasource: datasource }
+		);
+		var data = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			data.append( hydrate( records, row ) );
+		}
+		return { data: data, total: total.total[ 1 ] };
+	}
+
+	any function updateState(
+		required string id,
+		required string status,
+		required numeric progress,
+		required string currentPhase,
+		required string message,
+		string startedAt         = "",
+		string completedAt       = "",
+		string cancelRequestedAt = ""
+	) {
+		queryExecute(
+			"
+				UPDATE review_runs
+				SET status = :status,
+					progress = :progress,
+					current_phase = :currentPhase,
+					message = :message,
+					started_at = COALESCE( NULLIF( :startedAt, '' ), started_at ),
+					completed_at = COALESCE( NULLIF( :completedAt, '' ), completed_at ),
+					cancel_requested_at = COALESCE( NULLIF( :cancelRequestedAt, '' ), cancel_requested_at ),
+					lease_expires_at = CASE
+						WHEN :status IN ( 'succeeded', 'partial', 'failed', 'cancelled' ) THEN NULL
+						ELSE lease_expires_at
+					END,
+					updated_at = :updatedAt
+				WHERE id = :id
+			",
+			{
+				id               : arguments.id,
+				status           : arguments.status,
+				progress         : arguments.progress,
+				currentPhase     : arguments.currentPhase,
+				message          : arguments.message,
+				startedAt        : arguments.startedAt,
+				completedAt      : arguments.completedAt,
+				cancelRequestedAt: arguments.cancelRequestedAt,
+				updatedAt        : timestamp()
+			},
+			{ datasource: datasource }
+		);
+		return this.find( arguments.id );
+	}
+
+	boolean function isCancellationRequested( required string id ) {
+		var result = queryExecute(
+			"SELECT cancel_requested_at FROM review_runs WHERE id = :id",
+			{ id: arguments.id },
+			{ datasource: datasource }
+		);
+		return result.recordCount && !isNull( result.cancel_requested_at[ 1 ] ) && len( result.cancel_requested_at[ 1 ] );
+	}
+
+	/**
+	 * Most recent earlier succeeded/partial run for the same path+mode that has a stored summary.
+	 */
+	any function findPriorEligibleBaseline(
+		required string projectPath,
+		required string mode,
+		required string beforeCreatedAt,
+		required string excludeRunId,
+		string tenantId  = "",
+		string projectId = ""
+	) {
+		var result = queryExecute(
+			"
+				SELECT r.*
+				FROM review_runs r
+				INNER JOIN review_summaries s ON s.run_id = r.id
+				WHERE r.project_path = :projectPath
+					AND r.mode = :mode
+					AND ( :tenantId = '' OR r.tenant_id = :tenantId )
+					AND ( :projectId = '' OR r.project_id = :projectId )
+					AND r.status IN ( 'succeeded', 'partial' )
+					AND r.id <> :excludeRunId
+					AND r.created_at < :beforeCreatedAt
+				ORDER BY r.created_at DESC
+				LIMIT 1
+			",
+			{
+				projectPath    : arguments.projectPath,
+				mode           : arguments.mode,
+				beforeCreatedAt: arguments.beforeCreatedAt,
+				excludeRunId   : arguments.excludeRunId,
+				tenantId       : arguments.tenantId,
+				projectId      : arguments.projectId
+			},
+			{ datasource: datasource }
+		);
+		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
+	}
+
+	private any function hydrate( required query record, required numeric row ) {
+		return new app.models.domain.ReviewRun(
+			{
+				id          : record.id[ row ],
+				tenantId    : record.tenant_id[ row ],
+				projectId   : record.project_id[ row ],
+				projectPath : record.project_path[ row ],
+				mode        : record.mode[ row ],
+				baseRevision: nullableColumn(
+					record,
+					"base_revision",
+					row
+				),
+				headRevision: nullableColumn(
+					record,
+					"head_revision",
+					row
+				),
+				status      : record.status[ row ],
+				progress    : record.progress[ row ],
+				currentPhase: record.current_phase[ row ],
+				message     : record.message[ row ],
+				createdAt   : record.created_at[ row ],
+				startedAt   : nullableColumn(
+					record,
+					"started_at",
+					row
+				),
+				completedAt: nullableColumn(
+					record,
+					"completed_at",
+					row
+				),
+				cancelRequestedAt: nullableColumn(
+					record,
+					"cancel_requested_at",
+					row
+				),
+				updatedAt  : record.updated_at[ row ],
+				policy     : jsonDeserialize( record.policy_json[ row ] ),
+				budgets    : jsonDeserialize( record.budgets_json[ row ] ),
+				workerId   : record.worker_id[ row ],
+				sourceRunId: nullableColumn(
+					record,
+					"source_run_id",
+					row
+				)
+			}
+		);
+	}
+
+	private any function nullableColumn( required query record, required string column, required numeric row ) {
+		return isNull( record[ column ][ row ] ) ? "" : record[ column ][ row ];
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

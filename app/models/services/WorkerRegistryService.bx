@@ -1,0 +1,91 @@
+/**
+ * Registers and heartbeats workers that claim run leases in multi-worker mode.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	property name="workerId" inject="coldbox:setting:workerId";
+
+	property name="workerLeaseSeconds" inject="coldbox:setting:workerLeaseSeconds";
+
+	void function heartbeat( string status = "ready", struct capabilities = {} ) {
+		var nowValue = timestamp();
+		queryExecute(
+			"
+				INSERT INTO review_workers (
+					id, status, capabilities_json, last_seen_at,
+					lease_expires_at, started_at
+				) VALUES (
+					:id, :status, :capabilities, :nowValue, :leaseExpiresAt, :nowValue
+				)
+				ON CONFLICT( id ) DO UPDATE SET
+					status = excluded.status,
+					capabilities_json = excluded.capabilities_json,
+					last_seen_at = excluded.last_seen_at,
+					lease_expires_at = excluded.lease_expires_at
+			",
+			{
+				id            : workerId,
+				status        : arguments.status,
+				capabilities  : jsonSerialize( arguments.capabilities ),
+				nowValue      : nowValue,
+				leaseExpiresAt: dateTimeFormat(
+					dateAdd(
+						"s",
+						workerLeaseSeconds,
+						now()
+					),
+					"iso"
+				)
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	array function listActive() {
+		var records = queryExecute(
+			"
+				SELECT id, status, capabilities_json, last_seen_at,
+					lease_expires_at, started_at
+				FROM review_workers
+				WHERE lease_expires_at > :nowValue
+				ORDER BY id
+			",
+			{ nowValue: timestamp() },
+			{ datasource: datasource }
+		);
+		var result = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			result.append(
+					{
+						id            : records.id[ row ],
+						status        : records.status[ row ],
+						capabilities  : jsonDeserialize( records.capabilities_json[ row ] ),
+						lastSeenAt    : records.last_seen_at[ row ],
+						leaseExpiresAt: records.lease_expires_at[ row ],
+						startedAt     : records.started_at[ row ]
+					}
+				);
+		}
+		return result;
+	}
+
+	void function stop() {
+		queryExecute(
+			"
+				UPDATE review_workers
+				SET status = 'stopped', lease_expires_at = :nowValue,
+					last_seen_at = :nowValue
+				WHERE id = :id
+			",
+			{ id: workerId, nowValue: timestamp() },
+			{ datasource: datasource }
+		);
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

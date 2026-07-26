@@ -1,0 +1,696 @@
+/**
+ * Maps bx-ai intercept payloads into Langfuse-inspired observation structs.
+ */
+
+@singleton
+class {
+	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
+
+	property name="sanitizer" inject="PayloadSanitizer@aiFlight";
+
+	struct function forEvent( required string eventName, required struct interceptData ) {
+		var name = arguments.eventName;
+		var data = arguments.interceptData ?: {};
+		var previewChars = int( val( moduleSettings.previewChars ?: 2000 ) );
+		var includePayload = yesNoFormat( moduleSettings.includePayloadJson ?: true ) == "Yes";
+		var base = {
+			sourceEvent: name,
+			startTime  : isoNow(),
+			payload    : includePayload ? sanitizer.sanitize( summarizePayload( data ) ) : {},
+			provider   : extractProvider( data ),
+			model      : extractModel( data )
+		};
+
+		switch ( name ) {
+			case "beforeAIAgentRun":
+				return base.append(
+						{
+							type     : "span",
+							name     : "agent.run",
+							status   : "running",
+							inputText: truncate( extractInput( data ), previewChars ),
+							openTrace: true,
+							traceName: "agent.run",
+							openSpan : true
+						},
+						true
+					);
+			case "afterAIAgentRun":
+				return base.append(
+						{
+							type      : "span",
+							name      : "agent.run",
+							status    : "ok",
+							outputText: truncate( extractOutput( data ), previewChars ),
+							closeSpan : true,
+							closeTrace: true,
+							endTime   : isoNow()
+						},
+						true
+					);
+			case "onAIChatRequest":
+
+			case "onAIChatRequestCreate":
+				return base.append(
+						{
+							type     : "generation",
+							name     : "generate-response",
+							status   : "running",
+							inputText: truncate( extractChatUserPreview( data ), previewChars ),
+							openTrace: true,
+							traceName: "generate-response",
+							openGen  : true
+						},
+						true
+					);
+			case "onAIChatResponse":
+				return base.append(
+						{
+							type      : "generation",
+							name      : "generate-response",
+							status    : "ok",
+							outputText: truncate( extractChatOutput( data ), previewChars ),
+							usage     : extractUsage( data ),
+							closeGen  : true,
+							closeTrace: true,
+							endTime   : isoNow()
+						},
+						true
+					);
+			case "onAITokenCount":
+				return base.append(
+						{
+							type      : "event",
+							name      : "token.count",
+							status    : "ok",
+							usage     : extractUsage( data ),
+							level     : "DEFAULT",
+							mergeUsage: true
+						},
+						true
+					);
+			case "onAIError":
+				return base.append(
+						{
+							type      : "event",
+							name      : "ai.error",
+							status    : "error",
+							level     : "ERROR",
+							outputText: truncate( extractError( data ), previewChars ),
+							markError : true,
+							endTime   : isoNow()
+						},
+						true
+					);
+			case "onAIRateLimitHit":
+				return base.append(
+						{
+							type     : "event",
+							name     : "ai.rate_limit",
+							status   : "error",
+							level    : "WARNING",
+							markError: true,
+							endTime  : isoNow()
+						},
+						true
+					);
+			case "beforeAIToolExecute":
+				return base.append(
+						{
+							type     : "tool",
+							name     : "tool:" & extractToolName( data ),
+							status   : "running",
+							inputText: truncate( extractInput( data ), previewChars ),
+							openTool : true
+						},
+						true
+					);
+			case "afterAIToolExecute":
+				return base.append(
+						{
+							type      : "tool",
+							name      : "tool:" & extractToolName( data ),
+							status    : "ok",
+							outputText: truncate( extractOutput( data ), previewChars ),
+							closeTool : true,
+							endTime   : isoNow()
+						},
+						true
+					);
+			case "beforeAIModelInvoke":
+				return base.append(
+						{
+							type  : "span",
+							name  : "model.invoke",
+							status: "running"
+						},
+						true
+					);
+			case "afterAIModelInvoke":
+				return base.append(
+						{
+							type   : "span",
+							name   : "model.invoke",
+							status : "ok",
+							endTime: isoNow()
+						},
+						true
+					);
+			case "beforeAIEmbed":
+
+			case "onAIEmbedRequest":
+				return base.append(
+						{
+							type     : "span",
+							name     : "embed",
+							status   : "running",
+							inputText: truncate( extractInput( data ), previewChars )
+						},
+						true
+					);
+			case "afterAIEmbed":
+
+			case "onAIEmbedResponse":
+				return base.append(
+						{
+							type   : "span",
+							name   : "embed",
+							status : "ok",
+							endTime: isoNow()
+						},
+						true
+					);
+			case "beforeAIPipelineRun":
+				return base.append(
+						{
+							type     : "span",
+							name     : "pipeline",
+							status   : "running",
+							openTrace: true,
+							traceName: "pipeline",
+							openSpan : true
+						},
+						true
+					);
+			case "afterAIPipelineRun":
+				return base.append(
+						{
+							type      : "span",
+							name      : "pipeline",
+							status    : "ok",
+							closeSpan : true,
+							closeTrace: true,
+							endTime   : isoNow()
+						},
+						true
+					);
+			case "onMCPRequest":
+
+			case "onMCPClientRequest":
+				return base.append(
+						{
+							type     : "span",
+							name     : "mcp.request",
+							status   : "running",
+							inputText: truncate( extractMcpMethod( data ), previewChars )
+						},
+						true
+					);
+			case "onMCPResponse":
+
+			case "onMCPClientResponse":
+				return base.append(
+						{
+							type   : "span",
+							name   : "mcp.response",
+							status : "ok",
+							endTime: isoNow()
+						},
+						true
+					);
+			case "onMCPError":
+
+			case "onMCPClientError":
+				return base.append(
+						{
+							type     : "event",
+							name     : "mcp.error",
+							status   : "error",
+							level    : "ERROR",
+							markError: true,
+							endTime  : isoNow()
+						},
+						true
+					);
+			default:
+				if ( reFindNoCase( "beforeAI|onAI.*Request$", name ) ) {
+					return base.append(
+							{
+								type  : "span",
+								name  : humanize( name ),
+								status: "running"
+							},
+							true
+						);
+				}
+				if ( reFindNoCase( "afterAI|onAI.*Response$", name ) ) {
+					return base.append(
+							{
+								type   : "span",
+								name   : humanize( name ),
+								status : "ok",
+								endTime: isoNow()
+							},
+							true
+						);
+				}
+				return base.append(
+						{
+							type  : "event",
+							name  : humanize( name ),
+							status: "ok",
+							level : "DEFAULT"
+						},
+						true
+					);
+		}
+	}
+
+	boolean function shouldCapture( required string eventName ) {
+		var allow = moduleSettings.eventAllowlist ?: [];
+		var deny = moduleSettings.eventDenylist ?: [];
+		if ( isArray( deny ) && arrayLen( deny ) && arrayFindNoCase( deny, arguments.eventName ) ) {
+			return false;
+		}
+		if ( isArray( allow ) && arrayLen( allow ) ) {
+			return arrayFindNoCase( allow, arguments.eventName ) > 0;
+		}
+		if ( !( moduleSettings.captureCreateEvents ?: false ) ) {
+			if (
+				reFindNoCase(
+					"Create$|RegistryRegister$|RegistryUnregister$|onMissingAiProvider",
+					arguments.eventName
+				)
+			) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private struct function summarizePayload( required struct data ) {
+		var keys = [
+			"provider",
+			"model",
+			"input",
+			"response",
+			"results",
+			"error",
+			"exception",
+			"tool",
+			"name",
+			"method",
+			"requestData",
+			"responseData",
+			"tokens",
+			"usage",
+			"promptTokens",
+			"completionTokens",
+			"totalTokens",
+			"conversationId",
+			"userId",
+			"tenant"
+		];
+		var out = {};
+		for ( var key in keys ) {
+			if ( structKeyExists( arguments.data, key ) ) {
+				out[ key ] = arguments.data[ key ];
+			}
+		}
+		if ( structKeyExists( arguments.data, "chatRequest" ) ) {
+			out.chatRequest = "[AiChatRequest]";
+		}
+		if ( structKeyExists( arguments.data, "dataPacket" ) && isStruct( arguments.data.dataPacket ) ) {
+			out.dataPacket = {
+				model: arguments
+						.data
+						.dataPacket
+						.model ?:
+					"",
+				messages: arguments
+						.data
+						.dataPacket
+						.messages ?:
+					[]
+			};
+		}
+		if ( !out.count() ) {
+			// shallow copy of simple keys only
+			for ( var k in arguments.data ) {
+				try {
+					if ( isSimpleValue( arguments.data[ k ] ) ) {
+						out[ k ] = arguments.data[ k ];
+					}
+				} catch (any e) {
+
+
+					// skip
+				}
+			}
+		}
+		return out;
+	}
+
+	private string function extractProvider( required struct data ) {
+		if ( len( arguments.data.provider ?: "" ) && isSimpleValue( arguments.data.provider ) ) {
+			return toString( arguments.data.provider );
+		}
+		try {
+			if ( !isNull( arguments.data.provider ) && !isSimpleValue( arguments.data.provider ) ) {
+				if ( structKeyExists( arguments.data.provider, "getName" ) ) {
+					return toString( arguments
+							.data
+							.provider
+							.getName() );
+				}
+				return listLast( getMetadata( arguments.data.provider ).name ?: "", "." );
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		try {
+			if ( structKeyExists( arguments.data, "chatRequest" ) ) {
+				return toString(
+					arguments
+							.data
+							.chatRequest
+							.getProvider() ?:
+						""
+				);
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		return "";
+	}
+
+	private string function extractModel( required struct data ) {
+		if ( len( toString( arguments.data.model ?: "" ) ) ) {
+			return toString( arguments.data.model );
+		}
+		try {
+			if ( structKeyExists( arguments.data, "chatRequest" ) ) {
+				return toString(
+					arguments
+							.data
+							.chatRequest
+							.getModel() ?:
+						""
+				);
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		if ( isStruct( arguments.data.dataPacket ?: "" ) ) {
+			return toString(
+				arguments
+						.data
+						.dataPacket
+						.model ?:
+					""
+			);
+		}
+		return "";
+	}
+
+	private string function extractInput( required struct data ) {
+		return coalesceSimple(
+			[ arguments.data.input ?: "", arguments.data.prompt ?: "", arguments.data.text ?: ""]
+		);
+	}
+
+	private string function extractOutput( required struct data ) {
+		return coalesceSimple(
+			[ arguments.data.response ?: "", arguments.data.output ?: "", arguments.data.results ?: "", arguments.data.text ?: ""]
+		);
+	}
+
+	private string function extractChatUserPreview( required struct data ) {
+		if ( isStruct( arguments.data.dataPacket ?: "" ) ) {
+			var messages = arguments
+					.data
+					.dataPacket
+					.messages ?:
+				[];
+			if ( isArray( messages ) && arrayLen( messages ) ) {
+				for ( var i = arrayLen( messages ); i >= 1; i-- ) {
+					var msg = messages[ i ];
+					if ( isStruct( msg ) && toString( msg.role ?: "" ) == "user" ) {
+						return toString( msg.content ?: "" );
+					}
+				}
+				var last = messages[ arrayLen( messages ) ];
+				if ( isStruct( last ) ) {
+					return toString( last.content ?: "" );
+				}
+			}
+		}
+		return extractInput( arguments.data );
+	}
+
+	private string function extractChatInput( required struct data ) {
+		return extractChatUserPreview( arguments.data );
+	}
+
+	private string function extractChatOutput( required struct data ) {
+		try {
+			if ( structKeyExists( arguments.data, "response" ) ) {
+				if ( isSimpleValue( arguments.data.response ) ) {
+					return toString( arguments.data.response );
+				}
+				var response = arguments.data.response;
+				if ( isStruct( response ) ) {
+					if ( isArray( response.choices ?: "" ) && arrayLen( response.choices ) ) {
+						var msg = response.choices[ 1 ].message ?: {};
+						if ( isStruct( msg ) && len( toString( msg.content ?: "" ) ) ) {
+							return toString( msg.content );
+						}
+					}
+					if ( len( toString( response.content ?: "" ) ) ) {
+						return toString( response.content );
+					}
+					if ( len( toString( response.text ?: "" ) ) ) {
+						return toString( response.text );
+					}
+				}
+				if ( structKeyExists( response, "getData" ) ) {
+					return toString( response.getData() );
+				}
+				if ( structKeyExists( response, "getContent" ) ) {
+					return toString( response.getContent() );
+				}
+			}
+		} catch (any e) {
+
+
+			// fall through
+		}
+		return extractOutput( arguments.data );
+	}
+
+	private struct function extractUsage( required struct data ) {
+		var usage = {};
+		if ( isStruct( arguments.data.usage ?: "" ) ) {
+			usage = duplicate( arguments.data.usage );
+		}
+		try {
+			if (
+				!structCount( usage ) && isStruct( arguments.data.response ?: "" ) &&
+					isStruct(
+						arguments
+								.data
+								.response
+								.usage ?:
+							""
+					)
+			) {
+				usage = duplicate( arguments
+						.data
+						.response
+						.usage );
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		usage.promptTokens = int(
+			val(
+				usage.promptTokens ?: usage.prompt_tokens ?: arguments.data.promptTokens ?: arguments.data.prompt_tokens ?: 0
+			)
+		);
+		usage.completionTokens = int(
+			val(
+				usage.completionTokens ?: usage.completion_tokens ?: arguments.data.completionTokens ?: arguments.data.completion_tokens ?:
+					0
+			)
+		);
+		usage.totalTokens = int(
+			val(
+				usage.totalTokens ?: usage.total_tokens ?: arguments.data.totalTokens ?: arguments.data.total_tokens ?: 0
+			)
+		);
+		if ( !usage.totalTokens && ( usage.promptTokens || usage.completionTokens ) ) {
+			usage.totalTokens = usage.promptTokens + usage.completionTokens;
+		}
+		if ( len( extractProvider( arguments.data ) ) ) {
+			usage.provider = extractProvider( arguments.data );
+		}
+		if ( len( extractModel( arguments.data ) ) ) {
+			usage.model = extractModel( arguments.data );
+		}
+		var cost = val( usage.cost ?: arguments.data.cost ?: 0 );
+		try {
+			if (
+				!cost && isStruct( arguments.data.response ?: "" ) &&
+					isStruct(
+						arguments
+								.data
+								.response
+								.usage ?:
+							""
+					)
+			) {
+				cost = val(
+					arguments
+							.data
+							.response
+							.usage
+							.cost ?:
+						0
+				);
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		if ( cost ) {
+			usage.cost = cost;
+		}
+		return usage;
+	}
+
+	private string function extractError( required struct data ) {
+		try {
+			if ( structKeyExists( arguments.data, "exception" ) ) {
+				return toString(
+					arguments
+							.data
+							.exception
+							.message ?:
+						arguments.data.exception
+				);
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		return toString(
+			arguments.data.error ?: arguments.data.message ?: "AI error"
+		);
+	}
+
+	private string function extractToolName( required struct data ) {
+		try {
+			if ( structKeyExists( arguments.data, "tool" ) ) {
+				if ( isSimpleValue( arguments.data.tool ) ) {
+					return toString( arguments.data.tool );
+				}
+				if ( structKeyExists( arguments.data.tool, "getName" ) ) {
+					return toString( arguments
+							.data
+							.tool
+							.getName() );
+				}
+				return toString(
+					arguments
+							.data
+							.tool
+							.name ?:
+						"tool"
+				);
+			}
+		} catch (any e) {
+
+
+			// ignore
+		}
+		return toString( arguments.data.name ?: "tool" );
+	}
+
+	private string function extractMcpMethod( required struct data ) {
+		if ( isStruct( arguments.data.requestData ?: "" ) ) {
+			return toString(
+				arguments
+						.data
+						.requestData
+						.method ?:
+					""
+			);
+		}
+		return toString( arguments.data.method ?: "mcp" );
+	}
+
+	private string function coalesceSimple( required array values ) {
+		for ( var v in arguments.values ) {
+			if ( !isNull( v ) && len( toString( v ) ) ) {
+				return toString( v );
+			}
+		}
+		return "";
+	}
+
+	private string function truncate( required string text, required numeric maxChars ) {
+		if ( len( arguments.text ) <= arguments.maxChars ) {
+			return arguments.text;
+		}
+		return left( arguments.text, arguments.maxChars ) & "…";
+	}
+
+	private string function humanize( required string eventName ) {
+		return reReplace(
+			arguments.eventName,
+			"([a-z])([A-Z])",
+			"\1.\2",
+			"all"
+		)
+			.lCase()
+			.replace(
+				"on.",
+				"",
+				"one"
+			)
+			.replace(
+				"before.",
+				"",
+				"one"
+			)
+			.replace(
+				"after.",
+				"",
+				"one"
+			);
+	}
+
+	private string function isoNow() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

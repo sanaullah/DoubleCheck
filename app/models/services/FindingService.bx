@@ -1,0 +1,248 @@
+/**
+ * Deterministic findings, AI finding normalization, fingerprinting, and deduplication.
+ */
+
+@singleton
+class {
+	property name="findingSolutionService" inject="FindingSolutionService";
+	variables.severities = [ "critical", "high", "medium", "low", "info"];
+
+	function init() {
+		if (
+			isNull(
+				variables.findingSolutionService ?: javacast( "null", "" )
+			)
+		) {
+			variables.findingSolutionService = new app.models.services.FindingSolutionService();
+		}
+		return this;
+	}
+
+	array function deterministic( required array files ) {
+		var findings = [];
+		for ( var file in arguments.files ) {
+			for ( var lineNumber = 1; lineNumber <= file.lines.len(); lineNumber++ ) {
+				var sourceLine = file.lines[ lineNumber ];
+				var evidence = trim( sourceLine );
+				if ( !len( evidence ) ) {
+					continue;
+				}
+
+				if (
+					reFindNoCase(
+						"(api[_-]?key|password|secret|access[_-]?token)\s*[:=]\s*['""][^'""]{8,}['""]",
+						sourceLine
+					)
+				) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "secrets/hardcoded-credential",
+								severity   = "high",
+								confidence = .98,
+								title      = "Possible hardcoded credential",
+								message    = "A credential-like value appears to be embedded directly in source.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Move the value to an environment variable or secret manager and rotate it if it is active.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( reFindNoCase( "\b(eval|new\s+Function)\s*\(", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "execution/dynamic-code",
+								severity   = "high",
+								confidence = .9,
+								title      = "Dynamic code execution",
+								message    = "Dynamic execution can turn untrusted input into executable code.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Replace dynamic execution with an explicit parser or allow-listed dispatch.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( reFindNoCase( "\bqueryExecute\s*\(", sourceLine ) && reFind( "##[^##]+##", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "database/query-interpolation",
+								severity   = "high",
+								confidence = .99,
+								title      = "SQL contains string interpolation",
+								message    = "The SQL text interpolates a value instead of binding it as a query parameter.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Replace interpolation with a named query parameter and a parameter value struct.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( reFindNoCase( "catch\s*\([^)]*\)\s*\{\s*\}", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "reliability",
+								ruleId     = "errors/empty-catch",
+								severity   = "medium",
+								confidence = .96,
+								title      = "Empty exception handler",
+								message    = "The exception is discarded, hiding failures and making diagnosis difficult.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Handle the expected failure or log and rethrow unexpected exceptions.",
+								source     = "deterministic"
+							)
+						);
+				}
+				var markerComment = reFindNoCase( "^\s*(//|/\*|\*|<!--).*\b(TODO|FIXME)\b", sourceLine ) ||
+					( left( evidence, 1 ) == char( 35 ) && reFindNoCase( "\b(TODO|FIXME)\b", sourceLine ) );
+				if ( markerComment ) {
+					findings.append(
+							build(
+								category   = "maintainability",
+								ruleId     = "maintenance/open-marker",
+								severity   = "info",
+								confidence = 1,
+								title      = "Open maintenance marker",
+								message    = "The reviewed source contains an unresolved TODO or FIXME marker.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Resolve the marker or link it to tracked work with enough context.",
+								source     = "deterministic"
+							)
+						);
+				}
+			}
+		}
+		return deduplicate( findings );
+	}
+
+	array function normalizeAI( required any response, required array files ) {
+		var candidates = [];
+		if ( isStruct( arguments.response ) && isArray( arguments.response.findings ?: "" ) ) {
+			candidates = arguments.response.findings;
+		} else if ( isArray( arguments.response ) ) {
+			candidates = arguments.response;
+		}
+		var indexedFiles = {};
+		arguments.files.each( ( file ) => indexedFiles[ lCase( file.filePath ) ] = file );
+		var findings = [];
+
+		for ( var candidate in candidates ) {
+			if ( !isStruct( candidate ) ) {
+				continue;
+			}
+			var filePath = normalizePath( candidate.filePath ?: "" );
+			if ( !len( filePath ) || !indexedFiles.keyExists( lCase( filePath ) ) ) {
+				continue;
+			}
+			var file = indexedFiles[ lCase( filePath ) ];
+			var startLine = isNumeric( candidate.startLine ?: "" ) ? int( candidate.startLine ) : 0;
+			var endLine = isNumeric( candidate.endLine ?: "" ) ? int( candidate.endLine ) : startLine;
+			if ( startLine < 1 || startLine > file.lines.len() || endLine < startLine || endLine > file.lines.len() ) {
+				continue;
+			}
+			var evidence = trim( file.lines[ startLine ] );
+			if ( !len( evidence ) || !len( trim( candidate.title ?: "" ) ) || !len( trim( candidate.message ?: "" ) ) ) {
+				continue;
+			}
+			var severity = lCase( candidate.severity ?: "medium" );
+			if ( !variables.severities.contains( severity ) ) {
+				severity = "medium";
+			}
+			var confidence = isNumeric( candidate.confidence ?: "" ) ? min( 1, max( 0, candidate.confidence ) ) : .7;
+			findings.append(
+					build(
+						category          = lCase( candidate.category ?: "quality" ),
+						ruleId            = candidate.ruleId ?: "ai/review",
+						severity          = severity,
+						confidence        = confidence,
+						title             = trim( candidate.title ),
+						message           = trim( candidate.message ),
+						filePath          = file.filePath,
+						startLine         = startLine,
+						endLine           = endLine,
+						evidence          = evidence,
+						suggestion        = trim( candidate.suggestion ?: "" ),
+						source            = "bx-ai",
+						candidateFixPatch = candidate.fixPatch ?: javacast( "null", "" )
+					)
+				);
+		}
+		return deduplicate( findings );
+	}
+
+	array function deduplicate( required array findings ) {
+		var seen = {};
+		var result = [];
+		for ( var finding in arguments.findings ) {
+			if ( !seen.keyExists( finding.fingerprint ) ) {
+				seen[ finding.fingerprint ] = true;
+				result.append( finding );
+			}
+		}
+		return result;
+	}
+
+	private struct function build(
+		required string category,
+		required string ruleId,
+		required string severity,
+		required numeric confidence,
+		required string title,
+		required string message,
+		required string filePath,
+		required numeric startLine,
+		required numeric endLine,
+		required string evidence,
+		required string suggestion,
+		required string source,
+		any candidateFixPatch = javacast( "null", "" )
+	) {
+		var fingerprint = lCase(
+			hash( lCase( arguments.category ) & "|" & lCase( arguments.ruleId ) & "|" & lCase( normalizePath( arguments.filePath ) ) & "|" & arguments.startLine & "|" & trim( arguments.evidence ),
+				"SHA-256" )
+		);
+		return findingSolutionService.enrich(
+				{
+					id         : lCase( createUUID() ),
+					fingerprint: fingerprint,
+					category   : lCase( arguments.category ),
+					ruleId     : arguments.ruleId,
+					severity   : lCase( arguments.severity ),
+					confidence : arguments.confidence,
+					title      : arguments.title,
+					message    : arguments.message,
+					filePath   : normalizePath( arguments.filePath ),
+					startLine  : arguments.startLine,
+					endLine    : arguments.endLine,
+					evidence   : arguments.evidence,
+					suggestion : arguments.suggestion,
+					source     : arguments.source
+				},
+				arguments.candidateFixPatch
+			);
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+}

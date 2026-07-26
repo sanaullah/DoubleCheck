@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=1280">
+	<title><bx:output>#encodeForHTML( prc.pageTitle ?: "AiFlight" )#</bx:output></title>
+	<style>
+	:root {
+		--bg: #10151c;
+		--panel: #161d26;
+		--panel-2: #1b2430;
+		--border: #2a3544;
+		--text: #e8eef6;
+		--muted: #8b9bb0;
+		--accent: #4ea1f3;
+		--ok: #3ecf8e;
+		--err: #f07178;
+		--gen: #c792ea;
+		--tool: #82aaff;
+		--span: #89ddff;
+		--event: #9ca3af;
+		--font: "IBM Plex Sans", "Segoe UI", sans-serif;
+		--mono: "IBM Plex Mono", Consolas, monospace;
+		--list-w: 400px;
+	}
+	* { box-sizing: border-box; }
+	html, body { height: 100%; }
+	body {
+		margin: 0;
+		font-family: var(--font);
+		background: var(--bg);
+		color: var(--text);
+		overflow: hidden;
+	}
+	.shell { height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+	.top {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		padding: 14px 20px;
+		border-bottom: 1px solid var(--border);
+		background: var(--panel);
+	}
+	.brand { margin: 0; font-size: 1.15rem; font-weight: 650; letter-spacing: -0.02em; }
+	.brand span { color: var(--muted); font-weight: 450; font-size: 0.85rem; margin-left: 8px; }
+	.meta { color: var(--muted); font-size: 0.8rem; }
+	.workspace {
+		display: grid;
+		grid-template-columns: var(--list-w) 1fr;
+		min-height: 0;
+		height: 100%;
+	}
+	.list-pane {
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+		border-right: 1px solid var(--border);
+		background: var(--panel);
+	}
+	.mode-tabs {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 10px 12px 0;
+		background: var(--panel-2);
+		border-bottom: 1px solid var(--border);
+	}
+	.mode-tab {
+		font: inherit;
+		border: 1px solid transparent;
+		background: transparent;
+		color: var(--muted);
+		padding: 7px 12px;
+		border-radius: 6px 6px 0 0;
+		cursor: pointer;
+		font-weight: 600;
+		font-size: 0.85rem;
+	}
+	.mode-tab.is-active {
+		color: var(--text);
+		background: var(--panel);
+		border-color: var(--border);
+		border-bottom-color: var(--panel);
+		margin-bottom: -1px;
+	}
+	.filters {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		align-items: center;
+		padding: 10px 12px;
+		border-bottom: 1px solid var(--border);
+		background: var(--panel-2);
+	}
+	.filters input, .filters select, .filters button {
+		font: inherit;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		background: var(--bg);
+		color: var(--text);
+		padding: 7px 9px;
+	}
+	.filters input[type="search"] { flex: 1 1 100px; min-width: 80px; }
+	.filters input[type="text"], .filters input[type="number"] { width: 96px; }
+	.filters .chk {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 0.75rem;
+		color: var(--muted);
+		white-space: nowrap;
+	}
+	.filters .chk input { width: auto; padding: 0; }
+	.filters button {
+		background: var(--accent);
+		border-color: transparent;
+		color: #041018;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.live-pill {
+		margin-left: auto;
+		align-self: center;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 0.7rem;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--ok);
+		padding: 5px 8px;
+		border-radius: 999px;
+		border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
+	}
+	.live-pill::before {
+		content: "";
+		width: 6px; height: 6px; border-radius: 50%;
+		background: var(--ok);
+		animation: pulse 1.4s ease-in-out infinite;
+	}
+	.live-pill.stale { color: var(--muted); border-color: var(--border); }
+	.live-pill.stale::before { background: var(--muted); animation: none; }
+	@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+	.trace-list { overflow: auto; min-height: 0; flex: 1; overflow-anchor: none; }
+	.trace-item, .session-item {
+		display: block;
+		width: 100%;
+		text-align: left;
+		border: 0;
+		border-bottom: 1px solid var(--border);
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		padding: 12px 14px;
+		cursor: pointer;
+	}
+	.trace-item:hover, .session-item:hover { background: rgba(78, 161, 243, 0.06); }
+	.trace-item.is-active, .session-item.is-open {
+		background: rgba(78, 161, 243, 0.12);
+		box-shadow: inset 3px 0 0 var(--accent);
+	}
+	.trace-item-top, .session-top {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
+		margin-bottom: 4px;
+	}
+	.trace-item-top strong, .session-top strong { font-size: 0.95rem; }
+	.trace-item-meta, .session-meta { font-size: 0.75rem; color: var(--muted); margin-bottom: 2px; }
+	.trace-item-sub { font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.session-children { display: none; background: var(--bg); }
+	.session-item.is-open + .session-children,
+	.session-block.is-open .session-children { display: block; }
+	.session-block.is-open .session-item { box-shadow: inset 3px 0 0 var(--accent); background: rgba(78, 161, 243, 0.08); }
+	.session-children .trace-item { padding-left: 22px; }
+	.detail-pane { min-height: 0; overflow: auto; background: var(--bg); overflow-anchor: none; }
+	.detail-inner { padding: 18px 22px 40px; max-width: 960px; }
+	.detail-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 10px 14px;
+		margin-bottom: 14px;
+	}
+	.detail-head h2 { margin: 0; font-size: 1.35rem; letter-spacing: -0.02em; flex: 1 1 auto; }
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 10px 20px;
+		margin-bottom: 18px;
+		color: var(--muted);
+		font-size: 0.86rem;
+		padding: 10px 12px;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+	}
+	.stats b { color: var(--text); font-weight: 600; }
+	.tree { margin-top: 8px; }
+	.obs {
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		background: var(--panel);
+		margin-bottom: 8px;
+		overflow: hidden;
+	}
+	.obs-children { margin: 0 0 8px 18px; border-left: 1px solid var(--border); padding-left: 10px; }
+	.obs-head {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 10px 14px;
+		cursor: pointer;
+		user-select: none;
+		background: var(--panel-2);
+	}
+	.obs-type {
+		font-size: 0.7rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		min-width: 78px;
+	}
+	.obs-type.generation { color: var(--gen); }
+	.obs-type.tool { color: var(--tool); }
+	.obs-type.span { color: var(--span); }
+	.obs-type.event { color: var(--event); }
+	.obs-name {
+		font-weight: 600;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.obs-meta {
+		margin-left: auto;
+		flex: 0 0 auto;
+		color: var(--muted);
+		font-size: 0.78rem;
+		font-family: var(--mono);
+		white-space: nowrap;
+	}
+	.obs-body { display: none; padding: 12px 14px 14px; border-top: 1px solid var(--border); }
+	.obs.open > .obs-body { display: block; }
+	.obs-body h4 {
+		margin: 0 0 6px;
+		font-size: 0.72rem;
+		color: var(--muted);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.obs-source {
+		margin: 0 0 12px;
+		font-size: 0.78rem;
+		color: var(--muted);
+		font-family: var(--mono);
+	}
+	.obs-source b { color: var(--text); font-weight: 600; }
+	.obs-body pre, .preview-block {
+		margin: 0 0 12px;
+		padding: 10px 12px;
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		color: #d7e2ef;
+		overflow: auto;
+		overflow-anchor: none;
+		overscroll-behavior: contain;
+	}
+	.obs-body pre.io-block, .preview-block {
+		max-height: min(55vh, 520px);
+	}
+	.obs-body pre.meta-block {
+		max-height: 200px;
+	}
+	details.payload, details.usage-block { margin-top: 4px; }
+	details.payload summary, details.usage-block summary {
+		cursor: pointer;
+		color: var(--muted);
+		font-size: 0.78rem;
+		margin-bottom: 6px;
+	}
+	.waterfall {
+		margin: 0 0 18px;
+		padding: 12px;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+	}
+	.waterfall-title {
+		margin: 0 0 10px;
+		font-size: 0.72rem;
+		color: var(--muted);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.wf-row {
+		display: grid;
+		grid-template-columns: 120px 1fr 72px;
+		gap: 8px;
+		align-items: center;
+		margin-bottom: 6px;
+		cursor: pointer;
+	}
+	.wf-row:hover .wf-track { background: rgba(78, 161, 243, 0.12); }
+	.wf-label {
+		font-size: 0.72rem;
+		font-family: var(--mono);
+		color: var(--muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.wf-track {
+		position: relative;
+		height: 14px;
+		background: var(--bg);
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		overflow: hidden;
+	}
+	.wf-bar {
+		position: absolute;
+		top: 1px;
+		bottom: 1px;
+		border-radius: 3px;
+		min-width: 4px;
+		opacity: 0.9;
+	}
+	.wf-bar.generation { background: var(--gen); }
+	.wf-bar.tool { background: var(--tool); }
+	.wf-bar.span { background: var(--span); }
+	.wf-bar.event { background: var(--event); }
+	.wf-dur { font-size: 0.72rem; font-family: var(--mono); color: var(--muted); text-align: right; }
+	.chat-block { margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
+	.chat-msg {
+		padding: 10px 12px;
+		border-radius: 8px;
+		border: 1px solid var(--border);
+		background: var(--bg);
+		max-width: 920px;
+	}
+	.chat-msg .chat-role {
+		display: block;
+		font-size: 0.68rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--muted);
+		margin-bottom: 4px;
+	}
+	.chat-msg.user { border-left: 3px solid var(--accent); }
+	.chat-msg.assistant { border-left: 3px solid var(--gen); }
+	.chat-msg.system, .chat-msg.tool { border-left: 3px solid var(--tool); }
+	.chat-msg .chat-body {
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-size: 0.86rem;
+		line-height: 1.45;
+	}
+	.session-link, .back-link, .hdr-btn {
+		font: inherit;
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--accent);
+		border-radius: 6px;
+		padding: 4px 10px;
+		cursor: pointer;
+		font-size: 0.8rem;
+	}
+	.session-link:hover, .back-link:hover, .hdr-btn:hover { border-color: var(--accent); }
+	.hdr-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+	.meta-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin: 0 0 14px;
+	}
+	.meta-chip {
+		font-size: 0.72rem;
+		font-family: var(--mono);
+		padding: 3px 8px;
+		border-radius: 6px;
+		border: 1px solid var(--border);
+		background: var(--panel);
+		color: var(--muted);
+	}
+	.meta-chip b { color: var(--text); font-weight: 600; }
+	details.meta-all { margin: 0 0 14px; }
+	details.meta-all summary {
+		cursor: pointer;
+		color: var(--muted);
+		font-size: 0.78rem;
+		margin-bottom: 6px;
+	}
+	.replay-turn {
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		background: var(--panel);
+		padding: 14px 16px;
+		margin-bottom: 12px;
+		cursor: pointer;
+	}
+	.replay-turn:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+	.replay-turn-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px 14px;
+		align-items: center;
+		margin-bottom: 10px;
+		font-size: 0.78rem;
+		color: var(--muted);
+		font-family: var(--mono);
+	}
+	.replay-turn-meta strong { color: var(--text); font-family: var(--font); font-size: 0.95rem; }
+	.session-item.is-active {
+		background: rgba(78, 161, 243, 0.12);
+		box-shadow: inset 3px 0 0 var(--accent);
+	}
+	.empty { padding: 48px 24px; text-align: center; color: var(--muted); }
+	.empty.compact { padding: 28px 16px; }
+	.empty.detail-empty { padding-top: 18vh; }
+	.empty strong { display: block; color: var(--text); font-size: 1.05rem; margin-bottom: 8px; }
+	.badge {
+		display: inline-block;
+		padding: 2px 8px;
+		border-radius: 999px;
+		font-size: 0.72rem;
+		font-weight: 600;
+		border: 1px solid var(--border);
+	}
+	.badge.running { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+	.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+	.badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+	.mono { font-family: var(--mono); }
+	.muted { color: var(--muted); }
+	.err-msg { color: var(--err); margin: 0 0 14px; }
+	</style>
+</head>
+<body>
+	<div class="shell">
+		<header class="top">
+			<h1 class="brand">AiFlight <span>local traces</span></h1>
+			<div class="meta">Waterfall · sessions · replay</div>
+		</header>
+		<bx:output>#view()#</bx:output>
+	</div>
+	<script>
+	(function () {
+		const root = document.getElementById("observe-workspace");
+		if (!root) return;
+
+		const listEl = document.getElementById("observe-list");
+		const detailEl = document.getElementById("observe-detail");
+		const liveEl = document.getElementById("observe-live");
+		const pollSeconds = Number(root.getAttribute("data-poll-seconds") || "2");
+		let selectedId = root.getAttribute("data-selected") || "";
+		let selectedSessionId = "";
+		let sessionsCache = [];
+		let mode = "traces";
+		let listFp = "";
+		let detailContentFp = "";
+		let detailMetaFp = "";
+		let detailPollTimer = null;
+		let openSessionIds = new Set();
+		let viewMode = "empty"; // empty | trace | session
+
+		const esc = (v) => String(v ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;");
+
+		function formatWhen(raw) {
+			if (!raw) return "-";
+			const d = new Date(raw);
+			if (Number.isNaN(d.getTime())) return String(raw);
+			const diff = Date.now() - d.getTime();
+			if (diff >= 0 && diff < 45000) return "just now";
+			if (diff >= 0 && diff < 3600000) {
+				const mins = Math.max(1, Math.round(diff / 60000));
+				return mins === 1 ? "1 min ago" : mins + " min ago";
+			}
+			if (diff >= 0 && diff < 86400000) {
+				return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+			}
+			const opts = { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
+			if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+			return d.toLocaleString(undefined, opts);
+		}
+
+		function formatDuration(ms) {
+			const n = Number(ms) || 0;
+			if (n < 1000) return n + " ms";
+			if (n < 60000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + " s";
+			return Math.floor(n / 60000) + "m " + Math.round((n % 60000) / 1000) + "s";
+		}
+
+		function formatCost(usageOrCost) {
+			let c = 0;
+			if (typeof usageOrCost === "number") c = usageOrCost;
+			else if (usageOrCost && typeof usageOrCost === "object") c = Number(usageOrCost.cost || 0);
+			else c = Number(usageOrCost || 0);
+			if (!c) return "";
+			return c < 0.01 ? c.toFixed(6) : c.toFixed(4);
+		}
+
+		function rowCost(t) {
+			if (t && t.cost !== "" && t.cost != null && Number(t.cost) > 0) return formatCost(Number(t.cost));
+			return formatCost(t && t.usage);
+		}
+
+		function hydrateTimes(scope) {
+			(scope || document).querySelectorAll("[data-when]").forEach((el) => {
+				if (!el) return;
+				const next = formatWhen(el.getAttribute("data-when") || "");
+				if (el.textContent !== next) el.textContent = next;
+			});
+		}
+
+		function buildListUrl() {
+			const params = new URLSearchParams({ limit: "50" });
+			const status = root.getAttribute("data-filter-status") || "";
+			const q = root.getAttribute("data-filter-q") || "";
+			if (status) params.set("status", status);
+			if (q) params.set("q", q);
+			if (root.getAttribute("data-filter-tools") === "true") params.set("hasTools", "true");
+			if (root.getAttribute("data-filter-errors") === "true") params.set("hasErrors", "true");
+			["model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost"].forEach((key) => {
+				const attr = "data-filter-" + key.toLowerCase().replace("ms", "ms");
+				const map = {
+					model: "data-filter-model",
+					userId: "data-filter-userid",
+					environment: "data-filter-environment",
+					obsType: "data-filter-obstype",
+					minDurationMs: "data-filter-minduration",
+					maxDurationMs: "data-filter-maxduration",
+					minCost: "data-filter-mincost"
+				};
+				const v = root.getAttribute(map[key]) || "";
+				if (v) params.set(key, v);
+			});
+			return root.getAttribute("data-list-url") + "?" + params.toString();
+		}
+
+		function syncFiltersFromForm() {
+			const form = document.getElementById("flight-filters");
+			if (!form) return;
+			const fd = new FormData(form);
+			const set = (attr, name) => {
+				const v = (fd.get(name) || "").toString().trim();
+				root.setAttribute(attr, v);
+			};
+			set("data-filter-q", "q");
+			set("data-filter-status", "status");
+			set("data-filter-model", "model");
+			set("data-filter-userid", "userId");
+			set("data-filter-environment", "environment");
+			set("data-filter-obstype", "obsType");
+			set("data-filter-minduration", "minDurationMs");
+			set("data-filter-maxduration", "maxDurationMs");
+			set("data-filter-mincost", "minCost");
+			root.setAttribute("data-filter-tools", form.querySelector('[name="hasTools"]')?.checked ? "true" : "");
+			root.setAttribute("data-filter-errors", form.querySelector('[name="hasErrors"]')?.checked ? "true" : "");
+			const url = new URL(location.href);
+			["q", "status", "model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost", "hasTools", "hasErrors"].forEach((k) => url.searchParams.delete(k));
+			const q = root.getAttribute("data-filter-q"); if (q) url.searchParams.set("q", q);
+			const status = root.getAttribute("data-filter-status"); if (status) url.searchParams.set("status", status);
+			const model = root.getAttribute("data-filter-model"); if (model) url.searchParams.set("model", model);
+			const userId = root.getAttribute("data-filter-userid"); if (userId) url.searchParams.set("userId", userId);
+			const environment = root.getAttribute("data-filter-environment"); if (environment) url.searchParams.set("environment", environment);
+			const obsType = root.getAttribute("data-filter-obstype"); if (obsType) url.searchParams.set("obsType", obsType);
+			const minD = root.getAttribute("data-filter-minduration"); if (minD) url.searchParams.set("minDurationMs", minD);
+			const maxD = root.getAttribute("data-filter-maxduration"); if (maxD) url.searchParams.set("maxDurationMs", maxD);
+			const minC = root.getAttribute("data-filter-mincost"); if (minC) url.searchParams.set("minCost", minC);
+			if (root.getAttribute("data-filter-tools") === "true") url.searchParams.set("hasTools", "true");
+			if (root.getAttribute("data-filter-errors") === "true") url.searchParams.set("hasErrors", "true");
+			history.replaceState(null, "", url.pathname + url.search + location.hash);
+		}
+
+		function downloadJson(filename, data) {
+			const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+			const a = document.createElement("a");
+			a.href = URL.createObjectURL(blob);
+			a.download = filename;
+			a.click();
+			URL.revokeObjectURL(a.href);
+		}
+
+		async function copyCurrentLink(btn) {
+			const url = location.origin + location.pathname + location.search + location.hash;
+			try {
+				await navigator.clipboard.writeText(url);
+				if (btn) {
+					const prev = btn.textContent;
+					btn.textContent = "Copied";
+					setTimeout(() => { btn.textContent = prev; }, 1200);
+				}
+			} catch (e) {}
+		}
+
+		function metadataChips(meta) {
+			if (!meta || typeof meta !== "object") return "";
+			const entries = Object.keys(meta).filter((k) => {
+				const v = meta[k];
+				return v != null && (typeof v === "string" || typeof v === "number" || typeof v === "boolean");
+			}).slice(0, 8);
+			if (!entries.length) return "";
+			const chips = entries.map((k) => `<span class="meta-chip"><b>${esc(k)}</b> ${esc(String(meta[k]).slice(0, 80))}</span>`).join("");
+			const full = `<details class="meta-all"><summary>All metadata</summary><pre class="meta-block">${esc(JSON.stringify(meta, null, 2))}</pre></details>`;
+			return `<div class="meta-chips">${chips}</div>${full}`;
+		}
+
+		function previewOf(t) {
+			return String(t.outputPreview || t.inputPreview || "").replace(/\s+/g, " ").trim().slice(0, 120);
+		}
+
+		function fingerprint(rows, kind) {
+			return kind + ":" + rows.map((t) => [t.id, t.status, t.totalTokens, t.traceCount || t.observationCount, t.endedAt || t.lastStartedAt, t.durationMs || 0, t.cost || ""].join(":")).join("|");
+		}
+
+		function contentFingerprint(t) {
+			if (!t || !t.id) return "";
+			const obs = Array.isArray(t.observations) ? t.observations : [];
+			return [
+				t.id, t.errorMessage || "", t.outputPreview || "", t.sessionId || "",
+				obs.map((o) => [
+					o.id, o.type, o.name, o.parentObservationId || "",
+					o.inputText || "", o.outputText || "", o.sourceEvent || "",
+					JSON.stringify(o.usage || {}), JSON.stringify(o.payload || {})
+				].join("\x1e")).join("|")
+			].join("::");
+		}
+
+		function metaFingerprint(t) {
+			if (!t || !t.id) return "";
+			const obs = Array.isArray(t.observations) ? t.observations : [];
+			return [
+				t.status, t.totalTokens, t.promptTokens, t.completionTokens, t.durationMs, t.model, t.provider,
+				obs.map((o) => [o.id, o.status, o.durationMs, o.startTime].join(":")).join("|")
+			].join("::");
+		}
+
+		function parseMs(raw) {
+			const d = new Date(raw || "");
+			return Number.isNaN(d.getTime()) ? null : d.getTime();
+		}
+
+		function parseMessages(raw) {
+			if (raw == null) return null;
+			let v = raw;
+			if (typeof v === "string") {
+				const s = v.trim();
+				if (!s) return null;
+				if (s[0] !== "[" && s[0] !== "{") return null;
+				try { v = JSON.parse(s); } catch (e) { return null; }
+			}
+			if (Array.isArray(v)) {
+				const msgs = v.filter((m) => m && typeof m === "object" && ("role" in m || "content" in m));
+				return msgs.length ? msgs : null;
+			}
+			if (v && typeof v === "object" && ("role" in v || "content" in v)) return [v];
+			return null;
+		}
+
+		function messageContent(m) {
+			const c = m.content;
+			if (typeof c === "string") return c;
+			if (Array.isArray(c)) {
+				return c.map((part) => {
+					if (typeof part === "string") return part;
+					if (part && typeof part === "object") return part.text || part.content || JSON.stringify(part);
+					return "";
+				}).join("\n");
+			}
+			if (c == null) return "";
+			return typeof c === "object" ? JSON.stringify(c, null, 2) : String(c);
+		}
+
+		function renderIo(raw, scrollKey, cls) {
+			const msgs = parseMessages(raw);
+			if (msgs) {
+				return `<div class="chat-block" data-scroll-key="${esc(scrollKey)}">${msgs.map((m) => {
+					const role = String(m.role || "message").toLowerCase();
+					return `<div class="chat-msg ${esc(role)}"><span class="chat-role">${esc(role)}</span><div class="chat-body">${esc(messageContent(m))}</div></div>`;
+				}).join("")}</div>`;
+			}
+			const text = typeof raw === "string" ? raw : (raw == null ? "" : JSON.stringify(raw, null, 2));
+			return `<pre class="${esc(cls || "io-block")}" data-scroll-key="${esc(scrollKey)}">${esc(text)}</pre>`;
+		}
+
+		function captureDetailUi() {
+			const openObs = [];
+			const openPayload = [];
+			const openUsage = [];
+			const preScroll = {};
+			detailEl.querySelectorAll(".obs.open[data-obs-id]").forEach((el) => openObs.push(el.getAttribute("data-obs-id")));
+			detailEl.querySelectorAll("details.payload[open]").forEach((el) => {
+				const obs = el.closest("[data-obs-id]");
+				if (obs) openPayload.push(obs.getAttribute("data-obs-id"));
+			});
+			detailEl.querySelectorAll("details.usage-block[open]").forEach((el) => {
+				const obs = el.closest("[data-obs-id]");
+				if (obs) openUsage.push(obs.getAttribute("data-obs-id"));
+			});
+			detailEl.querySelectorAll("pre[data-scroll-key]").forEach((el) => {
+				preScroll[el.getAttribute("data-scroll-key")] = el.scrollTop;
+			});
+			return { pane: detailEl.scrollTop, openObs, openPayload, openUsage, preScroll };
+		}
+
+		function restoreDetailUi(state) {
+			if (!state) return;
+			state.openObs.forEach((id) => {
+				const el = detailEl.querySelector('.obs[data-obs-id="' + CSS.escape(id) + '"]');
+				if (el) el.classList.add("open");
+			});
+			(state.openPayload || []).forEach((id) => {
+				const obs = detailEl.querySelector('.obs[data-obs-id="' + CSS.escape(id) + '"]');
+				if (obs) {
+					const d = obs.querySelector("details.payload");
+					if (d) d.open = true;
+				}
+			});
+			(state.openUsage || []).forEach((id) => {
+				const obs = detailEl.querySelector('.obs[data-obs-id="' + CSS.escape(id) + '"]');
+				if (obs) {
+					const d = obs.querySelector("details.usage-block");
+					if (d) d.open = true;
+				}
+			});
+			Object.keys(state.preScroll || {}).forEach((key) => {
+				const el = detailEl.querySelector('pre[data-scroll-key="' + CSS.escape(key) + '"]');
+				if (el) el.scrollTop = state.preScroll[key];
+			});
+			detailEl.scrollTop = state.pane || 0;
+		}
+
+		function scheduleRestore(state) {
+			if (!state) return;
+			requestAnimationFrame(() => {
+				restoreDetailUi(state);
+				requestAnimationFrame(() => restoreDetailUi(state));
+			});
+		}
+
+		function setHash(kind, id) {
+			let next = "#";
+			if (kind === "trace" && id) next = "#trace/" + encodeURIComponent(id);
+			if (kind === "session" && id) next = "#session/" + encodeURIComponent(id);
+			if (location.hash !== next) {
+				history.replaceState(null, "", next === "#" ? location.pathname + location.search : next);
+			}
+		}
+
+		function markActive() {
+			listEl.querySelectorAll(".trace-item").forEach((btn) => {
+				btn.classList.toggle("is-active", btn.getAttribute("data-id") === selectedId);
+			});
+			listEl.querySelectorAll(".session-item").forEach((btn) => {
+				btn.classList.toggle("is-active", btn.getAttribute("data-session-toggle") === selectedSessionId && viewMode === "session");
+			});
+		}
+
+		function rememberOpenSessions() {
+			openSessionIds = new Set(
+				Array.from(listEl.querySelectorAll(".session-block.is-open")).map((el) => el.getAttribute("data-session"))
+			);
+		}
+
+		function restoreOpenSessions() {
+			openSessionIds.forEach((id) => {
+				const el = listEl.querySelector('.session-block[data-session="' + CSS.escape(id) + '"]');
+				if (el) el.classList.add("is-open");
+			});
+		}
+
+		function withListScroll(fn) {
+			const top = listEl.scrollTop;
+			rememberOpenSessions();
+			fn();
+			restoreOpenSessions();
+			listEl.scrollTop = top;
+			markActive();
+		}
+
+		function renderTraceButton(t) {
+			const id = esc(t.id || "");
+			const status = esc(t.status || "running");
+			const started = esc(t.startedAt || "");
+			const preview = esc(previewOf(t));
+			const cost = rowCost(t);
+			const hints = [];
+			if (t.userId) hints.push("user " + t.userId);
+			if (t.environment) hints.push(t.environment);
+			return `<button type="button" class="trace-item" role="option" data-id="${id}">
+				<div class="trace-item-top">
+					<strong>${esc(t.name || "trace")}</strong>
+					<span class="badge ${status}">${status}</span>
+				</div>
+				<div class="trace-item-meta mono">
+					<time class="when" data-when="${started}">${esc(formatWhen(t.startedAt))}</time>
+					· ${esc(formatDuration(t.durationMs))}
+					· ${esc(t.totalTokens || 0)} tok
+					${cost ? " · $" + esc(cost) : ""}
+					· ${esc(t.observationCount || 0)} steps
+				</div>
+				${hints.length ? `<div class="trace-item-sub muted mono">${esc(hints.join(" · "))}</div>` : ""}
+				<div class="trace-item-sub muted">${preview || esc(t.model || t.provider || "-")}</div>
+			</button>`;
+		}
+
+		function renderTraces(traces) {
+			withListScroll(() => {
+				if (!traces.length) {
+					listEl.innerHTML = '<div class="empty compact"><strong>No traces yet</strong>Run a review - rows appear here live.</div>';
+					return;
+				}
+				listEl.innerHTML = traces.map((t) => renderTraceButton(t)).join("");
+				if (!selectedId && !selectedSessionId && traces[0]) selectTrace(traces[0].id, false);
+			});
+		}
+
+		function renderSessions(sessions) {
+			sessionsCache = sessions;
+			withListScroll(() => {
+				if (!sessions.length) {
+					listEl.innerHTML = '<div class="empty compact"><strong>No sessions yet</strong>Traces with a shared request/conversation appear here.</div>';
+					return;
+				}
+				listEl.innerHTML = sessions.map((s) => {
+					const id = esc(s.id || "");
+					const status = esc(s.status || "ok");
+					const children = (s.traces || []).map((t) => renderTraceButton(t)).join("");
+					return `<div class="session-block" data-session="${id}">
+						<button type="button" class="session-item" data-session-toggle="${id}">
+							<div class="session-top">
+								<strong class="mono">${esc(String(s.id || "").slice(0, 8))}...</strong>
+								<span class="badge ${status}">${status}</span>
+							</div>
+							<div class="session-meta mono">
+								${esc(s.traceCount || 0)} traces · ${esc(s.totalTokens || 0)} tok ·
+								<time data-when="${esc(s.lastStartedAt || "")}">${esc(formatWhen(s.lastStartedAt))}</time>
+							</div>
+						</button>
+						<div class="session-children">${children}</div>
+					</div>`;
+				}).join("");
+			});
+		}
+
+		function buildWaterfall(t) {
+			const obs = Array.isArray(t.observations) ? t.observations : [];
+			if (!obs.length) return "";
+			const starts = obs.map((o) => parseMs(o.startTime)).filter((n) => n != null);
+			const origin = parseMs(t.startedAt) ?? (starts.length ? Math.min(...starts) : Date.now());
+			let end = origin + (Number(t.durationMs) || 0);
+			obs.forEach((o) => {
+				const s = parseMs(o.startTime) ?? origin;
+				const e = s + (Number(o.durationMs) || 0);
+				if (e > end) end = e;
+			});
+			const span = Math.max(1, end - origin);
+			const rows = obs.map((o) => {
+				const s = parseMs(o.startTime) ?? origin;
+				const dur = Math.max(0, Number(o.durationMs) || 0);
+				const left = Math.max(0, ((s - origin) / span) * 100);
+				const width = Math.max(0.5, (dur / span) * 100);
+				const type = esc(o.type || "event");
+				return `<div class="wf-row" data-wf-id="${esc(o.id || "")}" title="${esc(o.name || "")}">
+					<span class="wf-label">${esc(o.name || o.type || "step")}</span>
+					<span class="wf-track"><span class="wf-bar ${type}" style="left:${left}%;width:${Math.min(100 - left, width)}%"></span></span>
+					<span class="wf-dur">${esc(formatDuration(dur))}</span>
+				</div>`;
+			}).join("");
+			return `<div class="waterfall"><div class="waterfall-title">Waterfall</div>${rows}</div>`;
+		}
+
+		function buildTree(observations, preferredOpen) {
+			const byParent = {};
+			const roots = [];
+			(observations || []).forEach((o) => {
+				const pid = o.parentObservationId || "";
+				if (!pid) roots.push(o);
+				else {
+					if (!byParent[pid]) byParent[pid] = [];
+					byParent[pid].push(o);
+				}
+			});
+			const restoring = Array.isArray(preferredOpen);
+			const openSet = new Set(preferredOpen || []);
+			function nodeHtml(o, depth, fallbackOpen) {
+				const type = esc(o.type || "event");
+				const kids = byParent[o.id] || [];
+				const cost = formatCost(o.usage);
+				const isOpen = restoring ? openSet.has(o.id) : fallbackOpen;
+				let body = "";
+				if (o.inputText) body += `<h4>Input</h4>${renderIo(o.inputText, o.id + ":in", "io-block")}`;
+				if (o.outputText) body += `<h4>Output</h4>${renderIo(o.outputText, o.id + ":out", "io-block")}`;
+				if (o.sourceEvent) body += `<p class="obs-source">Source <b data-scroll-key="${esc(o.id)}:src">${esc(o.sourceEvent)}</b></p>`;
+				if (o.usage && typeof o.usage === "object" && Object.keys(o.usage).length) {
+					body += `<details class="usage-block"><summary>Usage</summary><pre class="meta-block" data-scroll-key="${esc(o.id)}:usage">${esc(JSON.stringify(o.usage, null, 2))}</pre></details>`;
+				}
+				if (o.payload && typeof o.payload === "object" && Object.keys(o.payload).length) {
+					body += `<details class="payload"><summary>Payload</summary><pre class="meta-block" data-scroll-key="${esc(o.id)}:payload">${esc(JSON.stringify(o.payload, null, 2))}</pre></details>`;
+				}
+				const childHtml = kids.map((c) => nodeHtml(c, depth + 1, false)).join("");
+				return `<div class="obs${isOpen ? " open" : ""}" data-obs-id="${esc(o.id || "")}">
+					<div class="obs-head">
+						<span class="obs-type ${type}">${type}</span>
+						<span class="obs-name" title="${esc(o.name || "")}">${esc(o.name || "")}</span>
+						<span class="badge ${esc(o.status || "")}">${esc(o.status || "")}</span>
+						<span class="obs-meta">${esc(formatDuration(o.durationMs))}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time></span>
+					</div>
+					<div class="obs-body">${body}</div>
+					${childHtml ? `<div class="obs-children">${childHtml}</div>` : ""}
+				</div>`;
+			}
+			const list = roots.length ? roots : observations;
+			return list.map((o, i) => nodeHtml(o, 0, i === 0)).join("");
+		}
+
+		function patchDetailMeta(t) {
+			const rootInner = detailEl.querySelector(".detail-inner");
+			if (!rootInner) return false;
+			const badge = rootInner.querySelector(".detail-head .badge");
+			if (badge) {
+				badge.textContent = t.status || "";
+				badge.className = "badge " + (t.status || "");
+			}
+			const stats = rootInner.querySelector(".stats");
+			if (stats) {
+				const cost = formatCost((Array.isArray(t.observations) ? t.observations : []).find((o) => o.usage && o.usage.cost)?.usage || t.usage);
+				stats.innerHTML = statsHtml(t, cost);
+			}
+			const wf = rootInner.querySelector(".waterfall");
+			if (wf) wf.outerHTML = buildWaterfall(t);
+			(Array.isArray(t.observations) ? t.observations : []).forEach((o) => {
+				const node = detailEl.querySelector('.obs[data-obs-id="' + CSS.escape(o.id || "") + '"]');
+				if (!node) return;
+				const statusEl = node.querySelector(":scope > .obs-head .badge");
+				if (statusEl) {
+					statusEl.textContent = o.status || "";
+					statusEl.className = "badge " + (o.status || "");
+				}
+				const metaEl = node.querySelector(":scope > .obs-head .obs-meta");
+				if (metaEl) {
+					const cost = formatCost(o.usage);
+					metaEl.innerHTML = `${esc(formatDuration(o.durationMs))}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time>`;
+				}
+			});
+			return true;
+		}
+
+		function patchDetailContent(t) {
+			const obs = Array.isArray(t.observations) ? t.observations : [];
+			const byId = {};
+			detailEl.querySelectorAll(".obs[data-obs-id]").forEach((el) => {
+				byId[el.getAttribute("data-obs-id")] = el;
+			});
+			if (Object.keys(byId).length !== obs.length) return false;
+			for (let i = 0; i < obs.length; i++) {
+				if (!byId[obs[i].id]) return false;
+			}
+			for (let i = 0; i < obs.length; i++) {
+				const o = obs[i];
+				const node = byId[o.id];
+				const pairs = [
+					[":usage", o.usage && Object.keys(o.usage).length ? JSON.stringify(o.usage, null, 2) : null],
+					[":payload", o.payload && Object.keys(o.payload).length ? JSON.stringify(o.payload, null, 2) : null]
+				];
+				const srcEl = node.querySelector('[data-scroll-key="' + CSS.escape(o.id + ":src") + '"]');
+				if (o.sourceEvent && srcEl && srcEl.textContent !== o.sourceEvent) srcEl.textContent = o.sourceEvent;
+				const kinds = ["in", "out"];
+				for (let k = 0; k < kinds.length; k++) {
+					const kind = kinds[k];
+					const key = o.id + ":" + kind;
+					const val = kind === "in" ? o.inputText : o.outputText;
+					if (val == null || val === "") continue;
+					if (parseMessages(val)) {
+						const chat = node.querySelector('.chat-block[data-scroll-key="' + CSS.escape(key) + '"]');
+						if (!chat) return false;
+						continue;
+					}
+					const pre = node.querySelector('pre[data-scroll-key="' + CSS.escape(key) + '"]');
+					if (!pre) return false;
+					const top = pre.scrollTop;
+					if (pre.textContent !== val) {
+						pre.textContent = val;
+						pre.scrollTop = top;
+					}
+				}
+				for (let p = 0; p < pairs.length; p++) {
+					const key = o.id + pairs[p][0];
+					const val = pairs[p][1];
+					const el = node.querySelector('pre[data-scroll-key="' + CSS.escape(key) + '"]');
+					if (val == null) {
+						if (el) return false;
+						continue;
+					}
+					if (!el) return false;
+					const top = el.scrollTop;
+					if (el.textContent !== val) {
+						el.textContent = val;
+						el.scrollTop = top;
+					}
+				}
+			}
+			return true;
+		}
+
+		function statsHtml(t, cost) {
+			return `
+				<span>Started <b><time data-when="${esc(t.startedAt || "")}">${esc(formatWhen(t.startedAt))}</time></b></span>
+				<span>Duration <b>${esc(formatDuration(t.durationMs))}</b></span>
+				<span>Tokens <b>${esc(t.totalTokens || 0)}</b> <span class="muted">(p ${esc(t.promptTokens || 0)} / c ${esc(t.completionTokens || 0)})</span></span>
+				${cost ? `<span>Cost <b>$${esc(cost)}</b></span>` : ""}
+				<span>Model <b class="mono">${esc(t.model || "-")}</b></span>
+				<span>Provider <b class="mono">${esc(t.provider || "-")}</b></span>
+				${t.environment ? `<span>Env <b class="mono">${esc(t.environment)}</b></span>` : ""}
+				${t.userId ? `<span>User <b class="mono">${esc(t.userId)}</b></span>` : ""}
+				${t.sessionId ? `<span>Session <button type="button" class="session-link" data-open-session="${esc(t.sessionId)}">${esc(String(t.sessionId).slice(0, 8))}...</button></span>` : ""}
+			`;
+		}
+
+		function headerActions(kind, id) {
+			return `<div class="hdr-actions">
+				<button type="button" class="hdr-btn" data-copy-link>Copy link</button>
+				<button type="button" class="hdr-btn" data-export="${esc(kind)}" data-export-id="${esc(id || "")}">Export</button>
+			</div>`;
+		}
+
+		function renderDetail(t, opts) {
+			opts = opts || {};
+			viewMode = "trace";
+			const cFp = contentFingerprint(t);
+			const mFp = metaFingerprint(t);
+			if (!opts.force && cFp && cFp === detailContentFp && detailEl.querySelector(".detail-inner")) {
+				if (mFp !== detailMetaFp) {
+					patchDetailMeta(t);
+					detailMetaFp = mFp;
+				} else {
+					hydrateTimes(detailEl);
+				}
+				return;
+			}
+			if (!opts.force && detailContentFp && cFp !== detailContentFp && detailEl.querySelector(".detail-inner")) {
+				const patched = patchDetailContent(t);
+				if (patched !== false && patched) {
+					detailContentFp = cFp;
+					if (mFp !== detailMetaFp) {
+						patchDetailMeta(t);
+						detailMetaFp = mFp;
+					}
+					return;
+				}
+			}
+			const ui = opts.preserve ? captureDetailUi() : null;
+			if (!t || !t.id) {
+				detailContentFp = "";
+				detailMetaFp = "";
+				viewMode = "empty";
+				detailEl.innerHTML = '<div class="empty detail-empty"><strong>Select a trace</strong>Click a row on the left to inspect the nested timeline - no page change.</div>';
+				return;
+			}
+			const obs = Array.isArray(t.observations) ? t.observations : [];
+			const cost = formatCost(obs.find((o) => o.usage && o.usage.cost)?.usage || t.usage) || rowCost(t);
+			const preferredOpen = ui ? ui.openObs : null;
+			const hasObsOutput = obs.some((o) => !!(o.outputText || o.inputText));
+			const showPreview = !!(t.outputPreview && !hasObsOutput);
+			const back = selectedSessionId
+				? `<button type="button" class="back-link" data-back-session="${esc(selectedSessionId)}"><- Session</button>`
+				: "";
+			detailEl.innerHTML = `<div class="detail-inner">
+				<div class="detail-head">
+					${back}
+					<h2>${esc(t.name || "Trace")}</h2>
+					<span class="badge ${esc(t.status || "")}">${esc(t.status || "")}</span>
+					${headerActions("trace", t.id)}
+				</div>
+				${t.errorMessage ? `<p class="err-msg">${esc(t.errorMessage)}</p>` : ""}
+				<div class="stats">${statsHtml(t, cost)}</div>
+				${metadataChips(t.metadata)}
+				${buildWaterfall(t)}
+				${showPreview ? `<h4 class="muted" style="margin:0 0 6px;font-size:0.72rem;text-transform:uppercase;letter-spacing:.04em">Output preview</h4>${renderIo(t.outputPreview, "preview", "preview-block")}` : ""}
+				<div class="tree">${obs.length ? buildTree(obs, preferredOpen) : '<div class="empty compact"><strong>No steps yet</strong>Waiting for observations...</div>'}</div>
+			</div>`;
+			detailContentFp = cFp;
+			detailMetaFp = mFp;
+			if (ui) scheduleRestore(ui);
+		}
+
+		function renderSessionReplay(session) {
+			viewMode = "session";
+			selectedSessionId = session.id || selectedSessionId;
+			selectedId = "";
+			detailContentFp = "";
+			detailMetaFp = "";
+			if (detailPollTimer) {
+				clearInterval(detailPollTimer);
+				detailPollTimer = null;
+			}
+			const traces = (session.traces || []).slice().sort((a, b) => {
+				const ta = parseMs(a.startedAt) || 0;
+				const tb = parseMs(b.startedAt) || 0;
+				return ta - tb;
+			});
+			const turns = traces.map((t) => {
+				const cost = rowCost(t);
+				const user = t.inputPreview || "";
+				const assistant = t.outputPreview || "";
+				return `<div class="replay-turn" data-id="${esc(t.id || "")}">
+					<div class="replay-turn-meta">
+						<strong>${esc(t.name || "trace")}</strong>
+						<span class="badge ${esc(t.status || "")}">${esc(t.status || "")}</span>
+						<span>${esc(formatDuration(t.durationMs))}</span>
+						<span>${esc(t.totalTokens || 0)} tok</span>
+						${cost ? `<span>$${esc(cost)}</span>` : ""}
+						<span><time data-when="${esc(t.startedAt || "")}">${esc(formatWhen(t.startedAt))}</time></span>
+					</div>
+					${user ? `<div class="chat-msg user"><span class="chat-role">user</span><div class="chat-body">${esc(user)}</div></div>` : ""}
+					${assistant ? `<div class="chat-msg assistant" style="margin-top:8px"><span class="chat-role">assistant</span><div class="chat-body">${esc(assistant)}</div></div>` : (!user ? '<div class="muted">No preview</div>' : "")}
+				</div>`;
+			}).join("");
+			detailEl.innerHTML = `<div class="detail-inner">
+				<div class="detail-head">
+					<h2>Session ${esc(String(session.id || "").slice(0, 8))}...</h2>
+					<span class="badge ${esc(session.status || "")}">${esc(session.status || "")}</span>
+					${headerActions("session", session.id)}
+				</div>
+				<div class="stats">
+					<span>Traces <b>${esc(session.traceCount || traces.length)}</b></span>
+					<span>Tokens <b>${esc(session.totalTokens || 0)}</b></span>
+					<span>Last <b><time data-when="${esc(session.lastStartedAt || "")}">${esc(formatWhen(session.lastStartedAt))}</time></b></span>
+				</div>
+				${turns || '<div class="empty compact"><strong>Empty session</strong></div>'}
+			</div>`;
+			markActive();
+		}
+
+		async function loadDetail(id) {
+			const base = root.getAttribute("data-detail-url") || "/ai-flight/api/trace/";
+			const res = await fetch(base + encodeURIComponent(id), { headers: { Accept: "application/json" } });
+			if (!res.ok) throw new Error("detail failed");
+			return res.json();
+		}
+
+		async function selectTrace(id, updateHash = true) {
+			if (!id) return;
+			const same = selectedId === id && viewMode === "trace" && detailEl.querySelector(".detail-inner");
+			selectedId = id;
+			markActive();
+			if (updateHash) setHash("trace", id);
+			if (!same) {
+				detailContentFp = "";
+				detailMetaFp = "";
+				detailEl.innerHTML = '<div class="empty compact"><strong>Loading...</strong></div>';
+			}
+			try {
+				const data = await loadDetail(id);
+				if (selectedId !== id) return;
+				if (data.sessionId) selectedSessionId = data.sessionId;
+				renderDetail(data, { force: !same, preserve: same });
+				scheduleDetailPoll(data);
+			} catch (e) {
+				if (!same) detailEl.innerHTML = '<div class="empty compact"><strong>Could not load trace</strong>Try another row.</div>';
+			}
+		}
+
+		function selectSession(id, updateHash = true) {
+			if (!id) return;
+			selectedSessionId = id;
+			openSessionIds.add(id);
+			const block = listEl.querySelector('.session-block[data-session="' + CSS.escape(id) + '"]');
+			if (block) block.classList.add("is-open");
+			let session = sessionsCache.find((s) => s.id === id);
+			if (!session && block) {
+				session = { id, traces: [], traceCount: 0, status: "ok" };
+			}
+			if (updateHash) setHash("session", id);
+			if (session) renderSessionReplay(session);
+			else {
+				fetch((root.getAttribute("data-sessions-url") || "/ai-flight/api/sessions") + "?limit=50", { headers: { Accept: "application/json" } })
+					.then((r) => r.json())
+					.then((data) => {
+						sessionsCache = Array.isArray(data.sessions) ? data.sessions : [];
+						const s = sessionsCache.find((x) => x.id === id);
+						if (s) renderSessionReplay(s);
+					})
+					.catch(() => {});
+			}
+			markActive();
+		}
+
+		function scheduleDetailPoll(data) {
+			if (detailPollTimer) clearInterval(detailPollTimer);
+			detailPollTimer = null;
+			if (!data || data.status !== "running" || pollSeconds < 1) return;
+			detailPollTimer = setInterval(async () => {
+				if (!selectedId || viewMode !== "trace") return;
+				try {
+					const fresh = await loadDetail(selectedId);
+					if (selectedId !== fresh.id) return;
+					renderDetail(fresh, { preserve: true });
+					if (fresh.status !== "running") {
+						clearInterval(detailPollTimer);
+						detailPollTimer = null;
+					}
+				} catch (e) {}
+			}, pollSeconds * 1000);
+		}
+
+		listEl.addEventListener("click", (ev) => {
+			const toggle = ev.target.closest("[data-session-toggle]");
+			if (toggle) {
+				const sid = toggle.getAttribute("data-session-toggle");
+				const block = toggle.closest(".session-block");
+				if (block) {
+					const opening = !block.classList.contains("is-open");
+					block.classList.toggle("is-open", opening);
+					rememberOpenSessions();
+					if (opening) selectSession(sid, true);
+				}
+				return;
+			}
+			const btn = ev.target.closest(".trace-item");
+			if (!btn) return;
+			selectTrace(btn.getAttribute("data-id"), true);
+		});
+
+		detailEl.addEventListener("click", (ev) => {
+			const copyBtn = ev.target.closest("[data-copy-link]");
+			if (copyBtn) {
+				copyCurrentLink(copyBtn);
+				return;
+			}
+			const exp = ev.target.closest("[data-export]");
+			if (exp) {
+				const kind = exp.getAttribute("data-export");
+				const eid = exp.getAttribute("data-export-id") || "";
+				(async () => {
+					try {
+						if (kind === "trace") {
+							const data = await loadDetail(eid || selectedId);
+							downloadJson("ai-flight-trace-" + (data.id || eid) + ".json", data);
+						} else if (kind === "session") {
+							const base = root.getAttribute("data-session-url") || "/ai-flight/api/session/";
+							const res = await fetch(base + encodeURIComponent(eid || selectedSessionId), { headers: { Accept: "application/json" } });
+							if (!res.ok) throw new Error("session export failed");
+							const data = await res.json();
+							downloadJson("ai-flight-session-" + (data.id || eid) + ".json", data);
+						}
+					} catch (e) {}
+				})();
+				return;
+			}
+			const back = ev.target.closest("[data-back-session]");
+			if (back) {
+				selectSession(back.getAttribute("data-back-session"), true);
+				return;
+			}
+			const sess = ev.target.closest("[data-open-session]");
+			if (sess) {
+				mode = "sessions";
+				document.querySelectorAll(".mode-tab").forEach((t) => {
+					const on = t.getAttribute("data-mode") === "sessions";
+					t.classList.toggle("is-active", on);
+					t.setAttribute("aria-selected", on ? "true" : "false");
+				});
+				listFp = "";
+				pollList().then(() => selectSession(sess.getAttribute("data-open-session"), true));
+				return;
+			}
+			const turn = ev.target.closest(".replay-turn");
+			if (turn) {
+				selectTrace(turn.getAttribute("data-id"), true);
+				return;
+			}
+			const wf = ev.target.closest("[data-wf-id]");
+			if (wf) {
+				const id = wf.getAttribute("data-wf-id");
+				const obs = detailEl.querySelector('.obs[data-obs-id="' + CSS.escape(id) + '"]');
+				if (obs) {
+					obs.classList.add("open");
+					obs.scrollIntoView({ block: "nearest" });
+				}
+				return;
+			}
+			const head = ev.target.closest(".obs-head");
+			if (!head) return;
+			head.parentElement.classList.toggle("open");
+		});
+
+		document.querySelectorAll(".mode-tab").forEach((tab) => {
+			tab.addEventListener("click", () => {
+				mode = tab.getAttribute("data-mode") || "traces";
+				document.querySelectorAll(".mode-tab").forEach((t) => {
+					const on = t === tab;
+					t.classList.toggle("is-active", on);
+					t.setAttribute("aria-selected", on ? "true" : "false");
+				});
+				listFp = "";
+				pollList();
+			});
+		});
+
+		async function pollList() {
+			try {
+				if (mode === "sessions") {
+					const res = await fetch((root.getAttribute("data-sessions-url") || "/ai-flight/api/sessions") + "?limit=50", { headers: { Accept: "application/json" } });
+					if (!res.ok) throw new Error("sessions failed");
+					const data = await res.json();
+					const rows = Array.isArray(data.sessions) ? data.sessions : [];
+					const fp = fingerprint(rows, "sessions");
+					if (fp !== listFp) {
+						listFp = fp;
+						renderSessions(rows);
+						if (viewMode === "session" && selectedSessionId) {
+							const s = rows.find((x) => x.id === selectedSessionId);
+							if (s) renderSessionReplay(s);
+						}
+					} else {
+						hydrateTimes(listEl);
+					}
+				} else {
+					const res = await fetch(buildListUrl(), { headers: { Accept: "application/json" } });
+					if (!res.ok) throw new Error("list failed");
+					const data = await res.json();
+					const rows = Array.isArray(data.traces) ? data.traces : [];
+					const fp = fingerprint(rows, "traces");
+					if (fp !== listFp) {
+						listFp = fp;
+						renderTraces(rows);
+					} else {
+						hydrateTimes(listEl);
+					}
+				}
+				if (liveEl) liveEl.classList.remove("stale");
+			} catch (e) {
+				if (liveEl) liveEl.classList.add("stale");
+			}
+		}
+
+		function idFromHash() {
+			const m = location.hash.match(/^#(trace|session)\/([^/]+)/);
+			if (!m) return null;
+			return { kind: m[1], id: decodeURIComponent(m[2]) };
+		}
+
+		hydrateTimes(listEl);
+		const hash = idFromHash();
+		if (hash && hash.kind === "session") {
+			mode = "sessions";
+			document.querySelectorAll(".mode-tab").forEach((t) => {
+				const on = t.getAttribute("data-mode") === "sessions";
+				t.classList.toggle("is-active", on);
+				t.setAttribute("aria-selected", on ? "true" : "false");
+			});
+			pollList().then(() => selectSession(hash.id, false));
+		} else if (hash && hash.kind === "trace") {
+			selectedId = hash.id;
+			markActive();
+			selectTrace(hash.id, false);
+		} else if (selectedId) {
+			selectTrace(selectedId, true);
+		} else {
+			const first = listEl.querySelector(".trace-item");
+			if (first) selectTrace(first.getAttribute("data-id"), true);
+		}
+
+		if (pollSeconds >= 1) setInterval(pollList, pollSeconds * 1000);
+		setInterval(() => {
+			hydrateTimes(listEl);
+			hydrateTimes(detailEl);
+		}, 30000);
+		window.addEventListener("hashchange", () => {
+			const h = idFromHash();
+			if (!h) return;
+			if (h.kind === "session" && h.id !== selectedSessionId) selectSession(h.id, false);
+			else if (h.kind === "trace" && h.id !== selectedId) selectTrace(h.id, false);
+		});
+	})();
+	</script>
+</body>
+</html>

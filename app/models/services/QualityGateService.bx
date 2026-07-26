@@ -1,0 +1,236 @@
+/**
+ * Evaluates release/quality gate status from corpus runs and configured thresholds.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	property name="evaluationService" inject="EvaluationService";
+
+	property name="findingService" inject="FindingService";
+
+	property name="corpusPath" inject="coldbox:setting:evaluationCorpusPath";
+
+	property name="environment" inject="coldbox:setting:environment";
+
+	property name="supportedLanguageService" inject="SupportedLanguageService";
+
+	function init() {
+		if (
+			isNull(
+				variables.supportedLanguageService ?: javacast( "null", "" )
+			)
+		) {
+			variables.supportedLanguageService = new app.models.services.SupportedLanguageService();
+		}
+		return this;
+	}
+
+	struct function runSeededGate() {
+		var corpus = evaluationService.loadCorpus( corpusPath );
+		var caseResults = [];
+		var passed = true;
+		for ( var corpusCase in corpus.cases ) {
+			var findings = findingService.deterministic( corpusCase.files );
+			var gate = evaluationService.evaluate(
+					corpusCase.expected,
+					findings,
+					corpusCase.files,
+					corpus.thresholds
+				);
+			caseResults.append(
+					{
+						id      : corpusCase.id,
+						passed  : gate.passed,
+						metrics : gate.metrics,
+						failures: gate.failures
+					}
+				);
+			passed = passed && gate.passed;
+		}
+		var gateRun = persist(
+			corpus.version,
+			corpus.language ?: "BoxLang",
+			corpus.capabilityTier ?: "deterministic",
+			passed,
+			{ cases: caseResults, thresholds: corpus.thresholds },
+			caseResults.reduce(
+					( failures, item ) => failures.append( item.failures, true ),
+					[]
+				)
+		);
+		if ( !passed && environment == "production" ) {
+			throw(
+				type    = "EvaluationGateException",
+				message = "The seeded finding-quality gate failed"
+			);
+		}
+		return gateRun;
+	}
+
+	struct function status() {
+		var gates = queryExecute(
+			"
+				SELECT id, corpus_version, language, capability_tier,
+					passed, metrics_json, failures_json, created_at
+				FROM evaluation_gate_runs
+				ORDER BY created_at DESC
+				LIMIT 20
+			",
+			{},
+			{ datasource: datasource }
+		);
+		var capabilities = queryExecute(
+			"
+				SELECT language, capability_tier, corpus_version,
+					gate_run_id, promoted_at
+				FROM language_capabilities
+				ORDER BY language
+			",
+			{},
+			{ datasource: datasource }
+		);
+		return {
+			gates       : queryRows( gates, true ),
+			capabilities: queryRows( capabilities, false )
+		};
+	}
+
+	array function advertisedLanguages( required string parserVersion ) {
+		var promoted = {};
+		var statusValue = status();
+		for ( var item in statusValue.capabilities ) {
+			promoted[ lCase( item.language ) ] = item;
+		}
+		var languages = [];
+		for ( var definition in supportedLanguageService.definitions() ) {
+			var key = lCase( definition.name );
+			if ( promoted.keyExists( key ) ) {
+				languages.append(
+						{
+							name         : definition.name,
+							tier         : promoted[ key ].capabilityTier,
+							corpusVersion: promoted[ key ].corpusVersion,
+							measured     : true
+						}
+					);
+			} else {
+				languages.append(
+						{
+							name    : definition.name,
+							tier    : definition.tier,
+							measured: false
+						}
+					);
+			}
+			if ( definition.name == "BoxLang" ) {
+				languages[ languages.len() ].parserVersion = arguments.parserVersion;
+			}
+		}
+		return languages;
+	}
+
+	private struct function persist(
+		required string corpusVersion,
+		required string language,
+		required string capabilityTier,
+		required boolean passed,
+		required struct metrics,
+		required array failures
+	) {
+		var id = lCase( createUUID() );
+		var createdAt = dateTimeFormat( now(), "iso" );
+		transaction {
+			queryExecute(
+				"
+					INSERT INTO evaluation_gate_runs (
+						id, corpus_version, language, capability_tier,
+						passed, metrics_json, failures_json, created_at
+					) VALUES (
+						:id, :corpusVersion, :language, :capabilityTier,
+						:passed, :metrics, :failures, :createdAt
+					)
+				",
+				{
+					id            : id,
+					corpusVersion : arguments.corpusVersion,
+					language      : arguments.language,
+					capabilityTier: arguments.capabilityTier,
+					passed        : arguments.passed ? 1 : 0,
+					metrics       : jsonSerialize( arguments.metrics ),
+					failures      : jsonSerialize( arguments.failures ),
+					createdAt     : createdAt
+				},
+				{ datasource: datasource }
+			);
+			if ( arguments.passed ) {
+				queryExecute(
+					"
+						INSERT INTO language_capabilities (
+							language, capability_tier, corpus_version,
+							gate_run_id, promoted_at
+						) VALUES (
+							:language, :capabilityTier, :corpusVersion,
+							:id, :createdAt
+						)
+						ON CONFLICT( language ) DO UPDATE SET
+							capability_tier = excluded.capability_tier,
+							corpus_version = excluded.corpus_version,
+							gate_run_id = excluded.gate_run_id,
+							promoted_at = excluded.promoted_at
+					",
+					{
+						id            : id,
+						language      : arguments.language,
+						capabilityTier: arguments.capabilityTier,
+						corpusVersion : arguments.corpusVersion,
+						createdAt     : createdAt
+					},
+					{ datasource: datasource }
+				);
+			}
+		}
+		return {
+			id            : id,
+			corpusVersion : arguments.corpusVersion,
+			language      : arguments.language,
+			capabilityTier: arguments.capabilityTier,
+			passed        : arguments.passed,
+			metrics       : arguments.metrics,
+			failures      : arguments.failures,
+			createdAt     : createdAt
+		};
+	}
+
+	private array function queryRows( required query records, required boolean gateRows ) {
+		var data = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			if ( arguments.gateRows ) {
+				data.append(
+						{
+							id            : records.id[ row ],
+							corpusVersion : records.corpus_version[ row ],
+							language      : records.language[ row ],
+							capabilityTier: records.capability_tier[ row ],
+							passed        : records.passed[ row ] == 1,
+							metrics       : jsonDeserialize( records.metrics_json[ row ] ),
+							failures      : jsonDeserialize( records.failures_json[ row ] ),
+							createdAt     : records.created_at[ row ]
+						}
+					);
+			} else {
+				data.append(
+						{
+							language      : records.language[ row ],
+							capabilityTier: records.capability_tier[ row ],
+							corpusVersion : records.corpus_version[ row ],
+							gateRunId     : records.gate_run_id[ row ],
+							promotedAt    : records.promoted_at[ row ]
+						}
+					);
+			}
+		}
+		return data;
+	}
+}

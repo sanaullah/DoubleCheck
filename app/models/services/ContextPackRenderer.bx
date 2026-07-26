@@ -1,0 +1,271 @@
+/**
+ * Validates, ranks, redacts, and renders complete authorized evidence lines
+ * for chat-only specialist providers.
+ */
+
+@singleton
+class {
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	struct function render(
+		required struct task,
+		required array files,
+		numeric maxCharacters = 14000,
+		struct control        = {}
+	) {
+		var startedAt = getTickCount();
+		var limit = max( 1, int( val( arguments.maxCharacters ) ) );
+		var indexedFiles = indexFiles( arguments.files );
+		var candidates = evidenceCandidates( arguments.task, indexedFiles );
+		var chunks = [];
+		var includedRanges = [];
+		var omittedRanges = [];
+		var used = 0;
+		var redactionCount = 0;
+
+		for ( var candidate in candidates ) {
+			assertNotCancelled( arguments.control );
+			var rendered = renderCandidate(
+				candidate,
+				indexedFiles[ candidate.filePath ],
+				limit - used - ( chunks.len() ? 2 : 0 )
+			);
+			if ( !len( rendered.text ) ) {
+				omittedRanges.append( rangeManifest( candidate ) );
+				continue;
+			}
+			chunks.append( rendered.text );
+			used += len( rendered.text ) + ( chunks.len() > 1 ? 2 : 0 );
+			redactionCount += rendered.redactionCount;
+			var included = rangeManifest( candidate );
+			included.endLine = rendered.endLine;
+			included.truncated = rendered.endLine < candidate.endLine;
+			includedRanges.append( included );
+			if ( included.truncated ) {
+				omittedRanges.append(
+						{
+							filePath : candidate.filePath,
+							startLine: rendered.endLine + 1,
+							endLine  : candidate.endLine,
+							reason   : candidate.reason
+						}
+					);
+			}
+		}
+
+		var text = chunks.toList( char( 10 ) & char( 10 ) );
+		return {
+			version        : "ranked-evidence-pack-v1",
+			text           : text,
+			characters     : len( text ),
+			estimatedTokens: ceiling( len( text ) / 2 ),
+			includedRanges : includedRanges,
+			omittedRanges  : omittedRanges,
+			redactionCount : redactionCount,
+			truncated      : omittedRanges.len() > 0,
+			fingerprint    : stableHash(
+				"ranked-evidence-pack-v1|" & includedRanges.map(
+						( item ) => "#item.filePath#:#item.startLine#-#item.endLine#"
+					).toList( "|" ) & "|" & text
+			),
+			durationMs: getTickCount() - startedAt
+		};
+	}
+
+	private struct function indexFiles( required array files ) {
+		var indexed = {};
+		for ( var file in arguments.files ) {
+			indexed[ normalizePath( file.filePath ) ] = file;
+		}
+		return indexed;
+	}
+
+	private array function evidenceCandidates( required struct task, required struct indexedFiles ) {
+		var candidates = [];
+		var seen = {};
+		for ( var contextFile in arguments
+				.task
+				.context
+				.files ?:
+			[] ) {
+			var filePath = normalizePath( contextFile.filePath ?: "" );
+			validateArtifact(
+				filePath,
+				contextFile,
+				arguments.indexedFiles
+			);
+			for ( var rangeItem in contextFile.ranges ?: [] ) {
+				var startLine = max( 1, int( val( rangeItem.startLine ?: 0 ) ) );
+				var endLine = int( val( rangeItem.endLine ?: 0 ) );
+				var file = arguments.indexedFiles[ filePath ];
+				if ( endLine < startLine || endLine > file.lines.len() ) {
+					throw(
+						type    = "ContextPackPolicyException",
+						message = "Authorized evidence range is invalid"
+					);
+				}
+				var signature = "#filePath#:#startLine#:#endLine#";
+				if ( seen.keyExists( signature ) ) {
+					continue;
+				}
+				seen[ signature ] = true;
+				var reason = primaryReason( rangeItem, contextFile );
+				candidates.append(
+						{
+							filePath : filePath,
+							startLine: startLine,
+							endLine  : endLine,
+							reason   : reason,
+							priority : reasonPriority( reason, arguments.task.role ?: "" )
+						}
+					);
+			}
+		}
+		candidates.sort(
+				( first, second ) => {
+					if ( first.priority != second.priority ) {
+						return second.priority - first.priority;
+					}
+					var pathOrder = compareNoCase( first.filePath, second.filePath );
+					return pathOrder != 0 ? pathOrder : first.startLine - second.startLine;
+				}
+			);
+		return candidates;
+	}
+
+	private struct function renderCandidate(
+		required struct candidate,
+		required struct file,
+		required numeric availableCharacters
+	) {
+		var header = "## #arguments.candidate.filePath#:#arguments.candidate.startLine#-#arguments.candidate.endLine#";
+		if ( arguments.availableCharacters <= len( header ) + 4 ) {
+			return {
+				text          : "",
+				endLine       : arguments.candidate.startLine - 1,
+				redactionCount: 0
+			};
+		}
+		var sourceLines = [];
+		for ( var lineNumber = arguments.candidate.startLine; lineNumber <= arguments.candidate.endLine; lineNumber++ ) {
+			sourceLines.append( arguments.file.lines[ lineNumber ] );
+		}
+		var redacted = secretRedactionService.redactLines( sourceLines );
+		var renderedLines = [];
+		var text = header;
+		var finalLine = arguments.candidate.startLine - 1;
+		for ( var offset = 1; offset <= redacted.lines.len(); offset++ ) {
+			var lineNumber = arguments.candidate.startLine + offset - 1;
+			var renderedLine = "#lineNumber#| #redacted.lines[ offset ]#";
+			var proposed = text & char( 10 ) & renderedLine;
+			if ( len( proposed ) > arguments.availableCharacters ) {
+				break;
+			}
+			text = proposed;
+			renderedLines.append( renderedLine );
+			finalLine = lineNumber;
+		}
+		if ( !renderedLines.len() ) {
+			return {
+				text          : "",
+				endLine       : finalLine,
+				redactionCount: 0
+			};
+		}
+		return {
+			text          : text,
+			endLine       : finalLine,
+			redactionCount: countRedactions( redacted.lines, renderedLines.len() )
+		};
+	}
+
+	private void function validateArtifact(
+		required string filePath,
+		required struct contextFile,
+		required struct indexedFiles
+	) {
+		if (
+			!len( arguments.filePath ) || left( arguments.filePath, 1 ) == "/" || reFind( "^[A-Za-z]:", arguments.filePath ) ||
+					reFind( "(^|/)\.\.(/|$)", arguments.filePath ) ||
+				!arguments.indexedFiles.keyExists( arguments.filePath )
+		) {
+			throw(
+				type    = "ContextPackPolicyException",
+				message = "Evidence path is outside indexed task context"
+			);
+		}
+		if ( arguments.indexedFiles[ arguments.filePath ].contentHash != arguments.contextFile.contentHash ) {
+			throw(
+				type    = "ContextPackPolicyException",
+				message = "Indexed artifact identity does not match task context"
+			);
+		}
+	}
+
+	private string function primaryReason( required struct rangeItem, required struct contextFile ) {
+		if (
+			isArray( arguments.rangeItem.reasons ?: "" ) &&
+				arguments
+					.rangeItem
+					.reasons
+					.len()
+		) {
+			return arguments.rangeItem.reasons[ 1 ];
+		}
+		return arguments.contextFile.reason ?: "supporting-context";
+	}
+
+	private numeric function reasonPriority( required string reason, required string role ) {
+		var priorities = {
+			"changed-symbol" : 100,
+			"changed-file"   : 95,
+			"test-edge"      : 85,
+			"test-impact"    : 80,
+			"dependency-edge": 70,
+			"impact-cone"    : 60
+		};
+		var score = priorities[ arguments.reason ] ?: 40;
+		if ( lCase( arguments.role ) == "testing" && findNoCase( "test", arguments.reason ) ) {
+			score += 20;
+		}
+		return score;
+	}
+
+	private struct function rangeManifest( required struct candidate ) {
+		return {
+			filePath : arguments.candidate.filePath,
+			startLine: arguments.candidate.startLine,
+			endLine  : arguments.candidate.endLine,
+			reason   : arguments.candidate.reason
+		};
+	}
+
+	private numeric function countRedactions( required array lines, required numeric includedCount ) {
+		var count = 0;
+		for ( var index = 1; index <= arguments.includedCount; index++ ) {
+			if ( arguments.lines[ index ] == "[REDACTED SENSITIVE CONTENT]" ) {
+				count++;
+			}
+		}
+		return count;
+	}
+
+	private void function assertNotCancelled( required struct control ) {
+		if ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) {
+			throw( type = "RunCancelled", message = "Run was cancelled" );
+		}
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

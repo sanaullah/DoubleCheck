@@ -1,0 +1,195 @@
+/**
+ * Durable fingerprint-level review decisions and append-only transition events.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	struct function listForProject(
+		required string tenantId,
+		required string projectId,
+		required string projectPath
+	) {
+		var reviews = queryExecute(
+			"
+				SELECT fingerprint, review_state, note, version, updated_by, updated_at
+				FROM finding_reviews
+				WHERE tenant_id = :tenantId
+					AND project_id = :projectId
+					AND project_path = :projectPath
+			",
+			{
+				tenantId   : arguments.tenantId,
+				projectId  : arguments.projectId,
+				projectPath: arguments.projectPath
+			},
+			{ datasource: datasource }
+		);
+		var result = {};
+		for ( var row = 1; row <= reviews.recordCount; row++ ) {
+			result[ lCase( reviews.fingerprint[ row ] ) ] = {
+				state    : reviews.review_state[ row ],
+				note     : reviews.note[ row ],
+				version  : reviews.version[ row ],
+				updatedBy: reviews.updated_by[ row ],
+				updatedAt: reviews.updated_at[ row ],
+				history  : []
+			};
+		}
+		if ( !result.count() ) {
+			return result;
+		}
+		var events = queryExecute(
+			"
+				SELECT fingerprint, run_id, previous_state, review_state,
+					note, version, changed_by, created_at
+				FROM finding_review_events
+				WHERE tenant_id = :tenantId
+					AND project_id = :projectId
+					AND project_path = :projectPath
+				ORDER BY id DESC
+			",
+			{
+				tenantId   : arguments.tenantId,
+				projectId  : arguments.projectId,
+				projectPath: arguments.projectPath
+			},
+			{ datasource: datasource }
+		);
+		for ( var row = 1; row <= events.recordCount; row++ ) {
+			var key = lCase( events.fingerprint[ row ] );
+			if ( result.keyExists( key ) ) {
+				result[ key ].history.append(
+						{
+							runId        : events.run_id[ row ],
+							previousState: events.previous_state[ row ],
+							state        : events.review_state[ row ],
+							note         : events.note[ row ],
+							version      : events.version[ row ],
+							changedBy    : events.changed_by[ row ],
+							createdAt    : events.created_at[ row ]
+						}
+					);
+			}
+		}
+		return result;
+	}
+
+	struct function setState(
+		required string tenantId,
+		required string projectId,
+		required string projectPath,
+		required string fingerprint,
+		required string reviewState,
+		required numeric expectedVersion,
+		string note      = "",
+		string changedBy = "",
+		string runId     = ""
+	) {
+		var nowValue = timestamp();
+		var updated = {};
+		bx:transaction datasource="#datasource#" {
+			var current = queryExecute(
+				"
+					SELECT review_state, version
+					FROM finding_reviews
+					WHERE tenant_id = :tenantId
+						AND project_id = :projectId
+						AND project_path = :projectPath
+						AND fingerprint = :fingerprint
+				",
+				identityParams( arguments ),
+				{ datasource: datasource }
+			);
+			var currentVersion = current.recordCount ? current.version[ 1 ] : 0;
+			var previousState = current.recordCount ? current.review_state[ 1 ] : "";
+			if ( currentVersion != arguments.expectedVersion ) {
+				throw(
+					type    = "FindingReviewConflict",
+					message = "Finding review changed; refresh before saving"
+				);
+			}
+			var nextVersion = currentVersion + 1;
+			queryExecute(
+				"
+					INSERT INTO finding_reviews (
+						tenant_id, project_id, project_path, fingerprint,
+						review_state, note, version, updated_by, updated_at
+					) VALUES (
+						:tenantId, :projectId, :projectPath, :fingerprint,
+						:reviewState, :note, :version, :changedBy, :updatedAt
+					)
+					ON CONFLICT ( tenant_id, project_id, project_path, fingerprint )
+					DO UPDATE SET
+						review_state = excluded.review_state,
+						note = excluded.note,
+						version = excluded.version,
+						updated_by = excluded.updated_by,
+						updated_at = excluded.updated_at
+				",
+				{
+					tenantId   : arguments.tenantId,
+					projectId  : arguments.projectId,
+					projectPath: arguments.projectPath,
+					fingerprint: lCase( arguments.fingerprint ),
+					reviewState: arguments.reviewState,
+					note       : arguments.note,
+					version    : nextVersion,
+					changedBy  : arguments.changedBy,
+					updatedAt  : nowValue
+				},
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO finding_review_events (
+						tenant_id, project_id, project_path, fingerprint,
+						run_id, previous_state, review_state, note,
+						version, changed_by, created_at
+					) VALUES (
+						:tenantId, :projectId, :projectPath, :fingerprint,
+						:runId, :previousState, :reviewState, :note,
+						:version, :changedBy, :createdAt
+					)
+				",
+				{
+					tenantId     : arguments.tenantId,
+					projectId    : arguments.projectId,
+					projectPath  : arguments.projectPath,
+					fingerprint  : lCase( arguments.fingerprint ),
+					runId        : arguments.runId,
+					previousState: previousState,
+					reviewState  : arguments.reviewState,
+					note         : arguments.note,
+					version      : nextVersion,
+					changedBy    : arguments.changedBy,
+					createdAt    : nowValue
+				},
+				{ datasource: datasource }
+			);
+			updated = {
+				state    : arguments.reviewState,
+				note     : arguments.note,
+				version  : nextVersion,
+				updatedBy: arguments.changedBy,
+				updatedAt: nowValue,
+				history  : []
+			};
+		}
+		return updated;
+	}
+
+	private struct function identityParams( required struct source ) {
+		return {
+			tenantId   : arguments.source.tenantId,
+			projectId  : arguments.source.projectId,
+			projectPath: arguments.source.projectPath,
+			fingerprint: lCase( arguments.source.fingerprint )
+		};
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

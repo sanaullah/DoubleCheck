@@ -1,0 +1,192 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"ReportExportService",
+			() => {
+				var service = "";
+				var run = "";
+				var result = "";
+
+				beforeEach(
+					() => {
+						service = new app.models.services.ReportExportService();
+						run = {
+							id          : "run-export-fixture-1",
+							projectPath : "C:/code/demo",
+							mode        : "working-tree",
+							status      : "succeeded",
+							baseRevision: "",
+							headRevision: "",
+							createdAt   : "2026-07-25T10:00:00.000-04:00",
+							completedAt : "2026-07-25T10:01:00.000-04:00"
+						};
+						result = {
+							summary           : "One high-severity finding was retained.",
+							languages         : [ "BoxLang"],
+							filesScanned      : 3,
+							bytesScanned      : 1200,
+							findingsCount     : 1,
+							aiEnabled         : false,
+							aiFilesReviewed   : 0,
+							aiCharactersSent  : 0,
+							reviewScope       : "working-tree",
+							repositoryRevision: "abc123",
+							baseRevision      : "",
+							headRevision      : "",
+							findings          : [
+								{
+									id         : "finding-1",
+									fingerprint: repeatString( "a", 64 ),
+									category   : "security",
+									ruleId     : "secrets/hardcoded-credential",
+									severity   : "high",
+									confidence : .98,
+									title      : "Possible hardcoded credential",
+									message    : "A credential-like value appears embedded in source.",
+									filePath   : "app/models/Insecure.bx",
+									startLine  : 12,
+									endLine    : 12,
+									evidence   : "password = ""super-secret-value""",
+									suggestion : "Move the secret to an environment variable.",
+									source     : "deterministic",
+									playbook   : {
+										steps  : [ "Move the secret to an environment variable."],
+										example: "password = getSystemSetting( ""DB_PASSWORD"" )"
+									},
+									fixPatch: {
+										before    : "password = ""super-secret-value""",
+										after     : "password = getSystemSetting( ""DB_PASSWORD"" )",
+										confidence: .9
+									}
+								}
+							]
+						};
+					}
+				);
+
+				it(
+					"exports stable Markdown with finding location and fingerprint",
+					() => {
+						var report = service.export(
+								run,
+								result,
+								"markdown"
+							);
+						expect( report.format ).toBe( "markdown" );
+						expect( report.contentType ).toInclude( "markdown" );
+						expect( report.fileName ).toBe( "doublecheck-runexportfix.md" );
+						expect( report.content ).toInclude( "## DoubleCheck Review Report" );
+						expect( report.content ).toInclude( "app/models/Insecure.bx:12" );
+						expect( report.content ).toInclude( repeatString( "a", 64 ) );
+						expect( report.content ).toInclude( "Possible hardcoded credential" );
+						expect( report.content ).toInclude( "How to fix" );
+						expect( report.content ).toInclude( "Suggested change" );
+					}
+				);
+
+				it(
+					"exports machine-readable JSON with schema version and findings",
+					() => {
+						var report = service.export(
+								run,
+								result,
+								"json"
+							);
+						expect( report.format ).toBe( "json" );
+						expect( report.contentType ).toBe( "application/json" );
+						var payload = jsonDeserialize( report.content );
+						expect( payload.schemaVersion ).toBe( "doublecheck-report-v1" );
+						expect( payload.run.id ).toBe( "run-export-fixture-1" );
+						expect( payload.findings ).toHaveLength( 1 );
+						expect( payload.findings[ 1 ].fingerprint ).toHaveLength( 64 );
+						expect( payload.findings[ 1 ].filePath ).toBe( "app/models/Insecure.bx" );
+						expect( payload.findings[ 1 ].playbook.steps ).toHaveLength( 1 );
+						expect( payload.findings[ 1 ].fixPatch.after ).toInclude( "getSystemSetting" );
+					}
+				);
+
+				it(
+					"exports SARIF 2.1.0 with mapped severity and fingerprints",
+					() => {
+						var report = service.export(
+								run,
+								result,
+								"sarif"
+							);
+						expect( report.format ).toBe( "sarif" );
+						expect( report.contentType ).toBe( "application/sarif+json" );
+						var payload = jsonDeserialize( report.content );
+						expect( payload.version ).toBe( "2.1.0" );
+						expect( payload.runs ).toHaveLength( 1 );
+						expect( payload.runs[ 1 ]
+								.tool
+								.driver
+								.name ).toBe( "DoubleCheck" );
+						expect( payload.runs[ 1 ].results ).toHaveLength( 1 );
+						expect( payload.runs[ 1 ].results[ 1 ].level ).toBe( "error" );
+						expect( payload.runs[ 1 ].results[ 1 ].ruleId ).toBe( "secrets/hardcoded-credential" );
+						expect( payload.runs[ 1 ].results[ 1 ].fingerprints[ "doublecheck/v1" ] ).toHaveLength( 64 );
+						expect( payload.runs[ 1 ].results[ 1 ].locations[ 1 ]
+								.physicalLocation
+								.region
+								.startLine ).toBe( 12 );
+					}
+				);
+
+				it(
+					"rejects unsupported export formats",
+					() => {
+						expect(
+							() => {
+								service.export(
+										run,
+										result,
+										"xml"
+									);
+							}
+						).toThrow( "ValidationException" );
+					}
+				);
+
+				it(
+					"includes baseline summary when present on the result",
+					() => {
+						result.baseline = {
+							runId    : "prior-run",
+							status   : "succeeded",
+							createdAt: "2026-07-24T10:00:00.000-04:00",
+							counts   : { new: 1, unchanged: 0, fixed: 1 }
+						};
+						result.findings[ 1 ].baselineStatus = "new";
+						result.fixedFindings = [
+							{
+								fingerprint: repeatString( "c", 64 ),
+								title      : "Resolved finding",
+								filePath   : "app/Old.bx",
+								ruleId     : "secrets/hardcoded-credential",
+								severity   : "high"
+							}
+						];
+						var markdown = service.export(
+								run,
+								result,
+								"markdown"
+							).content;
+						expect( markdown ).toInclude( "1 new · 0 unchanged · 1 fixed" );
+						expect( markdown ).toInclude( "prior-run" );
+						expect( markdown ).toInclude( "Baseline status" );
+						var payload = jsonDeserialize( service.export(
+									run,
+									result,
+									"json"
+								).content );
+						expect( payload.baseline.runId ).toBe( "prior-run" );
+						expect( payload.findings[ 1 ].baselineStatus ).toBe( "new" );
+						expect( payload.fixedFindings ).toHaveLength( 1 );
+					}
+				);
+			}
+		);
+	}
+}

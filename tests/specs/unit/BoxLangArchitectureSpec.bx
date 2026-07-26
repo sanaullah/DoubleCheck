@@ -1,0 +1,171 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"BoxLang architecture indexing",
+			() => {
+				it(
+					"extracts BoxLang symbols and dependency edges",
+					() => {
+						var parser = new app.models.services.BoxLangParserService();
+						var file = fixtureFile();
+						var parsed = parser.parse( file );
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var symbolKinds = parsed.symbols.map( ( item ) => item.kind );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+
+						expect( parsed.parserVersion ).toBe( parser.getVersion() );
+						expect( symbolNames ).toInclude( "ReviewHandler" );
+						expect( symbolNames ).toInclude( "reviewService" );
+						expect( symbolNames ).toInclude( "index" );
+						expect( symbolNames ).toInclude( "/api/reviews" );
+						expect( symbolKinds ).toInclude( "handler-action" );
+						expect( dependencyTargets ).toInclude( "BaseHandler" );
+						expect( dependencyTargets ).toInclude( "ReviewService" );
+						expect( dependencyTargets ).toInclude( "app.models.Result" );
+						expect( dependencyTargets ).toInclude( "app.models.Helper" );
+					}
+				);
+
+				it(
+					"reuses parser output by content hash and parser version",
+					() => {
+						var parser = new app.models.services.BoxLangParserService();
+						var file = fixtureFile();
+						var graphRepository = prepareMock( new app.models.repositories.AnalysisGraphRepository() );
+						graphRepository.$( "findCached" ).$results( javacast( "null", "" ), parser.parse( file ) );
+						graphRepository.$( "saveCached" );
+						graphRepository.$(
+								"findBaselineGraph",
+								{ runId: "", symbols: [], dependencies: [] }
+							);
+						graphRepository.$( "replaceRunGraph" );
+
+						var service = prepareMock( new app.models.services.ArchitectureIndexService() );
+						service.$property(
+								"parserService",
+								"variables",
+								parser
+							);
+						service.$property(
+								"graphRepository",
+								"variables",
+								graphRepository
+							);
+						var first = service.index( "run-one", [ file] );
+						var second = service.index( "run-two", [ file] );
+
+						expect( first.parserExecutions ).toBe( 1 );
+						expect( first.cacheHits ).toBe( 0 );
+						expect( second.parserExecutions ).toBe( 0 );
+						expect( second.cacheHits ).toBe( 1 );
+						expect( second.symbolCount ).toBe( first.symbolCount );
+						expect( second.dependencyCount ).toBe( first.dependencyCount );
+					}
+				);
+
+				it(
+					"extracts calls, types, handler actions, and TestBox symbols",
+					() => {
+						var parser = new app.models.services.BoxLangParserService();
+						var lines = [
+							"class extends=""testbox.system.BaseSpec"" {",
+							"property name=""reviewService"" type=""app.models.ReviewService"" inject=""ReviewService"";",
+							"function run() {",
+							"    describe( ""Review service"", () => {",
+							"        it( ""reviews code"", () => reviewService.review() );",
+							"    } );",
+							"}",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "tests/specs/ReviewServiceSpec.bx",
+									language   : "BoxLang",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolKinds = parsed.symbols.map( ( item ) => item.kind );
+						var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+
+						expect( symbolKinds ).toInclude( "test-suite" );
+						expect( symbolKinds ).toInclude( "test" );
+						expect( dependencyKinds ).toInclude( "type-reference" );
+						expect( dependencyKinds ).toInclude( "calls" );
+						expect( dependencyTargets ).toInclude( "reviewService.review" );
+					}
+				);
+
+				it(
+					"builds a bounded transitive reverse-dependency impact cone",
+					() => {
+						var service = prepareMock( new app.models.services.ArchitectureIndexService() );
+						service.$property(
+								"impactMaxDepth",
+								"variables",
+								3
+							);
+						service.$property(
+								"impactMaxNodes",
+								"variables",
+								20
+							);
+						var impacts = service.buildImpactCone(
+								[ "app/models/ReviewService.bx"],
+								[
+									{
+										filePath: "app/models/ReviewService.bx",
+										kind    : "function",
+										name    : "review"
+									}
+								],
+								[
+									{
+										sourceFile: "app/handlers/Reviews.bx",
+										targetFile: "app/models/ReviewService.bx",
+										kind      : "calls"
+									},
+									{
+										sourceFile: "tests/specs/ReviewsSpec.bx",
+										targetFile: "app/handlers/Reviews.bx",
+										kind      : "tests"
+									}
+								]
+							);
+
+						expect( impacts.len() ).toBe( 2 );
+						expect( impacts[ 1 ].changedSymbol ).toBe( "review" );
+						expect( impacts[ 1 ].depth ).toBe( 1 );
+						expect( impacts[ 2 ].depth ).toBe( 2 );
+						expect( impacts[ 2 ].impactedFile ).toBe( "tests/specs/ReviewsSpec.bx" );
+					}
+				);
+			}
+		);
+	}
+
+	private struct function fixtureFile() {
+		var lines = [
+			"class extends=""BaseHandler"" {",
+			"property name=""reviewService"" inject=""ReviewService"";",
+			"import app.models.Helper;",
+			"function index( event, rc, prc ) {",
+			"    var result = new app.models.Result();",
+			"    route( ""/api/reviews"" );",
+			"}",
+			"}"
+		];
+		var content = arrayToList( lines, char( 10 ) );
+		return {
+			filePath   : "app/handlers/ReviewHandler.bx",
+			language   : "BoxLang",
+			contentHash: lCase( hash( content, "SHA-256" ) ),
+			content    : content,
+			lines      : lines
+		};
+	}
+}

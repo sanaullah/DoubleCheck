@@ -1,0 +1,370 @@
+/**
+ * Discovers reviewable source files for working-tree, revision-diff, or full modes.
+ *
+ * @see GitRepositoryService
+ */
+
+@singleton
+class {
+	property name="maxFiles" inject="coldbox:setting:scanMaxFiles";
+
+	property name="maxBytes" inject="coldbox:setting:scanMaxBytes";
+
+	property name="maxFileBytes" inject="coldbox:setting:scanMaxFileBytes";
+
+	property name="maxEntries" inject="coldbox:setting:scanMaxEntries";
+
+	property name="gitRepositoryService" inject="GitRepositoryService";
+
+	property name="supportedLanguageService" inject="SupportedLanguageService";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.ignoredDirectories = [
+		".git",
+		".agents",
+		".ai",
+		".idea",
+		".vscode",
+		".venv",
+		"__pycache__",
+		"node_modules",
+		"vendor",
+		"lib",
+		"runtime",
+		"data",
+		"dist",
+		"build",
+		"coverage"
+	];
+	variables.sensitiveNames = [
+		".env",
+		".env.local",
+		".env.production",
+		"id_rsa",
+		"id_ed25519",
+		"credentials",
+		"credentials.json"
+	];
+	variables.sensitiveExtensions = [
+		"pem",
+		"key",
+		"p12",
+		"pfx",
+		"jks",
+		"keystore"
+	];
+
+	function init() {
+		if (
+			isNull(
+				variables.supportedLanguageService ?: javacast( "null", "" )
+			)
+		) {
+			variables.supportedLanguageService = new app.models.services.SupportedLanguageService();
+		}
+		return this;
+	}
+
+	struct function scan(
+		required string projectPath,
+		string mode         = "working-tree",
+		string baseRevision = "",
+		string headRevision = "HEAD"
+	) {
+		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
+		var supportedExtensions = supportedLanguageService.extensionMap();
+		var candidateResult = candidatePaths(
+			root,
+			arguments.mode,
+			arguments.baseRevision,
+			arguments.headRevision
+		);
+		var files = [];
+		var totalBytes = 0;
+		var skipped = {
+			ignored   : 0,
+			oversized : 0,
+			binary    : 0,
+			unreadable: 0,
+			limit     : 0
+		};
+
+		for ( var candidatePath in candidateResult.paths ) {
+			if ( files.len() >= maxFiles ) {
+				skipped.limit++;
+				continue;
+			}
+			try {
+				var candidate = createObject( "java", "java.io.File" ).init( candidatePath ).getCanonicalFile();
+				var revisionContent = len( candidateResult.contentRevision ?: "" );
+				if ( !candidate.toPath().startsWith( root.toPath() ) || ( !revisionContent && !candidate.isFile() ) ) {
+					skipped.ignored++;
+					continue;
+				}
+
+				var relativePath = normalizePath( root
+						.toPath()
+						.relativize( candidate.toPath() )
+						.toString() );
+				if ( shouldIgnore( relativePath ) ) {
+					skipped.ignored++;
+					continue;
+				}
+
+				var extension = lCase( listLast( relativePath, "." ) );
+				if ( !supportedExtensions.keyExists( extension ) ) {
+					skipped.ignored++;
+					continue;
+				}
+
+				var sizeBytes = 0;
+				var content = "";
+				if ( revisionContent ) {
+					var blob = gitRepositoryService.readBlob(
+							root         = root,
+							revision     = candidateResult.contentRevision,
+							relativePath = relativePath,
+							maxBytes     = maxFileBytes
+						);
+					if ( blob.oversized ) {
+						skipped.oversized++;
+						continue;
+					}
+					if ( !blob.available ) {
+						skipped.unreadable++;
+						continue;
+					}
+					sizeBytes = blob.sizeBytes;
+					content = blob.content;
+				} else {
+					sizeBytes = candidate.length();
+					if ( sizeBytes > maxFileBytes ) {
+						skipped.oversized++;
+						continue;
+					}
+					content = fileRead( candidate.getPath(), "UTF-8" );
+				}
+				if ( totalBytes + sizeBytes > maxBytes ) {
+					skipped.oversized++;
+					continue;
+				}
+				if ( find( char( 0 ), content ) ) {
+					skipped.binary++;
+					continue;
+				}
+				var lines = listToArray(
+					replace(
+						content,
+						char( 13 ),
+						"",
+						"all"
+					),
+					char( 10 ),
+					true,
+					true
+				);
+				files.append(
+						{
+							filePath    : relativePath,
+							absolutePath: revisionContent ? "" : candidate.getPath(),
+							language    : supportedExtensions[ extension ],
+							contentHash : lCase( hash( content, "SHA-256" ) ),
+							sizeBytes   : sizeBytes,
+							lineCount   : max( 1, lines.len() ),
+							content     : content,
+							lines       : lines
+						}
+					);
+				totalBytes += sizeBytes;
+			} catch (any error) {
+				skipped.unreadable++;
+				if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+					log.warn(
+							"Repository file could not be indexed",
+							{
+								path      : toString( candidatePath ),
+								type      : error.type ?: "",
+								message   : secretRedactionService.redactText( error.message ?: "" ),
+								stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+							}
+						);
+				}
+			}
+		}
+
+		var languages = [];
+		files.each(
+				( file ) => {
+					if ( !languages.contains( file.language ) ) {
+						languages.append( file.language );
+					}
+				}
+			);
+		languages.sort( "textnocase" );
+		return {
+			files             : files,
+			languages         : languages,
+			totalBytes        : totalBytes,
+			skipped           : skipped,
+			scope             : candidateResult.scope,
+			gitAvailable      : candidateResult.gitAvailable,
+			discoveryTruncated: candidateResult.discoveryTruncated ?: false,
+			baseRevision      : candidateResult.baseRevision ?: "",
+			headRevision      : candidateResult.headRevision ?: "",
+			repositoryRevision: candidateResult.repositoryRevision ?: "",
+			error             : candidateResult.error ?: ""
+		};
+	}
+
+	private struct function candidatePaths(
+		required any root,
+		required string mode,
+		required string baseRevision,
+		required string headRevision
+	) {
+		if ( lCase( arguments.mode ) == "working-tree" ) {
+			var changes = gitRepositoryService.workingTreePaths( arguments.root, maxEntries );
+			if ( changes.available ) {
+				return {
+					paths             : changes.paths,
+					scope             : "working-tree",
+					gitAvailable      : true,
+					discoveryTruncated: changes.truncated,
+					repositoryRevision: changes.repositoryRevision
+				};
+			}
+			return {
+				paths             : [],
+				scope             : "working-tree-unavailable",
+				gitAvailable      : false,
+				discoveryTruncated: false
+			};
+		}
+		if ( lCase( arguments.mode ) == "revision-diff" ) {
+			var revisionDiff = gitRepositoryService.revisionPaths(
+					root         = arguments.root,
+					baseRevision = arguments.baseRevision,
+					headRevision = arguments.headRevision,
+					maxEntries   = maxEntries
+				);
+			return {
+				paths             : revisionDiff.paths,
+				scope             : revisionDiff.available ? "revision-diff" : "revision-diff-unavailable",
+				gitAvailable      : revisionDiff.available,
+				discoveryTruncated: revisionDiff.truncated,
+				baseRevision      : revisionDiff.baseRevision,
+				headRevision      : revisionDiff.headRevision,
+				repositoryRevision: revisionDiff.repositoryRevision,
+				contentRevision   : revisionDiff.headRevision,
+				error             : revisionDiff.error
+			};
+		}
+
+		var gitFiles = gitRepositoryService.fullPaths( arguments.root, maxEntries );
+		if ( gitFiles.available ) {
+			return {
+				paths             : gitFiles.paths,
+				scope             : "full-git",
+				gitAvailable      : true,
+				discoveryTruncated: gitFiles.truncated,
+				repositoryRevision: gitFiles.repositoryRevision
+			};
+		}
+		return discoverPaths( arguments.root );
+	}
+
+	private struct function discoverPaths( required any root ) {
+		var supportedExtensions = supportedLanguageService.extensionMap();
+		var directories = [ arguments.root];
+		var paths = [];
+		var visited = {};
+		var inspectedEntries = 0;
+		var truncated = false;
+
+		while ( directories.len() && inspectedEntries < maxEntries ) {
+			var directory = directories[ 1 ];
+			arrayDeleteAt( directories, 1 );
+			var canonicalDirectory = directory.getCanonicalFile();
+			var directoryKey = lCase( canonicalDirectory.getPath() );
+			if ( visited.keyExists( directoryKey ) ) {
+				continue;
+			}
+			visited[ directoryKey ] = true;
+
+			var listing = directoryList(
+				canonicalDirectory.getPath(),
+				false,
+				"query"
+			);
+			for ( var row = 1; row <= listing.recordCount; row++ ) {
+				inspectedEntries++;
+				if ( inspectedEntries > maxEntries ) {
+					truncated = true;
+					break;
+				}
+
+				var candidate = createObject( "java", "java.io.File" ).init( listing.directory[ row ] & "/" & listing.name[ row ] );
+				var canonicalCandidate = candidate.getCanonicalFile();
+				if ( !canonicalCandidate.toPath().startsWith( arguments.root.toPath() ) ) {
+					continue;
+				}
+				var relativePath = normalizePath( arguments
+						.root
+						.toPath()
+						.relativize( canonicalCandidate.toPath() )
+						.toString() );
+				if ( shouldIgnore( relativePath ) ) {
+					continue;
+				}
+				if ( lCase( listing.type[ row ] ) == "dir" ) {
+					directories.append( canonicalCandidate );
+					continue;
+				}
+				if ( lCase( listing.type[ row ] ) == "file" ) {
+					var extension = lCase( listLast( canonicalCandidate.getName(), "." ) );
+					if ( supportedExtensions.keyExists( extension ) ) {
+						paths.append( canonicalCandidate.getPath() );
+					}
+				}
+			}
+		}
+		if ( directories.len() ) {
+			truncated = true;
+		}
+		return {
+			paths             : paths,
+			scope             : "full",
+			gitAvailable      : directoryExists( arguments.root.getPath() & "/.git" ),
+			discoveryTruncated: truncated
+		};
+	}
+
+	private boolean function shouldIgnore( required string relativePath ) {
+		var normalized = "/" & lCase( normalizePath( arguments.relativePath ) ) & "/";
+		if ( left( normalized, len( "/resources/codeinsight/" ) ) == "/resources/codeinsight/" ) {
+			return true;
+		}
+		for ( var directory in variables.ignoredDirectories ) {
+			if ( find( "/#lCase( directory )#/", normalized ) ) {
+				return true;
+			}
+		}
+		var fileName = lCase( listLast( normalizePath( arguments.relativePath ), "/" ) );
+		if ( variables.sensitiveNames.contains( fileName ) || left( fileName, 5 ) == ".env." ) {
+			return true;
+		}
+		var extension = listLen( fileName, "." ) > 1 ? listLast( fileName, "." ) : "";
+		return variables.sensitiveExtensions.contains( extension );
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+}

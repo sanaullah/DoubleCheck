@@ -1,0 +1,246 @@
+/**
+ * Derives deterministic architecture facts from the graph and scanned files.
+ */
+
+@singleton
+class {
+	property name="factLimit" inject="coldbox:setting:architectureFactLimit";
+	variables.modelVersion = "architecture-model-v1";
+	variables.factLimit = 500;
+
+	app.models.domain.ArchitectureModel function build( required struct graph, required array files, string repositoryRevision = "" ) {
+		var facts = [];
+		var componentFiles = {};
+		var limit = numericSetting( variables.factLimit, 500 );
+
+		for ( var file in arguments.files ) {
+			var component = classifyFile( file.filePath );
+			if ( !componentFiles.keyExists( component ) ) {
+				componentFiles[ component ] = [];
+			}
+			componentFiles[ component ].append( file.filePath );
+			if ( facts.len() < limit ) {
+				facts.append(
+						fact(
+							"file",
+							file.filePath,
+							"#file.filePath# is classified as #component#.",
+							[
+								evidence(
+									file.filePath,
+									1,
+									"",
+									file.contentHash
+								)
+							]
+						)
+					);
+			}
+		}
+
+		var symbolFacts = 0;
+		for ( var item in arguments.graph.symbols ) {
+			if ( facts.len() >= limit ) {
+				break;
+			}
+			facts.append(
+					fact(
+						"symbol/#item.kind#",
+						item.name,
+						symbolStatement( item ),
+						[
+							evidence(
+								item.filePath,
+								item.line,
+								item.id,
+								""
+							)
+						]
+					)
+				);
+			symbolFacts++;
+		}
+
+		var dependencyFacts = 0;
+		for ( var edge in arguments.graph.dependencies ) {
+			if ( facts.len() >= limit ) {
+				break;
+			}
+			if ( !len( edge.targetFile ?: "" ) ) {
+				continue;
+			}
+			facts.append(
+					fact(
+						"dependency/#edge.kind#",
+						"#edge.sourceFile# -> #edge.targetFile#",
+						"#edge.sourceFile# #edge.kind# #edge.targetFile#.",
+						[
+							evidence(
+								edge.sourceFile,
+								edge.line,
+								edge.id,
+								""
+							)
+						]
+					)
+				);
+			dependencyFacts++;
+		}
+
+		var components = [];
+		var componentNames = componentFiles.keyArray();
+		componentNames.sort( "textnocase" );
+		for ( var name in componentNames ) {
+			var paths = componentFiles[ name ];
+			paths.sort( "textnocase" );
+			components.append(
+					{
+						id       : stableHash( "component:#name#" ),
+						name     : name,
+						fileCount: paths.len(),
+						files    : paths
+					}
+				);
+		}
+		var summary = {
+			componentCount : components.len(),
+			factCount      : facts.len(),
+			fileFacts      : min( arguments.files.len(), limit ),
+			symbolFacts    : symbolFacts,
+			dependencyFacts: dependencyFacts,
+			inferredFacts  : 0,
+			truncated      : facts.len() >= limit &&
+				(
+					arguments.files.len() +
+								arguments
+									.graph
+									.symbols
+									.len() +
+							arguments
+								.graph
+								.dependencies
+								.len() >
+						limit
+				)
+		};
+		var fingerprint = stableHash( variables.modelVersion & "|" & arguments.repositoryRevision & "|" & facts.map( ( item
+						 ) => item.id ).toList( "," ) & "|" & arguments
+				.files
+				.map( ( file ) => file.contentHash )
+				.toList( "," ) );
+		return new app.models.domain.ArchitectureModel(
+			{
+				version           : variables.modelVersion,
+				fingerprint       : fingerprint,
+				repositoryRevision: arguments.repositoryRevision,
+				facts             : facts,
+				components        : components,
+				summary           : summary,
+				enrichment        : {
+					enabled   : false,
+					used      : false,
+					version   : "",
+					provider  : "",
+					model     : "",
+					addedFacts: 0,
+					error     : ""
+				}
+			}
+		);
+	}
+
+	private struct function fact(
+		required string type,
+		required string name,
+		required string statement,
+		required array evidenceRecords
+	) {
+		var firstEvidence = arguments.evidenceRecords[ 1 ];
+		return {
+			id       : stableHash(
+				"#arguments.type#:#arguments.name#:#"#firstEvidence.filePath#:#firstEvidence.line#"#"
+			),
+			type     : arguments.type,
+			name     : arguments.name,
+			statement: arguments.statement,
+			inferred : false,
+			origin   : "deterministic",
+			evidence : arguments.evidenceRecords
+		};
+	}
+
+	private struct function evidence(
+		required string filePath,
+		required numeric line,
+		required string recordId,
+		required string contentHash
+	) {
+		return {
+			filePath   : arguments.filePath,
+			line       : arguments.line,
+			recordId   : arguments.recordId,
+			contentHash: arguments.contentHash
+		};
+	}
+
+	private string function symbolStatement( required struct item ) {
+		switch ( arguments.item.kind ) {
+			case "handler-action":
+				return "#arguments.item.name# is a ColdBox handler action in #arguments.item.filePath#.";
+			case "route":
+				return "#arguments.item.name# is a declared route in #arguments.item.filePath#.";
+			case "test":
+				return "#arguments.item.name# is a TestBox test in #arguments.item.filePath#.";
+			case "test-suite":
+				return "#arguments.item.name# is a TestBox suite in #arguments.item.filePath#.";
+			default:
+				return "#arguments.item.name# is a #arguments.item.kind# declared in #arguments.item.filePath#.";
+		}
+	}
+
+	private string function classifyFile( required string filePath ) {
+		var path = lCase(
+			replace(
+				arguments.filePath,
+				"\",
+				"/",
+				"all"
+			)
+		);
+		if ( reFind( "(^|/)tests?/", path ) ) {
+			return "tests";
+		}
+		if ( reFind( "(^|/)handlers?/", path ) ) {
+			return "http-handlers";
+		}
+		if ( reFind( "(^|/)models?/", path ) ) {
+			return "application-models";
+		}
+		if ( reFind( "(^|/)config/", path ) ) {
+			return "configuration";
+		}
+		if ( reFind( "(^|/)docs?/", path ) ) {
+			return "documentation";
+		}
+		if (
+			reFind(
+				"(^|/)(box|server|package|composer|pom)\.(json|xml)$",
+				path
+			)
+		) {
+			return "manifests";
+		}
+		if ( reFind( "(^|/)public/|(^|/)application\.bx$", path ) ) {
+			return "entry-points";
+		}
+		return "other";
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

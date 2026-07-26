@@ -1,0 +1,93 @@
+/**
+ * Produces an explicit, deterministic account of specialist coverage and remaining gaps.
+ */
+
+@singleton
+class {
+
+	struct function assess( required struct result ) {
+		var tasks = arguments
+				.result
+				.plan
+				.tasks ?:
+			[];
+		var outcomes = arguments
+				.result
+				.specialists
+				.results ?:
+			[];
+		var outcomeByTask = {};
+		for ( var outcome in outcomes ) {
+			outcomeByTask[ outcome.taskId ?: "" ] = outcome;
+		}
+		var covered = [];
+		var gaps = [];
+		var roles = {};
+		for ( var task in tasks ) {
+			var taskId = task.id ?: task.taskId ?: "";
+			var role = task.role ?: "general";
+			roles[ role ] = roles[ role ] ?: { planned: 0, completed: 0, failed: 0 };
+			roles[ role ].planned++;
+			if ( outcomeByTask.keyExists( taskId ) && outcomeByTask[ taskId ].status == "succeeded" ) {
+				roles[ role ].completed++;
+				covered.append(
+						{
+							taskId: taskId,
+							role  : role,
+							files : task.files ?: task.targetFiles ?: [],
+							status: "covered"
+						}
+					);
+			} else {
+				roles[ role ].failed++;
+				gaps.append(
+						{
+							taskId: taskId,
+							role  : role,
+							files : task.files ?: task.targetFiles ?: [],
+							reason: outcomeByTask.keyExists( taskId )
+								? ( outcomeByTask[ taskId ].error ?: "Specialist task did not succeed" )
+								: "No specialist outcome was retained"
+						}
+					);
+			}
+		}
+		if ( arguments.result.discoveryTruncated ?: false ) {
+			gaps.append(
+					{
+						taskId: "",
+						role  : "discovery",
+						files : [],
+						reason: "Repository discovery reached its configured limit"
+					}
+				);
+		}
+		var planned = tasks.len();
+		return {
+			version          : "coverage-v1",
+			plannedTasks     : planned,
+			completedTasks   : covered.len(),
+			gapCount         : gaps.len(),
+			completionPercent: planned ? int( ( covered.len() / planned ) * 100 ) : 100,
+			roles            : roles,
+			covered          : covered,
+			gaps             : gaps,
+			followUp         : {
+				available: gaps.len() > 0,
+				maxTasks : min( 3, gaps.len() ),
+				roles    : gaps
+					.map( ( gap ) => gap.role )
+					.filter( ( role ) => role != "discovery" )
+					.reduce(
+						( unique, role ) => {
+							if ( !unique.contains( role ) ) {
+								unique.append( role );
+							}
+							return unique;
+						},
+						[]
+					)
+			}
+		};
+	}
+}

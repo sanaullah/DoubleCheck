@@ -1,0 +1,297 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"AiFlight TraceStoreService",
+			() => {
+				beforeEach(
+					() => {
+						variables.dbFile = getTempDirectory() & "ai-flight-test-#createUUID()#.db";
+						variables.store = new aiFlight.models.TraceStoreService();
+						variables.store.moduleSettings = {
+							dbPath      : variables.dbFile,
+							maxTraces   : 5,
+							previewChars: 2000,
+							environment : "local"
+						};
+						variables.store.onDIComplete();
+						variables.store.ensureSchema();
+					}
+				);
+
+				afterEach(
+					() => {
+						try {
+							if ( fileExists( variables.dbFile ) ) {
+								fileDelete( variables.dbFile );
+							}
+						} catch (any e) {
+
+
+							// ignore locked files on Windows
+						}
+					}
+				);
+
+				it(
+					"creates traces and nested observations then lists them",
+					() => {
+						var trace = variables.store.createTrace(
+								{
+									name        : "chat",
+									provider    : "openai",
+									model       : "test-model",
+									inputPreview: "hi"
+								}
+							);
+						expect( trace.id ).notToBeEmpty();
+						expect( trace.status ).toBe( "running" );
+
+						variables.store.upsertObservation(
+								{
+									traceId    : trace.id,
+									type       : "generation",
+									name       : "chat",
+									status     : "ok",
+									inputText  : "hi",
+									outputText : "hello",
+									sourceEvent: "onAIChatResponse",
+									usage      : {
+										promptTokens    : 3,
+										completionTokens: 2,
+										totalTokens     : 5,
+										cost            : .0012
+									},
+									endTime: dateTimeFormat( now(), "yyyy-mm-dd'T'HH:nn:ss" ) & "Z"
+								}
+							);
+
+						variables.store.completeTrace(
+								id            = trace.id,
+								status        = "ok",
+								outputPreview = "hello",
+								durationMs    = 1500,
+								usage         = { promptTokens: 3, completionTokens: 2, totalTokens: 5 }
+							);
+
+						var listed = variables.store.listTraces( limit = 10 );
+						expect( listed ).toHaveLength( 1 );
+						expect( listed[ 1 ].observationCount ).toBe( 1 );
+						expect( listed[ 1 ].durationMs ).toBe( 1500 );
+						expect( val( listed[ 1 ].cost ) ).toBeGT( 0 );
+						expect( listed[ 1 ].environment ).toBe( "local" );
+
+						var detail = variables.store.getTraceDetail( trace.id );
+						expect( detail.observations ).toHaveLength( 1 );
+						expect( detail.observations[ 1 ].type ).toBe( "generation" );
+						expect( detail.status ).toBe( "ok" );
+						expect( detail.totalTokens ).toBe( 5 );
+					}
+				);
+
+				it(
+					"filters by model environment userId obsType duration and minCost",
+					() => {
+						var a = variables.store.createTrace(
+								{
+									name       : "a",
+									model      : "deepseek-v4",
+									userId     : "u1",
+									environment: "staging",
+									status     : "ok"
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									traceId: a.id,
+									type   : "tool",
+									name   : "tool:x",
+									status : "ok",
+									usage  : { cost: .05 }
+								}
+							);
+						variables.store.completeTrace(
+								id         = a.id,
+								status     = "ok",
+								durationMs = 2000
+							);
+
+						var b = variables.store.createTrace(
+								{
+									name       : "b",
+									model      : "gpt-test",
+									userId     : "u2",
+									environment: "local",
+									status     : "ok"
+								}
+							);
+						variables.store.completeTrace(
+								id         = b.id,
+								status     = "ok",
+								durationMs = 100
+							);
+
+						expect( arrayLen( variables.store.listTraces() ) ).toBe( 2 );
+						expect( arrayLen( variables.store.listTraces( model = "deep" ) ) ).toBe( 1, "model prefix" );
+						expect(
+							arrayLen( variables.store.listTraces( environment = "staging" ) )
+						).toBe( 1, "environment" );
+						expect( arrayLen( variables.store.listTraces( userId = "u2" ) ) ).toBe( 1, "userId" );
+						expect(
+							arrayLen( variables.store.listTraces( obsType = "tool" ) )
+						).toBe( 1, "obsType" );
+						expect(
+							arrayLen( variables.store.listTraces( minDurationMs = 1500 ) )
+						).toBe( 1, "minDuration" );
+						expect(
+							arrayLen( variables.store.listTraces( maxDurationMs = 500 ) )
+						).toBe( 1, "maxDuration" );
+						expect( arrayLen( variables.store.listTraces( minCost = .01 ) ) ).toBe( 1, "minCost" );
+					}
+				);
+
+				it(
+					"returns a session by id with member traces",
+					() => {
+						variables.store.createTrace( { name: "t1", sessionId: "sess-x" } );
+						variables.store.createTrace( { name: "t2", sessionId: "sess-x" } );
+						var sess = variables.store.getSession( "sess-x" );
+						expect( sess.id ).toBe( "sess-x" );
+						expect( sess.traceCount ).toBe( 2 );
+						expect( arrayLen( sess.traces ) ).toBe( 2 );
+					}
+				);
+
+				it(
+					"prunes oldest traces beyond maxTraces",
+					() => {
+						for ( var i = 1; i <= 7; i++ ) {
+							variables.store.createTrace( { name: "t#i#" } );
+						}
+						var listed = variables.store.listTraces( limit = 20 );
+						expect( arrayLen( listed ) ).toBeLTE( 5 );
+					}
+				);
+
+				it(
+					"groups traces into sessions by session_id",
+					() => {
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-a" } );
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-a" } );
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-b" } );
+						var sessions = variables.store.listSessions( limit = 10 );
+						expect( arrayLen( sessions ) ).toBeGTE( 2 );
+						var sessA = sessions.filter( ( s ) => s.id == "sess-a" );
+						expect( arrayLen( sessA ) ).toBe( 1 );
+						expect( sessA[ 1 ].traceCount ).toBe( 2 );
+						expect( arrayLen( sessA[ 1 ].traces ) ).toBe( 2 );
+					}
+				);
+
+				it(
+					"finds latest running trace and running generation for recovery",
+					() => {
+						var old = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "conv-1",
+									status   : "running"
+								}
+							);
+						var fresh = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "conv-1",
+									status   : "running"
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-run",
+									traceId    : fresh.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest"
+								}
+							);
+						var found = variables.store.findLatestRunningTrace( sessionId = "conv-1", name = "generate-response" );
+						expect( found.id ).toBe( fresh.id );
+						var gen = variables.store.findRunningGeneration( fresh.id );
+						expect( gen.id ).toBe( "obs-run" );
+						expect( gen.status ).toBe( "running" );
+						expect( old.id ).notToBe( found.id );
+					}
+				);
+
+				it(
+					"abandons stale running traces and their open observations",
+					() => {
+						variables
+							.store
+							.moduleSettings
+							.staleRunningMinutes = 5;
+						var staleAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-30,
+								now()
+							),
+							"yyyy-mm-dd'T'HH:nn:ss"
+						) & "Z";
+						var freshAt = dateTimeFormat( now(), "yyyy-mm-dd'T'HH:nn:ss" ) & "Z";
+						var emptyAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-2,
+								now()
+							),
+							"yyyy-mm-dd'T'HH:nn:ss"
+						) & "Z";
+						var stale = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-stale",
+									status   : "running",
+									startedAt: staleAt
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-stale",
+									traceId    : stale.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest",
+									startTime  : staleAt
+								}
+							);
+						var emptyShell = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-empty",
+									status   : "running",
+									startedAt: emptyAt
+								}
+							);
+						var fresh = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-fresh",
+									status   : "running",
+									startedAt: freshAt
+								}
+							);
+						var abandoned = variables.store.abandonStaleRunningTraces( force = true );
+						expect( abandoned ).toBeGTE( 2 );
+						expect( variables.store.getTrace( stale.id ).status ).toBe( "error" );
+						expect( variables.store.getObservation( "obs-stale" ).status ).toBe( "error" );
+						expect( variables.store.getTrace( emptyShell.id ).status ).toBe( "error" );
+						expect( variables.store.getTrace( fresh.id ).status ).toBe( "running" );
+					}
+				);
+			}
+		);
+	}
+}
