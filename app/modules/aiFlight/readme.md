@@ -3,7 +3,7 @@
 Local **Langfuse-style** observability for [bx-ai](https://ai.ortusbooks.com/) interceptor events.
 
 ColdBox module folder: `app/modules/aiFlight/` (no hyphens in the folder name).  
-Public URL entry point: `/ai-flight/`.
+Public URL entry point: `/aiflight/`.
 
 It listens via `BoxRegisterInterceptor` to bx-ai `BoxAnnounce` points, stores traces in **module-owned SQLite**, and serves a desktop explorer.
 
@@ -14,11 +14,11 @@ It listens via `BoxRegisterInterceptor` to bx-ai `BoxAnnounce` points, stores tr
 3. In the host router, register module routing (if not already done by the module entryPoint):
 
 ```boxlang
-route( "/ai-flight" ).toModuleRouting( "aiFlight" );
+route( "/aiflight" ).toModuleRouting( "aiFlight" );
 ```
 
 4. Reinit ColdBox (`?fwreinit=1`).
-5. Open `/ai-flight/`.
+5. Open `/aiflight/`.
 6. Run any `aiChat()` / agent / tool call — traces appear automatically.
 
 ## Settings
@@ -50,7 +50,7 @@ moduleSettings = {
 ## Security
 
 - API keys and auth headers are redacted before persistence.
-- The viewer has **no auth** — protect `/ai-flight/` on shared hosts.
+- The viewer has **no auth** — protect `/aiflight/` on shared hosts.
 - Independent of any host app’s review/observability pipeline.
 
 ## Non-goals
