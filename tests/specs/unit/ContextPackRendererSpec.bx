@@ -3,7 +3,80 @@ class extends="testbox.system.BaseSpec" {
 	function run() {
 		describe( "ContextPackRenderer", () => {
 			it(
-				"prioritizes emphasized-scanned-file ranges over changed-symbol under budget",
+				"prioritizes emphasized-scanned-file ranges over lower-priority reasons under budget",
+				() => {
+					var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
+					renderer.$property(
+						"secretRedactionService",
+						"variables",
+						new app.models.services.SecretRedactionService()
+					);
+					var emphasizedPath = "emphasized/file.bx";
+					var impactPath = "impact/file.bx";
+					var emphasizedLines = [];
+					var impactLines = [];
+					for ( var index = 1; index <= 20; index++ ) {
+						emphasizedLines.append( repeatString( "x", 50 ) );
+						impactLines.append( repeatString( "y", 50 ) );
+					}
+					var files = [
+						{
+							filePath   : emphasizedPath,
+							contentHash: "hash-emphasized",
+							lines      : emphasizedLines
+						},
+						{
+							filePath   : impactPath,
+							contentHash: "hash-impact",
+							lines      : impactLines
+						}
+					];
+					var task = {
+						role   : "security",
+						context: {
+							files: [
+								{
+									filePath   : impactPath,
+									contentHash: "hash-impact",
+									reason     : "impact-cone",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "impact-cone"]
+										}
+									]
+								},
+								{
+									filePath   : emphasizedPath,
+									contentHash: "hash-emphasized",
+									reason     : "emphasized-scanned-file",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "emphasized-scanned-file"]
+										}
+									]
+								}
+							]
+						}
+					};
+					var result = renderer.render( task, files, 600 );
+
+					expect( result.includedRanges ).notToBeEmpty();
+					expect( result.includedRanges[ 1 ].reason ).toBe( "emphasized-scanned-file" );
+					expect(
+						result.includedRanges.map( ( item ) => item.reason )
+					).notToInclude( "impact-cone" );
+					expect(
+						result.omittedRanges.map( ( item ) => item.reason )
+					).toInclude( "impact-cone" );
+				}
+			);
+
+			it(
+				"does not let emphasized-scanned-file outrank a changed-line range under budget",
 				() => {
 					var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
 					renderer.$property(
@@ -38,12 +111,12 @@ class extends="testbox.system.BaseSpec" {
 								{
 									filePath   : changedPath,
 									contentHash: "hash-changed",
-									reason     : "changed-symbol",
+									reason     : "changed-line",
 									ranges     : [
 										{
 											startLine: 1,
 											endLine  : 20,
-											reasons  : [ "changed-symbol"]
+											reasons  : [ "changed-line"]
 										}
 									]
 								},
@@ -65,13 +138,13 @@ class extends="testbox.system.BaseSpec" {
 					var result = renderer.render( task, files, 600 );
 
 					expect( result.includedRanges ).notToBeEmpty();
-					expect( result.includedRanges[ 1 ].reason ).toBe( "emphasized-scanned-file" );
+					expect( result.includedRanges[ 1 ].reason ).toBe( "changed-line" );
 					expect(
 						result.includedRanges.map( ( item ) => item.reason )
-					).notToInclude( "changed-symbol" );
+					).notToInclude( "emphasized-scanned-file" );
 					expect(
 						result.omittedRanges.map( ( item ) => item.reason )
-					).toInclude( "changed-symbol" );
+					).toInclude( "emphasized-scanned-file" );
 				}
 			);
 		} );
