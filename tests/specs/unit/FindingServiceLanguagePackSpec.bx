@@ -1,0 +1,49 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "FindingService language packs", () => {
+			it( "does not flag JS dynamic execution in CFML source", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Widget.cfc",
+						language: "CFML",
+						lines   : [ "var x = eval( userInput );", "queryExecute( ""SELECT * FROM t WHERE id = ##id##"" );" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "execution/dynamic-code" );
+				expect( ruleIds ).toInclude( "database/query-interpolation" );
+			} );
+
+			it( "does not flag queryExecute interpolation in JavaScript", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "public/assets/demo.js",
+						language: "JavaScript",
+						lines   : [ "queryExecute( 'SELECT * FROM t WHERE id = ##id##' );", "eval( code );" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "database/query-interpolation" );
+				expect( ruleIds ).toInclude( "execution/dynamic-code" );
+			} );
+
+			it( "still flags secrets and TODO markers in any supported language", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "src/Main.java",
+						language: "Java",
+						lines   : [ "String password = ""hunter2password"";", "// TODO: fix later" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "secrets/hardcoded-credential" );
+				expect( ruleIds ).toInclude( "maintenance/open-marker" );
+			} );
+		} );
+	}
+
+}
