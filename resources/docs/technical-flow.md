@@ -204,15 +204,30 @@ Modes: `full` (default), `working-tree`, `revision-diff`.
 
 | Phase | Service(s) | What happens |
 |---|---|---|
-| `indexing` | `RepositoryScannerService`, `GitRepositoryService` | Discover files for the selected mode |
+| `indexing` | `RepositoryScannerService`, `GitRepositoryService` | Discover files for the selected mode; **skip counts** (`oversized`, `limit`, …) and `discoveryTruncated` persist on the run result, UI, export, and coverage assessment |
 | `architecture-index` | `ArchitectureIndexService`, `BoxLangParserService` | Build BoxLang symbol/dependency graph |
-| `architecture-planning` | `ArchitectureModelService`, enrichment/diff, `CrewPlannerService`, `ReviewPlannerService`, `ContextPackService` | Architecture facts + plan + context budgets |
-| `deterministic-analysis` | `FindingService.deterministic` | Rule-based findings (no AI key required) |
+| `architecture-planning` | `ArchitectureModelService`, enrichment/diff, `CrewPlannerService`, `ReviewPlannerService`, `ContextPackService` | Architecture facts + plan + context budgets; deterministic roles get **`emphasizeFiles`** without LLM; context packs prefer **changed-line** ranges when Git supplies them (`symbol-range-artifact-refs-v3`) |
+| `deterministic-analysis` | `FindingService.deterministic` | **Language-scoped** rule packs (shared, JavaScript, CFML/BoxLang); no AI key required |
 | `specialist-review` | `SpecialistReviewService` → gateway → chat; or `AIReviewService` fallback | Optional LLM deepening |
 | `verifying` | `ReviewResultRepository` | Persist findings + summary + fingerprints |
 | `completed` | `FindingBaselineService` (on **read**) | Result API attaches new/unchanged/fixed vs prior run |
 
 Cancel: `DELETE /api/v1/runs/:id` sets a cancel flag; `executeRun` checks between phases.
+
+### Review focus & coverage honesty
+
+Recent pipeline tightening (see
+[`plans/2026-07-27-review-focus-improvements.md`](plans/2026-07-27-review-focus-improvements.md)):
+
+| Area | Behavior |
+|---|---|
+| **Language-scoped rules** | `FindingService.deterministic` applies packs by file `language`: shared rules (secrets, open markers) on all supported languages; `execution/dynamic-code` on JavaScript only; `database/query-interpolation` and CF-style empty-catch on CFML/BoxLang; JS empty-catch on JavaScript. Java stays shared-only. |
+| **Skip / truncation persistence** | `RepositoryScannerService` returns `skipped` counts and `discoveryTruncated`; `ReviewRunService` stores them on the result (`skipped_json`, `discovery_truncated`). The UI, `ReportExportService`, and `CoverageAssessmentService` surface honest coverage notes when files were skipped or discovery hit a budget. |
+| **Deterministic `emphasizeFiles`** | When LLM crew planning is off, `ReviewPlannerService.emphasizeFilesForRole` picks up to eight paths per role (convention, security, testing heuristics). `contextFilesForSelection()` already boosts emphasized paths in context packs. |
+| **Changed-line context packs** | `GitRepositoryService.changedLineRanges` feeds `changedLines` on indexed files; `ContextPackService` ranks `changed-line` candidates first. Context version is **`symbol-range-artifact-refs-v3`** (capabilities + fingerprints). |
+
+Scan defaults were raised for typical repos (`DOUBLECHECK_SCAN_MAX_FILE_BYTES=524288`,
+`DOUBLECHECK_SCAN_MAX_BYTES=10485760`) so more source is indexed before skip gates apply.
 
 ### Technical flow (Mermaid)
 
@@ -282,11 +297,12 @@ flowchart TD
 Config knobs (`.env` / `ColdBox.bx`): `OPENAI_API_BASE`, `OPENAI_API_KEY`,
 `DEFAULT_MODEL`, `AI_CONTEXT_WINDOW`, timeouts and budgets.
 
-Scan defaults (`DOUBLECHECK_SCAN_MAX_FILE_BYTES`, `DOUBLECHECK_SCAN_MAX_BYTES`)
-gate indexing volume separately from specialist context packs
-(`DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS`, `AI_CONTEXT_WINDOW`). Raise scan
-limits to index more source for deterministic rules; raise plan/token knobs if
-prompts hit context errors.
+Scan defaults (`DOUBLECHECK_SCAN_MAX_FILE_BYTES`, `DOUBLECHECK_SCAN_MAX_BYTES`,
+`DOUBLECHECK_SCAN_MAX_FILES`) gate indexing volume separately from specialist
+context packs (`DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS`, `AI_CONTEXT_WINDOW`).
+When limits bite, skip counts appear on the result rather than silently dropping
+files. Raise scan limits to index more source for deterministic rules; raise
+plan/token knobs if prompts hit context errors.
 
 ### With vs without an AI key
 
