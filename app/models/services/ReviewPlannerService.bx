@@ -9,6 +9,8 @@
 class {
 	property name="maxTasks" inject="coldbox:setting:planMaxTasks";
 
+	property name="maxLinesPerRange" inject="coldbox:setting:planMaxLinesPerRange";
+
 	property name="contextPackService" inject="ContextPackService";
 	variables.planVersion = "review-plan-v2";
 	variables.maxTasks = 6;
@@ -100,7 +102,11 @@ class {
 			var taskId = stableHash(
 				"#variables.planVersion#:#model.fingerprint#:#role#:#"#policyFingerprint#:#budgetFingerprint#:"##"#contextPack.fingerprint#:#allocatedTokens#"#"
 			);
-			var taskContextFiles = contextFilesForSelection( contextFiles, selection.emphasizeFiles ?: [] );
+			var taskContextFiles = contextFilesForSelection(
+				contextFiles,
+				selection.emphasizeFiles ?: [],
+				plannerFiles
+			);
 			tasks.append(
 					{
 						id      : taskId,
@@ -194,40 +200,92 @@ class {
 		return selections;
 	}
 
-	private array function contextFilesForSelection( required array contextFiles, required array emphasizeFiles ) {
+	private array function contextFilesForSelection(
+		required array contextFiles,
+		required array emphasizeFiles,
+		required array scannedFiles
+	) {
 		if ( !arguments.emphasizeFiles.len() ) {
 			return arguments.contextFiles;
 		}
+		var scannedByPath = {};
+		for ( var scannedFile in arguments.scannedFiles ) {
+			scannedByPath[ normalizePath( scannedFile.filePath ?: "" ) ] = scannedFile;
+		}
 		var wanted = {};
 		for ( var path in arguments.emphasizeFiles ) {
-			wanted[ lCase(
-				replace(
-					trim( path ),
-					"\",
-					"/",
-					"all"
-				)
-			) ] = true;
+			var emphasizedPath = normalizePath( path );
+			if ( !len( emphasizedPath ) || !scannedByPath.keyExists( emphasizedPath ) || wanted.keyExists( emphasizedPath ) ) {
+				continue;
+			}
+			wanted[ emphasizedPath ] = true;
+			if ( wanted.count() >= 8 ) {
+				break;
+			}
 		}
 		var focused = [];
 		var remainder = [];
+		var packedPaths = {};
 		for ( var file in arguments.contextFiles ) {
-			var key = lCase(
-				replace(
-					trim( file.filePath ?: "" ),
-					"\",
-					"/",
-					"all"
-				)
-			);
+			var key = normalizePath( file.filePath ?: "" );
+			packedPaths[ key ] = true;
 			if ( wanted.keyExists( key ) ) {
 				focused.append( file );
 			} else {
 				remainder.append( file );
 			}
 		}
+		for ( var wantedPath in wanted ) {
+			if ( packedPaths.keyExists( wantedPath ) ) {
+				continue;
+			}
+			var admittedFile = emphasizedContextFile( scannedByPath[ wantedPath ] );
+			if ( !admittedFile.isEmpty() ) {
+				focused.append( admittedFile );
+			}
+		}
 		// Emphasized paths first, then the rest of the shared pack (boost, don't replace).
 		return focused.len() ? focused.append( remainder, true ) : arguments.contextFiles;
+	}
+
+	private struct function emphasizedContextFile( required struct file ) {
+		var fileLines = isArray( arguments.file.lines ?: "" ) ? arguments.file.lines : [];
+		var lineCount = min( int( val( arguments.file.lineCount ?: fileLines.len() ) ), fileLines.len() );
+		if ( lineCount < 1 ) {
+			return {};
+		}
+		var endLine = min( lineCount, int( numericSetting( variables.maxLinesPerRange, 80 ) ) );
+		var estimatedCharacters = 0;
+		for ( var lineNumber = 1; lineNumber <= endLine; lineNumber++ ) {
+			estimatedCharacters += len( fileLines[ lineNumber ] ) + 1;
+		}
+		var reason = "emphasized-scanned-file";
+		var rangeItem = {
+			id                 : stableHash( "#arguments.file.filePath#:1:#endLine#:#reason#" ),
+			filePath           : arguments.file.filePath,
+			startLine          : 1,
+			endLine            : endLine,
+			lineCount          : endLine,
+			estimatedCharacters: estimatedCharacters,
+			reasons            : [ reason],
+			symbolIds          : [],
+			recordIds          : []
+		};
+		return {
+			filePath           : arguments.file.filePath,
+			language           : arguments.file.language,
+			contentHash        : arguments.file.contentHash,
+			sizeBytes          : arguments.file.sizeBytes ?: len( arguments.file.content ?: "" ),
+			lineCount          : lineCount,
+			reason             : reason,
+			symbolIds          : [],
+			ranges             : [ rangeItem],
+			estimatedCharacters: estimatedCharacters
+		};
+	}
+
+	private string function normalizePath( required string path ) {
+		return lCase( replace( trim( arguments.path ), "\", "/", "all" ) );
 	}
 
 	private array function emphasizeFilesForRole( required string role, required array files, required struct graph ) {
