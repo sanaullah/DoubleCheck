@@ -128,6 +128,63 @@ class extends="testbox.system.BaseSpec" {
 				);
 
 				it(
+					"discovers changed-line ranges for a modified middle line in a revision diff",
+					() => {
+						var fixture = createFixture();
+						try {
+							var lines = [];
+							for ( var lineNumber = 1; lineNumber <= 10; lineNumber++ ) {
+								lines.append( "line #lineNumber#" );
+							}
+							fileWrite( fixture.path & "/src/multi.bx", lines.toList( char( 10 ) ) );
+							runGit( fixture.path, [ "add", "."] );
+							runGit( fixture.path, [ "commit", "--quiet", "-m", "add multi"] );
+							var baseRevision = runGit( fixture.path, [ "rev-parse", "HEAD"] ).output;
+
+							lines[ 5 ] = "line 5 changed";
+							fileWrite( fixture.path & "/src/multi.bx", lines.toList( char( 10 ) ) );
+							runGit( fixture.path, [ "add", "."] );
+							runGit( fixture.path, [ "commit", "--quiet", "-m", "change middle line"] );
+							var headRevision = runGit( fixture.path, [ "rev-parse", "HEAD"] ).output;
+
+							var result = new app.models.services.GitRepositoryService().changedLineRanges(
+									root         = fixture.root,
+									relativePath = "src/multi.bx",
+									baseRevision = baseRevision,
+									headRevision = headRevision
+								);
+
+							expect( result.available ).toBeTrue();
+							expect(
+								result.ranges.some( ( range ) => range.startLine <= 5 && range.endLine >= 5 )
+							).toBeTrue();
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"reports Git changed-line ranges as unavailable without throwing when Git fails",
+					() => {
+						var fixture = createFixture();
+						try {
+							var result = new app.models.services.GitRepositoryService().changedLineRanges(
+									root         = fixture.root,
+									relativePath = "src/missing.bx",
+									baseRevision = "not-a-real-revision",
+									headRevision = "also-not-real"
+								);
+
+							expect( result.available ).toBeFalse();
+							expect( result.ranges ).toHaveLength( 0 );
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
 					"scans a historical head without reading checked-out source",
 					() => {
 						var fixture = createFixture();

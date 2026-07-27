@@ -23,7 +23,7 @@ class {
 	property name="maxLinesPerRange" inject="coldbox:setting:planMaxLinesPerRange";
 
 	property name="mergeGap" inject="coldbox:setting:planContextMergeGap";
-	variables.contextVersion = "symbol-range-artifact-refs-v2";
+	variables.contextVersion = "symbol-range-artifact-refs-v3";
 
 	struct function build( required struct graph, required array files ) {
 		var changedSymbols = boundedSymbols( arguments.graph.symbols );
@@ -120,6 +120,12 @@ class {
 		for ( var file in arguments.files ) {
 			fileLines[ file.filePath ] = file.lineCount ?: file.lines.len();
 		}
+		appendChangedLineCandidates(
+			byFile,
+			arguments.files,
+			arguments.wantedPaths,
+			fileLines
+		);
 		var symbolsByFile = {};
 		for ( var item in arguments.graph.symbols ) {
 			if ( !arguments.wantedPaths.keyExists( item.filePath ) || !fileLines.keyExists( item.filePath ) ) {
@@ -230,6 +236,75 @@ class {
 		}
 	}
 
+	/**
+	 * Git-provided changed-line hints (see GitRepositoryService.changedLineRanges
+	 * via RepositoryScannerService) are appended before symbol-body candidates
+	 * so an edited line far from any indexed symbol still earns a range.
+	 */
+	private void function appendChangedLineCandidates(
+		required struct byFile,
+		required array files,
+		required struct wantedPaths,
+		required struct fileLines
+	) {
+		for ( var file in arguments.files ) {
+			if (
+				!arguments.wantedPaths.keyExists( file.filePath ) || !structKeyExists( file, "changedLines" ) ||
+						!isArray( file.changedLines ) ||
+					!file.changedLines.len()
+			) {
+				continue;
+			}
+			var fileLineCount = arguments.fileLines[ file.filePath ] ?: ( file.lineCount ?: file.lines.len() );
+			for ( var changedRange in file.changedLines ) {
+				var startLine = max( 1, int( val( changedRange.startLine ?: 1 ) ) );
+				var endLine = max( startLine, int( val( changedRange.endLine ?: startLine ) ) );
+				appendCandidate(
+					arguments.byFile,
+					changedLineCandidate(
+						file.filePath,
+						startLine,
+						endLine,
+						fileLineCount
+					)
+				);
+			}
+		}
+	}
+
+	private struct function changedLineCandidate(
+		required string filePath,
+		required numeric startLine,
+		required numeric endLine,
+		required numeric fileLineCount
+	) {
+		var maximumLine = max( 1, arguments.fileLineCount );
+		var before = numericSetting(
+			variables.beforeLines,
+			3,
+			true
+		);
+		var after = numericSetting(
+			variables.afterLines,
+			12,
+			true
+		);
+		var maximumRangeLines = numericSetting( variables.maxLinesPerRange, 80 );
+		var windowStart = max( 1, arguments.startLine - before );
+		var windowEnd = min( maximumLine, arguments.endLine + after );
+		if ( windowEnd - windowStart + 1 > maximumRangeLines ) {
+			windowEnd = windowStart + maximumRangeLines - 1;
+		}
+		return {
+			filePath : arguments.filePath,
+			startLine: windowStart,
+			endLine  : windowEnd,
+			reasons  : [ "changed-line"],
+			symbolIds: [],
+			recordIds: []
+		};
+	}
+
 	private void function appendCandidate( required struct byFile, required struct candidate ) {
 		if ( !arguments.byFile.keyExists( arguments.candidate.filePath ) ) {
 			arguments.byFile[ arguments.candidate.filePath ] = [];
@@ -310,13 +385,15 @@ class {
 					truncated = true;
 				}
 			}
-			var fileRanges = [];
 			var fileCharacters = 0;
-			for ( var rangeItem in ranges ) {
-				if ( fileRanges.len() >= maximumRanges ) {
+			var keptByPosition = {};
+			var selectionOrder = prioritizedSelectionOrder( ranges );
+			for ( var orderItem in selectionOrder ) {
+				if ( keptByPosition.count() >= maximumRanges ) {
 					truncated = true;
 					break;
 				}
+				var rangeItem = ranges[ orderItem.index];
 				var rangeLines = rangeItem.endLine - rangeItem.startLine + 1;
 				var rangeCharacters = estimateCharacters( file, rangeItem );
 				if ( selectedLines + rangeLines > maximumLines || characters + rangeCharacters > maximumCharacters ) {
@@ -329,11 +406,17 @@ class {
 				);
 				finalRange.lineCount = rangeLines;
 				finalRange.estimatedCharacters = rangeCharacters;
-				fileRanges.append( finalRange );
+				keptByPosition[ orderItem.index] = finalRange;
 				fileCharacters += rangeCharacters;
 				characters += rangeCharacters;
 				selectedLines += rangeLines;
 				selectedRanges++;
+			}
+			var fileRanges = [];
+			for ( var position = 1; position <= ranges.len(); position++ ) {
+				if ( keptByPosition.keyExists( position ) ) {
+					fileRanges.append( keptByPosition[ position] );
+				}
 			}
 			if ( !fileRanges.len() ) {
 				continue;
@@ -362,6 +445,51 @@ class {
 			candidateCount: candidateCount,
 			truncated     : truncated || selectedRanges < candidateCount
 		};
+	}
+
+	/**
+	 * Selects which merged ranges survive the per-file budget before output,
+	 * preferring higher-value reasons (changed-line, changed-symbol, ...) so
+	 * a distant but high-priority range is not starved by nearer low-priority
+	 * ones. Output order (fileRanges) still follows document position.
+	 */
+	private array function prioritizedSelectionOrder( required array ranges ) {
+		var order = [];
+		for ( var index = 1; index <= arguments.ranges.len(); index++ ) {
+			order.append(
+					{
+						index    : index,
+						priority : candidatePriority( arguments.ranges[ index].reasons ),
+						startLine: arguments.ranges[ index].startLine
+					}
+				);
+		}
+		order.sort(
+				( first, second ) => first.priority == second.priority
+					? first.startLine - second.startLine
+					: second.priority - first.priority
+			);
+		return order;
+	}
+
+	private numeric function candidatePriority( required array reasons ) {
+		var priorities = {
+			"changed-line"   : 105,
+			"changed-symbol" : 100,
+			"changed-file"   : 95,
+			"test-edge"      : 85,
+			"test-impact"    : 80,
+			"dependency-edge": 70,
+			"impact-cone"    : 60
+		};
+		var best = 0;
+		for ( var reason in arguments.reasons ) {
+			var score = priorities.keyExists( reason ) ? priorities[ reason] : 40;
+			if ( score > best ) {
+				best = score;
+			}
+		}
+		return best;
 	}
 
 	private array function headlessFileRanges( required struct file, required string reason, required numeric maximumRanges ) {

@@ -217,6 +217,75 @@ class {
 		}
 	}
 
+	/**
+	 * Parses `git diff -U0` hunk headers to find new-side (post-change) line
+	 * ranges for a single file, so context packs can prefer changed lines.
+	 * Never throws on Git failure; returns available: false instead.
+	 */
+	struct function changedLineRanges(
+		required any root,
+		required string relativePath,
+		string baseRevision = "HEAD",
+		string headRevision = ""
+	) {
+		var safePath = replace(
+			arguments.relativePath,
+			"\",
+			"/",
+			"all"
+		);
+		try {
+			var diffArguments = len( arguments.headRevision )
+				? [
+					"diff",
+					"-U0",
+					"--diff-filter=ACMRTUXB",
+					"#arguments.baseRevision#...#arguments.headRevision#",
+					"--",
+					safePath
+				]
+				: [ "diff", "-U0", arguments.baseRevision, "--", safePath];
+			var result = executeText( arguments.root, diffArguments );
+			if ( result.exitCode != 0 ) {
+				return { available: false, ranges: [], truncated: false };
+			}
+			return {
+				available: true,
+				ranges   : parseHunkRanges( result.output ),
+				truncated: false
+			};
+		} catch (any unavailableGit) {
+			return { available: false, ranges: [], truncated: false };
+		}
+	}
+
+	private array function parseHunkRanges( required string diffOutput ) {
+		var ranges = [];
+		var hunkMatcher = match(
+			"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
+			arguments.diffOutput
+		);
+		while ( hunkMatcher.find() ) {
+			var startLine = int( val( hunkMatcher.group( 1 ) ) );
+			var lengthGroup = hunkMatcher.group( 2 );
+			var lineCount = isNull( lengthGroup ) ? 1 : int( val( lengthGroup ) );
+			if ( lineCount <= 0 || startLine <= 0 ) {
+				continue;
+			}
+			ranges.append( { startLine: startLine, endLine: startLine + lineCount - 1 } );
+		}
+		return ranges;
+	}
+
+	private any function match( required string expression, required string source ) {
+		return createObject( "java", "java.util.regex.Pattern" )
+			.compile(
+				arguments.expression,
+				createObject( "java", "java.util.regex.Pattern" ).MULTILINE
+			)
+			.matcher( arguments.source );
+	}
+
 	private struct function resolveRevision( required any root, required string revision ) {
 		var candidate = trim( arguments.revision );
 		if ( !len( candidate ) || left( candidate, 1 ) == "-" || !reFind( "^[A-Za-z0-9._/@{}~^:+-]+$", candidate ) ) {

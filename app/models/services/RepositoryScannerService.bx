@@ -165,18 +165,27 @@ class {
 					true,
 					true
 				);
-				files.append(
-						{
-							filePath    : relativePath,
-							absolutePath: revisionContent ? "" : candidate.getPath(),
-							language    : supportedExtensions[ extension ],
-							contentHash : lCase( hash( content, "SHA-256" ) ),
-							sizeBytes   : sizeBytes,
-							lineCount   : max( 1, lines.len() ),
-							content     : content,
-							lines       : lines
-						}
-					);
+				var fileEntry = {
+					filePath    : relativePath,
+					absolutePath: revisionContent ? "" : candidate.getPath(),
+					language    : supportedExtensions[ extension ],
+					contentHash : lCase( hash( content, "SHA-256" ) ),
+					sizeBytes   : sizeBytes,
+					lineCount   : max( 1, lines.len() ),
+					content     : content,
+					lines       : lines
+				};
+				var changedLines = changedLinesFor(
+					root,
+					relativePath,
+					arguments.mode,
+					candidateResult,
+					lines.len()
+				);
+				if ( changedLines.len() ) {
+					fileEntry.changedLines = changedLines;
+				}
+				files.append( fileEntry );
 				totalBytes += sizeBytes;
 			} catch (any error) {
 				skipped.unreadable++;
@@ -216,6 +225,35 @@ class {
 			repositoryRevision: candidateResult.repositoryRevision ?: "",
 			error             : candidateResult.error ?: ""
 		};
+	}
+
+	/**
+	 * Attaches changed-line ranges only for working-tree / revision-diff
+	 * scans; `full` mode leaves files without changedLines so ContextPackService
+	 * keeps its current symbol-first behavior. Untracked files (no diff output)
+	 * fall back to treating the whole file as changed.
+	 */
+	private array function changedLinesFor(
+		required any root,
+		required string relativePath,
+		required string mode,
+		required struct candidateResult,
+		required numeric lineCount
+	) {
+		var normalizedMode = lCase( arguments.mode );
+		if ( normalizedMode != "working-tree" && normalizedMode != "revision-diff" ) {
+			return [];
+		}
+		var changed = gitRepositoryService.changedLineRanges(
+				root         = arguments.root,
+				relativePath = arguments.relativePath,
+				baseRevision = normalizedMode == "working-tree" ? "HEAD" : ( arguments.candidateResult.baseRevision ?: "HEAD" ),
+				headRevision = normalizedMode == "working-tree" ? "" : ( arguments.candidateResult.headRevision ?: "" )
+			);
+		if ( !changed.available ) {
+			return [];
+		}
+		return changed.ranges.len() ? changed.ranges : [ { startLine: 1, endLine: max( 1, arguments.lineCount ) } ];
 	}
 
 	private struct function candidatePaths(
