@@ -227,27 +227,15 @@ class extends="testbox.system.BaseSpec" {
 				it(
 					"abandons stale running traces and their open observations",
 					() => {
+						variables.store.moduleSettings.maxTraces = 50;
 						variables
 							.store
 							.moduleSettings
 							.staleRunningMinutes = 5;
-						var staleAt = dateTimeFormat(
-							dateAdd(
-								"n",
-								-30,
-								now()
-							),
-							"yyyy-mm-dd'T'HH:nn:ss"
-						) & "Z";
-						var freshAt = dateTimeFormat( now(), "yyyy-mm-dd'T'HH:nn:ss" ) & "Z";
-						var emptyAt = dateTimeFormat(
-							dateAdd(
-								"n",
-								-2,
-								now()
-							),
-							"yyyy-mm-dd'T'HH:nn:ss"
-						) & "Z";
+						// Absolute timestamps avoid flaky string compares against "now".
+						var staleAt = "2020-01-01T00:00:00Z";
+						var emptyAt = "2020-01-01T00:01:00Z";
+						var freshAt = "2099-01-01T00:00:00Z";
 						var stale = variables.store.createTrace(
 								{
 									name     : "generate-response",
@@ -283,14 +271,89 @@ class extends="testbox.system.BaseSpec" {
 									startedAt: freshAt
 								}
 							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-fresh",
+									traceId    : fresh.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest",
+									startTime  : freshAt
+								}
+							);
 						var abandoned = variables.store.abandonStaleRunningTraces( force = true );
 						expect( abandoned ).toBeGTE( 2 );
-						expect( variables.store.getTrace( stale.id ).status ).toBe( "error" );
-						expect( variables.store.getObservation( "obs-stale" ).status ).toBe( "error" );
-						expect( variables.store.getTrace( emptyShell.id ).status ).toBe( "error" );
+						expect( variables.store.getTrace( stale.id ).status ).toBe( "abandoned" );
+						expect( variables.store.getObservation( "obs-stale" ).status ).toBe( "abandoned" );
+						expect( variables.store.getTrace( emptyShell.id ).status ).toBe( "abandoned" );
 						expect( variables.store.getTrace( fresh.id ).status ).toBe( "running" );
+
+						// Late success after timeout should become ok, not stay as a failure.
+						variables.store.completeTrace(
+								id            = stale.id,
+								status        = "ok",
+								outputPreview = "late reply"
+							);
+						expect( variables.store.getTrace( stale.id ).status ).toBe( "ok" );
+						expect( variables.store.getTrace( stale.id ).errorMessage ).toBe( "" );
 					}
 				);
+
+				it( "upserts feedback on a trace and overwrites the same name", () => {
+					var trace = variables.store.createTrace( { name: "chat", status: "ok" } );
+					var first = variables.store.upsertFeedback( trace.id, "up", "looks good" );
+					expect( first.value ).toBe( "up" );
+					expect( first.comment ).toBe( "looks good" );
+					expect( first.updatedAt ).notToBeEmpty();
+
+					var second = variables.store.upsertFeedback( trace.id, "down", "regressed" );
+					expect( second.value ).toBe( "down" );
+					expect( second.comment ).toBe( "regressed" );
+
+					var detail = variables.store.getTraceDetail( trace.id );
+					expect( detail.feedback.value ).toBe( "down" );
+					expect( detail.feedback.comment ).toBe( "regressed" );
+				} );
+
+				it( "rejects invalid feedback values and missing traces on upsert", () => {
+					var trace = variables.store.createTrace( { name: "chat" } );
+					expect( () => variables.store.upsertFeedback( trace.id, "meh" ) )
+						.toThrow( type = "AiFlight.InvalidFeedback" );
+					expect( variables.store.upsertFeedback( "missing-id", "up" ) ).toBeEmpty();
+				} );
+
+				it( "clears feedback and is idempotent when absent", () => {
+					var trace = variables.store.createTrace( { name: "chat" } );
+					variables.store.upsertFeedback( trace.id, "up" );
+					expect( variables.store.clearFeedback( trace.id ) ).toBeTrue();
+					expect( variables.store.getTraceDetail( trace.id ).feedback ).toBeNull();
+					expect( variables.store.clearFeedback( trace.id ) ).toBeFalse();
+					expect( variables.store.clearFeedback( "missing-id" ) ).toBeFalse();
+				} );
+
+				it( "filters traces by feedback up down any and none", () => {
+					var up = variables.store.createTrace( { name: "up-trace", status: "ok" } );
+					var down = variables.store.createTrace( { name: "down-trace", status: "ok" } );
+					var bare = variables.store.createTrace( { name: "bare", status: "ok" } );
+					variables.store.upsertFeedback( up.id, "up" );
+					variables.store.upsertFeedback( down.id, "down", "nope" );
+
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 1, "up" );
+					expect( arrayLen( variables.store.listTraces( feedback = "down" ) ) ).toBe( 1, "down" );
+					expect( arrayLen( variables.store.listTraces( feedback = "any" ) ) ).toBe( 2, "any" );
+					expect( arrayLen( variables.store.listTraces( feedback = "none" ) ) ).toBe( 1, "none" );
+					expect( variables.store.listTraces( feedback = "none" )[ 1 ].id ).toBe( bare.id );
+				} );
+
+				it( "cascades scores when a trace is deleted", () => {
+					var doomed = variables.store.createTrace( { name: "doomed" } );
+					variables.store.upsertFeedback( doomed.id, "up" );
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 1 );
+					expect( variables.store.deleteTrace( doomed.id ) ).toBeTrue();
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 0 );
+					expect( variables.store.getTrace( doomed.id ) ).toBeEmpty();
+				} );
 			}
 		);
 	}

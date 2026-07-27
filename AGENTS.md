@@ -79,6 +79,10 @@ Keep application code outside the public web root. Preserve the modern
 - Preserve basic non-LLM behavior when adding or changing AI-assisted features.
 - Follow nearby BoxLang/CFML formatting and naming rather than applying a broad
   unrelated rewrite.
+- Prefer `import java:` / `new java:` over `createObject( "java", ... )`. Because
+  BoxLang is case-insensitive, do not name a variable the same as an imported
+  class short name (e.g. after `import java:java.io.File`, avoid `file` /
+  `File`). See `.cursor/rules/boxlang-java-interop.mdc`.
 
 ## Verification
 

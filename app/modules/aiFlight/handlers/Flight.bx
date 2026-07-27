@@ -82,6 +82,22 @@ class {
 		event.renderData( type = "json", data = detail );
 	}
 
+	function apiTraceFeedback( event, rc, prc ) {
+		var id = trim( rc.id ?: "" );
+		var method = uCase( event.getHTTPMethod() );
+		if ( method == "PUT" || method == "POST" ) {
+			return putTraceFeedback( event, rc, prc, id );
+		}
+		if ( method == "DELETE" ) {
+			return deleteTraceFeedback( event, rc, prc, id );
+		}
+		event.renderData(
+				type       = "json",
+				data       = { error: "method_not_allowed" },
+				statusCode = 405
+			);
+	}
+
 	function apiStatus( event, rc, prc ) {
 		listener.registerWithRuntime();
 		event.renderData(
@@ -157,6 +173,63 @@ class {
 		return listFindNoCase( "true,yes,1,on", toString( arguments.value ) ) > 0;
 	}
 
+	private function putTraceFeedback( event, rc, prc, required string id ) {
+		var body = {};
+		try {
+			body = event.getHTTPContent( json = true );
+		} catch (any e) {
+			body = {};
+		}
+		if ( !isStruct( body ) || !body.count() ) {
+			body = rc;
+		}
+		var value = trim( toString( body.value ?: rc.value ?: "" ) );
+		var comment = toString( body.comment ?: rc.comment ?: "" );
+		try {
+			var feedback = store.upsertFeedback( id, value, comment );
+		} catch ("AiFlight.InvalidFeedback" e) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "invalid_value", message: e.message },
+					statusCode = 400
+				);
+			return;
+		}
+		if ( !feedback.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = { feedback: feedback } );
+	}
+
+	private function deleteTraceFeedback( event, rc, prc, required string id ) {
+		if ( !store.getTrace( id ).count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		if ( !store.clearFeedback( id ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData(
+				type       = "json",
+				data       = {},
+				statusCode = 204
+			);
+	}
+
 	private struct function filterStruct( required struct rc ) {
 		return {
 			status       : trim( arguments.rc.status ?: "" ),
@@ -169,7 +242,8 @@ class {
 			obsType      : trim( arguments.rc.obsType ?: "" ),
 			minDurationMs: trim( arguments.rc.minDurationMs ?: "" ),
 			maxDurationMs: trim( arguments.rc.maxDurationMs ?: "" ),
-			minCost      : trim( arguments.rc.minCost ?: "" )
+			minCost      : trim( arguments.rc.minCost ?: "" ),
+			feedback     : trim( arguments.rc.feedback ?: "" )
 		};
 	}
 
@@ -187,7 +261,8 @@ class {
 			obsType      : f.obsType,
 			minDurationMs: val( f.minDurationMs ),
 			maxDurationMs: val( f.maxDurationMs ),
-			minCost      : val( f.minCost )
+			minCost      : val( f.minCost ),
+			feedback     : f.feedback
 		};
 	}
 }

@@ -85,12 +85,30 @@ class {
 			"CREATE INDEX IF NOT EXISTS idx_observations_trace ON observations(trace_id, start_time)"
 		);
 		executeUpdate(
+			"
+				CREATE TABLE IF NOT EXISTS scores (
+					id TEXT PRIMARY KEY,
+					trace_id TEXT NOT NULL,
+					observation_id TEXT,
+					name TEXT NOT NULL,
+					data_type TEXT NOT NULL,
+					value TEXT NOT NULL,
+					comment TEXT NOT NULL DEFAULT '',
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL,
+					FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
+				)
+			"
+		);
+		executeUpdate( "CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_trace_name ON scores(trace_id, name)" );
+		executeUpdate( "CREATE INDEX IF NOT EXISTS idx_scores_trace ON scores(trace_id)" );
+		executeUpdate(
 			"CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at DESC)"
 		);
 		executeUpdate(
 			"
 				INSERT OR IGNORE INTO schema_meta(key, value)
-				VALUES ('version', '2')
+				VALUES ('version', '3')
 			"
 		);
 		migrateSchema();
@@ -377,6 +395,11 @@ class {
 		if ( !total && ( prompt || completion ) ) {
 			total = prompt + completion;
 		}
+		// Late success after timeout cleanup: clear the timeout note when finishing ok.
+		var errMsg = arguments.errorMessage;
+		if ( arguments.status == "ok" && !len( trim( errMsg ) ) ) {
+			errMsg = "";
+		}
 		executeUpdate(
 			"
 				UPDATE traces SET
@@ -396,9 +419,9 @@ class {
 				status        : { value: arguments.status, cfsqltype: "varchar" },
 				output_preview: { value: arguments.outputPreview, cfsqltype: "varchar" },
 				error_message : {
-					value    : arguments.errorMessage,
+					value    : errMsg,
 					cfsqltype: "varchar",
-					null     : !len( arguments.errorMessage )
+					null     : !len( errMsg )
 				},
 				duration_ms: {
 					value    : int( arguments.durationMs ?: val( trace.durationMs ?: 0 ) ),
@@ -465,7 +488,8 @@ class {
 		string obsType        = "",
 		numeric minDurationMs = 0,
 		numeric maxDurationMs = 0,
-		numeric minCost       = 0
+		numeric minCost       = 0,
+		string feedback       = ""
 	) {
 		abandonStaleRunningTraces( force = false );
 		var sql = "
@@ -477,7 +501,10 @@ class {
 						AND json_extract(o.usage_json, '$.cost') IS NOT NULL
 					ORDER BY o.rowid DESC
 					LIMIT 1
-				) AS cost
+				) AS cost,
+				( SELECT s.value FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_value,
+				( SELECT s.comment FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_comment,
+				( SELECT s.updated_at FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_updated_at
 			FROM traces t
 			WHERE 1 = 1
 		";
@@ -552,6 +579,24 @@ class {
 				ORDER BY o.rowid DESC
 				LIMIT 1
 			), 0) >= #val( arguments.minCost )#";
+		}
+		var fb = lCase( trim( arguments.feedback ) );
+		if ( fb == "up" || fb == "down" ) {
+			sql &= " AND EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback' AND s.value = :feedback_value
+			)";
+			params.feedback_value = { value: fb, cfsqltype: "varchar" };
+		} else if ( fb == "any" ) {
+			sql &= " AND EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback'
+			)";
+		} else if ( fb == "none" ) {
+			sql &= " AND NOT EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback'
+			)";
 		}
 		// rowid is insert order — more reliable than started_at string sort
 		sql &= " ORDER BY t.rowid DESC LIMIT :limit";
@@ -628,7 +673,10 @@ class {
 							AND json_extract(o.usage_json, '$.cost') IS NOT NULL
 						ORDER BY o.rowid DESC
 						LIMIT 1
-					) AS cost
+					) AS cost,
+					( SELECT s.value FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_value,
+					( SELECT s.comment FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_comment,
+					( SELECT s.updated_at FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_updated_at
 				FROM traces t
 				WHERE IFNULL(NULLIF(t.session_id, ''), t.id) = :session_id
 				ORDER BY t.rowid DESC
@@ -696,6 +744,108 @@ class {
 		return trace;
 	}
 
+	struct function upsertFeedback(
+		required string traceId,
+		required string value,
+		string comment = ""
+	) {
+		var normalized = lCase( trim( arguments.value ) );
+		if ( !listFindNoCase( "up,down", normalized ) ) {
+			throw(
+				type    = "AiFlight.InvalidFeedback",
+				message = "Feedback value must be up or down"
+			);
+		}
+		var trace = getTrace( arguments.traceId );
+		if ( !trace.count() ) {
+			return {};
+		}
+		var note = trim( toString( arguments.comment ?: "" ) );
+		var nowIso = isoNow();
+		var existing = executeQuery(
+			"
+				SELECT id, created_at
+				FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( existing.recordCount ) {
+			executeUpdate(
+				"
+					UPDATE scores
+					SET value = :value,
+						data_type = 'categorical',
+						comment = :comment,
+						updated_at = :updated_at,
+						observation_id = NULL
+					WHERE id = :id
+				",
+				{
+					id        : { value: existing.id, cfsqltype: "varchar" },
+					value     : { value: normalized, cfsqltype: "varchar" },
+					comment   : { value: note, cfsqltype: "varchar" },
+					updated_at: { value: nowIso, cfsqltype: "varchar" }
+				}
+			);
+		} else {
+			executeUpdate(
+				"
+					INSERT INTO scores (
+						id, trace_id, observation_id, name, data_type, value, comment, created_at, updated_at
+					) VALUES (
+						:id, :trace_id, NULL, 'feedback', 'categorical', :value, :comment, :created_at, :updated_at
+					)
+				",
+				{
+					id        : { value: createUUID(), cfsqltype: "varchar" },
+					trace_id  : { value: arguments.traceId, cfsqltype: "varchar" },
+					value     : { value: normalized, cfsqltype: "varchar" },
+					comment   : { value: note, cfsqltype: "varchar" },
+					created_at: { value: nowIso, cfsqltype: "varchar" },
+					updated_at: { value: nowIso, cfsqltype: "varchar" }
+				}
+			);
+		}
+		return {
+			value    : normalized,
+			comment  : note,
+			updatedAt: nowIso
+		};
+	}
+
+	boolean function clearFeedback( required string traceId ) {
+		var existing = executeQuery(
+			"
+				SELECT id FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( !existing.recordCount ) {
+			return false;
+		}
+		executeUpdate(
+			"DELETE FROM scores WHERE id = :id",
+			{ id: { value: existing.id, cfsqltype: "varchar" } }
+		);
+		return true;
+	}
+
+	boolean function deleteTrace( required string id ) {
+		var existing = getTrace( arguments.id );
+		if ( !existing.count() ) {
+			return false;
+		}
+		executeUpdate(
+			"DELETE FROM traces WHERE id = :id",
+			{ id: { value: arguments.id, cfsqltype: "varchar" } }
+		);
+		return true;
+	}
+
 	struct function getSession( required string sessionId ) {
 		var sid = trim( arguments.sessionId );
 		if ( !len( sid ) ) {
@@ -739,14 +889,14 @@ class {
 	}
 
 	/**
-	 * Latest running trace for a session (used to re-attach closes after fwreinit).
+	 * Latest open trace for a session (running or abandoned — for late closes after timeout).
 	 */
 	struct function findLatestRunningTrace( string sessionId = "", string name = "" ) {
 		var sql = "
 			SELECT t.*,
 				( SELECT COUNT(*) FROM observations o WHERE o.trace_id = t.id ) AS observation_count
 			FROM traces t
-			WHERE t.status = 'running'
+			WHERE t.status IN ( 'running', 'abandoned' )
 		";
 		var params = {};
 		if ( len( trim( arguments.sessionId ) ) ) {
@@ -757,7 +907,7 @@ class {
 			sql &= " AND t.name = :name";
 			params.name = { value: trim( arguments.name ), cfsqltype: "varchar" };
 		}
-		sql &= " ORDER BY t.rowid DESC LIMIT 1";
+		sql &= " ORDER BY CASE t.status WHEN 'running' THEN 0 ELSE 1 END, t.rowid DESC LIMIT 1";
 		var q = executeQuery( sql, params );
 		if ( !q.recordCount ) {
 			return {};
@@ -771,8 +921,8 @@ class {
 				SELECT * FROM observations
 				WHERE trace_id = :trace_id
 					AND type = 'generation'
-					AND status = 'running'
-				ORDER BY rowid DESC
+					AND status IN ( 'running', 'abandoned' )
+				ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, rowid DESC
 				LIMIT 1
 			",
 			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
@@ -784,8 +934,9 @@ class {
 	}
 
 	/**
-	 * Mark long-running traces (and their open observations) as abandoned errors.
-	 * Also abandons empty running shells (0 observations) after 1 minute.
+	 * Close long-running traces (and open observations) as abandoned — not error.
+	 * Real AI failures still use status error. Also abandons empty running shells
+	 * (0 observations) after 1 minute.
 	 */
 	numeric function abandonStaleRunningTraces( boolean force = true ) {
 		var minutes = int( val( moduleSettings.staleRunningMinutes ?: 5 ) );
@@ -814,13 +965,14 @@ class {
 			"yyyy-mm-dd'T'HH:nn:ss"
 		) & "Z";
 		var ended = isoNow();
-		var msg = "Abandoned: no close event within #minutes# minutes (stale running)";
+		var staleMsg = "Timed out: no close event within #minutes# minutes (still open)";
+		var emptyMsg = "Timed out: empty trace (no steps) after 1 minute";
 		executeUpdate(
 			"
 				UPDATE observations SET
-					status = 'error',
+					status = 'abandoned',
 					end_time = COALESCE(NULLIF(end_time, ''), :ended_at),
-					level = 'ERROR'
+					level = 'WARNING'
 				WHERE status = 'running'
 					AND trace_id IN (
 						SELECT id FROM traces
@@ -864,9 +1016,17 @@ class {
 		executeUpdate(
 			"
 				UPDATE traces SET
-					status = 'error',
+					status = 'abandoned',
 					ended_at = :ended_at,
-					error_message = COALESCE(NULLIF(error_message, ''), :error_message)
+					error_message = COALESCE(
+						NULLIF(error_message, ''),
+						CASE
+							WHEN ( SELECT COUNT(*) FROM observations o WHERE o.trace_id = traces.id ) = 0
+								AND started_at >= :cutoff
+							THEN :empty_message
+							ELSE :stale_message
+						END
+					)
 				WHERE status = 'running'
 					AND (
 						started_at < :cutoff
@@ -878,7 +1038,8 @@ class {
 			",
 			{
 				ended_at     : { value: ended, cfsqltype: "varchar" },
-				error_message: { value: msg, cfsqltype: "varchar" },
+				empty_message: { value: emptyMsg, cfsqltype: "varchar" },
+				stale_message: { value: staleMsg, cfsqltype: "varchar" },
 				cutoff       : { value: cutoff, cfsqltype: "varchar" },
 				empty_cutoff : { value: emptyCutoff, cfsqltype: "varchar" }
 			}
@@ -911,9 +1072,29 @@ class {
 		executeUpdate(
 			"
 				INSERT OR REPLACE INTO schema_meta(key, value)
-				VALUES ('version', '2')
+				VALUES ('version', '3')
 			"
 		);
+	}
+
+	private any function feedbackFromTraceId( required string traceId ) {
+		var q = executeQuery(
+			"
+				SELECT value, comment, updated_at
+				FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return javaCast( "null", "" );
+		}
+		return {
+			value    : toString( q.value ?: "" ),
+			comment  : toString( q.comment ?: "" ),
+			updatedAt: toString( q.updated_at ?: "" )
+		};
 	}
 
 	private void function pruneIfNeeded() {
@@ -935,7 +1116,7 @@ class {
 	}
 
 	private struct function mapTraceRow( required any row ) {
-		return {
+		var result = {
 			id              : row.id,
 			name            : row.name ?: "",
 			sessionId       : row.session_id ?: "",
@@ -957,6 +1138,18 @@ class {
 			metadata        : tryDeserialize( row.metadata_json ?: "{}" ),
 			observationCount: int( val( row.observation_count ?: 0 ) )
 		};
+		var feedback = javaCast( "null", "" );
+		if ( len( trim( toString( row.feedback_value ?: "" ) ) ) ) {
+			feedback = {
+				value    : toString( row.feedback_value ),
+				comment  : toString( row.feedback_comment ?: "" ),
+				updatedAt: toString( row.feedback_updated_at ?: "" )
+			};
+		} else if ( !structKeyExists( row, "feedback_value" ) ) {
+			feedback = feedbackFromTraceId( toString( row.id ) );
+		}
+		result.feedback = feedback;
+		return result;
 	}
 
 	private struct function mapObservationRow( required any row ) {
@@ -1017,7 +1210,7 @@ class {
 	}
 
 	private string function isoNow() {
-		return dateTimeFormat( now(), "iso" );
+		return dateTimeFormat( now(), "yyyy-mm-dd'T'HH:nn:ss" ) & "Z";
 	}
 
 	private struct function queryOptions() {

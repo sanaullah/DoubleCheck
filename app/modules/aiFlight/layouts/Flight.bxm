@@ -437,11 +437,57 @@
 		border: 1px solid var(--border);
 	}
 	.badge.running { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+	.feedback-bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin: 12px 0 16px;
+		padding: 10px 12px;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		background: var(--panel);
+	}
+	.feedback-bar .fb-btn {
+		padding: 4px 10px;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		background: transparent;
+		color: var(--text);
+		cursor: pointer;
+		font-size: 0.82rem;
+	}
+	.feedback-bar .fb-btn[aria-pressed="true"] {
+		border-color: var(--accent);
+		background: rgba(78, 161, 243, 0.14);
+		color: var(--accent);
+	}
+	.feedback-bar .fb-note {
+		flex: 1 1 160px;
+		min-width: 120px;
+		padding: 4px 8px;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		background: var(--bg);
+		color: var(--text);
+		font-size: 0.82rem;
+	}
+	.feedback-bar .fb-clear {
+		padding: 4px 10px;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+		font-size: 0.82rem;
+	}
 	.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
 	.badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+	.badge.abandoned { color: #d4a017; border-color: color-mix(in srgb, #d4a017 45%, var(--border)); }
 	.mono { font-family: var(--mono); }
 	.muted { color: var(--muted); }
 	.err-msg { color: var(--err); margin: 0 0 14px; }
+	.warn-msg { color: #d4a017; margin: 0 0 14px; }
 	</style>
 </head>
 <body>
@@ -533,8 +579,7 @@
 			if (q) params.set("q", q);
 			if (root.getAttribute("data-filter-tools") === "true") params.set("hasTools", "true");
 			if (root.getAttribute("data-filter-errors") === "true") params.set("hasErrors", "true");
-			["model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost"].forEach((key) => {
-				const attr = "data-filter-" + key.toLowerCase().replace("ms", "ms");
+			["model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost", "feedback"].forEach((key) => {
 				const map = {
 					model: "data-filter-model",
 					userId: "data-filter-userid",
@@ -542,7 +587,8 @@
 					obsType: "data-filter-obstype",
 					minDurationMs: "data-filter-minduration",
 					maxDurationMs: "data-filter-maxduration",
-					minCost: "data-filter-mincost"
+					minCost: "data-filter-mincost",
+					feedback: "data-filter-feedback"
 				};
 				const v = root.getAttribute(map[key]) || "";
 				if (v) params.set(key, v);
@@ -567,10 +613,11 @@
 			set("data-filter-minduration", "minDurationMs");
 			set("data-filter-maxduration", "maxDurationMs");
 			set("data-filter-mincost", "minCost");
+			set("data-filter-feedback", "feedback");
 			root.setAttribute("data-filter-tools", form.querySelector('[name="hasTools"]')?.checked ? "true" : "");
 			root.setAttribute("data-filter-errors", form.querySelector('[name="hasErrors"]')?.checked ? "true" : "");
 			const url = new URL(location.href);
-			["q", "status", "model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost", "hasTools", "hasErrors"].forEach((k) => url.searchParams.delete(k));
+			["q", "status", "model", "userId", "environment", "obsType", "minDurationMs", "maxDurationMs", "minCost", "feedback", "hasTools", "hasErrors"].forEach((k) => url.searchParams.delete(k));
 			const q = root.getAttribute("data-filter-q"); if (q) url.searchParams.set("q", q);
 			const status = root.getAttribute("data-filter-status"); if (status) url.searchParams.set("status", status);
 			const model = root.getAttribute("data-filter-model"); if (model) url.searchParams.set("model", model);
@@ -580,6 +627,7 @@
 			const minD = root.getAttribute("data-filter-minduration"); if (minD) url.searchParams.set("minDurationMs", minD);
 			const maxD = root.getAttribute("data-filter-maxduration"); if (maxD) url.searchParams.set("maxDurationMs", maxD);
 			const minC = root.getAttribute("data-filter-mincost"); if (minC) url.searchParams.set("minCost", minC);
+			const feedback = root.getAttribute("data-filter-feedback"); if (feedback) url.searchParams.set("feedback", feedback);
 			if (root.getAttribute("data-filter-tools") === "true") url.searchParams.set("hasTools", "true");
 			if (root.getAttribute("data-filter-errors") === "true") url.searchParams.set("hasErrors", "true");
 			history.replaceState(null, "", url.pathname + url.search + location.hash);
@@ -623,7 +671,7 @@
 		}
 
 		function fingerprint(rows, kind) {
-			return kind + ":" + rows.map((t) => [t.id, t.status, t.totalTokens, t.traceCount || t.observationCount, t.endedAt || t.lastStartedAt, t.durationMs || 0, t.cost || ""].join(":")).join("|");
+			return kind + ":" + rows.map((t) => [t.id, t.status, t.totalTokens, t.traceCount || t.observationCount, t.endedAt || t.lastStartedAt, t.durationMs || 0, t.cost || "", (t.feedback && t.feedback.value) || "", (t.feedback && t.feedback.comment) || ""].join(":")).join("|");
 		}
 
 		function contentFingerprint(t) {
@@ -642,8 +690,10 @@
 		function metaFingerprint(t) {
 			if (!t || !t.id) return "";
 			const obs = Array.isArray(t.observations) ? t.observations : [];
+			const fb = t.feedback || {};
 			return [
 				t.status, t.totalTokens, t.promptTokens, t.completionTokens, t.durationMs, t.model, t.provider,
+				fb.value || "", fb.comment || "",
 				obs.map((o) => [o.id, o.status, o.durationMs, o.startTime].join(":")).join("|")
 			].join("::");
 		}
@@ -800,6 +850,7 @@
 			const hints = [];
 			if (t.userId) hints.push("user " + t.userId);
 			if (t.environment) hints.push(t.environment);
+			if (t.feedback && t.feedback.value) hints.push("feedback:" + t.feedback.value);
 			return `<button type="button" class="trace-item" role="option" data-id="${id}">
 				<div class="trace-item-top">
 					<strong>${esc(t.name || "trace")}</strong>
@@ -1078,6 +1129,15 @@
 			const back = selectedSessionId
 				? `<button type="button" class="back-link" data-back-session="${esc(selectedSessionId)}"><- Session</button>`
 				: "";
+			const fb = t.feedback || null;
+			const fbVal = fb && fb.value ? String(fb.value) : "";
+			const fbNote = fb && fb.comment ? String(fb.comment) : "";
+			const feedbackBar = `<div class="feedback-bar" data-trace-id="${esc(t.id)}">
+				<button type="button" class="fb-btn" data-fb="up" aria-pressed="${fbVal === "up" ? "true" : "false"}">Up</button>
+				<button type="button" class="fb-btn" data-fb="down" aria-pressed="${fbVal === "down" ? "true" : "false"}">Down</button>
+				<input type="text" class="fb-note" placeholder="Note (optional)" value="${esc(fbNote)}">
+				<button type="button" class="fb-clear"${fbVal ? "" : " disabled"}>Clear</button>
+			</div>`;
 			detailEl.innerHTML = `<div class="detail-inner">
 				<div class="detail-head">
 					${back}
@@ -1085,8 +1145,9 @@
 					<span class="badge ${esc(t.status || "")}">${esc(t.status || "")}</span>
 					${headerActions("trace", t.id)}
 				</div>
-				${t.errorMessage ? `<p class="err-msg">${esc(t.errorMessage)}</p>` : ""}
+				${t.errorMessage ? `<p class="${t.status === "abandoned" ? "warn-msg" : "err-msg"}">${esc(t.errorMessage)}</p>` : ""}
 				<div class="stats">${statsHtml(t, cost)}</div>
+				${feedbackBar}
 				${metadataChips(t.metadata)}
 				${buildWaterfall(t)}
 				${showPreview ? `<h4 class="muted" style="margin:0 0 6px;font-size:0.72rem;text-transform:uppercase;letter-spacing:.04em">Output preview</h4>${renderIo(t.outputPreview, "preview", "preview-block")}` : ""}
@@ -1235,10 +1296,59 @@
 			selectTrace(btn.getAttribute("data-id"), true);
 		});
 
+		async function saveTraceFeedback(traceId, value, comment) {
+			const base = (root.getAttribute("data-detail-url") || "/aiflight/api/trace/") + encodeURIComponent(traceId) + "/feedback";
+			const res = await fetch(base, {
+				method: "PUT",
+				headers: { "Content-Type": "application/json", Accept: "application/json" },
+				body: JSON.stringify({ value: value, comment: comment || "" })
+			});
+			if (!res.ok) throw new Error("feedback save failed");
+			return res.json();
+		}
+
+		async function clearTraceFeedback(traceId) {
+			const base = (root.getAttribute("data-detail-url") || "/aiflight/api/trace/") + encodeURIComponent(traceId) + "/feedback";
+			const res = await fetch(base, { method: "DELETE", headers: { Accept: "application/json" } });
+			if (!res.ok && res.status !== 204) throw new Error("feedback clear failed");
+		}
+
 		detailEl.addEventListener("click", (ev) => {
 			const copyBtn = ev.target.closest("[data-copy-link]");
 			if (copyBtn) {
 				copyCurrentLink(copyBtn);
+				return;
+			}
+			const fbBtn = ev.target.closest("[data-fb]");
+			if (fbBtn) {
+				const bar = fbBtn.closest(".feedback-bar");
+				const tid = bar && bar.getAttribute("data-trace-id");
+				const value = fbBtn.getAttribute("data-fb");
+				const note = bar ? (bar.querySelector(".fb-note")?.value || "") : "";
+				if (!tid || !value) return;
+				(async () => {
+					try {
+						await saveTraceFeedback(tid, value, note);
+						const fresh = await loadDetail(tid);
+						renderDetail(fresh, { force: true, preserve: true });
+						pollList();
+					} catch (e) {}
+				})();
+				return;
+			}
+			const clearBtn = ev.target.closest(".fb-clear");
+			if (clearBtn) {
+				const bar = clearBtn.closest(".feedback-bar");
+				const tid = bar && bar.getAttribute("data-trace-id");
+				if (!tid) return;
+				(async () => {
+					try {
+						await clearTraceFeedback(tid);
+						const fresh = await loadDetail(tid);
+						renderDetail(fresh, { force: true, preserve: true });
+						pollList();
+					} catch (e) {}
+				})();
 				return;
 			}
 			const exp = ev.target.closest("[data-export]");
@@ -1296,6 +1406,24 @@
 			const head = ev.target.closest(".obs-head");
 			if (!head) return;
 			head.parentElement.classList.toggle("open");
+		});
+
+		detailEl.addEventListener("change", (ev) => {
+			const note = ev.target.closest(".fb-note");
+			if (!note) return;
+			const bar = note.closest(".feedback-bar");
+			const tid = bar && bar.getAttribute("data-trace-id");
+			const active = bar && bar.querySelector('.fb-btn[aria-pressed="true"]');
+			const value = active && active.getAttribute("data-fb");
+			if (!tid || !value) return;
+			(async () => {
+				try {
+					await saveTraceFeedback(tid, value, note.value || "");
+					const fresh = await loadDetail(tid);
+					renderDetail(fresh, { force: true, preserve: true });
+					pollList();
+				} catch (e) {}
+			})();
 		});
 
 		document.querySelectorAll(".mode-tab").forEach((tab) => {

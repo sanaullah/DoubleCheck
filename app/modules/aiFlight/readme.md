@@ -41,10 +41,12 @@ moduleSettings = {
 };
 ```
 
-## Explorer (v1.3)
+## Explorer (v1.4)
 
 - Copy link / JSON export on trace and session views
-- Filters: search, status, model, environment, userId, observation type, duration, min cost, tools, errors
+- Filters: search, status, model, environment, userId, observation type, duration, min cost, tools, errors, feedback (`up` / `down` / `any` / `none`)
+- Trace feedback: thumbs up/down, optional note, clear (`PUT`/`DELETE` `/aiflight/api/trace/:id/feedback`)
+- Statuses: `running`, `ok`, `abandoned` (timed out / no close), `error` (real AI failure only)
 - Detail shows userId, environment, and metadata chips when present
 
 ## Security
