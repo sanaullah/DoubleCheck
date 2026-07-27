@@ -167,6 +167,144 @@ class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 						expect( testingTasks[ 1 ].context.files[ 1 ].filePath ).toBe( "tests/specs/ReviewsSpec.bx" );
 					}
 				);
+
+				it(
+					"admits emphasized CFML files around changedLines not from line 1",
+					() => {
+						var lines = [];
+						for ( var lineNumber = 1; lineNumber <= 50; lineNumber++ ) {
+							lines.append( "/* line #lineNumber# */" );
+						}
+						var cfmlFile = {
+							filePath     : "legacy/Deep.cfc",
+							language     : "CFML",
+							contentHash  : lCase( hash( lines.toList( char( 10 ) ), "SHA-256" ) ),
+							content      : lines.toList( char( 10 ) ),
+							lines        : lines,
+							sizeBytes    : len( lines.toList( char( 10 ) ) ),
+							lineCount    : 50,
+							changedLines : [ { startLine: 40, endLine: 42 }]
+						};
+						var files = fileFixtures();
+						files.append( cfmlFile );
+						var graph = {
+							summary: { symbolCount: 0, dependencyCount: 0, impactCount: 0 },
+							symbols: [],
+							dependencies: [],
+							impacts: []
+						};
+						var emptyPack = {
+							version       : "symbol-range-artifact-refs-v3",
+							fingerprint   : "empty-pack",
+							changedSymbols: [],
+							files         : [],
+							summary       : {
+								fileCount     : 0,
+								rangeCount    : 0,
+								lineCount     : 0,
+								characters    : 0,
+								candidateCount: 0,
+								truncated     : false
+							}
+						};
+						var planner = prepareMock( getInstance( "ReviewPlannerService" ) );
+						var packService = createStub().$( "build", emptyPack );
+						planner.$property( propertyName = "contextPackService", mock = packService );
+						planner.$property( propertyName = "beforeLines", mock = 3 );
+						planner.$property( propertyName = "afterLines", mock = 12 );
+						planner.$property( propertyName = "maxLinesPerRange", mock = 80 );
+						planner.$property( propertyName = "maxTasks", mock = 6 );
+						var model = getInstance( "ArchitectureModelService" ).build( graph, files, "crew-changed-lines" );
+						var plan = planner.plan(
+								model,
+								graph,
+								files,
+								{},
+								{},
+								{
+									ok     : false,
+									source : "none",
+									summary: "",
+									tasks  : []
+								}
+							);
+						var cfmlTasks = plan
+							.getMemento()
+							.tasks
+							.filter( ( task ) => task.role == "cfml-conventions" );
+						expect( cfmlTasks ).toHaveLength( 1 );
+						var deepFile = cfmlTasks[ 1 ].context.files.filter( ( file ) => file.filePath == "legacy/Deep.cfc" );
+						expect( deepFile ).toHaveLength( 1 );
+						expect( deepFile[ 1 ].ranges[ 1 ].startLine ).toBeGTE( 37 );
+						expect( deepFile[ 1 ].ranges[ 1 ].startLine ).notToBe( 1 );
+						expect( deepFile[ 1 ].ranges[ 1 ].endLine ).toBeGTE( 42 );
+					}
+				);
+
+				it(
+					"prefers CFML files with changedLines when emphasizing convention roles",
+					() => {
+						var files = [
+							sourceFile(
+								"legacy/Old.cfc",
+								"CFML",
+								"component { function stale() { return 1; } }"
+							),
+							sourceFile(
+								"legacy/New.cfc",
+								"CFML",
+								"component { function fresh() { return 2; } }"
+							)
+						];
+						files[ 2 ].changedLines = [ { startLine: 1, endLine: 1 }];
+						var graph = {
+							summary: { symbolCount: 0, dependencyCount: 0, impactCount: 0 },
+							symbols: [],
+							dependencies: [],
+							impacts: []
+						};
+						var emptyPack = {
+							version       : "symbol-range-artifact-refs-v3",
+							fingerprint   : "empty-pack-pref",
+							changedSymbols: [],
+							files         : [],
+							summary       : {
+								fileCount     : 0,
+								rangeCount    : 0,
+								lineCount     : 0,
+								characters    : 0,
+								candidateCount: 0,
+								truncated     : false
+							}
+						};
+						var planner = prepareMock( getInstance( "ReviewPlannerService" ) );
+						planner.$property(
+							propertyName = "contextPackService",
+							mock         = createStub().$( "build", emptyPack )
+						);
+						planner.$property( propertyName = "maxTasks", mock = 6 );
+						var model = getInstance( "ArchitectureModelService" ).build( graph, files, "crew-prefer-changed" );
+						var plan = planner.plan(
+								model,
+								graph,
+								files,
+								{},
+								{},
+								{
+									ok     : false,
+									source : "none",
+									summary: "",
+									tasks  : []
+								}
+							);
+						var cfmlTasks = plan
+							.getMemento()
+							.tasks
+							.filter( ( task ) => task.role == "cfml-conventions" );
+						expect( cfmlTasks ).toHaveLength( 1 );
+						expect( cfmlTasks[ 1 ].context.files[ 1 ].filePath ).toBe( "legacy/New.cfc" );
+					}
+				);
 			}
 		);
 	}

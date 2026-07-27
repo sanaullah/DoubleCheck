@@ -11,6 +11,10 @@ class {
 
 	property name="maxLinesPerRange" inject="coldbox:setting:planMaxLinesPerRange";
 
+	property name="beforeLines" inject="coldbox:setting:planContextBeforeLines";
+
+	property name="afterLines" inject="coldbox:setting:planContextAfterLines";
+
 	property name="contextPackService" inject="ContextPackService";
 	variables.planVersion = "review-plan-v2";
 	variables.maxTasks = 6;
@@ -235,8 +239,9 @@ class {
 				remainder.append( file );
 			}
 		}
-		for ( var wantedPath in wanted ) {
-			if ( packedPaths.keyExists( wantedPath ) ) {
+		for ( var path in arguments.emphasizeFiles ) {
+			var wantedPath = normalizePath( path );
+			if ( !wanted.keyExists( wantedPath ) || packedPaths.keyExists( wantedPath ) ) {
 				continue;
 			}
 			var admittedFile = emphasizedContextFile( scannedByPath[ wantedPath ] );
@@ -254,23 +259,50 @@ class {
 		if ( lineCount < 1 ) {
 			return {};
 		}
-		var endLine = min( lineCount, int( numericSetting( variables.maxLinesPerRange, 80 ) ) );
-		var estimatedCharacters = 0;
-		for ( var lineNumber = 1; lineNumber <= endLine; lineNumber++ ) {
-			estimatedCharacters += len( fileLines[ lineNumber ] ) + 1;
-		}
 		var reason = "emphasized-scanned-file";
-		var rangeItem = {
-			id                 : stableHash( "#arguments.file.filePath#:1:#endLine#:#reason#" ),
-			filePath           : arguments.file.filePath,
-			startLine          : 1,
-			endLine            : endLine,
-			lineCount          : endLine,
-			estimatedCharacters: estimatedCharacters,
-			reasons            : [ reason],
-			symbolIds          : [],
-			recordIds          : []
-		};
+		var ranges = [];
+		var estimatedCharacters = 0;
+		var changedWindows = emphasizedChangedWindows( arguments.file, lineCount );
+		if ( changedWindows.len() ) {
+			for ( var window in changedWindows ) {
+				var windowChars = 0;
+				for ( var lineNumber = window.startLine; lineNumber <= window.endLine; lineNumber++ ) {
+					windowChars += len( fileLines[ lineNumber ] ) + 1;
+				}
+				estimatedCharacters += windowChars;
+				ranges.append(
+						{
+							id                 : stableHash( "#arguments.file.filePath#:#window.startLine#:#window.endLine#:#reason#" ),
+							filePath           : arguments.file.filePath,
+							startLine          : window.startLine,
+							endLine            : window.endLine,
+							lineCount          : window.endLine - window.startLine + 1,
+							estimatedCharacters: windowChars,
+							reasons            : [ reason, "changed-line"],
+							symbolIds          : [],
+							recordIds          : []
+						}
+					);
+			}
+		} else {
+			var endLine = min( lineCount, int( numericSetting( variables.maxLinesPerRange, 80 ) ) );
+			for ( var lineNumber = 1; lineNumber <= endLine; lineNumber++ ) {
+				estimatedCharacters += len( fileLines[ lineNumber ] ) + 1;
+			}
+			ranges.append(
+					{
+						id                 : stableHash( "#arguments.file.filePath#:1:#endLine#:#reason#" ),
+						filePath           : arguments.file.filePath,
+						startLine          : 1,
+						endLine            : endLine,
+						lineCount          : endLine,
+						estimatedCharacters: estimatedCharacters,
+						reasons            : [ reason],
+						symbolIds          : [],
+						recordIds          : []
+					}
+				);
+		}
 		return {
 			filePath           : arguments.file.filePath,
 			language           : arguments.file.language,
@@ -279,9 +311,33 @@ class {
 			lineCount          : lineCount,
 			reason             : reason,
 			symbolIds          : [],
-			ranges             : [ rangeItem],
+			ranges             : ranges,
 			estimatedCharacters: estimatedCharacters
 		};
+	}
+
+	private array function emphasizedChangedWindows( required struct file, required numeric lineCount ) {
+		if (
+			!structKeyExists( arguments.file, "changedLines" ) || !isArray( arguments.file.changedLines ) ||
+				!arguments.file.changedLines.len()
+		) {
+			return [];
+		}
+		var before = max( 0, int( numericSetting( variables.beforeLines, 3 ) ) );
+		var after = max( 0, int( numericSetting( variables.afterLines, 12 ) ) );
+		var maximumRangeLines = int( numericSetting( variables.maxLinesPerRange, 80 ) );
+		var windows = [];
+		for ( var changedRange in arguments.file.changedLines ) {
+			var startLine = max( 1, int( val( changedRange.startLine ?: 1 ) ) );
+			var endLine = max( startLine, int( val( changedRange.endLine ?: startLine ) ) );
+			var windowStart = max( 1, startLine - before );
+			var windowEnd = min( arguments.lineCount, endLine + after );
+			if ( windowEnd - windowStart + 1 > maximumRangeLines ) {
+				windowEnd = windowStart + maximumRangeLines - 1;
+			}
+			windows.append( { startLine: windowStart, endLine: windowEnd } );
+		}
+		return windows;
 	}
 
 	private string function normalizePath( required string path ) {
@@ -289,7 +345,8 @@ class {
 	}
 
 	private array function emphasizeFilesForRole( required string role, required array files, required struct graph ) {
-		var emphasized = [];
+		var changedMatches = [];
+		var otherMatches = [];
 		var testPaths = {};
 		if ( arguments.role == "testing" ) {
 			for ( var symbol in arguments.graph.symbols ) {
@@ -319,14 +376,27 @@ class {
 					matches = reFindNoCase( "(^|/)tests?/", path ) > 0 || testPaths.keyExists( lCase( path ) );
 					break;
 			}
-			if ( matches ) {
-				emphasized.append( file.filePath );
-				if ( emphasized.len() >= 8 ) {
-					break;
-				}
+			if ( !matches ) {
+				continue;
+			}
+			var hasChangedLines = structKeyExists( file, "changedLines" ) &&
+				isArray( file.changedLines ) &&
+				file.changedLines.len();
+			if (
+				( arguments.role == "cfml-conventions" || arguments.role == "boxlang-conventions" ) &&
+					hasChangedLines
+			) {
+				changedMatches.append( file.filePath );
+			} else {
+				otherMatches.append( file.filePath );
 			}
 		}
-		return emphasized;
+		var emphasized = changedMatches.append( otherMatches, true );
+		var limited = [];
+		for ( var index = 1; index <= min( 8, emphasized.len() ); index++ ) {
+			limited.append( emphasized[ index ] );
+		}
+		return limited;
 	}
 
 	private string function briefForRole( required string role, required array files ) {
