@@ -8,6 +8,38 @@ This document describes how the system is wired. Install and product summary liv
 
 ---
 
+## Product summary
+
+DoubleCheck is a local desktop code review assistant for BoxLang, ColdFusion,
+JavaScript, and Java. It uses Git to scope reviews (`working-tree`,
+`revision-diff`, or `full`), indexes source files, runs deterministic checks
+without an AI key, and optionally sends bounded context to configurable LLM
+specialist agents with read-only tools. It produces structured, line-level
+findings with evidence and export to Markdown, JSON, or SARIF. For unfamiliar
+codebases or when there is no meaningful diff, **full** mode reviews entire
+supported directories on disk.
+
+Git scopes which files to review; the pipeline indexes full source contents, not
+unified diff patches.
+
+## Core approach
+
+DoubleCheck runs deterministic engineering first — indexing, parsing,
+architecture facts, rule-based checks, and evidence validation — then optionally
+layers bounded specialist agents on top for deeper semantic review. The agent
+proposes; deterministic gates verify. Basic review works without AI; agents
+deepen selected areas when configured.
+
+| Layer | Deterministic engineering | Agent / LLM (optional) |
+|---|---|---|
+| Discovery | Git scoping, file indexing, language filtering | — |
+| Structure | BoxLang parser, dependency graph, architecture facts | Optional fact enrichment with citation checks |
+| Planning | Role selection, budgets, context packs, policy | Optional crew planner (roles + briefs) |
+| Findings | High-confidence rules (secrets, SQL interpolation, …) | Semantic review by specialist role |
+| Trust | Evidence must match indexed source; authorized spans; fingerprints | Proposes candidates; must pass deterministic validation |
+
+---
+
 ## Mental model
 
 ```text
@@ -249,6 +281,12 @@ flowchart TD
 
 Config knobs (`.env` / `ColdBox.bx`): `OPENAI_API_BASE`, `OPENAI_API_KEY`,
 `DEFAULT_MODEL`, `AI_CONTEXT_WINDOW`, timeouts and budgets.
+
+Scan defaults (`DOUBLECHECK_SCAN_MAX_FILE_BYTES`, `DOUBLECHECK_SCAN_MAX_BYTES`)
+gate indexing volume separately from specialist context packs
+(`DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS`, `AI_CONTEXT_WINDOW`). Raise scan
+limits to index more source for deterministic rules; raise plan/token knobs if
+prompts hit context errors.
 
 ### With vs without an AI key
 

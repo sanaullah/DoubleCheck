@@ -11,6 +11,28 @@ Runs on your machine with SQLite — not SaaS, not hosted, not multi-tenant. A d
 
 > Basic review works **without an AI key**. Deterministic checks always run; LLM specialists deepen selected areas when a provider is configured.
 
+## What it is
+
+DoubleCheck is a local desktop code review assistant for BoxLang, ColdFusion,
+JavaScript, and Java. It uses Git to scope reviews (working tree, revision range,
+or full repository), indexes source files, runs deterministic checks without an
+AI key, and optionally sends bounded context to configurable LLM specialist
+agents with read-only tools. It produces structured, line-level findings with
+evidence and export to Markdown, JSON, or SARIF. For unfamiliar codebases or
+when there is no meaningful diff, **full** mode reviews entire supported
+directories on disk.
+
+Git scopes which files to review; the pipeline indexes full source contents, not
+unified diff patches.
+
+## Core approach
+
+DoubleCheck runs deterministic engineering first — indexing, parsing,
+architecture facts, rule-based checks, and evidence validation — then optionally
+layers bounded specialist agents on top for deeper semantic review. The agent
+proposes; deterministic gates verify. Basic review works without AI; agents
+deepen selected areas when configured.
+
 ---
 
 ## What you get
@@ -64,21 +86,23 @@ No other languages are product targets.
 
 ## Quick start
 
-**Requirements:** [CommandBox](https://commandbox.ortusbooks.com/) 6+ and a BoxLang-capable server (runtime modules download on first start via `server.json`).
+**Requirements:** [CommandBox](https://commandbox.ortusbooks.com/) 6+ and a BoxLang-capable server (runtime modules such as `bx-ai` / `bx-sqlite` install on first start via `server.json`).
 
 ```powershell
 box install
 box run-script setup
 # Optional — set OPENAI_API_KEY in .env for LLM specialists
-box server start
+box server start --console
 ```
 
 `setup` only creates `.env` if missing. On first start the app creates the SQLite file and schema when needed.
 
-Open the URL CommandBox prints (commonly `http://127.0.0.1:55452`).
+`--console` keeps the server in the foreground and prints the bind URL (commonly `http://127.0.0.1:55452`). Open that URL for the workspace.
 
 | Resource | Path |
 |---|---|
+| Workspace | `/` (URL printed by CommandBox) |
+| AiFlight (bx-ai traces) | `/aiflight/` |
 | API docs (Swagger UI) | `/apidocs/` |
 | OpenAPI JSON | `/api/v1/openapi.json` |
 | OpenAPI YAML | `/api/v1/openapi.yaml` |
@@ -99,6 +123,18 @@ Copy [`.env.example`](.env.example). Important keys:
 | `OPENAI_API_BASE` / `OPENAI_API_KEY` / `DEFAULT_MODEL` | LLM specialists (optional for basic review) |
 
 Local-only: no auth, tenants, or hosted production mode.
+
+### Scan and LLM budgets
+
+| Variable | Default | Role |
+|---|---|---|
+| `DOUBLECHECK_SCAN_MAX_FILE_BYTES` | `524288` | Skip a single file if larger (scan gate, not LLM) |
+| `DOUBLECHECK_SCAN_MAX_BYTES` | `10485760` | Total indexed bytes |
+| `DOUBLECHECK_SCAN_MAX_FILES` | `250` | Max indexed files |
+| `AI_CONTEXT_WINDOW` | local `8192` / cloud `128000` | Model context window |
+| `DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS` | `30000` | Specialist context-pack budget |
+
+Raising scan limits indexes more source for deterministic rules. Specialists still receive bounded context packs; raise plan/token/`AI_CONTEXT_WINDOW` knobs separately if prompts hit context errors.
 
 ---
 
