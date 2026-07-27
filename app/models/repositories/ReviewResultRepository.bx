@@ -109,7 +109,8 @@ class {
 		string repositoryRevision  = "",
 		string baseRevision        = "",
 		string headRevision        = "",
-		boolean discoveryTruncated = false
+		boolean discoveryTruncated = false,
+		struct skipped             = {}
 	) {
 		queryExecute(
 			"
@@ -117,12 +118,12 @@ class {
 					run_id, summary, languages, files_scanned, bytes_scanned,
 					findings_count, ai_enabled, ai_files_reviewed, ai_characters_sent,
 					review_scope, repository_revision, base_revision, head_revision,
-					discovery_truncated, created_at
+					discovery_truncated, skipped_json, created_at
 				) VALUES (
 					:runId, :summary, :languages, :filesScanned, :bytesScanned,
 					:findingsCount, :aiEnabled, :aiFilesReviewed, :aiCharactersSent,
 					:reviewScope, :repositoryRevision, :baseRevision, :headRevision,
-					:discoveryTruncated, :createdAt
+					:discoveryTruncated, :skippedJson, :createdAt
 				)
 				ON CONFLICT ( run_id ) DO UPDATE SET
 					summary = excluded.summary,
@@ -138,6 +139,7 @@ class {
 					base_revision = excluded.base_revision,
 					head_revision = excluded.head_revision,
 					discovery_truncated = excluded.discovery_truncated,
+					skipped_json = excluded.skipped_json,
 					created_at = excluded.created_at
 			",
 			{
@@ -155,6 +157,7 @@ class {
 				baseRevision      : arguments.baseRevision,
 				headRevision      : arguments.headRevision,
 				discoveryTruncated: arguments.discoveryTruncated ? 1 : 0,
+				skippedJson       : jsonSerialize( normalizeSkipped( arguments.skipped ) ),
 				createdAt         : timestamp()
 			},
 			{ datasource: datasource }
@@ -204,6 +207,7 @@ class {
 				baseRevision      : "",
 				headRevision      : "",
 				discoveryTruncated: false,
+				skipped           : normalizeSkipped(),
 				findings          : findings
 			};
 			emptyResult.snapshot = buildSnapshotManifest( arguments.runId, findings );
@@ -223,6 +227,7 @@ class {
 			baseRevision      : summaryQuery.base_revision[ 1 ],
 			headRevision      : summaryQuery.head_revision[ 1 ],
 			discoveryTruncated: summaryQuery.discovery_truncated[ 1 ] == 1,
+			skipped           : normalizeSkipped( jsonDeserialize( summaryQuery.skipped_json[ 1 ] ?: "{}" ) ),
 			findings          : findings
 		};
 		result.snapshot = buildSnapshotManifest( arguments.runId, findings );
@@ -327,6 +332,16 @@ class {
 			}
 		}
 		return finding;
+	}
+
+	private struct function normalizeSkipped( struct skipped = {} ) {
+		return {
+			ignored   : int( arguments.skipped.ignored ?: 0 ),
+			oversized : int( arguments.skipped.oversized ?: 0 ),
+			binary    : int( arguments.skipped.binary ?: 0 ),
+			unreadable: int( arguments.skipped.unreadable ?: 0 ),
+			limit     : int( arguments.skipped.limit ?: 0 )
+		};
 	}
 
 	private string function timestamp() {

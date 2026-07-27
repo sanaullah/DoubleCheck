@@ -1799,6 +1799,34 @@ function setRun(run) {
 	}
 }
 
+function discoveryCoverageText(skipped = {}, discoveryTruncated = false) {
+	const labels = {
+		ignored: "ignored",
+		oversized: "oversized",
+		binary: "binary",
+		unreadable: "unreadable",
+		limit: "limit"
+	};
+	const parts = Object.entries(labels)
+		.filter(([key]) => Number(skipped?.[key] || 0) > 0)
+		.map(([key, label]) => `${Number(skipped[key])} ${label}`);
+	if (discoveryTruncated) parts.push("truncated");
+	return parts.length ? `Skipped: ${parts.join(" · ")}` : "";
+}
+
+function renderDiscoveryCoverage(skipped = {}, discoveryTruncated = false) {
+	if (!elements.summary) return;
+	let line = document.querySelector("#result-discovery-coverage");
+	if (!line) {
+		line = document.createElement("p");
+		line.id = "result-discovery-coverage";
+		line.className = "result-discovery-coverage";
+		elements.summary.insertAdjacentElement("afterend", line);
+	}
+	line.textContent = discoveryCoverageText(skipped, discoveryTruncated);
+	line.hidden = !line.textContent;
+}
+
 function appendEvent(type, payload) {
 	if (elements.feed.querySelector(".empty-state")) elements.feed.innerHTML = "";
 	const item = document.createElement("li");
@@ -1813,10 +1841,12 @@ function appendEvent(type, payload) {
 	const detail = payload?.data?.detail;
 	let message = run?.message || payload?.message || "Lifecycle update";
 	if (type === "review.indexed" && detail) {
-		message = `${detail.filesScanned} files indexed · ${(detail.languages || []).join(", ") || "no source languages"}`;
+		const coverage = discoveryCoverageText(detail.skipped, detail.discoveryTruncated);
+		message = `${detail.filesScanned} files indexed · ${(detail.languages || []).join(", ") || "no source languages"}${coverage ? ` · ${coverage}` : ""}`;
 		state.commandMetrics.files = detail.filesScanned || 0;
 		state.commandMetrics.languages = detail.languages || [];
 		updateCommandMetrics();
+		renderDiscoveryCoverage(detail.skipped, detail.discoveryTruncated);
 	}
 	if (type === "review.findings" && detail) {
 		message = `${detail.count} ${detail.source} findings retained`;
@@ -1904,6 +1934,7 @@ function renderResult(result = {}) {
 	const unavailable = scope === "working-tree-unavailable" || scope === "revision-diff-unavailable";
 	elements.summary.textContent = result.summary || "The review has not produced a summary yet.";
 	elements.summary.dataset.tone = unavailable ? "warning" : (result.findingsCount ? "ok" : "idle");
+	renderDiscoveryCoverage(result.skipped, result.discoveryTruncated);
 	elements.resultFiles.textContent = result.filesScanned || 0;
 	elements.resultLanguages.textContent = (result.languages || []).join(", ") || "—";
 	elements.resultCount.textContent = result.findingsCount || 0;
