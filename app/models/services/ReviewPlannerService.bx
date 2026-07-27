@@ -65,6 +65,8 @@ class {
 		// Pre-flight cost estimates are worst-case ceilings for a single task.
 		// Do not divide the run budget here or every multi-role review fails the gate.
 		var costPerTask = totalCostLimit;
+		var plannerFiles = arguments.files;
+		var plannerGraph = arguments.graph;
 		var roleQueue = useLlmCrew
 			? crewSelections
 			: selectedRoles.map(
@@ -74,7 +76,11 @@ class {
 							priority      : rolePriority( role ),
 							objective     : roleObjective( role ),
 							brief         : "",
-							emphasizeFiles: []
+							emphasizeFiles: emphasizeFilesForRole(
+								role,
+								plannerFiles,
+								plannerGraph
+							)
 						};
 					}
 				);
@@ -222,6 +228,44 @@ class {
 		}
 		// Emphasized paths first, then the rest of the shared pack (boost, don't replace).
 		return focused.len() ? focused.append( remainder, true ) : arguments.contextFiles;
+	}
+
+	private array function emphasizeFilesForRole( required string role, required array files, required struct graph ) {
+		var emphasized = [];
+		var testPaths = {};
+		if ( arguments.role == "testing" ) {
+			for ( var symbol in arguments.graph.symbols ) {
+				if ( findNoCase( "test", symbol.kind ?: "" ) > 0 ) {
+					testPaths[ lCase( replace( symbol.filePath ?: "", "\", "/", "all" ) ) ] = true;
+				}
+			}
+		}
+		for ( var file in arguments.files ) {
+			var path = replace( trim( file.filePath ?: "" ), "\", "/", "all" );
+			var language = lCase( trim( file.language ?: "" ) );
+			var matches = false;
+			switch ( arguments.role ) {
+				case "cfml-conventions":
+					matches = language == "cfml";
+					break;
+				case "boxlang-conventions":
+					matches = language == "boxlang" || reFindNoCase( "\.bxm?$", path ) > 0;
+					break;
+				case "security":
+					matches = listFindNoCase( "cfml,boxlang", language ) > 0 || reFindNoCase( "\.(?:cfc|cfm|bx|bxm)$", path ) > 0;
+					break;
+				case "testing":
+					matches = reFindNoCase( "(^|/)tests?/", path ) > 0 || testPaths.keyExists( lCase( path ) );
+					break;
+			}
+			if ( matches ) {
+				emphasized.append( file.filePath );
+				if ( emphasized.len() >= 8 ) {
+					break;
+				}
+			}
+		}
+		return emphasized;
 	}
 
 	private array function authorizedRoles( required struct policy ) {
