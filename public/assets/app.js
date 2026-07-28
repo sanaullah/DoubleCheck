@@ -31,6 +31,8 @@ const state = {
 	architectureSearch: "",
 	architectureKind: "all",
 	architectureGraph: null,
+	architectureSelectedPath: "",
+	architectureReviewScope: "full",
 	history: {
 		page: 1,
 		totalPages: 0,
@@ -115,6 +117,28 @@ const phasePipelineStage = {
 	cancelled: "completion",
 	failed: "completion"
 };
+
+const emptyStateIcons = {
+	findings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l2 2 4-4"/><path d="M5 5h14v14H5z"/></svg>',
+	search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
+	detail: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>',
+	history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+	architecture: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="8" cy="18" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8.2 7.8 15.8 8.8M7.2 15.8 15.5 15.2M8.3 8.3 9.5 15.7"/></svg>',
+	feed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h10M4 18h7"/></svg>',
+	inbox: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h16v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8Z"/><path d="m4 8 2.5-3h11L20 8"/><path d="M9 13h6"/></svg>'
+};
+
+function emptyStateHtml({ icon = "inbox", title = "", hint = "" } = {}) {
+	const svg = emptyStateIcons[icon] || emptyStateIcons.inbox;
+	const hintHtml = hint ? `<span class="empty-state-hint">${hint}</span>` : "";
+	return `<div class="empty-state" role="status"><span class="empty-state-icon" aria-hidden="true">${svg}</span><strong class="empty-state-title">${title}</strong>${hintHtml}</div>`;
+}
+
+function emptyStateElement(options = {}) {
+	const wrap = document.createElement("div");
+	wrap.innerHTML = emptyStateHtml(options);
+	return wrap.firstElementChild;
+}
 
 function specialistWarningText(result = {}) {
 	const failures = (result.specialists?.results || [])
@@ -1024,16 +1048,23 @@ function renderObservability() {
 	elements.observeFeed.innerHTML = "";
 	if (!rows.length) {
 		const empty = document.createElement("li");
-		empty.className = "empty-state";
+		empty.className = "empty-state-item";
 		const parts = [];
 		if (filter === "failures") parts.push("failure");
 		else if (filter !== "all") parts.push(filter);
 		if (roleFilter !== "all") parts.push(roleFilter);
-		empty.textContent = filter === "all" && roleFilter === "all" && !query
-			? (state.activeRun
-				? "Waiting for first server event…"
-				: "Start or select a run to inspect generations, tool calls, inputs, and outputs.")
-			: `No matching ${parts.length ? parts.join(" ") + " " : ""}observations.`;
+		const filtered = Boolean(parts.length || query);
+		empty.innerHTML = emptyStateHtml({
+			icon: filtered ? "search" : "feed",
+			title: filtered
+				? "No matching observations"
+				: (state.activeRun ? "Waiting for first server event…" : "No trace selected"),
+			hint: filtered
+				? `No matching ${parts.length ? parts.join(" ") + " " : ""}observations${query ? " for this search" : ""}.`
+				: (state.activeRun
+					? "Live observations will appear here as the review progresses."
+					: "Start or select a run to inspect generations, tool calls, inputs, and outputs.")
+		});
 		elements.observeFeed.appendChild(empty);
 		return;
 	}
@@ -1432,6 +1463,10 @@ const elements = {
 	architectureSummary: document.querySelector("#architecture-summary"),
 	architectureResults: document.querySelector("#architecture-results"),
 	architectureSnapshot: document.querySelector("#architecture-snapshot"),
+	architectureDiagramShell: document.querySelector("#architecture-diagram-shell"),
+	architectureDiagram: document.querySelector("#architecture-diagram"),
+	architectureDiagramMeta: document.querySelector("#architecture-diagram-meta"),
+	architectureClearSelection: document.querySelector("#architecture-clear-selection"),
 	exportActions: document.querySelector("#export-actions"),
 	aiBadge: document.querySelector("#ai-badge"),
 	healthDot: document.querySelector("#health-dot"),
@@ -1932,8 +1967,26 @@ function appendEvent(type, payload) {
 function renderResult(result = {}) {
 	const scope = result.reviewScope || "";
 	const unavailable = scope === "working-tree-unavailable" || scope === "revision-diff-unavailable";
-	elements.summary.textContent = result.summary || "The review has not produced a summary yet.";
-	elements.summary.dataset.tone = unavailable ? "warning" : (result.findingsCount ? "ok" : "idle");
+	const hasPayload = !!(
+		result.filesScanned ||
+		result.findingsCount ||
+		(result.findings || []).length ||
+		result.graph?.summary?.symbolCount ||
+		result.architecture?.summary?.factCount ||
+		state.activeRun
+	);
+	const resultsPanel = document.querySelector("#results-panel");
+	const architecturePanel = document.querySelector("#architecture-explorer");
+	if (resultsPanel) resultsPanel.dataset.state = hasPayload ? "active" : "idle";
+	if (architecturePanel) architecturePanel.dataset.state = hasPayload ? "active" : "idle";
+	if (!hasPayload) {
+		elements.summary.textContent = "Complete a run to inspect its indexed languages and evidence-backed findings.";
+		elements.summary.dataset.tone = "idle";
+	} else {
+		elements.summary.textContent = result.summary || "The review has not produced a summary yet.";
+		elements.summary.dataset.tone = unavailable ? "warning" : (result.findingsCount ? "ok" : "idle");
+	}
+	state.architectureReviewScope = result.reviewScope || "full";
 	renderDiscoveryCoverage(result.skipped, result.discoveryTruncated);
 	elements.resultFiles.textContent = result.filesScanned || 0;
 	elements.resultLanguages.textContent = (result.languages || []).join(", ") || "—";
@@ -2069,13 +2122,25 @@ function renderFindingsWorkspace(unavailable = false) {
 	const findings = filteredFindings();
 	elements.findings.innerHTML = "";
 	if (!findings.length) {
-		const empty = document.createElement("p");
-		empty.className = "empty-state";
-		empty.textContent = state.findings.length
-			? "No findings match the current filters."
-			: unavailable
-				? "No files were reviewed. Switch Review mode to Full baseline and start again."
-				: "No evidence-backed findings were retained.";
+		const empty = emptyStateElement(
+			state.findings.length
+				? {
+					icon: "search",
+					title: "No findings match these filters",
+					hint: "Try clearing severity, review state, or search."
+				}
+				: unavailable
+					? {
+						icon: "findings",
+						title: "No files were reviewed",
+						hint: "Switch Review mode to Full baseline and start again."
+					}
+					: {
+						icon: "findings",
+						title: "No evidence-backed findings",
+						hint: "Complete a run to inspect indexed languages and retained findings."
+					}
+		);
 		elements.findings.appendChild(empty);
 		renderFindingDetail(null);
 		return;
@@ -2131,7 +2196,11 @@ function renderFindingDetail(finding) {
 	if (!elements.findingDetail) return;
 	elements.findingDetail.innerHTML = "";
 	if (!finding) {
-		elements.findingDetail.innerHTML = '<p class="empty-state">Select a finding to inspect its evidence and recommendation.</p>';
+		elements.findingDetail.innerHTML = emptyStateHtml({
+			icon: "detail",
+			title: "Select a finding",
+			hint: "Inspect its evidence, recommendation, and review decision here."
+		});
 		return;
 	}
 	const detail = document.createElement("div");
@@ -2250,6 +2319,116 @@ async function saveFindingReview(finding, detail) {
 	}
 }
 
+function architectureEscapeHtml(value) {
+	return String(value ?? "")
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+function architectureEscapeAttr(value) {
+	return architectureEscapeHtml(value).replace(/'/g, "&#39;");
+}
+
+function renderArchitectureDiagram(graph) {
+	const flow = window.ArchitectureFlow;
+	const shell = elements.architectureDiagramShell;
+	const host = elements.architectureDiagram;
+	if (!flow || !shell || !host) return;
+
+	const subgraph = flow.pickArchitectureSubgraph(graph, state.architectureReviewScope, {
+		maxNodes: 16,
+		maxEdges: 18
+	});
+	if (!subgraph.nodes.length) {
+		shell.hidden = true;
+		host.innerHTML = "";
+		if (elements.architectureClearSelection) elements.architectureClearSelection.hidden = true;
+		return;
+	}
+	shell.hidden = false;
+	const layout = flow.layoutFlowPositions(subgraph);
+	const selected = state.architectureSelectedPath;
+	const hot = new Set();
+	if (selected) {
+		hot.add(selected);
+		layout.edges.forEach((e) => {
+			if (e.from === selected || e.to === selected) {
+				hot.add(e.from);
+				hot.add(e.to);
+			}
+		});
+	}
+
+	const modeEl = document.getElementById("architecture-diagram-mode");
+	if (modeEl) {
+		modeEl.dataset.mode = subgraph.mode;
+		modeEl.textContent = subgraph.mode === "impact" ? "Impact" : "Wiring";
+	}
+	const trunc = subgraph.truncated
+		? `Showing ${subgraph.nodes.length} of ${subgraph.totalNodes} files · ${layout.edges.length} links`
+		: `${subgraph.nodes.length} files · ${layout.edges.length} links`;
+	if (elements.architectureDiagramMeta) {
+		elements.architectureDiagramMeta.textContent = trunc
+			+ (subgraph.mode === "impact"
+				? " · changed files → what they touch"
+				: " · how key files depend on each other");
+	}
+	if (elements.architectureClearSelection) {
+		elements.architectureClearSelection.hidden = !selected;
+	}
+
+	const byId = Object.fromEntries(layout.nodes.map((n) => [n.id, n]));
+	const edgeLines = layout.edges.map((e) => {
+		const a = byId[e.from];
+		const b = byId[e.to];
+		if (!a || !b) return "";
+		const x1 = a.x + a.w;
+		const y1 = a.y + a.h / 2;
+		const x2 = b.x;
+		const y2 = b.y + b.h / 2;
+		const dx = Math.max(36, (x2 - x1) * 0.45);
+		const connected = !selected || (hot.has(e.from) && hot.has(e.to));
+		const isHot = selected && (e.from === selected || e.to === selected);
+		const cls = [
+			"architecture-edge",
+			connected ? "" : "is-dimmed",
+			isHot ? "is-hot" : ""
+		].filter(Boolean).join(" ");
+		return `<path class="${cls}" d="M${x1} ${y1} C${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" />`;
+	}).join("");
+
+	const shortDir = flow.shortDir || flow.fileDir;
+	const nodeHtml = layout.nodes.map((n) => {
+		const dim = selected && !hot.has(n.id) ? " is-dimmed" : "";
+		const sel = selected === n.id ? " is-selected" : "";
+		const seed = n.role === "seed" ? " seed" : "";
+		const titleText = flow.fileBasename(n.path);
+		const subLabel = shortDir(n.path);
+		return `<g class="architecture-node${seed}${sel}${dim}" data-path="${architectureEscapeAttr(n.path)}" transform="translate(${n.x},${n.y})">
+			<title>${architectureEscapeAttr(n.path)}</title>
+			<rect class="architecture-node-card" width="${n.w}" height="${n.h}" rx="10" ry="10"></rect>
+			<rect class="architecture-node-rail" x="0" y="0" width="4" height="${n.h}" rx="2"></rect>
+			<text class="architecture-node-title" x="14" y="23">${architectureEscapeHtml(titleText)}</text>
+			<text class="architecture-node-sub" x="14" y="41">${architectureEscapeHtml(subLabel)}</text>
+		</g>`;
+	}).join("");
+
+	host.innerHTML = `<svg viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" xmlns="http://www.w3.org/2000/svg">
+		<defs>
+			<marker id="architecture-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+				<path d="M0,0 L7,3.5 L0,7 Z" fill="#5a738a"></path>
+			</marker>
+			<marker id="architecture-arrow-hot" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+				<path d="M0,0 L7,3.5 L0,7 Z" fill="#67e8b6"></path>
+			</marker>
+		</defs>
+		${edgeLines}
+		${nodeHtml}
+	</svg>`;
+}
+
 function renderArchitectureExplorer(result = null) {
 	if (result) state.architectureGraph = {
 		graph: result.graph || {},
@@ -2276,6 +2455,7 @@ function renderArchitectureExplorer(result = null) {
 		item.querySelector("strong").textContent = value;
 		elements.architectureSummary.appendChild(item);
 	});
+	renderArchitectureDiagram(graph);
 	const query = state.architectureSearch.toLowerCase().trim();
 	const kind = state.architectureKind;
 	const facts = [];
@@ -2303,15 +2483,30 @@ function renderArchitectureExplorer(result = null) {
 			detail: item.reason || ""
 		}));
 	}
-	const visible = facts.filter((fact) => !query ||
+	let visible = facts.filter((fact) => !query ||
 		[fact.type, fact.title, fact.location, fact.detail].some((value) =>
 			String(value || "").toLowerCase().includes(query)
 		)
 	);
+	if (state.architectureSelectedPath) {
+		const needle = state.architectureSelectedPath.toLowerCase().replace(/\\/g, "/");
+		visible = visible.filter((fact) =>
+			[fact.title, fact.location, fact.detail].some((value) =>
+				String(value || "").toLowerCase().replace(/\\/g, "/").includes(needle)
+			)
+		);
+	}
 	elements.architectureResults.innerHTML = "";
 	if (!visible.length) {
-		elements.architectureResults.innerHTML =
-			'<p class="empty-state">No architecture facts match this view.</p>';
+		elements.architectureResults.innerHTML = emptyStateHtml({
+			icon: query || kind !== "all" || state.architectureSelectedPath ? "search" : "architecture",
+			title: query || kind !== "all" || state.architectureSelectedPath
+				? "No architecture facts match"
+				: "No architecture snapshot",
+			hint: query || kind !== "all" || state.architectureSelectedPath
+				? "Try another search, fact type, or clear the diagram selection."
+				: "Open a completed review to explore symbols, dependencies, and impact paths."
+		});
 		return;
 	}
 	visible.slice(0, 250).forEach((fact) => {
@@ -2757,7 +2952,11 @@ function openEventStream(run, afterSequence = 0) {
 async function loadRuns() {
 	if (!elements.history || state.history.loading) return;
 	state.history.loading = true;
-	elements.history.innerHTML = `<tr><td colspan="8" class="empty-state">Loading review history…</td></tr>`;
+	elements.history.innerHTML = `<tr><td colspan="8">${emptyStateHtml({
+		icon: "history",
+		title: "Loading review history…",
+		hint: "Fetching recent runs from the local database."
+	})}</td></tr>`;
 	try {
 		const params = historyQueryParams();
 		const payload = await request(`/api/v1/history?${params.toString()}`);
@@ -2767,7 +2966,13 @@ async function loadRuns() {
 		state.history.totalPages = meta.totalPages || 0;
 		elements.history.innerHTML = rows.length
 			? ""
-			: `<tr><td colspan="8" class="empty-state">${hasHistoryFilters() ? "No reviews match these filters." : "No runs yet."}</td></tr>`;
+			: `<tr><td colspan="8">${emptyStateHtml({
+				icon: hasHistoryFilters() ? "search" : "history",
+				title: hasHistoryFilters() ? "No reviews match these filters" : "No runs yet",
+				hint: hasHistoryFilters()
+					? "Clear filters or broaden the date range."
+					: "Start a local review above — completed runs appear here."
+			})}</td></tr>`;
 		renderHistoryTrends(meta.trends || {});
 		renderHistoryPagination(meta);
 		rows.forEach((item) => {
@@ -2857,7 +3062,11 @@ async function loadRuns() {
 			}
 		}
 	} catch (error) {
-		elements.history.innerHTML = `<tr><td colspan="8" class="empty-state">${error.message}</td></tr>`;
+		elements.history.innerHTML = `<tr><td colspan="8">${emptyStateHtml({
+			icon: "inbox",
+			title: "Could not load history",
+			hint: error.message || "Try refreshing the history table."
+		})}</td></tr>`;
 	} finally {
 		state.history.loading = false;
 	}
@@ -2880,7 +3089,7 @@ function historyQueryParams() {
 		}
 	});
 	params.set("page", String(state.history.page));
-	params.set("limit", "20");
+	params.set("limit", "5");
 	return params;
 }
 
@@ -2928,7 +3137,7 @@ function renderHistorySeverity(target, findings = {}) {
 		chips.appendChild(chip);
 	});
 	if (!chips.childElementCount) {
-		chips.textContent = findings.total == null ? "Unavailable" : "No findings";
+		chips.innerHTML = `<span class="history-severity-empty">${findings.total == null ? "Unavailable" : "No findings"}</span>`;
 	}
 }
 
@@ -2969,14 +3178,22 @@ async function loadHistoryComparison(run) {
 	if (!elements.historyComparison) return;
 	elements.historyComparison.hidden = false;
 	elements.historyComparisonTitle.textContent = `Comparing ${run.projectPath || run.id}`;
-	elements.comparisonCounts.innerHTML = `<p class="empty-state">Loading compatible baseline…</p>`;
+	elements.comparisonCounts.innerHTML = emptyStateHtml({
+		icon: "history",
+		title: "Loading compatible baseline…",
+		hint: "Comparing this run with the prior matching review."
+	});
 	elements.comparisonMovements.innerHTML = "";
 	elements.historyComparison.scrollIntoView({ behavior: "smooth", block: "nearest" });
 	try {
 		const payload = await request(`/api/v1/history/${encodeURIComponent(run.id)}/comparison`);
 		renderHistoryComparison(run, payload.data || {});
 	} catch (error) {
-		elements.comparisonCounts.innerHTML = `<p class="empty-state">${error.message}</p>`;
+		elements.comparisonCounts.innerHTML = emptyStateHtml({
+			icon: "inbox",
+			title: "Could not load comparison",
+			hint: error.message || "Try again from History."
+		});
 	}
 }
 
@@ -2984,7 +3201,11 @@ function renderHistoryComparison(run, comparison = {}) {
 	const counts = comparison.counts || {};
 	elements.comparisonCounts.innerHTML = "";
 	if (!comparison.baseline) {
-		elements.comparisonCounts.innerHTML = `<p class="empty-state">No prior compatible run (same repository and mode).</p>`;
+		elements.comparisonCounts.innerHTML = emptyStateHtml({
+			icon: "history",
+			title: "No prior compatible run",
+			hint: "Need another completed run with the same repository and mode."
+		});
 		elements.comparisonMovements.innerHTML = "";
 		return;
 	}
@@ -3061,7 +3282,11 @@ function renderHistoryComparison(run, comparison = {}) {
 		elements.comparisonMovements.appendChild(button);
 	});
 	if (!elements.comparisonMovements.childElementCount) {
-		elements.comparisonMovements.innerHTML = `<p class="empty-state">No finding movement recorded.</p>`;
+		elements.comparisonMovements.innerHTML = emptyStateHtml({
+			icon: "findings",
+			title: "No finding movement recorded",
+			hint: "This baseline comparison has no new, resolved, or severity changes."
+		});
 	}
 }
 
@@ -3332,6 +3557,25 @@ elements.architectureSearch?.addEventListener("input", (event) => {
 
 elements.architectureKind?.addEventListener("change", (event) => {
 	state.architectureKind = event.target.value || "all";
+	renderArchitectureExplorer();
+});
+
+elements.architectureDiagram?.addEventListener("click", (event) => {
+	const node = event.target.closest(".architecture-node");
+	if (node) {
+		const path = node.getAttribute("data-path") || "";
+		state.architectureSelectedPath = state.architectureSelectedPath === path ? "" : path;
+		renderArchitectureExplorer();
+		return;
+	}
+	if (event.target.closest("svg") || event.target === elements.architectureDiagram) {
+		state.architectureSelectedPath = "";
+		renderArchitectureExplorer();
+	}
+});
+
+elements.architectureClearSelection?.addEventListener("click", () => {
+	state.architectureSelectedPath = "";
 	renderArchitectureExplorer();
 });
 
