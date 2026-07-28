@@ -48,6 +48,9 @@ class {
 			{ itemType: itemType, itemId: arguments.itemId, decision: decision, note: note, itemFingerprint: fingerprint, decidedBy: arguments.context.actor ?: "local-user" }
 		);
 		modernizationRepository.appendDecisionEvent( arguments.run.getId(), { itemType: itemType, itemId: arguments.itemId, action: decision, decision: saved, actor: arguments.context.actor ?: "local-user" } );
+		if ( itemType == "roadmap-phase" ) {
+			cascadePhaseDecision( arguments.run.getId(), item, decision, note, arguments.context.actor ?: "local-user" );
+		}
 		var state = recomputeState( planRecord, arguments.run.getId() );
 		persistState( planRecord, state );
 		return { decision: saved, state: state, decisions: modernizationRepository.listDecisions( arguments.run.getId() ), events: modernizationRepository.listDecisionEvents( arguments.run.getId() ) };
@@ -131,6 +134,62 @@ class {
 				: ( isArray( arguments.plan[ path ] ?: "" ) ? arguments.plan[ path ] : [] );
 		for ( var item in values ) if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
 		return javacast( "null", "" );
+	}
+
+	private void function cascadePhaseDecision(
+		required string runId,
+		required struct phase,
+		required string decision,
+		required string note,
+		required string actor
+	) {
+		var planRecord = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( planRecord ) ) return;
+		var plan = planRecord.plan ?: {};
+		var cascadeNote = len( trim( arguments.note ) )
+			? "[cascade from phase #arguments.phase.id ?: ""#] #arguments.note#"
+			: "[cascade from phase #arguments.phase.id ?: ""#]";
+		var links = [
+			{ ids: arguments.phase.unitIds ?: [], type: "target-unit" },
+			{ ids: arguments.phase.routeIds ?: [], type: "route-contract" },
+			{ ids: arguments.phase.sampleIds ?: [], type: "sample" },
+			{ ids: arguments.phase.dbFindingIds ?: [], type: "db-finding" },
+			{ ids: arguments.phase.transitionIds ?: [], type: "db-transition" }
+		];
+		for ( var link in links ) {
+			var idList = isArray( link.ids ) ? link.ids : [];
+			for ( var linkedId in idList ) {
+				var itemId = trim( linkedId );
+				if ( !len( itemId ) ) continue;
+				var linked = findItem( plan, link.type, itemId );
+				if ( isNull( linked ) ) continue;
+				var fp = trim( linked.itemFingerprint ?: "" );
+				if ( !len( fp ) ) continue;
+				var saved = modernizationRepository.upsertDecision(
+					arguments.runId,
+					{
+						itemType        : link.type,
+						itemId          : itemId,
+						decision        : arguments.decision,
+						note            : cascadeNote,
+						itemFingerprint : fp,
+						decidedBy       : arguments.actor,
+						cascadedFrom    : arguments.phase.id ?: ""
+					}
+				);
+				modernizationRepository.appendDecisionEvent(
+					arguments.runId,
+					{
+						itemType     : link.type,
+						itemId       : itemId,
+						action       : arguments.decision,
+						decision     : saved,
+						actor        : arguments.actor,
+						cascadedFrom : arguments.phase.id ?: ""
+					}
+				);
+			}
+		}
 	}
 
 	private void function ensureModernization(required any run) {
