@@ -1,0 +1,72 @@
+/** Extracts deterministic modernization seams before any LLM call. */
+@singleton
+class {
+	variables.version = "modernization-signals-v1";
+
+	struct function build(required struct inventory, struct schemaPack = {}, struct evidence = {}) {
+		var signals = [];
+		var add = ( string id, string group, string meaning, any refs, numeric confidence = 1 ) => {
+			var evidenceRefs = isArray( refs ) ? refs : [ refs ];
+			signals.append( { id: stableHash( "#id#|#jsonSerialize( evidenceRefs )#" ), signalId: id, group: group, meaning: meaning, evidenceRefs: evidenceRefs, confidence: confidence } );
+		};
+		for ( var dep in arguments.inventory.dependencies ?: [] ) {
+			var ref = { filePath: dep.filePath ?: "", startLine: dep.startLine ?: 0, endLine: dep.endLine ?: dep.startLine ?: 0, target: dep.target ?: "" };
+			switch ( lCase( dep.kind ?: "" ) ) {
+				case "http": add( "http.outbound", "outbound-integration", "Outbound HTTP integration", ref ); break;
+				case "schedule": add( "schedule.task", "outbound-integration", "Scheduled work entry", ref ); break;
+				case "include": add( "include.chain", "include-call-coupling", "CFML include chain", ref ); break;
+				case "component-construction": add( "component.construction", "include-call-coupling", "Component construction or invocation", ref ); break;
+				case "filesystem": add( "filesystem.io", "outbound-integration", "Filesystem dependency", ref ); break;
+				case "java": add( "java.interop", "outbound-integration", "Java interoperability", ref ); break;
+				case "datasource": add( "datasource.named", "datasource-table-coupling", "Named datasource dependency", ref ); break;
+				case "table-query": add( "sql.table-ref", "datasource-table-coupling", "SQL table reference", ref ); break;
+				case "column-query": add( "sql.column-ref", "datasource-table-coupling", "SQL column reference", ref ); break;
+				case "sql-type-hint": add( "sql.type-hint", "datasource-table-coupling", "CFML SQL type hint", ref ); break;
+				case "sql-proc-call": add( "sql.proc-call", "datasource-table-coupling", "Stored procedure call evidence", ref ); break;
+				case "sql-parameter-mismatch": add( "sql.parameter-mismatch", "cf-sql-parameter-mismatch", "CFML and SQL parameter binding may not match", ref, 0.7 ); break;
+				case "query": add( "sql.query", "datasource-table-coupling", "SQL/query execution", ref ); break;
+				case "scope.session": add( "scope.session-heavy", "security-session", "Session scope coupling", ref ); break;
+				case "scope.application": add( "scope.application-state", "application-lifecycle-state", "Application scope state", ref ); break;
+				case "scope.client": add( "scope.client", "security-session", "Client scope coupling", ref ); break;
+				case "security-session-gate": add( "security.session-gate", "security-session", "Session or authentication gate", ref ); break;
+			}
+		}
+		for ( var unresolved in arguments.inventory.unresolved ?: [] ) {
+			var ref = { filePath: unresolved.filePath ?: "", startLine: unresolved.startLine ?: 0, endLine: unresolved.endLine ?: unresolved.startLine ?: 0, evidence: unresolved.evidence ?: "" };
+			switch ( lCase( unresolved.kind ?: "" ) ) {
+				case "dynamic-include": add( "include.chain", "include-call-coupling", "Dynamic include cannot be resolved", ref, 0.5 ); break;
+				case "dynamic-component": add( "component.dynamic", "include-call-coupling", "Dynamic component construction requires manual mapping", ref, 0.5 ); break;
+				case "dynamic-evaluate": add( "dynamic.eval", "application-lifecycle-state", "evaluate() requires manual migration review", ref, 1 ); break;
+				case "unparameterized-sql": add( "sql.unparameterized", "datasource-table-coupling", "SQL appears to be string-built or unparameterized", ref, 0.9 ); break;
+				case "dynamic-sql": add( "sql.dynamic-identifier", "cf-sql-parameter-mismatch", "Dynamic SQL identifier cannot be resolved safely", ref, 0.5 ); break;
+				case "dynamic-route": add( "route.dynamic", "route-contract", "Dynamic route evidence requires review", ref, 0.5 ); break;
+			}
+		}
+		for ( var route in arguments.inventory.routeEvidence ?: [] ) {
+			add( "route.evidence", "route-contract", "Legacy route evidence", { filePath: route.filePath ?: "", startLine: route.startLine ?: 0, endLine: route.endLine ?: 0, path: route.legacyPath ?: "" }, route.unresolved ? 0.5 : 1 );
+		}
+		for ( var unit in arguments.inventory.units ?: [] ) {
+			if ( ( unit.unitType ?: "" ) == "application" ) add( "app.lifecycle", "application-lifecycle-state", "Application.cfc lifecycle unit", unit.evidenceRefs ?: [] );
+		}
+		var stackHints = [];
+		for ( var sourceFile in arguments.evidence.files ?: [] ) {
+			if ( reFindNoCase( "(^|/)config/ColdBox\\.(?:cfc|bx)$", sourceFile.filePath ?: "" ) ) {
+				add( "coldbox.present", "runtime-hints", "ColdBox configuration is present", { filePath: sourceFile.filePath, startLine: 1, endLine: 1 } );
+				stackHints.append( "coldbox.present" );
+			}
+		}
+		if ( ( arguments.inventory.files ?: [] ).filter( ( item ) => reFindNoCase( "(^|/)application\\.(?:cfc|bx)$", item.filePath ?: "" ) ).len() ) stackHints.append( "application.lifecycle" );
+		// Stable ordering prevents prompt drift and makes plan fingerprints useful.
+		signals.sort( ( a, b ) => compareNoCase( a.signalId & ":" & jsonSerialize( a.evidenceRefs ), b.signalId & ":" & jsonSerialize( b.evidenceRefs ) ) );
+		var groups = {};
+		for ( var item in signals ) {
+			if ( !groups.keyExists( item.group ) ) groups[ item.group ] = [];
+			groups[ item.group ].append( item );
+		}
+		return { version: variables.version, signals: signals, groups: groups, stackHints: stackHints, count: signals.len(), fingerprint: stableHash( variables.version & "|" & jsonSerialize( signals ) ) };
+	}
+
+	struct function derive(required struct inventory, struct schemaPack = {}, struct evidence = {}) returntype="struct" { return build( arguments.inventory, arguments.schemaPack, arguments.evidence ); }
+	struct function detect(required struct inventory, struct schemaPack = {}, struct evidence = {}) returntype="struct" { return build( arguments.inventory, arguments.schemaPack, arguments.evidence ); }
+	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
+}

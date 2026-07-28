@@ -237,6 +237,74 @@ class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 						}
 					}
 				);
+
+				it(
+					"exports a Modernize plan as Markdown and JSON but rejects SARIF",
+					() => {
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var modernizationRepository = getInstance( "ModernizationRepository" );
+						try {
+							runRepository.create( {
+								id          : runId,
+								tenantId    : "default",
+								projectId   : "default",
+								projectPath : expandPath( "/app" ),
+								mode        : "full",
+								runKind     : "modernize",
+								input       : { version: "modernization-input-v1" },
+								baseRevision: "",
+								headRevision: "HEAD",
+								status      : "succeeded",
+								progress    : 100,
+								currentPhase: "completed",
+								message     : "Modernize export fixture",
+								policy      : { version: "modernization-input-v1" },
+								budgets     : {},
+								createdAt   : nowValue,
+								updatedAt   : nowValue
+							} );
+							modernizationRepository.savePlan(
+								runId,
+								{
+									version: "modernization-plan-v1",
+									state: "needs-review",
+									summary: "Inference-limited modernization fixture",
+									coverage: { banners: [ "Schema evidence is inference-limited." ], schema: { coverage: "inference-limited" } },
+									inventory: { units: [ { id: "legacy-1", path: "index.cfm", kind: "template" } ] },
+									target: { units: [ { id: "target-1", path: "app/handlers/Index.bx", validationStatus: "warning" } ] },
+									routeContracts: [ { id: "route-1", legacyPath: "/index.cfm", targetRoute: "/", validationStatus: "valid" } ],
+									roadmapPhases: [],
+									dbFindings: [],
+									dbTransitions: [],
+									samples: [ { id: "sample-1", targetPath: "app/handlers/Index.bx", language: "boxlang", code: "writeOutput( 'ok' );" } ],
+									validation: { status: "warning", blockingCount: 0, warningCount: 1 },
+									decisions: []
+								},
+								{ status: "warning", blockingCount: 0, warningCount: 1 },
+								{ schema: { coverage: "inference-limited" } }
+							);
+
+							var markdownEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "markdown" } );
+							expect( markdownEvent.getResponse() ).toHaveStatus( 200 );
+							expect( markdownEvent.getRenderedContent() ).toInclude( "DoubleCheck Modernization Plan" );
+							expect( markdownEvent.getRenderedContent() ).toInclude( "inference-limited" );
+
+							var jsonEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "json" } );
+							expect( jsonEvent.getResponse() ).toHaveStatus( 200 );
+							var payload = jsonDeserialize( jsonEvent.getRenderedContent() );
+							expect( payload.schemaVersion ).toBe( "modernization-plan-v1" );
+							expect( payload.run.runKind ).toBe( "modernize" );
+							expect( payload.samples ).toHaveLength( 1 );
+
+							var sarifEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "sarif" } );
+							expect( sarifEvent.getRenderData().statusCode ).toBe( 422 );
+						} finally {
+							queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+						}
+					}
+				);
 			}
 		);
 	}

@@ -1,0 +1,179 @@
+/**
+ * Builds deterministic, bounded context partitions for modernization roles.
+ * Partitions follow candidate seams (directory/unit) and contain references,
+ * not an unbounded copy of the repository or schema attachment.
+ */
+@singleton
+class {
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="maxPartitions" inject="coldbox:setting:modernizeMaxContextPartitions";
+	property name="maxCharacters" inject="coldbox:setting:modernizeMaxContextCharacters";
+	property name="maxLinesPerFile" inject="coldbox:setting:modernizeMaxContextLinesPerFile";
+	property name="maxCharactersPerPartition" inject="coldbox:setting:modernizeMaxContextCharactersPerPartition";
+	variables.defaults = { maxPartitions: 40, maxCharacters: 60000, maxLinesPerFile: 120, maxCharactersPerPartition: 18000 };
+	variables.version = "modernization-context-partitions-v1";
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		return this;
+	}
+
+	struct function build(
+		required struct first,
+		any second = {},
+		any third = {},
+		any fourth = {},
+		any fifth = [],
+		struct options = {}
+	) {
+		// Accept both the explicit service contract
+		// build(inventory, signals, schemaPack, coverage, sourceFiles, options)
+		// and the pipeline shorthand build(scan, inventory, signals, options).
+		var inventoryData = arguments.first;
+		var signalsData = isStruct( arguments.second ) ? arguments.second : {};
+		var schemaData = isStruct( arguments.third ) ? arguments.third : {};
+		var coverageData = isStruct( arguments.fourth ) ? arguments.fourth : {};
+		var sourceData = arguments.fifth;
+		if ( !arguments.first.keyExists( "units" ) && isStruct( arguments.second ) && arguments.second.keyExists( "units" ) ) {
+			inventoryData = arguments.second;
+			signalsData = isArray( arguments.third ) ? { signals: arguments.third } : ( isStruct( arguments.third ) ? arguments.third : {} );
+			schemaData = isStruct( arguments.fourth ) ? ( arguments.fourth.schemaPack ?: {} ) : {};
+			coverageData = {};
+			sourceData = arguments.first.files ?: [];
+			if ( isStruct( arguments.fourth ) ) arguments.options = arguments.fourth;
+		}
+		arguments.inventory = inventoryData;
+		arguments.signals = signalsData;
+		arguments.schemaPack = schemaData;
+		arguments.coverage = coverageData;
+		arguments.sourceFiles = sourceData;
+		var maxPartitions = numericSetting( arguments.options.maxPartitions ?: variables.maxPartitions, variables.defaults.maxPartitions );
+		var maxCharacters = numericSetting( arguments.options.maxCharacters ?: variables.maxCharacters, variables.defaults.maxCharacters );
+		var maxLines = numericSetting( arguments.options.maxLinesPerFile ?: variables.maxLinesPerFile, variables.defaults.maxLinesPerFile );
+		var maxPartitionChars = numericSetting( arguments.options.maxCharactersPerPartition ?: variables.maxCharactersPerPartition, variables.defaults.maxCharactersPerPartition );
+		var source = isArray( arguments.sourceFiles ) ? arguments.sourceFiles : ( isStruct( arguments.sourceFiles ) ? ( arguments.sourceFiles.files ?: [] ) : ( arguments.inventory.sourceFiles ?: [] ) );
+		if ( !source.len() ) source = arguments.inventory.files ?: [];
+		var indexed = {};
+		for ( var file in source ) indexed[ normalizePath( file.filePath ?: file.path ?: "" ) ] = file;
+		var pathGroups = {};
+		for ( var file in arguments.inventory.files ?: [] ) {
+			var path = normalizePath( file.filePath ?: "" );
+			if ( len( path ) && !pathGroups.keyExists( path ) ) pathGroups[ path ] = [];
+		}
+		for ( var unit in arguments.inventory.units ?: [] ) {
+			var path = normalizePath( unit.filePath ?: "" );
+			if ( !len( path ) ) continue;
+			if ( !pathGroups.keyExists( path ) ) pathGroups[ path ] = [];
+			pathGroups[ path ].append( unit );
+		}
+		var paths = structKeyArray( pathGroups );
+		paths.sort( "textnocase" );
+		var partitions = [];
+		var usedCharacters = 0;
+		var omitted = 0;
+		for ( var path in paths ) {
+			if ( partitions.len() >= maxPartitions ) { omitted++; continue; }
+			var file = indexed[ path ] ?: { filePath: path, contentHash: "", lines: [] };
+			var partition = buildPartition( path, file, pathGroups[ path ], arguments.signals, arguments.schemaPack, arguments.coverage, maxLines, maxPartitionChars, maxCharacters - usedCharacters );
+			if ( !len( partition.text ) && !partition.artifactRefs.len() ) { omitted++; continue; }
+			partitions.append( partition );
+			usedCharacters += len( partition.text );
+			if ( usedCharacters >= maxCharacters ) { omitted += paths.len() - partitions.len(); break; }
+		}
+		var summary = { partitionCount: partitions.len(), characters: usedCharacters, files: paths.len(), omittedPartitions: omitted, truncated: omitted > 0 || coverageTruncated( arguments.coverage ), lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 ) };
+		return { version: variables.version, partitions: partitions, contexts: partitions, files: partitions, summary: summary, truncated: summary.truncated, characters: usedCharacters, fingerprint: stableHash( variables.version & "|" & partitions.map( ( item ) => item.fingerprint ).toList( "|" ) ) };
+	}
+
+	struct function partition(required struct inventory, struct signals = {}, struct schemaPack = {}, struct coverage = {}, any sourceFiles = [], struct options = {}) returntype="struct" { return build( arguments.inventory, arguments.signals, arguments.schemaPack, arguments.coverage, arguments.sourceFiles, arguments.options ); }
+
+	private struct function buildPartition(
+		required string path,
+		required struct file,
+		required array units,
+		required struct signals,
+		required struct schemaPack,
+		required struct coverage,
+		required numeric maxLines,
+		required numeric maxPartitionChars,
+		required numeric availableCharacters
+	) {
+		var lines = isArray( arguments.file.lines ) ? arguments.file.lines : listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true );
+		if ( !lines.len() && len( arguments.file.content ?: "" ) ) lines = [ arguments.file.content ];
+		var ranges = selectRanges( arguments.units, lines.len(), arguments.maxLines );
+		var rendered = [];
+		var renderedRanges = [];
+		var used = 0;
+		for ( var rangeItem in ranges ) {
+			var rangeLines = [];
+			for ( var lineNumber = rangeItem.startLine; lineNumber <= rangeItem.endLine && lineNumber <= lines.len(); lineNumber++ ) rangeLines.append( toString( lines[ lineNumber ] ) );
+			var redacted = variables.secretRedactionService.redactLines( rangeLines );
+			var outputLines = [];
+			for ( var offset = 1; offset <= redacted.lines.len(); offset++ ) {
+				var lineText = redacted.lines[ offset ];
+				if ( isRowDml( lineText ) ) continue;
+				var candidate = "#rangeItem.startLine + offset - 1#| #lineText#";
+				if ( used + len( candidate ) > min( arguments.maxPartitionChars, arguments.availableCharacters ) ) break;
+				outputLines.append( candidate );
+				used += len( candidate ) + 1;
+			}
+			if ( outputLines.len() ) {
+				rendered.append( "BEGIN_UNTRUSTED_SOURCE #arguments.path#:#rangeItem.startLine#-#rangeItem.endLine#" & char( 10 ) & outputLines.toList( char( 10 ) ) & char( 10 ) & "END_UNTRUSTED_SOURCE" );
+				renderedRanges.append( { filePath: arguments.path, startLine: rangeItem.startLine, endLine: rangeItem.startLine + outputLines.len() - 1, extractionMethod: "bounded-source-range-v1", contentHash: arguments.file.contentHash ?: "", artifactRef: stableHash( "#arguments.path#:#rangeItem.startLine#:#rangeItem.endLine#" ) } );
+			}
+		}
+		var artifactRefs = renderedRanges.map( ( item ) => { return { filePath: item.filePath, startLine: item.startLine, endLine: item.endLine, contentHash: item.contentHash, ref: item.artifactRef }; } );
+		var matchingSignals = [];
+		for ( var signal in arguments.signals.signals ?: [] ) {
+			for ( var ref in signal.evidenceRefs ?: [] ) if ( normalizePath( ref.filePath ?: "" ) == arguments.path ) { matchingSignals.append( signal.signalId ?: signal.id ?: "" ); break; }
+		}
+		matchingSignals.sort( "textnocase" );
+		var schemaSummary = { coverage: arguments.schemaPack.coverage ?: "absent", tables: ( arguments.schemaPack.tables ?: [] ).len(), columns: ( arguments.schemaPack.columns ?: [] ).len(), unresolved: val( arguments.schemaPack.unresolvedCount ?: 0 ) };
+		var text = rendered.toList( char( 10 ) & char( 10 ) );
+		var fingerprint = stableHash(
+			variables.version & "|" & arguments.path & "|" & ( arguments.file.contentHash ?: "" ) & "|" &
+			jsonSerialize( renderedRanges ) & "|" & text & "|" & jsonSerialize( schemaSummary ) & "|" &
+			jsonSerialize( arguments.coverage.banners ?: [] ) & "|" & matchingSignals.toList( "," )
+		);
+		return { id: left( fingerprint, 32 ), seam: seamFor( arguments.path, arguments.units ), filePath: arguments.path, artifactRefs: artifactRefs, ranges: renderedRanges, signalIds: matchingSignals, schemaSummary: schemaSummary, coverage: arguments.coverage.banners ?: [], text: text, characters: len( text ), lineCount: renderedRanges.reduce( ( total, item ) => total + item.endLine - item.startLine + 1, 0 ), status: "planned", fingerprint: fingerprint };
+	}
+
+	private array function selectRanges(required array units, required numeric lineCount, required numeric maxLines) {
+		var ranges = [];
+		for ( var unit in arguments.units ) {
+			var startLine = max( 1, val( unit.startLine ?: 1 ) );
+			var endLine = min( arguments.lineCount ?: startLine, val( unit.endLine ?: startLine ) );
+			if ( endLine >= startLine ) ranges.append( { startLine: startLine, endLine: min( endLine, startLine + arguments.maxLines - 1 ) } );
+		}
+		if ( !ranges.len() && arguments.lineCount ) ranges.append( { startLine: 1, endLine: min( arguments.lineCount, arguments.maxLines ) } );
+		ranges.sort( ( a, b ) => a.startLine - b.startLine );
+		var merged = [];
+		for ( var item in ranges ) {
+			if ( merged.len() && item.startLine <= merged[ merged.len() ].endLine + 1 ) merged[ merged.len() ].endLine = max( merged[ merged.len() ].endLine, item.endLine );
+			else merged.append( item );
+		}
+		return merged;
+	}
+
+	private string function seamFor(required string path, required array units) {
+		if ( units.len() && len( units[ 1 ].layer ?: "" ) ) return units[ 1 ].layer;
+		return listFirst( arguments.path, "/" );
+	}
+	private boolean function isRowDml( required string line ) {
+		var value = uCase( trim( arguments.line ) );
+		for ( var keyword in [ "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "UPSERT " ] ) if ( left( value, len( keyword ) ) == keyword ) return true;
+		// SQL is often embedded in a quoted string.  Avoid a quoted-string
+		// literal here because BoxLang's parser treats escaped quotes in array
+		// literals inconsistently; the bounded keyword check still removes only
+		// obvious row-level DML statements.
+		return reFindNoCase( "(INSERT|UPDATE|DELETE|MERGE|UPSERT)[[:space:]]+", value ) > 0;
+	}
+	private boolean function coverageTruncated(required struct coverage) {
+		var repository = arguments.coverage.repository ?: {};
+		var llm = arguments.coverage.llm ?: {};
+		return ( repository.truncation ?: false ) || ( llm.truncated ?: false );
+	}
+	private numeric function numericSetting(any value, required numeric fallback) { var number = isNull( arguments.value ?: javacast( "null", "" ) ) ? 0 : val( arguments.value ); return number > 0 ? number : arguments.fallback; }
+	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" ); }
+	private string function normalizeText(required string text) { return replace( replace( arguments.text ?: "", char( 13 ), "", "all" ), char( 0 ), "", "all" ); }
+	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
+}

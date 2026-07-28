@@ -4,6 +4,8 @@
 class extends="coldbox.system.RestHandler" {
 	property name="historyService" inject="ReviewHistoryService";
 
+	property name="runService" inject="ReviewRunService";
+
 	property name="securityContextService" inject="SecurityContextService";
 
 	function preHandler( event, rc, prc ) {
@@ -11,6 +13,15 @@ class extends="coldbox.system.RestHandler" {
 	}
 
 	function index( event, rc, prc ) {
+		var requestedRunKind = lCase( trim( rc.runKind ?: "" ) );
+		if ( len( requestedRunKind ) && ![ "review", "modernize" ].contains( requestedRunKind ) ) {
+			event.renderData(
+					type       = "json",
+					statusCode = 422,
+					data       = { error: { code: "invalid_run_kind", message: "runKind must be review or modernize" } }
+				);
+			return;
+		}
 		event.renderData(
 				type = "json",
 				data = historyService.listScoped(
@@ -20,6 +31,7 @@ class extends="coldbox.system.RestHandler" {
 							projectPath: rc.projectPath ?: "",
 							mode       : rc.mode ?: "",
 							status     : rc.status ?: "",
+							runKind    : requestedRunKind,
 							from       : rc.from ?: "",
 							to         : rc.to ?: "",
 							q          : rc.q ?: "",
@@ -33,6 +45,27 @@ class extends="coldbox.system.RestHandler" {
 	}
 
 	function comparison( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			event.renderData(
+					type       = "json",
+					statusCode = 404,
+					data       = { error: { code: "run_not_found", message: "Review run not found" } }
+				);
+			return;
+		}
+		if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+			event.renderData(
+					type       = "json",
+					statusCode = 422,
+					data       = { error: { code: "modernization_comparison_unsupported", message: "Baseline finding comparison is available for Review runs only." } }
+				);
+			return;
+		}
 		var comparison = historyService.compareScoped(
 				rc.id ?: "",
 				prc.securityContext,

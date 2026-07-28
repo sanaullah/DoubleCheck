@@ -1,0 +1,63 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+	function beforeAll() { super.beforeAll(); }
+	function afterAll() { super.afterAll(); }
+
+	function run() {
+		describe( "Modernization result and decision API", () => {
+			beforeEach( () => setup() );
+
+			it( "dispatches result/export by run kind and protects the decision fingerprint", () => {
+				var runId = "modern-api-" & lCase( replace( createUUID(), "-", "", "all" ) );
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var plan = {
+					version: "modernization-plan-v1",
+					schemaVersion: "modernization-plan-v1",
+					metadata: { runId: runId },
+					coverage: {},
+					target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [],
+					routeContracts: [ { id: "route-1", itemFingerprint: "route-fp", method: "GET", path: "/orders", request: {}, response: {}, auth: {}, sideEffects: [], rollback: {}, evidence: [], unresolved: [] } ],
+					roadmapPhases: [], samples: []
+				};
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id: runId, tenantId: "default", projectId: "default", projectPath: "C:/modern-api", mode: "full", runKind: "modernize",
+						input: { version: "modernization-input-v1" }, policy: { providerEnabled: true }, budgets: {}, status: "succeeded", progress: 100,
+						currentPhase: "completed", message: "Modernization API fixture", createdAt: nowValue, updatedAt: nowValue
+					} );
+					getInstance( "ModernizationRepository" ).savePlan( runId, plan, { ok: true, blocking: 0, warnings: 0 }, {} );
+
+					var resultEvent = this.get( "/api/v1/runs/#runId#/result" );
+					expect( resultEvent.getResponse() ).toHaveStatus( 200 );
+					expect( jsonDeserialize( resultEvent.getRenderedContent() ).data.result.schemaVersion ).toBe( "modernization-plan-v1" );
+					var markdownEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "markdown" } );
+					expect( markdownEvent.getResponse() ).toHaveStatus( 200 );
+					expect( markdownEvent.getRenderedContent() ).toInclude( "DoubleCheck Modernization Plan" );
+					var jsonEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "json" } );
+					expect( jsonEvent.getResponse() ).toHaveStatus( 200 );
+					expect( jsonDeserialize( jsonEvent.getRenderedContent() ).schemaVersion ).toBe( "modernization-plan-v1" );
+
+					var sarifEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "sarif" } );
+					expect( sarifEvent.getRenderData().statusCode ).toBe( 422 );
+
+					var accepted = this.put(
+						"/api/v1/runs/#runId#/modernization/items/route-1/decision",
+						{}, {}, true, false, cgi.SERVER_NAME,
+						jsonSerialize( { itemType: "route-contract", itemFingerprint: "route-fp", decision: "accepted" } )
+					);
+					expect( accepted.getResponse() ).toHaveStatus( 200 );
+					expect( jsonDeserialize( accepted.getRenderedContent() ).data.result.decisions ).toHaveLength( 1 );
+
+					var stale = this.put(
+						"/api/v1/runs/#runId#/modernization/items/route-1/decision",
+						{}, {}, true, false, cgi.SERVER_NAME,
+						jsonSerialize( { itemType: "route-contract", itemFingerprint: "route-fp", planFingerprint: "stale-plan", decision: "accepted" } )
+					);
+					expect( stale.getResponse() ).toHaveStatus( 409 );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+		} );
+	}
+}

@@ -52,6 +52,14 @@ class {
 
 	property name="coverageAssessmentService" inject="CoverageAssessmentService";
 
+	property name="modernizationRunService" inject="ModernizationRunService";
+
+	property name="modernizationPolicyService" inject="ModernizationPolicyService";
+
+	property name="modernizationSchemaPackService" inject="ModernizationSchemaPackService";
+
+	property name="modernizationRepository" inject="ModernizationRepository";
+
 	property name="crewPlannerService" inject="CrewPlannerService";
 
 	property name="runExecutor" inject="coldbox:setting:runExecutor";
@@ -61,12 +69,14 @@ class {
 	property name="runLeaseSeconds" inject="coldbox:setting:runLeaseSeconds";
 
 	property name="specialistEventCoalesceMs" inject="coldbox:setting:specialistEventCoalesceMs";
+	property name="datasource" inject="coldbox:setting:datasource";
 
 	property name="workerId" inject="coldbox:setting:workerId";
 
 	property name="workerEnabled" inject="coldbox:setting:workerEnabled";
 
 	property name="log" inject="logbox:logger:{this}";
+	property name="applicationErrorLogService" inject="ApplicationErrorLogService";
 	variables.terminalStatuses = [ "succeeded", "partial", "failed", "cancelled"];
 	variables.activeFutures = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
 	variables.activeLeaseTokens = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
@@ -97,16 +107,75 @@ class {
 				message = "baseRevision is required for revision-diff mode"
 			);
 		}
-		var runContract = reviewPolicyService.normalize( arguments.input );
+		var runKind = lCase( trim( input.runKind ?: input.workspace ?: "review" ) );
+		if ( ![ "review", "modernize" ].contains( runKind ) ) {
+			throw( type = "ValidationException", message = "runKind must be review or modernize" );
+		}
+		var runContract = {};
+		var runInput = {};
+		var durableSchemaPack = {};
+		if ( runKind == "modernize" ) {
+				var modernizationInput = structKeyExists( arguments.input, "modernization" ) && isStruct( arguments.input.modernization ) && arguments.input.modernization.count()
+				? arguments.input.modernization
+				: arguments.input;
+			var modernContract = modernizationPolicyService.normalize( modernizationInput );
+			modernizationPolicyService.ensureProviderEnabled();
+			runInput = duplicate( modernContract.input );
+			// Attachments are sanitized before durable run creation. The persisted
+			// input therefore contains bounded/redacted schema evidence only. An
+			// internal rerun may provide an already-sanitized snapshot directly so
+			// the new run can be committed atomically without rereading the repo.
+				if ( structKeyExists( arguments.input, "sanitizedSchemaPack" ) && isStruct( arguments.input.sanitizedSchemaPack ) && arguments.input.sanitizedSchemaPack.count() ) {
+				durableSchemaPack = duplicate( arguments.input.sanitizedSchemaPack );
+				runInput.schemaPack = {
+					sourceKind: durableSchemaPack.sourceKind ?: "attached-dump",
+					format: durableSchemaPack.format ?: "sql-ddl",
+					relativePath: durableSchemaPack.relativePath ?: "",
+					contentHash: durableSchemaPack.contentHash ?: "",
+					packVersion: durableSchemaPack.version ?: "modernization-schema-pack-v1"
+				};
+			} else {
+					var rawSchema = structKeyExists( modernizationInput, "schemaPack" ) && isStruct( modernizationInput.schemaPack ) ? modernizationInput.schemaPack : {};
+				if ( isStruct( rawSchema ) && lCase( trim( rawSchema.sourceKind ?: "none" ) ) != "none" ) {
+				var schemaSource = duplicate( rawSchema );
+				var sourceKind = lCase( trim( schemaSource.sourceKind ?: "" ) );
+				schemaSource.sourceKind = sourceKind == "inline" ? "inline-ddl" : ( sourceKind == "upload" ? "attached-dump" : sourceKind );
+				durableSchemaPack = modernizationSchemaPackService.ingest( schemaSource, projectPath );
+				runInput.schemaPack = {
+					sourceKind: durableSchemaPack.sourceKind ?: sourceKind,
+					format: durableSchemaPack.format ?: schemaSource.format ?: "",
+					relativePath: durableSchemaPack.relativePath ?: schemaSource.relativePath ?: "",
+					contentHash: durableSchemaPack.contentHash ?: "",
+					packVersion: durableSchemaPack.version ?: "modernization-schema-pack-v1"
+				};
+				}
+			}
+			runContract = {
+				policy : { version: modernContract.input.version, fingerprint: modernContract.fingerprint, provider: modernContract.provider, providerEnabled: modernContract.providerEnabled, runKind: "modernize" },
+					budgets: normalizeModernizationBudgets(
+						structKeyExists( modernizationInput, "budgets" ) && isStruct( modernizationInput.budgets )
+							? modernizationInput.budgets
+							: ( structKeyExists( arguments.input, "budgets" ) && isStruct( arguments.input.budgets ) ? arguments.input.budgets : {} )
+					)
+			};
+		} else {
+			runContract = reviewPolicyService.normalize( arguments.input );
+		}
 
 		var nowValue = timestamp();
-		var run = runRepository.create(
+		var run;
+		// Run creation and its sanitized schema snapshot are one short SQLite
+		// transaction. Nothing is published or queued until both records commit.
+		bx:transaction datasource="#datasource#" {
+			run = runRepository.create(
 				{
 					id          : lCase( createUUID() ),
 					tenantId    : securityContext.tenantId,
 					projectId   : project.id,
 					projectPath : projectPath,
 					mode        : mode,
+					runKind     : runKind,
+					input       : runInput,
 					baseRevision: baseRevision,
 					headRevision: headRevision,
 					status      : "queued",
@@ -120,6 +189,13 @@ class {
 					updatedAt   : nowValue
 				}
 			);
+			if ( runKind == "modernize" && isStruct( durableSchemaPack ) && durableSchemaPack.count() ) {
+				modernizationRepository.saveSchemaPack(
+					run.getId(),
+					{ sourceKind: durableSchemaPack.sourceKind ?: "attached-dump", format: durableSchemaPack.format ?: "sql-ddl", relativePath: durableSchemaPack.relativePath ?: "", contentHash: durableSchemaPack.contentHash ?: "", packVersion: durableSchemaPack.version ?: "modernization-schema-pack-v1", metadata: { coverage: durableSchemaPack.coverage ?: "", redactions: durableSchemaPack.redactions ?: {}, dmlRemoved: durableSchemaPack.dmlRemoved ?: 0 }, sanitized: durableSchemaPack }
+				);
+			}
+		}
 
 		eventService.publish(
 				run.getId(),
@@ -141,17 +217,26 @@ class {
 		if ( isNull( source ) ) {
 			return javacast( "null", "" );
 		}
+		var sourceSchemaPack = {};
+		if ( lCase( source.getRunKind() ?: "review" ) == "modernize" ) {
+			var storedSourcePack = modernizationRepository.getSchemaPack( source.getId() );
+			if ( !isNull( storedSourcePack ) ) sourceSchemaPack = duplicate( storedSourcePack.sanitized ?: storedSourcePack );
+		}
+		var rerunInput = {
+			projectId   : source.getProjectId(),
+			projectPath : source.getProjectPath(),
+			runKind     : source.getRunKind(),
+			mode        : source.getMode(),
+			baseRevision: source.getBaseRevision(),
+			headRevision: source.getHeadRevision(),
+			policy      : source.getPolicy(),
+			budgets     : source.getBudgets(),
+			modernization: source.getRunKind() == "modernize" ? rerunModernizationInput( source ) : {},
+			sourceRunId : source.getId()
+		};
+		if ( isStruct( sourceSchemaPack ) && sourceSchemaPack.count() ) rerunInput.sanitizedSchemaPack = sourceSchemaPack;
 		var rerun = create(
-			{
-				projectId   : source.getProjectId(),
-				projectPath : source.getProjectPath(),
-				mode        : source.getMode(),
-				baseRevision: source.getBaseRevision(),
-				headRevision: source.getHeadRevision(),
-				policy      : source.getPolicy(),
-				budgets     : source.getBudgets(),
-				sourceRunId : source.getId()
-			},
+			rerunInput,
 			arguments.context
 		);
 		eventService.publish(
@@ -162,6 +247,24 @@ class {
 		return rerun;
 	}
 
+	private struct function rerunModernizationInput( required any source ) {
+		var input = duplicate( arguments.source.getInput() ?: {} );
+		// Reruns must reuse the immutable sanitized schema snapshot. Suppress
+		// re-ingestion of a path or inline descriptor during create(); the
+		// snapshot is supplied through the internal atomic create path.
+		try {
+			var stored = modernizationRepository.getSchemaPack( arguments.source.getId() );
+			if ( !isNull( stored ) ) input.schemaPack = {
+				sourceKind: "none",
+				format: stored.format ?: "",
+				relativePath: stored.relativePath ?: "",
+				contentHash: stored.contentHash ?: "",
+				packVersion: stored.packVersion ?: ""
+			};
+		} catch ( any ignored ) {}
+		return input;
+	}
+
 	any function followUpScoped( required string id, required struct context, string projectId = "" ) {
 		var source = getScoped(
 			arguments.id,
@@ -170,6 +273,9 @@ class {
 		);
 		if ( isNull( source ) ) {
 			return javacast( "null", "" );
+		}
+		if ( lCase( source.getRunKind() ?: "review" ) == "modernize" ) {
+			throw( type = "ValidationException", message = "Specialist follow-up is only available for Review runs" );
 		}
 		var coverage = getResult( source.getId() ).coverage;
 		if ( !( coverage.followUp.available ?: false ) || !( coverage.followUp.roles ?: [] ).len() ) {
@@ -215,7 +321,7 @@ class {
 		if ( !workerEnabled ) {
 			return;
 		}
-		workerRegistryService.heartbeat( "ready", { review: true, sqliteQueue: true } );
+		workerRegistryService.heartbeat( "ready", { review: true, modernization: true, sqliteQueue: true } );
 		for ( var runId in runRepository.recoverableIds( timestamp() ) ) {
 			enqueue( runId );
 		}
@@ -239,6 +345,10 @@ class {
 	}
 
 	struct function getResult( required string id ) {
+		var run = runRepository.find( arguments.id );
+		if ( !isNull( run ) && lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+			return modernizationRunService.getResult( arguments.id );
+		}
 		var result = resultRepository.getResult( arguments.id );
 		result.graph = graphRepository.getGraph( arguments.id );
 		var architectureBundle = architectureRepository.get( arguments.id );
@@ -249,7 +359,6 @@ class {
 		result.specialists = specialistResultRepository.get( arguments.id );
 		result.coverage = coverageAssessmentService.assess( result );
 
-		var run = runRepository.find( arguments.id );
 		if ( isNull( run ) ) {
 			return findingBaselineService.applyToResult( result );
 		}
@@ -355,7 +464,11 @@ class {
 				{ run: updated.getMemento() }
 			);
 		if ( variables.activeFutures.containsKey( arguments.id ) ) {
-			specialistReviewService.cancelRun( arguments.id );
+			if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+				modernizationRunService.cancelRun( arguments.id );
+			} else {
+				specialistReviewService.cancelRun( arguments.id );
+			}
 			variables
 				.activeFutures
 				.get( arguments.id )
@@ -410,7 +523,98 @@ class {
 					headRevision = run.getHeadRevision()
 				);
 			renewOwnedLease( arguments.runId, arguments.leaseToken );
-			if ( [ "working-tree-unavailable", "revision-diff-unavailable"].contains( scan.scope ) ) {
+			// The repository scan is shared by both workspaces. Persist the
+			// immutable indexed artifacts and publish the common indexed event before
+			// dispatching Modernize so consumers receive the same source snapshot
+			// contract (including runKind) as Review.
+			resultRepository.replaceArtifacts( arguments.runId, scan.files );
+			publishDetail(
+				arguments.runId,
+				"review.indexed",
+				{
+					filesScanned      : scan.files.len(),
+					bytesScanned      : scan.totalBytes,
+					languages         : scan.languages,
+					scope             : scan.scope,
+					skipped           : scan.skipped,
+					discoveryTruncated: scan.discoveryTruncated,
+					runKind           : run.getRunKind() ?: "review"
+				}
+			);
+			if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+				var modernizationRunId = arguments.runId;
+				var modernizationLeaseToken = arguments.leaseToken;
+				var modernization = modernizationRunService.execute(
+					run,
+					scan,
+					{
+						runId: modernizationRunId,
+						runKind: run.getRunKind() ?: "modernize",
+						transition: ( progress, phase, message ) => transition(
+							 runId = modernizationRunId, status = "running", progress = progress,
+							phase = phase, message = message, eventType = "task.progress"
+						),
+						checkCancellation: () => checkCancellation( modernizationRunId ),
+						renewLease: () => renewOwnedLease( modernizationRunId, modernizationLeaseToken ),
+						onObservation: ( observation ) => {
+							renewOwnedLease( modernizationRunId, modernizationLeaseToken );
+								eventService.publish(
+								modernizationRunId,
+								"modernization.provider",
+							{
+								runKind: "modernize",
+								detail: {
+									role: observation.role ?: "",
+									stage: observation.stage ?: "",
+									observe: {
+										kind: listFindNoCase( "provider-error,budget-exceeded", observation.stage ?: "" ) ? "fallback" : "llm",
+										observationType: listFindNoCase( "provider-error,budget-exceeded", observation.stage ?: "" ) ? "event" : "generation",
+										title: "Modernization provider",
+										preview: observation.error ?: observation.stage ?: "provider",
+										model: observation.model ?: "",
+										modelParameters: { provider: observation.provider ?: "" },
+										meta: {
+											attempt: observation.attempt ?: 0,
+											elapsedMs: observation.elapsedMs ?: 0,
+											outputCharacters: observation.outputCharacters ?: 0
+										}
+									}
+								}
+								}
+								);
+								renewOwnedLease( modernizationRunId, modernizationLeaseToken );
+							}
+					}
+				);
+				resultRepository.saveSummary(
+					runId = arguments.runId,
+					summary = modernization.message ?: "Modernization plan generated",
+					languages = scan.languages, filesScanned = scan.files.len(), bytesScanned = scan.totalBytes,
+					findingsCount = 0, aiEnabled = run.getPolicy().providerEnabled ?: false,
+					reviewScope = scan.scope, repositoryRevision = scan.repositoryRevision,
+					baseRevision = scan.baseRevision, headRevision = scan.headRevision,
+					discoveryTruncated = scan.discoveryTruncated, skipped = scan.skipped
+				);
+				var modernStatus = modernization.status ?: "failed";
+				var modernMessage = modernization.message ?: "Modernization run finished";
+				if ( modernStatus == "failed" && isArray( modernization.errors ?: "" ) && modernization.errors.len() ) {
+					var firstModernizationError = modernization.errors[ 1 ];
+					var detailMessage = isStruct( firstModernizationError ) ? ( firstModernizationError.message ?: "" ) : toString( firstModernizationError );
+					if ( len( trim( detailMessage ) ) ) modernMessage &= ": " & detailMessage;
+				}
+				var modernCompleted = transition(
+					runId = arguments.runId, status = modernStatus, progress = 100,
+					phase = modernStatus == "cancelled" ? "cancelled" : "completed",
+					message = modernMessage,
+					completedAt = timestamp(), eventType = modernStatus == "failed" ? "run.error" : "run.completed"
+				);
+				eventService.publish(
+					arguments.runId, "modernization.completed",
+					{ run: modernCompleted.getMemento(), result: modernizationRunService.getResult( arguments.runId ) }
+				);
+				return;
+			}
+			if ( [ "working-tree-unavailable", "revision-diff-unavailable" ].contains( scan.scope ) ) {
 				var unavailableMessage = scan.scope == "working-tree-unavailable"
 					? "Git working-tree state is unavailable. No files were reviewed. Choose Full baseline explicitly to review the repository."
 					: "#scan.error#. No files were reviewed.";
@@ -448,19 +652,6 @@ class {
 					);
 				return;
 			}
-			resultRepository.replaceArtifacts( arguments.runId, scan.files );
-			publishDetail(
-				arguments.runId,
-				"review.indexed",
-				{
-					filesScanned      : scan.files.len(),
-					bytesScanned      : scan.totalBytes,
-					languages         : scan.languages,
-					scope             : scan.scope,
-					skipped           : scan.skipped,
-					discoveryTruncated: scan.discoveryTruncated
-				}
-			);
 			transition(
 				runId     = arguments.runId,
 				status    = "running",
@@ -803,6 +994,7 @@ class {
 				return;
 			}
 			var errorReference = lCase( createUUID() );
+			applicationErrorLogService.error( "Review worker run #arguments.runId# failed [#errorReference#]", { errorType: error.type ?: "", message: error.message ?: "", stackTrace: error.stackTrace ?: "" } );
 			runRepository.setErrorReference( arguments.runId, errorReference );
 			log.error(
 					"Review run #arguments.runId# failed (reference #errorReference#)",
@@ -903,6 +1095,24 @@ class {
 			.scan
 			.languages
 			.len()# languages were indexed. #"#arguments.findings.len()# evidence-backed findings were retained. #scopeMessage##aiMessage#"#";
+	}
+
+		private struct function normalizeModernizationBudgets( required struct requested ) {
+			var budgetInput = { maxTokens: "", maxTokensPerTask: "", maxDurationMs: "", maxIterations: "", maxIterationsPerTask: "", maxTasks: "", maxToolOutputCharacters: "", maxCostUsd: "", maxRepairRounds: "" };
+			structAppend( budgetInput, arguments.requested, true );
+			var maxTokens = isNumeric( budgetInput.maxTokens ) ? max( 256, min( 24000, int( budgetInput.maxTokens ) ) ) : 6000;
+			var maxTokensPerTask = isNumeric( budgetInput.maxTokensPerTask ) ? max( 256, min( 12000, int( budgetInput.maxTokensPerTask ) ) ) : 6000;
+			var maxDuration = isNumeric( budgetInput.maxDurationMs ) ? max( 1000, min( 1800000, int( budgetInput.maxDurationMs ) ) ) : 180000;
+			var maxIterations = isNumeric( budgetInput.maxIterations ) || isNumeric( budgetInput.maxIterationsPerTask ) ? max( 1, min( 16, int( isNumeric( budgetInput.maxIterations ) ? budgetInput.maxIterations : budgetInput.maxIterationsPerTask ) ) ) : 2;
+			var maxTasks = isNumeric( budgetInput.maxTasks ) ? max( 1, min( 6, int( budgetInput.maxTasks ) ) ) : 3;
+			var maxToolOutput = isNumeric( budgetInput.maxToolOutputCharacters ) ? max( 1000, min( 100000, int( budgetInput.maxToolOutputCharacters ) ) ) : 48000;
+			var maxCost = isNumeric( budgetInput.maxCostUsd ) ? max( 0, min( 100, val( budgetInput.maxCostUsd ) ) ) : 5;
+			var maxRepairRounds = isNumeric( budgetInput.maxRepairRounds ) ? max( 0, min( 2, int( budgetInput.maxRepairRounds ) ) ) : 2;
+		return {
+			maxTokens: maxTokens, maxTokensPerTask: maxTokensPerTask, maxDurationMs: maxDuration,
+			maxIterations: maxIterations, maxIterationsPerTask: maxIterations, maxTasks: maxTasks,
+			maxToolOutputCharacters: maxToolOutput, maxCostUsd: maxCost, maxRepairRounds: maxRepairRounds
+		};
 	}
 
 	private any function transition(

@@ -1,0 +1,361 @@
+/**
+ * Modernize stages after the shared repository scan. ReviewRunService owns
+ * queueing, leases, status transitions, and SSE; this service owns only the
+ * evidence/proposal artifact lifecycle.
+ */
+@singleton
+class {
+	property name="modernizationPolicyService" inject="ModernizationPolicyService";
+	property name="schemaPackService" inject="ModernizationSchemaPackService";
+	property name="inventoryService" inject="ModernizationInventoryService";
+	property name="evidenceDiscoveryService" inject="ModernizationEvidenceDiscoveryService";
+	property name="signalService" inject="ModernizationSignalService";
+	property name="coverageService" inject="ModernizationCoverageService";
+	property name="contextPackService" inject="ModernizationContextPackService";
+	property name="proposalService" inject="ModernizationProposalService";
+	property name="validationService" inject="ModernizationValidationService";
+	property name="modernizationRepository" inject="ModernizationRepository";
+	property name="modernizationDecisionService" inject="ModernizationDecisionService";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="eventService" inject="ReviewEventService";
+	property name="log" inject="logbox:logger:{this}";
+	property name="applicationErrorLogService" inject="ApplicationErrorLogService";
+
+	struct function execute(required any run, required struct scan, struct callbacks = {}) {
+		var runId = arguments.run.getId();
+		var pipelineCallbacks = arguments.callbacks;
+		var input = duplicate( arguments.run.getInput() ?: {} );
+		var inputFingerprint = ( arguments.run.getPolicy() ?: {} ).fingerprint ?: lCase( hash( jsonSerialize( input ), "SHA-256" ) );
+		var sourceFingerprint = sourceFingerprint( arguments.scan );
+		var pipelineStartedAt = getTickCount();
+		var priorCheckpoints = modernizationRepository.getCheckpoints( runId );
+		var result = {
+			schemaVersion: "modernization-plan-v1",
+			coverage: {}, inventory: {}, schemaEvidence: {}, signals: [], target: { units: [], contexts: [], extracts: [] },
+			unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
+			validation: {}, decisions: [], errors: [], checkpoints: []
+		};
+		try {
+			checkCancellation( arguments.callbacks );
+			emit( arguments.callbacks, 25, "modernization-inventory", "Cataloging CFML units and legacy evidence" );
+			var inventoryCheckpoint = reusableCheckpoint( priorCheckpoints, "inventory", inputFingerprint, sourceFingerprint );
+			var inventory = !isNull( inventoryCheckpoint ) ? ( inventoryCheckpoint.payload.value ?: inventoryCheckpoint.payload ) : inventoryService.build( arguments.scan );
+			result.inventory = inventory;
+			checkpoint( runId, "inventory", inventory, 30, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			if ( inventory.noModernizationScope ?: false ) {
+				result.errors.append( { stage: "inventory", message: "No CFML files were found in the selected scope" } );
+				return terminal( result, "failed", "No CFML modernization scope was found", "failed" );
+			}
+			checkCancellation( arguments.callbacks );
+
+			emit( arguments.callbacks, 35, "modernization-schema", "Sanitizing optional schema evidence" );
+			var storedSchema = modernizationRepository.getSchemaPack( runId );
+			var schemaCheckpoint = reusableCheckpoint( priorCheckpoints, "schema", inputFingerprint, sourceFingerprint );
+			var schemaCheckpointValue = !isNull( schemaCheckpoint ) ? ( schemaCheckpoint.payload.value ?: schemaCheckpoint.payload ) : {};
+			var schemaPack = !isNull( storedSchema )
+				? ( storedSchema.sanitized ?: storedSchema )
+				: ( isStruct( schemaCheckpointValue ) && schemaCheckpointValue.count() ? schemaCheckpointValue : schemaPackFromInput( input, arguments.run.getProjectPath() ) );
+			result.schemaEvidence = schemaPack ?: { coverage: "absent", objects: [], routines: [], unresolved: [] };
+			if ( isNull( storedSchema ) && isStruct( schemaPack ) && schemaPack.count() ) {
+				modernizationRepository.saveSchemaPack( runId, {
+					sourceKind: schemaPack.sourceKind ?: "attached-dump",
+					format: schemaPack.format ?: "sql-ddl",
+					relativePath: schemaPack.relativePath ?: "",
+					contentHash: schemaPack.contentHash ?: "",
+					packVersion: schemaPack.version ?: "modernization-schema-pack-v1",
+					metadata: { coverage: schemaPack.coverage ?: "", redactions: schemaPack.redactions ?: {}, dmlRemoved: schemaPack.dmlRemoved ?: 0 },
+					sanitized: schemaPack
+				} );
+			}
+			checkpoint( runId, "schema", result.schemaEvidence, 38, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
+			var extraEvidence = evidenceDiscoveryService.discover(
+				arguments.run.getProjectPath(),
+				{ relativePaths: input.evidencePaths ?: [], migrationPaths: input.migrationPaths ?: [] }
+			);
+			result.evidence = extraEvidence;
+			if ( isArray( extraEvidence.routeEvidence ?: "" ) ) result.inventory.routeEvidence = ( result.inventory.routeEvidence ?: [] ).append( extraEvidence.routeEvidence, true );
+			var signals = signalService.build( inventory, schemaPack ?: {}, extraEvidence );
+			result.signals = signals.signals ?: signals;
+			emit( arguments.callbacks, 45, "modernization-signals", "Deriving modernization coupling signals" );
+			var contextCheckpoint = reusableCheckpoint( priorCheckpoints, "context", inputFingerprint, sourceFingerprint );
+			var contextCheckpointValue = !isNull( contextCheckpoint ) ? ( contextCheckpoint.payload.value ?: contextCheckpoint.payload ) : {};
+			var context = isStruct( contextCheckpointValue ) && isStruct( contextCheckpointValue.context ?: "" )
+				? contextCheckpointValue.context
+				: contextPackService.build( arguments.scan, inventory, result.signals, { schemaPack: schemaPack ?: {}, extraEvidence: extraEvidence, input: input } );
+				result.contexts = context.contexts ?: context;
+				checkpoint( runId, "context", { inventory: inventory.fingerprint ?: "", signals: result.signals, context: context }, 42, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+				checkCancellation( arguments.callbacks );
+
+				var evidenceCheckpoint = reusableCheckpoint( priorCheckpoints, "evidence", inputFingerprint, sourceFingerprint );
+				var evidenceCheckpointValue = !isNull( evidenceCheckpoint ) ? ( evidenceCheckpoint.payload.value ?: evidenceCheckpoint.payload ) : {};
+				var coverage = isStruct( evidenceCheckpointValue ) && isStruct( evidenceCheckpointValue.coverage ?: "" )
+					? evidenceCheckpointValue.coverage
+					: coverageService.assess( arguments.scan, inventory, schemaPack ?: {}, context, {} );
+				result.coverage = coverage;
+				checkCancellation( arguments.callbacks );
+			var evidence = {
+				inventory: inventory,
+				schemaEvidence: schemaPack ?: {},
+				signals: result.signals,
+				coverage: coverage,
+				context: context,
+				extraEvidence: extraEvidence
+			};
+			if ( isStruct( evidenceCheckpointValue ) && evidenceCheckpointValue.count() && isStruct( evidenceCheckpointValue.inventory ?: "" ) ) evidence = evidenceCheckpointValue;
+			checkpoint( runId, "evidence", evidence, 48, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+
+			checkCancellation( arguments.callbacks );
+			emit( arguments.callbacks, 58, "modernization-proposal", "Generating application and database modernization proposals" );
+			var proposalInput = duplicate( input );
+				proposalInput.runId = runId;
+				proposalInput.budgets = arguments.run.getBudgets() ?: {};
+			proposalInput.startedAt = pipelineStartedAt;
+			var proposalCheckpoint = reusableCheckpoint( priorCheckpoints, "proposal", inputFingerprint, sourceFingerprint );
+			var proposalCheckpointValue = !isNull( proposalCheckpoint ) ? ( proposalCheckpoint.payload.value ?: proposalCheckpoint.payload ) : {};
+			var proposal = isStruct( proposalCheckpointValue ) && structKeyExists( proposalCheckpointValue, "plan" )
+				? proposalCheckpointValue
+				: proposalService.propose(
+					runId,
+					proposalInput,
+					evidence,
+					{
+						isCancelled: () => isCancelled( pipelineCallbacks ),
+						onObservation: ( observation ) => {
+							if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
+						}
+					}
+				);
+			checkpoint( runId, "proposal", proposal, 76, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			if ( !( proposal.ok ?: false ) ) {
+				result.errors.append( proposal.errors ?: [], true );
+				modernizationRepository.savePlan(
+					runId,
+					{ version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: { runId: runId, privacy: input.privacy ?: {}, remoteProviderDisclosure: ( input.privacy.remoteProvider ?: false ) ? "Bounded, redacted modernization context may be sent to the configured remote provider." : "Modernization provider execution is configured as local; no remote egress is expected." }, coverage: result.coverage, assumptions: [], inventory: result.inventory, schemaEvidence: result.schemaEvidence, signals: result.signals, target: result.target, unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [], validation: { blocking: 1, warnings: 0, validationLevel: "blocking" }, decisions: [], errors: result.errors },
+					{ blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors },
+					result.coverage
+				);
+				return terminal( result, "failed", "Modernization proposal was not generated", "failed" );
+			}
+			var plan = proposal.plan ?: {};
+			plan.schemaVersion = "modernization-plan-v1";
+			plan.metadata = plan.metadata ?: {};
+			plan.metadata.runId = runId;
+			plan.metadata.privacy = input.privacy ?: {};
+			plan.metadata.remoteProviderDisclosure = ( input.privacy.remoteProvider ?: false )
+				? "Bounded, redacted modernization context may be sent to the configured remote provider."
+				: "Modernization provider execution is configured as local; no remote egress is expected.";
+				plan.coverage = coverage;
+				emit( arguments.callbacks, 82, "modernization-validation", "Checking proposal structure, evidence, and safety gates" );
+				var validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
+				plan.validation = validation;
+				// Repair is deliberately bounded and fingerprint-scoped.  A repair
+				// response can replace only invalid items identified by this report;
+				// valid items and the rest of the artifact remain untouched.
+				var repairRound = 0;
+				var runBudgets = arguments.run.getBudgets() ?: {};
+				var requestedRepairRounds = runBudgets.maxRepairRounds ?: runBudgets.maxIterations ?: 2;
+				var repairLimit = isNumeric( requestedRepairRounds ) ? min( 2, max( 0, int( requestedRepairRounds ) ) ) : 2;
+				while ( ( validation.blocking ?: 0 ) > 0 && repairRound < repairLimit ) {
+					checkCancellation( arguments.callbacks );
+					repairRound++;
+					emit( arguments.callbacks, 88, "modernization-repair", "Repairing only invalid modernization items" );
+					var repair = proposalService.repair(
+						runId,
+						plan,
+						validation,
+						proposalInput,
+						evidence,
+						repairRound,
+						{
+							isCancelled: () => isCancelled( pipelineCallbacks ),
+							budgets: arguments.run.getBudgets() ?: {},
+							startedAt: proposalInput.startedAt,
+							maxDurationMs: val( ( arguments.run.getBudgets() ?: {} ).maxDurationMs ?: 180000 ),
+							onObservation: ( observation ) => {
+								if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
+							}
+						}
+					);
+					checkpoint( runId, "repair-#repairRound#", repair, 88, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+					if ( !( repair.ok ?: false ) || !( repair.repaired ?: false ) ) {
+						if ( len( trim( repair.reason ?: "" ) ) ) result.errors.append( { stage: "repair", message: repair.reason } );
+						break;
+					}
+					plan = repair.plan ?: plan;
+					plan.schemaVersion = "modernization-plan-v1";
+					plan.metadata = plan.metadata ?: {};
+					plan.metadata.runId = runId;
+					plan.coverage = coverage;
+					validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
+					plan.validation = validation;
+				}
+				emit( arguments.callbacks, 94, "modernization-roadmap", "Assembling the bounded modernization roadmap" );
+				checkCancellation( arguments.callbacks );
+								var planState = validation.ok ? "needs-review" : "needs-review";
+								// A newly generated artifact always starts in the separate human-review
+								// state.  Do not let ModernizationRepository's generic default of
+								// `generated` hide blocking validation or imply acceptance.
+								plan.state = planState;
+								modernizationRepository.savePlan( runId, plan, validation, coverage );
+			checkpoint( runId, "validation", { plan: plan, validation: validation }, 90, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			carryForwardDecisions( arguments.run, plan );
+			// Carry-forward may satisfy every required item on an unchanged rerun.
+			// Read the persisted state back so this terminal payload agrees with the
+			// state that will be returned after the next result fetch.
+			var persistedPlan = modernizationRepository.getPlan( runId );
+			if ( !isNull( persistedPlan ) ) planState = persistedPlan.state ?: planState;
+			result = flattenPlan( plan, result );
+			result.validation = validation;
+			result.planState = planState;
+			result.decisions = modernizationRepository.listDecisions( runId );
+			result.decisionEvents = modernizationRepository.listDecisionEvents( runId );
+			if ( proposal.partial ) result.errors.append( proposal.errors ?: [], true );
+			var repositoryTruncated = ( arguments.scan.discoveryTruncated ?: false ) || ( coverage.repository.truncation ?: false );
+			var terminalStatus = ( validation.blocking ?: 0 ) > 0 || repositoryTruncated || ( proposal.partial ?: false ) ? "partial" : "succeeded";
+			var message = terminalStatus == "partial" ? "Modernization plan retained with review gates" : "Modernization plan generated; review decisions are required";
+			checkCancellation( arguments.callbacks );
+			return terminal( result, terminalStatus, message, planState );
+		} catch ( "RunCancelled" error ) {
+			return terminal( result, "cancelled", "Modernization run cancelled", "needs-review" );
+		} catch ( any error ) {
+			if ( findNoCase( "LeaseLostException", error.type ?: "" ) ) rethrow;
+			var failureMessage = secretRedactionService.redactText( error.message ?: "Modernization run failed" );
+			var failureType = toString( error.type ?: "" );
+			var failureTrace = toString( error.stackTrace ?: error.detail ?: "" );
+			if ( len( trim( failureType ) ) ) failureMessage &= " [" & failureType & "]";
+			if ( len( trim( failureTrace ) ) ) failureMessage &= " @ " & left( replace( replace( failureTrace, char( 13 ), " ", "all" ), char( 10 ), " ", "all" ), 500 );
+			try {
+				applicationErrorLogService.error( "Modernization run #runId# failed", { errorType: failureType, errorMessage: failureMessage, stackTrace: failureTrace } );
+				log.error(
+					"Modernization run #runId# failed: #failureMessage#",
+					{ runId: runId, errorType: failureType, errorMessage: failureMessage, stackTrace: failureTrace }
+				);
+			} catch ( any ignored ) {}
+			result.errors.append( { stage: "modernization", message: failureMessage } );
+			// Preserve the concrete failure in the durable plan artifact. Without
+			// this, the worker can only report the generic status and the UI cannot
+			// distinguish an indexing/parser failure from a provider failure.
+			try {
+				modernizationRepository.savePlan(
+					runId,
+					{ version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: { runId: runId }, coverage: result.coverage ?: {}, inventory: result.inventory ?: {}, schemaEvidence: result.schemaEvidence ?: {}, signals: result.signals ?: [], target: result.target ?: { units: [] }, unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [], validation: { blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors }, decisions: [], errors: result.errors },
+					{ blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors },
+					result.coverage ?: {}
+				);
+			} catch ( any ignored ) {}
+			return terminal( result, "failed", "Modernization run failed: " & failureMessage, "needs-review" );
+		}
+	}
+
+	struct function getResult(required string runId) {
+		var stored = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( stored ) ) return { schemaVersion: "modernization-plan-v1", validation: {}, coverage: {}, decisions: [], decisionEvents: [] };
+		var result = duplicate( stored.plan ?: {} );
+		result.schemaVersion = result.schemaVersion ?: stored.planVersion;
+		result.validation = stored.validation ?: result.validation ?: {};
+		result.coverage = stored.coverage ?: result.coverage ?: {};
+		result.planState = stored.state;
+		result.planFingerprint = stored.fingerprint;
+		result.decisions = modernizationRepository.listDecisions( arguments.runId );
+		result.decisionEvents = modernizationRepository.listDecisionEvents( arguments.runId );
+		result.checkpoints = modernizationRepository.getCheckpoints( arguments.runId );
+		return result;
+	}
+
+	void function cancelRun(required string runId) {
+		proposalService.cancelRun( arguments.runId );
+	}
+
+	private struct function schemaPackFromInput(required struct input, required string projectPath) {
+		var descriptor = arguments.input.schemaPack ?: {};
+		if ( !isStruct( descriptor ) || ( descriptor.sourceKind ?: "none" ) == "none" ) return {};
+		if ( structKeyExists( descriptor, "sanitizedText" ) || structKeyExists( descriptor, "tables" ) ) return descriptor;
+		return schemaPackService.ingest( descriptor, arguments.projectPath );
+	}
+
+	private struct function flattenPlan(required struct plan, required struct current) {
+		for ( var key in arguments.plan.keyArray() ) arguments.current[ key ] = arguments.plan[ key ];
+		return arguments.current;
+	}
+	private void function checkpoint(required string runId, required string stage, required any payload, required numeric progress, struct provenance = {}) {
+			var status = isStruct( arguments.payload ) && structKeyExists( arguments.payload, "ok" ) && !arguments.payload.ok ? "failed" : "succeeded";
+			modernizationRepository.saveCheckpoint( arguments.runId, arguments.stage, { status: status, progress: arguments.progress, payload: { value: arguments.payload, provenance: arguments.provenance } } );
+		}
+	private any function reusableCheckpoint(required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint) {
+		for ( var item in arguments.checkpoints ) {
+			if ( ( item.stage ?: "" ) != arguments.stage || ( item.status ?: "" ) != "succeeded" ) continue;
+			var payload = item.payload ?: {};
+			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
+			if ( ( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint && ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint ) return item;
+		}
+		return javacast( "null", "" );
+	}
+		private string function sourceFingerprint(required struct scan) {
+			var parts = [ "revision:" & ( arguments.scan.repositoryRevision ?: "" ) ];
+			for ( var file in arguments.scan.files ?: [] ) parts.append( ( file.filePath ?: file.path ?: "" ) & ":" & ( file.contentHash ?: hash( file.content ?: "", "SHA-256" ) ) );
+		parts.sort( "textnocase" );
+		return lCase( hash( parts.toList( "|" ), "SHA-256" ) );
+	}
+	private void function carryForwardDecisions( required any run, required struct plan ) {
+		var sourceRunId = trim( arguments.run.getSourceRunId() ?: "" );
+		if ( !len( sourceRunId ) ) return;
+		var sourceDecisions = modernizationRepository.listDecisions( sourceRunId );
+		for ( var prior in sourceDecisions ) {
+			var current = findPlanItem( arguments.plan, prior.itemType ?: "", prior.itemId ?: "" );
+			if ( isNull( current ) || trim( current.itemFingerprint ?: "" ) != trim( prior.itemFingerprint ?: "" ) ) continue;
+			var saved = modernizationRepository.upsertDecision( arguments.run.getId(), {
+				itemType: prior.itemType, itemId: prior.itemId, decision: prior.decision,
+				note: prior.note ?: "", itemFingerprint: prior.itemFingerprint ?: "", decidedBy: prior.decidedBy ?: "carried-forward"
+			} );
+			modernizationRepository.appendDecisionEvent( arguments.run.getId(), {
+				itemType: prior.itemType, itemId: prior.itemId, action: "carried-forward",
+				decision: saved, actor: "carried-forward", sourceRunId: sourceRunId
+			} );
+		}
+		modernizationDecisionService.refreshState( arguments.run.getId() );
+	}
+	private any function findPlanItem( required struct plan, required string itemType, required string itemId ) {
+		var map = { "target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts", "db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples" };
+		if ( !map.keyExists( arguments.itemType ) ) return javacast( "null", "" );
+		var path = map[ arguments.itemType ];
+		var values = arguments.itemType == "target-unit" ? ( arguments.plan.target.units ?: [] ) : ( isArray( arguments.plan[ path ] ?: "" ) ? arguments.plan[ path ] : [] );
+		for ( var item in values ) if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+		return javacast( "null", "" );
+	}
+	private void function emit(required struct callbacks, required numeric progress, required string phase, required string message) {
+		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) arguments.callbacks.renewLease();
+		if ( structKeyExists( arguments.callbacks, "transition" ) && isCustomFunction( arguments.callbacks.transition ) ) arguments.callbacks.transition( arguments.progress, arguments.phase, arguments.message );
+		var eventName = {
+			"modernization-schema": "modernization.schema",
+			"modernization-inventory": "modernization.inventory",
+			"modernization-signals": "modernization.signals",
+				"modernization-proposal": "modernization.proposal.progress",
+				"modernization-validation": "modernization.validation",
+				"modernization-repair": "modernization.repair",
+				"modernization-roadmap": "modernization.roadmap"
+		}[ arguments.phase ] ?: "";
+		if ( len( eventName ) ) {
+			try {
+				if ( len( trim( arguments.callbacks.runId ?: "" ) ) ) eventService.publish( arguments.callbacks.runId, eventName, { progress: arguments.progress, phase: arguments.phase, message: arguments.message, runKind: arguments.callbacks.runKind ?: "modernize" } );
+			} catch ( any ignored ) {
+				// Lifecycle progress remains owned by ReviewRunService; event detail
+				// is best effort for direct service tests and recovery paths.
+			}
+		}
+		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) arguments.callbacks.renewLease();
+	}
+	private void function checkCancellation(required struct callbacks) {
+		if ( isCancelled( arguments.callbacks ) ) throw( type = "RunCancelled", message = "Modernization run cancelled" );
+	}
+	private boolean function isCancelled(required struct callbacks) {
+		return structKeyExists( arguments.callbacks, "checkCancellation" ) && isCustomFunction( arguments.callbacks.checkCancellation ) && arguments.callbacks.checkCancellation();
+	}
+	private struct function terminal(required struct result, required string status, required string message, required string planState) {
+		arguments.result.status = arguments.status;
+		arguments.result.message = arguments.message;
+		arguments.result.planState = arguments.planState;
+		return arguments.result;
+	}
+}

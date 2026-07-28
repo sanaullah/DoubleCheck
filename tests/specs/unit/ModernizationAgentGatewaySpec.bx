@@ -1,0 +1,61 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization JSON gateway", () => {
+			it( "normalizes fenced JSON and redacts observation errors", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = "```json" & jsonSerialize( { targetUnits: [] } ) & "```";
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.model = "scripted";
+				service.maxRetries = 2;
+				var observations = [];
+				var result = service.run( "run-1", { messages: [ { role: "user", content: "evidence" } ] }, { onObservation: ( item ) => observations.append( item ) } );
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits ).toBeEmpty();
+				expect( chat.callCount() ).toBe( 1 );
+				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
+			} );
+
+			it( "returns a bounded provider failure after malformed JSON retries", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "not-json" );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.maxRetries = 1;
+				var result = service.run( "run-2", { messages: [] }, { budgets: { maxIterations: 2 } } );
+				expect( result.ok ).toBeFalse();
+				expect( chat.callCount() ).toBe( 2 );
+			} );
+
+			it( "cancels before provider execution", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { ok: true } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.cancelRun( "run-3" );
+				expect( () => service.run( "run-3", { messages: [] } ) ).toThrow( type = "RunCancelled" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "does not call the provider when the immutable cost budget is exhausted", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { ok: true } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				var result = service.run( "run-4", { messages: [] }, { budgets: { maxCostUsd: 0 } } );
+				expect( result.ok ).toBeFalse();
+				expect( result.error ).toBe( "cost-budget-exceeded" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+		} );
+	}
+}

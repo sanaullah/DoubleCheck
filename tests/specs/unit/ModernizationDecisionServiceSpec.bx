@@ -1,0 +1,36 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization human decisions", () => {
+			it( "requires accepted decisions for mandatory route and migration items", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: { units: [] }, unitLinks: [], dbFindings: [],
+					dbTransitions: [ { id: "migration-1", itemFingerprint: "migration-fp" } ],
+					routeContracts: [ { id: "route-1", itemFingerprint: "route-fp" } ],
+					roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp" } ], samples: []
+				} );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				var first = service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", decision: "accepted" } );
+				expect( first.state.required ).toBe( 3 );
+				expect( first.state.accepted ).toBe( 1 );
+				expect( first.state.state ).toBe( "needs-review" );
+				service.decide( run, "migration-1", { itemType: "db-transition", itemFingerprint: "migration-fp", decision: "accepted" } );
+				var complete = service.decide( run, "phase-1", { itemType: "roadmap-phase", itemFingerprint: "phase-fp", decision: "accepted" } );
+				expect( complete.state.state ).toBe( "accepted" );
+				expect( repo.planRecord.plan.state ).toBe( "accepted" );
+			} );
+
+			it( "rejects stale artifact fingerprints and records clear events", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = { target: { units: [] }, unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [ { id: "route-1", itemFingerprint: "route-fp" } ], roadmapPhases: [], samples: [] } );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				expect( () => service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", planFingerprint: "old", decision: "accepted" } ) ).toThrow( type = "ModernizationDecisionConflict" );
+				service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", decision: "accepted" } );
+				var cleared = service.clear( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", planFingerprint: "plan-fp" } );
+				expect( cleared.events.some( ( item ) => item.action == "cleared" ) ).toBeTrue();
+			} );
+		} );
+	}
+}

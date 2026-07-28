@@ -1,0 +1,92 @@
+/** Produces explicit repository, inventory, schema, and LLM coverage math. */
+@singleton
+class {
+	variables.version = "modernization-coverage-v1";
+
+	struct function assess(
+		struct scan = {},
+		struct inventory = {},
+		struct schemaPack = {},
+		struct context = {},
+		struct llm = {}
+	) {
+		var scanData = arguments.scan ?: {};
+		var files = scanData.files ?: [];
+		var skipped = scanData.skipped ?: {};
+		var indexedBytes = 0;
+		for ( var item in files ) indexedBytes += val( item.sizeBytes ?: len( item.content ?: "" ) );
+		var candidateCount = isNumeric( scanData.candidateCount ?: "" ) ? val( scanData.candidateCount ) : 0;
+		if ( candidateCount <= 0 && isNumeric( scanData.candidates ?: "" ) ) candidateCount = val( scanData.candidates );
+		if ( candidateCount <= 0 ) candidateCount = files.len() + sumSkipped( skipped );
+		var supported = {};
+		var supportedLanguages = {};
+		var unsupported = 0;
+		for ( var item in files ) {
+			var language = item.language ?: "";
+			var extension = lCase( listLast( item.filePath ?: item.path ?: "", "." ) );
+			if ( len( extension ) ) supported[ extension ] = ( supported[ extension ] ?: 0 ) + 1;
+			if ( len( language ) ) supportedLanguages[ language ] = ( supportedLanguages[ language ] ?: 0 ) + 1;
+			else unsupported++;
+		}
+		var repository = {
+			candidates: candidateCount,
+			indexed: files.len(),
+			bytes: indexedBytes,
+			skipped: sumSkipped( skipped ),
+			oversized: val( skipped.oversized ?: 0 ),
+			truncation: val( skipped.limit ?: 0 ) > 0 || ( scanData.truncated ?: false ) || ( scanData.discoveryTruncated ?: false ),
+			supportedExtensions: supported,
+			supportedLanguages: supportedLanguages,
+			unsupported: val( skipped.unsupported ?: unsupported ),
+			scope: scanData.scope ?: "full"
+		};
+		var inventoryFiles = inventory.files ?: [];
+		var cfml = {
+			files: inventoryFiles.len(),
+			unitsExtracted: ( inventory.units ?: [] ).len(),
+			unresolved: ( inventory.unresolved ?: [] ).len(),
+			truncated: inventory.truncated ?: false,
+			noScope: inventory.noModernizationScope ?: false
+		};
+		var schema = {
+			source: schemaPack.source ?: ( schemaPack.sourceKind ?: "absent" ),
+			format: schemaPack.format ?: "absent",
+			coverage: schemaPack.coverage ?: "absent",
+			objects: {
+				tables: ( schemaPack.tables ?: [] ).len(),
+				columns: ( schemaPack.columns ?: [] ).len(),
+				constraints: ( schemaPack.constraints ?: [] ).len(),
+				indexes: ( schemaPack.indexes ?: [] ).len(),
+				routines: ( schemaPack.routines ?: [] ).len()
+			},
+			unresolved: val( schemaPack.unresolvedCount ?: ( schemaPack.unresolved ?: [] ).len() ),
+			vendor: schemaPack.vendor ?: "",
+			vendorConfidence: val( schemaPack.vendorConfidence ?: 0 )
+		};
+		var partitions = context.partitions ?: context.files ?: llm.partitions ?: [];
+		var contextSummary = context.summary ?: {};
+		var planned = val( llm.planned ?: context.planned ?: partitions.len() );
+		var completed = val( llm.completed ?: context.completed ?: countStatus( partitions, "completed" ) );
+		var failed = val( llm.failed ?: context.failed ?: countStatus( partitions, "failed" ) );
+		var llmCoverage = {
+			planned: planned,
+			completed: completed,
+			failed: failed,
+			truncated: context.truncated ?: false,
+			partitions: partitions.len(),
+			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 )
+		};
+		var banners = [];
+		if ( repository.truncation ) banners.append( "Repository inventory is partial because scan budgets were reached." );
+		if ( !schemaPack.len() || schema.coverage == "absent" ) banners.append( "Schema findings are inference-limited; attach a schema pack for stronger proposals." );
+		if ( cfml.noScope ) banners.append( "No CFML scope was found; modernization enrichment is not available." );
+		if ( llmCoverage.truncated ) banners.append( "LLM context was bounded and some evidence ranges were omitted." );
+		var schemaCoverageLabel = schema.coverage == "absent" ? "inference-limited" : schema.coverage;
+		return { version: variables.version, repository: repository, filesScanned: repository.indexed, cfmlFiles: cfml.files, cfmlInventory: cfml, schema: schema, schemaCoverage: schemaCoverageLabel, llm: llmCoverage, banners: banners, truncated: repository.truncation || cfml.truncated || llmCoverage.truncated, complete: !repository.truncation && !cfml.truncated && !llmCoverage.truncated, fingerprint: stableHash( variables.version & "|" & jsonSerialize( { repository: repository, cfml: cfml, schema: schema, llm: llmCoverage } ) ) };
+	}
+
+	struct function build(struct scan = {}, struct inventory = {}, struct schemaPack = {}, struct context = {}, struct llm = {}) returntype="struct" { return assess( arguments.scan, arguments.inventory, arguments.schemaPack, arguments.context, arguments.llm ); }
+	private numeric function sumSkipped(required struct skipped) { var total = 0; for ( var key in arguments.skipped ) total += val( arguments.skipped[ key ] ?: 0 ); return total; }
+	private numeric function countStatus(required array items, required string status) { var count = 0; for ( var item in arguments.items ) if ( ( item.status ?: "" ) == arguments.status ) count++; return count; }
+	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
+}

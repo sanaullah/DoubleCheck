@@ -1,0 +1,289 @@
+/** Deterministic structural, evidence, syntax and safety gates for modernization plans. */
+@singleton
+class {
+	variables.allowedMethods = [ "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD" ];
+	variables.allowedTransitionOperations = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
+
+	struct function validate( required struct plan, struct context = {} ) {
+		var messages = [];
+		var blocking = 0;
+		var warnings = 0;
+		var target = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) ? arguments.plan.target : {};
+		var metadata = structKeyExists( arguments.plan, "metadata" ) && isStruct( arguments.plan.metadata ) ? arguments.plan.metadata : {};
+		var coverageData = structKeyExists( arguments.plan, "coverage" ) && isStruct( arguments.plan.coverage ) ? arguments.plan.coverage : {};
+		var inventoryData = structKeyExists( arguments.plan, "inventory" ) && isStruct( arguments.plan.inventory ) ? arguments.plan.inventory : {};
+		var runtime = structKeyExists( metadata, "runtime" ) && isStruct( metadata.runtime ) ? trim( metadata.runtime.runtime ?: "" ) : ( structKeyExists( metadata, "runtime" ) ? trim( metadata.runtime ?: "" ) : "" );
+		if ( !len( runtime ) ) runtime = trim( target.runtime ?: "" );
+		runtime = lCase( runtime );
+		var profile = lCase( trim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
+		var inventoryPaths = inventoryPathSet( structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData );
+
+		if ( ( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : "" ) != "modernization-plan-v1" ) {
+			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1" ); blocking++;
+		}
+		for ( var field in [ "version", "metadata", "coverage", "assumptions", "inventory", "schemaEvidence", "signals", "target", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples", "validation", "decisions" ] ) {
+			if ( !structKeyExists( arguments.plan, field ) ) { addMessage( messages, "contract", "blocking", "Missing top-level field: #field#" ); blocking++; }
+		}
+
+		var seen = {};
+		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ];
+		for ( var collection in collections ) {
+			var parts = collection.listToArray( "." );
+			var owner = parts.len() == 2 ? ( structKeyExists( arguments.plan, parts[ 1 ] ) && isStruct( arguments.plan[ parts[ 1 ] ] ) ? arguments.plan[ parts[ 1 ] ] : {} ) : arguments.plan;
+			var key = parts[ parts.len() ];
+			var items = isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [];
+			for ( var item in items ) {
+				if ( !isStruct( item ) ) { addMessage( messages, collection, "blocking", "Item must be an object" ); blocking++; continue; }
+				var id = trim( item.id ?: item.itemId ?: "" );
+				if ( !len( id ) ) { addMessage( messages, collection, "blocking", "Item is missing a stable id", id ); blocking++; }
+				else if ( seen.keyExists( id ) ) { addMessage( messages, collection, "blocking", "Duplicate id: #id#", id ); blocking++; }
+				else seen[ id ] = true;
+				var decisionCollection = [ "target.units", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection );
+				if ( !len( trim( item.itemFingerprint ?: "" ) ) ) {
+					addMessage( messages, collection, decisionCollection ? "blocking" : "warning", "Item #id# has no itemFingerprint", id );
+					if ( decisionCollection ) blocking++; else warnings++;
+				}
+				// Route contracts use an absolute URL path, while the generic
+				// collections use project-relative file paths. Do not run the
+				// relative-path gate against a route's URL.
+				var itemPath = trim( item.targetPath ?: item.pathHint ?: ( collection == "routeContracts" ? "" : ( item.path ?: item.filePath ?: "" ) ) );
+					if ( collection != "routeContracts" && len( itemPath ) && !safeRelativePath( itemPath ) ) { addMessage( messages, collection, "blocking", "Item #id# contains an unsafe path", id ); blocking++; }
+				if ( collection == "target.units" ) {
+					if ( !len( itemPath ) ) { addMessage( messages, collection, "blocking", "Target unit #id# is missing targetPath", id ); blocking++; }
+					else if ( !legalTargetPath( itemPath, runtime, profile ) ) { addMessage( messages, collection, "blocking", "Target unit #id# has an illegal runtime/layout extension", id ); blocking++; }
+					var sourcePath = lCase( replace( trim( item.sourcePath ?: item.sourceFile ?: item.legacyPath ?: "" ), "\\", "/", "all" ) );
+					var sourceBacked = len( sourcePath ) && inventoryPaths.keyExists( sourcePath );
+					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( trim( item.proposalReason ?: "" ) ) ) ) {
+						var refs = item.evidenceRefs ?: item.evidence ?: [];
+						if ( isArray( refs ) ) {
+							for ( var ref in refs ) {
+								var refPath = lCase( replace( trim( ref.filePath ?: ref.path ?: "" ), "\\", "/", "all" ) );
+								if ( len( refPath ) && inventoryPaths.keyExists( refPath ) ) { sourceBacked = true; break; }
+							}
+						}
+					}
+					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( trim( item.proposalReason ?: "" ) ) ) ) {
+						addMessage( messages, collection, "blocking", "Target unit #id# is not inventory-backed and is missing a new-proposal reason", id ); blocking++;
+					}
+				}
+				if ( [ "unitLinks", "routeContracts", "dbFindings", "dbTransitions" ].contains( collection ) ) {
+					var refs = item.evidenceRefs ?: item.evidence ?: [];
+					if ( !isArray( refs ) || !refs.len() ) { addMessage( messages, collection, "blocking", "Item #id# has no evidence references", id ); blocking++; }
+				}
+			}
+		}
+		var referenceReport = validateReferences( arguments.plan, seen, messages );
+		blocking += referenceReport.blocking;
+		warnings += referenceReport.warnings;
+		var contextIds = {};
+		for ( var contextItem in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
+			var contextId = contextItem.id ?: contextItem.itemId ?: "";
+			if ( len( contextId ) ) contextIds[ contextId ] = true;
+			if ( !isArray( contextItem.evidenceRefs ?: contextItem.evidence ?: "" ) || !( contextItem.evidenceRefs ?: contextItem.evidence ?: [] ).len() ) { addMessage( messages, "target.contexts", "blocking", "Context #contextId# must declare evidence references", contextId ); blocking++; }
+			if ( structKeyExists( contextItem, "dataBoundary" ) && findNoCase( "secret", jsonSerialize( contextItem.dataBoundary ) ) ) { addMessage( messages, "target.contexts", "blocking", "Context #contextId# contains a secret data boundary", contextId ); blocking++; }
+		}
+		for ( var extractItem in ( isArray( target.extracts ?: "" ) ? target.extracts : [] ) ) {
+			var extractId = extractItem.id ?: extractItem.itemId ?: "";
+			var contextRef = extractItem.contextId ?: extractItem.context ?: "";
+			if ( len( contextRef ) && !contextIds.keyExists( contextRef ) ) { addMessage( messages, "target.extracts", "blocking", "Extract #extractId# references an unknown context", extractId ); blocking++; }
+			if ( !structKeyExists( extractItem, "dataBoundary" ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
+		}
+
+		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
+		for ( var link in planUnitLinks ) {
+			var sourcePath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\\", "/", "all" ) );
+			var linkId = link.id ?: link.itemId ?: "unknown";
+			if ( len( sourcePath ) && !inventoryPaths.keyExists( sourcePath ) && !( link.newProposal ?: false ) ) { addMessage( messages, "unitLinks", "blocking", "Unit link #linkId# is not backed by inventory evidence", linkId ); blocking++; }
+		}
+
+		var planRoutes = structKeyExists( arguments.plan, "routeContracts" ) && isArray( arguments.plan.routeContracts ) ? arguments.plan.routeContracts : [];
+		for ( var route in planRoutes ) {
+			var routeId = route.id ?: route.itemId ?: "";
+			if ( !variables.allowedMethods.contains( uCase( trim( route.method ?: "" ) ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route method is invalid", routeId ); blocking++; }
+			if ( !safeRoutePath( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route path must be a safe absolute application path", routeId ); blocking++; }
+			for ( var requiredKey in [ "request", "response", "auth", "sideEffects", "rollback", "evidence" ] ) if ( !structKeyExists( route, requiredKey ) ) { addMessage( messages, "routeContracts", "blocking", "Route is missing #requiredKey#", routeId ); blocking++; }
+			if ( structKeyExists( route, "samplePath" ) && trim( route.samplePath ?: "" ) != trim( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route samplePath does not match its path", routeId ); blocking++; }
+			if ( !isArray( route.evidence ?: "" ) || !route.evidence.len() ) { addMessage( messages, "routeContracts", "blocking", "Route has no evidence references", routeId ); blocking++; }
+		}
+
+		var planSamples = structKeyExists( arguments.plan, "samples" ) && isArray( arguments.plan.samples ) ? arguments.plan.samples : [];
+		for ( var sample in planSamples ) {
+			var serializedSample = jsonSerialize( sample );
+			var sampleId = sample.id ?: sample.itemId ?: "";
+			if ( !len( trim( sample.sampleKind ?: "" ) ) || !len( trim( sample.targetPath ?: sample.path ?: "" ) ) ) { addMessage( messages, "samples", "blocking", "Sample needs sampleKind and targetPath", sampleId ); blocking++; }
+			if ( !safeRelativePath( sample.targetPath ?: sample.path ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample path is unsafe", sampleId ); blocking++; }
+			if ( !isArray( sample.relatedItemIds ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare relatedItemIds", sampleId ); blocking++; }
+			if ( !structKeyExists( sample, "irreversible" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare irreversible safety", sampleId ); blocking++; }
+			var sampleLanguage = lCase( trim( sample.language ?: "" ) );
+			var sampleExtension = lCase( listLast( sample.targetPath ?: sample.path ?: "", "." ) );
+			if ( sampleLanguage == "boxlang" && ![ "bx", "bxm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "BoxLang sample path must end in .bx or .bxm", sampleId ); blocking++; }
+			if ( sampleLanguage == "cfml" && ![ "cfc", "cfm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "CFML sample path must end in .cfc or .cfm", sampleId ); blocking++; }
+			if ( sampleLanguage == "sql" && sampleExtension != "sql" ) { addMessage( messages, "samples", "blocking", "SQL sample path must end in .sql", sampleId ); blocking++; }
+			if ( findNoCase( "secret", serializedSample ) || reFindNoCase( "(?i)(api[_-]?key|password|authorization)\\s*[:=]", serializedSample ) ) { addMessage( messages, "samples", "blocking", "Sample contains a possible secret", sampleId ); blocking++; }
+			if ( len( serializedSample ) > 20000 ) { addMessage( messages, "samples", "blocking", "Sample exceeds the 20,000 character safety limit", sampleId ); blocking++; }
+		}
+
+		var planTransitions = structKeyExists( arguments.plan, "dbTransitions" ) && isArray( arguments.plan.dbTransitions ) ? arguments.plan.dbTransitions : [];
+		var transitionReport = validateTransitions( planTransitions, messages );
+		blocking += transitionReport.blocking;
+		warnings += transitionReport.warnings;
+		var phases = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
+		if ( !phases.len() ) { addMessage( messages, "roadmap", "warning", "No roadmap phases were generated" ); warnings++; }
+		var phaseIndex = {};
+		for ( var phasePosition = 1; phasePosition <= phases.len(); phasePosition++ ) phaseIndex[ phases[ phasePosition ].id ?: phases[ phasePosition ].itemId ?: "" ] = phasePosition;
+		for ( var phasePosition = 1; phasePosition <= phases.len(); phasePosition++ ) {
+			var phase = phases[ phasePosition ];
+			for ( var dependency in ( isArray( phase.dependencies ?: "" ) ? phase.dependencies : [] ) ) {
+				if ( !phaseIndex.keyExists( dependency ) ) { addMessage( messages, "roadmapPhases", "blocking", "Roadmap dependency #dependency# is unknown" ); blocking++; }
+				else if ( phaseIndex[ dependency ] >= phasePosition ) { addMessage( messages, "roadmapPhases", "blocking", "Roadmap dependency #dependency# must precede its phase" ); blocking++; }
+			}
+			for ( var requiredKey in [ "exitCriteria", "rollback", "parityIntent" ] ) if ( !structKeyExists( phase, requiredKey ) ) { addMessage( messages, "roadmapPhases", "warning", "Roadmap phase is missing #requiredKey#" ); warnings++; }
+		}
+		if ( ( coverageData.truncated ?: false ) == true || ( isStruct( coverageData.repository ?: "" ) && coverageData.repository.truncation ?: false ) == true ) { addMessage( messages, "coverage", "warning", "Repository or schema evidence was truncated" ); warnings++; }
+		if ( ( coverageData.unresolvedCount ?: 0 ) > 0 || ( isArray( inventoryData.unresolved ?: "" ) && inventoryData.unresolved.len() ) ) { addMessage( messages, "coverage", "warning", "Unresolved evidence remains visible in the plan" ); warnings++; }
+
+		var level = blocking ? "blocking" : ( warnings ? "warning" : "structural" );
+		return {
+			ok: blocking == 0, blocking: blocking, warnings: warnings, blockingCount: blocking, warningCount: warnings,
+			counts: { blocking: blocking, warnings: warnings, total: messages.len() }, messages: messages,
+			validationLevel: level, status: level, overallStatus: level,
+			levels: { structural: blocking == 0 ? "structurally-valid" : "structurally-invalid", evidence: evidenceLevel( messages ), syntax: syntaxLevel( arguments.plan ), dialect: dialectLevel( arguments.plan ), human: "human-unreviewed" }
+		};
+	}
+
+	private void function addMessage( required array messages, required string category, required string level, required string text, string itemId = "" ) {
+		var item = { category: arguments.category, level: arguments.level, message: arguments.text, validationLevel: arguments.level };
+		if ( len( trim( arguments.itemId ) ) ) item.itemId = arguments.itemId;
+		arguments.messages.append( item );
+	}
+
+	/** Check the common cross-collection IDs without assuming provider-specific
+	 * field names. Empty optional references remain valid; supplied references
+	 * must resolve to an item in the immutable plan artifact. */
+	private struct function validateReferences( required struct plan, required struct knownIds, required array messages ) {
+		var report = { blocking: 0, warnings: 0 };
+		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var targetIds = {};
+		for ( var unit in targetUnits ) targetIds[ unit.id ?: unit.itemId ?: "" ] = true;
+		var inventoryIds = {};
+		for ( var unit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) inventoryIds[ unit.id ?: unit.itemId ?: "" ] = true;
+		var routeIds = idSet( arguments.plan.routeContracts ?: [] );
+		var linkIds = idSet( arguments.plan.unitLinks ?: [] );
+		var findingIds = idSet( arguments.plan.dbFindings ?: [] );
+		var transitionIds = idSet( arguments.plan.dbTransitions ?: [] );
+		var phaseIds = idSet( arguments.plan.roadmapPhases ?: [] );
+		var sampleIds = idSet( arguments.plan.samples ?: [] );
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			var linkId = link.id ?: link.itemId ?: "";
+			checkReference( link.legacyUnitId ?: link.sourceUnitId ?: "", inventoryIds, "unitLinks", linkId, "legacyUnitId", report, arguments.messages );
+			checkReference( link.targetUnitId ?: "", targetIds, "unitLinks", linkId, "targetUnitId", report, arguments.messages );
+		}
+		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
+			var routeId = route.id ?: route.itemId ?: "";
+			checkReference( route.unitLinkId ?: "", linkIds, "routeContracts", routeId, "unitLinkId", report, arguments.messages );
+			checkReference( route.targetUnitId ?: "", targetIds, "routeContracts", routeId, "targetUnitId", report, arguments.messages );
+		}
+		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
+			var transitionId = transition.id ?: transition.itemId ?: "";
+			checkReference( transition.dbFindingId ?: transition.findingId ?: "", findingIds, "dbTransitions", transitionId, "dbFindingId", report, arguments.messages );
+			checkReference( transition.roadmapPhaseId ?: transition.phaseId ?: "", phaseIds, "dbTransitions", transitionId, "roadmapPhaseId", report, arguments.messages );
+		}
+		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
+			var phaseId = phase.id ?: phase.itemId ?: "";
+			checkReferenceArray( phase.unitIds ?: phase.targetUnitIds ?: [], targetIds, "roadmapPhases", phaseId, "unitIds", report, arguments.messages );
+			checkReferenceArray( phase.dbFindingIds ?: [], findingIds, "roadmapPhases", phaseId, "dbFindingIds", report, arguments.messages );
+			checkReferenceArray( phase.transitionIds ?: [], transitionIds, "roadmapPhases", phaseId, "transitionIds", report, arguments.messages );
+		}
+		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
+			var sampleId = sample.id ?: sample.itemId ?: "";
+			checkReferenceArray( sample.relatedItemIds ?: [], knownIds, "samples", sampleId, "relatedItemIds", report, arguments.messages );
+		}
+		return report;
+	}
+
+	private struct function idSet( required any items ) {
+		var output = {};
+		for ( var item in ( isArray( arguments.items ) ? arguments.items : [] ) ) {
+			var id = trim( item.id ?: item.itemId ?: "" );
+			if ( len( id ) ) output[ id ] = true;
+		}
+		return output;
+	}
+
+	private void function checkReference( required any value, required struct allowed, required string category, required string itemId, required string field, required struct report, required array messages ) {
+		var reference = trim( toString( arguments.value ?: "" ) );
+		if ( !len( reference ) || arguments.allowed.keyExists( reference ) ) return;
+		addMessage( arguments.messages, arguments.category, "blocking", "Item #arguments.itemId# references unknown #arguments.field# #reference#", arguments.itemId );
+		arguments.report.blocking++;
+	}
+
+	private void function checkReferenceArray( required any values, required struct allowed, required string category, required string itemId, required string field, required struct report, required array messages ) {
+		if ( !isArray( arguments.values ) ) return;
+		for ( var value in arguments.values ) checkReference( value, arguments.allowed, arguments.category, arguments.itemId, arguments.field, arguments.report, arguments.messages );
+	}
+
+	private struct function inventoryPathSet( required any inventory ) {
+		var output = {};
+		if ( !isStruct( arguments.inventory ) ) return output;
+		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
+			var path = lCase( replace( trim( unit.filePath ?: unit.path ?: "" ), "\\", "/", "all" ) );
+			if ( len( path ) ) output[ path ] = true;
+		}
+		for ( var file in ( isArray( arguments.inventory.files ?: "" ) ? arguments.inventory.files : [] ) ) {
+			var filePath = lCase( replace( trim( file.filePath ?: file.path ?: "" ), "\\", "/", "all" ) );
+			if ( len( filePath ) ) output[ filePath ] = true;
+		}
+		return output;
+	}
+
+	private boolean function safeRelativePath( required string path ) {
+		var normalized = replace( trim( arguments.path ), "\\", "/", "all" );
+		if ( !len( normalized ) || find( "..", normalized ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", normalized ) ) return false;
+		return true;
+	}
+	private boolean function safeRoutePath( required string path ) {
+		var normalized = replace( trim( arguments.path ), "\\", "/", "all" );
+		return reFind( "^/", normalized ) && !find( "..", normalized ) && !reFind( "^//", normalized );
+	}
+
+	private boolean function legalTargetPath( required string path, required string runtime, required string profile ) {
+		if ( !safeRelativePath( arguments.path ) ) return false;
+		var extension = lCase( listLast( arguments.path, "." ) );
+		if ( arguments.runtime == "boxlang" ) return [ "bx", "bxm" ].contains( extension ) && [ "boxlang", "modern" ].contains( arguments.profile ?: "modern" );
+		if ( arguments.runtime == "lucee" ) return [ "cfc", "cfm" ].contains( extension ) && [ "modern", "flat" ].contains( arguments.profile ?: "modern" );
+		return true;
+	}
+
+	private struct function validateTransitions( required any transitions, required array messages ) {
+		var output = { blocking: 0, warnings: 0 };
+		var previous = 0;
+		for ( var transition in ( isArray( arguments.transitions ) ? arguments.transitions : [] ) ) {
+			var operation = lCase( trim( transition.operation ?: transition.phase ?: "" ) );
+			if ( !variables.allowedTransitionOperations.contains( operation ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition has an invalid operation" ); output.blocking++; }
+			var order = isNumeric( transition.order ?: "" ) ? int( transition.order ) : 0;
+			if ( order && order < previous ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition order must be monotonic" ); output.blocking++; }
+			if ( order ) previous = order;
+			if ( transition.irreversible ?: false || transition.forwardOnly ?: false ) { addMessage( arguments.messages, "dbTransitions", "warning", "Database transition is forward-only and requires rollback review" ); output.warnings++; }
+			if ( !structKeyExists( transition, "rollback" ) ) { addMessage( arguments.messages, "dbTransitions", "warning", "Database transition is missing rollback intent" ); output.warnings++; }
+			if ( findNoCase( "queryExecute", jsonSerialize( transition ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition must not execute query text during validation" ); output.blocking++; }
+			var migrationText = toString( transition.migrationCode ?: transition.code ?: transition.migration ?: "" );
+			var migrationPath = toString( transition.migrationPath ?: transition.filePath ?: "" );
+			if ( len( migrationText ) || len( migrationPath ) ) {
+				var transitionId = transition.id ?: transition.itemId ?: "";
+				if ( len( migrationText ) && reFindNoCase( "(?:password|passwd|api[_-]?key|authorization|private[_-]?key)\\s*[:=]", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration contains a possible secret", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !safeRelativePath( migrationPath ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must remain inside the project", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\\.bx$", replace( migrationPath, "\\", "/", "all" ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must use a cfmigrations timestamp", transitionId ); output.blocking++; }
+				if ( len( migrationText ) && !reFindNoCase( "function\\s+up\\s*\\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing up(schema, query)", transitionId ); output.blocking++; }
+				if ( len( migrationText ) && !reFindNoCase( "function\\s+down\\s*\\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing down(schema, query)", transitionId ); output.blocking++; }
+			}
+		}
+		return output;
+	}
+
+	private string function evidenceLevel( required array messages ) {
+		for ( var item in arguments.messages ) if ( [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples" ].contains( item.category ) && item.level == "blocking" ) return "evidence-unchecked";
+		return "evidence-grounded";
+	}
+	private string function syntaxLevel( required struct plan ) { return "syntax-unchecked"; }
+	private string function dialectLevel( required struct plan ) { return structKeyExists( arguments.plan, "dbTransitions" ) && isArray( arguments.plan.dbTransitions ) && arguments.plan.dbTransitions.len() ? "dialect-checked" : "dialect-unchecked"; }
+}

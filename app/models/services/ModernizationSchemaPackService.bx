@@ -1,0 +1,538 @@
+/**
+ * Ingests optional, local schema evidence for a Modernize run.
+ *
+ * This service is deliberately conservative: schema text is treated as
+ * untrusted evidence, never executed, and row-bearing DML is removed before
+ * any text is retained or sent to an LLM.
+ */
+@singleton
+class {
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="maxBytes" inject="coldbox:setting:modernizationSchemaMaxBytes";
+	property name="maxFiles" inject="coldbox:setting:modernizationSchemaMaxFiles";
+	property name="maxStatements" inject="coldbox:setting:modernizationSchemaMaxStatements";
+
+	variables.version = "modernization-schema-pack-v1";
+	variables.allowedExtensions = [ "sql", "json", "bx", "cfc" ];
+	variables.defaults = { maxBytes: 2097152, maxFiles: 100, maxStatements: 5000 };
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) {
+			variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		}
+		return this;
+	}
+
+	/**
+	 * Ingests inline DDL, a repository-relative file/folder, or structured JSON.
+	 * The returned record is safe to persist; it does not contain the original
+	 * attachment and contains only bounded, redacted evidence.
+	 */
+	struct function ingest(
+		any input,
+		string projectPath = "",
+		struct options = {}
+	) {
+		var descriptor = isStruct( arguments.input ) ? duplicate( arguments.input ) : { inlineContent: toString( arguments.input ?: "" ) };
+		var sourceKind = lCase( trim( descriptor.sourceKind ?: descriptor.kind ?: "" ) );
+		if ( !len( sourceKind ) ) {
+			sourceKind = len( trim( descriptor.relativePath ?: "" ) ) ? "repo-path" : ( descriptor.structured ? "structured-json-v1" : "inline-ddl" );
+		}
+		var maxByteLimit = numericSetting( arguments.options.maxBytes ?: variables.maxBytes, variables.defaults.maxBytes );
+		var maxFileLimit = numericSetting( arguments.options.maxFiles ?: variables.maxFiles, variables.defaults.maxFiles );
+		var maxStatementLimit = numericSetting( arguments.options.maxStatements ?: variables.maxStatements, variables.defaults.maxStatements );
+		if ( maxByteLimit <= 0 ) maxByteLimit = variables.defaults.maxBytes;
+		if ( maxFileLimit <= 0 ) maxFileLimit = variables.defaults.maxFiles;
+		if ( maxStatementLimit <= 0 ) maxStatementLimit = variables.defaults.maxStatements;
+
+		if ( sourceKind == "structured-json-v1" || ( descriptor.format ?: "" ) == "structured-json-v1" ) {
+			return ingestStructured( descriptor, maxByteLimit, maxStatementLimit );
+		}
+
+		var sources = [];
+		if ( sourceKind == "inline" ) sourceKind = "inline-ddl";
+		if ( sourceKind == "upload" ) sourceKind = "attached-dump";
+		if ( sourceKind == "inline-ddl" || sourceKind == "attached-dump" ) {
+			var inline = descriptor.inlineContent ?: descriptor.content ?: descriptor.text ?: "";
+			if ( !isSimpleValue( inline ) ) inline = jsonSerialize( inline );
+			if ( byteLength( toString( inline ) ) > maxByteLimit ) {
+				throw( type="ModernizationSchemaPackLimitException", message="Schema pack exceeds the configured byte limit" );
+			}
+			sources.append( { filePath: "<inline>", content: toString( inline ) } );
+		} else if ( sourceKind == "repo-path" || sourceKind == "migration-folder" ) {
+			sources = readRepositorySources(
+				arguments.projectPath,
+				descriptor.relativePath ?: descriptor.path ?: "",
+				maxByteLimit,
+				maxFileLimit
+			);
+		} else {
+			throw( type="ModernizationSchemaPackInputException", message="Unsupported schema source kind" );
+		}
+
+		if ( !sources.len() ) {
+			var empty = emptyPack( sourceKind );
+			empty.relativePath = sourceKind == "repo-path" || sourceKind == "migration-folder" ? normalizePath( descriptor.relativePath ?: descriptor.path ?: "" ) : "";
+			return empty;
+		}
+		var consumedBytes = 0;
+		var sanitizedParts = [];
+		var redactionCount = 0;
+		var dmlRemoved = 0;
+		var statements = 0;
+		for ( var source in sources ) {
+			var sourceText = toString( source.content ?: "" );
+			consumedBytes += byteLength( sourceText );
+			if ( consumedBytes > maxByteLimit ) {
+				throw( type="ModernizationSchemaPackLimitException", message="Schema pack exceeds the configured byte limit" );
+			}
+			var redacted = redactSchemaLines(
+				listToArray( normalizeText( sourceText ), char( 10 ), true, true )
+			);
+			redactionCount += redacted.redactionCount;
+			var stripped = stripDml( redacted.lines );
+			dmlRemoved += stripped.removed;
+			statements += countStatements( stripped.lines );
+			if ( statements > maxStatementLimit ) {
+				throw( type="ModernizationSchemaPackLimitException", message="Schema pack exceeds the configured statement limit" );
+			}
+			var sourcePath = normalizePath( source.filePath ?: "<inline>" );
+			sanitizedParts.append( "-- source: " & sourcePath & char( 10 ) & stripped.lines.toList( char( 10 ) ) );
+		}
+
+		var sanitizedText = sanitizedParts.toList( char( 10 ) & char( 10 ) );
+		var parsed = parseSql( sanitizedText, maxStatementLimit );
+		parsed.unresolvedCount += dmlRemoved;
+		var coverage = parsed.tables.len() || parsed.indexes.len() || parsed.constraints.len() ? "partial-ddl" : ( statements ? "migration-evidence-only" : "absent" );
+		return {
+			version        : variables.version,
+			source         : [ "repo-path", "migration-folder" ].contains( sourceKind ) ? "repo-ddl" : "attached-dump",
+			sourceKind     : sourceKind,
+			format         : "sql-ddl",
+			relativePath   : [ "repo-path", "migration-folder" ].contains( sourceKind ) ? normalizePath( descriptor.relativePath ?: descriptor.path ?: "" ) : "",
+			files          : sources.map( ( item ) => normalizePath( item.filePath ?: "<inline>" ) ),
+			text           : sanitizedText,
+			sanitizedText  : sanitizedText,
+			contentHash    : lCase( hash( sanitizedText, "SHA-256" ) ),
+			bytes          : byteLength( sanitizedText ),
+			redactions     : { count: redactionCount },
+			dmlRemoved     : dmlRemoved,
+			statementCount : statements,
+			coverage       : coverage,
+			unresolvedCount: parsed.unresolvedCount,
+			unresolved     : parsed.unresolved,
+			tables         : parsed.tables,
+			objects        : parsed.tables,
+			columns        : parsed.columns,
+			constraints    : parsed.constraints,
+			indexes        : parsed.indexes,
+			routines       : parsed.routines,
+			vendor         : detectVendor( sanitizedText ),
+			vendorConfidence: detectVendorConfidence( sanitizedText ),
+			database       : { vendor: detectVendor( sanitizedText ), confidence: detectVendorConfidence( sanitizedText ) },
+			promptLikeCount: countPromptLike( sanitizedText )
+		};
+	}
+
+	struct function sanitize( required any input, string projectPath = "", struct options = {} ) {
+		return ingest( arguments.input, arguments.projectPath, arguments.options );
+	}
+
+	struct function parse( required any input, string projectPath = "", struct options = {} ) {
+		return ingest( arguments.input, arguments.projectPath, arguments.options );
+	}
+
+	private struct function ingestStructured( required struct descriptor, required numeric maxBytes, required numeric maxStatements ) {
+		var raw = descriptor.data ?: descriptor.content ?: descriptor.inlineContent ?: descriptor.json ?: descriptor;
+		var parsed = raw;
+		if ( isSimpleValue( raw ) ) {
+			if ( byteLength( toString( raw ) ) > arguments.maxBytes ) {
+				throw( type="ModernizationSchemaPackLimitException", message="Schema pack exceeds the configured byte limit" );
+			}
+			try {
+				parsed = jsonDeserialize( toString( raw ) );
+			} catch ( any error ) {
+				throw( type="ModernizationSchemaPackInputException", message="Structured schema pack is not valid JSON" );
+			}
+		}
+		if ( !isStruct( parsed ) ) {
+			throw( type="ModernizationSchemaPackInputException", message="Structured schema pack must be an object" );
+		}
+		// Structured metadata is evidence too. Redact sensitive keys and token
+		// values before normalizing objects, otherwise sanitized text could still
+		// be accompanied by raw credentials in parsed arrays.
+		var originalSerialized = jsonSerialize( parsed );
+		parsed = sanitizeStructuredValue( parsed );
+		var version = parsed.version ?: parsed.schemaVersion ?: "modernization-schema-pack-v1";
+		if ( version != "modernization-schema-pack-v1" && version != "structured-json-v1" ) {
+			throw( type="ModernizationSchemaPackInputException", message="Unsupported structured schema pack version" );
+		}
+		var tables = normalizeObjects( parsed.tables ?: [] , "table" );
+		var columns = normalizeObjects( parsed.columns ?: [] , "column" );
+		var constraints = normalizeObjects( parsed.constraints ?: [] , "constraint" );
+		var indexes = normalizeObjects( parsed.indexes ?: [] , "index" );
+		var routines = normalizeObjects( parsed.routines ?: parsed.procedures ?: [] , "routine" );
+		var canonical = {
+			version: "structured-json-v1",
+			tables: tables,
+			columns: columns,
+			constraints: constraints,
+			indexes: indexes,
+			routines: routines
+		};
+		var serialized = jsonSerialize( canonical );
+		var sanitized = variables.secretRedactionService.redactText( serialized );
+		// Keep the parsed metadata consistent with the sanitized text. This also
+		// protects callers that persist the structured arrays directly.
+		try {
+			var sanitizedCanonical = jsonDeserialize( sanitized );
+			if ( isStruct( sanitizedCanonical ) ) canonical = sanitizedCanonical;
+		} catch ( any ignored ) {}
+		var statementCount = tables.len() + columns.len() + constraints.len() + indexes.len() + routines.len();
+		if ( statementCount > arguments.maxStatements ) {
+			throw( type="ModernizationSchemaPackLimitException", message="Schema pack exceeds the configured statement limit" );
+		}
+		return {
+			version          : variables.version,
+			source           : "attached-dump",
+			sourceKind       : "structured-json-v1",
+			format           : "structured-json-v1",
+			files            : [ "<structured-json>" ],
+			relativePath    : "",
+			text             : sanitized,
+			sanitizedText    : sanitized,
+			contentHash      : lCase( hash( sanitized, "SHA-256" ) ),
+			bytes            : byteLength( sanitized ),
+			redactions       : { count: originalSerialized == jsonSerialize( canonical ) ? 0 : 1 },
+			dmlRemoved       : 0,
+			statementCount   : statementCount,
+			coverage         : tables.len() ? "complete-structured" : "absent",
+			unresolvedCount  : 0,
+			unresolved       : [],
+			tables           : canonical.tables ?: [],
+			objects          : canonical.tables ?: [],
+			columns          : canonical.columns ?: [],
+			constraints      : canonical.constraints ?: [],
+			indexes          : canonical.indexes ?: [],
+			routines         : canonical.routines ?: [],
+			vendor           : parsed.vendor ?: parsed.databaseVendor ?: "",
+			vendorConfidence : len( parsed.vendor ?: parsed.databaseVendor ?: "" ) ? 1 : 0,
+			database         : { vendor: parsed.vendor ?: parsed.databaseVendor ?: "", confidence: len( parsed.vendor ?: parsed.databaseVendor ?: "" ) ? 1 : 0 },
+			promptLikeCount  : countPromptLike( sanitized )
+		};
+	}
+
+	private array function readRepositorySources(
+		required string projectPath,
+		required string relativePath,
+		required numeric maxBytes,
+		required numeric maxFiles
+	) {
+		if ( !len( trim( arguments.projectPath ) ) || !len( trim( arguments.relativePath ) ) ) {
+			throw( type="ModernizationSchemaPackInputException", message="A repository-relative schema path is required" );
+		}
+		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
+		var requested = replace( trim( arguments.relativePath ), "\\", "/", "all" );
+		if ( reFind( "^(?:[A-Za-z]:|/|\\\\)", requested ) || listFind( requested, "..", "/" ) ) {
+			throw( type="ModernizationSchemaPackInputException", message="Schema path must be relative to the selected project" );
+		}
+		var target = createObject( "java", "java.io.File" ).init( root, requested ).getCanonicalFile();
+		if ( !target.toPath().startsWith( root.toPath() ) ) {
+			throw( type="ModernizationSchemaPackInputException", message="Schema path escapes the selected project" );
+		}
+		var paths = [];
+		if ( target.isFile() ) {
+			var targetExtension = lCase( listLast( target.getName(), "." ) );
+			if ( !variables.allowedExtensions.contains( targetExtension ) ) {
+				throw( type="ModernizationSchemaPackInputException", message="Schema file extension is not allowlisted" );
+			}
+			paths = [ target.getPath() ];
+		} else if ( target.isDirectory() ) {
+			var listing = directoryList( target.getPath(), true, "query" );
+			for ( var row = 1; row <= listing.recordCount; row++ ) {
+				if ( lCase( listing.type[ row ] ?: "file" ) == "file" ) {
+					var listedFile = createObject( "java", "java.io.File" ).init( listing.directory[ row ] & createObject( "java", "java.io.File" ).separator & listing.name[ row ] ).getCanonicalFile();
+					if ( listedFile.toPath().startsWith( root.toPath() ) ) paths.append( listedFile.getPath() );
+				}
+			}
+		} else {
+			throw( type="ModernizationSchemaPackInputException", message="Schema path does not exist" );
+		}
+		paths.sort( "textnocase" );
+		var result = [];
+		var total = 0;
+		for ( var path in paths ) {
+			if ( result.len() >= arguments.maxFiles ) {
+				break;
+			}
+			var extension = lCase( listLast( path, "." ) );
+			if ( !variables.allowedExtensions.contains( extension ) ) {
+				continue;
+			}
+			var size = createObject( "java", "java.io.File" ).init( path ).length();
+			if ( total + size > arguments.maxBytes ) {
+				break;
+			}
+			var content = fileRead( path, "UTF-8" );
+			result.append( { filePath: normalizePath( root.toPath().relativize( createObject( "java", "java.io.File" ).init( path ).getCanonicalFile().toPath().toString() ) ), content: content } );
+			total += size;
+		}
+		return result;
+	}
+
+	private struct function parseSql( required string text, required numeric maxStatements ) {
+		var tables = [];
+		var columns = [];
+		var constraints = [];
+		var indexes = [];
+		var routines = [];
+		var unresolved = [];
+		var tableNames = {};
+		var lines = listToArray( normalizeText( arguments.text ), char( 10 ), true, true );
+		for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
+			var line = trim( lines[ lineNumber ] );
+			if ( !len( line ) || left( line, 2 ) == "--" ) continue;
+			var tableMatch = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.$-]+)", line );
+			if ( tableMatch.find() ) {
+				var tableName = tableMatch.group( 1 );
+				if ( !tableNames.keyExists( lCase( tableName ) ) ) {
+					tableNames[ lCase( tableName ) ] = true;
+					tables.append( { name: tableName, evidence: [ evidenceRef( lineNumber, line ) ] } );
+				}
+				continue;
+			}
+			var indexMatch = match( "(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+([A-Za-z0-9_.$-]+)\s+ON\s+([A-Za-z0-9_.$-]+)", line );
+			if ( indexMatch.find() ) {
+				indexes.append( { name: indexMatch.group( 1 ), table: indexMatch.group( 2 ), evidence: [ evidenceRef( lineNumber, line ) ] } );
+				continue;
+			}
+			var routineMatch = match( "(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION|VIEW|TRIGGER)\s+([A-Za-z0-9_.$-]+)", line );
+			if ( routineMatch.find() ) {
+				routines.append( { kind: lCase( routineMatch.group( 1 ) ), name: routineMatch.group( 2 ), evidence: [ evidenceRef( lineNumber, line ) ] } );
+				continue;
+			}
+			var constraintLine = reReplace( line, "^\s*,\s*", "" );
+			var constraintMatch = match( "(?i)^(?:CONSTRAINT\s+([A-Za-z0-9_.$-]+)\s+)?(PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK)", constraintLine );
+			if ( constraintMatch.find() ) {
+				constraints.append( { name: constraintMatch.group( 1 ) ?: "", kind: lCase( reReplaceNoCase( constraintMatch.group( 2 ), "\s+", "-", "all" ) ), evidence: [ evidenceRef( lineNumber, line ) ] } );
+				continue;
+			}
+			if ( reFindNoCase( "^(INSERT|UPDATE|DELETE|MERGE)\b", line ) ) continue;
+			if ( reFindNoCase( "^(ALTER|DROP|GRANT|REVOKE|SET|USE)\b", line ) ) {
+				unresolved.append( { line: lineNumber, statement: left( line, 240 ), reason: "unsupported-ddl" } );
+			}
+		}
+		// Capture common column declarations inside CREATE TABLE blocks. This is
+		// intentionally line-oriented and does not attempt a full SQL grammar.
+		var currentTable = "";
+		for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
+			var line = trim( lines[ lineNumber ] );
+			var tableStart = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.$-]+)", line );
+			if ( tableStart.find() ) {
+				currentTable = tableStart.group( 1 );
+				var openParen = find( "(", line );
+				var reverseClose = find( ")", reverse( line ) );
+				var closeParen = reverseClose ? len( line ) - reverseClose + 1 : 0;
+				if ( openParen && closeParen > openParen ) {
+					for ( var inlineDefinition in listToArray( mid( line, openParen + 1, closeParen - openParen - 1 ), "," ) ) {
+						var inlineColumn = match( "(?i)^\s*([A-Za-z_][A-Za-z0-9_$-]*)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", inlineDefinition );
+						if ( inlineColumn.find() && !listFindNoCase( "constraint,primary,foreign,unique,check,index", inlineColumn.group( 1 ) ) ) columns.append( { table: currentTable, name: inlineColumn.group( 1 ), type: trim( inlineColumn.group( 2 ) ), evidence: [ evidenceRef( lineNumber, inlineDefinition ) ] } );
+					}
+					currentTable = "";
+				}
+				continue;
+			}
+			if ( !len( currentTable ) ) continue;
+			if ( reFind( "^\)\s*;?$", line ) ) { currentTable = ""; continue; }
+			var columnLine = reReplace( line, "^\s*,\s*", "" );
+			var columnMatch = match( "(?i)^([A-Za-z_][A-Za-z0-9_$-]*)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", columnLine );
+			if ( columnMatch.find() && !listFindNoCase( "constraint,primary,foreign,unique,check,index", columnMatch.group( 1 ) ) ) {
+				columns.append( { table: currentTable, name: columnMatch.group( 1 ), type: trim( columnMatch.group( 2 ) ), evidence: [ evidenceRef( lineNumber, line ) ] } );
+			}
+		}
+		return { tables: tables, columns: columns, constraints: constraints, indexes: indexes, routines: routines, unresolved: unresolved, unresolvedCount: unresolved.len() };
+	}
+
+	private struct function stripDml( required array lines ) {
+		var kept = [];
+		var removed = 0;
+		var dropping = false;
+		var inRoutine = false;
+		for ( var line in arguments.lines ) {
+			if ( reFindNoCase( "^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION|TRIGGER)\b", line ) ) inRoutine = true;
+			if ( inRoutine ) {
+				kept.append( line );
+				if ( reFindNoCase( "^\s*(END|GO)\s*;?\s*$", line ) || ( find( ";", line ) && !reFindNoCase( "\bBEGIN\b", line ) ) ) inRoutine = false;
+				continue;
+			}
+			if ( !dropping && isDmlStatement( line ) ) {
+				removed++;
+				dropping = find( ";", line ) == 0;
+				continue;
+			}
+			if ( dropping ) {
+				if ( find( ";", line ) ) dropping = false;
+				removed++;
+				continue;
+			}
+			// DDL and row DML are often emitted on the same line by dumps. Remove
+			// only the DML segment so the surrounding CREATE statement remains
+			// useful evidence; routine bodies stay protected by the branch above.
+			var inlineDml = reMatchNoCase( "(?:^|;)\s*(?:INSERT|UPDATE|DELETE|MERGE|UPSERT)\b[^;]*(?:;|$)", line );
+			if ( inlineDml.len() ) {
+				removed += inlineDml.len();
+				line = reReplaceNoCase( line, "(?:^|;)\s*(?:INSERT|UPDATE|DELETE|MERGE|UPSERT)\b[^;]*(?:;|$)", "", "all" );
+			}
+			kept.append( line );
+		}
+		return { lines: kept, removed: removed };
+	}
+	private boolean function isDmlStatement( required string line ) {
+		var value = uCase( trim( arguments.line ) );
+		for ( var keyword in [ "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "UPSERT " ] ) if ( left( value, len( keyword ) ) == keyword ) return true;
+		return false;
+	}
+
+	/**
+	 * Redact credential values in-place so a safe DDL statement on the same line
+	 * remains parseable. SecretRedactionService intentionally redacts whole
+	 * source lines; schema evidence needs a narrower replacement boundary.
+	 */
+	private struct function redactSchemaLines( required array lines ) {
+		var output = [];
+		var redactionCount = 0;
+		var insidePrivateKey = false;
+		for ( var originalLine in arguments.lines ) {
+			var line = toString( originalLine );
+			if ( reFindNoCase( "-----BEGIN [A-Z ]*PRIVATE KEY-----", line ) ) insidePrivateKey = true;
+			if ( insidePrivateKey ) {
+				output.append( "[REDACTED SENSITIVE CONTENT]" );
+				redactionCount++;
+				if ( reFindNoCase( "-----END [A-Z ]*PRIVATE KEY-----", line ) ) insidePrivateKey = false;
+				continue;
+			}
+			var redacted = reReplaceNoCase(
+				line,
+				"((?:api[_-]?key|password|passwd|secret|token|authorization|client[_-]?secret|private[_-]?key)\s*[:=]\s*)[^;\s,)]*",
+				"\1[REDACTED SENSITIVE CONTENT]",
+				"all"
+			);
+			redacted = reReplaceNoCase( redacted, "\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,})\b", "[REDACTED SENSITIVE CONTENT]", "all" );
+			if ( redacted != line ) redactionCount++;
+			output.append( redacted );
+		}
+		return { lines: output, redactionCount: redactionCount };
+	}
+
+	private array function normalizeObjects( required any value, required string kind ) {
+		if ( !isArray( arguments.value ) ) return [];
+		var result = [];
+		for ( var item in arguments.value ) {
+			if ( !isStruct( item ) ) continue;
+			var copy = duplicate( item );
+			if ( !len( trim( copy.name ?: copy.table ?: "" ) ) ) continue;
+			copy.kind = copy.kind ?: arguments.kind;
+			result.append( copy );
+		}
+		result.sort( ( a, b ) => compareNoCase( toString( a.name ?: a.table ?: "" ), toString( b.name ?: b.table ?: "" ) ) );
+		return result;
+	}
+
+	private struct function emptyPack( required string sourceKind ) {
+		return {
+			version: variables.version, source: "attached-dump", sourceKind: arguments.sourceKind, format: "sql-ddl", relativePath: "",
+			files: [], text: "", sanitizedText: "", contentHash: lCase( hash( "", "SHA-256" ) ), bytes: 0,
+			redactions: { count: 0 }, dmlRemoved: 0, statementCount: 0, coverage: "absent", unresolvedCount: 0,
+			unresolved: [], tables: [], objects: [], columns: [], constraints: [], indexes: [], routines: [], vendor: "", vendorConfidence: 0, database: { vendor: "", confidence: 0 }, promptLikeCount: 0
+		};
+	}
+
+	private struct function evidenceRef( required numeric lineNumber, required string line ) {
+		return { startLine: arguments.lineNumber, endLine: arguments.lineNumber, snippet: left( trim( arguments.line ), 240 ) };
+	}
+
+	private numeric function countStatements( required array lines ) {
+		var count = 0;
+		for ( var line in arguments.lines ) if ( reFindNoCase( "\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|CALL)\b", line ) ) count++;
+		return count;
+	}
+
+	private string function detectVendor( required string text ) {
+		if ( findNoCase( "TSQL", arguments.text ) || findNoCase( "NVARCHAR", arguments.text ) || findNoCase( "IDENTITY", arguments.text ) || reFindNoCase( "(^|\s)GO($|\s)", arguments.text ) || findNoCase( "SQL_SERVER", arguments.text ) ) return "sqlserver";
+		if ( findNoCase( "AUTO_INCREMENT", arguments.text ) || findNoCase( "ENGINE=", replace( arguments.text, " ", "", "all" ) ) || findNoCase( "DELIMITER", arguments.text ) ) return "mysql";
+		if ( findNoCase( "SERIAL", arguments.text ) || findNoCase( "ILIKE", arguments.text ) || findNoCase( "JSONB", arguments.text ) || findNoCase( "PUBLIC", arguments.text ) ) return "postgresql";
+		return "";
+	}
+
+	private numeric function detectVendorConfidence( required string text ) {
+		var vendor = detectVendor( arguments.text );
+		return len( vendor ) ? 0.8 : 0;
+	}
+
+	private numeric function countPromptLike( required string text ) {
+		return reFindNoCase( "ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions|system\s+message|you\s+are\s+chatgpt", arguments.text ) ? 1 : 0;
+	}
+
+	private string function normalizeText( required string text ) {
+		return replace( replace( arguments.text, char( 13 ), "", "all" ), char( 0 ), "", "all" );
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" );
+	}
+
+	/** Redact both sensitive keys and token-like scalar values in structured evidence. */
+	private any function sanitizeStructuredValue( required any value, string keyName = "" ) {
+		if ( isNull( arguments.value ) ) return javacast( "null", "" );
+		if ( isStruct( arguments.value ) ) {
+			var output = {};
+			for ( var key in arguments.value ) {
+				if ( isSensitiveKey( key ) ) {
+					output[ key ] = "[REDACTED SENSITIVE CONTENT]";
+				} else {
+					output[ key ] = sanitizeStructuredValue( arguments.value[ key ], key );
+				}
+			}
+			return output;
+		}
+		if ( isArray( arguments.value ) ) {
+			var arrayOutput = [];
+			for ( var item in arguments.value ) arrayOutput.append( sanitizeStructuredValue( item, arguments.keyName ) );
+			return arrayOutput;
+		}
+		if ( isBoolean( arguments.value ) || isNumeric( arguments.value ) ) return arguments.value;
+		if ( !isSimpleValue( arguments.value ) ) return "[REDACTED UNSUPPORTED EVIDENCE]";
+		return variables.secretRedactionService.redactText( toString( arguments.value ) );
+	}
+
+	private boolean function isSensitiveKey( required string keyName ) {
+		return reFindNoCase(
+			"(api[_-]?key|password|passwd|secret|token|authorization|client[_-]?secret|private[_-]?key)",
+			arguments.keyName
+		) > 0;
+	}
+
+	private numeric function byteLength( required string text ) {
+		try {
+			return createObject( "java", "java.lang.String" ).init( arguments.text ).getBytes( "UTF-8" ).length;
+		} catch ( any ignored ) {
+			return len( arguments.text );
+		}
+	}
+
+	private numeric function numericSetting( any value, required numeric fallback ) {
+		var candidate = isNull( arguments.value ?: javacast( "null", "" ) ) ? 0 : val( arguments.value );
+		return candidate > 0 ? candidate : arguments.fallback;
+	}
+
+	private boolean function isSimpleValue( required any value ) {
+		return !isStruct( arguments.value ) && !isArray( arguments.value ) && !isObject( arguments.value );
+	}
+
+	private any function match( required string expression, required string source ) {
+		return createObject( "java", "java.util.regex.Pattern" ).compile(
+			arguments.expression,
+			createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE
+		).matcher( arguments.source );
+	}
+}

@@ -1,0 +1,204 @@
+/** Validates immutable Modernize input and performs the provider gate. */
+@singleton
+class {
+	property name="aiReviewService" inject="AIReviewService";
+	property name="aiProvider" inject="coldbox:setting:aiProvider";
+	property name="aiLocalProvider" inject="coldbox:setting:aiLocalProvider";
+	property name="modernizationDefaultColdboxMajor" inject="coldbox:setting:modernizationDefaultColdboxMajor";
+	property name="modernizationDefaultCliMajor" inject="coldbox:setting:modernizationDefaultCliMajor";
+	property name="modernizationMaxFiles" inject="coldbox:setting:modernizationMaxFiles";
+	property name="modernizationMaxOutcomes" inject="coldbox:setting:modernizationMaxOutcomes";
+
+	variables.version = "modernization-input-v1";
+	variables.allowedSourceEngines = [ "adobe", "adobe-coldfusion", "coldfusion", "lucee", "boxlang", "unknown" ];
+	variables.allowedRuntimes = [ "boxlang", "lucee" ];
+	variables.allowedVendors = [ "sqlserver", "mssql", "mysql", "postgresql", "postgres", "oracle", "sqlite", "unknown" ];
+
+	struct function normalize( struct input = {} ) {
+		// BoxLang raises when a missing struct key is dereferenced, even when it
+		// appears on the left side of `?:`.  Seed each nested input object before
+		// reading optional fields so partial API payloads become normal validation
+		// errors rather than runtime KeyNotFound exceptions.
+		var source = { engine: "unknown", version: "", javaVersion: "" };
+		var target = { runtime: "boxlang", language: "boxlang", layoutProfile: "modern", coldboxMajor: "", cliMajor: "" };
+		var database = { vendor: "unknown", version: "", schema: "", collation: "", timezone: "" };
+		var privacy = { remoteProvider: false, remoteEgressAcknowledged: false };
+		var samplePolicy = { maxFiles: 0, currentPhasesOnly: true };
+		if ( structKeyExists( arguments.input, "source" ) && isStruct( arguments.input.source ) ) structAppend( source, arguments.input.source, true );
+		if ( structKeyExists( arguments.input, "target" ) && isStruct( arguments.input.target ) ) structAppend( target, arguments.input.target, true );
+		if ( structKeyExists( arguments.input, "database" ) && isStruct( arguments.input.database ) ) structAppend( database, arguments.input.database, true );
+		if ( structKeyExists( arguments.input, "privacy" ) && isStruct( arguments.input.privacy ) ) structAppend( privacy, arguments.input.privacy, true );
+		if ( structKeyExists( arguments.input, "samplePolicy" ) && isStruct( arguments.input.samplePolicy ) ) structAppend( samplePolicy, arguments.input.samplePolicy, true );
+		var maxFiles = configuredLimit( modernizationMaxFiles, 40 );
+		var maxOutcomes = configuredLimit( modernizationMaxOutcomes, 12 );
+		var sourceEngine = lCase( trim( source.engine ?: "unknown" ) );
+		if ( !variables.allowedSourceEngines.contains( sourceEngine ) ) {
+			validationError( "source.engine is not supported" );
+		}
+		if ( sourceEngine == "coldfusion" ) sourceEngine = "adobe-coldfusion";
+		var runtime = lCase( trim( target.runtime ?: "boxlang" ) );
+		var language = lCase( trim( target.language ?: ( runtime == "lucee" ? "cfml" : "boxlang" ) ) );
+		var layout = lCase( trim( target.layoutProfile ?: "modern" ) );
+		if ( !variables.allowedRuntimes.contains( runtime ) ) validationError( "target.runtime must be boxlang or lucee" );
+		if ( runtime == "boxlang" && ![ "boxlang", "modern" ].contains( layout ) ) validationError( "target.layoutProfile is not valid for BoxLang" );
+		if ( runtime == "lucee" && ![ "modern", "flat" ].contains( layout ) ) validationError( "target.layoutProfile is not valid for Lucee" );
+		if ( runtime == "boxlang" && language != "boxlang" ) validationError( "BoxLang targets must emit BoxLang" );
+		if ( runtime == "lucee" && language != "cfml" ) validationError( "Lucee targets must emit CFML" );
+		var vendor = lCase( trim( database.vendor ?: "unknown" ) );
+		if ( !variables.allowedVendors.contains( vendor ) ) validationError( "database.vendor is not supported" );
+		if ( vendor == "mssql" ) vendor = "sqlserver";
+		if ( vendor == "postgres" ) vendor = "postgresql";
+		var outcomes = normalizeOutcomes( structKeyExists( arguments.input, "outcomes" ) ? arguments.input.outcomes : [] );
+		var localProvider = toBoolean( aiLocalProvider );
+		var remoteProvider = !localProvider;
+		if ( structKeyExists( arguments.input, "privacy" ) && isStruct( arguments.input.privacy ) && structKeyExists( arguments.input.privacy, "remoteProvider" ) ) remoteProvider = toBoolean( arguments.input.privacy.remoteProvider );
+		if ( !localProvider && !toBoolean( privacy.remoteEgressAcknowledged ?: false ) ) {
+			validationError( "privacy.remoteEgressAcknowledged is required for remote providers" );
+		}
+		var normalized = {
+			version: variables.version,
+			outcomes: outcomes,
+			source: {
+				engine: sourceEngine,
+				version: boundedText( source.version ?: "", "source.version", 80 ),
+				javaVersion: boundedText( source.javaVersion ?: "", "source.javaVersion", 40 )
+			},
+			target: {
+				runtime: runtime,
+				language: language,
+				layoutProfile: layout,
+				coldboxMajor: boundedText( target.coldboxMajor ?: ( modernizationDefaultColdboxMajor ?: "8" ), "target.coldboxMajor", 20 ),
+				cliMajor: boundedText( target.cliMajor ?: ( modernizationDefaultCliMajor ?: "6" ), "target.cliMajor", 20 )
+			},
+			database: {
+				vendor: vendor,
+				version: boundedText( database.version ?: "", "database.version", 80 ),
+				schema: boundedText( database.schema ?: "", "database.schema", 120 ),
+				collation: boundedText( database.collation ?: "", "database.collation", 120 ),
+				timezone: boundedText( database.timezone ?: "", "database.timezone", 80 )
+			},
+			schemaPack: normalizeSchemaPackDescriptor( structKeyExists( arguments.input, "schemaPack" ) ? arguments.input.schemaPack : {} ),
+			privacy: { remoteProvider: toBoolean( remoteProvider ), remoteEgressAcknowledged: toBoolean( privacy.remoteEgressAcknowledged ?: false ) },
+			samplePolicy: {
+				maxFiles: boundedInteger( ( isNumeric( samplePolicy.maxFiles ) && val( samplePolicy.maxFiles ) > 0 ) ? samplePolicy.maxFiles : maxFiles, "samplePolicy.maxFiles", 1, maxFiles ),
+				currentPhasesOnly: toBoolean( samplePolicy.currentPhasesOnly )
+			}
+		};
+		normalized.fingerprint = lCase( hash( serializeCanonical( normalized ), "SHA-256" ) );
+		return {
+			input: normalized,
+			fingerprint: normalized.fingerprint,
+			provider: aiProvider,
+			providerEnabled: isProviderEnabled(),
+			schemaPackRequest: normalized.schemaPack
+		};
+	}
+
+	struct function preflight( struct input = {} ) {
+		var normalized = normalize( arguments.input );
+		return {
+			valid: true,
+			enabled: normalized.providerEnabled,
+			provider: normalized.provider,
+			local: toBoolean( aiLocalProvider ),
+			fingerprint: normalized.fingerprint,
+			input: normalized.input,
+			schemaPackRequest: normalized.schemaPackRequest
+		};
+	}
+
+	boolean function isProviderEnabled() {
+		// Direct unit construction does not run ColdBox injection. Treat a
+		// missing gateway as disabled rather than dereferencing null; the running
+		// application always injects AIReviewService here.
+		if ( isNull( variables.aiReviewService ?: javacast( "null", "" ) ) ) return false;
+		try {
+			return aiReviewService.isEnabled();
+		} catch ( any ignored ) {
+			return false;
+		}
+	}
+
+	void function ensureProviderEnabled() {
+		if ( !isProviderEnabled() ) {
+			validationError( "Modernize requires an enabled LLM provider" );
+		}
+	}
+
+	private struct function normalizeSchemaPackDescriptor( required any value ) {
+		if ( !isStruct( arguments.value ) ) validationError( "schemaPack must be an object" );
+		var requested = { sourceKind: "none", format: "", relativePath: "", contentHash: "", packVersion: "" };
+		structAppend( requested, arguments.value, true );
+		var descriptor = {
+			sourceKind: lCase( trim( requested.sourceKind ) ),
+			format: lCase( trim( requested.format ) ),
+			relativePath: boundedText( requested.relativePath, "schemaPack.relativePath", 240 ),
+				contentHash: boundedText( requested.contentHash, "schemaPack.contentHash", 128 ),
+				packVersion: boundedText( requested.packVersion, "schemaPack.packVersion", 40 )
+			};
+			// Inline schema text remains transient, but its hash participates in the
+			// immutable fingerprint so different attachments cannot reuse checkpoints.
+			if ( !len( descriptor.contentHash ) && structKeyExists( arguments.value, "inlineContent" ) && isSimpleValue( arguments.value.inlineContent ) ) {
+				descriptor.contentHash = lCase( hash( toString( arguments.value.inlineContent ), "SHA-256" ) );
+			}
+		if ( ![ "none", "inline", "inline-ddl", "upload", "attached-dump", "repo-path", "migration-folder" ].contains( descriptor.sourceKind ) ) validationError( "schemaPack.sourceKind is not supported" );
+		if ( len( descriptor.format ) && ![ "sql-ddl", "inline-ddl", "structured-json-v1", "migration-folder" ].contains( descriptor.format ) ) validationError( "schemaPack.format is not supported" );
+		return descriptor;
+	}
+
+	private array function normalizeOutcomes( required any requested ) {
+		if ( !isArray( arguments.requested ) ) validationError( "outcomes must be an array" );
+		var maxOutcomes = configuredLimit( modernizationMaxOutcomes, 12 );
+		if ( arguments.requested.len() > maxOutcomes ) validationError( "outcomes exceeds the configured maximum" );
+		var output = [];
+		for ( var item in arguments.requested ) {
+			if ( !isSimpleValue( item ) ) validationError( "outcomes must contain text values" );
+			var value = boundedText( item, "outcomes[]", 120 );
+			if ( !output.contains( value ) ) output.append( value );
+			if ( output.len() > maxOutcomes ) validationError( "outcomes exceeds the configured maximum" );
+		}
+		return output;
+	}
+
+	private string function boundedText( required any value, required string field, required numeric maximum ) {
+		if ( !isSimpleValue( arguments.value ) ) validationError( "#arguments.field# must be text" );
+		var text = trim( toString( arguments.value ) );
+		if ( len( text ) > arguments.maximum ) validationError( "#arguments.field# exceeds the maximum length" );
+		return text;
+	}
+
+	private numeric function boundedInteger( required any value, required string field, required numeric minimum, required numeric maximum ) {
+		if ( !isNumeric( arguments.value ) || val( arguments.value ) != int( val( arguments.value ) ) || val( arguments.value ) < arguments.minimum || val( arguments.value ) > arguments.maximum ) validationError( "#arguments.field# must be an integer between #arguments.minimum# and #arguments.maximum#" );
+		return int( val( arguments.value ) );
+	}
+
+	private numeric function configuredLimit( any value, required numeric fallback ) {
+		var candidate = isNull( arguments.value ?: javacast( "null", "" ) ) ? 0 : val( arguments.value );
+		return candidate > 0 ? candidate : arguments.fallback;
+	}
+
+	private boolean function toBoolean( required any value ) {
+		if ( isBoolean( arguments.value ) ) return arguments.value;
+		return [ "true", "1", "yes", "on" ].contains( lCase( trim( toString( arguments.value ) ) ) );
+	}
+
+	private string function serializeCanonical( required any value ) {
+		if ( isStruct( arguments.value ) ) {
+			var keys = structKeyArray( arguments.value );
+			arraySort( keys, "textnocase" );
+			var output = "{";
+			for ( var key in keys ) output &= lCase( key ) & ":" & serializeCanonical( arguments.value[ key ] ) & ";";
+			return output & "}";
+		}
+		if ( isArray( arguments.value ) ) {
+			var items = "[";
+			for ( var item in arguments.value ) items &= serializeCanonical( item ) & ";";
+			return items & "]";
+		}
+		return jsonSerialize( arguments.value );
+	}
+
+	private void function validationError( required string message ) {
+		throw( type = "ValidationException", message = arguments.message );
+	}
+}

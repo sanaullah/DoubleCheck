@@ -1,0 +1,55 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization input policy", () => {
+			it( "accepts the supported runtime/layout matrix and produces a stable fingerprint", () => {
+				var service = new app.models.services.ModernizationPolicyService();
+				service.aiLocalProvider = true;
+				service.aiProvider = "ollama";
+				service.modernizationMaxFiles = 40;
+				service.modernizationMaxOutcomes = 12;
+				service.modernizationDefaultColdboxMajor = "8";
+				service.modernizationDefaultCliMajor = "6";
+				var input = { source: { engine: "lucee" }, target: { runtime: "lucee", language: "cfml", layoutProfile: "modern" }, database: { vendor: "postgres" }, outcomes: [] };
+				var first = service.normalize( input );
+				var second = service.normalize( input );
+				expect( first.input.target.runtime ).toBe( "lucee" );
+				expect( first.fingerprint ).toBe( second.fingerprint );
+				expect( first.input.schemaPack.sourceKind ).toBe( "none" );
+			} );
+
+			it( "rejects an illegal runtime/layout combination", () => {
+				var service = new app.models.services.ModernizationPolicyService();
+				service.aiLocalProvider = true;
+				service.modernizationMaxFiles = 40;
+				service.modernizationMaxOutcomes = 12;
+				expect( () => service.normalize( { target: { runtime: "lucee", language: "cfml", layoutProfile: "boxlang" } } ) ).toThrow( "ValidationException" );
+			} );
+
+			it( "requires an explicit acknowledgement for remote providers", () => {
+				var service = new app.models.services.ModernizationPolicyService();
+				service.aiLocalProvider = false;
+				service.modernizationMaxFiles = 40;
+				service.modernizationMaxOutcomes = 12;
+				expect( () => service.normalize( { privacy: { remoteProvider: true } } ) ).toThrow( "ValidationException" );
+				var normalized = service.normalize( { privacy: { remoteProvider: true, remoteEgressAcknowledged: true } } );
+				expect( normalized.input.privacy.remoteProvider ).toBeTrue();
+				expect( normalized.input.privacy.remoteEgressAcknowledged ).toBeTrue();
+			} );
+
+			it( "rejects unknown source engines and database vendors", () => {
+				var service = new app.models.services.ModernizationPolicyService();
+				service.aiLocalProvider = true;
+				service.modernizationMaxFiles = 40;
+				service.modernizationMaxOutcomes = 12;
+				expect( () => service.normalize( { source: { engine: "not-an-engine" } } ) ).toThrow( "ValidationException" );
+				expect( () => service.normalize( { database: { vendor: "not-a-database" } } ) ).toThrow( "ValidationException" );
+			} );
+
+			it( "fails closed when no enabled provider is available", () => {
+				var service = new app.models.services.ModernizationPolicyService();
+				service.aiLocalProvider = true;
+				expect( () => service.ensureProviderEnabled() ).toThrow( "ValidationException" );
+			} );
+		} );
+	}
+}

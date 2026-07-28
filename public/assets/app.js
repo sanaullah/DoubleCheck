@@ -2,6 +2,7 @@ const state = {
 	activeRun: null,
 	eventSource: null,
 	session: null,
+	capabilities: {},
 	statusPoll: null,
 	closingStream: false,
 	finishingRunId: "",
@@ -45,6 +46,22 @@ const state = {
 		findings: 0,
 		specialistCompleted: 0,
 		specialistTotal: 0
+	},
+	workspace: "review",
+	modernization: {
+		result: null,
+		activePane: "overview",
+		search: "",
+		itemType: "all",
+		validation: "all",
+		decision: "all",
+		context: "all",
+		phase: "all",
+		selectedItem: null,
+		decisions: {},
+		decisionNotes: {},
+		notice: "",
+		noticeTone: "info"
 	}
 };
 
@@ -71,7 +88,14 @@ const phaseLabels = {
 	persisting: "Saving findings",
 	completed: "Completed",
 	cancelled: "Cancelled",
-	failed: "Failed"
+	failed: "Failed",
+	"modernization-schema": "Sanitizing schema evidence",
+	"modernization-inventory": "Cataloging CFML units",
+	"modernization-signals": "Deriving coupling signals",
+	"modernization-proposal": "Generating modernization proposals",
+	"modernization-validation": "Validating proposal",
+	"modernization-repair": "Repairing invalid items",
+	"modernization-roadmap": "Assembling roadmap"
 };
 
 const eventLabels = {
@@ -89,6 +113,14 @@ const eventLabels = {
 	"run.completed": "Completed",
 	"run.cancelled": "Cancelled",
 	"run.error": "Error",
+	"modernization.schema": "Schema evidence",
+	"modernization.inventory": "Inventory",
+	"modernization.signals": "Signals",
+	"modernization.proposal.progress": "Proposal",
+	"modernization.validation": "Validation",
+	"modernization.repair": "Repair",
+	"modernization.roadmap": "Roadmap",
+	"modernization.completed": "Plan completed",
 	"stream.error": "Stream",
 	"stream.waiting": "Reconnect"
 };
@@ -115,7 +147,39 @@ const phasePipelineStage = {
 	persisting: "completion",
 	completed: "completion",
 	cancelled: "completion",
-	failed: "completion"
+	failed: "completion",
+	"modernization-schema": "architecture",
+	"modernization-inventory": "architecture",
+	"modernization-signals": "planning",
+	"modernization-proposal": "specialists",
+	"modernization-validation": "completion",
+	"modernization-repair": "completion",
+	"modernization-roadmap": "completion"
+};
+
+const pipelineLabels = {
+	review: {
+		aria: "Review pipeline",
+		stages: {
+			scan: "Repository scan",
+			architecture: "Architecture model",
+			planning: "Crew planning",
+			deterministic: "Deterministic review",
+			specialists: "Specialist analysis",
+			completion: "Validate + save"
+		}
+	},
+	modernize: {
+		aria: "Modernize pipeline",
+		stages: {
+			scan: "Repository scan",
+			architecture: "CFML inventory + schema",
+			planning: "Signals + context packs",
+			deterministic: "Evidence coverage",
+			specialists: "Proposal agents",
+			completion: "Validate + roadmap"
+		}
+	}
 };
 
 const emptyStateIcons = {
@@ -595,6 +659,14 @@ function timelineFromEvent(type, payload = {}, message = "") {
 			});
 		});
 		return;
+	}
+	const modernizationDetail = payload?.data?.detail || payload?.data || {};
+	if (type.startsWith("modernization.") && modernizationDetail) {
+		const progress = modernizationDetail.progress != null ? ` · ${modernizationDetail.progress}%` : "";
+		message = modernizationDetail.message || modernizationDetail.stage || `${friendlyEvent(type)}${progress}`;
+		if (modernizationDetail.filesScanned != null) state.commandMetrics.files = modernizationDetail.filesScanned;
+		if (modernizationDetail.unitCount != null) state.commandMetrics.findings = modernizationDetail.unitCount;
+		updateCommandMetrics();
 	}
 	if (type === "review.plan" && detail) {
 		const crewSource = detail.crewSource || "deterministic";
@@ -1339,7 +1411,7 @@ function renderSpecialistResults(result = {}) {
 						{ method: "POST", body: "{}" }
 					);
 					watchRun(payload.data);
-					loadHistory();
+					loadRuns();
 				} catch (error) {
 					button.disabled = false;
 					button.textContent = "Retry targeted follow-up";
@@ -1387,6 +1459,8 @@ const elements = {
 	presetSummary: document.querySelector("#preset-summary"),
 	advancedSummary: document.querySelector("#advanced-summary-value"),
 	readinessDetail: document.querySelector("#review-readiness-detail"),
+	readinessLabel: document.querySelector("#readiness-label"),
+	reviewGoalLabel: document.querySelector("#review-goal-label"),
 	revisionFields: document.querySelector("#revision-fields"),
 	baseRevision: document.querySelector("#base-revision"),
 	cancel: document.querySelector("#cancel-button"),
@@ -1419,6 +1493,10 @@ const elements = {
 	status: document.querySelector("#active-status"),
 	phase: document.querySelector("#active-phase"),
 	progress: document.querySelector("#active-progress"),
+	commandWorkspaceLabel: document.querySelector("#command-workspace-label"),
+	commandWorkspacePurpose: document.querySelector("#command-workspace-purpose"),
+	resultsPanel: document.querySelector("#results-panel"),
+	architectureExplorer: document.querySelector("#architecture-explorer"),
 	message: document.querySelector("#active-message"),
 	bar: document.querySelector("#progress-bar"),
 	feed: document.querySelector("#event-feed"),
@@ -1472,10 +1550,41 @@ const elements = {
 	healthDot: document.querySelector("#health-dot"),
 	healthLabel: document.querySelector("#health-label"),
 	projectId: document.querySelector("#project-id"),
-	projectPath: document.querySelector("#project-path")
-	,settingsForm: document.querySelector("#settings-form")
-	,settingsReset: document.querySelector("#settings-reset")
-	,settingsStatus: document.querySelector("#settings-status")
+	projectPath: document.querySelector("#project-path"),
+	runKind: document.querySelector("#run-kind"),
+	workspaceHint: document.querySelector("#workspace-hint"),
+	modernizationFields: document.querySelector("#modernization-fields"),
+	modernizationProvider: document.querySelector("#modernization-provider"),
+	modernizationTargetRuntime: document.querySelector("#target-runtime"),
+	modernizationTargetLanguage: document.querySelector("#target-language"),
+	modernizationLayoutProfile: document.querySelector("#layout-profile"),
+	modernizationProviderStatus: document.querySelector("#modernization-provider-status"),
+	modernizationReadiness: document.querySelector("#modernization-readiness"),
+	modernizationResults: document.querySelector("#modernization-results"),
+	modernizationOverview: document.querySelector("#modernization-overview"),
+	modernizationCoverageBanner: document.querySelector("#modernization-coverage-banner"),
+	modernizationPlanState: document.querySelector("#modernization-plan-state"),
+	modernizationExportActions: document.querySelector("#modernization-export-actions"),
+	modernizationSearch: document.querySelector("#modernization-search"),
+	modernizationItemType: document.querySelector("#modernization-item-type"),
+	modernizationValidation: document.querySelector("#modernization-validation-filter"),
+	modernizationDecision: document.querySelector("#modernization-decision-filter"),
+	modernizationContext: document.querySelector("#modernization-context-filter"),
+	modernizationPhase: document.querySelector("#modernization-phase-filter"),
+	modernizationItemDetail: document.querySelector("#modernization-item-detail"),
+	modernizationPanes: document.querySelector("#modernization-panes"),
+	modernizationSchemaSource: document.querySelector("#schema-source"),
+	modernizationSchemaFile: document.querySelector("#schema-file"),
+	modernizationSchemaFileWrap: document.querySelector("#schema-file-wrap"),
+	modernizationSchemaPathWrap: document.querySelector("#schema-path-wrap"),
+	modernizationSchemaPath: document.querySelector("#schema-path"),
+	modernizationSchemaStatus: document.querySelector("#schema-file-status"),
+	modernizationRemoteAckWrap: document.querySelector("#remote-provider-ack-wrap"),
+	modernizationRemoteAck: document.querySelector("#remote-provider-ack"),
+	startRunButton: document.querySelector("#start-run-button"),
+	settingsForm: document.querySelector("#settings-form"),
+	settingsReset: document.querySelector("#settings-reset"),
+	settingsStatus: document.querySelector("#settings-status")
 };
 
 const reviewPresets = {
@@ -1565,7 +1674,12 @@ function updateNewReviewSummary() {
 	}
 	if (elements.readinessDetail) {
 		elements.readinessDetail.textContent =
-			`${modeLabels[elements.mode?.value] || "Working tree"} · ${preset.label} · Read-only`;
+			`${modeLabels[elements.mode?.value] || "Working tree"} · ${preset.label} · ${state.workspace === "modernize" ? "Proposal only · Read-only" : "Read-only"}`;
+	}
+	if (elements.readinessLabel) {
+		elements.readinessLabel.textContent = state.workspace === "modernize"
+			? "Ready for a local modernization plan"
+			: "Ready for a local review";
 	}
 	if (elements.reviewGoalCount) {
 		elements.reviewGoalCount.textContent = `${elements.reviewGoal?.value.length || 0} / 500`;
@@ -1626,6 +1740,7 @@ async function loadSession() {
 	try {
 		const payload = await request("/api/v1/session");
 		renderSession(payload.data);
+		await loadCapabilities();
 		await loadProjects();
 		await loadRuns();
 	} catch (error) {
@@ -1634,6 +1749,39 @@ async function loadSession() {
 			elements.formMessage.dataset.tone = "danger";
 		}
 	}
+}
+
+async function loadCapabilities() {
+	try {
+		const payload = await request("/api/v1/capabilities");
+		state.capabilities = payload.data || {};
+		syncModernizationProviderToServer();
+		updateModernizationProviderDisclosure();
+	} catch (error) {
+		// Capability discovery is advisory.  Keep the conservative local defaults
+		// so a healthy Review workspace remains usable when an older server is
+		// running during a desktop upgrade.
+		state.capabilities = {};
+	}
+}
+
+// The provider used by the run is the provider configured on the local
+// server.  Keep the setup selector truthful instead of allowing a browser-only
+// choice (for example, "Ollama") to disagree with the configured remote
+// provider that the smoke endpoint and backend will actually use.
+function syncModernizationProviderToServer() {
+	const select = elements.modernizationProvider;
+	const configured = String(state.capabilities?.aiExecution?.provider || "").trim().toLowerCase();
+	if (!select || !configured) return;
+	let option = [...select.options].find((item) => item.value.toLowerCase() === configured);
+	if (!option) {
+		option = document.createElement("option");
+		option.value = configured;
+		option.textContent = `Configured provider · ${configured}`;
+		select.appendChild(option);
+	}
+	select.value = configured;
+	select.dataset.configuredProvider = configured;
 }
 
 async function loadProjects() {
@@ -1706,6 +1854,13 @@ function scopeLabel(mode = "") {
 function updatePipeline(run) {
 	if (!elements.pipelineSteps) return;
 	const status = run?.status || "Idle";
+	const kind = run?.runKind === "modernize" || (!run && state.workspace === "modernize") ? "modernize" : "review";
+	const labels = pipelineLabels[kind];
+	elements.pipelineSteps.setAttribute("aria-label", labels.aria);
+	elements.pipelineSteps.querySelectorAll("[data-pipeline-stage]").forEach((item) => {
+		const title = item.querySelector("strong");
+		if (title) title.textContent = labels.stages[item.dataset.pipelineStage] || item.dataset.pipelineStage;
+	});
 	const activeStage = phasePipelineStage[run?.currentPhase] || "scan";
 	const activeIndex = pipelineOrder.indexOf(activeStage);
 	const terminalSuccess = status === "succeeded" || status === "partial";
@@ -1771,9 +1926,30 @@ function updateCommandMetrics(run = state.activeRun) {
 }
 
 function setRun(run) {
+	const previousRunId = state.activeRun?.id || "";
 	state.activeRun = run;
+	if (run?.runKind) state.workspace = run.runKind === "modernize" ? "modernize" : "review";
+	if (run?.id && run.id !== previousRunId && run.runKind === "modernize") {
+		state.modernization.result = null;
+		state.modernization.selectedItem = null;
+		state.modernization.decisions = {};
+		state.modernization.decisionNotes = {};
+		state.modernization.notice = "";
+		state.modernization.noticeTone = "info";
+		state.modernization.context = "all";
+		state.modernization.phase = "all";
+		state.modernization.activePane = "overview";
+	}
 	const status = run?.status || "Idle";
-	elements.title.textContent = run ? `Review ${run.id.slice(0, 8)}` : "No active review";
+	const workspaceLabel = state.workspace === "modernize" ? "Modernize" : "Review";
+	if (elements.jumpFindings) elements.jumpFindings.textContent = state.workspace === "modernize" ? "View plan" : "View findings";
+	if (elements.commandExport) elements.commandExport.textContent = state.workspace === "modernize" ? "Export plan" : "Export report";
+	if (elements.cancel) elements.cancel.textContent = state.workspace === "modernize" ? "Cancel plan" : "Cancel review";
+	if (elements.commandWorkspaceLabel) elements.commandWorkspaceLabel.textContent = `${workspaceLabel} command center`;
+	if (elements.commandWorkspacePurpose) elements.commandWorkspacePurpose.textContent = state.workspace === "modernize"
+		? "Watch repository evidence, proposal roles, validation gates, and plan milestones for the active run."
+		: "Watch pipeline stages, crew progress, and live milestones for the active run.";
+	elements.title.textContent = run ? `${workspaceLabel} ${run.id.slice(0, 8)}` : `No active ${state.workspace === "modernize" ? "modernization" : "review"}`;
 	elements.status.textContent = friendlyStatus(status);
 	elements.status.dataset.status = status;
 	elements.phase.textContent = friendlyPhase(run?.currentPhase);
@@ -1792,43 +1968,53 @@ function setRun(run) {
 	}
 	if (elements.commandRunContext) {
 		elements.commandRunContext.textContent = run
-			? `${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
-			: "Start a review to monitor its pipeline and evidence.";
+			? `${run.runKind === "modernize" ? "Modernize" : "Review"} · ${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
+			: `Start a ${state.workspace === "modernize" ? "Modernize plan" : "review"} to monitor its pipeline and evidence.`;
 	}
 	updatePipeline(run);
 	updateCommandMetrics(run);
 	renderObserveIdentity();
 	if (elements.exportActions) {
-		elements.exportActions.hidden = !run || !state.terminal.has(status);
+		elements.exportActions.hidden = state.workspace === "modernize" || !run || !state.terminal.has(status);
 	}
+	if (elements.modernizationExportActions) {
+		elements.modernizationExportActions.hidden = state.workspace !== "modernize" || !run || !state.terminal.has(status);
+	}
+	if (elements.modernizationResults && state.workspace === "modernize") {
+		renderModernizationResult(state.modernization.result || {});
+	} else if (elements.modernizationResults) {
+		elements.modernizationResults.hidden = true;
+	}
+	if (elements.resultsPanel) elements.resultsPanel.hidden = state.workspace === "modernize";
+	if (elements.architectureExplorer) elements.architectureExplorer.hidden = state.workspace === "modernize";
 	document.querySelectorAll(".history-row").forEach((row) => {
 		row.classList.toggle("is-active", Boolean(run && row.dataset.runId === run.id));
 	});
 	if (elements.message) {
 		if (!run) {
-			elements.message.textContent = "Start a review to watch live progress here.";
+			elements.message.textContent = `Start a ${state.workspace === "modernize" ? "Modernize plan" : "review"} to watch live progress here.`;
 			elements.message.dataset.tone = "idle";
 		} else if (status === "failed") {
-			elements.message.textContent = run.message || "The review failed.";
+			elements.message.textContent = run.message || `The ${state.workspace === "modernize" ? "Modernize plan" : "review"} failed.`;
 			elements.message.dataset.tone = "danger";
 		} else if (status === "partial") {
-			elements.message.textContent = run.message
-				? `${run.message} Check the findings panel below for details.`
-				: "Review finished with warnings. Check the findings panel below.";
+				elements.message.textContent = run.message
+					? `${run.message} Check the ${state.workspace === "modernize" ? "plan" : "findings"} panel below for details.`
+					: `${state.workspace === "modernize" ? "Modernize plan" : "Review"} finished with warnings. Check the panel below.`;
 			elements.message.dataset.tone = "warning";
 		} else if (status === "succeeded") {
-			elements.message.textContent = run.message
-				? `${run.message} Scroll down to review findings.`
-				: "Review completed successfully. Scroll down to review findings.";
+				elements.message.textContent = run.message
+					? `${run.message} Scroll down to review the ${state.workspace === "modernize" ? "plan" : "findings"}.`
+					: `${state.workspace === "modernize" ? "Modernize plan" : "Review"} completed successfully. Scroll down to inspect the result.`;
 			elements.message.dataset.tone = "ok";
 		} else if (status === "cancelled") {
-			elements.message.textContent = run.message || "Review cancelled.";
+				elements.message.textContent = run.message || `${state.workspace === "modernize" ? "Modernize plan" : "Review"} cancelled.`;
 			elements.message.dataset.tone = "muted";
 		} else if (status === "queued") {
-			elements.message.textContent = run.message || "Waiting for a worker to pick up this review…";
+				elements.message.textContent = run.message || `Waiting for a worker to pick up this ${state.workspace === "modernize" ? "plan" : "review"}…`;
 			elements.message.dataset.tone = "info";
 		} else {
-			elements.message.textContent = run.message || "Review is in progress…";
+				elements.message.textContent = run.message || `${state.workspace === "modernize" ? "Modernize plan" : "Review"} is in progress…`;
 			elements.message.dataset.tone = "info";
 		}
 	}
@@ -1946,10 +2132,10 @@ function appendEvent(type, payload) {
 		});
 	}
 	if (type === "run.error") {
-		message = run?.message || detail?.message || "Review failed";
+		message = run?.message || detail?.message || `${state.workspace === "modernize" ? "Modernize plan" : "Review"} failed`;
 		item.classList.add("is-error");
 	}
-	if (type === "run.completed" || type === "review.completed") {
+	if (type === "run.completed" || type === "review.completed" || type === "modernization.completed") {
 		item.classList.add("is-done");
 	}
 	if (type === "stream.error" || type === "stream.waiting") {
@@ -1964,7 +2150,332 @@ function appendEvent(type, payload) {
 	timelineFromEvent(type, payload, message);
 }
 
+function modernizationItems(result = {}, pane = "") {
+	const target = result.target || {};
+	const database = result.schemaEvidence?.database || result.database || {};
+	const map = {
+		legacy: [result.inventory?.units || [], "legacy-unit"],
+		target: [(target.units || [])
+			.concat((result.unitLinks || []).map((item) => ({ ...item, itemType: item.itemType || "unit-link" })))
+			.concat((result.samples || []).map((item) => ({ ...item, itemType: item.itemType || "sample" }))), "target-unit"],
+		routes: [result.routeContracts || [], "route-contract"],
+		database: [(result.dbFindings || []).map((item) => ({ ...item, itemType: item.itemType || "db-finding" })).concat((result.dbTransitions || database.findings || []).map((item) => ({ ...item, itemType: item.itemType || "db-transition" }))), "db-finding"],
+		contexts: [(target.contexts || result.contexts || []).map((item) => ({ ...item, itemType: item.itemType || "context" })).concat((target.extracts || result.extracts || []).map((item) => ({ ...item, itemType: item.itemType || "extract" }))), "context"],
+		roadmap: [result.roadmapPhases || [], "roadmap-phase"]
+	};
+	const pair = map[pane] || [[], "item"];
+	return pair[0].map((item) => ({ ...item, _modernizationType: item.itemType || pair[1] }));
+}
+
+function modernizationItemLabel(item) {
+	return item.name || item.title || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
+}
+
+function modernizationValidationStatus(item) {
+	const value = String(item.validationStatus || item.validationLevel || item.status || "unknown").toLowerCase();
+	if (["passed", "pass", "ok", "succeeded", "valid"].includes(value)) return "valid";
+	if (["error", "failed", "fail", "blocking", "blocker"].includes(value)) return "blocking";
+	if (["warn", "warning"].includes(value)) return "warning";
+	return value;
+}
+
+function modernizationItemContext(item) {
+	const value = item.contextId || item.context || item.contextName;
+	return typeof value === "object" ? (value.id || value.name || "unassigned") : (value || "unassigned");
+}
+
+function modernizationItemPhase(item) {
+	const value = item.phase || item.phaseId || item.roadmapPhase;
+	return typeof value === "object" ? (value.id || value.name || "unassigned") : (value || "unassigned");
+}
+
+function modernizationItemMatches(item) {
+	const query = state.modernization.search.trim().toLowerCase();
+	if (state.modernization.itemType !== "all" && item._modernizationType !== state.modernization.itemType) return false;
+	const validation = modernizationValidationStatus(item);
+	if (state.modernization.validation !== "all" && validation !== state.modernization.validation) return false;
+	const key = modernizationItemKey(item);
+	const decision = String(state.modernization.decisions[key] || item.decision || "undecided").toLowerCase();
+	if (state.modernization.decision !== "all" && decision !== state.modernization.decision) return false;
+	const context = String(modernizationItemContext(item));
+	if (state.modernization.context !== "all" && context !== state.modernization.context) return false;
+	const phase = String(modernizationItemPhase(item));
+	if (state.modernization.phase !== "all" && phase !== state.modernization.phase) return false;
+	if (!query) return true;
+	return Object.values(item).some((value) => String(value || "").toLowerCase().includes(query));
+}
+
+function refreshModernizationFilterOptions(result = {}) {
+	const allItems = ["legacy", "target", "routes", "database", "contexts", "roadmap"]
+		.flatMap((pane) => modernizationItems(result, pane));
+	const optionsFor = (values, selected, fallbackLabel) => {
+		const unique = [...new Set(values.filter(Boolean).map(String))].sort((a, b) => a.localeCompare(b));
+		return [{ value: "all", label: fallbackLabel }, ...unique.map((value) => ({ value, label: value }))];
+	};
+	const apply = (select, options, selected) => {
+		if (!select) return;
+		select.innerHTML = "";
+		options.forEach((option) => {
+			const node = document.createElement("option");
+			node.value = option.value;
+			node.textContent = option.label;
+			select.appendChild(node);
+		});
+		select.value = options.some((option) => option.value === selected) ? selected : "all";
+	};
+	apply(elements.modernizationContext, optionsFor(allItems.map(modernizationItemContext), state.modernization.context, "All contexts"), state.modernization.context);
+	apply(elements.modernizationPhase, optionsFor(allItems.map(modernizationItemPhase), state.modernization.phase, "All phases"), state.modernization.phase);
+}
+
+function modernizationItemKey(item) {
+	return item.itemFingerprint || item.id || item.itemId || item.findingId || item.transitionId || modernizationItemLabel(item);
+}
+
+function modernizationItemRouteId(item) {
+	return item.id || item.itemId || item.findingId || item.transitionId || modernizationItemKey(item);
+}
+
+function modernizationEvidenceRefs(item = {}) {
+	const value = item.evidenceRefs || item.evidenceReferences || item.evidence || [];
+	if (typeof value === "string" && value.trim()) {
+		const path = item.filePath || item.path || item.sourcePath || item.sourceFile || "";
+		const startLine = Number(item.startLine || item.line || 0);
+		const endLine = Number(item.endLine || startLine || 0);
+		const range = startLine ? `:${startLine}${endLine && endLine !== startLine ? `–${endLine}` : ""}` : "";
+		return path ? [{ label: `${path}${range}`, path, startLine, endLine }] : [];
+	}
+	const refs = Array.isArray(value) ? value : (value && typeof value === "object" ? [value] : []);
+	return refs.map((ref) => {
+		if (!ref || typeof ref !== "object") return { label: String(ref || ""), path: "", startLine: 0, endLine: 0 };
+		const path = ref.filePath || ref.path || ref.sourcePath || ref.file || ref.sourceFile || "";
+		const startLine = Number(ref.startLine || ref.line || ref.lineStart || 0);
+		const endLine = Number(ref.endLine || ref.lineEnd || startLine || 0);
+		const range = startLine ? `:${startLine}${endLine && endLine !== startLine ? `–${endLine}` : ""}` : "";
+		return { label: `${path || "Immutable snapshot evidence"}${range}`, path, startLine, endLine };
+	}).filter((ref) => ref.label);
+}
+
+function renderModernizationList(container, items) {
+	container.innerHTML = "";
+	const filtered = items.filter(modernizationItemMatches);
+	if (!filtered.length) {
+		container.appendChild(emptyStateElement({ icon: "search", title: "No proposal items match", hint: "Try clearing the search or validation filter." }));
+		return;
+	}
+	filtered.forEach((item) => {
+		const card = document.createElement("button");
+		card.type = "button";
+		card.className = "modernization-item-card";
+		card.dataset.modernizationItem = modernizationItemKey(item);
+		card.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span><span class="modernization-item-decision"></span>`;
+		card.querySelector(".modernization-item-title").textContent = modernizationItemLabel(item);
+		const validation = modernizationValidationStatus(item);
+		card.querySelector(".modernization-item-meta").textContent = `${item._modernizationType} · ${validation}`;
+		const decision = state.modernization.decisions[modernizationItemKey(item)] || item.decision || "undecided";
+		card.querySelector(".modernization-item-decision").textContent = decision;
+		card.classList.toggle("is-selected", modernizationItemKey(item) === modernizationItemKey(state.modernization.selectedItem || {}));
+		container.appendChild(card);
+	});
+}
+
+function renderModernizationDetail(item) {
+	if (!elements.modernizationItemDetail) return;
+	elements.modernizationItemDetail.innerHTML = "";
+	if (!item) {
+		elements.modernizationItemDetail.appendChild(emptyStateElement({ icon: "detail", title: "Select a proposal item", hint: "Inspect evidence, then record an accept or reject decision." }));
+		return;
+	}
+	const detail = document.createElement("div");
+	detail.className = "modernization-detail-card";
+	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
+	detail.querySelector(".eyebrow").textContent = item._modernizationType || "proposal";
+	detail.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
+	detail.querySelector("h3").textContent = modernizationItemLabel(item);
+	const evidenceLinks = detail.querySelector(".modernization-evidence-links");
+	const evidenceRefs = modernizationEvidenceRefs(item);
+	if (evidenceRefs.length) {
+		evidenceRefs.forEach((ref) => {
+			const link = document.createElement("a");
+			link.className = "modernization-evidence-link";
+			link.href = "#modernization-item-detail";
+			link.textContent = ref.label;
+			link.title = "Evidence location in the immutable repository snapshot";
+			link.dataset.snapshotPath = ref.path;
+			link.dataset.snapshotStartLine = String(ref.startLine || "");
+			link.dataset.snapshotEndLine = String(ref.endLine || "");
+			evidenceLinks.appendChild(link);
+		});
+	} else {
+		evidenceLinks.textContent = "No evidence reference; this item must be marked as a new proposal or resolved before acceptance.";
+	}
+	const fields = detail.querySelector(".modernization-detail-fields");
+	Object.entries(item).forEach(([key, value]) => {
+		if (key.startsWith("_") || key === "itemFingerprint" || ["evidenceRefs", "evidenceReferences", "evidence"].includes(key) || value === null || value === undefined || value === "") return;
+		const dt = document.createElement("dt");
+		const dd = document.createElement("dd");
+		dt.textContent = key;
+		dd.textContent = typeof value === "object" ? JSON.stringify(value) : String(value);
+		fields.append(dt, dd);
+	});
+	const key = modernizationItemKey(item);
+	const decisionTypes = ["target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample"];
+	const canDecide = decisionTypes.includes(item._modernizationType);
+	if (!canDecide) {
+		const controls = detail.querySelector(".modernization-decision-controls");
+		controls.innerHTML = "<p>This evidence item is informational and does not require a human decision.</p>";
+	}
+	const prior = state.modernization.decisions[key] || item.decision || "undecided";
+	if (!canDecide) {
+		elements.modernizationItemDetail.appendChild(detail);
+		return;
+	}
+	detail.querySelector("select").value = prior;
+	detail.querySelector("textarea").value = state.modernization.decisionNotes?.[key] || item.note || "";
+	detail.querySelector(".primary-button").addEventListener("click", async () => {
+		const decision = detail.querySelector("select").value;
+		if (decision === "undecided") return;
+		await saveModernizationDecision(item, decision, detail.querySelector("textarea").value, detail.querySelector("p"));
+	});
+	detail.querySelector(".secondary-button").addEventListener("click", async () => {
+		await clearModernizationDecision(item, detail.querySelector("p"));
+	});
+	elements.modernizationItemDetail.appendChild(detail);
+}
+
+async function saveModernizationDecision(item, decision, note, statusElement) {
+	if (!state.activeRun?.id) return;
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(modernizationItemRouteId(item))}/decision`, {
+			method: "PUT",
+			body: JSON.stringify({ itemType: item._modernizationType, itemFingerprint: item.itemFingerprint || "", decision, note: String(note || "").trim() })
+		});
+		state.modernization.decisions[modernizationItemKey(item)] = decision;
+		if (!state.modernization.decisionNotes) state.modernization.decisionNotes = {};
+		state.modernization.decisionNotes[modernizationItemKey(item)] = String(note || "").trim();
+		state.modernization.notice = "";
+		if (payload?.data?.result) renderModernizationResult(payload.data.result);
+		else if (payload?.data) renderModernizationResult({ ...state.modernization.result, planState: payload.data.state?.state || state.modernization.result?.planState, decisions: payload.data.decisions || state.modernization.result?.decisions || [] });
+	if (statusElement) statusElement.textContent = "Decision saved.";
+	} catch (error) {
+		if (statusElement) statusElement.textContent = error.status === 409 ? "This proposal changed. Refreshing the result…" : error.message;
+		if (error.status === 409 && state.activeRun?.id) {
+			state.modernization.notice = "This proposal changed while you were deciding. The result was refreshed; review the current fingerprint before saving again.";
+			state.modernization.noticeTone = "warning";
+			state.modernization.decisions = {};
+			state.modernization.decisionNotes = {};
+			state.modernization.selectedItem = null;
+			await loadResult(state.activeRun.id);
+		}
+	}
+}
+
+async function clearModernizationDecision(item, statusElement) {
+	if (!state.activeRun?.id) return;
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(modernizationItemRouteId(item))}/decision`, { method: "DELETE", body: JSON.stringify({ itemType: item._modernizationType, itemFingerprint: item.itemFingerprint || "" }) });
+		delete state.modernization.decisions[modernizationItemKey(item)];
+		if (state.modernization.decisionNotes) delete state.modernization.decisionNotes[modernizationItemKey(item)];
+		state.modernization.notice = "";
+		if (payload?.data?.result) renderModernizationResult(payload.data.result);
+		else if (payload?.data) renderModernizationResult({ ...state.modernization.result, planState: payload.data.state?.state || state.modernization.result?.planState, decisions: payload.data.decisions || state.modernization.result?.decisions || [] });
+		if (statusElement) statusElement.textContent = "Decision cleared.";
+	} catch (error) {
+		if (statusElement) statusElement.textContent = error.status === 409 ? "This proposal changed. Refreshing the result…" : error.message;
+		if (error.status === 409 && state.activeRun?.id) {
+			state.modernization.notice = "This proposal changed while you were clearing a decision. The result was refreshed; review the current fingerprint.";
+			state.modernization.noticeTone = "warning";
+			state.modernization.decisions = {};
+			state.modernization.decisionNotes = {};
+			state.modernization.selectedItem = null;
+			await loadResult(state.activeRun.id);
+		}
+	}
+}
+
+function renderModernizationResult(result = {}) {
+	state.modernization.result = result;
+	refreshModernizationFilterOptions(result);
+	if (Array.isArray(result.decisions)) {
+		result.decisions.forEach((decision) => {
+			const key = decision.itemFingerprint || decision.itemId || decision.id;
+			if (key && decision.decision) state.modernization.decisions[key] = decision.decision;
+		});
+	}
+	const active = state.workspace === "modernize" || state.activeRun?.runKind === "modernize";
+	if (elements.modernizationResults) {
+		elements.modernizationResults.hidden = !active;
+		elements.modernizationResults.dataset.state = active ? "active" : "idle";
+	}
+	if (!active) return;
+	if (document.querySelector("#results-panel")) document.querySelector("#results-panel").dataset.state = "idle";
+	const hasResult = !!result && Object.keys(result).length > 0;
+	if (!state.activeRun && !hasResult) {
+		if (elements.modernizationPlanState) {
+			elements.modernizationPlanState.textContent = "No plan";
+			elements.modernizationPlanState.dataset.state = "idle";
+		}
+		if (elements.modernizationOverview) {
+			elements.modernizationOverview.innerHTML = emptyStateHtml({ icon: "inbox", title: "No Modernize plan selected", hint: "Complete a Modernize run or open one from history to inspect its evidence and decisions." });
+		}
+		if (elements.modernizationCoverageBanner) {
+			elements.modernizationCoverageBanner.hidden = true;
+			elements.modernizationCoverageBanner.textContent = "";
+		}
+		if (elements.modernizationExportActions) elements.modernizationExportActions.hidden = true;
+		if (elements.modernizationItemDetail) {
+			elements.modernizationItemDetail.innerHTML = "";
+			elements.modernizationItemDetail.appendChild(emptyStateElement({ icon: "detail", title: "Select a proposal item", hint: "A completed plan will show immutable evidence here." }));
+		}
+		return;
+	}
+	const coverage = result.coverage || {};
+	const validation = result.validation || {};
+	const runStatus = state.activeRun?.status || "";
+	const planState = result.planState || result.state || (runStatus === "succeeded" || runStatus === "partial" ? "needs-review" : runStatus || "queued");
+	if (elements.modernizationPlanState) {
+		elements.modernizationPlanState.textContent = planState;
+		elements.modernizationPlanState.dataset.state = planState;
+	}
+	if (elements.modernizationOverview) {
+		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Legacy units</span><strong>${(result.inventory?.units || []).length}</strong></div><div><span>Target units</span><strong>${(result.target?.units || []).length}</strong></div><div><span>Routes</span><strong>${(result.routeContracts || []).length}</strong></div><div><span>DB findings</span><strong>${(result.dbFindings || []).length}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div>`;
+		const queuedSummary = runStatus === "queued" ? "Modernize is queued; the plan will appear after the shared repository scan." : runStatus === "running" ? "Modernize is building an evidence-backed plan. Proposal items will appear as stages complete." : runStatus === "failed" ? (state.activeRun?.message || "Modernize could not generate a plan.") : runStatus === "cancelled" ? "Modernize was cancelled before a complete plan was generated." : runStatus === "partial" ? "A partial Modernize plan was retained with review gates." : "Modernization proposal is ready for review.";
+		elements.modernizationOverview.querySelector(".result-summary").textContent = result.summary || queuedSummary;
+		const notice = elements.modernizationOverview.querySelector(".modernization-notice");
+		if (notice) {
+			notice.textContent = state.modernization.notice;
+			notice.dataset.tone = state.modernization.noticeTone || "info";
+		}
+	}
+	if (elements.modernizationCoverageBanner) {
+		const bannerText = Array.isArray(coverage.banners) ? coverage.banners.join(" ") : "";
+		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "");
+		elements.modernizationCoverageBanner.hidden = !note;
+		elements.modernizationCoverageBanner.textContent = note;
+	}
+	const paneRows = {
+		legacy: modernizationItems(result, "legacy"), target: modernizationItems(result, "target"), routes: modernizationItems(result, "routes"), database: modernizationItems(result, "database"), contexts: modernizationItems(result, "contexts"), roadmap: modernizationItems(result, "roadmap")
+	};
+	Object.entries(paneRows).forEach(([pane, rows]) => {
+		const element = document.querySelector(`#modernization-pane-${pane}`);
+		if (element) renderModernizationList(element, rows);
+	});
+	const validationPane = document.querySelector("#modernization-pane-validation");
+	if (validationPane) {
+		validationPane.innerHTML = `<div class="modernization-validation-summary"><strong>${validation.status || validation.overallStatus || "unknown"}</strong><span>${validation.blockingCount || validation.blockers || 0} blocking · ${validation.warningCount || validation.warnings || 0} warnings</span></div>`;
+		renderModernizationList(validationPane, (validation.items || validation.messages || []).map((item) => ({ ...item, _modernizationType: item.itemType || "validation" })));
+	}
+	const overviewPane = document.querySelector("#modernization-pane-overview");
+	if (overviewPane) overviewPane.innerHTML = `<p>${result.assumptions?.length || 0} assumptions · ${(result.signals || []).length} coupling signals · ${(result.samples || []).length} bounded samples</p><p class="field-hint">Every proposal item should point back to an evidence reference or be marked as a new proposal.</p>`;
+	const selected = state.modernization.selectedItem;
+	if (selected) renderModernizationDetail(selected);
+	if (elements.modernizationExportActions) elements.modernizationExportActions.hidden = !state.terminal.has(state.activeRun?.status || "");
+}
+
 function renderResult(result = {}) {
+	if (state.workspace === "modernize" || state.activeRun?.runKind === "modernize") {
+		renderModernizationResult(result);
+		return;
+	}
 	const scope = result.reviewScope || "";
 	const unavailable = scope === "working-tree-unavailable" || scope === "revision-diff-unavailable";
 	const hasPayload = !!(
@@ -2893,7 +3404,11 @@ function openEventStream(run, afterSequence = 0) {
 		"review.graph", "review.plan", "review.specialist.progress",
 		"review.specialist.observe", "review.specialists",
 		"review.findings", "review.completed", "run.completed",
-		"run.cancelled", "run.error"
+		"run.cancelled", "run.error", "modernization.schema",
+		"modernization.inventory", "modernization.signals",
+		"modernization.proposal.progress", "modernization.validation",
+		"modernization.repair", "modernization.roadmap",
+		"modernization.completed"
 	];
 	eventTypes.forEach((type) => source.addEventListener(type, (event) => {
 		try {
@@ -2954,7 +3469,7 @@ async function loadRuns() {
 	state.history.loading = true;
 	elements.history.innerHTML = `<tr><td colspan="8">${emptyStateHtml({
 		icon: "history",
-		title: "Loading review history…",
+		title: "Loading run history…",
 		hint: "Fetching recent runs from the local database."
 	})}</td></tr>`;
 	try {
@@ -2968,16 +3483,18 @@ async function loadRuns() {
 			? ""
 			: `<tr><td colspan="8">${emptyStateHtml({
 				icon: hasHistoryFilters() ? "search" : "history",
-				title: hasHistoryFilters() ? "No reviews match these filters" : "No runs yet",
+				title: hasHistoryFilters() ? "No runs match these filters" : "No runs yet",
 				hint: hasHistoryFilters()
 					? "Clear filters or broaden the date range."
-					: "Start a local review above — completed runs appear here."
+					: "Start a local Review or Modernize run above — completed runs appear here."
 			})}</td></tr>`;
 		renderHistoryTrends(meta.trends || {});
 		renderHistoryPagination(meta);
 		rows.forEach((item) => {
 			const run = item.run || {};
 			const metrics = item.metrics || {};
+			const modernization = item.modernization || metrics.modernization || {};
+			const isModernize = String(run.runKind || "review").toLowerCase() === "modernize";
 			const row = document.createElement("tr");
 			row.className = "history-row";
 			if (state.activeRun?.id === run.id) {
@@ -3003,13 +3520,25 @@ async function loadRuns() {
 			`;
 			row.querySelector(".repo").textContent = run.projectPath;
 			row.querySelector(".repo").title = run.projectPath || "";
-			row.querySelector(".mode").textContent = scopeLabel(run.mode);
+			row.querySelector(".mode").textContent = `${isModernize ? "Modernize" : "Review"} · ${scopeLabel(run.mode)}`;
 			const badge = row.querySelector(".status-badge");
 			badge.textContent = friendlyStatus(run.status);
 			badge.classList.add(run.status);
 			badge.title = run.message || run.status;
-			renderHistorySeverity(row.querySelector(".history-severity"), metrics.findings || {});
-			renderHistorySpecialists(row.querySelector(".history-specialists"), metrics.specialists || {});
+			if (isModernize) {
+				const planState = modernization.planState || modernization.state || "needs-review";
+				const validation = modernization.validationStatus || modernization.validation?.status || "pending";
+				const severity = row.querySelector(".history-severity");
+				severity.textContent = `Plan · ${planState}`;
+				severity.title = `Modernize plan state: ${planState}`;
+				const specialists = row.querySelector(".history-specialists");
+				specialists.textContent = `Validation · ${validation}`;
+				specialists.title = "Modernize validation summary";
+				row.querySelector(".history-compare").hidden = true;
+			} else {
+				renderHistorySeverity(row.querySelector(".history-severity"), metrics.findings || {});
+				renderHistorySpecialists(row.querySelector(".history-specialists"), metrics.specialists || {});
+			}
 			renderHistoryExecution(row.querySelector(".history-execution"), metrics);
 			row.querySelector(".created").textContent = new Date(run.createdAt).toLocaleString();
 			const open = () => watchRun(run);
@@ -3033,7 +3562,7 @@ async function loadRuns() {
 						{ method: "POST", body: "{}" }
 					);
 					watchRun(payload.data);
-					loadHistory();
+					loadRuns();
 				} catch (error) {
 					button.disabled = false;
 					button.textContent = "Rerun";
@@ -3376,8 +3905,166 @@ elements.settingsReset?.addEventListener("click", () => {
 	applyLocalSettings();
 });
 
+function setModernizationWorkspace(kind) {
+	const modernize = kind === "modernize";
+	state.workspace = modernize ? "modernize" : "review";
+	if (elements.commandWorkspaceLabel) elements.commandWorkspaceLabel.textContent = `${modernize ? "Modernize" : "Review"} command center`;
+	if (elements.commandWorkspacePurpose) elements.commandWorkspacePurpose.textContent = modernize
+		? "Watch repository evidence, proposal roles, validation gates, and plan milestones for the active run."
+		: "Watch pipeline stages, crew progress, and live milestones for the active run.";
+	if (elements.modernizationFields) elements.modernizationFields.hidden = !modernize;
+	if (elements.modernizationResults) elements.modernizationResults.hidden = !modernize;
+	if (elements.workspaceHint) elements.workspaceHint.textContent = modernize
+		? "Modernize builds a reviewable migration plan from CFML evidence; it never writes source files."
+		: "Review produces evidence-backed findings and optional specialist analysis.";
+	const modeLabel = document.querySelector("#run-mode-label");
+	if (modeLabel) modeLabel.textContent = modernize ? "Modernize scope" : "Review mode";
+	if (elements.startRunButton) elements.startRunButton.textContent = modernize ? "Start modernization plan" : "Start code review";
+	if (elements.reviewGoalLabel) elements.reviewGoalLabel.firstChild.textContent = modernize ? "Modernization goal " : "Review goal ";
+	if (elements.jumpFindings) elements.jumpFindings.textContent = modernize ? "View plan" : "View findings";
+	if (elements.commandExport) elements.commandExport.textContent = modernize ? "Export plan" : "Export report";
+	if (elements.cancel) elements.cancel.textContent = modernize ? "Cancel plan" : "Cancel review";
+	if (!state.activeRun && elements.title) elements.title.textContent = modernize ? "No active modernization" : "No active review";
+	if (elements.modernizationExportActions) elements.modernizationExportActions.hidden = !modernize || !state.terminal.has(state.activeRun?.status || "");
+	if (elements.exportActions) elements.exportActions.hidden = modernize || !state.activeRun || !state.terminal.has(state.activeRun.status);
+	if (elements.resultsPanel) elements.resultsPanel.hidden = modernize;
+	if (elements.architectureExplorer) elements.architectureExplorer.hidden = modernize;
+	if (modernize) updateModernizationSchemaFields();
+	updateNewReviewSummary();
+	updatePipeline(state.activeRun);
+}
+
+function updateModernizationSchemaFields() {
+	const source = elements.modernizationSchemaSource?.value || "none";
+	if (elements.modernizationSchemaFileWrap) elements.modernizationSchemaFileWrap.hidden = source !== "attached-dump";
+	if (elements.modernizationSchemaPathWrap) elements.modernizationSchemaPathWrap.hidden = source !== "repo-path";
+}
+
+function updateModernizationTargetProfiles() {
+	const runtime = elements.modernizationTargetRuntime?.value || "lucee-modern";
+	const profiles = window.DoubleCheckModernization?.allowedProfiles(runtime) || [];
+	if (!profiles.length) return;
+	const languages = [...new Set(profiles.map((profile) => profile.targetLanguage))];
+	const layouts = [...new Set(profiles.map((profile) => profile.layoutProfile))];
+	const labels = { boxlang: "BoxLang app/ + public/", modern: "ColdBox app/ + public/", flat: "Flat repository layout" };
+	const replaceOptions = (select, values, preferred) => {
+		if (!select) return;
+		const prior = select.value;
+		select.innerHTML = "";
+		values.forEach((value) => {
+			const option = document.createElement("option");
+			option.value = value;
+			option.textContent = labels[value] || value;
+			select.appendChild(option);
+		});
+		select.value = values.includes(prior) ? prior : (values.includes(preferred) ? preferred : values[0]);
+	};
+	replaceOptions(elements.modernizationTargetLanguage, languages, languages[0]);
+	replaceOptions(elements.modernizationLayoutProfile, layouts, "modern");
+}
+
+function updateModernizationProviderDisclosure() {
+	const configured = String(elements.modernizationProvider?.dataset?.configuredProvider || "").toLowerCase();
+	if (configured && elements.modernizationProvider && elements.modernizationProvider.value.toLowerCase() !== configured) {
+		elements.modernizationProvider.value = configured;
+	}
+	const provider = String(elements.modernizationProvider?.value || "").toLowerCase();
+	const remote = provider && provider !== "ollama" && provider !== "docker";
+	if (elements.modernizationRemoteAckWrap) elements.modernizationRemoteAckWrap.hidden = !remote;
+	if (elements.modernizationProviderStatus) {
+		elements.modernizationProviderStatus.textContent = remote ? "Remote acknowledgement required" : "Local provider";
+		elements.modernizationProviderStatus.dataset.state = remote ? "warning" : "ok";
+	}
+	if (remote && elements.modernizationReadiness) {
+		elements.modernizationReadiness.textContent = "Run a provider smoke check before starting a remote proposal.";
+		elements.modernizationReadiness.dataset.tone = "warning";
+	}
+}
+
+function readModernizationSchemaFile(file) {
+	if (!file) return Promise.resolve({ text: "", fileName: "" });
+	const limit = Number(state.capabilities?.modernization?.maxSchemaAttachmentBytes || state.capabilities?.maxSchemaAttachmentBytes || 2 * 1024 * 1024);
+	if (file.size > limit) return Promise.reject(new Error("Schema attachment exceeds the 2 MB local limit."));
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve({ text: String(reader.result || ""), fileName: file.name || "" });
+		reader.onerror = () => reject(new Error("Unable to read the schema attachment locally."));
+		reader.readAsText(file);
+	});
+}
+
+async function smokeModernizationProvider() {
+	if (!elements.modernizationProviderStatus) return { status: "unknown" };
+	elements.modernizationProviderStatus.textContent = "Checking provider…";
+	elements.modernizationProviderStatus.dataset.state = "pending";
+	try {
+		const payload = await request("/api/v1/ai/smoke");
+		const success = payload?.data?.success !== false;
+		elements.modernizationProviderStatus.textContent = success ? "Provider ready" : "Provider unavailable";
+		elements.modernizationProviderStatus.dataset.state = success ? "ok" : "danger";
+		return { status: success ? "succeeded" : "failed", message: payload?.data?.message || "Provider smoke check failed." };
+	} catch (error) {
+		elements.modernizationProviderStatus.textContent = "Provider unavailable";
+		elements.modernizationProviderStatus.dataset.state = "danger";
+		return { status: "failed", message: error.message };
+	}
+}
+
+async function submitModernization() {
+	const formData = new FormData(elements.form);
+	const values = Object.fromEntries(formData.entries());
+	values.allowedRole = formData.getAll("allowedRole");
+	const file = elements.modernizationSchemaFile?.files?.[0];
+	try {
+		const attachment = await readModernizationSchemaFile(file);
+		values.schemaText = attachment.text;
+		values.schemaFileName = attachment.fileName;
+		const contract = window.DoubleCheckModernization;
+		const capabilityInput = {
+			...(state.capabilities?.modernization || {}),
+			...state.capabilities,
+			defaultProvider: values.provider,
+			providerRequired: true
+		};
+		const requestBody = contract
+			? contract.normalizeModernizationRequest(values, capabilityInput)
+			: { runKind: "modernize", projectPath: values.projectPath, mode: values.mode, modernization: values };
+		const smoke = await smokeModernizationProvider();
+		const readiness = contract
+			? contract.modernizationReadiness(requestBody, capabilityInput, smoke)
+			: { ready: smoke.status !== "failed", errors: smoke.status === "failed" ? [smoke.message] : [], warnings: [] };
+		if (!readiness.ready) {
+			elements.modernizationReadiness.textContent = readiness.errors.join(" ");
+			elements.modernizationReadiness.dataset.tone = "danger";
+			return;
+		}
+		elements.modernizationReadiness.textContent = readiness.warnings.join(" ");
+		const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(requestBody) });
+		watchRun(payload.data);
+		loadRuns();
+	} catch (error) {
+		elements.formMessage.textContent = error.message;
+		elements.formMessage.dataset.tone = "danger";
+	}
+}
+
+elements.runKind?.addEventListener("change", (event) => setModernizationWorkspace(event.target.value));
+elements.modernizationProvider?.addEventListener("change", updateModernizationProviderDisclosure);
+elements.modernizationTargetRuntime?.addEventListener("change", () => {
+	updateModernizationTargetProfiles();
+});
+elements.modernizationSchemaSource?.addEventListener("change", updateModernizationSchemaFields);
+elements.modernizationSchemaFile?.addEventListener("change", () => {
+		const file = elements.modernizationSchemaFile.files?.[0];
+		if (elements.modernizationSchemaStatus) elements.modernizationSchemaStatus.textContent = file ? `${file.name} selected · read locally on submit` : "Schema input is optional. Missing schema remains visible as inference-limited coverage.";
+});
+
 elements.form?.addEventListener("submit", async (event) => {
 	event.preventDefault();
+	if (state.workspace === "modernize") {
+		await submitModernization();
+		return;
+	}
 	elements.formMessage.textContent = "";
 	const formData = new FormData(elements.form);
 	const body = Object.fromEntries(formData);
@@ -3614,7 +4301,7 @@ async function downloadExport(format) {
 	if (!state.activeRun) return;
 	try {
 		const response = await fetch(
-			`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/export?exportFormat=${encodeURIComponent(format)}`
+			`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/export?format=${encodeURIComponent(format)}`
 		);
 		if (!response.ok) {
 			const payload = await response.json().catch(() => ({}));
@@ -3643,9 +4330,90 @@ elements.exportActions?.addEventListener("click", (event) => {
 	downloadExport(button.dataset.exportFormat);
 });
 
+function selectModernizationPane(paneName, { focus = false } = {}) {
+	const pane = String(paneName || "overview");
+	state.modernization.activePane = pane;
+	const tabs = elements.modernizationPanes?.querySelectorAll("[data-modern-pane]") || [];
+	tabs.forEach((button) => {
+		const selected = button.dataset.modernPane === pane;
+		button.setAttribute("aria-selected", selected ? "true" : "false");
+		button.setAttribute("tabindex", selected ? "0" : "-1");
+		if (selected && focus) button.focus();
+	});
+	document.querySelectorAll("[data-modernization-pane]").forEach((panel) => {
+		const selected = panel.dataset.modernizationPane === pane;
+		panel.hidden = !selected;
+		panel.setAttribute("aria-hidden", selected ? "false" : "true");
+	});
+}
+
+elements.modernizationResults?.addEventListener("click", (event) => {
+	const tab = event.target.closest("[data-modern-pane]");
+	if (tab) {
+		selectModernizationPane(tab.dataset.modernPane, { focus: false });
+		return;
+	}
+	const itemButton = event.target.closest("[data-modernization-item]");
+	if (!itemButton || !state.modernization.result) return;
+	const rows = modernizationItems(state.modernization.result, state.modernization.activePane);
+	state.modernization.selectedItem = rows.find((item) => modernizationItemKey(item) === itemButton.dataset.modernizationItem) || null;
+	renderModernizationList(document.querySelector(`#modernization-pane-${state.modernization.activePane}`), rows);
+	renderModernizationDetail(state.modernization.selectedItem);
+});
+
+elements.modernizationResults?.addEventListener("keydown", (event) => {
+	const tab = event.target.closest("[data-modern-pane]");
+	if (!tab) return;
+	const tabs = [...elements.modernizationPanes.querySelectorAll("[data-modern-pane]")];
+	const index = tabs.indexOf(tab);
+	if (index < 0) return;
+	let next = index;
+	if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % tabs.length;
+	else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + tabs.length) % tabs.length;
+	else if (event.key === "Home") next = 0;
+	else if (event.key === "End") next = tabs.length - 1;
+	else return;
+	event.preventDefault();
+	selectModernizationPane(tabs[next].dataset.modernPane, { focus: true });
+});
+
+elements.modernizationSearch?.addEventListener("input", (event) => {
+	state.modernization.search = event.target.value || "";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationItemType?.addEventListener("change", (event) => {
+	state.modernization.itemType = event.target.value || "all";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationValidation?.addEventListener("change", (event) => {
+	state.modernization.validation = event.target.value || "all";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationDecision?.addEventListener("change", (event) => {
+	state.modernization.decision = event.target.value || "all";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationContext?.addEventListener("change", (event) => {
+	state.modernization.context = event.target.value || "all";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationPhase?.addEventListener("change", (event) => {
+	state.modernization.phase = event.target.value || "all";
+	renderModernizationResult(state.modernization.result || {});
+});
+elements.modernizationExportActions?.addEventListener("click", (event) => {
+	const button = event.target.closest("[data-modernization-export-format]");
+	if (!button) return;
+	downloadExport(button.dataset.modernizationExportFormat);
+});
+
 loadHealth();
 applyLocalSettings();
 loadSession();
 renderResult();
+setModernizationWorkspace(elements.runKind?.value || "review");
+selectModernizationPane(state.modernization.activePane);
+updateModernizationProviderDisclosure();
+updateModernizationTargetProfiles();
 updateRevisionFields();
 updateNewReviewSummary();

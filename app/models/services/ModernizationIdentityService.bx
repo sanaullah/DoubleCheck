@@ -1,0 +1,71 @@
+/**
+ * Deterministic identity helpers shared by modernization persistence and UI.
+ * IDs are deliberately opaque lowercase SHA-256 values so generated artifacts
+ * can be compared without exposing source text in the identifier.
+ */
+@singleton
+class {
+	string function itemId( required string kind, required any identity ) {
+		return stableHash( lCase( trim( arguments.kind ) ) & "|" & canonical( arguments.identity, true ) );
+	}
+
+	string function itemFingerprint( required string kind, required any item ) {
+		return stableHash( lCase( trim( arguments.kind ) ) & "|" & canonical( arguments.item, false ) );
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+
+	/**
+	 * Canonical JSON-like representation. Identity paths are normalized so
+	 * slash/case differences do not create duplicate IDs; fingerprints retain
+	 * content while still normalizing object key order.
+	 */
+	private string function canonical( required any value, boolean pathAware = false ) {
+		if ( isNull( arguments.value ) ) {
+			return "null";
+		}
+		if ( isStruct( arguments.value ) ) {
+			var keys = structKeyArray( arguments.value );
+			arraySort( keys, "textnocase" );
+			var output = "{";
+			for ( var key in keys ) {
+				var child = arguments.value[ key ];
+				var normalized = child;
+				if ( arguments.pathAware && isSimpleValue( child ) && ( findNoCase( "path", key ) || findNoCase( "file", key ) ) ) {
+					normalized = normalizePath( toString( child ) );
+				}
+				output &= lCase( key ) & ":" & canonical( normalized, arguments.pathAware ) & ";";
+			}
+			return output & "}";
+		}
+		if ( isArray( arguments.value ) ) {
+			var arrayOutput = "[";
+			for ( var entry in arguments.value ) {
+				arrayOutput &= canonical( entry, arguments.pathAware ) & ";";
+			}
+			return arrayOutput & "]";
+		}
+		if ( isBoolean( arguments.value ) ) {
+			return arguments.value ? "true" : "false";
+		}
+		return canonicalScalar( arguments.value, arguments.pathAware );
+	}
+
+	private string function canonicalScalar( required any value, boolean pathAware = false ) {
+		var text = toString( arguments.value );
+		return jsonSerialize( text );
+	}
+
+	private string function normalizePath( required string path ) {
+		var result = replace( trim( arguments.path ), char( 92 ), "/", "all" );
+		while ( find( "//", result ) ) {
+			result = replace( result, "//", "/", "all" );
+		}
+		if ( len( result ) > 2 && right( result, 1 ) == "/" ) {
+			result = left( result, len( result ) - 1 );
+		}
+		return lCase( result );
+	}
+}

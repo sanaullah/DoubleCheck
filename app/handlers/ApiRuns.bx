@@ -13,6 +13,10 @@ class extends="coldbox.system.RestHandler" {
 
 	property name="reportExportService" inject="ReportExportService";
 
+	property name="modernizationExportService" inject="ModernizationExportService";
+
+	property name="modernizationDecisionService" inject="ModernizationDecisionService";
+
 	property name="observabilityTraceService" inject="ObservabilityTraceService";
 
 	property name="pollInterval" inject="coldbox:setting:runEventPollInterval";
@@ -107,6 +111,15 @@ class extends="coldbox.system.RestHandler" {
 				);
 		} catch ("ValidationException" error) {
 			validationError( event, error.message );
+		} catch ("ModernizationSchemaPackInputException" error) {
+			validationError( event, error.message );
+		} catch ("ModernizationSchemaPackLimitException" error) {
+			validationError( event, error.message );
+		} catch ("AIConfigurationException" error) {
+			// Modernize is explicitly provider-gated. Surface a client error at
+			// creation time instead of allowing a disabled provider to become a
+			// queued run that can never produce a plan.
+			validationError( event, error.message );
 		}
 	}
 
@@ -180,6 +193,44 @@ class extends="coldbox.system.RestHandler" {
 			);
 	}
 
+	function updateModernizationDecision( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) body = {};
+			var decision = modernizationDecisionService.decide( run, rc.itemId ?: "", body, prc.securityContext );
+			decision.result = runService.getResult( run.getId() );
+			event.renderData( type = "json", data = { data: decision } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	function clearModernizationDecision( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+				var body = event.getHTTPContent( json = true );
+				if ( !isStruct( body ) ) body = {};
+				if ( !len( trim( body.itemType ?: rc.itemType ?: "" ) ) ) body.itemType = rc.itemType ?: "";
+				if ( !len( trim( body.itemFingerprint ?: rc.itemFingerprint ?: "" ) ) ) body.itemFingerprint = rc.itemFingerprint ?: "";
+				var cleared = modernizationDecisionService.clear( run, rc.itemId ?: "", body, prc.securityContext );
+			cleared.result = runService.getResult( run.getId() );
+			event.renderData( type = "json", data = { data: cleared } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
 	function updateFindingReview( event, rc, prc ) {
 		var run = runService.getScoped(
 				rc.id ?: "",
@@ -228,23 +279,24 @@ class extends="coldbox.system.RestHandler" {
 			return notFound( event );
 		}
 		try {
-			var report = reportExportService.export(
-					run.getMemento(),
-					runService.getResult( run.getId() ),
-					rc.exportFormat ?: ( rc.format ?: "markdown" )
-				);
+			var report = lCase( run.getRunKind() ?: "review" ) == "modernize"
+				? modernizationExportService.export( run.getMemento(), runService.getResult( run.getId() ), rc.exportFormat ?: ( rc.format ?: "markdown" ) )
+				: reportExportService.export( run.getMemento(), runService.getResult( run.getId() ), rc.exportFormat ?: ( rc.format ?: "markdown" ) );
 			structDelete( rc, "format" );
+			event.renderData(
+					type       = "plain",
+					data       = report.content,
+					statusCode = 200
+				);
+			// renderData establishes a default text/plain content type.  Apply the
+			// export headers afterwards so JSON/SARIF and attachment metadata survive
+			// ColdBox's renderer normalization.
 			event.setHTTPHeader(
 					name  = "Content-Disposition",
 					value = "attachment; filename=""#report.fileName#"""
 				);
 			event.setHTTPHeader( name = "X-DoubleCheck-Export-Format", value = report.format );
 			event.setHTTPHeader( name = "Content-Type", value = report.contentType );
-			event.renderData(
-					type       = "plain",
-					data       = report.content,
-					statusCode = 200
-				);
 		} catch ("ValidationException" error) {
 			validationError( event, error.message );
 		}

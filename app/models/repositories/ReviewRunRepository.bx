@@ -12,15 +12,17 @@ class {
 		record.projectId = record.projectId ?: "default";
 		record.policyJson = jsonSerialize( record.policy ?: {} );
 		record.budgetsJson = jsonSerialize( record.budgets ?: {} );
+		record.runKind = lCase( trim( record.runKind ?: "review" ) );
+		record.inputJson = jsonSerialize( record.input ?: {} );
 		record.sourceRunId = record.sourceRunId ?: "";
 		queryExecute(
 			"
 				INSERT INTO review_runs (
-					id, tenant_id, project_id, project_path, mode, base_revision, head_revision,
+					id, tenant_id, project_id, project_path, mode, run_kind, input_json, base_revision, head_revision,
 					status, progress, current_phase,
 					message, policy_json, budgets_json, source_run_id, created_at, updated_at
 				) VALUES (
-					:id, :tenantId, :projectId, :projectPath, :mode, :baseRevision, :headRevision,
+					:id, :tenantId, :projectId, :projectPath, :mode, :runKind, :inputJson, :baseRevision, :headRevision,
 					:status, :progress, :currentPhase,
 					:message, :policyJson, :budgetsJson, :sourceRunId, :createdAt, :updatedAt
 				)
@@ -38,6 +40,11 @@ class {
 			{ datasource: datasource }
 		);
 		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
+	}
+
+	/** Remove a just-created run when its companion modernization snapshot cannot be persisted. */
+	void function delete( required string id ) {
+		queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: arguments.id }, { datasource: datasource } );
 	}
 
 	any function findScoped( required string id, required string tenantId, string projectId = "" ) {
@@ -299,6 +306,7 @@ class {
 				INNER JOIN review_summaries s ON s.run_id = r.id
 				WHERE r.project_path = :projectPath
 					AND r.mode = :mode
+					AND COALESCE( r.run_kind, 'review' ) = 'review'
 					AND ( :tenantId = '' OR r.tenant_id = :tenantId )
 					AND ( :projectId = '' OR r.project_id = :projectId )
 					AND r.status IN ( 'succeeded', 'partial' )
@@ -328,6 +336,8 @@ class {
 				projectId   : record.project_id[ row ],
 				projectPath : record.project_path[ row ],
 				mode        : record.mode[ row ],
+				runKind     : nullableColumn( record, "run_kind", row ) ?: "review",
+				input       : parseJsonColumn( record, "input_json", row, {} ),
 				baseRevision: nullableColumn(
 					record,
 					"base_revision",
@@ -372,7 +382,21 @@ class {
 	}
 
 	private any function nullableColumn( required query record, required string column, required numeric row ) {
-		return isNull( record[ column ][ row ] ) ? "" : record[ column ][ row ];
+		try {
+			return isNull( record[ column ][ row ] ) ? "" : record[ column ][ row ];
+		} catch (any ignored) {
+			return "";
+		}
+	}
+
+	private struct function parseJsonColumn( required query record, required string column, required numeric row, struct fallback = {} ) {
+		try {
+			if ( isNull( arguments.record[ arguments.column ][ arguments.row ] ) ) return duplicate( arguments.fallback );
+			var parsed = jsonDeserialize( arguments.record[ arguments.column ][ arguments.row ] );
+			return isStruct( parsed ) ? parsed : duplicate( arguments.fallback );
+		} catch (any ignored) {
+			return duplicate( arguments.fallback );
+		}
 	}
 
 	private string function timestamp() {

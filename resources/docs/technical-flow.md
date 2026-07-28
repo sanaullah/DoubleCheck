@@ -1,7 +1,8 @@
 # DoubleCheck — technical implementation & project flow
 
-Local desktop review helper for **BoxLang, ColdFusion, JavaScript, and Java**.
-Analysis and SQLite run on the developer’s machine. LLM specialists are optional.
+Local desktop review and modernization helper for **BoxLang, ColdFusion,
+JavaScript, and Java**. Analysis and SQLite run on the developer’s machine.
+LLM specialists are optional for Review; Modernize requires an enabled provider.
 
 This document describes how the system is wired. Install and product summary live in
 [`readme.md`](../../readme.md). OpenAPI lives under [`resources/apidocs/`](../apidocs/).
@@ -156,12 +157,13 @@ Defined in `app/config/Router.bx`.
 | GET | `/api/v1/projects` | ApiProjects | Local project list |
 | GET | `/api/v1/workers` | ApiWorkers | Worker registry |
 | GET | `/api/v1/quality` | ApiQuality | Seeded evaluation gate |
-| GET | `/api/v1/history` | ApiHistory | Review history |
+| GET | `/api/v1/history` | ApiHistory | Review + Modernize history (`runKind` filter) |
 | GET/POST | `/api/v1/runs` | ApiRuns | List / **create run** |
 | GET/DELETE | `/api/v1/runs/:id` | ApiRuns | Status / cancel |
 | GET | `/api/v1/runs/:id/events` | ApiRuns | **SSE** progress stream |
 | GET | `/api/v1/runs/:id/result` | ApiRuns | Final payload |
-| GET | `/api/v1/runs/:id/export` | ApiRuns | Markdown / JSON / SARIF |
+| GET | `/api/v1/runs/:id/export` | ApiRuns | Review: Markdown / JSON / SARIF; Modernize: Markdown / JSON |
+| PUT/DELETE | `/api/v1/runs/:id/modernization/items/:itemId/decision` | ApiRuns | Accept, reject, or clear a Modernize decision |
 | GET | `/api/v1/ai/smoke` | ApiAI | Provider smoke test |
 
 UI create path: `app.js` → `POST /api/v1/runs` → open SSE on `/events`.
@@ -228,7 +230,7 @@ Recent pipeline tightening (see
 | **Specialist prompt v3** | `SpecialistAgentFactory` uses `specialist-prompt-v3`. CFML conventions get equal-weight defects + incremental modernization assist (never assume ColdBox; not a rewrite). BoxLang conventions stay framework-contract focused. Other roles do not receive CF modernization paragraphs. Capabilities label: `specialistCfmlDepth=cfml-conventions-llm-v2`. |
 | **Deterministic convention briefs** | When LLM crew planning is off, `ReviewPlannerService.briefForRole` fills `cfml-conventions` / `boxlang-conventions` briefs with up to five matching paths (preferring `changedLines`) plus a short reminder. |
 | **Emphasized CF/BX packs** | Emphasized admissions for convention roles prefer files with `changedLines` and build ranges around those windows (same before/after/`maxLinesPerRange` clamps as context packs), falling back to the file head only when Git supplies no changed lines. |
-| **CF guidance playbooks** | `RulePlaybookCatalog` includes small `modernization/…` and `cfml/evaluate-dynamic` playbooks for specialist ruleIds. A first-class CF modernization **workspace** is out of scope here — see [`plans/2026-07-27-cf-modernization-workspace-design.md`](plans/2026-07-27-cf-modernization-workspace-design.md). |
+| **CF guidance playbooks** | `RulePlaybookCatalog` includes small `modernization/…` and `cfml/evaluate-dynamic` playbooks for specialist ruleIds. The first-class CF Modernize workspace is described below and remains proposal-only (no source or DDL writes). |
 
 Scan defaults were raised for typical repos (`DOUBLECHECK_SCAN_MAX_FILE_BYTES=524288`,
 `DOUBLECHECK_SCAN_MAX_BYTES=10485760`) so more source is indexed before skip gates apply.
@@ -276,6 +278,56 @@ flowchart TD
   Done --> SSE["SSE: review.completed"]
   SSE --> Result["GET result<br/>+ FindingBaselineService"]
 ```
+
+---
+
+## One Modernize run (CFML workspace)
+
+Modernize is a separate run kind on the same local run queue. It proposes and
+validates a migration plan; it does not rewrite application files, execute DDL,
+or guarantee runtime parity. Basic Review remains available without an AI key.
+Modernize requires an enabled LLM provider, including keyless local Ollama or
+Docker providers. When a remote provider is selected, the UI requires an
+explicit egress acknowledgement; only bounded, redacted context leaves the
+machine.
+
+```mermaid
+sequenceDiagram
+  participant UI as Modernize workspace
+  participant API as ApiRuns
+  participant RRS as ReviewRunService
+  participant MRS as ModernizationRunService
+  participant DB as SQLite
+  participant LLM as Enabled provider
+
+  UI->>API: POST /api/v1/runs (runKind=modernize)
+  API->>RRS: validate path, target profile, provider, schema pack
+  RRS->>DB: persist immutable input + sanitized schema snapshot
+  RRS-->>UI: 202 queued + Location
+  RRS->>MRS: shared scan then modernization stages
+  MRS->>DB: inventory / schema / signal checkpoints
+  MRS->>LLM: bounded application + database context
+  LLM-->>MRS: versioned proposal JSON
+  MRS->>DB: validation report + plan snapshot
+  UI->>API: GET /api/v1/runs/:id/result
+  API-->>UI: plan, coverage, validation, decisions, events
+  UI->>API: PUT or DELETE decision for an item fingerprint
+  API->>DB: recompute plan state + append decision event
+  UI->>API: GET /api/v1/runs/:id/export?format=markdown|json
+```
+
+Modernize checkpoints are reusable only when the immutable input and source
+fingerprints match. A rerun creates a new run and snapshot; a prior decision is
+carried forward only when the item type, stable ID, and item fingerprint are
+identical. Finding baselines and `follow-up` remain Review-only in v1.
+
+Provider lifecycle observations are persisted as redacted local trace events
+with modernization role and phase labels. Prompts and raw provider responses are
+not stored in the plan, event stream, or export.
+
+The result workspace keeps coverage banners visible when the repository scan is
+truncated or schema evidence is absent, and labels missing schema coverage as
+inference-limited rather than presenting inferred database changes as facts.
 
 ---
 
@@ -337,6 +389,14 @@ flowchart LR
   Spec["SpecialistReviewService"] --> SR[("review_specialist_results")]
 ```
 
+Modernize adds durable snapshots beside the Review records:
+`modernization_schema_packs` stores sanitized schema evidence by fingerprint,
+`modernization_checkpoints` stores stage artifacts, `modernization_plans` stores
+the versioned proposal/validation snapshot, and `modernization_decisions` plus
+`modernization_decision_events` store the current human decision state and its
+audit trail. Inline schema text and provider credentials are never retained in
+raw form.
+
 AI API keys are **not** stored in SQLite (environment only).
 
 ---
@@ -347,8 +407,9 @@ AI API keys are **not** stored in SQLite (environment only).
 
 1. Boot health / session / capabilities
 2. Create run → watch SSE + poll status
-3. Render findings, architecture explorer, specialist board, baselines
-4. History, rerun/follow-up, cancel, export, finding review actions
+3. Render findings, architecture explorer, specialist board, baselines, or the
+   Modernize plan workspace
+4. History, rerun/follow-up (Review-only), cancel, export, finding/plan decisions
 
 Screenshots: [images/01-workspace.png](images/01-workspace.png),
 [images/02-findings.png](images/02-findings.png),

@@ -1,0 +1,309 @@
+/** Executes the three modernization roles and merges their bounded fragments. */
+@singleton
+class {
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="identityService" inject="ModernizationIdentityService";
+	variables.cancelledRuns = {};
+	variables.maxItems = 200;
+
+	struct function propose(
+		required string runId,
+		required struct input,
+		required struct evidence,
+		struct options = {}
+	) {
+		if ( !agentGateway.isEnabled() ) return failure( "provider-disabled" );
+		var budgets = structKeyExists( arguments.input, "budgets" ) && isStruct( arguments.input.budgets ) ? arguments.input.budgets : {};
+		var maxTasks = isNumeric( budgets.maxTasks ?: "" ) ? max( 1, int( budgets.maxTasks ) ) : 3;
+		var maxDurationMs = isNumeric( budgets.maxDurationMs ?: "" ) ? max( 1000, int( budgets.maxDurationMs ) ) : 180000;
+		var startedAt = isNumeric( arguments.input.startedAt ?: "" ) ? val( arguments.input.startedAt ) : getTickCount();
+		var fragments = {};
+		var errors = [];
+		var totalOutputCharacters = 0;
+		var totalCostUsd = 0;
+		var totalOutputLimit = isNumeric( budgets.maxTokens ?: "" ) ? max( 2048, int( budgets.maxTokens ) * 4 ) : 24000;
+		var samplePolicy = structKeyExists( arguments.input, "samplePolicy" ) && isStruct( arguments.input.samplePolicy ) ? arguments.input.samplePolicy : {};
+		var roles = [ "modernization-application", "modernization-database" ];
+		// The two evidence roles are intentionally bounded by the immutable run
+		// task budget.  The roadmap role is the final task and only runs when a
+		// task slot and the wall-clock budget remain.
+		for ( var roleIndex = 1; roleIndex <= min( roles.len(), maxTasks ); roleIndex++ ) {
+			var role = roles[ roleIndex ];
+			if ( isCancelled( arguments.runId, arguments.options ) ) throw( type = "RunCancelled", message = "Modernization proposal cancelled" );
+			if ( getTickCount() - startedAt >= maxDurationMs ) {
+				errors.append( { role: role, message: "budget-exceeded", elapsedMs: getTickCount() - startedAt, maxDurationMs: maxDurationMs, startedAt: startedAt } );
+				break;
+			}
+			if ( totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: role, message: "total-output-budget-exceeded" } );
+				break;
+			}
+			if ( isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd >= val( budgets.maxCostUsd ) ) {
+				errors.append( { role: role, message: "cost-budget-exceeded" } );
+				break;
+			}
+			var runtime = { runtime: arguments.input.target.runtime ?: arguments.input.runtime ?: "", profile: arguments.input.target.layoutProfile ?: arguments.input.profile ?: "" };
+			var agentRequest = agentFactory.build( role, runtime, arguments.evidence, budgets );
+			var roleOptions = duplicate( arguments.options );
+			roleOptions.budgets = budgets;
+			roleOptions.startedAt = startedAt;
+			roleOptions.maxDurationMs = maxDurationMs;
+			roleOptions.role = role;
+			var response = agentGateway.run( arguments.runId, agentRequest, roleOptions );
+			totalCostUsd += isNumeric( response.costUsd ?: "" ) ? val( response.costUsd ) : 0;
+			if ( !( response.ok ?: false ) ) {
+				errors.append( { role: role, message: response.error ?: "provider-failed" } );
+			} else if ( !validFragment( role, response.payload ?: {} ) ) {
+				errors.append( { role: role, message: "malformed-role-output" } );
+			} else {
+				var redactedFragment = redactPayload( response.payload ?: {} );
+				if ( !redactedFragment.count() && ( response.payload ?: {} ).count() ) errors.append( { role: role, message: "redaction-failed" } );
+				else fragments[ role ] = redactedFragment;
+				totalOutputCharacters += isNumeric( response.outputCharacters ?: "" ) ? int( response.outputCharacters ) : len( jsonSerialize( response.payload ?: {} ) );
+			}
+		}
+		var costExceeded = isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd > val( budgets.maxCostUsd );
+		if ( costExceeded ) errors.append( { role: "modernization", message: "cost-budget-exceeded" } );
+		if ( !fragments.count() ) {
+			var firstError = errors.len() ? errors[ 1 ] : {};
+			var firstMessage = firstError.message ?: "no-role-output";
+			if ( firstMessage == "budget-exceeded" && structKeyExists( firstError, "elapsedMs" ) ) firstMessage &= " (elapsedMs=#firstError.elapsedMs#, maxDurationMs=#firstError.maxDurationMs#)";
+			return failure( firstMessage, errors );
+		}
+		var merged = mergeFragments( arguments.input, arguments.evidence, fragments, errors );
+		if ( !costExceeded && ( fragments.keyExists( "modernization-application" ) || fragments.keyExists( "modernization-database" ) ) ) {
+			if ( maxTasks < 3 || getTickCount() - startedAt >= maxDurationMs || totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: "modernization-roadmap", message: "budget-exceeded" } );
+				return { ok: true, plan: sortPlan( merged ), partial: errors.len() > 0, errors: errors };
+			}
+				var roadmapRequest = agentFactory.build( "modernization-roadmap", runtime, merged, budgets );
+			var roadmapOptions = duplicate( arguments.options );
+			roadmapOptions.budgets = budgets;
+			roadmapOptions.startedAt = startedAt;
+			roadmapOptions.maxDurationMs = maxDurationMs;
+			roadmapOptions.role = "modernization-roadmap";
+			var roadmap = agentGateway.run( arguments.runId, roadmapRequest, roadmapOptions );
+			totalCostUsd += isNumeric( roadmap.costUsd ?: "" ) ? val( roadmap.costUsd ) : 0;
+			if ( roadmap.ok ?: false && validFragment( "modernization-roadmap", roadmap.payload ?: {} ) ) {
+				var redactedRoadmap = redactPayload( roadmap.payload ?: {} );
+				if ( !redactedRoadmap.count() && ( roadmap.payload ?: {} ).count() ) errors.append( { role: "modernization-roadmap", message: "redaction-failed" } );
+				else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy );
+			} else errors.append( { role: "modernization-roadmap", message: roadmap.error ?: ( roadmap.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
+		}
+		var sampleLimit = isNumeric( samplePolicy.maxFiles ?: "" ) ? max( 1, int( samplePolicy.maxFiles ) ) : 40;
+		merged.samples = boundedArray( merged.samples ?: [], sampleLimit );
+		if ( ( samplePolicy.currentPhasesOnly ?: true ) && isArray( merged.roadmapPhases ?: "" ) ) merged.samples = currentSliceSamples( merged.samples ?: [], merged.roadmapPhases );
+		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
+		merged.metadata.promptVersion = agentFactory.version();
+		merged.generationErrors = errors;
+		return { ok: true, plan: sortPlan( merged ), partial: errors.len() > 0, errors: errors };
+	}
+
+	void function cancelRun( required string runId ) {
+		variables.cancelledRuns[ arguments.runId ] = true;
+		agentGateway.cancelRun( arguments.runId );
+	}
+
+	/**
+	 * Apply one bounded, fingerprint-scoped repair response.  The pipeline owns
+	 * the validation loop and decides whether another round is allowed; this
+	 * method deliberately cannot add items or replace an unlisted fingerprint.
+	 */
+	struct function repair(
+		required string runId,
+		required struct plan,
+		required struct validation,
+		required struct input,
+		required struct evidence,
+		numeric round = 1,
+		struct options = {}
+	) {
+		var repairBudgets = structKeyExists( arguments.input, "budgets" ) && isStruct( arguments.input.budgets ) ? arguments.input.budgets : {};
+		var repairBudget = structKeyExists( repairBudgets, "maxRepairRounds" ) ? repairBudgets.maxRepairRounds : ( structKeyExists( repairBudgets, "maxIterations" ) ? repairBudgets.maxIterations : 2 );
+		var roundLimit = isNumeric( repairBudget ) ? max( 1, min( 2, int( repairBudget ) ) ) : 2;
+		if ( arguments.round < 1 || arguments.round > roundLimit ) return { ok: false, repaired: false, reason: "repair-budget-exhausted", plan: arguments.plan };
+		var invalidItemList = invalidItems( arguments.plan, arguments.validation );
+		if ( !invalidItemList.len() ) return { ok: true, repaired: false, reason: "no-invalid-items", plan: arguments.plan };
+		var runtime = { runtime: arguments.input.target.runtime ?: arguments.input.runtime ?: "", profile: arguments.input.target.layoutProfile ?: arguments.input.profile ?: "" };
+		var repairRequest = agentFactory.build( "modernization-repair", runtime, { invalidItems: invalidItemList, validation: arguments.validation }, repairBudgets );
+		var repairOptions = duplicate( arguments.options );
+		repairOptions.budgets = repairBudgets;
+		repairOptions.role = "modernization-repair";
+		if ( isNumeric( arguments.input.startedAt ?: "" ) ) repairOptions.startedAt = val( arguments.input.startedAt );
+		if ( !structKeyExists( repairOptions, "maxDurationMs" ) && isNumeric( repairOptions.budgets.maxDurationMs ?: "" ) ) repairOptions.maxDurationMs = int( repairOptions.budgets.maxDurationMs );
+		var response = agentGateway.run( arguments.runId, repairRequest, repairOptions );
+		if ( !( response.ok ?: false ) || !isStruct( response.payload ?: {} ) || !isArray( response.payload.replacements ?: "" ) ) return { ok: false, repaired: false, reason: response.error ?: "malformed-repair-output", plan: arguments.plan };
+		var repaired = duplicate( arguments.plan );
+		var replaced = 0;
+		for ( var replacement in response.payload.replacements ) {
+			if ( !isStruct( replacement ) || !len( trim( replacement.itemFingerprint ?: "" ) ) ) continue;
+			var fp = trim( replacement.itemFingerprint );
+			for ( var collection in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
+				var parts = collection.listToArray( "." );
+				var owner = parts.len() == 2 ? ( repaired[ parts[ 1 ] ] ?: {} ) : repaired;
+				var key = parts[ parts.len() ];
+				if ( !isStruct( owner ) || !isArray( owner[ key ] ?: "" ) ) continue;
+				for ( var index = 1; index <= owner[ key ].len(); index++ ) {
+					if ( trim( owner[ key ][ index ].itemFingerprint ?: "" ) == fp && invalidItemList.some( ( item ) => item.itemFingerprint == fp ) ) {
+						var replacementCopy = duplicate( replacement );
+						structDelete( replacementCopy, "itemFingerprint" );
+						owner[ key ][ index ] = structAppend( duplicate( owner[ key ][ index ] ), replacementCopy, true );
+						owner[ key ][ index ].itemFingerprint = fp;
+						replaced++;
+					}
+				}
+			}
+		}
+		return { ok: true, repaired: replaced > 0, replaced: replaced, plan: repaired, round: arguments.round };
+	}
+
+	private struct function mergeFragments(required struct input, required struct evidence, required struct fragments, required array errors) {
+		var plan = {
+			version      : "modernization-plan-v1",
+			schemaVersion: "modernization-plan-v1",
+			metadata     : { runId: structKeyExists( arguments.input, "runId" ) ? arguments.input.runId : "", generatedAt: now(), runtime: arguments.input.target ?: {}, targetProfile: ( isStruct( arguments.input.target ?: "" ) && structKeyExists( arguments.input.target, "layoutProfile" ) ? arguments.input.target.layoutProfile : ( structKeyExists( arguments.input, "targetProfile" ) ? arguments.input.targetProfile : "" ) ), samplePolicy: arguments.input.samplePolicy ?: { currentPhasesOnly: true } },
+			coverage     : evidence.coverage ?: {},
+			assumptions  : [],
+			inventory    : evidence.inventory ?: { units: [], routeEvidence: [], dependencies: [], unresolved: [] },
+			schemaEvidence: evidence.schemaEvidence ?: { database: {}, objects: [], routines: [], unresolved: [] },
+			signals      : evidence.signals ?: [],
+			target       : { units: [], contexts: [], extracts: [] },
+			unitLinks    : [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
+			validation   : {}, decisions: []
+		};
+		var app = fragments[ "modernization-application" ] ?: {};
+		var db = fragments[ "modernization-database" ] ?: {};
+		plan.target.units = boundedArray( app.targetUnits ?: app.units ?: [], variables.maxItems );
+		plan.target.contexts = boundedArray( app.contexts ?: [], variables.maxItems );
+		plan.target.extracts = boundedArray( app.extracts ?: [], variables.maxItems );
+		plan.unitLinks = boundedArray( app.unitLinks ?: [], variables.maxItems );
+		plan.routeContracts = boundedArray( app.routeContracts ?: [], variables.maxItems );
+		plan.dbFindings = boundedArray( db.dbFindings ?: [], variables.maxItems );
+		plan.dbTransitions = boundedArray( db.dbTransitions ?: [], variables.maxItems );
+		plan.samples = boundedArray( app.samples ?: [], 40 );
+		plan.samples.append( boundedArray( db.samples ?: [], 20 ), true );
+		for ( var item in plan.target.units ) ensureIdentity( item, "target-unit" );
+		for ( var item in plan.unitLinks ) ensureIdentity( item, "unit-link" );
+		for ( var item in plan.routeContracts ) ensureIdentity( item, "route-contract" );
+			for ( var item in plan.dbFindings ) ensureIdentity( item, "db-finding" );
+			for ( var item in plan.dbTransitions ) ensureIdentity( item, "db-transition" );
+			for ( var item in plan.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
+			for ( var item in plan.samples ) ensureIdentity( item, "sample" );
+			return plan;
+		}
+
+	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}) {
+		var useCurrentSlice = structKeyExists( arguments.samplePolicy, "currentPhasesOnly" ) ? !!arguments.samplePolicy.currentPhasesOnly : true;
+			arguments.plan.roadmapPhases = boundedArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40 );
+			for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
+			arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
+			arguments.plan.samples.append( boundedArray( arguments.roadmap.samples ?: [], 20 ), true );
+			for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
+			if ( useCurrentSlice ) arguments.plan.samples = currentSliceSamples( arguments.plan.samples, arguments.plan.roadmapPhases );
+		return arguments.plan;
+	}
+
+	private array function currentSliceSamples( required array samples, required array phases ) {
+		var currentPhaseIds = {};
+		for ( var phase in arguments.phases ) if ( phase.currentSlice ?: false ) currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
+		var output = [];
+		for ( var sample in arguments.samples ) {
+			var phaseId = sample.phaseId ?: sample.roadmapPhaseId ?: "";
+			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) ) output.append( sample );
+		}
+		return output;
+	}
+
+	private array function boundedArray(required any value, required numeric limit) {
+		return isArray( arguments.value ) && arguments.value.len() ? arguments.value.slice( 1, min( arguments.limit, arguments.value.len() ) ) : [];
+	}
+
+	private boolean function validFragment(required string role, required any payload) {
+		if ( !isStruct( arguments.payload ) ) return false;
+		if ( arguments.role == "modernization-repair" ) return structKeyExists( arguments.payload, "replacements" ) && isArray( arguments.payload.replacements );
+		var keys = arguments.role == "modernization-application"
+			? [ "targetUnits", "units", "unitLinks", "routeContracts", "contexts", "extracts", "samples" ]
+			: ( arguments.role == "modernization-database" ? [ "dbFindings", "dbTransitions", "samples" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] );
+		var present = false;
+		for ( var key in keys ) {
+			if ( !structKeyExists( arguments.payload, key ) ) continue;
+			present = true;
+			if ( !isArray( arguments.payload[ key ] ) ) return false;
+		}
+		return present;
+	}
+
+	private struct function redactPayload(required struct payload) {
+		try {
+			var redacted = secretRedactionService.redactText( jsonSerialize( arguments.payload ) );
+			var parsed = jsonDeserialize( redacted );
+			return isStruct( parsed ) ? parsed : {};
+		} catch ( any ignored ) {
+			// Never persist a provider payload that could not pass redaction and
+			// JSON normalization; retaining raw output would violate the local
+			// privacy boundary.
+			return {};
+		}
+	}
+
+	private void function ensureIdentity(required struct item, required string kind) {
+		if ( !len( trim( arguments.item.id ?: arguments.item.itemId ?: "" ) ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
+		if ( !len( trim( arguments.item.itemFingerprint ?: "" ) ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+	}
+	private boolean function isCancelled(required string runId, required struct options) {
+		return variables.cancelledRuns.keyExists( arguments.runId ) || ( structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled() );
+	}
+	private struct function failure(required string message, array errors = []) {
+		return { ok: false, plan: {}, partial: false, errors: arguments.errors.len() ? arguments.errors : [ { role: "provider", message: arguments.message } ] };
+	}
+
+	private array function invalidItems( required struct plan, required struct validation ) {
+		var output = [];
+		var seen = {};
+		var messages = isArray( arguments.validation.messages ?: "" ) ? arguments.validation.messages : [];
+		for ( var message in messages ) {
+			if ( lCase( message.level ?: message.validationLevel ?: "" ) != "blocking" ) continue;
+			var category = message.category ?: "";
+			var collection = category == "target.units" ? "target.units" : category;
+			if ( ![ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection ) ) continue;
+			var parts = collection.listToArray( "." );
+			var owner = parts.len() == 2 ? ( arguments.plan[ parts[ 1 ] ] ?: {} ) : arguments.plan;
+			var key = parts[ parts.len() ];
+			for ( var item in ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [] ) ) {
+				var fp = trim( item.itemFingerprint ?: "" );
+				var itemId = item.id ?: item.itemId ?: "";
+				if ( len( message.itemId ?: "" ) && message.itemId != itemId ) continue;
+				if ( len( fp ) && !seen.keyExists( fp ) ) { output.append( { itemId: itemId, itemFingerprint: fp, category: category, item: item } ); seen[ fp ] = true; }
+			}
+		}
+		return output;
+	}
+
+	/**
+	 * Provider order is not a durable ordering contract.  Sort every generated
+	 * collection by stable identity before persisting/exporting so retries and
+	 * different providers produce the same artifact ordering.
+	 */
+	private struct function sortPlan( required struct plan ) {
+		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "roadmapPhases", "samples", "assumptions" ];
+		for ( var path in collections ) {
+			var parts = path.listToArray( "." );
+			var parent = parts.len() == 2 ? arguments.plan[ parts[ 1 ] ] : arguments.plan;
+			var key = parts[ parts.len() ];
+			if ( isStruct( parent ) && isArray( parent[ key ] ?: "" ) ) {
+				parent[ key ].sort( ( first, second ) => compareNoCase(
+					identityKey( first ),
+					identityKey( second )
+				) );
+			}
+		}
+		return arguments.plan;
+	}
+
+	private string function identityKey( required any item ) {
+		if ( !isStruct( arguments.item ) ) return toString( arguments.item );
+		return lCase( trim( arguments.item.id ?: arguments.item.itemId ?: arguments.item.itemFingerprint ?: arguments.item.filePath ?: arguments.item.path ?: jsonSerialize( arguments.item ) ) );
+	}
+}

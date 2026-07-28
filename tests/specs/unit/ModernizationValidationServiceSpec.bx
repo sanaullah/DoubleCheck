@@ -1,0 +1,47 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization plan validation", () => {
+			it( "blocks malformed contracts and reports counts", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( { schemaVersion: "wrong", unitLinks: [] } );
+				expect( report.ok ).toBeFalse();
+				expect( report.blocking ).toBeGT( 0 );
+				expect( report.messages ).notToBeEmpty();
+			} );
+
+			it( "accepts a complete route contract with stable identity", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: {}, coverage: {}, assumptions: [], signals: [], inventory: {}, schemaEvidence: {}, target: { units: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], roadmapPhases: [ { id: "phase-1", itemFingerprint: "fp" } ], samples: [], validation: {}, decisions: [],
+					routeContracts: [ { id: "route-1", itemFingerprint: "fp", method: "GET", path: "/health", request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {}, evidence: [ { evidenceId: "route-e1" } ] } ]
+				} );
+					expect( report.ok ).toBeTrue();
+				expect( report.blocking ).toBe( 0 );
+			} );
+
+			it( "blocks unsafe target paths, duplicate identities and invalid migration phases", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1", metadata: { runtime: { runtime: "boxlang" } }, coverage: {}, inventory: { units: [] }, schemaEvidence: {},
+					target: { units: [ { id: "same", itemFingerprint: "fp", targetPath: "../escape.cfc" }, { id: "same", itemFingerprint: "fp2", targetPath: "app/ok.bx" } ] },
+					unitLinks: [], dbFindings: [], dbTransitions: [ { id: "migration-1", itemFingerprint: "m", operation: "drop-table", order: 1 } ], routeContracts: [], roadmapPhases: [], samples: []
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.blocking ).toBeGT( 2 );
+				expect( report.levels.dialect ).toBe( "dialect-checked" );
+			} );
+
+			it( "keeps unresolved and truncated coverage visible as warnings", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: {}, coverage: { truncated: true, unresolvedCount: 2 }, assumptions: [], signals: [], inventory: { unresolved: [ { id: "u" } ] }, schemaEvidence: {}, target: { units: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp" } ], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.ok ).toBeTrue();
+				expect( report.warnings ).toBeGT( 0 );
+				expect( report.messages.some( ( item ) => item.category == "coverage" ) ).toBeTrue();
+			} );
+		} );
+	}
+}

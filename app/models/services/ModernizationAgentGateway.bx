@@ -1,0 +1,179 @@
+/** Bounded JSON-only chat gateway for modernization roles. */
+@singleton
+class {
+	property name="chatGateway" inject="AIChatGateway";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="provider" inject="coldbox:setting:aiProvider";
+	property name="baseURL" inject="coldbox:setting:aiBaseURL";
+	property name="apiKey" inject="coldbox:setting:aiApiKey";
+	property name="model" inject="coldbox:setting:aiModel";
+	property name="timeout" inject="coldbox:setting:aiTimeout";
+	property name="contextWindow" inject="coldbox:setting:aiContextWindow";
+	property name="maxPromptCharacters" inject="coldbox:setting:aiMaxPromptCharacters";
+	property name="maxRetries" inject="coldbox:setting:specialistMaxRetries";
+	property name="retryBackoffMs" inject="coldbox:setting:specialistRetryBackoffMs";
+	property name="inputUsdPerMillion" inject="coldbox:setting:specialistInputUsdPerMillion";
+	property name="outputUsdPerMillion" inject="coldbox:setting:specialistOutputUsdPerMillion";
+	property name="log" inject="logbox:logger:{this}";
+	variables.cancelledRuns = {};
+
+	boolean function isEnabled() {
+		return chatGateway.isEnabled( provider, apiKey );
+	}
+
+	struct function run( required string runId, required struct request, struct options = {} ) {
+		if ( !isEnabled() ) {
+			throw( type = "AIConfigurationException", message = "Modernization provider is not enabled" );
+		}
+		if ( isCancelled( arguments.runId, arguments.options ) ) throw( type = "RunCancelled", message = "Modernization provider request cancelled" );
+		var requestedRetries = isNumeric( arguments.options.maxRetries ?: "" )
+			? max( 0, min( 3, int( arguments.options.maxRetries ) ) )
+			: max( 0, min( 3, int( maxRetries ?: 2 ) ) );
+		var requestedBudgets = structKeyExists( arguments.options, "budgets" ) && isStruct( arguments.options.budgets ) ? arguments.options.budgets : {};
+		var budgets = requestedBudgets;
+		if ( isNumeric( budgets.maxCostUsd ?: "" ) && val( budgets.maxCostUsd ) <= 0 ) return { ok: false, payload: {}, attempt: 0, provider: provider, model: model, error: "cost-budget-exceeded" };
+		var iterationLimit = isNumeric( budgets.maxIterations ?: "" ) ? max( 1, int( budgets.maxIterations ) ) : 3;
+		var attemptLimit = min( requestedRetries, iterationLimit - 1 );
+		var startedAt = isNumeric( arguments.options.startedAt ?: "" ) ? val( arguments.options.startedAt ) : getTickCount();
+		var maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? max( 1000, int( arguments.options.maxDurationMs ) ) : 180000;
+		var lastError = "";
+		var spentUsd = 0;
+		for ( var attempt = 0; attempt <= attemptLimit; attempt++ ) {
+			if ( isCancelled( arguments.runId, arguments.options ) ) {
+				throw( type = "RunCancelled", message = "Modernization provider request cancelled" );
+			}
+			var elapsedMs = getTickCount() - startedAt;
+			if ( elapsedMs >= maxDurationMs ) {
+				emitObservation( arguments.options, { stage: "budget-exceeded", runId: arguments.runId, elapsedMs: elapsedMs, maxDurationMs: maxDurationMs } );
+				return { ok: false, payload: {}, attempt: attempt, provider: provider, model: model, error: "budget-exceeded" };
+			}
+			try {
+				var response = chatGateway.chat(
+					fitMessages( arguments.request.messages ?: [] ),
+					buildParams( arguments.request, budgets ),
+					buildOptions( max( 1, maxDurationMs - elapsedMs ) )
+				);
+				var responseUsage = extractUsage( response );
+				var payload = normalizeResponse( response );
+				if ( !isStruct( payload ) ) {
+					throw( type = "ModernizationProviderResponseException", message = "Provider returned non-object JSON" );
+				}
+				var outputTokens = isNumeric( budgets.maxTokensPerTask ?: "" ) ? int( budgets.maxTokensPerTask ) : ( isNumeric( budgets.maxTokens ?: "" ) ? int( budgets.maxTokens ) : 6000 );
+				var outputLimit = max( 2048, min( 60000, outputTokens * 4 ) );
+				if ( len( jsonSerialize( payload ) ) > outputLimit ) {
+					throw( type = "ModernizationProviderResponseException", message = "Provider response exceeded the modernization output budget" );
+				}
+				var usage = normalizeUsage( responseUsage, arguments.request, payload );
+				var costUsd = estimateCost( usage );
+				spentUsd += costUsd;
+				if ( isNumeric( budgets.maxCostUsd ?: "" ) && spentUsd > val( budgets.maxCostUsd ) ) {
+					emitObservation( arguments.options, { stage: "budget-exceeded", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, costUsd: spentUsd, maxCostUsd: val( budgets.maxCostUsd ) } );
+					return { ok: false, payload: {}, attempt: attempt + 1, provider: provider, model: model, costUsd: spentUsd, usage: usage, error: "cost-budget-exceeded" };
+				}
+				emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usage } );
+				return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: provider, model: model, costUsd: spentUsd, usage: usage };
+			} catch ( any error ) {
+				if ( lCase( error.type ?: "" ) == "runcancelled" ) rethrow;
+				lastError = secretRedactionService.redactText( error.message ?: "Provider request failed" );
+				emitObservation( arguments.options, { stage: "provider-error", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, error: lastError } );
+				if ( attempt < attemptLimit ) {
+					var delayMs = isNumeric( retryBackoffMs ?: "" ) ? max( 0, int( retryBackoffMs ) ) * ( attempt + 1 ) : 0;
+					if ( delayMs ) sleep( min( 1000, delayMs ) );
+				}
+			}
+		}
+		return { ok: false, payload: {}, attempt: attemptLimit + 1, provider: provider, model: model, error: lastError };
+	}
+
+	void function cancelRun( required string runId ) {
+		variables.cancelledRuns[ arguments.runId ] = true;
+	}
+
+	private boolean function isCancelled( required string runId, required struct options ) {
+		if ( variables.cancelledRuns.keyExists( arguments.runId ) ) return true;
+		return structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled();
+	}
+
+	private struct function buildParams( required struct request, struct budgets = {} ) {
+		var window = isNumeric( contextWindow ?: "" ) ? max( 1024, int( contextWindow ) ) : 8192;
+		var requestedTokens = isNumeric( arguments.budgets.maxTokensPerTask ?: "" ) ? int( arguments.budgets.maxTokensPerTask ) : min( 6000, max( 512, int( window * .25 ) ) );
+		var params = { temperature: 0, max_tokens: min( 6000, max( 512, requestedTokens ) ) };
+		if ( len( trim( model ?: "" ) ) ) params.model = model;
+		if ( structKeyExists( arguments.request, "params" ) && isStruct( arguments.request.params ) ) structAppend( params, arguments.request.params, true );
+		// Provider/request metadata must not be able to bypass the immutable run
+		// output budget.  Clamp again after merging request params.
+		params.max_tokens = min( params.max_tokens ?: 6000, min( 6000, max( 512, requestedTokens ) ) );
+		return params;
+	}
+
+	private struct function buildOptions( numeric effectiveTimeout = 0 ) {
+		var result = { provider: provider, apiKey: apiKey, returnFormat: "json", timeout: arguments.effectiveTimeout > 0 ? arguments.effectiveTimeout : timeout };
+		if ( len( trim( baseURL ?: "" ) ) ) result.baseURL = baseURL;
+		return result;
+	}
+
+	private void function emitObservation( required struct options, required struct observation ) {
+		if ( structKeyExists( arguments.options, "onObservation" ) && isCustomFunction( arguments.options.onObservation ) ) {
+			try {
+				var safe = duplicate( arguments.observation );
+				safe.role = structKeyExists( arguments.options, "role" ) ? arguments.options.role : "";
+				if ( structKeyExists( safe, "error" ) ) safe.error = secretRedactionService.redactText( toString( safe.error ) );
+				arguments.options.onObservation( safe );
+			} catch ( any ignored ) {
+				// Observability is best effort and must never fail a modernization run.
+			}
+		}
+	}
+
+	private array function fitMessages(required array messages) {
+		var cap = isNumeric( maxPromptCharacters ?: "" ) ? max( 4000, int( maxPromptCharacters ) ) : 60000;
+		var output = duplicate( arguments.messages );
+		var total = 0;
+		for ( var index = 1; index <= output.len(); index++ ) {
+			var content = toString( output[ index ].content ?: "" );
+			if ( total + len( content ) > cap ) {
+				var remaining = max( 500, cap - total );
+				output[ index ].content = left( content, remaining ) & char( 10 ) & "[context truncated by modernization gateway]";
+				output = output.slice( 1, index );
+				break;
+			}
+			total += len( content );
+		}
+		return output;
+	}
+
+	private any function normalizeResponse( required any response ) {
+		if ( isStruct( arguments.response ) ) {
+			if ( structKeyExists( arguments.response, "content" ) && isSimpleValue( arguments.response.content ) ) return normalizeResponse( arguments.response.content );
+			return arguments.response;
+		}
+		var text = trim( toString( arguments.response ) );
+		if ( !len( text ) ) return {};
+		// Strip the optional Markdown fence without relying on a backslash-heavy
+		// regex (BoxLang preserves doubled escapes in string literals).
+		text = replaceNoCase( text, "```json", "", "all" );
+		text = replace( text, "```", "", "all" );
+		text = trim( text );
+		return jsonDeserialize( text );
+	}
+
+	private struct function extractUsage( required any response ) {
+		if ( isStruct( arguments.response ) && isStruct( arguments.response.usage ?: "" ) ) return arguments.response.usage;
+		if ( isStruct( arguments.response ) && isStruct( arguments.response.meta ?: "" ) && isStruct( arguments.response.meta.usage ?: "" ) ) return arguments.response.meta.usage;
+		return {};
+	}
+
+	private struct function normalizeUsage( required struct usage, required struct request, required any payload ) {
+		var prompt = val( arguments.usage.promptTokens ?: arguments.usage.prompt_tokens ?: arguments.usage.inputTokens ?: arguments.usage.input_tokens ?: 0 );
+		var completion = val( arguments.usage.completionTokens ?: arguments.usage.completion_tokens ?: arguments.usage.outputTokens ?: arguments.usage.output_tokens ?: 0 );
+		if ( prompt <= 0 ) prompt = max( 1, int( len( jsonSerialize( arguments.request.messages ?: [] ) ) / 4 ) );
+		if ( completion <= 0 ) completion = max( 1, int( len( jsonSerialize( arguments.payload ) ) / 4 ) );
+		return { promptTokens: prompt, completionTokens: completion, totalTokens: prompt + completion };
+	}
+
+	private numeric function estimateCost( required struct usage ) {
+		var inputRate = isNumeric( inputUsdPerMillion ?: "" ) ? val( inputUsdPerMillion ) : 5;
+		var outputRate = isNumeric( outputUsdPerMillion ?: "" ) ? val( outputUsdPerMillion ) : 15;
+		return ( val( arguments.usage.promptTokens ?: 0 ) / 1000000 * inputRate ) + ( val( arguments.usage.completionTokens ?: 0 ) / 1000000 * outputRate );
+	}
+}

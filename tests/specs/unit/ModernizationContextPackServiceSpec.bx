@@ -1,0 +1,26 @@
+class extends="testbox.system.BaseSpec" {
+    function run() {
+        describe( "Modernization context packs", () => {
+        it( "bounds partitions and redacts source evidence", () => {
+            var file = { filePath: "app/Orders.cfc", language: "ColdFusion", content: "component {\npassword=hidden\nfunction list() {}\n}", lines: [ "component {", "password=hidden", "function list() {}", "}" ], contentHash: "hash" };
+            var inventory = { files: [ file ], units: [ { filePath: file.filePath, layer: "component", symbolName: "list", startLine: 3, endLine: 3 } ] };
+            var result = new app.models.services.ModernizationContextPackService().build( inventory, {}, {}, {}, [ file ], { maxCharacters: 5000 } );
+            expect( result.partitions.len() ).toBe( 1 );
+            expect( result.partitions[ 1 ].text ).notToInclude( "hidden" );
+            expect( result.partitions[ 1 ].text ).toInclude( "BEGIN_UNTRUSTED_SOURCE" );
+            expect( result.partitions[ 1 ].text ).toInclude( "END_UNTRUSTED_SOURCE" );
+            expect( result.fingerprint ).toBe( new app.models.services.ModernizationContextPackService().build( inventory, {}, {}, {}, [ file ], { maxCharacters: 5000 } ).fingerprint );
+        } );
+
+        it( "fingerprints bounded content and omits embedded row DML", () => {
+            var file = { filePath: "app/Orders.cfc", language: "ColdFusion", content: "component {\nvar sql = 'INSERT INTO orders VALUES (1)';\nfunction list() {}\n}", lines: [ "component {", "var sql = 'INSERT INTO orders VALUES (1)';", "function list() {}", "}" ], contentHash: "hash-a" };
+            var inventory = { files: [ file ], units: [ { filePath: file.filePath, layer: "component", symbolName: "list", startLine: 1, endLine: 4 } ] };
+            var first = new app.models.services.ModernizationContextPackService().build( inventory, {}, {}, {}, [ file ], { maxCharacters: 5000 } );
+            expect( first.partitions[ 1 ].text ).notToInclude( "INSERT INTO" );
+            file.contentHash = "hash-b";
+            var second = new app.models.services.ModernizationContextPackService().build( inventory, {}, {}, {}, [ file ], { maxCharacters: 5000 } );
+            expect( first.fingerprint ).notToBe( second.fingerprint );
+        } );
+        } );
+    }
+}

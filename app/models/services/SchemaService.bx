@@ -108,6 +108,8 @@ class {
 					id TEXT PRIMARY KEY,
 					project_path TEXT NOT NULL,
 					mode TEXT NOT NULL,
+					run_kind TEXT NOT NULL DEFAULT 'review',
+					input_json TEXT NOT NULL DEFAULT '{}',
 					base_revision TEXT,
 					head_revision TEXT,
 					status TEXT NOT NULL,
@@ -483,6 +485,7 @@ class {
 			"source_run_id",
 			"TEXT"
 		);
+		ensureModernizationSchema();
 		ensureColumn(
 			"review_summaries",
 			"ai_files_reviewed",
@@ -647,12 +650,43 @@ class {
 		queryExecute(
 			"
 				CREATE TRIGGER IF NOT EXISTS trg_review_runs_contract_immutable
-				BEFORE UPDATE OF policy_json, budgets_json ON review_runs
+				BEFORE UPDATE OF policy_json, budgets_json, run_kind, input_json ON review_runs
 				BEGIN
 					SELECT RAISE(
 						ABORT,
-						'review run policy and budgets are immutable'
+						'review run contract is immutable'
 					);
+				END
+			",
+			{},
+			{ datasource: datasource }
+		);
+	}
+
+	private void function ensureModernizationSchema() {
+		ensureColumn( "review_runs", "run_kind", "TEXT NOT NULL DEFAULT 'review'" );
+		ensureColumn( "review_runs", "input_json", "TEXT NOT NULL DEFAULT '{}'" );
+		var statements = [
+			"CREATE TABLE IF NOT EXISTS modernization_schema_packs ( run_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, format TEXT NOT NULL, relative_path TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', pack_version TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}', sanitized_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
+			"CREATE TABLE IF NOT EXISTS modernization_checkpoints ( run_id TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', progress INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL, PRIMARY KEY ( run_id, stage ), FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
+			"CREATE TABLE IF NOT EXISTS modernization_plans ( run_id TEXT PRIMARY KEY, plan_version TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'generated', fingerprint TEXT NOT NULL DEFAULT '', plan_json TEXT NOT NULL, validation_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
+			"CREATE TABLE IF NOT EXISTS modernization_decisions ( run_id TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL, decision TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', item_fingerprint TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY ( run_id, item_type, item_id ), FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
+			"CREATE TABLE IF NOT EXISTS modernization_decision_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL, action TEXT NOT NULL, decision_json TEXT NOT NULL DEFAULT '{}', actor TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
+			"CREATE INDEX IF NOT EXISTS idx_review_runs_kind_history ON review_runs ( run_kind, created_at DESC )",
+			"CREATE INDEX IF NOT EXISTS idx_modernization_checkpoints_run ON modernization_checkpoints ( run_id, updated_at )",
+			"CREATE INDEX IF NOT EXISTS idx_modernization_decisions_lookup ON modernization_decisions ( run_id, item_type, updated_at )",
+			"CREATE INDEX IF NOT EXISTS idx_modernization_decision_events_lookup ON modernization_decision_events ( run_id, item_type, item_id, id )"
+		];
+		for ( var statement in statements ) {
+			queryExecute( statement, {}, { datasource: datasource } );
+		}
+		queryExecute( "DROP TRIGGER IF EXISTS trg_review_runs_contract_immutable", {}, { datasource: datasource } );
+		queryExecute(
+			"
+				CREATE TRIGGER IF NOT EXISTS trg_review_runs_contract_immutable
+				BEFORE UPDATE OF policy_json, budgets_json, run_kind, input_json ON review_runs
+				BEGIN
+					SELECT RAISE( ABORT, 'review run contract is immutable' );
 				END
 			",
 			{},

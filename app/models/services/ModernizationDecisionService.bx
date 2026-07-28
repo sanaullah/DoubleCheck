@@ -1,0 +1,139 @@
+/** Stale-safe human decisions for Modernize plan items. */
+@singleton
+class {
+	property name="modernizationRepository" inject="ModernizationRepository";
+	property name="identityService" inject="ModernizationIdentityService";
+	property name="securityContextService" inject="SecurityContextService";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.allowedTypes = [ "target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample" ];
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		return this;
+	}
+
+	struct function refreshState( required string runId ) {
+		var planRecord = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( planRecord ) ) return { state: "generated", required: 0, accepted: 0, rejected: 0 };
+		var state = recomputeState( planRecord, arguments.runId );
+		persistState( planRecord, state );
+		return state;
+	}
+
+	struct function decide(
+		required any run,
+		required string itemId,
+		required struct input,
+		struct context = {}
+	) {
+		ensureModernization( arguments.run );
+		var itemType = lCase( trim( arguments.input.itemType ?: "" ) );
+		var decision = lCase( trim( arguments.input.decision ?: "" ) );
+		var fingerprint = trim( arguments.input.itemFingerprint ?: "" );
+		var planFingerprint = trim( arguments.input.planFingerprint ?: arguments.input.artifactFingerprint ?: "" );
+		var note = trim( arguments.input.note ?: "" );
+		if ( !variables.allowedTypes.contains( itemType ) ) throw( type = "ValidationException", message = "itemType is not supported" );
+		if ( ![ "accepted", "rejected" ].contains( decision ) ) throw( type = "ValidationException", message = "decision must be accepted or rejected" );
+		if ( len( note ) > 2000 ) throw( type = "ValidationException", message = "note exceeds 2000 characters" );
+		note = secretRedactionService.redactText( note );
+		var planRecord = modernizationRepository.getPlan( arguments.run.getId() );
+		if ( isNull( planRecord ) ) throw( type = "ValidationException", message = "Modernization plan is not available" );
+		if ( len( planFingerprint ) && planFingerprint != trim( planRecord.fingerprint ?: "" ) ) throw( type = "ModernizationDecisionConflict", message = "The modernization artifact changed; refresh before deciding" );
+		var item = findItem( planRecord.plan ?: {}, itemType, arguments.itemId );
+		if ( isNull( item ) ) throw( type = "ModernizationItemNotFound", message = "Modernization item was not found" );
+		var actualFingerprint = trim( item.itemFingerprint ?: "" );
+		if ( !len( actualFingerprint ) || !len( fingerprint ) || actualFingerprint != fingerprint ) throw( type = "ModernizationDecisionConflict", message = "The modernization proposal changed; refresh before deciding" );
+		var saved = modernizationRepository.upsertDecision(
+			arguments.run.getId(),
+			{ itemType: itemType, itemId: arguments.itemId, decision: decision, note: note, itemFingerprint: fingerprint, decidedBy: arguments.context.actor ?: "local-user" }
+		);
+		modernizationRepository.appendDecisionEvent( arguments.run.getId(), { itemType: itemType, itemId: arguments.itemId, action: decision, decision: saved, actor: arguments.context.actor ?: "local-user" } );
+		var state = recomputeState( planRecord, arguments.run.getId() );
+		persistState( planRecord, state );
+		return { decision: saved, state: state, decisions: modernizationRepository.listDecisions( arguments.run.getId() ), events: modernizationRepository.listDecisionEvents( arguments.run.getId() ) };
+	}
+
+	struct function clear(required any run, required string itemId, required struct input = {}, struct context = {}) {
+		ensureModernization( arguments.run );
+		var itemType = lCase( trim( arguments.input.itemType ?: "" ) );
+		if ( !variables.allowedTypes.contains( itemType ) ) throw( type = "ValidationException", message = "itemType is not supported" );
+		var planRecord = modernizationRepository.getPlan( arguments.run.getId() );
+		var item = isNull( planRecord ) ? javacast( "null", "" ) : findItem( planRecord.plan ?: {}, itemType, arguments.itemId );
+		if ( isNull( planRecord ) || isNull( item ) ) throw( type = "ModernizationItemNotFound", message = "Modernization item was not found" );
+		var planFingerprint = trim( arguments.input.planFingerprint ?: arguments.input.artifactFingerprint ?: "" );
+		if ( len( planFingerprint ) && planFingerprint != trim( planRecord.fingerprint ?: "" ) ) throw( type = "ModernizationDecisionConflict", message = "The modernization artifact changed; refresh before clearing a decision" );
+		var itemFingerprint = trim( arguments.input.itemFingerprint ?: "" );
+		if ( !len( itemFingerprint ) ) throw( type = "ValidationException", message = "itemFingerprint is required" );
+		if ( itemFingerprint != trim( item.itemFingerprint ?: "" ) ) throw( type = "ModernizationDecisionConflict", message = "The modernization proposal changed; refresh before clearing a decision" );
+		modernizationRepository.deleteDecision( arguments.run.getId(), itemType, arguments.itemId );
+		modernizationRepository.appendDecisionEvent( arguments.run.getId(), { itemType: itemType, itemId: arguments.itemId, action: "cleared", decision: {}, actor: arguments.context.actor ?: "local-user" } );
+		var clearedState = recomputeState( planRecord, arguments.run.getId() );
+		persistState( planRecord, clearedState );
+		return { state: clearedState, decisions: modernizationRepository.listDecisions( arguments.run.getId() ), events: modernizationRepository.listDecisionEvents( arguments.run.getId() ) };
+	}
+
+	private struct function recomputeState(required struct planRecord, required string runId) {
+		var validation = arguments.planRecord.validation ?: {};
+		var decisions = modernizationRepository.listDecisions( arguments.runId );
+		var state = ( val( validation.blocking ?: 0 ) > 0 ) ? "needs-review" : "generated";
+		var requiredItems = {};
+		var accepted = 0; var rejected = 0;
+		for ( var collection in [ "target.units", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases" ] ) {
+			var collectionParts = collection.listToArray( "." );
+			var collectionOwner = collectionParts.len() == 2 ? ( arguments.planRecord.plan[ collectionParts[ 1 ] ] ?: {} ) : arguments.planRecord.plan;
+			var collectionKey = collectionParts[ collectionParts.len() ];
+			for ( var item in ( isStruct( collectionOwner ) && isArray( collectionOwner[ collectionKey ] ?: "" ) ? collectionOwner[ collectionKey ] : [] ) ) {
+				var itemId = item.id ?: item.itemId ?: "";
+				var isRequired = collection == "dbTransitions" || collection == "routeContracts" || collection == "roadmapPhases" || ( item.validationLevel ?: "" ) == "blocking" || ( item.severity ?: "" ) == "critical" || ( item.requiredDecision ?: false ) == true || ( item.currentSlice ?: false ) == true;
+				// Persistence/API item types use singular kebab-case names while the
+				// plan contract uses camelCase collection keys. Keep the mapping
+				// explicit so required-item counts line up with submitted decisions.
+				var decisionType = {
+					"target.units": "target-unit",
+					"unitLinks": "unit-link",
+					"dbFindings": "db-finding",
+					"dbTransitions": "db-transition",
+					"routeContracts": "route-contract",
+					"roadmapPhases": "roadmap-phase"
+				}[ collection ] ?: "";
+				if ( isRequired && len( itemId ) ) requiredItems[ decisionType & ":" & itemId ] = true;
+			}
+		}
+		for ( var itemDecision in decisions ) {
+			var decisionKey = ( itemDecision.itemType ?: "" ) & ":" & ( itemDecision.itemId ?: "" );
+			if ( requiredItems.keyExists( decisionKey ) && itemDecision.decision == "accepted" ) accepted++;
+			if ( requiredItems.keyExists( decisionKey ) && itemDecision.decision == "rejected" ) rejected++;
+		}
+		if ( rejected ) state = "rejected";
+		else if ( requiredItems.count() && accepted >= requiredItems.count() && val( validation.blocking ?: 0 ) == 0 ) state = "accepted";
+		else if ( requiredItems.count() || val( validation.blocking ?: 0 ) > 0 ) state = "needs-review";
+		return { state: state, required: requiredItems.count(), accepted: accepted, rejected: rejected };
+	}
+
+	private void function persistState( required struct planRecord, required struct state ) {
+		var plan = duplicate( arguments.planRecord.plan ?: {} );
+		// Keep the artifact fingerprint stable while exposing the recomputed state.
+		plan.state = arguments.state.state;
+		plan.fingerprint = arguments.planRecord.fingerprint ?: plan.fingerprint ?: "";
+		var planRunId = structKeyExists( arguments.planRecord, "runId" ) ? arguments.planRecord.runId : "";
+		if ( !len( trim( planRunId ) ) ) return;
+		modernizationRepository.savePlan( planRunId, plan, arguments.planRecord.validation ?: {}, arguments.planRecord.coverage ?: {} );
+	}
+
+	private any function findItem(required struct plan, required string itemType, required string itemId) {
+		var map = {
+			"target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts",
+			"db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples"
+		};
+		var path = map[ arguments.itemType ];
+			var values = arguments.itemType == "target-unit"
+				? ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] )
+				: ( isArray( arguments.plan[ path ] ?: "" ) ? arguments.plan[ path ] : [] );
+		for ( var item in values ) if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+		return javacast( "null", "" );
+	}
+
+	private void function ensureModernization(required any run) {
+		if ( lCase( run.getRunKind() ?: "review" ) != "modernize" ) throw( type = "ValidationException", message = "Human decisions require a Modernize run" );
+	}
+}

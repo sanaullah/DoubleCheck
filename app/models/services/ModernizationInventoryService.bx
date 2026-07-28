@@ -1,0 +1,331 @@
+/**
+ * Conservative CFML inventory used only by Modernize. This is a line-oriented
+ * extractor, not a full CFML AST; every record carries the source range and
+ * extraction method so the proposal layer can show its evidence honestly.
+ */
+@singleton
+class {
+	property name="identityService" inject="ModernizationIdentityService";
+	variables.version = "cfml-inventory-conservative-v1";
+
+	struct function build( required any scan ) {
+		var files = isStruct( arguments.scan ) ? ( arguments.scan.files ?: [] ) : arguments.scan;
+		var inventoryFiles = [];
+		var units = [];
+		var dependencies = [];
+		var routeEvidence = [];
+		var unresolved = [];
+		var cfmlFileCount = 0;
+		var totalBytes = 0;
+		for ( var file in files ) {
+			if ( !isStruct( file ) ) continue;
+			var path = normalizePath( file.filePath ?: file.path ?: "" );
+			var extension = lCase( listLast( path, "." ) );
+			var isCfml = ( file.language ?: "" ) == "ColdFusion" || listFindNoCase( "cfm,cfc", extension );
+			if ( !isCfml ) continue;
+			cfmlFileCount++;
+			var content = toString( file.content ?: "" );
+			var lines = structKeyExists( file, "lines" ) && isArray( file.lines ) ? file.lines : listToArray( normalizeText( content ), char( 10 ), true, true );
+			if ( !lines.len() ) lines = [ "" ];
+			totalBytes += val( file.sizeBytes ?: len( content ) );
+			inventoryFiles.append(
+				{
+					filePath    : path,
+					language    : "CFML",
+					contentHash : file.contentHash ?: lCase( hash( content, "SHA-256" ) ),
+					sizeBytes   : val( file.sizeBytes ?: len( content ) ),
+					lineCount   : lines.len(),
+					extractionMethod: "regex-conservative-v1"
+				}
+			);
+			var unitKind = classifyUnit( path );
+			if ( extension == "cfm" || unitKind == "custom-tag" ) {
+				units.append( makeUnit( unitKind == "custom-tag" ? "custom-tag" : "page", path, listFirst( listLast( path, "/" ), "." ), 1, lines.len(), "regex-conservative-v1", file, [] ) );
+			}
+			if ( unitKind == "application" ) {
+				units.append( makeUnit( "application", path, "Application.cfc", 1, lines.len(), "regex-conservative-v1", file, [] ) );
+			} else if ( extension == "cfc" ) {
+				// Keep component files visible even when their methods use syntax the
+				// conservative extractor cannot parse. Method units are added below.
+				units.append( makeUnit( "component", path, listFirst( listLast( path, "/" ), "." ), 1, lines.len(), "regex-conservative-v1", file, [] ) );
+			}
+			var functionsFound = extractFunctions( path, lines, file );
+			for ( var fn in functionsFound.units ) units.append( fn );
+			for ( var unresolvedItem in functionsFound.unresolved ) unresolved.append( unresolvedItem );
+
+			for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
+				var sourceLine = toString( lines[ lineNumber ] );
+				var trimmed = trim( sourceLine );
+				if ( !len( trimmed ) ) continue;
+				var lineEvidence = evidence( path, lineNumber, sourceLine, file );
+				var remoteRoute = remoteRouteFromLine( path, lineNumber, sourceLine, file );
+				if ( !isNull( remoteRoute ?: javacast( "null", "" ) ) ) routeEvidence.append( remoteRoute );
+				var includeMatch = variables.javaPatternMatcher( "(?:<cfinclude\\s+template\\s*=\\s*|\\binclude\\s+)[^A-Za-z0-9_./-]*([A-Za-z0-9_./-]+)", sourceLine );
+				if ( includeMatch.find() ) {
+					var includeTarget = includeMatch.group( 1 );
+					dependencies.append( dependency( "include", includeTarget, lineEvidence ) );
+					if ( find( char( 35 ), includeTarget ) ) unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
+				} else if ( reFindNoCase( "<cfinclude\\b|\\binclude\\s+", sourceLine ) ) {
+					unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
+				}
+				var constructMatch = variables.javaPatternMatcher( "(?i)component[^A-Za-z0-9_./-]*([A-Za-z_][A-Za-z0-9_./-]*)", sourceLine );
+				while ( constructMatch.find() ) dependencies.append( dependency( "component-construction", constructMatch.group( 1 ), lineEvidence ) );
+				var newMatch = variables.javaPatternMatcher( "(?i)new[ ]+([A-Za-z_][A-Za-z0-9_./-]*)", sourceLine );
+				while ( newMatch.find() ) dependencies.append( dependency( "component-construction", newMatch.group( 1 ), lineEvidence ) );
+				if ( ( reFindNoCase( "createObject|cfinvoke", sourceLine ) && reFindNoCase( "(arguments|variables|url|form)[.]", sourceLine ) ) || ( findNoCase( "<cfinvoke", sourceLine ) && find( char( 35 ), sourceLine ) ) ) {
+					unresolved.append( unresolvedEvidence( "dynamic-component", path, lineNumber, sourceLine ) );
+				}
+				if ( reFindNoCase( "(cfhttp|httpRequest|httpClient|fetch)", sourceLine ) ) dependencies.append( dependency( "http", "outbound", lineEvidence ) );
+				if ( findNoCase( "cfschedule", sourceLine ) || findNoCase( "schedule", sourceLine ) || findNoCase( "onschedule", lCase( sourceLine ) ) ) dependencies.append( dependency( "schedule", "scheduled-work", lineEvidence ) );
+				if ( reFindNoCase( "(cf_file|fileRead|fileWrite|fileCopy|fileMove|directoryList|directoryCreate|fileUpload|cffile)", sourceLine ) ) dependencies.append( dependency( "filesystem", "filesystem", lineEvidence ) );
+				if ( ( findNoCase( "createobject", sourceLine ) && findNoCase( "java", sourceLine ) ) || findNoCase( "new java.", sourceLine ) ) dependencies.append( dependency( "java", "java-interop", lineEvidence ) );
+				if ( reFindNoCase( "(datasource|this[.]datasource)[ ]*=", sourceLine ) ) dependencies.append( dependency( "datasource", extractQuotedOrValue( sourceLine, "datasource" ), lineEvidence ) );
+				if ( reFindNoCase( "(queryExecute|executeQuery|cfquery|queryNew|cfstoredproc)", sourceLine ) ) {
+					dependencies.append( dependency( "query", "sql", lineEvidence ) );
+					if ( reFindNoCase( "(cf_sql_[A-Za-z0-9_]+|cfsqltype|sqltype)", sourceLine ) ) dependencies.append( dependency( "sql-type-hint", "sql-type-hint", lineEvidence ) );
+					if ( reFindNoCase( "cfstoredproc|CALL[ ]+[A-Za-z_]", sourceLine ) ) dependencies.append( dependency( "sql-proc-call", "stored-procedure", lineEvidence ) );
+					var sqlInfo = sqlReferences( sourceLine );
+					for ( var tableRef in sqlInfo.tables ) dependencies.append( dependency( "table-query", tableRef, lineEvidence ) );
+					for ( var columnRef in sqlInfo.columns ) dependencies.append( dependency( "column-query", columnRef, lineEvidence ) );
+					if ( sqlInfo.unparameterized ) unresolved.append( unresolvedEvidence( "unparameterized-sql", path, lineNumber, sourceLine ) );
+					if ( sqlInfo.parameterMismatch ) dependencies.append( dependency( "sql-parameter-mismatch", "parameter-binding", lineEvidence ) );
+					if ( sqlInfo.dynamicIdentifier ) unresolved.append( unresolvedEvidence( "dynamic-sql", path, lineNumber, sourceLine ) );
+				}
+				for ( var scope in [ "session", "application", "client" ] ) {
+					if ( reFindNoCase( "#scope#[ ]*[.]", sourceLine ) ) dependencies.append( dependency( "scope.#scope#", scope, lineEvidence ) );
+				}
+				if ( reFindNoCase( "session[.](user|isLoggedIn|authenticated)|isLoggedIn|loginRequired|authenticate|authorize", sourceLine ) ) dependencies.append( dependency( "security-session-gate", "session-gate", lineEvidence ) );
+				if ( findNoCase( "evaluate", sourceLine ) ) unresolved.append( unresolvedEvidence( "dynamic-evaluate", path, lineNumber, sourceLine ) );
+				var route = routeFromLine( path, lineNumber, sourceLine, file );
+				if ( !isNull( route ?: javacast( "null", "" ) ) ) {
+					routeEvidence.append( route );
+					if ( route.unresolved ?: false ) unresolved.append( unresolvedEvidence( "dynamic-route", path, lineNumber, sourceLine ) );
+				}
+			}
+		}
+		units.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.symbolName, b.filePath & ":" & b.startLine & ":" & b.symbolName ) );
+		dependencies.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.kind & ":" & a.target, b.filePath & ":" & b.startLine & ":" & b.kind & ":" & b.target ) );
+		unresolved.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.kind, b.filePath & ":" & b.startLine & ":" & b.kind ) );
+		var noScope = cfmlFileCount == 0;
+		return {
+			version       : variables.version,
+			files         : inventoryFiles,
+			units         : units,
+			dependencies  : dependencies,
+			routeEvidence : routeEvidence,
+			unresolved    : unresolved,
+			noModernizationScope: noScope,
+			type          : noScope ? "NoModernizationScope" : "ModernizationInventory",
+			status        : noScope ? "NoModernizationScope" : "ready",
+			summary       : {
+				cfmlFiles: cfmlFileCount,
+				unitCount: units.len(),
+				dependencyCount: dependencies.len(),
+				unresolvedCount: unresolved.len(),
+				totalBytes: totalBytes
+			},
+			coverage      : isStruct( arguments.scan ) ? ( arguments.scan.scope ?: "full" ) : "full",
+			fingerprint   : lCase( hash( variables.version & "|" & jsonSerialize( { files: inventoryFiles, units: units, dependencies: dependencies, unresolved: unresolved } ), "SHA-256" ) )
+		};
+	}
+
+	struct function inventory( required any scan ) returntype="struct" { return build( arguments.scan ); }
+	struct function analyze( required any scan ) returntype="struct" { return build( arguments.scan ); }
+
+	private struct function extractFunctions( required string path, required array lines, required struct file ) {
+		var result = { units: [], unresolved: [] };
+		for ( var lineNumber = 1; lineNumber <= arguments.lines.len(); lineNumber++ ) {
+			var sourceLine = toString( arguments.lines[ lineNumber ] );
+				var tagMatch = variables.javaPatternMatcher( "<cffunction\\s+[^>]*\\bname\\s*=[^A-Za-z0-9_]*([A-Za-z_][A-Za-z0-9_.-]*)[^>]*>", sourceLine );
+			if ( tagMatch.find() ) {
+				var endLine = findClosingTag( arguments.lines, lineNumber, "</cffunction>" );
+				var tagUnit = makeUnit( "function", arguments.path, tagMatch.group( 1 ), lineNumber, endLine, "tag-regex-v1", arguments.file, [ "signature", "access", "return" ] );
+				tagUnit.parameters = extractTagArguments( arguments.lines, lineNumber, endLine );
+				var tagParameterNames = tagUnit.parameters.map( ( item ) => item.name ).toList( ", " );
+				tagUnit.signature = tagMatch.group( 1 ) & "(" & tagParameterNames & ")";
+				result.units.append( tagUnit );
+				continue;
+			}
+				var fnMatch = variables.javaPatternMatcher( "(?:(?:public|private|protected|remote|static|final)\\s+)*(?:[A-Za-z_][A-Za-z0-9_.$]*\\s+)?function\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(([^)]*)\\)", sourceLine );
+			if ( fnMatch.find() ) {
+				var fnName = fnMatch.group( 1 );
+				var endLine = findFunctionEnd( arguments.lines, lineNumber );
+				var unit = makeUnit( "function", arguments.path, fnName, lineNumber, endLine, "script-regex-v1", arguments.file, [ "signature", "access", "return" ] );
+				unit.signature = "#fnName#(#trim( fnMatch.group( 2 ) )#)";
+				unit.parameters = parseParameters( fnMatch.group( 2 ) );
+				result.units.append( unit );
+			}
+		}
+		return result;
+	}
+
+	private array function parseParameters( required string parameterText ) {
+		var output = [];
+		for ( var rawParameter in listToArray( arguments.parameterText, ",", true, true ) ) {
+			var value = trim( rawParameter );
+			if ( !len( value ) ) continue;
+			var parameterMatch = variables.javaPatternMatcher( "(?i)^(?:(required|optional)\\s+)?(?:(string|numeric|boolean|struct|array|query|any|date|component|[A-Za-z_][A-Za-z0-9_.]*)\\s+)?([A-Za-z_][A-Za-z0-9_]*)", value );
+			if ( parameterMatch.find() ) {
+				output.append( { name: parameterMatch.group( 3 ), type: parameterMatch.group( 2 ) ?: "any", required: lCase( parameterMatch.group( 1 ) ?: "optional" ) == "required" } );
+			} else {
+				output.append( { name: left( value, 120 ), type: "unknown", required: false, unresolved: true } );
+			}
+		}
+		return output;
+	}
+
+	private array function extractTagArguments( required array lines, required numeric startLine, required numeric endLine ) {
+		var output = [];
+		for ( var lineNumber = arguments.startLine; lineNumber <= arguments.endLine && lineNumber <= arguments.lines.len(); lineNumber++ ) {
+				var argumentMatch = variables.javaPatternMatcher( "(?i)<cfargument\\s+[^>]*\\bname\\s*=[^A-Za-z0-9_]*([A-Za-z_][A-Za-z0-9_.-]*)[^>]*>", toString( arguments.lines[ lineNumber ] ) );
+			if ( argumentMatch.find() ) {
+				var line = toString( arguments.lines[ lineNumber ] );
+					var typeMatch = variables.javaPatternMatcher( "(?i)\\btype\\s*=[^A-Za-z]*([A-Za-z][A-Za-z0-9_-]*)", line );
+					var requiredMatch = variables.javaPatternMatcher( "(?i)\\brequired\\s*=[^A-Za-z0-9]*(true|false|yes|no|1|0)", line );
+				output.append( { name: argumentMatch.group( 1 ), type: typeMatch.find() ? typeMatch.group( 1 ) : "any", required: requiredMatch.find() && [ "true", "yes", "1" ].contains( lCase( requiredMatch.group( 1 ) ) ) } );
+			}
+		}
+		return output;
+	}
+
+	private struct function makeUnit(
+		required string kind,
+		required string path,
+		required string name,
+		required numeric startLine,
+		required numeric endLine,
+		required string method,
+		required struct file,
+		array evidenceKinds = []
+	) {
+		var signature = arguments.name;
+		var id = stableItemId( "legacy-unit", "#arguments.path#:#arguments.startLine#:#arguments.name#:#arguments.kind#" );
+		var unitLines = structKeyExists( arguments.file, "lines" ) && isArray( arguments.file.lines ) ? arguments.file.lines : listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true );
+		var unitLine = ( unitLines.len() && arguments.startLine <= unitLines.len() ) ? unitLines[ arguments.startLine ] : "";
+		var access = "";
+		var accessMatch = variables.javaPatternMatcher( "(?i)^\\s*(public|private|protected|remote)\\b", unitLine );
+		if ( accessMatch.find() ) access = lCase( accessMatch.group( 1 ) );
+		var returnType = "";
+		// Keep the return-type capture conservative and quote-agnostic.  The
+		// previous character-class expression was parsed as a malformed numeric
+		// pattern by BoxLang's regex bridge on some runtimes.
+		var returnMatch = variables.javaPatternMatcher( "(?i)returntype[[:space:]]*=[[:space:]]*[^A-Za-z0-9]*([A-Za-z0-9_.-]+)", unitLine );
+		if ( returnMatch.find() ) returnType = returnMatch.group( 1 );
+		return {
+			id: id,
+			filePath: arguments.path,
+			layer: arguments.kind == "application" ? "application" : ( arguments.kind == "page" ? "page" : ( arguments.kind == "custom-tag" ? "custom-tag" : "component" ) ),
+			unitType: arguments.kind,
+			symbolName: arguments.name,
+			signature: signature,
+			startLine: arguments.startLine,
+			endLine: max( arguments.startLine, arguments.endLine ),
+			access: access,
+			returnType: returnType,
+			evidenceRefs: [ { filePath: arguments.path, startLine: arguments.startLine, endLine: max( arguments.startLine, arguments.endLine ), extractionMethod: arguments.method, contentHash: arguments.file.contentHash ?: "" } ],
+			signalIds: [],
+			touchedTables: [],
+			touchedColumns: [],
+			extractionMethod: arguments.method
+		};
+	}
+
+	private struct function evidence(required string path, required numeric lineNumber, required string line, required struct file) {
+		return { filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", contentHash: arguments.file.contentHash ?: lCase( hash( arguments.line, "SHA-256" ) ), snippet: left( trim( arguments.line ), 240 ) };
+	}
+
+	private struct function dependency( required string kind, required string target, required struct evidence ) {
+		return { id: stableItemId( "dependency", "#arguments.kind#:#arguments.evidence.filePath#:#arguments.evidence.startLine#:#arguments.target#" ), kind: arguments.kind, target: arguments.target, filePath: arguments.evidence.filePath, startLine: arguments.evidence.startLine, endLine: arguments.evidence.endLine, evidenceRefs: [ arguments.evidence ] };
+	}
+
+	private struct function unresolvedEvidence( required string kind, required string path, required numeric lineNumber, required string line ) {
+		return { id: stableItemId( "unresolved", "#arguments.kind#:#arguments.path#:#arguments.lineNumber#" ), kind: arguments.kind, filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", evidence: left( trim( arguments.line ), 240 ) };
+	}
+
+	private struct function routeFromLine(required string path, required numeric lineNumber, required string line, required struct file) {
+		var matcher = variables.javaPatternMatcher( "(?i)(action|href|url)[ ]*=[^A-Za-z0-9_./:?&=-]*([^[:space:]>]+)", arguments.line );
+		if ( matcher.find() ) {
+			var routePath = matcher.group( 2 );
+			var methodMatch = variables.javaPatternMatcher( "(?i)method[ ]*=[^A-Za-z]*([A-Za-z]+)", arguments.line );
+			var method = methodMatch.find() ? uCase( methodMatch.group( 1 ) ) : "GET";
+			return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:#routePath#" ), legacyPath: routePath, method: method, filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: find( char( 35 ), routePath ) > 0 };
+		}
+		if ( reFindNoCase( "<form\\b|<a\\b|\\burl\\s*=", arguments.line ) ) {
+			return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#dynamic" ), legacyPath: "", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: true };
+		}
+		return javacast( "null", "" );
+	}
+
+	private struct function remoteRouteFromLine(required string path, required numeric lineNumber, required string line, required struct file) {
+		if ( !reFindNoCase( "\bremote\b.*\bfunction\b|<cffunction\b.*\baccess\s*=\s*[\""']remote", arguments.line ) ) return javacast( "null", "" );
+		var matcher = variables.javaPatternMatcher( "(?i)(?:function\s+|name\s*=\s*[\""'])([A-Za-z_][A-Za-z0-9_]*)", arguments.line );
+		if ( !matcher.find() ) return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:remote" ), legacyPath: "", method: "UNKNOWN", routeKind: "remote-cfc-method", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "remote-cfc-regex-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: true };
+		var name = matcher.group( 1 );
+		return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:remote:#name#" ), legacyPath: "remote:#name#", method: "UNKNOWN", routeKind: "remote-cfc-method", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "remote-cfc-regex-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: false };
+	}
+
+	private struct function sqlReferences( required string line ) {
+		var tables = [];
+		var columns = [];
+		var tableMatch = variables.javaPatternMatcher( "(?:from|join|into|update|delete\\s+from)\\s+([A-Za-z_][A-Za-z0-9_.$-]*)", arguments.line );
+		while ( tableMatch.find() ) tables.append( tableMatch.group( 1 ) );
+		var columnMatch = variables.javaPatternMatcher( "\\b([A-Za-z_][A-Za-z0-9_.$-]*)\\s*(?:=|>|<|in\\s*\\(|like\\s)", arguments.line );
+		while ( columnMatch.find() ) columns.append( columnMatch.group( 1 ) );
+		var sqlKeyword = reFindNoCase( "(select|insert|update|delete)", arguments.line ) > 0;
+		var hasInterpolation = find( char( 35 ), arguments.line ) > 0 || find( "&", arguments.line ) > 0 || find( "+", arguments.line ) > 0 || findNoCase( "stringFormat", arguments.line ) > 0;
+		var unparameterized = sqlKeyword && hasInterpolation;
+		var hasBinding = reFindNoCase( "(cfqueryparam|params?|queryParams|setParameter)", arguments.line ) > 0;
+		var parameterMismatch = unparameterized || ( find( "?", arguments.line ) > 0 && !hasBinding );
+			var dynamicIdentifier = ( reFindNoCase( "(from|join|into|update|delete)[ ]+", arguments.line ) > 0 ) && find( char( 35 ), arguments.line ) > 0;
+		return { tables: tables, columns: columns, unparameterized: unparameterized, parameterMismatch: parameterMismatch, dynamicIdentifier: dynamicIdentifier };
+	}
+
+	private string function extractQuotedOrValue(required string line, required string name) {
+		var marker = lCase( trim( arguments.name ) ) & "=";
+		var position = findNoCase( marker, arguments.line );
+		if ( !position ) return "";
+		var value = trim( mid( arguments.line, position + len( marker ), len( arguments.line ) ) );
+		if ( len( value ) >= 2 && ( ( left( value, 1 ) == char( 34 ) && right( value, 1 ) == char( 34 ) ) || ( left( value, 1 ) == char( 39 ) && right( value, 1 ) == char( 39 ) ) ) ) value = mid( value, 2, len( value ) - 2 );
+		return left( value, 160 );
+	}
+
+	private string function classifyUnit(required string path) {
+		var lower = lCase( arguments.path );
+		if ( reFindNoCase( "(^|/)application\\.cfc$", lower ) ) return "application";
+		if ( reFindNoCase( "(^|/)(customtags?|tags)(/|$)", lower ) ) return "custom-tag";
+		return "component";
+	}
+
+	private numeric function findClosingTag(required array lines, required numeric startLine, required string closingTag) {
+		for ( var i = arguments.startLine; i <= arguments.lines.len(); i++ ) if ( reFindNoCase( arguments.closingTag, arguments.lines[ i ] ) ) return i;
+		return arguments.lines.len();
+	}
+
+	private numeric function findFunctionEnd(required array lines, required numeric startLine) {
+		var depth = 0;
+		for ( var i = arguments.startLine; i <= arguments.lines.len(); i++ ) {
+			var line = arguments.lines[ i ];
+			depth += len( reMatchNoCase( "\\b(function|if|for|while|switch|try)\\b", line ) );
+			depth -= len( reMatchNoCase( "\\b(end|})\\b", line ) );
+			if ( i > arguments.startLine && depth <= 0 ) return i;
+		}
+		return arguments.lines.len();
+	}
+
+	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" ); }
+	private string function normalizeText(required string text) { return replace( replace( arguments.text, char( 13 ), "", "all" ), char( 0 ), "", "all" ); }
+	private string function stableItemId(required string kind, required string identity) {
+		try { if ( !isNull( variables.identityService ?: javacast( "null", "" ) ) ) return variables.identityService.itemId( arguments.kind, arguments.identity ); } catch ( any ignore ) {}
+		return lCase( hash( lCase( arguments.kind & "|" & normalizePath( arguments.identity ) ), "SHA-256" ) );
+	}
+	private any function javaPatternMatcher( required string expression, required string source ) {
+		// BoxLang source literals retain doubled backslashes while Java's regex
+		// bridge expects a single escape character. Normalize only the doubled
+		// form so the conservative patterns below compile consistently.
+		var expressionText = replace( arguments.expression, char( 92 ) & char( 92 ), char( 92 ), "all" );
+		return createObject( "java", "java.util.regex.Pattern" ).compile(
+			expressionText,
+			createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE
+		).matcher( arguments.source );
+	}
+}

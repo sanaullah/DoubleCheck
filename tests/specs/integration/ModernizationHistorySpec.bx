@@ -1,0 +1,86 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function run() {
+		describe( "Modernization history compatibility", () => {
+			beforeEach( () => setup() );
+
+			it( "filters Modernize rows and exposes plan state instead of Review severity", () => {
+				var marker = lCase( createUUID() );
+				var runId = "modern-history-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var modernizationRepository = getInstance( "ModernizationRepository" );
+				try {
+					runRepository.create( {
+						id          : runId,
+						tenantId    : "default",
+						projectId   : "default",
+						projectPath : "C:/modern-history/#marker#",
+						mode        : "full",
+						runKind     : "modernize",
+						input       : { version: "modernization-input-v1" },
+						baseRevision: "",
+						headRevision: "HEAD",
+						status      : "succeeded",
+						progress    : 100,
+						currentPhase: "completed",
+						message     : "Modernization history fixture",
+						policy      : { version: "modernization-input-v1" },
+						budgets     : {},
+						createdAt   : nowValue,
+						updatedAt   : nowValue
+					} );
+					modernizationRepository.savePlan(
+						runId,
+						{
+							version: "modernization-plan-v1",
+							state  : "needs-review",
+							metadata: { runId: runId }
+						},
+						{ status: "warning", blockingCount: 1, warningCount: 2 },
+						{ status: "inference-limited", schema: { coverage: "absent" } }
+					);
+
+					var history = this.get( "/api/v1/history?runKind=modernize&q=#marker#" );
+					expect( history.getResponse() ).toHaveStatus( 200 );
+					var body = jsonDeserialize( history.getRenderedContent() );
+					expect( body.data ).toHaveLength( 1 );
+					expect( body.data[ 1 ].run.runKind ).toBe( "modernize" );
+					expect( body.data[ 1 ].run.planState ).toBe( "needs-review" );
+					expect( body.data[ 1 ].metrics.modernization.validationStatus ).toBe( "warning" );
+					expect( body.data[ 1 ].metrics.modernization.blocking ).toBe( 1 );
+					expect( body.data[ 1 ].metrics.modernization.warnings ).toBe( 2 );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
+			it( "rejects Review baseline comparison for a Modernize run", () => {
+				var runId = "modern-history-compare-#lCase( createUUID() )#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id: runId, tenantId: "default", projectId: "default",
+						projectPath: "C:/modern-history-compare", mode: "full", runKind: "modernize",
+						input: {}, baseRevision: "", headRevision: "HEAD", status: "succeeded",
+						progress: 100, currentPhase: "completed", message: "Comparison fixture",
+						policy: {}, budgets: {}, createdAt: nowValue, updatedAt: nowValue
+					} );
+					var response = this.get( "/api/v1/history/#runId#/comparison" );
+					expect( response.getResponse() ).toHaveStatus( 422 );
+					var body = jsonDeserialize( response.getRenderedContent() );
+					expect( body.error.code ).toBe( "modernization_comparison_unsupported" );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
+			it( "rejects an unknown history run kind", () => {
+				var response = this.get( "/api/v1/history?runKind=upgrade" );
+				expect( response.getResponse() ).toHaveStatus( 422 );
+				var body = jsonDeserialize( response.getRenderedContent() );
+				expect( body.error.code ).toBe( "invalid_run_kind" );
+			} );
+		} );
+	}
+}

@@ -1,0 +1,97 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+			describe( "Modernization proposal orchestration", () => {
+			it( "preserves millisecond timestamps without int overflow", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-timestamp", { startedAt: getTickCount(), target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( gateway.callCount() ).toBe( 3 );
+			} );
+
+			it( "merges role fragments, adds stable identities and sorts deterministically", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ { id: "z-unit", targetPath: "app/z.bx" }, { id: "a-unit", targetPath: "app/a.bx" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-2" }, { id: "phase-1" } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				expect( service.agentGateway.isEnabled() ).toBeTrue();
+				var result = service.propose( "run-1", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.target.units[ 1 ].id ).toBe( "a-unit" );
+				expect( result.plan.target.units[ 1 ].itemFingerprint ).notToBeEmpty();
+				expect( result.plan.roadmapPhases[ 1 ].id ).toBe( "phase-1" );
+				expect( gateway.callCount() ).toBe( 3 );
+			} );
+
+			it( "retains a usable partial plan when the roadmap role fails", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { throw: true, message: "provider down" }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-2", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				expect( result.errors ).notToBeEmpty();
+			} );
+
+			it( "honors the immutable task budget and skips roadmap generation", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-3", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 2, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				expect( gateway.callCount() ).toBe( 2 );
+			} );
+
+			it( "repairs only the invalid fingerprint-listed item", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-repair": { replacements: [ { itemFingerprint: "bad-fp", targetPath: "app/Fixed.bx" } ] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.repair(
+					"run-4",
+					{ schemaVersion: "modernization-plan-v1", target: { units: [ { id: "unit-1", itemFingerprint: "bad-fp", targetPath: "../bad.cfc" }, { id: "unit-2", itemFingerprint: "good-fp", targetPath: "app/Good.bx" } ] } },
+					{ blocking: 1, messages: [ { category: "target.units", level: "blocking", itemId: "unit-1", message: "unsafe path" } ] },
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxIterations: 2 } },
+					{},
+					1
+				);
+				expect( result.repaired ).toBeTrue();
+				expect( result.plan.target.units[ 1 ].targetPath ).toBe( "app/Fixed.bx" );
+				expect( result.plan.target.units[ 2 ].targetPath ).toBe( "app/Good.bx" );
+			} );
+		} );
+	}
+}

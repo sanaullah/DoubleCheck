@@ -1,0 +1,291 @@
+/** SQLite persistence for schema evidence, modernization checkpoints, plans, and decisions. */
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	struct function saveSchemaPack( required string runId, required struct schemaPack ) {
+		var nowValue = timestamp();
+		var pack = arguments.schemaPack;
+		var normalized = {
+			sourceKind  : pack.sourceKind ?: pack.source_kind ?: "none",
+			format      : pack.format ?: "",
+			relativePath: pack.relativePath ?: pack.relative_path ?: "",
+			contentHash : pack.contentHash ?: pack.content_hash ?: "",
+			packVersion : pack.packVersion ?: pack.pack_version ?: "",
+			metadata    : pack.metadata ?: {},
+			sanitized   : pack.sanitized ?: pack.data ?: pack
+		};
+		queryExecute(
+			"
+				INSERT INTO modernization_schema_packs
+				(run_id, source_kind, format, relative_path, content_hash, pack_version, metadata_json, sanitized_json, created_at)
+				VALUES (:runId, :sourceKind, :format, :relativePath, :contentHash, :packVersion, :metadataJson, :sanitizedJson, :createdAt)
+				ON CONFLICT(run_id) DO UPDATE SET
+				 source_kind = excluded.source_kind,
+				 format = excluded.format,
+				 relative_path = excluded.relative_path,
+				 content_hash = excluded.content_hash,
+				 pack_version = excluded.pack_version,
+				 metadata_json = excluded.metadata_json,
+				 sanitized_json = excluded.sanitized_json
+			",
+			{
+				runId      : arguments.runId,
+				sourceKind : normalized.sourceKind,
+				format     : normalized.format,
+				relativePath: normalized.relativePath,
+				contentHash: normalized.contentHash,
+				packVersion: normalized.packVersion,
+				metadataJson: jsonSerialize( normalized.metadata ),
+				sanitizedJson: jsonSerialize( normalized.sanitized ),
+				createdAt  : nowValue
+			},
+			{ datasource: datasource }
+		);
+		return getSchemaPack( arguments.runId );
+	}
+
+	any function getSchemaPack( required string runId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_schema_packs WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		if ( !records.recordCount ) return javacast( "null", "" );
+		return {
+			runId      : records.run_id[ 1 ],
+			sourceKind : records.source_kind[ 1 ],
+			format     : records.format[ 1 ],
+			relativePath: records.relative_path[ 1 ],
+			contentHash: records.content_hash[ 1 ],
+			packVersion: records.pack_version[ 1 ],
+			metadata   : parseJson( records.metadata_json[ 1 ], {} ),
+			sanitized  : parseJson( records.sanitized_json[ 1 ], {} ),
+			createdAt  : records.created_at[ 1 ]
+		};
+	}
+
+	struct function saveCheckpoint( required string runId, required string stage, required struct checkpoint ) {
+		var value = arguments.checkpoint;
+		var nowValue = timestamp();
+		queryExecute(
+			"
+				INSERT INTO modernization_checkpoints (run_id, stage, status, progress, payload_json, updated_at)
+				VALUES (:runId, :stage, :status, :progress, :payloadJson, :updatedAt)
+				ON CONFLICT(run_id, stage) DO UPDATE SET
+				 status = excluded.status, progress = excluded.progress,
+				 payload_json = excluded.payload_json, updated_at = excluded.updated_at
+			",
+			{
+				runId     : arguments.runId,
+				stage     : arguments.stage,
+				status    : value.status ?: "pending",
+				progress  : isNumeric( value.progress ?: 0 ) ? int( value.progress ) : 0,
+				payloadJson: jsonSerialize( value.payload ?: value ),
+				updatedAt : nowValue
+			},
+			{ datasource: datasource }
+		);
+		return {
+			runId: arguments.runId,
+			stage: arguments.stage,
+			status: value.status ?: "pending",
+			progress: isNumeric( value.progress ?: 0 ) ? int( value.progress ) : 0,
+			payload: value.payload ?: value,
+			updatedAt: nowValue
+		};
+	}
+
+	array function getCheckpoints( required string runId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_checkpoints WHERE run_id = :runId ORDER BY updated_at, stage",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var output = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			output.append( {
+				runId: records.run_id[ row ],
+				stage: records.stage[ row ],
+				status: records.status[ row ],
+				progress: records.progress[ row ],
+				payload: parseJson( records.payload_json[ row ], {} ),
+				updatedAt: records.updated_at[ row ]
+			} );
+		}
+		return output;
+	}
+
+	struct function savePlan(
+		required string runId,
+		required any plan,
+		struct validation = {},
+		struct coverage = {}
+	) {
+		var planData = isObject( arguments.plan )
+			? arguments.plan.getMemento()
+			: ( isStruct( arguments.plan ) ? arguments.plan : {} );
+		var nowValue = timestamp();
+		var version = planData.version ?: planData.planVersion ?: "modernization-plan-v1";
+		var fingerprint = planData.fingerprint ?: lCase( hash( jsonSerialize( planData ), "SHA-256" ) );
+		var state = planData.state ?: "generated";
+		queryExecute(
+			"
+				INSERT INTO modernization_plans
+				(run_id, plan_version, state, fingerprint, plan_json, validation_json, coverage_json, created_at, updated_at)
+				VALUES (:runId, :planVersion, :state, :fingerprint, :planJson, :validationJson, :coverageJson, :createdAt, :updatedAt)
+				ON CONFLICT(run_id) DO UPDATE SET
+				 plan_version = excluded.plan_version, state = excluded.state,
+				 fingerprint = excluded.fingerprint, plan_json = excluded.plan_json,
+				 validation_json = excluded.validation_json, coverage_json = excluded.coverage_json,
+				 updated_at = excluded.updated_at
+			",
+			{
+				runId: arguments.runId,
+				planVersion: version,
+				state: state,
+				fingerprint: fingerprint,
+				planJson: jsonSerialize( planData ),
+				validationJson: jsonSerialize( arguments.validation ),
+				coverageJson: jsonSerialize( arguments.coverage ),
+				createdAt: nowValue,
+				updatedAt: nowValue
+			},
+			{ datasource: datasource }
+		);
+		return getPlan( arguments.runId );
+	}
+
+	any function getPlan( required string runId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_plans WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		if ( !records.recordCount ) return javacast( "null", "" );
+		return {
+			runId: records.run_id[ 1 ],
+			planVersion: records.plan_version[ 1 ],
+			state: records.state[ 1 ],
+			fingerprint: records.fingerprint[ 1 ],
+			plan: parseJson( records.plan_json[ 1 ], {} ),
+			validation: parseJson( records.validation_json[ 1 ], {} ),
+			coverage: parseJson( records.coverage_json[ 1 ], {} ),
+			createdAt: records.created_at[ 1 ],
+			updatedAt: records.updated_at[ 1 ]
+		};
+	}
+
+	struct function upsertDecision( required string runId, required struct decision ) {
+		var item = arguments.decision;
+		var nowValue = timestamp();
+		queryExecute(
+			"
+				INSERT INTO modernization_decisions
+				(run_id, item_type, item_id, decision, note, item_fingerprint, decided_by, created_at, updated_at)
+				VALUES (:runId, :itemType, :itemId, :decision, :note, :itemFingerprint, :decidedBy, :createdAt, :updatedAt)
+				ON CONFLICT(run_id, item_type, item_id) DO UPDATE SET
+				 decision = excluded.decision, note = excluded.note,
+				 item_fingerprint = excluded.item_fingerprint, decided_by = excluded.decided_by,
+				 updated_at = excluded.updated_at
+			",
+			{
+				runId: arguments.runId,
+				itemType: item.itemType ?: item.item_type ?: "",
+				itemId: item.itemId ?: item.item_id ?: "",
+				decision: item.decision ?: "",
+				note: item.note ?: "",
+				itemFingerprint: item.itemFingerprint ?: item.item_fingerprint ?: "",
+				decidedBy: item.decidedBy ?: item.decided_by ?: "",
+				createdAt: nowValue,
+				updatedAt: nowValue
+			},
+			{ datasource: datasource }
+		);
+		return findDecision( arguments.runId, item.itemType ?: item.item_type ?: "", item.itemId ?: item.item_id ?: "" );
+	}
+
+	any function findDecision( required string runId, required string itemType, required string itemId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_decisions WHERE run_id = :runId AND item_type = :itemType AND item_id = :itemId",
+			{ runId: arguments.runId, itemType: arguments.itemType, itemId: arguments.itemId },
+			{ datasource: datasource }
+		);
+		return records.recordCount ? hydrateDecision( records, 1 ) : javacast( "null", "" );
+	}
+
+	void function deleteDecision( required string runId, required string itemType, required string itemId ) {
+		queryExecute(
+			"DELETE FROM modernization_decisions WHERE run_id = :runId AND item_type = :itemType AND item_id = :itemId",
+			{ runId: arguments.runId, itemType: arguments.itemType, itemId: arguments.itemId },
+			{ datasource: datasource }
+		);
+	}
+
+	array function listDecisions( required string runId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_decisions WHERE run_id = :runId ORDER BY item_type, item_id",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var output = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) output.append( hydrateDecision( records, row ) );
+		return output;
+	}
+
+	struct function appendDecisionEvent( required string runId, required struct event ) {
+		var item = arguments.event;
+		queryExecute(
+			"
+				INSERT INTO modernization_decision_events
+				(run_id, item_type, item_id, action, decision_json, actor, created_at)
+				VALUES (:runId, :itemType, :itemId, :action, :decisionJson, :actor, :createdAt)
+			",
+			{
+				runId: arguments.runId,
+				itemType: item.itemType ?: item.item_type ?: "",
+				itemId: item.itemId ?: item.item_id ?: "",
+				action: item.action ?: "updated",
+				decisionJson: jsonSerialize( item.decision ?: item ),
+				actor: item.actor ?: item.decidedBy ?: "",
+				createdAt: timestamp()
+			},
+			{ datasource: datasource }
+		);
+		return { success: true };
+	}
+
+	array function listDecisionEvents( required string runId ) {
+		var records = queryExecute(
+			"SELECT * FROM modernization_decision_events WHERE run_id = :runId ORDER BY id",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var output = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			output.append( {
+				id: records.id[ row ], runId: records.run_id[ row ], itemType: records.item_type[ row ],
+				itemId: records.item_id[ row ], action: records.action[ row ],
+				decision: parseJson( records.decision_json[ row ], {} ), actor: records.actor[ row ], createdAt: records.created_at[ row ]
+			} );
+		}
+		return output;
+	}
+
+	private struct function hydrateDecision( required query records, required numeric row ) {
+		return {
+			runId: records.run_id[ arguments.row ], itemType: records.item_type[ arguments.row ], itemId: records.item_id[ arguments.row ],
+			decision: records.decision[ arguments.row ], note: records.note[ arguments.row ],
+			itemFingerprint: records.item_fingerprint[ arguments.row ], decidedBy: records.decided_by[ arguments.row ],
+			createdAt: records.created_at[ arguments.row ], updatedAt: records.updated_at[ arguments.row ]
+		};
+	}
+
+	private any function parseJson( required any value, required any fallback ) {
+		try { return jsonDeserialize( arguments.value ); } catch (any ignored) { return duplicate( arguments.fallback ); }
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

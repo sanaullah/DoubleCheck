@@ -73,6 +73,14 @@ class {
 				"cancelled"
 			]
 		);
+		addAllowlistedFilter(
+			whereParts,
+			params,
+			"COALESCE(r.run_kind, 'review')",
+			"runKind",
+			lCase( trim( arguments.filters.runKind ?: "" ) ),
+			[ "review", "modernize" ]
+		);
 		if ( len( trim( arguments.filters.from ?: "" ) ) ) {
 			whereParts.append( "r.created_at >= :fromDate" );
 			params.fromDate = trim( arguments.filters.from );
@@ -116,9 +124,12 @@ class {
 					COALESCE(sp.task_count, 0) AS specialist_count,
 					COALESCE(sp.completed_count, 0) AS specialist_completed,
 					COALESCE(sp.failed_count, 0) AS specialist_failed,
-					COALESCE(sp.roles, '') AS specialist_roles
+					COALESCE(sp.roles, '') AS specialist_roles,
+					mp.state AS modernization_plan_state,
+					mp.validation_json AS modernization_validation_json
 				FROM review_runs r
 				LEFT JOIN review_summaries s ON s.run_id = r.id
+				LEFT JOIN modernization_plans mp ON mp.run_id = r.id
 				LEFT JOIN (
 					SELECT run_id,
 						SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS critical_count,
@@ -179,6 +190,12 @@ class {
 			);
 		if ( isNull( run ) ) {
 			return {};
+		}
+		if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+			return {
+				runId: run.getId(), runKind: "modernize", comparisonAvailable: false,
+				reason: "Baseline finding comparison is available for Review runs only."
+			};
 		}
 		var baselineRun = runRepository.findPriorEligibleBaseline(
 				run.getProjectPath(),
@@ -386,9 +403,13 @@ class {
 		}
 		var roles = len( records.specialist_roles[ row ] ) ? listToArray( records.specialist_roles[ row ] ) : [];
 		roles.sort( "textnocase" );
+		var runKind = nullable( records, "run_kind", row ) ?: "review";
+		var modernizationValidation = parseJsonColumn( records, "modernization_validation_json", row, {} );
+		var modernizationState = nullable( records, "modernization_plan_state", row );
 		return {
-			run: {
-				id         : records.id[ row ],
+				run: {
+					id         : records.id[ row ],
+					runKind    : runKind,
 				projectId  : records.project_id[ row ],
 				projectPath: records.project_path[ row ],
 				mode       : records.mode[ row ],
@@ -397,7 +418,8 @@ class {
 				message    : records.message[ row ],
 				createdAt  : records.created_at[ row ],
 				startedAt  : startedAt,
-				completedAt: completedAt
+					completedAt: completedAt,
+					planState  : runKind == "modernize" ? modernizationState : ""
 			},
 			metrics: {
 				durationMs       : durationMs,
@@ -419,6 +441,12 @@ class {
 					low     : records.low_count[ row ],
 					info    : records.info_count[ row ]
 				},
+				modernization: runKind == "modernize" ? {
+					planState: modernizationState,
+					validationStatus: modernizationValidation.status ?: modernizationValidation.overallStatus ?: "unknown",
+					blocking: modernizationValidation.blockingCount ?: modernizationValidation.blocking ?: 0,
+					warnings: modernizationValidation.warningCount ?: modernizationValidation.warnings ?: 0
+				} : {},
 				specialists: {
 					selected : roles,
 					total    : records.specialist_count[ row ],
@@ -630,5 +658,16 @@ class {
 		return isNull( arguments.records[ arguments.column ][ arguments.row ] )
 			? ""
 			: toString( arguments.records[ arguments.column ][ arguments.row ] );
+	}
+
+	private struct function parseJsonColumn( required query records, required string column, required numeric row, struct fallback = {} ) {
+		try {
+			var value = nullable( arguments.records, arguments.column, arguments.row );
+			if ( !len( value ) ) return duplicate( arguments.fallback );
+			var parsed = jsonDeserialize( value );
+			return isStruct( parsed ) ? parsed : duplicate( arguments.fallback );
+		} catch ( any ignored ) {
+			return duplicate( arguments.fallback );
+		}
 	}
 }

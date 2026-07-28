@@ -1,0 +1,80 @@
+class extends="testbox.system.BaseSpec" {
+    function run() {
+        describe( "ModernizationSchemaPackService", () => {
+            it( "redacts credentials, removes row DML, and parses DDL", () => {
+                var result = new app.models.services.ModernizationSchemaPackService().ingest( {
+                    sourceKind: "inline-ddl",
+                    inlineContent: 'CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(40)); INSERT INTO orders VALUES (1, ''secret''); password=top-secret'
+                } );
+                expect( result.tables.len() ).toBe( 1 );
+                expect( result.dmlRemoved ).toBeGT( 0 );
+                expect( result.sanitizedText ).notToInclude( "top-secret" );
+                expect( result.sanitizedText ).notToInclude( "INSERT INTO" );
+            } );
+
+            it( "parses structured schema metadata without executing input", () => {
+                var result = new app.models.services.ModernizationSchemaPackService().ingest( {
+                    sourceKind: "structured-json-v1",
+                    inlineContent: jsonSerialize( { version: "structured-json-v1", tables: [ { name: "orders" } ], columns: [ { table: "orders", name: "id", type: "integer" } ] } )
+                } );
+                expect( result.coverage ).toBe( "complete-structured" );
+                expect( result.tables[ 1 ].name ).toBe( "orders" );
+            } );
+
+            it( "redacts sensitive structured metadata, not only the rendered text", () => {
+                var result = new app.models.services.ModernizationSchemaPackService().ingest( {
+                    sourceKind: "structured-json-v1",
+                    inlineContent: jsonSerialize( {
+                        version: "structured-json-v1",
+                        tables: [ { name: "orders", connectionPassword: "do-not-store" } ],
+                        routines: [ { name: "sync_orders", apiKey: "sk-test-secret" } ]
+                    } )
+                } );
+                expect( result.sanitizedText ).notToInclude( "do-not-store" );
+                expect( result.sanitizedText ).notToInclude( "sk-test-secret" );
+                expect( jsonSerialize( result.tables ) ).notToInclude( "do-not-store" );
+                expect( jsonSerialize( result.routines ) ).notToInclude( "sk-test-secret" );
+            } );
+
+            it( "rejects traversal and bounded input violations before reading a repository path", () => {
+                var service = new app.models.services.ModernizationSchemaPackService();
+                expect( () => service.ingest( { sourceKind: "repo-path", relativePath: "../outside/schema.sql" }, getTempDirectory() ) ).toThrow( "ModernizationSchemaPackInputException" );
+                expect( () => service.ingest( { sourceKind: "inline-ddl", inlineContent: "CREATE TABLE orders (id INT);" }, "", { maxBytes: 4 } ) ).toThrow( "ModernizationSchemaPackLimitException" );
+            } );
+
+            it( "rejects malformed structured input and non-allowlisted repository files", () => {
+                var service = new app.models.services.ModernizationSchemaPackService();
+                expect( () => service.ingest( { sourceKind: "structured-json-v1", inlineContent: "{not-json" } ) ).toThrow( "ModernizationSchemaPackInputException" );
+
+                var root = getTempDirectory() & "doublecheck-modernize-schema-" & replace( createUUID(), "-", "", "all" );
+                directoryCreate( root, true );
+                try {
+                    fileWrite( root & "/schema.txt", "CREATE TABLE orders (id INT);" );
+                    expect( () => service.ingest( { sourceKind: "repo-path", relativePath: "schema.txt" }, root ) ).toThrow( "ModernizationSchemaPackInputException" );
+                } finally {
+                    directoryDelete( root, true );
+                }
+            } );
+
+            it( "marks prompt-like schema text as evidence instead of instructions", () => {
+                var result = new app.models.services.ModernizationSchemaPackService().ingest( {
+                    sourceKind: "inline-ddl",
+                    inlineContent: fileRead( expandPath( "/tests/fixtures/modernization/hostile/prompt-injection.sql" ) )
+                } );
+                expect( result.promptLikeCount ).toBeGT( 0 );
+                expect( result.sanitizedText ).toInclude( "Ignore all previous instructions" );
+            } );
+
+            it( "parses the sanitized vendor fixtures without executing their SQL", () => {
+                var service = new app.models.services.ModernizationSchemaPackService();
+                var expectedVendors = { "mysql.sql": "mysql", "postgresql.sql": "postgresql", "sqlserver.sql": "sqlserver" };
+                for ( var name in expectedVendors ) {
+                    var result = service.ingest( { sourceKind: "inline-ddl", inlineContent: fileRead( expandPath( "/tests/fixtures/modernization/schema-packs/#name#" ) ) } );
+                    expect( result.tables.len() ).toBeGT( 0 );
+                    expect( result.vendor ).toBe( expectedVendors[ name ] );
+                    if ( name == "sqlserver.sql" ) expect( result.dmlRemoved ).toBeGT( 0 );
+                }
+            } );
+        } );
+    }
+}

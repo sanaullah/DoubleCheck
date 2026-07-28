@@ -1,0 +1,32 @@
+/** Deterministic provider double for ModernizationProposalService specs. */
+class {
+	property name="responses" type="struct";
+	property name="enabled" type="boolean" default="true";
+	property name="calls" type="numeric" default="0";
+	property name="cancelled" type="array";
+
+	function init( struct responses = {}, boolean enabled = true ) {
+		variables.responses = duplicate( arguments.responses );
+		variables.enabled = arguments.enabled;
+		variables.calls = 0;
+		variables.cancelled = [];
+		return this;
+	}
+
+	boolean function isEnabled() { return variables.enabled; }
+
+	struct function run( required string runId, required struct agentRequest, struct options = {} ) {
+		variables.calls++;
+		if ( variables.cancelled.contains( arguments.runId ) ) throw( type = "RunCancelled", message = "scripted cancellation" );
+		var role = structKeyExists( arguments.agentRequest, "role" ) ? arguments.agentRequest.role : "";
+		if ( variables.responses.keyExists( role ) ) {
+			var response = variables.responses[ role ];
+			if ( isStruct( response ) && structKeyExists( response, "throw" ) && response.throw ) return { ok: false, payload: {}, attempt: 1, provider: "scripted", model: "scripted", error: structKeyExists( response, "message" ) ? response.message : "scripted failure" };
+			return { ok: true, payload: isStruct( response ) ? duplicate( response ) : response, attempt: 1, provider: "scripted", model: "scripted" };
+		}
+		return { ok: true, payload: {}, attempt: 1, provider: "scripted", model: "scripted" };
+	}
+
+	void function cancelRun( required string runId ) { variables.cancelled.append( arguments.runId ); }
+	numeric function callCount() { return variables.calls; }
+}

@@ -1,0 +1,56 @@
+class extends="testbox.system.BaseSpec" {
+    function run() {
+        describe( "ModernizationInventoryService", () => {
+            it( "extracts CFML units, dependencies, routes, and unresolved evidence", () => {
+                var service = new app.models.services.ModernizationInventoryService();
+                var result = service.build( { files: [
+                    { filePath: "Application.cfc", language: "ColdFusion", content: "component { function onApplicationStart() {} }", contentHash: "a" },
+                    { filePath: "index.cfm", language: "ColdFusion", content: '<cfinclude template="header.cfm"><form action="/orders.cfm"><cfhttp url="https://example.invalid">', contentHash: "b" },
+                    { filePath: "Order.cfc", language: "ColdFusion", content: 'component { function getOrder() { return queryExecute("SELECT id FROM orders"); } }', contentHash: "c" }
+                ] } );
+                expect( result.noModernizationScope ).toBeFalse();
+                expect( result.units.len() ).toBeGT( 2 );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "include" );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "http" );
+                expect( result.routeEvidence.len() ).toBe( 1 );
+                expect( result.routeEvidence[ 1 ].method ).toBe( "GET" );
+            } );
+
+            it( "keeps opaque components and function signatures visible", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    { filePath: "Opaque.cfc", language: "ColdFusion", content: "component { /* unsupported dynamic body */ }", contentHash: "opaque" },
+                    { filePath: "Orders.cfc", language: "ColdFusion", content: "component { public string function list(required string status, numeric page=1) { return ''; } }", contentHash: "orders" }
+                ] } );
+                expect( result.units.map( ( item ) => item.unitType ) ).toInclude( "component" );
+                var listUnit = result.units.filter( ( item ) => item.symbolName == "list" )[ 1 ];
+                expect( listUnit.signature ).toInclude( "list(" );
+                expect( listUnit.parameters.len() ).toBeGT( 0 );
+            } );
+
+            it( "returns a typed result for an empty CFML scope", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [ { filePath: "main.bx", language: "BoxLang", content: "class {}" } ] } );
+                expect( result.type ).toBe( "NoModernizationScope" );
+                expect( result.noModernizationScope ).toBeTrue();
+            } );
+
+            it( "indexes the compact legacy-shop fixture with unresolved evidence", () => {
+                var root = createObject( "java", "java.io.File" ).init( expandPath( "/tests/fixtures/modernization/legacy-shop" ) ).getCanonicalFile();
+                var files = [];
+                var listing = directoryList( root.getPath(), true, "query" );
+                for ( var row = 1; row <= listing.recordCount; row++ ) {
+                    if ( lCase( listing.type[ row ] ?: "" ) != "file" ) continue;
+                    var file = createObject( "java", "java.io.File" ).init( listing.directory[ row ] & createObject( "java", "java.io.File" ).separator & listing.name[ row ] ).getCanonicalFile();
+                    var relative = replace( root.toPath().relativize( file.toPath() ).toString(), "\\", "/", "all" );
+                    files.append( { filePath: relative, language: "ColdFusion", content: fileRead( file.getPath() ), contentHash: lCase( hash( fileRead( file.getPath() ), "SHA-256" ) ) } );
+                }
+                var result = new app.models.services.ModernizationInventoryService().build( { files: files, scope: "full" } );
+                expect( result.units.len() ).toBeGT( 3 );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "query" );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "http" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "unparameterized-sql" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "dynamic-evaluate" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "dynamic-component" );
+            } );
+        } );
+    }
+}

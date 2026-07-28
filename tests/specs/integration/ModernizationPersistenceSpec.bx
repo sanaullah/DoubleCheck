@@ -1,0 +1,68 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+    function run() {
+        describe( "Modernization persistence", () => {
+            beforeEach( () => setup() );
+
+            it( "hydrates run input and persists modernization artifacts with cascades", () => {
+                var runId = lCase( createUUID() );
+                var nowValue = dateTimeFormat( now(), "iso" );
+                var runRepository = getInstance( "ReviewRunRepository" );
+                var modernizationRepository = getInstance( "ModernizationRepository" );
+                try {
+                    var run = runRepository.create( {
+                        id: runId,
+                        tenantId: "default",
+                        projectId: "default",
+                        projectPath: "C:/modernization-fixture",
+                        mode: "full",
+                        runKind: "modernize",
+                        input: { version: "modernization-input-v1", privacy: { remoteProvider: false } },
+                        baseRevision: "",
+                        headRevision: "HEAD",
+                        status: "queued",
+                        progress: 0,
+                        currentPhase: "queued",
+                        message: "Persistence fixture",
+                        policy: { version: "modernization-input-v1" },
+                        budgets: {},
+                        createdAt: nowValue,
+                        updatedAt: nowValue
+                    } );
+                    expect( run.getRunKind() ).toBe( "modernize" );
+                    expect( run.getInput().version ).toBe( "modernization-input-v1" );
+
+                    modernizationRepository.saveSchemaPack( runId, { sourceKind: "inline-ddl", format: "sql-ddl", contentHash: "hash", sanitized: { coverage: "partial-ddl" } } );
+                    modernizationRepository.saveCheckpoint( runId, "inventory", { status: "completed", progress: 25, payload: { files: 2 } } );
+                    modernizationRepository.savePlan( runId, { version: "modernization-plan-v1", state: "needs-review", metadata: { runId: runId } }, { blocking: 0 }, { schemaCoverage: "partial-ddl" } );
+                    modernizationRepository.upsertDecision( runId, { itemType: "target-unit", itemId: "unit-1", decision: "accepted", itemFingerprint: "fp-1", note: "ok" } );
+                    modernizationRepository.appendDecisionEvent( runId, { itemType: "target-unit", itemId: "unit-1", action: "accepted", decision: { decision: "accepted" } } );
+
+                    expect( modernizationRepository.getSchemaPack( runId ).sanitized.coverage ).toBe( "partial-ddl" );
+                    expect( modernizationRepository.getCheckpoints( runId ).len() ).toBe( 1 );
+                    expect( modernizationRepository.getPlan( runId ).state ).toBe( "needs-review" );
+                    expect( modernizationRepository.listDecisions( runId ).len() ).toBe( 1 );
+                    expect( modernizationRepository.listDecisionEvents( runId ).len() ).toBe( 1 );
+                } finally {
+                    queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+                }
+                expect( modernizationRepository.getSchemaPack( runId ) ).toBeNull();
+                expect( modernizationRepository.getCheckpoints( runId ).len() ).toBe( 0 );
+                expect( modernizationRepository.listDecisions( runId ).len() ).toBe( 0 );
+            } );
+
+            it( "hydrates legacy rows as review runs with an empty immutable input", () => {
+                var runId = lCase( createUUID() );
+                var nowValue = dateTimeFormat( now(), "iso" );
+                var runRepository = getInstance( "ReviewRunRepository" );
+                try {
+                    queryExecute( "INSERT INTO review_runs (id, project_path, mode, status, created_at, updated_at) VALUES (:id, :path, 'full', 'queued', :nowValue, :nowValue)", { id: runId, path: "C:/legacy", nowValue: nowValue } );
+                    var run = runRepository.find( runId );
+                    expect( run.getRunKind() ).toBe( "review" );
+                    expect( run.getInput() ).toBeStruct();
+                } finally {
+                    queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+                }
+            } );
+        } );
+    }
+}

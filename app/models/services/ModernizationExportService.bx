@@ -1,0 +1,284 @@
+/**
+ * Renders a persisted Modernize run for local download.
+ *
+ * Modernization artifacts are intentionally limited to JSON and Markdown.
+ * SARIF is a Review finding format and must not be used to imply that a
+ * modernization proposal is a compiler/security finding set.
+ */
+
+@singleton
+class {
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.supportedFormats = [ "json", "markdown" ];
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		return this;
+	}
+
+	struct function export( required struct run, required struct result, string format = "markdown" ) {
+		var normalized = lCase( trim( arguments.format ) );
+		if ( !variables.supportedFormats.contains( normalized ) ) {
+			throw(
+				type = "ValidationException",
+				message = "Unsupported Modernize export format. Use json or markdown."
+			);
+		}
+
+		var runToken = left(
+			reReplace( arguments.run.id ?: "modernization", "[^a-zA-Z0-9]", "", "all" ),
+			12
+		);
+		if ( !len( runToken ) ) runToken = "modernization";
+
+		if ( normalized == "json" ) {
+			return package(
+				normalized,
+				"application/json",
+				"doublecheck-modernization-#runToken#.json",
+				toJson( arguments.run, arguments.result )
+			);
+		}
+
+		return package(
+			normalized,
+			"text/markdown; charset=utf-8",
+			"doublecheck-modernization-#runToken#.md",
+			toMarkdown( arguments.run, arguments.result )
+		);
+	}
+
+	array function supportedFormats() {
+		return duplicate( variables.supportedFormats );
+	}
+
+	string function toJson( required struct run, required struct result ) {
+		var payload = sanitizeExportValue( duplicate( arguments.result ), "", "" );
+		sortExportCollections( payload );
+		var metadata = isStruct( payload.metadata ?: "" ) ? payload.metadata : {};
+		payload.schemaVersion = payload.schemaVersion ?: "modernization-plan-v1";
+		payload.run = {
+			id          : arguments.run.id ?: "",
+			projectPath : arguments.run.projectPath ?: "",
+			mode        : arguments.run.mode ?: "full",
+			runKind     : arguments.run.runKind ?: "modernize",
+			status      : arguments.run.status ?: "",
+			createdAt   : arguments.run.createdAt ?: "",
+			completedAt : arguments.run.completedAt ?: ""
+		};
+		payload.export = {
+			format     : "json",
+			generatedAt: metadata.generatedAt ?: arguments.run.createdAt ?: ""
+		};
+		return jsonSerialize( payload );
+	}
+
+	string function toMarkdown( required struct run, required struct result ) {
+		var lines = [];
+		var coverage = arguments.result.coverage ?: {};
+		var planMetadata = arguments.result.metadata ?: {};
+		var coverageSchema = coverage.schema ?: {};
+		var schemaEvidence = arguments.result.schemaEvidence ?: {};
+		var inventory = arguments.result.inventory ?: {};
+		var target = arguments.result.target ?: {};
+		var validation = arguments.result.validation ?: {};
+		var decisions = arguments.result.decisions ?: [];
+		var roadmap = arguments.result.roadmapPhases ?: [];
+		var legacyUnits = inventory.units ?: [];
+		var targetUnits = target.units ?: [];
+		var routes = arguments.result.routeContracts ?: [];
+		var dbFindings = arguments.result.dbFindings ?: [];
+		var transitions = arguments.result.dbTransitions ?: [];
+		var contexts = target.contexts ?: arguments.result.contexts ?: [];
+		var extracts = target.extracts ?: arguments.result.extracts ?: [];
+		var samples = arguments.result.samples ?: [];
+
+		lines.append( mdHeading( 1, "DoubleCheck Modernization Plan" ) );
+		lines.append( "" );
+		lines.append( "- **Run:** `" & escapeMarkdown( arguments.run.id ?: "" ) & "`" );
+		lines.append( "- **Repository:** `" & escapeMarkdown( arguments.run.projectPath ?: "" ) & "`" );
+		lines.append( "- **Scope:** `" & escapeMarkdown( arguments.run.mode ?: "full" ) & "`" );
+		lines.append( "- **Run status:** `" & escapeMarkdown( arguments.run.status ?: "" ) & "`" );
+		lines.append( "- **Plan state:** `" & escapeMarkdown( arguments.result.planState ?: arguments.result.state ?: "needs-review" ) & "`" );
+		lines.append( "" );
+
+		lines.append( mdHeading( 2, "Overview and coverage" ) );
+		lines.append( "" );
+		lines.append( escapeMarkdown( arguments.result.summary ?: "No modernization summary was generated." ) );
+		lines.append( "" );
+		lines.append( coverageLine( "Application files", coverage.filesScanned ?: coverage.fileCount ?: 0 ) );
+		lines.append( coverageLine( "CFML files", coverage.cfmlFiles ?: coverage.cfmlFileCount ?: 0 ) );
+		lines.append( coverageLine( "Schema source", coverage.schemaSource ?: schemaEvidence.source ?: "none" ) );
+		lines.append( coverageLine( "Schema coverage", coverage.schemaCoverage ?: coverageSchema.coverage ?: "unknown" ) );
+		lines.append( coverageLine( "Coverage status", coverage.status ?: coverage.coverageStatus ?: "unknown" ) );
+		if ( len( coverage.note ?: "" ) ) lines.append( "- **Coverage note:** " & escapeMarkdown( coverage.note ) );
+		if ( isArray( coverage.banners ?: "" ) ) {
+			for ( var banner in coverage.banners ) {
+				lines.append( "- **Coverage banner:** " & escapeMarkdown( toString( banner ) ) );
+			}
+		}
+		var providerDisclosure = coverage.remoteProviderDisclosure ?: arguments.result.remoteProviderDisclosure ?: planMetadata.remoteProviderDisclosure ?: "";
+		if ( len( providerDisclosure ) ) lines.append( "- **Provider disclosure:** " & escapeMarkdown( providerDisclosure ) );
+		lines.append( "" );
+
+		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnits, [ "id", "path", "kind", "name", "confidence" ] );
+		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus" ] );
+		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus" ] );
+		appendRows( lines, mdHeading( 2, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus" ] );
+		appendRows( lines, mdHeading( 2, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus" ] );
+		appendRows( lines, mdHeading( 2, "Contexts and extracts" ), contexts, [ "contextId", "phase", "purpose", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Context extracts" ), extracts, [ "extractId", "path", "startLine", "endLine", "contextId" ] );
+		appendSamples( lines, samples );
+		appendRows( lines, mdHeading( 2, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ] );
+
+		lines.append( mdHeading( 2, "Roadmap" ) );
+		lines.append( "" );
+		if ( !roadmap.len() ) {
+			lines.append( "No roadmap phases were generated." );
+		} else {
+			var phaseIndex = 1;
+			for ( var phase in roadmap ) {
+				lines.append( mdHeading( 3, phaseIndex & ". " & escapeMarkdown( phase.name ?: phase.title ?: "Phase" ) ) );
+				lines.append( "" );
+				lines.append( "- **Outcome:** " & escapeMarkdown( phase.outcome ?: phase.exitCriteria ?: "" ) );
+				lines.append( "- **Status:** `" & escapeMarkdown( phase.validationStatus ?: phase.status ?: "unknown" ) & "`" );
+				if ( isArray( phase.dependencies ?: "" ) && phase.dependencies.len() ) lines.append( "- **Dependencies:** `" & escapeMarkdown( arrayToList( phase.dependencies, ", " ) ) & "`" );
+				phaseIndex++;
+			}
+		}
+		lines.append( "" );
+
+		lines.append( mdHeading( 2, "Validation and decisions" ) );
+		lines.append( "" );
+		lines.append( "- **Validation status:** `" & escapeMarkdown( validation.status ?: validation.overallStatus ?: "unknown" ) & "`" );
+		lines.append( "- **Blocking issues:** `" & ( validation.blockingCount ?: validation.blockers ?: 0 ) & "`" );
+		lines.append( "- **Warnings:** `" & ( validation.warningCount ?: validation.warnings ?: 0 ) & "`" );
+		var decisionItems = isArray( decisions ) ? decisions : ( isArray( decisions.items ?: "" ) ? decisions.items : [] );
+		lines.append( "- **Decisions recorded:** `" & decisionItems.len() & "`" );
+		if ( decisionItems.len() ) {
+			lines.append( "" );
+			for ( var decision in decisionItems ) {
+				lines.append( "- `" & escapeMarkdown( decision.itemType ?: "item" ) & "` `" & escapeMarkdown( decision.decision ?: "undecided" ) & "` — " & escapeMarkdown( decision.note ?: "" ) );
+			}
+		}
+		lines.append( "" );
+		lines.append( "> AI-proposed artifacts are bounded skeletons. Validate them against the immutable evidence snapshot before applying changes." );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	private void function appendRows( required array lines, required string heading, required array rows, required array fields ) {
+		arguments.lines.append( arguments.heading );
+		arguments.lines.append( "" );
+		if ( !arguments.rows.len() ) {
+			arguments.lines.append( "No items were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		for ( var row in arguments.rows ) {
+			var label = row.name ?: row.path ?: row.objectRef ?: row.id ?: row.findingId ?: row.transitionId ?: "item";
+			arguments.lines.append( mdHeading( 3, escapeMarkdown( label ) ) );
+			for ( var field in arguments.fields ) {
+				if ( !structKeyExists( row, field ) || isNull( row[ field ] ) ) continue;
+				var value = row[ field ];
+				if ( isArray( value ) || isStruct( value ) ) value = jsonSerialize( value );
+				arguments.lines.append( "- **" & field & ":** " & escapeMarkdown( toString( value ) ) );
+			}
+			arguments.lines.append( "" );
+		}
+	}
+
+	private void function appendSamples( required array lines, required array samples ) {
+		arguments.lines.append( mdHeading( 2, "Bounded implementation samples" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.samples.len() ) {
+			arguments.lines.append( "No samples were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		var ordered = duplicate( arguments.samples );
+		ordered.sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+		for ( var sample in ordered ) {
+			arguments.lines.append( mdHeading( 3, escapeMarkdown( sample.sampleKind ?: sample.kind ?: "sample" ) & " · " & escapeMarkdown( sample.targetPath ?: sample.path ?: "target" ) ) );
+			arguments.lines.append( "" );
+			arguments.lines.append( "- **Validation level:** `" & escapeMarkdown( sample.validationLevel ?: sample.validationStatus ?: "syntax-unchecked" ) & "`" );
+			arguments.lines.append( "- **Irreversible:** `" & ( sample.irreversible ?: sample.forwardOnly ?: false ) & "`" );
+			if ( isArray( sample.relatedItemIds ?: "" ) && sample.relatedItemIds.len() ) arguments.lines.append( "- **Related items:** `" & escapeMarkdown( arrayToList( sample.relatedItemIds, ", " ) ) & "`" );
+			var code = sample.code ?: sample.content ?: "";
+			if ( len( trim( code ) ) ) {
+				code = variables.secretRedactionService.redactText( toString( code ) );
+				code = replace( code, "```", "`` `", "all" );
+				arguments.lines.append( "" );
+				arguments.lines.append( "```" & ( sample.language ?: sample.dialect ?: "text" ) );
+				arguments.lines.append( code );
+				arguments.lines.append( "```" );
+			}
+			arguments.lines.append( "" );
+		}
+	}
+
+	private string function mdHeading( required numeric level, required string text ) {
+		return repeatString( char( 35 ), arguments.level ) & " " & arguments.text;
+	}
+
+	private string function coverageLine( required string label, required any value ) {
+		return "- **" & arguments.label & ":** `" & escapeMarkdown( toString( arguments.value ) ) & "`";
+	}
+
+	private struct function package( required string format, required string contentType, required string fileName, required string content ) {
+		return { format: arguments.format, contentType: arguments.contentType, fileName: arguments.fileName, content: arguments.content };
+	}
+
+	private string function escapeMarkdown( required string value ) {
+		return replace( replace( replace( arguments.value, "`", "'", "all" ), char( 13 ), "", "all" ), "|", "\\|", "all" );
+	}
+
+	private string function identityKey( required any value ) {
+		if ( !isStruct( arguments.value ) ) return toString( arguments.value );
+		return lCase( trim( arguments.value.id ?: arguments.value.itemId ?: arguments.value.itemFingerprint ?: arguments.value.targetPath ?: arguments.value.path ?: arguments.value.name ?: jsonSerialize( arguments.value ) ) );
+	}
+
+	private void function sortExportCollections( required struct payload ) {
+		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
+			var parts = path.listToArray( "." );
+			var owner = parts.len() == 2 ? ( arguments.payload[ parts[ 1 ] ] ?: {} ) : arguments.payload;
+			var key = parts[ parts.len() ];
+			if ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ) owner[ key ].sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+		}
+	}
+
+	/** Remove transient/raw inputs and redact all secret-like fields before export. */
+	private any function sanitizeExportValue( required any value, string keyName = "", string path = "" ) {
+		if ( isNull( arguments.value ) ) return javacast( "null", "" );
+		if ( isStruct( arguments.value ) ) {
+			var output = {};
+			for ( var key in arguments.value ) {
+				var childPath = len( arguments.path ) ? arguments.path & "." & key : key;
+				if ( isTransientExportKey( key, childPath ) ) continue;
+				if ( isSensitiveExportKey( key ) ) output[ key ] = "[REDACTED]";
+				else output[ key ] = sanitizeExportValue( arguments.value[ key ], key, childPath );
+			}
+			return output;
+		}
+		if ( isArray( arguments.value ) ) {
+			var outputArray = [];
+			for ( var item in arguments.value ) outputArray.append( sanitizeExportValue( item, arguments.keyName, arguments.path ) );
+			return outputArray;
+		}
+		if ( isNumeric( arguments.value ) || isBoolean( arguments.value ) ) return arguments.value;
+		if ( isSimpleValue( arguments.value ) ) return variables.secretRedactionService.redactText( toString( arguments.value ) );
+		return "[REDACTED UNSUPPORTED VALUE]";
+	}
+
+	private boolean function isTransientExportKey( required string key, required string path ) {
+		if ( [ "inlineContent", "rawContent", "originalText", "providerKey", "apiKey", "api_key" ].contains( arguments.key ) ) return true;
+		return reFindNoCase( "schemaEvidence\\.(?:text|sanitizedText|inlineContent|raw)", arguments.path ) > 0;
+	}
+
+	private boolean function isSensitiveExportKey( required string key ) {
+		return reFindNoCase( "(?:password|passwd|secret|token|authorization|private[_-]?key|api[_-]?key)", arguments.key ) > 0;
+	}
+
+	private boolean function isSimpleValue( required any value ) {
+		return !isStruct( arguments.value ) && !isArray( arguments.value ) && !isObject( arguments.value );
+	}
+}
