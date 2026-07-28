@@ -1,0 +1,282 @@
+/**
+ * Evidence-backed rebuild of a single modernization roadmap phase.
+ * Replaces only that phase and its linked artifacts; never widens the plan silently.
+ */
+@singleton
+class {
+	property name="modernizationRepository" inject="ModernizationRepository";
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="identityService" inject="ModernizationIdentityService";
+	property name="validationService" inject="ModernizationValidationService";
+	property name="decisionService" inject="ModernizationDecisionService";
+	property name="runService" inject="ModernizationRunService";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	variables.rebuildLocks = {};
+	variables.maxNoteChars = 1000;
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) {
+			variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		}
+		return this;
+	}
+
+	void function assertEvidencePack( required struct inventorySlice, required array excerpts ) {
+		var units = isArray( arguments.inventorySlice.units ?: "" ) ? arguments.inventorySlice.units : [];
+		if ( !units.len() ) return;
+		var totalChars = 0;
+		for ( var excerpt in arguments.excerpts ) {
+			totalChars += len( trim( toString( excerpt.content ?: excerpt.text ?: excerpt ?: "" ) ) );
+		}
+		if ( totalChars <= 0 ) {
+			throw(
+				type    = "ModernizationRebuildException",
+				message = "Slice rebuild requires legacy source excerpts for linked units"
+			);
+		}
+	}
+
+	struct function mergeFragment( required struct plan, required string phaseId, required struct fragment ) {
+		var merged = duplicate( arguments.plan );
+		var replaceUnitIds = {};
+		var phase = isStruct( arguments.fragment.roadmapPhase ?: "" ) ? arguments.fragment.roadmapPhase : {};
+		for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) replaceUnitIds[ trim( unitId ) ] = true;
+		for ( var unit in ( isArray( arguments.fragment.targetUnits ?: "" ) ? arguments.fragment.targetUnits : [] ) ) {
+			replaceUnitIds[ trim( unit.id ?: "" ) ] = true;
+		}
+		var oldPhase = findPhase( merged, arguments.phaseId );
+		if ( !isNull( oldPhase ) ) {
+			for ( var oldUnitId in ( isArray( oldPhase.unitIds ?: "" ) ? oldPhase.unitIds : [] ) ) {
+				replaceUnitIds[ trim( oldUnitId ) ] = true;
+			}
+		}
+		if ( !isStruct( merged.target ?: "" ) ) merged.target = { units: [] };
+		if ( !isArray( merged.target.units ?: "" ) ) merged.target.units = [];
+		var keptUnits = [];
+		for ( var existing in merged.target.units ) {
+			var existingId = trim( existing.id ?: "" );
+			if ( !replaceUnitIds.keyExists( existingId ) ) keptUnits.append( existing );
+		}
+		for ( var nextUnit in ( isArray( arguments.fragment.targetUnits ?: "" ) ? arguments.fragment.targetUnits : [] ) ) {
+			keptUnits.append( nextUnit );
+		}
+		merged.target.units = keptUnits;
+		merged.unitLinks = replaceCollection( merged.unitLinks ?: [], arguments.fragment.unitLinks ?: [], replaceUnitIds, "targetUnitId" );
+		merged.routeContracts = replaceByIds( merged.routeContracts ?: [], arguments.fragment.routeContracts ?: [], collectIds( phase.routeIds ?: [], arguments.fragment.routeContracts ?: [] ) );
+		merged.samples = replaceByIds( merged.samples ?: [], arguments.fragment.samples ?: [], collectIds( phase.sampleIds ?: [], arguments.fragment.samples ?: [] ) );
+		merged.dbFindings = replaceByIds( merged.dbFindings ?: [], arguments.fragment.dbFindings ?: [], collectIds( phase.dbFindingIds ?: [], arguments.fragment.dbFindings ?: [] ) );
+		merged.dbTransitions = replaceByIds( merged.dbTransitions ?: [], arguments.fragment.dbTransitions ?: [], collectIds( phase.transitionIds ?: [], arguments.fragment.dbTransitions ?: [] ) );
+		var phases = isArray( merged.roadmapPhases ?: "" ) ? duplicate( merged.roadmapPhases ) : [];
+		var replacedPhase = false;
+		for ( var index = 1; index <= phases.len(); index++ ) {
+			if ( ( phases[ index ].id ?: "" ) == arguments.phaseId ) {
+				var nextPhase = duplicate( phase );
+				if ( !len( trim( nextPhase.id ?: "" ) ) ) nextPhase.id = arguments.phaseId;
+				phases[ index ] = nextPhase;
+				replacedPhase = true;
+				break;
+			}
+		}
+		if ( !replacedPhase && structCount( phase ) ) phases.append( phase );
+		merged.roadmapPhases = phases;
+		return merged;
+	}
+
+	struct function rebuild( required any run, required string phaseId, required struct input ) {
+		ensureModernization( arguments.run );
+		if ( !agentGateway.isEnabled() ) {
+			throw( type = "AIConfigurationException", message = "Modernization provider is not enabled" );
+		}
+		var runId = arguments.run.getId();
+		if ( variables.rebuildLocks.keyExists( runId ) ) {
+			throw( type = "ModernizationRebuildException", message = "A slice rebuild is already in progress for this run" );
+		}
+		variables.rebuildLocks[ runId ] = true;
+		try {
+			var planRecord = modernizationRepository.getPlan( runId );
+			if ( isNull( planRecord ) ) throw( type = "ValidationException", message = "Modernization plan is not available" );
+			var planFingerprint = trim( arguments.input.planFingerprint ?: "" );
+			if ( len( planFingerprint ) && planFingerprint != trim( planRecord.fingerprint ?: "" ) ) {
+				throw( type = "ModernizationDecisionConflict", message = "The modernization artifact changed; refresh before rebuilding" );
+			}
+			var plan = duplicate( planRecord.plan ?: {} );
+			var phase = findPhase( plan, arguments.phaseId );
+			if ( isNull( phase ) ) throw( type = "ModernizationItemNotFound", message = "Roadmap phase was not found" );
+			var note = secretRedactionService.redactText( left( trim( arguments.input.note ?: "" ), variables.maxNoteChars ) );
+			var evidence = buildEvidencePack( plan, phase );
+			assertEvidencePack( evidence.inventorySlice, evidence.excerpts );
+			var runtime = {
+				runtime: plan.metadata.runtime.runtime ?: plan.metadata.runtime ?: "boxlang",
+				profile: plan.metadata.targetProfile ?: plan.target.layoutProfile ?: "modern"
+			};
+			var agentRequest = agentFactory.build(
+				"modernization-slice-rebuild",
+				runtime,
+				{
+					phaseId    : arguments.phaseId,
+					note       : note,
+					phase      : phase,
+					priorSlice : extractPriorSlice( plan, phase ),
+					evidencePack: evidence
+				},
+				{}
+			);
+			var gatewayResult = agentGateway.run( runId, agentRequest, { role: "modernization-slice-rebuild" } );
+			if ( !( gatewayResult.ok ?: false ) ) {
+				throw( type = "ModernizationRebuildException", message = gatewayResult.error ?: "Slice rebuild provider request failed" );
+			}
+			var fragment = normalizeFragment( gatewayResult.payload ?: {} );
+			assertFragmentScope( fragment, phase, arguments.phaseId );
+			var merged = mergeFragment( plan, arguments.phaseId, fragment );
+			merged = refingerprintSlice( merged, phase, fragment );
+			merged.state = "needs-review";
+			var validation = validationService.validate( merged, { inventory: merged.inventory ?: {} } );
+			modernizationRepository.savePlan( runId, merged, validation, planRecord.coverage ?: merged.coverage ?: {} );
+			decisionService.refreshState( runId );
+			return {
+				result : runService.getResult( runId ),
+				rebuild: {
+					phaseId          : arguments.phaseId,
+					attempt          : gatewayResult.attempt ?: 1,
+					skillPack        : agentRequest.skillPack ?: [],
+					evidenceUnitCount: ( evidence.inventorySlice.units ?: [] ).len(),
+					costUsd          : gatewayResult.costUsd ?: 0
+				}
+			};
+		} finally {
+			structDelete( variables.rebuildLocks, runId );
+		}
+	}
+
+	private struct function buildEvidencePack( required struct plan, required struct phase ) {
+		var linkedLegacyIds = {};
+		for ( var unitId in ( isArray( arguments.phase.unitIds ?: "" ) ? arguments.phase.unitIds : [] ) ) {
+			for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+				if ( ( unit.id ?: "" ) != unitId ) continue;
+				for ( var legacyId in ( isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [] ) ) {
+					linkedLegacyIds[ trim( legacyId ) ] = true;
+				}
+				var sourcePath = trim( unit.sourcePath ?: "" );
+				if ( len( sourcePath ) ) linkedLegacyIds[ sourcePath ] = true;
+			}
+		}
+		var units = [];
+		var excerpts = [];
+		for ( var inventoryUnit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) {
+			var inventoryId = trim( inventoryUnit.id ?: "" );
+			var inventoryPath = trim( inventoryUnit.path ?: inventoryUnit.filePath ?: "" );
+			if ( !( linkedLegacyIds.keyExists( inventoryId ) || linkedLegacyIds.keyExists( inventoryPath ) ) ) continue;
+			units.append( inventoryUnit );
+			var body = trim( inventoryUnit.content ?: inventoryUnit.sourceExcerpt ?: inventoryUnit.excerpt ?: "" );
+			if ( len( body ) ) excerpts.append( { unitId: inventoryId, path: inventoryPath, content: left( body, 4000 ) } );
+		}
+		return { inventorySlice: { units: units }, excerpts: excerpts };
+	}
+
+	private struct function extractPriorSlice( required struct plan, required struct phase ) {
+		var unitIds = {};
+		for ( var unitId in ( isArray( arguments.phase.unitIds ?: "" ) ? arguments.phase.unitIds : [] ) ) unitIds[ trim( unitId ) ] = true;
+		var units = [];
+		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			if ( unitIds.keyExists( trim( unit.id ?: "" ) ) ) units.append( unit );
+		}
+		return {
+			phase         : arguments.phase,
+			targetUnits   : units,
+			routeContracts: filterByIds( arguments.plan.routeContracts ?: [], arguments.phase.routeIds ?: [] ),
+			samples       : filterByIds( arguments.plan.samples ?: [], arguments.phase.sampleIds ?: [] )
+		};
+	}
+
+	private struct function normalizeFragment( required struct payload ) {
+		var fragment = duplicate( arguments.payload );
+		if ( !structKeyExists( fragment, "targetUnits" ) && isArray( fragment.target.units ?: "" ) ) {
+			fragment.targetUnits = fragment.target.units;
+		}
+		if ( !structKeyExists( fragment, "roadmapPhase" ) && isArray( fragment.roadmapPhases ?: "" ) && fragment.roadmapPhases.len() ) {
+			fragment.roadmapPhase = fragment.roadmapPhases[ 1 ];
+		}
+		return fragment;
+	}
+
+	private void function assertFragmentScope( required struct fragment, required struct phase, required string phaseId ) {
+		var phaseOut = arguments.fragment.roadmapPhase ?: {};
+		if ( len( trim( phaseOut.id ?: "" ) ) && trim( phaseOut.id ) != arguments.phaseId ) {
+			throw( type = "ModernizationRebuildException", message = "Rebuild fragment targeted a different phase id" );
+		}
+	}
+
+	private struct function refingerprintSlice( required struct plan, required struct phase, required struct fragment ) {
+		var kinds = [
+			{ collection: "target.units", kind: "target-unit", nested: true },
+			{ collection: "unitLinks", kind: "unit-link", nested: false },
+			{ collection: "routeContracts", kind: "route-contract", nested: false },
+			{ collection: "samples", kind: "sample", nested: false },
+			{ collection: "dbFindings", kind: "db-finding", nested: false },
+			{ collection: "dbTransitions", kind: "db-transition", nested: false },
+			{ collection: "roadmapPhases", kind: "roadmap-phase", nested: false }
+		];
+		for ( var entry in kinds ) {
+			var items = entry.nested
+				? ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] )
+				: ( isArray( arguments.plan[ entry.collection ] ?: "" ) ? arguments.plan[ entry.collection ] : [] );
+			for ( var index = 1; index <= items.len(); index++ ) {
+				items[ index ].itemFingerprint = identityService.itemFingerprint( entry.kind, items[ index ] );
+			}
+			if ( entry.nested ) arguments.plan.target.units = items;
+			else arguments.plan[ entry.collection ] = items;
+		}
+		return arguments.plan;
+	}
+
+	private any function findPhase( required struct plan, required string phaseId ) {
+		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
+			if ( ( phase.id ?: "" ) == arguments.phaseId ) return phase;
+		}
+		return javacast( "null", "" );
+	}
+
+	private array function replaceByIds( required array existing, required array incoming, required struct replaceIds ) {
+		var kept = [];
+		for ( var item in arguments.existing ) {
+			var id = trim( item.id ?: item.itemId ?: "" );
+			if ( !arguments.replaceIds.keyExists( id ) ) kept.append( item );
+		}
+		for ( var nextItem in arguments.incoming ) kept.append( nextItem );
+		return kept;
+	}
+
+	private array function replaceCollection( required array existing, required array incoming, required struct replaceUnitIds, required string unitKey ) {
+		var kept = [];
+		for ( var item in arguments.existing ) {
+			var linked = trim( item[ arguments.unitKey ] ?: "" );
+			if ( !arguments.replaceUnitIds.keyExists( linked ) ) kept.append( item );
+		}
+		for ( var nextItem in arguments.incoming ) kept.append( nextItem );
+		return kept;
+	}
+
+	private struct function collectIds( required any listedIds, required array incoming ) {
+		var ids = {};
+		for ( var id in ( isArray( arguments.listedIds ) ? arguments.listedIds : [] ) ) ids[ trim( id ) ] = true;
+		for ( var item in arguments.incoming ) ids[ trim( item.id ?: item.itemId ?: "" ) ] = true;
+		return ids;
+	}
+
+	private array function filterByIds( required array items, required any ids ) {
+		var wanted = {};
+		for ( var id in ( isArray( arguments.ids ) ? arguments.ids : [] ) ) wanted[ trim( id ) ] = true;
+		var out = [];
+		for ( var item in arguments.items ) {
+			if ( wanted.keyExists( trim( item.id ?: item.itemId ?: "" ) ) ) out.append( item );
+		}
+		return out;
+	}
+
+	private void function ensureModernization( required any run ) {
+		if ( lCase( arguments.run.getRunKind() ?: "review" ) != "modernize" ) {
+			throw( type = "ValidationException", message = "Slice rebuild requires a Modernize run" );
+		}
+	}
+}
