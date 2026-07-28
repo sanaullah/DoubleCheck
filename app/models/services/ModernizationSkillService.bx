@@ -1,0 +1,178 @@
+/**
+ * Allowlisted reader for DoubleCheck modernization skill packs.
+ * Skills are always resolved from the DoubleCheck install, never the analyzed project.
+ */
+@singleton
+class {
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	variables.maxExcerptChars = 2500;
+	variables.maxReadChars = 20000;
+	variables.applicationSkills = [
+		"coldbox-app-layouts",
+		"coldbox-handler-development",
+		"coldbox-di",
+		"wirebox-di",
+		"coldbox-routing-development",
+		"boxlang-language-fundamentals",
+		"testbox-bdd"
+	];
+	variables.applicationSkillsLucee = [
+		"coldbox-app-layouts",
+		"coldbox-handler-development",
+		"coldbox-di",
+		"wirebox-di",
+		"coldbox-routing-development",
+		"testbox-bdd"
+	];
+	variables.rolePacks = {};
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) {
+			variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		}
+		variables.rolePacks = {
+			"modernization-application": {
+				"boxlang": duplicate( variables.applicationSkills ),
+				"lucee"  : duplicate( variables.applicationSkillsLucee )
+			},
+			"modernization-roadmap": {
+				"boxlang": duplicate( variables.applicationSkills ),
+				"lucee"  : duplicate( variables.applicationSkillsLucee )
+			},
+			"modernization-slice-rebuild": {
+				"boxlang": duplicate( variables.applicationSkills ),
+				"lucee"  : duplicate( variables.applicationSkillsLucee )
+			},
+			"modernization-database": {
+				"boxlang": [ "database-migrations", "boxlang-database-access" ],
+				"lucee"  : [ "database-migrations" ]
+			}
+		};
+		return this;
+	}
+
+	array function listPack( required string runtime, required string layoutProfile, required string role ) {
+		var safeRuntime = lCase( trim( arguments.runtime ) );
+		var safeRole = lCase( trim( arguments.role ) );
+		var packNames = packNamesFor( safeRole, safeRuntime );
+		var pack = [];
+		for ( var skillName in packNames ) {
+			var item = buildPackItem( skillName );
+			if ( !isNull( item ) ) pack.append( item );
+		}
+		return pack;
+	}
+
+	struct function readSkill( required string name ) {
+		var safeName = normalizeSkillName( arguments.name );
+		if ( !isAllowlisted( safeName ) ) {
+			throw( type = "ValidationException", message = "Skill is not allowlisted" );
+		}
+		var rawContent = readSkillFile( safeName );
+		if ( !len( rawContent ) ) {
+			throw( type = "ValidationException", message = "Skill content is unavailable" );
+		}
+		var redacted = variables.secretRedactionService.redactText( rawContent );
+		return { name: safeName, content: capText( redacted, variables.maxReadChars ) };
+	}
+
+	boolean function isAllowlisted( required string name ) {
+		var safeName = normalizeSkillName( arguments.name );
+		if ( !len( safeName ) ) return false;
+		if ( find( "..", safeName ) ) return false;
+		if ( find( "/", safeName ) || find( char( 92 ), safeName ) ) return false;
+		for ( var roleKey in variables.rolePacks ) {
+			for ( var engineKey in variables.rolePacks[ roleKey ] ) {
+				if ( variables.rolePacks[ roleKey ][ engineKey ].contains( safeName ) ) return true;
+			}
+		}
+		return false;
+	}
+
+	string function resolveSkillsRoot() {
+		var appDir = new java:java.io.File( expandPath( "/app" ) );
+		var projectRoot = appDir.getParentFile();
+		var skillsRoot = new java:java.io.File( projectRoot, ".agents/skills" );
+		return skillsRoot.getAbsolutePath();
+	}
+
+	private array function packNamesFor( required string role, required string runtime ) {
+		var rolePack = variables.rolePacks[ arguments.role ] ?: {};
+		return duplicate( rolePack[ arguments.runtime ] ?: [] );
+	}
+
+	private any function buildPackItem( required string name ) {
+		var rawContent = readSkillFile( arguments.name );
+		if ( !len( rawContent ) ) return javacast( "null", "" );
+		var redacted = variables.secretRedactionService.redactText( rawContent );
+		return {
+			name   : arguments.name,
+			summary: extractSummary( redacted, arguments.name ),
+			excerpt: capText( redacted, variables.maxExcerptChars )
+		};
+	}
+
+	private string function readSkillFile( required string name ) {
+		var skillDir = new java:java.io.File( resolveSkillsRoot(), arguments.name );
+		var skillDoc = new java:java.io.File( skillDir, "SKILL.md" );
+		if ( !skillDoc.isFile() ) return "";
+		try {
+			return fileRead( skillDoc.getAbsolutePath(), "UTF-8" );
+		} catch ( any error ) {
+			return "";
+		}
+	}
+
+	private string function normalizeSkillName( required string name ) {
+		return lCase( trim( arguments.name ) );
+	}
+
+	private string function extractSummary( required string content, required string fallbackName ) {
+		var lines = listToArray( arguments.content, char( 10 ), true, true );
+		var inFrontmatter = false;
+		var frontmatterDone = false;
+		var frontmatterLines = [];
+		for ( var line in lines ) {
+			if ( !frontmatterDone && trim( line ) == "---" ) {
+				if ( !inFrontmatter ) {
+					inFrontmatter = true;
+					continue;
+				}
+				frontmatterDone = true;
+				continue;
+			}
+			if ( inFrontmatter && !frontmatterDone ) frontmatterLines.append( line );
+		}
+		for ( var frontmatterLine in frontmatterLines ) {
+			if ( reFindNoCase( "^description\s*:", frontmatterLine ) ) {
+				return trim( unquoteYamlValue( frontmatterLine ) );
+			}
+		}
+		for ( var bodyLine in lines ) {
+			var trimmed = trim( bodyLine );
+			if ( !len( trimmed ) || trimmed == "---" ) continue;
+			if ( left( trimmed, 1 ) == char( 35 ) ) continue;
+			if ( reFindNoCase( "^description\s*:", trimmed ) ) continue;
+			return trimmed;
+		}
+		return arguments.fallbackName;
+	}
+
+	private string function unquoteYamlValue( required string rawLine ) {
+		var value = trim( reReplaceNoCase( arguments.rawLine, "^description\s*:\s*", "" ) );
+		var dquote = char( 34 );
+		if (
+			( left( value, 1 ) == dquote && right( value, 1 ) == dquote ) ||
+			( left( value, 1 ) == "'" && right( value, 1 ) == "'" )
+		) {
+			return mid( value, 2, len( value ) - 2 );
+		}
+		return value;
+	}
+
+	private string function capText( required string text, required numeric maxChars ) {
+		if ( len( arguments.text ) <= arguments.maxChars ) return arguments.text;
+		return left( arguments.text, arguments.maxChars );
+	}
+}
