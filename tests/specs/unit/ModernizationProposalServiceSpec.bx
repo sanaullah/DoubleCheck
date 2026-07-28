@@ -37,6 +37,41 @@ class extends="testbox.system.BaseSpec" {
 				expect( gateway.callCount() ).toBe( 3 );
 			} );
 
+			it( "rewrites legacy source paths into legal target layout paths", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ { id: "dashboard/index.cfm", proposedRole: "page", targetPath: "dashboard/index.cfm" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-layout", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.plan.target.units[ 1 ].sourcePath ).toBe( "dashboard/index.cfm" );
+				expect( result.plan.target.units[ 1 ].targetPath ).toBe( "app/handlers/index.bx" );
+			} );
+
+			it( "ignores non-object provider collection entries without crashing", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ "invalid target" ], unitLinks: [ "invalid link" ], routeContracts: [], contexts: [], extracts: [], samples: [ "invalid sample" ] },
+					"modernization-database": { dbFindings: [ "invalid finding" ], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ "invalid phase" ], assumptions: [], samples: [ "invalid roadmap sample" ] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-malformed-items", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				expect( result.plan.target.units ).toBeEmpty();
+				expect( result.plan.samples ).toBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "ignored-non-object-items" ) ).notToBeEmpty();
+			} );
+
 			it( "retains a usable partial plan when the roadmap role fails", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },

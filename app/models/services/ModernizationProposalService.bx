@@ -89,11 +89,11 @@ class {
 			if ( roadmap.ok ?: false && validFragment( "modernization-roadmap", roadmap.payload ?: {} ) ) {
 				var redactedRoadmap = redactPayload( roadmap.payload ?: {} );
 				if ( !redactedRoadmap.count() && ( roadmap.payload ?: {} ).count() ) errors.append( { role: "modernization-roadmap", message: "redaction-failed" } );
-				else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy );
+				else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy, errors );
 			} else errors.append( { role: "modernization-roadmap", message: roadmap.error ?: ( roadmap.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
 		}
 		var sampleLimit = isNumeric( samplePolicy.maxFiles ?: "" ) ? max( 1, int( samplePolicy.maxFiles ) ) : 40;
-		merged.samples = boundedArray( merged.samples ?: [], sampleLimit );
+		merged.samples = boundedStructArray( merged.samples ?: [], sampleLimit, errors, "samples" );
 		if ( ( samplePolicy.currentPhasesOnly ?: true ) && isArray( merged.roadmapPhases ?: "" ) ) merged.samples = currentSliceSamples( merged.samples ?: [], merged.roadmapPhases );
 		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
 		merged.metadata.promptVersion = agentFactory.version();
@@ -175,15 +175,15 @@ class {
 		};
 		var app = fragments[ "modernization-application" ] ?: {};
 		var db = fragments[ "modernization-database" ] ?: {};
-		plan.target.units = boundedArray( app.targetUnits ?: app.units ?: [], variables.maxItems );
-		plan.target.contexts = boundedArray( app.contexts ?: [], variables.maxItems );
-		plan.target.extracts = boundedArray( app.extracts ?: [], variables.maxItems );
-		plan.unitLinks = boundedArray( app.unitLinks ?: [], variables.maxItems );
-		plan.routeContracts = boundedArray( app.routeContracts ?: [], variables.maxItems );
-		plan.dbFindings = boundedArray( db.dbFindings ?: [], variables.maxItems );
-		plan.dbTransitions = boundedArray( db.dbTransitions ?: [], variables.maxItems );
-		plan.samples = boundedArray( app.samples ?: [], 40 );
-		plan.samples.append( boundedArray( db.samples ?: [], 20 ), true );
+		plan.target.units = normalizeTargetUnits( boundedStructArray( app.targetUnits ?: app.units ?: [], variables.maxItems, arguments.errors, "target.units" ), arguments.input );
+		plan.target.contexts = boundedStructArray( app.contexts ?: [], variables.maxItems, arguments.errors, "target.contexts" );
+		plan.target.extracts = boundedStructArray( app.extracts ?: [], variables.maxItems, arguments.errors, "target.extracts" );
+		plan.unitLinks = boundedStructArray( app.unitLinks ?: [], variables.maxItems, arguments.errors, "unitLinks" );
+		plan.routeContracts = boundedStructArray( app.routeContracts ?: [], variables.maxItems, arguments.errors, "routeContracts" );
+		plan.dbFindings = boundedStructArray( db.dbFindings ?: [], variables.maxItems, arguments.errors, "dbFindings" );
+		plan.dbTransitions = boundedStructArray( db.dbTransitions ?: [], variables.maxItems, arguments.errors, "dbTransitions" );
+		plan.samples = boundedStructArray( app.samples ?: [], 40, arguments.errors, "application.samples" );
+		plan.samples.append( boundedStructArray( db.samples ?: [], 20, arguments.errors, "database.samples" ), true );
 		for ( var item in plan.target.units ) ensureIdentity( item, "target-unit" );
 		for ( var item in plan.unitLinks ) ensureIdentity( item, "unit-link" );
 		for ( var item in plan.routeContracts ) ensureIdentity( item, "route-contract" );
@@ -191,15 +191,81 @@ class {
 			for ( var item in plan.dbTransitions ) ensureIdentity( item, "db-transition" );
 			for ( var item in plan.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
 			for ( var item in plan.samples ) ensureIdentity( item, "sample" );
-			return plan;
-		}
+		return plan;
+	}
 
-	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}) {
+	/** Providers often echo a legacy source filename as targetPath. Keep the
+	 * source identity, but derive a legal ColdBox target path before validation
+	 * or persistence so the UI never presents source files as target structure. */
+	private array function normalizeTargetUnits( required array units, required struct input ) {
+		var target = isStruct( arguments.input.target ?: "" ) ? arguments.input.target : {};
+		var runtime = lCase( trim( target.runtime ?: arguments.input.targetRuntime ?: "boxlang" ) );
+		var profile = lCase( trim( target.layoutProfile ?: arguments.input.targetProfile ?: "modern" ) );
+		var output = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var copy = duplicate( unit );
+			var sourcePath = trim( copy.sourcePath ?: copy.sourceFile ?: copy.legacyPath ?: copy.filePath ?: copy.id ?: "" );
+			if ( len( sourcePath ) ) copy.sourcePath = replace( sourcePath, "\\", "/", "all" );
+			var candidate = trim( copy.targetPath ?: copy.pathHint ?: "" );
+			if ( !legalModernTargetPath( candidate, runtime, profile ) || !targetPathMatchesLayer( candidate, copy ) ) copy.targetPath = deriveTargetPath( copy, sourcePath, runtime, profile );
+			if ( len( trim( copy.evidenceRef ?: "" ) ) && !structKeyExists( copy, "evidenceRefs" ) && copy.evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
+			ensureIdentity( copy, "target-unit" );
+			output.append( copy );
+		}
+		return output;
+	}
+
+	private boolean function legalModernTargetPath( required string path, required string runtime, required string profile ) {
+		if ( !len( trim( arguments.path ) ) || find( "..", arguments.path ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", arguments.path ) ) return false;
+		var extension = lCase( listLast( arguments.path, "." ) );
+		var normalized = lCase( replace( arguments.path, "\\", "/", "all" ) );
+		if ( arguments.profile == "flat" && !reFind( "^(?:handlers|models|views|layouts)/", normalized ) ) return false;
+		if ( arguments.profile != "flat" && !reFind( "^app/", normalized ) ) return false;
+		return arguments.runtime == "boxlang" ? [ "bx", "bxm" ].contains( extension ) : ( arguments.runtime == "lucee" ? [ "cfc", "cfm" ].contains( extension ) : true );
+	}
+
+	private boolean function targetPathMatchesLayer( required string path, required struct unit ) {
+		var normalized = lCase( replace( arguments.path, "\\", "/", "all" ) );
+		var layer = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: "" ) );
+		if ( !len( layer ) ) return true;
+		if ( layer == "service" || layer == "model" ) return find( "/models/", "/" & normalized ) > 0;
+		if ( layer == "handler" || layer == "page" ) return find( "/handlers/", "/" & normalized ) > 0;
+		if ( layer == "view" || layer == "layout" ) return find( "/views/", "/" & normalized ) > 0 || find( "/layouts/", "/" & normalized ) > 0;
+		if ( layer == "config" ) return find( "/config/", "/" & normalized ) > 0 || listLast( normalized, "/" ) == "application.bx";
+		if ( layer == "test" ) return find( "tests/specs/", normalized ) == 1;
+		return true;
+	}
+
+	private string function deriveTargetPath( required struct unit, required string sourcePath, required string runtime, required string profile ) {
+		var extension = arguments.runtime == "boxlang" ? ".bx" : ".cfc";
+		var sourceName = len( trim( arguments.sourcePath ) ) ? listLast( replace( arguments.sourcePath, "\\", "/", "all" ), "/" ) : "ModernizedUnit";
+		var stem = sourceName;
+		for ( var legacyExt in [ ".cfc", ".cfm", ".bxm", ".bx", ".js" ] ) {
+			if ( right( lCase( stem ), len( legacyExt ) ) == legacyExt ) {
+				stem = left( stem, len( stem ) - len( legacyExt ) );
+				break;
+			}
+		}
+		stem = reReplace( stem, "[^A-Za-z0-9_-]", "-", "all" );
+		if ( !len( trim( stem ) ) ) stem = "ModernizedUnit";
+		var role = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: arguments.unit.category ?: "" ) );
+		var root = arguments.profile == "flat" ? "" : "app/";
+		if ( findNoCase( "application", role ) || findNoCase( "bootstrap", role ) ) return root & "Application" & extension;
+		if ( role == "config" ) return root & "config/" & stem & extension;
+		if ( role == "interceptor" ) return root & "interceptors/" & stem & extension;
+		if ( role == "test" ) return "tests/specs/unit/" & stem & "Spec" & extension;
+		if ( findNoCase( "service", role ) || findNoCase( "component", role ) || findNoCase( "model", role ) ) return root & "models/services/" & stem & extension;
+		if ( findNoCase( "view", role ) || findNoCase( "layout", role ) ) return root & "views/" & stem & extension;
+		return root & "handlers/" & stem & extension;
+	}
+
+	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = []) {
 		var useCurrentSlice = structKeyExists( arguments.samplePolicy, "currentPhasesOnly" ) ? !!arguments.samplePolicy.currentPhasesOnly : true;
-			arguments.plan.roadmapPhases = boundedArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40 );
+			arguments.plan.roadmapPhases = boundedStructArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40, arguments.errors, "roadmapPhases" );
 			for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
 			arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
-			arguments.plan.samples.append( boundedArray( arguments.roadmap.samples ?: [], 20 ), true );
+			arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
 			for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
 			if ( useCurrentSlice ) arguments.plan.samples = currentSliceSamples( arguments.plan.samples, arguments.plan.roadmapPhases );
 		return arguments.plan;
@@ -207,9 +273,10 @@ class {
 
 	private array function currentSliceSamples( required array samples, required array phases ) {
 		var currentPhaseIds = {};
-		for ( var phase in arguments.phases ) if ( phase.currentSlice ?: false ) currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
+		for ( var phase in arguments.phases ) if ( isStruct( phase ) && ( phase.currentSlice ?: false ) ) currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
 		var output = [];
 		for ( var sample in arguments.samples ) {
+			if ( !isStruct( sample ) ) continue;
 			var phaseId = sample.phaseId ?: sample.roadmapPhaseId ?: "";
 			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) ) output.append( sample );
 		}
@@ -218,6 +285,17 @@ class {
 
 	private array function boundedArray(required any value, required numeric limit) {
 		return isArray( arguments.value ) && arguments.value.len() ? arguments.value.slice( 1, min( arguments.limit, arguments.value.len() ) ) : [];
+	}
+
+	private array function boundedStructArray(required any value, required numeric limit, array errors = [], string collection = "items") {
+		var output = [];
+		var rejected = 0;
+		for ( var item in boundedArray( arguments.value, arguments.limit ) ) {
+			if ( isStruct( item ) ) output.append( item );
+			else rejected++;
+		}
+		if ( rejected ) arguments.errors.append( { role: "provider-contract", collection: arguments.collection, message: "ignored-non-object-items", count: rejected } );
+		return output;
 	}
 
 	private boolean function validFragment(required string role, required any payload) {
