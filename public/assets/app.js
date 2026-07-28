@@ -58,6 +58,8 @@ const state = {
 		context: "all",
 		phase: "all",
 		selectedItem: null,
+		selectedPhaseId: "",
+		showUnsliced: false,
 		decisions: {},
 		decisionNotes: {},
 		notice: "",
@@ -2155,20 +2157,47 @@ function modernizationItems(result = {}, pane = "") {
 	const database = result.schemaEvidence?.database || result.database || {};
 	const map = {
 		legacy: [result.inventory?.units || [], "legacy-unit"],
-		target: [(target.units || [])
-			.concat((result.unitLinks || []).map((item) => ({ ...item, itemType: item.itemType || "unit-link" })))
-			.concat((result.samples || []).map((item) => ({ ...item, itemType: item.itemType || "sample" }))), "target-unit"],
+		target: [(target.units || []).concat((result.samples || []).map((item) => ({ ...item, itemType: item.itemType || "sample" }))), "target-unit"],
 		routes: [result.routeContracts || [], "route-contract"],
 		database: [(result.dbFindings || []).map((item) => ({ ...item, itemType: item.itemType || "db-finding" })).concat((result.dbTransitions || database.findings || []).map((item) => ({ ...item, itemType: item.itemType || "db-transition" }))), "db-finding"],
+		links: [result.unitLinks || [], "unit-link"],
 		contexts: [(target.contexts || result.contexts || []).map((item) => ({ ...item, itemType: item.itemType || "context" })).concat((target.extracts || result.extracts || []).map((item) => ({ ...item, itemType: item.itemType || "extract" }))), "context"],
 		roadmap: [result.roadmapPhases || [], "roadmap-phase"]
 	};
 	const pair = map[pane] || [[], "item"];
-	return pair[0].map((item) => ({ ...item, _modernizationType: item.itemType || pair[1] }));
+	return pair[0].map((item) => {
+		const typed = { ...item, _modernizationType: item.itemType || pair[1] };
+		const itemId = item.id || item.itemId || item.findingId || item.transitionId || "";
+		const messages = itemId ? (result.validation?.messages || []).filter((message) => message.itemId === itemId) : [];
+		if (messages.some((message) => (message.level || message.validationLevel) === "blocking")) typed.validationLevel = "blocking";
+		else if (messages.some((message) => (message.level || message.validationLevel) === "warning")) typed.validationLevel = "warning";
+		typed._validationMessages = messages.map((message) => message.message).filter(Boolean);
+		return typed;
+	});
 }
 
 function modernizationItemLabel(item) {
-	return item.name || item.title || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
+	if (item._modernizationType === "legacy-unit") {
+		const file = item.filePath || item.path || "Unknown source file";
+		const symbol = item.symbolName || item.signature || "";
+		return symbol && symbol !== file ? `${file} · ${symbol}` : file;
+	}
+	if (item._modernizationType === "target-unit") return item.targetPath || item.pathHint || item.name || item.title || item.id || "Untitled target";
+	if (item._modernizationType === "unit-link") return `${item.sourcePath || item.legacyUnitId || item.sourceUnitId || "Legacy unit"} → ${item.targetPath || item.targetUnitId || item.targetId || "Target unit"}`;
+	return item.name || item.title || item.filePath || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
+}
+
+function modernizationItemMeta(item) {
+	const validation = modernizationValidationStatus(item);
+	if (item._modernizationType === "legacy-unit") {
+		const range = item.startLine ? ` · lines ${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ""}` : "";
+		return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signals · ${item.touchedTables?.length || 0} tables`;
+	}
+	if (item._modernizationType === "target-unit") return `${item.layer || item.kind || "target"} · ${item.sourcePath || item.filePath || "new proposal"} · ${validation}`;
+	if (item._modernizationType === "roadmap-phase") return `${item.pattern || "migration phase"} · ${(item.dependencies || []).length} dependencies · ${validation}`;
+	if (item._modernizationType === "db-finding") return `${item.category || "database"} · ${item.severity || "unrated"} · ${item.expandContract || "review"}`;
+	if (item._modernizationType === "route-contract") return `${item.method || "GET"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target route"}`;
+	return `${item._modernizationType} · ${validation}`;
 }
 
 function modernizationValidationStatus(item) {
@@ -2206,7 +2235,7 @@ function modernizationItemMatches(item) {
 }
 
 function refreshModernizationFilterOptions(result = {}) {
-	const allItems = ["legacy", "target", "routes", "database", "contexts", "roadmap"]
+	const allItems = ["legacy", "target", "routes", "database", "links", "contexts", "roadmap"]
 		.flatMap((pane) => modernizationItems(result, pane));
 	const optionsFor = (values, selected, fallbackLabel) => {
 		const unique = [...new Set(values.filter(Boolean).map(String))].sort((a, b) => a.localeCompare(b));
@@ -2269,10 +2298,9 @@ function renderModernizationList(container, items) {
 		card.dataset.modernizationItem = modernizationItemKey(item);
 		card.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span><span class="modernization-item-decision"></span>`;
 		card.querySelector(".modernization-item-title").textContent = modernizationItemLabel(item);
-		const validation = modernizationValidationStatus(item);
-		card.querySelector(".modernization-item-meta").textContent = `${item._modernizationType} · ${validation}`;
+		card.querySelector(".modernization-item-meta").textContent = modernizationItemMeta(item);
 		const decision = state.modernization.decisions[modernizationItemKey(item)] || item.decision || "undecided";
-		card.querySelector(".modernization-item-decision").textContent = decision;
+		card.querySelector(".modernization-item-decision").textContent = ["legacy-unit", "context", "extract"].includes(item._modernizationType) ? "Evidence" : decision;
 		card.classList.toggle("is-selected", modernizationItemKey(item) === modernizationItemKey(state.modernization.selectedItem || {}));
 		container.appendChild(card);
 	});
@@ -2287,10 +2315,11 @@ function renderModernizationDetail(item) {
 	}
 	const detail = document.createElement("div");
 	detail.className = "modernization-detail-card";
-	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
+	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
 	detail.querySelector(".eyebrow").textContent = item._modernizationType || "proposal";
 	detail.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
 	detail.querySelector("h3").textContent = modernizationItemLabel(item);
+	renderModernizationDetailSummary(detail.querySelector(".modernization-detail-summary"), item);
 	const evidenceLinks = detail.querySelector(".modernization-evidence-links");
 	const evidenceRefs = modernizationEvidenceRefs(item);
 	if (evidenceRefs.length) {
@@ -2340,6 +2369,77 @@ function renderModernizationDetail(item) {
 		await clearModernizationDecision(item, detail.querySelector("p"));
 	});
 	elements.modernizationItemDetail.appendChild(detail);
+}
+
+function renderModernizationDetailSummary(host, item = {}) {
+	if (!host) return;
+	const add = (title, value, className = "") => {
+		if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) return;
+		const section = document.createElement("section");
+		if (className) section.className = className;
+		const heading = document.createElement("h4");
+		heading.textContent = title;
+		section.appendChild(heading);
+		if (className === "modernization-code-sample") {
+			const warning = document.createElement("p");
+			warning.className = "field-hint";
+			warning.textContent = "AI-proposed skeleton — validate before use; not production-complete.";
+			const pre = document.createElement("pre");
+			pre.textContent = String(value);
+			section.append(warning, pre);
+		} else if (Array.isArray(value)) {
+			const ul = document.createElement("ul");
+			value.forEach((entry) => {
+				const li = document.createElement("li");
+				li.textContent = typeof entry === "object" ? JSON.stringify(entry) : String(entry);
+				ul.appendChild(li);
+			});
+			section.appendChild(ul);
+		} else {
+			const p = document.createElement("p");
+			p.textContent = String(value);
+			section.appendChild(p);
+		}
+		host.appendChild(section);
+	};
+	if (item._modernizationType === "target-unit") {
+		add("Legacy source", item.sourcePath || item.sourceFile || item.filePath || "New proposal");
+		add("Proposed target", item.targetPath || item.pathHint);
+		add("Purpose", item.purpose || item.description || item.proposedRole);
+		add("Methods and signatures", item.signatures || item.symbolNames || item.methods);
+		add("Related database findings", item.relatedDbFindingIds);
+		add("Sample skeleton", item.sampleCode || item.code, "modernization-code-sample");
+	} else if (item._modernizationType === "legacy-unit") {
+		add("Purpose", item.purpose || "Purpose was not enriched for this unit.");
+		add("Signature", item.signature || item.symbolName);
+		add("Detected modernization signals", item.signalIds);
+		add("Tables touched", item.touchedTables);
+		add("Columns touched", item.touchedColumns);
+	} else if (item._modernizationType === "roadmap-phase") {
+		add("Goal", item.goal || item.description);
+		add("Pattern", item.pattern);
+		add("Parity intent", item.parityIntent);
+		add("Exit checklist", Array.isArray(item.exitCriteria) ? item.exitCriteria : (item.exitCriteria ? [item.exitCriteria] : []));
+		add("Rollback", item.rollback);
+		add("Implementer prompt", item.implementerPrompt);
+	} else if (item._modernizationType === "db-finding") {
+		add("Problem", item.problem || item.message);
+		add("Proposed change", item.proposedChange || item.recommendation);
+		add("Transition stage", item.expandContract);
+		add("Objects affected", item.objectRef || item.objectsTouched);
+		add("Sample migration", item.sampleMigration || item.migrationCode, "modernization-code-sample");
+	} else if (item._modernizationType === "route-contract") {
+		add("Legacy URL", item.legacyPath || item.path);
+		add("Target event / route", item.targetEvent || item.targetRoute);
+		add("Rollback", item.rollbackNote || item.rollback);
+	} else if (item._modernizationType === "unit-link") {
+		add("Legacy unit", item.legacyUnitId || item.sourceUnitId || item.sourcePath);
+		add("Target unit", item.targetUnitId || item.targetId || item.targetPath);
+		add("Migration relation", item.relation || item.relationship || item.kind);
+		add("Transition notes", item.notes || item.description);
+		add("Confidence", item.confidence);
+	}
+	add("Validation issues", item._validationMessages);
 }
 
 async function saveModernizationDecision(item, decision, note, statusElement) {
@@ -2426,6 +2526,8 @@ function renderModernizationResult(result = {}) {
 			elements.modernizationItemDetail.innerHTML = "";
 			elements.modernizationItemDetail.appendChild(emptyStateElement({ icon: "detail", title: "Select a proposal item", hint: "A completed plan will show immutable evidence here." }));
 		}
+		const solutionHost = document.querySelector("#modernization-solution");
+		if (solutionHost) solutionHost.hidden = true;
 		return;
 	}
 	const coverage = result.coverage || {};
@@ -2437,7 +2539,14 @@ function renderModernizationResult(result = {}) {
 		elements.modernizationPlanState.dataset.state = planState;
 	}
 	if (elements.modernizationOverview) {
-		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Legacy units</span><strong>${(result.inventory?.units || []).length}</strong></div><div><span>Target units</span><strong>${(result.target?.units || []).length}</strong></div><div><span>Routes</span><strong>${(result.routeContracts || []).length}</strong></div><div><span>DB findings</span><strong>${(result.dbFindings || []).length}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div>`;
+		const inventory = result.inventory || {};
+		const inventorySummary = inventory.summary || {};
+		const schema = coverage.schema || {};
+		const llm = coverage.llm || {};
+		const target = result.target || {};
+		const targetRuntime = result.metadata?.runtime?.runtime || result.metadata?.runtime || "not specified";
+		const targetProfile = result.metadata?.targetProfile || target.layoutProfile || "not specified";
+		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Evidence contexts</span><strong>${(target.contexts || []).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Context coverage</dt><dd>${llm.partitions || llm.planned || 0} prepared · ${(target.contexts || []).length} used · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
 		const queuedSummary = runStatus === "queued" ? "Modernize is queued; the plan will appear after the shared repository scan." : runStatus === "running" ? "Modernize is building an evidence-backed plan. Proposal items will appear as stages complete." : runStatus === "failed" ? (state.activeRun?.message || "Modernize could not generate a plan.") : runStatus === "cancelled" ? "Modernize was cancelled before a complete plan was generated." : runStatus === "partial" ? "A partial Modernize plan was retained with review gates." : "Modernization proposal is ready for review.";
 		elements.modernizationOverview.querySelector(".result-summary").textContent = result.summary || queuedSummary;
 		const notice = elements.modernizationOverview.querySelector(".modernization-notice");
@@ -2445,15 +2554,33 @@ function renderModernizationResult(result = {}) {
 			notice.textContent = state.modernization.notice;
 			notice.dataset.tone = state.modernization.noticeTone || "info";
 		}
+		renderModernizationTransitionGuide(result);
 	}
 	if (elements.modernizationCoverageBanner) {
 		const bannerText = Array.isArray(coverage.banners) ? coverage.banners.join(" ") : "";
 		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "");
 		elements.modernizationCoverageBanner.hidden = !note;
-		elements.modernizationCoverageBanner.textContent = note;
+		if (note) {
+			const schema = coverage.schema || {};
+			const llm = coverage.llm || {};
+			const repo = coverage.repository || {};
+			const targetContextCount = result.target?.contexts?.length || 0;
+			const sourceCount = coverage.filesScanned || repo.indexed || 0;
+			elements.modernizationCoverageBanner.innerHTML = `<div class="modernization-confidence-heading"><div><p class="eyebrow">Plan confidence</p><strong>Evidence gaps to resolve before implementation</strong></div><span class="status-badge" data-state="warning">Needs input</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div>`;
+			const cards = elements.modernizationCoverageBanner.querySelectorAll("section");
+			elements.modernizationCoverageBanner.querySelector(".repository-detail").textContent = `${sourceCount} files indexed from ${repo.candidates || sourceCount} candidates; ${repo.oversized || 0} oversized and ${repo.skipped || 0} total files skipped.`;
+			cards[0].querySelector(".confidence-impact").textContent = "Impact: the legacy catalog and dependency map are incomplete outside the indexed files.";
+			cards[0].querySelector(".confidence-action").textContent = "Next: narrow the run scope to the application directory or raise the repository scan limits, then rerun.";
+			elements.modernizationCoverageBanner.querySelector(".schema-detail").textContent = schema.coverage === "absent" ? "No schema pack: 0 tables, columns, constraints, indexes, or routines verified." : `${schema.coverage || "unknown"}: ${schema.objects?.tables || 0} tables, ${schema.objects?.columns || 0} columns, ${schema.objects?.constraints || 0} constraints, ${schema.objects?.indexes || 0} indexes, ${schema.objects?.routines || 0} routines.`;
+			cards[1].querySelector(".confidence-impact").textContent = schema.coverage === "absent" ? "Impact: database findings and migration samples are advisory only and must not be implemented." : "Impact: database proposals are limited to the parsed schema objects shown above.";
+			cards[1].querySelector(".confidence-action").textContent = schema.coverage === "absent" ? "Next: in Modernize setup, choose Schema source and attach DDL/JSON or an in-repository schema path." : "Next: review unresolved schema objects in the Database tab before accepting transitions.";
+			elements.modernizationCoverageBanner.querySelector(".context-detail").textContent = `${llm.partitions || llm.planned || 0} source partitions prepared; ${targetContextCount} referenced by this proposal; ${llm.contextCharacters || 0} characters across ${llm.files || 0} files and ${llm.lineCount || 0} lines.`;
+			cards[2].querySelector(".confidence-impact").textContent = `Impact: ${llm.omittedPartitions || 0} source partitions were omitted, so the target and roadmap cover selected slices rather than the whole application.`;
+			cards[2].querySelector(".confidence-action").textContent = "Next: run one outcome or bounded context at a time; use the current plan only for the files explicitly mapped in Target structure.";
+		}
 	}
 	const paneRows = {
-		legacy: modernizationItems(result, "legacy"), target: modernizationItems(result, "target"), routes: modernizationItems(result, "routes"), database: modernizationItems(result, "database"), contexts: modernizationItems(result, "contexts"), roadmap: modernizationItems(result, "roadmap")
+		legacy: modernizationItems(result, "legacy"), target: modernizationItems(result, "target"), routes: modernizationItems(result, "routes"), database: modernizationItems(result, "database"), links: modernizationItems(result, "links"), contexts: modernizationItems(result, "contexts"), roadmap: modernizationItems(result, "roadmap")
 	};
 	Object.entries(paneRows).forEach(([pane, rows]) => {
 		const element = document.querySelector(`#modernization-pane-${pane}`);
@@ -2469,6 +2596,246 @@ function renderModernizationResult(result = {}) {
 	const selected = state.modernization.selectedItem;
 	if (selected) renderModernizationDetail(selected);
 	if (elements.modernizationExportActions) elements.modernizationExportActions.hidden = !state.terminal.has(state.activeRun?.status || "");
+	renderModernizationSolution(result);
+}
+
+function selectedRoadPhase(result = {}) {
+	const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
+	if (!phases.length) return null;
+	if (state.modernization.selectedPhaseId) {
+		const match = phases.find((phase) => phase.id === state.modernization.selectedPhaseId);
+		if (match) return match;
+	}
+	return phases.find((phase) => phase.currentSlice) || phases[0];
+}
+
+function renderModernizationSolution(result = {}) {
+	const host = document.querySelector("#modernization-solution");
+	if (!host) return;
+	const hasPlan = !!(result.roadmapPhases?.length || result.target?.units?.length || result.inventory?.units?.length);
+	host.hidden = !hasPlan;
+	if (!hasPlan) return;
+	const phase = selectedRoadPhase(result);
+	if (phase?.id) state.modernization.selectedPhaseId = phase.id;
+	const road = result.coverage?.road || {};
+	const unslicedToggle = document.querySelector("#modernization-show-unsliced");
+	if (unslicedToggle) unslicedToggle.checked = !!state.modernization.showUnsliced;
+	const coverageEl = document.querySelector("#modernization-road-coverage");
+	if (coverageEl) {
+		const onRoad = Number(road.onRoad ?? 0);
+		const notYet = Number(road.notYetSliced ?? 0);
+		const schemaAbsent = (result.coverage?.schema?.coverage || "") === "absent";
+		coverageEl.hidden = false;
+		coverageEl.textContent = `${onRoad} on road · ${notYet} not yet sliced${schemaAbsent ? " · schema inference-limited" : ""}`;
+	}
+	const stackEl = document.querySelector("#modernization-source-stack");
+	if (stackEl) {
+		stackEl.hidden = !road.sourceStackNote;
+		stackEl.textContent = road.sourceStackNote || "";
+	}
+	const unitIds = new Set((phase?.unitIds || []).map(String));
+	const routeIds = new Set((phase?.routeIds || []).map(String));
+	const findingIds = new Set((phase?.dbFindingIds || []).map(String));
+	const transitionIds = new Set((phase?.transitionIds || []).map(String));
+	const onRoadLegacy = new Set();
+	(result.target?.units || []).forEach((unit) => {
+		if (unitIds.size && !unitIds.has(String(unit.id))) return;
+		(unit.legacyUnitIds || []).forEach((id) => onRoadLegacy.add(String(id)));
+	});
+	(result.unitLinks || []).forEach((link) => {
+		if (unitIds.size && link.targetUnitId && !unitIds.has(String(link.targetUnitId))) return;
+		if (link.legacyUnitId) onRoadLegacy.add(String(link.legacyUnitId));
+	});
+	const legacyList = document.querySelector("#modernization-legacy-list");
+	if (legacyList) {
+		legacyList.innerHTML = "";
+		const units = result.inventory?.units || [];
+		const filtered = units.filter((unit) => {
+			const id = String(unit.id || "");
+			const onRoad = onRoadLegacy.has(id);
+			return state.modernization.showUnsliced ? true : onRoad;
+		});
+		if (!filtered.length) {
+			legacyList.innerHTML = `<p class="field-hint">${state.modernization.showUnsliced ? "No legacy units in inventory." : "No legacy units linked to this phase yet."}</p>`;
+		} else {
+			filtered.slice(0, 80).forEach((unit) => {
+				const row = document.createElement("button");
+				row.type = "button";
+				row.className = "modernization-solution-row";
+				const onRoad = onRoadLegacy.has(String(unit.id || ""));
+				row.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span>`;
+				row.querySelector(".modernization-item-title").textContent = unit.path || unit.filePath || unit.name || unit.id || "Legacy unit";
+				row.querySelector(".modernization-item-meta").textContent = `${unit.kind || unit.layer || "unit"}${onRoad ? "" : " · not yet sliced"}`;
+				legacyList.appendChild(row);
+			});
+		}
+	}
+	const roadList = document.querySelector("#modernization-road-list");
+	if (roadList) {
+		roadList.innerHTML = "";
+		(result.roadmapPhases || []).forEach((item, index) => {
+			const card = document.createElement("button");
+			card.type = "button";
+			card.className = "modernization-road-card";
+			card.classList.toggle("is-selected", item.id === phase?.id);
+			card.dataset.phaseId = item.id || "";
+			card.innerHTML = `<span class="modernization-road-index">${index + 1}</span><span class="modernization-road-body"><strong></strong><span class="modernization-item-meta"></span></span><span class="status-badge"></span>`;
+			card.querySelector("strong").textContent = item.name || item.id || `Phase ${index + 1}`;
+			card.querySelector(".modernization-item-meta").textContent = item.goal || item.parityIntent || "";
+			card.querySelector(".status-badge").textContent = item.pattern || (item.currentSlice ? "current" : "phase");
+			card.addEventListener("click", () => {
+				state.modernization.selectedPhaseId = item.id || "";
+				renderModernizationSolution(state.modernization.result || result);
+			});
+			roadList.appendChild(card);
+		});
+	}
+	const routeStrip = document.querySelector("#modernization-route-strip");
+	if (routeStrip) {
+		const routes = (result.routeContracts || []).filter((route) => !routeIds.size || routeIds.has(String(route.id)));
+		routeStrip.innerHTML = routes.length
+			? `<h4>Routes</h4>${routes.map((route) => `<div class="modernization-route-row"><code></code><span></span></div>`).join("")}`
+			: `<p class="field-hint">No route contracts linked to this phase.</p>`;
+		[...routeStrip.querySelectorAll(".modernization-route-row")].forEach((row, index) => {
+			const route = routes[index];
+			row.querySelector("code").textContent = `${route.method || "GET"} ${route.legacyPath || route.path || "?"} → ${route.targetRoute || route.targetEvent || "?"}`;
+			row.querySelector("span").textContent = route.rollbackNote || route.rollback || "";
+		});
+	}
+	const targetTree = document.querySelector("#modernization-target-tree");
+	if (targetTree) {
+		const units = (result.target?.units || []).filter((unit) => !unitIds.size || unitIds.has(String(unit.id)));
+		targetTree.innerHTML = units.length ? "" : `<p class="field-hint">No target units linked to this phase.</p>`;
+		units.forEach((unit) => {
+			const row = document.createElement("button");
+			row.type = "button";
+			row.className = "modernization-solution-row";
+			row.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span>`;
+			row.querySelector(".modernization-item-title").textContent = unit.targetPath || unit.pathHint || unit.id;
+			row.querySelector(".modernization-item-meta").textContent = `${unit.layer || "target"} · ${(unit.symbolNames || []).slice(0, 3).join(", ") || "—"}`;
+			row.addEventListener("click", () => {
+				state.modernization.selectedItem = { ...unit, _modernizationType: "target-unit" };
+				renderModernizationDetail(state.modernization.selectedItem);
+			});
+			targetTree.appendChild(row);
+		});
+	}
+	const sliceDb = document.querySelector("#modernization-slice-db");
+	if (sliceDb) {
+		const findings = (result.dbFindings || []).filter((item) => !findingIds.size || findingIds.has(String(item.id)));
+		const transitions = (result.dbTransitions || []).filter((item) => !transitionIds.size || transitionIds.has(String(item.id)));
+		const schemaAbsent = (result.coverage?.schema?.coverage || "") === "absent";
+		if (schemaAbsent && !findings.length && !transitions.length) {
+			sliceDb.innerHTML = `<p class="field-hint">No schema pack — database notes for this slice are inference-limited.</p>`;
+		} else if (!findings.length && !transitions.length) {
+			sliceDb.innerHTML = `<p class="field-hint">No database findings linked to this phase.</p>`;
+		} else {
+			sliceDb.innerHTML = `<h4>Slice database</h4><ul></ul>`;
+			const list = sliceDb.querySelector("ul");
+			findings.slice(0, 8).forEach((item) => {
+				const li = document.createElement("li");
+				li.textContent = `${item.category || "db"} · ${item.objectRef || item.id}: ${item.proposedChange || item.problem || ""}`;
+				list.appendChild(li);
+			});
+			transitions.slice(0, 8).forEach((item) => {
+				const li = document.createElement("li");
+				li.textContent = `${item.operation || "transition"} · ${item.migrationPath || item.id}`;
+				list.appendChild(li);
+			});
+		}
+	}
+	const dod = document.querySelector("#modernization-slice-dod");
+	if (dod && !phase) {
+		dod.innerHTML = `<p class="field-hint">Select a roadmap phase to review definition of done.</p>`;
+	} else if (dod) {
+		const exit = Array.isArray(phase.exitCriteria) ? phase.exitCriteria : [];
+		const isCurrent = !!(phase.currentSlice || phase.id === (result.roadmapPhases || []).find((item) => item.currentSlice)?.id || phase.id === (result.roadmapPhases || [])[0]?.id);
+		dod.innerHTML = `
+			<div class="modernization-guide-heading"><div><p class="eyebrow">Slice definition of done</p><h3></h3></div><span class="status-badge"></span></div>
+			<p class="modernization-dod-goal"></p>
+			<p class="modernization-dod-parity"></p>
+			<div class="modernization-dod-grid"><section><h4>Exit criteria</h4><ul class="exit"></ul></section><section><h4>Rollback</h4><p class="rollback"></p></section></div>
+			<section class="modernization-dod-prompt"><h4>Implementer prompt</h4><pre></pre></section>
+			<label class="modernization-rebuild-note">Rebuild note <textarea id="modernization-rebuild-note" rows="2" maxlength="1000" placeholder="Optional guidance for a redo of this slice"></textarea></label>
+			<div class="modernization-dod-actions">
+				<button type="button" class="primary-button" data-slice-action="accept" ${isCurrent ? "" : "disabled"}>Accept slice</button>
+				<button type="button" class="secondary-button" data-slice-action="reject" ${isCurrent ? "" : "disabled"}>Reject slice</button>
+				<button type="button" class="secondary-button" data-slice-action="rebuild">Rebuild slice</button>
+			</div>
+			<p class="form-message" id="modernization-slice-action-status" role="status"></p>`;
+		dod.querySelector("h3").textContent = phase.name || phase.id;
+		dod.querySelector(".status-badge").textContent = phase.pattern || "phase";
+		dod.querySelector(".modernization-dod-goal").textContent = phase.goal || "";
+		dod.querySelector(".modernization-dod-parity").textContent = phase.parityIntent ? `Parity: ${phase.parityIntent}` : "";
+		const exitList = dod.querySelector("ul.exit");
+		if (!exit.length) exitList.innerHTML = `<li class="field-hint">No exit criteria listed.</li>`;
+		else exit.forEach((item) => {
+			const li = document.createElement("li");
+			li.textContent = item;
+			exitList.appendChild(li);
+		});
+		dod.querySelector(".rollback").textContent = phase.rollback || "No rollback note.";
+		dod.querySelector("pre").textContent = phase.implementerPrompt || "No implementer prompt.";
+		dod.querySelector('[data-slice-action="accept"]').addEventListener("click", () => saveSliceDecision(phase, "accepted"));
+		dod.querySelector('[data-slice-action="reject"]').addEventListener("click", () => saveSliceDecision(phase, "rejected"));
+		dod.querySelector('[data-slice-action="rebuild"]').addEventListener("click", () => rebuildSlice(phase));
+	}
+}
+
+async function saveSliceDecision(phase, decision) {
+	if (!state.activeRun?.id || !phase?.id) return;
+	const status = document.querySelector("#modernization-slice-action-status");
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(phase.id)}/decision`, {
+			method: "PUT",
+			body: JSON.stringify({
+				itemType: "roadmap-phase",
+				itemFingerprint: phase.itemFingerprint || "",
+				planFingerprint: state.modernization.result?.planFingerprint || "",
+				decision
+			})
+		});
+		if (status) status.textContent = `Slice ${decision}.`;
+		if (payload?.data?.result) renderModernizationResult(payload.data.result);
+		else await loadResult(state.activeRun.id);
+	} catch (error) {
+		if (status) status.textContent = error.message || "Could not save slice decision.";
+	}
+}
+
+async function rebuildSlice(phase) {
+	if (!state.activeRun?.id || !phase?.id) return;
+	const status = document.querySelector("#modernization-slice-action-status");
+	const note = document.querySelector("#modernization-rebuild-note")?.value || "";
+	if (status) status.textContent = "Rebuilding slice…";
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/phases/${encodeURIComponent(phase.id)}/rebuild`, {
+			method: "POST",
+			body: JSON.stringify({
+				note,
+				planFingerprint: state.modernization.result?.planFingerprint || ""
+			})
+		});
+		if (status) status.textContent = "Slice rebuilt.";
+		if (payload?.data?.result) renderModernizationResult(payload.data.result);
+		else await loadResult(state.activeRun.id);
+	} catch (error) {
+		if (status) status.textContent = error.message || "Slice rebuild failed.";
+	}
+}
+
+function renderModernizationTransitionGuide(result = {}) {
+	const host = document.querySelector("#modernization-transition-guide");
+	if (!host) return;
+	const target = result.target || {};
+	const metadata = result.metadata || {};
+	const runtime = metadata.runtime?.runtime || metadata.runtime || "boxlang";
+	const profile = metadata.targetProfile || target.layoutProfile || "modern";
+	const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
+	const units = Array.isArray(target.units) ? target.units : [];
+	const folders = [...new Set(units.map((unit) => String(unit.targetPath || "").split("/").slice(0, -1).join("/")).filter(Boolean))].sort();
+	const list = (items, empty) => items.length ? `<ul>${items.map((item) => `<li>${item}</li>`).join("")}</ul>` : `<p class="field-hint">${empty}</p>`;
+	host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">Recommended transition</p><h3>Move one bounded slice at a time</h3></div><span class="status-badge">${runtime} · ${profile}</span></div><div class="modernization-guide-grid"><section><h4>Target skeleton</h4>${list(folders.map((folder) => `<code>${folder}/</code>`), "No target folders were generated yet.")}<p class="field-hint">Target files are proposals only. Create the folders, then move one validated slice behind a route before retiring its legacy file.</p></section><section><h4>Safe order of work</h4>${list(["1. Confirm configuration and datasource access.", "2. Add the target handler/service without removing the legacy route.", "3. Compare response, side effects, and permissions on representative data.", "4. Switch the route, monitor, then retire the legacy unit."], "No transition steps available.")}</section><section><h4>Planned features</h4>${list(phases.slice(0, 6).map((phase, index) => `<strong>${index + 1}. ${phase.name || phase.id || "Migration phase"}</strong><br>${phase.description || "Review the phase details before implementation."}`), "No roadmap phases were generated.")}</section></div><div class="modernization-guide-actions"><strong>Before implementation</strong>${list(["Open Target structure to inspect each source → target mapping.", "Open Validation + decisions and resolve every blocking item.", "In Modernize setup, choose Schema source and attach a local .sql/.json file or repository schema path.", "Use the phase exit criteria and rollback text as the review checklist."], "No actions available.")}</div>`;
 }
 
 function renderResult(result = {}) {
@@ -4377,6 +4744,10 @@ elements.modernizationResults?.addEventListener("keydown", (event) => {
 	selectModernizationPane(tabs[next].dataset.modernPane, { focus: true });
 });
 
+document.querySelector("#modernization-show-unsliced")?.addEventListener("change", (event) => {
+	state.modernization.showUnsliced = !!event.target.checked;
+	renderModernizationSolution(state.modernization.result || {});
+});
 elements.modernizationSearch?.addEventListener("input", (event) => {
 	state.modernization.search = event.target.value || "";
 	renderModernizationResult(state.modernization.result || {});
