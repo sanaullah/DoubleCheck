@@ -2,6 +2,7 @@
 @singleton
 class {
 	property name="chatGateway" inject="AIChatGateway";
+	property name="skillService" inject="ModernizationSkillService";
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="provider" inject="coldbox:setting:aiProvider";
 	property name="baseURL" inject="coldbox:setting:aiBaseURL";
@@ -21,6 +22,35 @@ class {
 		return chatGateway.isEnabled( provider, apiKey );
 	}
 
+	/**
+	 * Optional allowlisted skill reader for agent path. Construction/read failures
+	 * never block the preferred chat JSON path.
+	 */
+	array function buildSkillTools() {
+		try {
+			var service = variables.skillService ?: javacast( "null", "" );
+			if ( isNull( service ) ) return [];
+			return [
+				aiTool(
+					"read_modernization_skill",
+					"Read one allowlisted DoubleCheck modernization skill by name. Skills come from the DoubleCheck install only, never the analyzed project.",
+					( name ) => {
+						try {
+							return service.readSkill( name );
+						} catch ( any error ) {
+							return {
+								ok   : false,
+								error: secretRedactionService.redactText( error.message ?: "Skill read failed" )
+							};
+						}
+					}
+				).describeName( "Allowlisted skill folder name under .agents/skills" )
+			];
+		} catch ( any ignored ) {
+			return [];
+		}
+	}
+
 	struct function run( required string runId, required struct request, struct options = {} ) {
 		if ( !isEnabled() ) {
 			throw( type = "AIConfigurationException", message = "Modernization provider is not enabled" );
@@ -36,6 +66,21 @@ class {
 		var attemptLimit = min( requestedRetries, iterationLimit - 1 );
 		var startedAt = isNumeric( arguments.options.startedAt ?: "" ) ? val( arguments.options.startedAt ) : getTickCount();
 		var maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? max( 1000, int( arguments.options.maxDurationMs ) ) : 180000;
+		// Prefer chat with injected skill pack. Optional agent+tool path may run first
+		// when explicitly requested; any tool/agent failure falls through to chat.
+		if ( arguments.options.useSkillAgent ?: false ) {
+			try {
+				var skillResult = runWithSkillAgent( arguments.runId, arguments.request, arguments.options, budgets, startedAt, maxDurationMs );
+				if ( isStruct( skillResult ) && ( skillResult.ok ?: false ) ) return skillResult;
+			} catch ( any toolError ) {
+				if ( lCase( toolError.type ?: "" ) == "runcancelled" ) rethrow;
+				emitObservation( arguments.options, {
+					stage : "skill-tool-fallback",
+					runId : arguments.runId,
+					error : secretRedactionService.redactText( toolError.message ?: "Skill tool path unavailable" )
+				} );
+			}
+		}
 		var lastError = "";
 		var spentUsd = 0;
 		for ( var attempt = 0; attempt <= attemptLimit; attempt++ ) {
@@ -123,6 +168,76 @@ class {
 				// Observability is best effort and must never fail a modernization run.
 			}
 		}
+	}
+
+	private struct function runWithSkillAgent(
+		required string runId,
+		required struct request,
+		required struct options,
+		required struct budgets,
+		required numeric startedAt,
+		required numeric maxDurationMs
+	) {
+		if ( isCancelled( arguments.runId, arguments.options ) ) {
+			throw( type = "RunCancelled", message = "Modernization provider request cancelled" );
+		}
+		var tools = buildSkillTools();
+		if ( !tools.len() ) {
+			throw( type = "ModernizationSkillToolUnavailable", message = "Skill tools unavailable" );
+		}
+		var systemText = "";
+		var userText = "";
+		for ( var message in ( arguments.request.messages ?: [] ) ) {
+			var role = lCase( trim( message.role ?: "" ) );
+			var content = toString( message.content ?: "" );
+			if ( role == "system" ) systemText &= ( len( systemText ) ? char( 10 ) : "" ) & content;
+			else userText &= ( len( userText ) ? char( 10 ) : "" ) & content;
+		}
+		if ( !len( trim( systemText ) ) ) systemText = "Return one JSON object for the modernization plan. Prefer tool reads only for allowlisted skills.";
+		if ( !len( trim( userText ) ) ) userText = "Produce the modernization JSON payload.";
+		var elapsedMs = getTickCount() - arguments.startedAt;
+		if ( elapsedMs >= arguments.maxDurationMs ) {
+			throw( type = "ModernizationSkillToolUnavailable", message = "Skill agent budget exceeded before start" );
+		}
+		var agent = aiAgent(
+			name         = "modernization-skill",
+			description  = "Modernization planner with optional allowlisted skill reads",
+			instructions = systemText,
+			tools        = tools
+		);
+		var raw = agent.run(
+			userText,
+			buildParams( arguments.request, arguments.budgets ),
+			buildOptions( max( 1, arguments.maxDurationMs - elapsedMs ) )
+		);
+		var responseUsage = extractUsage( raw );
+		var payload = normalizeResponse( raw );
+		if ( !isStruct( payload ) ) {
+			throw( type = "ModernizationProviderResponseException", message = "Skill agent returned non-object JSON" );
+		}
+		var usage = normalizeUsage( responseUsage, arguments.request, payload );
+		var costUsd = estimateCost( usage );
+		emitObservation( arguments.options, {
+			stage            : "provider-complete",
+			runId            : arguments.runId,
+			attempt          : 1,
+			elapsedMs        : getTickCount() - arguments.startedAt,
+			outputCharacters : len( jsonSerialize( payload ) ),
+			costUsd          : costUsd,
+			usage            : usage,
+			path             : "skill-agent"
+		} );
+		return {
+			ok               : true,
+			payload          : payload,
+			outputCharacters : len( jsonSerialize( payload ) ),
+			attempt          : 1,
+			provider         : provider,
+			model            : model,
+			costUsd          : costUsd,
+			usage            : usage,
+			path             : "skill-agent"
+		};
 	}
 
 	private array function fitMessages(required array messages) {

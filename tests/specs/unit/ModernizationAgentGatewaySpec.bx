@@ -56,6 +56,60 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.error ).toBe( "cost-budget-exceeded" );
 				expect( chat.callCount() ).toBe( 0 );
 			} );
+
+			it( "falls back to chat JSON when the optional skill-tool agent path fails", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = jsonSerialize( { targetUnits: [ { id: "tu-1" } ] } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.model = "scripted";
+				service.maxRetries = 1;
+				// Missing skill service → tool path unavailable → chat must still succeed.
+				service.skillService = javacast( "null", "" );
+				var observations = [];
+				var result = service.run(
+					"run-5",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{
+						useSkillAgent: true,
+						onObservation: ( item ) => observations.append( item )
+					}
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits.len() ).toBe( 1 );
+				expect( chat.callCount() ).toBeGTE( 1 );
+				expect( observations.some( ( item ) => item.stage == "skill-tool-fallback" ) ).toBeTrue();
+				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
+			} );
+
+			it( "still succeeds on chat when skill tools are empty and agent mode is requested", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { roadmapPhases: [] } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.skillService = javacast( "null", "" );
+				var result = service.run(
+					"run-6",
+					{ messages: [ { role: "system", content: "json" } ] },
+					{ useSkillAgent: true }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload ).toHaveKey( "roadmapPhases" );
+				expect( chat.callCount() ).toBeGTE( 1 );
+			} );
+
+			it( "builds an allowlisted read_modernization_skill tool when skill service is present", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.skillService = new app.models.services.ModernizationSkillService();
+				var tools = service.buildSkillTools();
+				expect( tools.len() ).toBeGTE( 1 );
+			} );
 		} );
 	}
 }
