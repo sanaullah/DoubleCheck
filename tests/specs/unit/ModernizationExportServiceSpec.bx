@@ -13,13 +13,31 @@ class extends="testbox.system.BaseSpec" {
 					schemaVersion: "modernization-plan-v1",
 					planState: "needs-review",
 					summary: "Plan with an evidence-backed route transition.",
-					coverage: { schema: { coverage: "inference-limited" }, banners: [ "Attach a schema pack for stronger proposals." ] },
+					coverage: {
+						schema: { coverage: "inference-limited" },
+						banners: [ "Attach a schema pack for stronger proposals." ],
+						road: { onRoad: 1, notYetSliced: 4, sourceStackNote: "" }
+					},
 					inventory: { units: [ { id: "legacy-1", path: "order.cfm", kind: "template" } ] },
-					target: { units: [ { id: "target-1", path: "app/handlers/Orders.bx", validationStatus: "warning" } ] },
-					routeContracts: [ { id: "route-1", legacyPath: "/order.cfm", targetRoute: "/orders", validationStatus: "valid" } ],
+					target: { units: [ { id: "target-1", path: "app/handlers/Orders.bx", targetPath: "app/handlers/Orders.bx", validationStatus: "warning" } ] },
+					routeContracts: [ { id: "route-1", method: "GET", legacyPath: "/order.cfm", targetRoute: "/orders", rollbackNote: "Flip route back to order.cfm", validationStatus: "valid" } ],
 					dbFindings: [],
 					dbTransitions: [],
-					roadmapPhases: [],
+					samples: [ { targetPath: "app/handlers/Orders.bx", language: "boxlang", code: "class { function index(){} }" } ],
+					roadmapPhases: [
+						{
+							id: "phase-1",
+							name: "Orders coexist slice",
+							pattern: "coexist-route",
+							goal: "Dual-route orders behind ColdBox",
+							parityIntent: "Same response shape for GET /order.cfm",
+							unitIds: [ "target-1" ],
+							routeIds: [ "route-1" ],
+							exitCriteria: [ "Route returns matching payload", "Legacy file still present" ],
+							rollback: "Point /orders back to order.cfm",
+							implementerPrompt: "Implement Orders.bx behind coexist routing."
+						}
+					],
 					validation: { status: "warning", blocking: 0, warnings: 1 },
 					decisions: []
 				};
@@ -32,6 +50,26 @@ class extends="testbox.system.BaseSpec" {
 				expect( report.content ).toInclude( "DoubleCheck Modernization Plan" );
 				expect( report.content ).toInclude( "order.cfm" );
 				expect( report.content ).toInclude( "Attach a schema pack" );
+			} );
+
+			it( "orders Markdown as strangler coverage then Solution road before legacy catalog", () => {
+				var content = service.export( run, result, "markdown" ).content;
+				var stranglerAt = findNoCase( '## Strangler coexistence', content );
+				var coverageAt = findNoCase( '## Overview and coverage', content );
+				var roadAt = findNoCase( '## Solution road', content );
+				var phaseAt = findNoCase( 'Orders coexist slice', content );
+				var legacyAt = findNoCase( '## Legacy catalog', content );
+				expect( stranglerAt ).toBeGT( 0 );
+				expect( coverageAt ).toBeGT( stranglerAt );
+				expect( roadAt ).toBeGT( coverageAt );
+				expect( phaseAt ).toBeGT( roadAt );
+				expect( legacyAt ).toBeGT( phaseAt );
+				expect( content ).toInclude( "On road" );
+				expect( content ).toInclude( "Not yet sliced" );
+				expect( content ).toInclude( "coexist-route" );
+				expect( content ).toInclude( "Flip route back to order.cfm" );
+				expect( content ).toInclude( "Exit criteria" );
+				expect( content ).toInclude( "Implement Orders.bx behind coexist routing." );
 			} );
 
 			it( "exports the versioned JSON plan", () => {

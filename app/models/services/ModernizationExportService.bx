@@ -78,6 +78,7 @@ class {
 		var coverage = arguments.result.coverage ?: {};
 		var planMetadata = arguments.result.metadata ?: {};
 		var coverageSchema = coverage.schema ?: {};
+		var coverageRoad = coverage.road ?: {};
 		var schemaEvidence = arguments.result.schemaEvidence ?: {};
 		var inventory = arguments.result.inventory ?: {};
 		var target = arguments.result.target ?: {};
@@ -92,6 +93,7 @@ class {
 		var contexts = target.contexts ?: arguments.result.contexts ?: [];
 		var extracts = target.extracts ?: arguments.result.extracts ?: [];
 		var samples = arguments.result.samples ?: [];
+		var unitLinks = arguments.result.unitLinks ?: [];
 
 		lines.append( mdHeading( 1, "DoubleCheck Modernization Plan" ) );
 		lines.append( "" );
@@ -102,12 +104,20 @@ class {
 		lines.append( "- **Plan state:** `" & escapeMarkdown( arguments.result.planState ?: arguments.result.state ?: "needs-review" ) & "`" );
 		lines.append( "" );
 
+		lines.append( mdHeading( 2, "Strangler coexistence" ) );
+		lines.append( "" );
+		lines.append( "Move one bounded slice at a time. Prefer coexist-route dual routing and measurable exit criteria before retiring legacy units. Do not treat this plan as a big-bang cutover." );
+		lines.append( "" );
+
 		lines.append( mdHeading( 2, "Overview and coverage" ) );
 		lines.append( "" );
 		lines.append( escapeMarkdown( arguments.result.summary ?: "No modernization summary was generated." ) );
 		lines.append( "" );
 		lines.append( coverageLine( "Application files", coverage.filesScanned ?: coverage.fileCount ?: 0 ) );
 		lines.append( coverageLine( "CFML files", coverage.cfmlFiles ?: coverage.cfmlFileCount ?: 0 ) );
+		lines.append( coverageLine( "On road", coverageRoad.onRoad ?: 0 ) );
+		lines.append( coverageLine( "Not yet sliced", coverageRoad.notYetSliced ?: 0 ) );
+		if ( len( coverageRoad.sourceStackNote ?: "" ) ) lines.append( "- **Source stack note:** " & escapeMarkdown( coverageRoad.sourceStackNote ) );
 		lines.append( coverageLine( "Schema source", coverage.schemaSource ?: schemaEvidence.source ?: "none" ) );
 		lines.append( coverageLine( "Schema coverage", coverage.schemaCoverage ?: coverageSchema.coverage ?: "unknown" ) );
 		lines.append( coverageLine( "Coverage status", coverage.status ?: coverage.coverageStatus ?: "unknown" ) );
@@ -121,6 +131,8 @@ class {
 		if ( len( providerDisclosure ) ) lines.append( "- **Provider disclosure:** " & escapeMarkdown( providerDisclosure ) );
 		lines.append( "" );
 
+		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
+
 		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnits, [ "id", "path", "kind", "name", "confidence" ] );
 		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus" ] );
 		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus" ] );
@@ -130,23 +142,6 @@ class {
 		appendRows( lines, mdHeading( 2, "Context extracts" ), extracts, [ "extractId", "path", "startLine", "endLine", "contextId" ] );
 		appendSamples( lines, samples );
 		appendRows( lines, mdHeading( 2, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ] );
-
-		lines.append( mdHeading( 2, "Roadmap" ) );
-		lines.append( "" );
-		if ( !roadmap.len() ) {
-			lines.append( "No roadmap phases were generated." );
-		} else {
-			var phaseIndex = 1;
-			for ( var phase in roadmap ) {
-				lines.append( mdHeading( 3, phaseIndex & ". " & escapeMarkdown( phase.name ?: phase.title ?: "Phase" ) ) );
-				lines.append( "" );
-				lines.append( "- **Outcome:** " & escapeMarkdown( phase.outcome ?: phase.exitCriteria ?: "" ) );
-				lines.append( "- **Status:** `" & escapeMarkdown( phase.validationStatus ?: phase.status ?: "unknown" ) & "`" );
-				if ( isArray( phase.dependencies ?: "" ) && phase.dependencies.len() ) lines.append( "- **Dependencies:** `" & escapeMarkdown( arrayToList( phase.dependencies, ", " ) ) & "`" );
-				phaseIndex++;
-			}
-		}
-		lines.append( "" );
 
 		lines.append( mdHeading( 2, "Validation and decisions" ) );
 		lines.append( "" );
@@ -164,6 +159,115 @@ class {
 		lines.append( "" );
 		lines.append( "> AI-proposed artifacts are bounded skeletons. Validate them against the immutable evidence snapshot before applying changes." );
 		return arrayToList( lines, char( 10 ) );
+	}
+
+	private void function appendSolutionPhases(
+		required array lines,
+		required array roadmap,
+		required array routes,
+		required array targetUnits,
+		required array samples,
+		required array dbFindings,
+		required array transitions,
+		required array unitLinks
+	) {
+		arguments.lines.append( mdHeading( 2, "Solution road" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.roadmap.len() ) {
+			arguments.lines.append( "No roadmap phases were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		var phaseIndex = 1;
+		for ( var phase in arguments.roadmap ) {
+			var unitIds = toIdSet( phase.unitIds ?: [] );
+			var routeIds = toIdSet( phase.routeIds ?: [] );
+			var findingIds = toIdSet( phase.dbFindingIds ?: [] );
+			var transitionIds = toIdSet( phase.transitionIds ?: [] );
+			var phaseId = toString( phase.id ?: "" );
+			arguments.lines.append( mdHeading( 3, phaseIndex & ". " & escapeMarkdown( phase.name ?: phase.title ?: "Phase" ) ) );
+			arguments.lines.append( "" );
+			arguments.lines.append( "- **Pattern:** `" & escapeMarkdown( phase.pattern ?: "phase" ) & "`" );
+			if ( len( phase.goal ?: "" ) ) arguments.lines.append( "- **Goal:** " & escapeMarkdown( phase.goal ) );
+			if ( len( phase.parityIntent ?: "" ) ) arguments.lines.append( "- **Parity:** " & escapeMarkdown( phase.parityIntent ) );
+			var phaseRoutes = arguments.routes.filter( ( route ) => !routeIds.len() || routeIds.contains( toString( route.id ?: "" ) ) );
+			if ( phaseRoutes.len() ) {
+				arguments.lines.append( "- **Routes:**" );
+				for ( var route in phaseRoutes ) {
+					arguments.lines.append( "  - `" & escapeMarkdown( ( route.method ?: "GET" ) & " " & ( route.legacyPath ?: route.path ?: "?" ) & " → " & ( route.targetRoute ?: route.targetEvent ?: "?" ) ) & "`" );
+					if ( len( route.rollbackNote ?: route.rollback ?: "" ) ) arguments.lines.append( "    - Rollback: " & escapeMarkdown( route.rollbackNote ?: route.rollback ) );
+				}
+			}
+			var phaseTargets = arguments.targetUnits.filter( ( unit ) => !unitIds.len() || unitIds.contains( toString( unit.id ?: "" ) ) );
+			if ( phaseTargets.len() ) {
+				arguments.lines.append( "- **Targets:**" );
+				for ( var unit in phaseTargets ) {
+					arguments.lines.append( "  - `" & escapeMarkdown( unit.targetPath ?: unit.path ?: unit.id ?: "target" ) & "`" );
+				}
+			}
+			var phaseSamples = arguments.samples.filter( ( sample ) => {
+				var related = sample.relatedItemIds ?: [];
+				if ( !isArray( related ) || !related.len() ) return false;
+				for ( var relatedId in related ) {
+					if ( unitIds.contains( toString( relatedId ) ) || toString( relatedId ) == phaseId ) return true;
+				}
+				return false;
+			} );
+			if ( !phaseSamples.len() && phaseTargets.len() ) {
+				var targetPaths = {};
+				for ( var targetUnit in phaseTargets ) targetPaths[ lCase( trim( targetUnit.targetPath ?: targetUnit.path ?: "" ) ) ] = true;
+				phaseSamples = arguments.samples.filter( ( sample ) => structKeyExists( targetPaths, lCase( trim( sample.targetPath ?: sample.path ?: "" ) ) ) );
+			}
+			if ( phaseSamples.len() ) {
+				var sample = phaseSamples[ 1 ];
+				var excerpt = left( toString( sample.code ?: sample.content ?: "" ), 400 );
+				if ( len( trim( excerpt ) ) ) {
+					excerpt = variables.secretRedactionService.redactText( excerpt );
+					excerpt = replace( excerpt, "```", "`` `", "all" );
+					arguments.lines.append( "- **Sample excerpt (`" & escapeMarkdown( sample.targetPath ?: sample.path ?: "sample" ) & "`):**" );
+					arguments.lines.append( "" );
+					arguments.lines.append( "```" & ( sample.language ?: sample.dialect ?: "text" ) );
+					arguments.lines.append( excerpt );
+					arguments.lines.append( "```" );
+				}
+			}
+			var phaseFindings = arguments.dbFindings.filter( ( item ) => !findingIds.len() || findingIds.contains( toString( item.id ?: item.findingId ?: "" ) ) );
+			var phaseTransitions = arguments.transitions.filter( ( item ) => !transitionIds.len() || transitionIds.contains( toString( item.id ?: item.transitionId ?: "" ) ) );
+			if ( phaseFindings.len() || phaseTransitions.len() ) {
+				arguments.lines.append( "- **Slice database:**" );
+				for ( var finding in phaseFindings ) {
+					arguments.lines.append( "  - " & escapeMarkdown( ( finding.category ?: "db" ) & " · " & ( finding.objectRef ?: finding.id ?: "" ) & ": " & ( finding.proposedChange ?: finding.problem ?: "" ) ) );
+				}
+				for ( var transition in phaseTransitions ) {
+					arguments.lines.append( "  - " & escapeMarkdown( ( transition.operation ?: "transition" ) & " · " & ( transition.migrationPath ?: transition.id ?: "" ) ) );
+				}
+			}
+			var exitCriteria = isArray( phase.exitCriteria ?: "" ) ? phase.exitCriteria : ( len( trim( toString( phase.exitCriteria ?: "" ) ) ) ? [ phase.exitCriteria ] : [] );
+			if ( exitCriteria.len() ) {
+				arguments.lines.append( "- **Exit criteria:**" );
+				for ( var criterion in exitCriteria ) arguments.lines.append( "  - " & escapeMarkdown( toString( criterion ) ) );
+			}
+			if ( len( phase.rollback ?: "" ) ) arguments.lines.append( "- **Rollback:** " & escapeMarkdown( phase.rollback ) );
+			if ( len( phase.implementerPrompt ?: "" ) ) {
+				arguments.lines.append( "- **Implementer prompt:**" );
+				arguments.lines.append( "" );
+				arguments.lines.append( "```" );
+				arguments.lines.append( variables.secretRedactionService.redactText( toString( phase.implementerPrompt ) ) );
+				arguments.lines.append( "```" );
+			}
+			arguments.lines.append( "" );
+			phaseIndex++;
+		}
+	}
+
+	private array function toIdSet( required any values ) {
+		var ids = [];
+		if ( !isArray( arguments.values ) ) return ids;
+		for ( var value in arguments.values ) {
+			var token = toString( value );
+			if ( len( token ) && !ids.contains( token ) ) ids.append( token );
+		}
+		return ids;
 	}
 
 	private void function appendRows( required array lines, required string heading, required array rows, required array fields ) {
