@@ -74,7 +74,10 @@ class {
 			failed: failed,
 			truncated: context.truncated ?: false,
 			partitions: partitions.len(),
-			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 )
+			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 ),
+			files: val( contextSummary.files ?: partitions.len() ),
+			lineCount: val( contextSummary.lineCount ?: 0 ),
+			omittedPartitions: val( contextSummary.omittedPartitions ?: 0 )
 		};
 		var banners = [];
 		if ( repository.truncation ) banners.append( "Repository inventory is partial because scan budgets were reached." );
@@ -86,6 +89,56 @@ class {
 	}
 
 	struct function build(struct scan = {}, struct inventory = {}, struct schemaPack = {}, struct context = {}, struct llm = {}) returntype="struct" { return assess( arguments.scan, arguments.inventory, arguments.schemaPack, arguments.context, arguments.llm ); }
+
+	/**
+	 * Adds onRoad / notYetSliced counts and optional ColdBox source-stack note.
+	 */
+	struct function enrichRoadCoverage( required struct coverage, required struct plan ) {
+		var result = duplicate( arguments.coverage );
+		var inventoryUnits = [];
+		if ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ) {
+			inventoryUnits = arguments.plan.inventory.units;
+		}
+		var onRoadIds = {};
+		var unitLinks = isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [];
+		for ( var link in unitLinks ) {
+			var legacyId = trim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
+			if ( len( legacyId ) ) onRoadIds[ legacyId ] = true;
+		}
+		var targetUnits = [];
+		if ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ) {
+			targetUnits = arguments.plan.target.units;
+		}
+		for ( var unit in targetUnits ) {
+			var legacyIds = isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [];
+			for ( var legacyUnitId in legacyIds ) {
+				var id = trim( legacyUnitId );
+				if ( len( id ) ) onRoadIds[ id ] = true;
+			}
+		}
+		var onRoad = 0;
+		for ( var inventoryUnit in inventoryUnits ) {
+			var inventoryId = trim( inventoryUnit.id ?: inventoryUnit.itemId ?: "" );
+			if ( len( inventoryId ) && onRoadIds.keyExists( inventoryId ) ) onRoad++;
+		}
+		var total = inventoryUnits.len();
+		var sourceStackNote = "";
+		var signals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		for ( var signal in signals ) {
+			var code = lCase( trim( signal.code ?: signal.id ?: signal.name ?: "" ) );
+			if ( findNoCase( "coldbox.present", code ) || code == "coldbox.present" ) {
+				sourceStackNote = "Existing ColdBox signals detected — prefer coexist / in-place deepen rather than greenfield-only advice.";
+				break;
+			}
+		}
+		result.road = {
+			onRoad         : onRoad,
+			notYetSliced   : max( 0, total - onRoad ),
+			sourceStackNote: sourceStackNote
+		};
+		return result;
+	}
+
 	private numeric function sumSkipped(required struct skipped) { var total = 0; for ( var key in arguments.skipped ) total += val( arguments.skipped[ key ] ?: 0 ); return total; }
 	private numeric function countStatus(required array items, required string status) { var count = 0; for ( var item in arguments.items ) if ( ( item.status ?: "" ) == arguments.status ) count++; return count; }
 	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }

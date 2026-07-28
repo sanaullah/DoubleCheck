@@ -142,6 +142,9 @@ class {
 		if ( ( coverageData.truncated ?: false ) == true || ( isStruct( coverageData.repository ?: "" ) && coverageData.repository.truncation ?: false ) == true ) { addMessage( messages, "coverage", "warning", "Repository or schema evidence was truncated" ); warnings++; }
 		if ( ( coverageData.unresolvedCount ?: 0 ) > 0 || ( isArray( inventoryData.unresolved ?: "" ) && inventoryData.unresolved.len() ) ) { addMessage( messages, "coverage", "warning", "Unresolved evidence remains visible in the plan" ); warnings++; }
 
+		var sampleContractReport = validateSampleContract( arguments.plan, messages );
+		warnings += sampleContractReport.warnings;
+
 		var level = blocking ? "blocking" : ( warnings ? "warning" : "structural" );
 		return {
 			ok: blocking == 0, blocking: blocking, warnings: warnings, blockingCount: blocking, warningCount: warnings,
@@ -149,6 +152,39 @@ class {
 			validationLevel: level, status: level, overallStatus: level,
 			levels: { structural: blocking == 0 ? "structurally-valid" : "structurally-invalid", evidence: evidenceLevel( messages ), syntax: syntaxLevel( arguments.plan ), dialect: dialectLevel( arguments.plan ), human: "human-unreviewed" }
 		};
+	}
+
+	private struct function validateSampleContract( required struct plan, required array messages ) {
+		var report = { warnings: 0 };
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var currentPhase = {};
+		for ( var phase in phases ) {
+			if ( phase.currentSlice ?: false ) {
+				currentPhase = phase;
+				break;
+			}
+		}
+		if ( !structCount( currentPhase ) && phases.len() ) currentPhase = phases[ 1 ];
+		var sliceUnitIds = {};
+		for ( var unitId in ( isArray( currentPhase.unitIds ?: "" ) ? currentPhase.unitIds : [] ) ) {
+			sliceUnitIds[ trim( unitId ) ] = true;
+		}
+		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		for ( var unit in targetUnits ) {
+			var id = trim( unit.id ?: unit.itemId ?: "" );
+			if ( structCount( sliceUnitIds ) && !sliceUnitIds.keyExists( id ) ) continue;
+			var layer = lCase( trim( unit.layer ?: unit.kind ?: "" ) );
+			if ( ![ "handler", "service" ].contains( layer ) ) continue;
+			var sample = toString( unit.sampleCode ?: "" );
+			if ( !len( trim( sample ) ) ) continue;
+			var hasClass = reFindNoCase( "\b(class|component)\b", sample ) > 0;
+			var hasDi = reFindNoCase( "\bproperty\b", sample ) > 0 || findNoCase( "inject", sample ) > 0 || findNoCase( "no DI", sample ) > 0 || findNoCase( "no di", sample ) > 0;
+			if ( !hasClass || !hasDi ) {
+				addMessage( arguments.messages, "sample-contract", "warning", "Current-slice #layer# #id# sample should be a class/component skeleton with DI (or an explicit no DI note)", id );
+				report.warnings++;
+			}
+		}
+		return report;
 	}
 
 	private void function addMessage( required array messages, required string category, required string level, required string text, string itemId = "" ) {
