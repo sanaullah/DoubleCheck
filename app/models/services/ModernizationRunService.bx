@@ -107,7 +107,11 @@ class {
 			checkpoint( runId, "evidence", evidence, 48, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
 
 			checkCancellation( arguments.callbacks );
-			emit( arguments.callbacks, 58, "modernization-proposal", "Generating application and database modernization proposals" );
+			emit( arguments.callbacks, 58, "modernization-proposal", "Generating sharded application maps, then database and roadmap proposals" );
+			try {
+				var startMsg = "Modernize run #runId#: starting proposal stage";
+				if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( startMsg );
+			} catch ( any ignored ) {}
 			var proposalInput = duplicate( input );
 				proposalInput.runId = runId;
 				proposalInput.budgets = arguments.run.getBudgets() ?: {};
@@ -212,8 +216,15 @@ class {
 			result.decisions = modernizationRepository.listDecisions( runId );
 			result.decisionEvents = modernizationRepository.listDecisionEvents( runId );
 			if ( proposal.partial ) result.errors.append( proposal.errors ?: [], true );
+			if ( isArray( proposal.notes ?: "" ) && proposal.notes.len() ) result.generationNotes = proposal.notes;
+			else if ( isArray( plan.generationNotes ?: "" ) && plan.generationNotes.len() ) result.generationNotes = plan.generationNotes;
+			if ( isArray( proposal.errors ?: "" ) ) result.generationErrors = proposal.errors;
+			else if ( isArray( plan.generationErrors ?: "" ) ) result.generationErrors = plan.generationErrors;
 			var repositoryTruncated = ( arguments.scan.discoveryTruncated ?: false ) || ( coverage.repository.truncation ?: false );
-			var terminalStatus = ( validation.blocking ?: 0 ) > 0 || repositoryTruncated || ( proposal.partial ?: false ) ? "partial" : "succeeded";
+			var cfmlScopeComplete = !!( coverage.repository.modernizationLanguagesComplete ?: false );
+			// Asset/JS scan truncation must not keep a usable CFML plan in "partial" forever.
+			var hardTruncation = repositoryTruncated && !cfmlScopeComplete;
+			var terminalStatus = ( validation.blocking ?: 0 ) > 0 || hardTruncation || ( proposal.partial ?: false ) ? "partial" : "succeeded";
 			var message = terminalStatus == "partial" ? "Modernization plan retained with review gates" : "Modernization plan generated; review decisions are required";
 			checkCancellation( arguments.callbacks );
 			return terminal( result, terminalStatus, message, planState );

@@ -20,6 +20,28 @@ class {
 		return state;
 	}
 
+	struct function clearStaleDecisions( required string runId ) {
+		var planRecord = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( planRecord ) ) return { cleared: 0 };
+		var cleared = 0;
+		for ( var itemDecision in modernizationRepository.listDecisions( arguments.runId ) ) {
+			var itemType = lCase( trim( itemDecision.itemType ?: "" ) );
+			var itemId = trim( itemDecision.itemId ?: "" );
+			var currentItem = variables.allowedTypes.contains( itemType )
+				? findItem( planRecord.plan ?: {}, itemType, itemId )
+				: javacast( "null", "" );
+			var currentFingerprint = isNull( currentItem ) ? "" : trim( currentItem.itemFingerprint ?: "" );
+			if ( len( currentFingerprint ) && currentFingerprint == trim( itemDecision.itemFingerprint ?: "" ) ) continue;
+			modernizationRepository.deleteDecision( arguments.runId, itemType, itemId );
+			modernizationRepository.appendDecisionEvent(
+				arguments.runId,
+				{ itemType: itemType, itemId: itemId, action: "cleared-stale", decision: {}, actor: "system-rebuild" }
+			);
+			cleared++;
+		}
+		return { cleared: cleared };
+	}
+
 	struct function decide(
 		required any run,
 		required string itemId,
@@ -99,13 +121,16 @@ class {
 					"routeContracts": "route-contract",
 					"roadmapPhases": "roadmap-phase"
 				}[ collection ] ?: "";
-				if ( isRequired && len( itemId ) ) requiredItems[ decisionType & ":" & itemId ] = true;
+				if ( isRequired && len( itemId ) ) requiredItems[ decisionType & ":" & itemId ] = trim( item.itemFingerprint ?: "" );
 			}
 		}
 		for ( var itemDecision in decisions ) {
 			var decisionKey = ( itemDecision.itemType ?: "" ) & ":" & ( itemDecision.itemId ?: "" );
-			if ( requiredItems.keyExists( decisionKey ) && itemDecision.decision == "accepted" ) accepted++;
-			if ( requiredItems.keyExists( decisionKey ) && itemDecision.decision == "rejected" ) rejected++;
+			var decisionIsCurrent = requiredItems.keyExists( decisionKey ) &&
+				len( requiredItems[ decisionKey ] ) &&
+				requiredItems[ decisionKey ] == trim( itemDecision.itemFingerprint ?: "" );
+			if ( decisionIsCurrent && itemDecision.decision == "accepted" ) accepted++;
+			if ( decisionIsCurrent && itemDecision.decision == "rejected" ) rejected++;
 		}
 		if ( rejected ) state = "rejected";
 		else if ( requiredItems.count() && accepted >= requiredItems.count() && val( validation.blocking ?: 0 ) == 0 ) state = "accepted";

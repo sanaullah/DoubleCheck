@@ -16,7 +16,10 @@ class {
 		if ( !len( runtime ) ) runtime = trim( target.runtime ?: "" );
 		runtime = lCase( runtime );
 		var profile = lCase( trim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
-		var inventoryPaths = inventoryPathSet( structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData );
+		var validationInventory = structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData;
+		var inventoryPaths = inventoryPathSet( validationInventory );
+		var inventoryIds = inventoryUnitIdSet( validationInventory );
+		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
 
 		if ( ( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : "" ) != "modernization-plan-v1" ) {
 			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1" ); blocking++;
@@ -51,17 +54,7 @@ class {
 				if ( collection == "target.units" ) {
 					if ( !len( itemPath ) ) { addMessage( messages, collection, "blocking", "Target unit #id# is missing targetPath", id ); blocking++; }
 					else if ( !legalTargetPath( itemPath, runtime, profile ) ) { addMessage( messages, collection, "blocking", "Target unit #id# has an illegal runtime/layout extension", id ); blocking++; }
-					var sourcePath = lCase( replace( trim( item.sourcePath ?: item.sourceFile ?: item.legacyPath ?: "" ), "\\", "/", "all" ) );
-					var sourceBacked = len( sourcePath ) && inventoryPaths.keyExists( sourcePath );
-					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( trim( item.proposalReason ?: "" ) ) ) ) {
-						var refs = item.evidenceRefs ?: item.evidence ?: [];
-						if ( isArray( refs ) ) {
-							for ( var ref in refs ) {
-								var refPath = lCase( replace( trim( ref.filePath ?: ref.path ?: "" ), "\\", "/", "all" ) );
-								if ( len( refPath ) && inventoryPaths.keyExists( refPath ) ) { sourceBacked = true; break; }
-							}
-						}
-					}
+					var sourceBacked = targetHasInventoryBacking( item, inventoryPaths, inventoryIds, planUnitLinks );
 					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( trim( item.proposalReason ?: "" ) ) ) ) {
 						addMessage( messages, collection, "blocking", "Target unit #id# is not inventory-backed and is missing a new-proposal reason", id ); blocking++;
 					}
@@ -89,9 +82,8 @@ class {
 			if ( !structKeyExists( extractItem, "dataBoundary" ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
 		}
 
-		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
 		for ( var link in planUnitLinks ) {
-			var sourcePath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\\", "/", "all" ) );
+			var sourcePath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
 			var linkId = link.id ?: link.itemId ?: "unknown";
 			if ( len( sourcePath ) && !inventoryPaths.keyExists( sourcePath ) && !( link.newProposal ?: false ) ) { addMessage( messages, "unitLinks", "blocking", "Unit link #linkId# is not backed by inventory evidence", linkId ); blocking++; }
 		}
@@ -262,23 +254,68 @@ class {
 		var output = {};
 		if ( !isStruct( arguments.inventory ) ) return output;
 		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
-			var path = lCase( replace( trim( unit.filePath ?: unit.path ?: "" ), "\\", "/", "all" ) );
+			var path = lCase( replace( trim( unit.filePath ?: unit.path ?: "" ), "\", "/", "all" ) );
 			if ( len( path ) ) output[ path ] = true;
 		}
 		for ( var file in ( isArray( arguments.inventory.files ?: "" ) ? arguments.inventory.files : [] ) ) {
-			var filePath = lCase( replace( trim( file.filePath ?: file.path ?: "" ), "\\", "/", "all" ) );
+			var filePath = lCase( replace( trim( file.filePath ?: file.path ?: "" ), "\", "/", "all" ) );
 			if ( len( filePath ) ) output[ filePath ] = true;
 		}
 		return output;
 	}
 
+	private struct function inventoryUnitIdSet( required any inventory ) {
+		var output = {};
+		if ( !isStruct( arguments.inventory ) ) return output;
+		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
+			var id = trim( unit.id ?: unit.itemId ?: "" );
+			if ( len( id ) ) output[ id ] = true;
+		}
+		return output;
+	}
+
+	private boolean function targetHasInventoryBacking(
+		required struct item,
+		required struct inventoryPaths,
+		required struct inventoryIds,
+		required array unitLinks
+	) {
+		var targetId = trim( arguments.item.id ?: arguments.item.itemId ?: "" );
+		var sourceValue = replace( toString( arguments.item.sourcePath ?: arguments.item.sourceFile ?: arguments.item.legacyPath ?: "" ), "\", "/", "all" );
+		for ( var sourcePath in listToArray( sourceValue, ",", true, true ) ) {
+			var normalizedSource = lCase( trim( sourcePath ) );
+			if ( len( normalizedSource ) && arguments.inventoryPaths.keyExists( normalizedSource ) ) return true;
+		}
+		var legacyIds = isArray( arguments.item.legacyUnitIds ?: "" ) ? duplicate( arguments.item.legacyUnitIds ) : [];
+		if ( len( trim( arguments.item.legacyUnitId ?: "" ) ) ) legacyIds.append( arguments.item.legacyUnitId );
+		for ( var legacyId in legacyIds ) {
+			if ( arguments.inventoryIds.keyExists( trim( toString( legacyId ) ) ) ) return true;
+		}
+		for ( var link in arguments.unitLinks ) {
+			if ( trim( link.targetUnitId ?: "" ) != targetId ) continue;
+			var linkedLegacyId = trim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
+			if ( len( linkedLegacyId ) && arguments.inventoryIds.keyExists( linkedLegacyId ) ) return true;
+			var linkedPath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
+			if ( len( linkedPath ) && arguments.inventoryPaths.keyExists( linkedPath ) ) return true;
+		}
+		var refs = arguments.item.evidenceRefs ?: arguments.item.evidence ?: [];
+		if ( isArray( refs ) ) {
+			for ( var ref in refs ) {
+				if ( !isStruct( ref ) ) continue;
+				var refPath = lCase( replace( trim( ref.filePath ?: ref.path ?: "" ), "\", "/", "all" ) );
+				if ( len( refPath ) && arguments.inventoryPaths.keyExists( refPath ) ) return true;
+			}
+		}
+		return false;
+	}
+
 	private boolean function safeRelativePath( required string path ) {
-		var normalized = replace( trim( arguments.path ), "\\", "/", "all" );
+		var normalized = replace( trim( arguments.path ), "\", "/", "all" );
 		if ( !len( normalized ) || find( "..", normalized ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", normalized ) ) return false;
 		return true;
 	}
 	private boolean function safeRoutePath( required string path ) {
-		var normalized = replace( trim( arguments.path ), "\\", "/", "all" );
+		var normalized = replace( trim( arguments.path ), "\", "/", "all" );
 		return reFind( "^/", normalized ) && !find( "..", normalized ) && !reFind( "^//", normalized );
 	}
 
@@ -308,7 +345,7 @@ class {
 				var transitionId = transition.id ?: transition.itemId ?: "";
 				if ( len( migrationText ) && reFindNoCase( "(?:password|passwd|api[_-]?key|authorization|private[_-]?key)\\s*[:=]", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration contains a possible secret", transitionId ); output.blocking++; }
 				if ( len( migrationPath ) && !safeRelativePath( migrationPath ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must remain inside the project", transitionId ); output.blocking++; }
-				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\\.bx$", replace( migrationPath, "\\", "/", "all" ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must use a cfmigrations timestamp", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\\.bx$", replace( migrationPath, "\", "/", "all" ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must use a cfmigrations timestamp", transitionId ); output.blocking++; }
 				if ( len( migrationText ) && !reFindNoCase( "function\\s+up\\s*\\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing up(schema, query)", transitionId ); output.blocking++; }
 				if ( len( migrationText ) && !reFindNoCase( "function\\s+down\\s*\\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing down(schema, query)", transitionId ); output.blocking++; }
 			}

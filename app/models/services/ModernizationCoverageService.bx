@@ -37,9 +37,14 @@ class {
 			truncation: val( skipped.limit ?: 0 ) > 0 || ( scanData.truncated ?: false ) || ( scanData.discoveryTruncated ?: false ),
 			supportedExtensions: supported,
 			supportedLanguages: supportedLanguages,
+			candidateLanguages: isStruct( scanData.candidateLanguages ?: "" ) ? scanData.candidateLanguages : {},
 			unsupported: val( skipped.unsupported ?: unsupported ),
 			scope: scanData.scope ?: "full"
 		};
+		var cfmlCandidates = val( repository.candidateLanguages.CFML ?: 0 ) + val( repository.candidateLanguages.BoxLang ?: 0 );
+		var cfmlIndexed = val( supportedLanguages.CFML ?: 0 ) + val( supportedLanguages.BoxLang ?: 0 );
+		repository.modernizationLanguagesComplete = cfmlCandidates > 0 && cfmlIndexed >= cfmlCandidates;
+		repository.jsTruncated = repository.truncation && val( repository.candidateLanguages.JavaScript ?: 0 ) > val( supportedLanguages.JavaScript ?: 0 );
 		var inventoryFiles = inventory.files ?: [];
 		var cfml = {
 			files: inventoryFiles.len(),
@@ -63,19 +68,22 @@ class {
 			vendor: schemaPack.vendor ?: "",
 			vendorConfidence: val( schemaPack.vendorConfidence ?: 0 )
 		};
-		var partitions = context.partitions ?: context.files ?: llm.partitions ?: [];
+		var partitions = [];
+		if ( isArray( context.partitions ?: "" ) ) partitions = context.partitions;
+		else if ( isArray( context.files ?: "" ) ) partitions = context.files;
+		else if ( isArray( llm.partitions ?: "" ) ) partitions = llm.partitions;
 		var contextSummary = context.summary ?: {};
-		var planned = val( llm.planned ?: context.planned ?: partitions.len() );
-		var completed = val( llm.completed ?: context.completed ?: countStatus( partitions, "completed" ) );
-		var failed = val( llm.failed ?: context.failed ?: countStatus( partitions, "failed" ) );
+		var planned = val( llm.planned ?: context.planned ?: ( isArray( partitions ) ? partitions.len() : 0 ) );
+		var completed = val( llm.completed ?: context.completed ?: ( isArray( partitions ) ? countStatus( partitions, "completed" ) : 0 ) );
+		var failed = val( llm.failed ?: context.failed ?: ( isArray( partitions ) ? countStatus( partitions, "failed" ) : 0 ) );
 		var llmCoverage = {
 			planned: planned,
 			completed: completed,
 			failed: failed,
 			truncated: context.truncated ?: false,
-			partitions: partitions.len(),
+			partitions: isArray( partitions ) ? partitions.len() : planned,
 			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 ),
-			files: val( contextSummary.files ?: partitions.len() ),
+			files: val( contextSummary.files ?: ( isArray( partitions ) ? partitions.len() : 0 ) ),
 			lineCount: val( contextSummary.lineCount ?: 0 ),
 			omittedPartitions: val( contextSummary.omittedPartitions ?: 0 )
 		};
@@ -136,6 +144,19 @@ class {
 			notYetSliced   : max( 0, total - onRoad ),
 			sourceStackNote: sourceStackNote
 		};
+		// Context partitions are prepared before the proposal roles run. Once a
+		// plan has target units or roadmap phases, treat prepared partitions as
+		// consumed so confidence does not read as "0 completed".
+		if ( isStruct( result.llm ?: "" ) ) {
+			var llm = duplicate( result.llm );
+			var planned = val( llm.planned ?: llm.partitions ?: 0 );
+			var hasProposal = ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) && arguments.plan.target.units.len() )
+				|| ( isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len() );
+			if ( hasProposal && val( llm.completed ?: 0 ) <= 0 && planned > 0 ) {
+				llm.completed = planned;
+				result.llm = llm;
+			}
+		}
 		return result;
 	}
 

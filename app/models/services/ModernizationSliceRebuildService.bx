@@ -41,15 +41,17 @@ class {
 		var merged = duplicate( arguments.plan );
 		var replaceUnitIds = {};
 		var phase = isStruct( arguments.fragment.roadmapPhase ?: "" ) ? arguments.fragment.roadmapPhase : {};
+		var oldPhase = findPhase( merged, arguments.phaseId );
+		if ( isNull( oldPhase ) ) {
+			throw( type = "ModernizationItemNotFound", message = "Roadmap phase was not found" );
+		}
+		assertFragmentScope( arguments.fragment, oldPhase, arguments.phaseId );
 		for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) replaceUnitIds[ trim( unitId ) ] = true;
 		for ( var unit in ( isArray( arguments.fragment.targetUnits ?: "" ) ? arguments.fragment.targetUnits : [] ) ) {
 			replaceUnitIds[ trim( unit.id ?: "" ) ] = true;
 		}
-		var oldPhase = findPhase( merged, arguments.phaseId );
-		if ( !isNull( oldPhase ) ) {
-			for ( var oldUnitId in ( isArray( oldPhase.unitIds ?: "" ) ? oldPhase.unitIds : [] ) ) {
-				replaceUnitIds[ trim( oldUnitId ) ] = true;
-			}
+		for ( var oldUnitId in ( isArray( oldPhase.unitIds ?: "" ) ? oldPhase.unitIds : [] ) ) {
+			replaceUnitIds[ trim( oldUnitId ) ] = true;
 		}
 		if ( !isStruct( merged.target ?: "" ) ) merged.target = { units: [] };
 		if ( !isArray( merged.target.units ?: "" ) ) merged.target.units = [];
@@ -63,10 +65,10 @@ class {
 		}
 		merged.target.units = keptUnits;
 		merged.unitLinks = replaceCollection( merged.unitLinks ?: [], arguments.fragment.unitLinks ?: [], replaceUnitIds, "targetUnitId" );
-		merged.routeContracts = replaceByIds( merged.routeContracts ?: [], arguments.fragment.routeContracts ?: [], collectIds( phase.routeIds ?: [], arguments.fragment.routeContracts ?: [] ) );
-		merged.samples = replaceByIds( merged.samples ?: [], arguments.fragment.samples ?: [], collectIds( phase.sampleIds ?: [], arguments.fragment.samples ?: [] ) );
-		merged.dbFindings = replaceByIds( merged.dbFindings ?: [], arguments.fragment.dbFindings ?: [], collectIds( phase.dbFindingIds ?: [], arguments.fragment.dbFindings ?: [] ) );
-		merged.dbTransitions = replaceByIds( merged.dbTransitions ?: [], arguments.fragment.dbTransitions ?: [], collectIds( phase.transitionIds ?: [], arguments.fragment.dbTransitions ?: [] ) );
+		merged.routeContracts = replaceByIds( merged.routeContracts ?: [], arguments.fragment.routeContracts ?: [], collectReplacementIds( oldPhase.routeIds ?: [], phase.routeIds ?: [], arguments.fragment.routeContracts ?: [] ) );
+		merged.samples = replaceByIds( merged.samples ?: [], arguments.fragment.samples ?: [], collectReplacementIds( oldPhase.sampleIds ?: [], phase.sampleIds ?: [], arguments.fragment.samples ?: [] ) );
+		merged.dbFindings = replaceByIds( merged.dbFindings ?: [], arguments.fragment.dbFindings ?: [], collectReplacementIds( oldPhase.dbFindingIds ?: [], phase.dbFindingIds ?: [], arguments.fragment.dbFindings ?: [] ) );
+		merged.dbTransitions = replaceByIds( merged.dbTransitions ?: [], arguments.fragment.dbTransitions ?: [], collectReplacementIds( oldPhase.transitionIds ?: [], phase.transitionIds ?: [], arguments.fragment.dbTransitions ?: [] ) );
 		var phases = isArray( merged.roadmapPhases ?: "" ) ? duplicate( merged.roadmapPhases ) : [];
 		var replacedPhase = false;
 		for ( var index = 1; index <= phases.len(); index++ ) {
@@ -104,7 +106,7 @@ class {
 			var phase = findPhase( plan, arguments.phaseId );
 			if ( isNull( phase ) ) throw( type = "ModernizationItemNotFound", message = "Roadmap phase was not found" );
 			var note = secretRedactionService.redactText( left( trim( arguments.input.note ?: "" ), variables.maxNoteChars ) );
-			var evidence = buildEvidencePack( plan, phase );
+			var evidence = buildEvidencePack( plan, phase, arguments.run.getProjectPath() );
 			assertEvidencePack( evidence.inventorySlice, evidence.excerpts );
 			var runtime = {
 				runtime: plan.metadata.runtime.runtime ?: plan.metadata.runtime ?: "boxlang",
@@ -133,6 +135,7 @@ class {
 			merged.state = "needs-review";
 			var validation = validationService.validate( merged, { inventory: merged.inventory ?: {} } );
 			modernizationRepository.savePlan( runId, merged, validation, planRecord.coverage ?: merged.coverage ?: {} );
+			decisionService.clearStaleDecisions( runId );
 			decisionService.refreshState( runId );
 			return {
 				result : runService.getResult( runId ),
@@ -149,29 +152,79 @@ class {
 		}
 	}
 
-	private struct function buildEvidencePack( required struct plan, required struct phase ) {
+	struct function buildEvidencePack( required struct plan, required struct phase, required string projectPath ) {
 		var linkedLegacyIds = {};
+		var linkedPaths = {};
+		var phaseUnitIds = stringSet( arguments.phase.unitIds ?: [] );
 		for ( var unitId in ( isArray( arguments.phase.unitIds ?: "" ) ? arguments.phase.unitIds : [] ) ) {
 			for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
 				if ( ( unit.id ?: "" ) != unitId ) continue;
 				for ( var legacyId in ( isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [] ) ) {
 					linkedLegacyIds[ trim( legacyId ) ] = true;
 				}
-				var sourcePath = trim( unit.sourcePath ?: "" );
-				if ( len( sourcePath ) ) linkedLegacyIds[ sourcePath ] = true;
+				for ( var sourcePath in listToArray( unit.sourcePath ?: "", ",", true, true ) ) {
+					var normalizedPath = lCase( replace( trim( sourcePath ), "\", "/", "all" ) );
+					if ( len( normalizedPath ) ) linkedPaths[ normalizedPath ] = true;
+				}
 			}
+		}
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( !phaseUnitIds.keyExists( trim( link.targetUnitId ?: "" ) ) ) continue;
+			var linkedLegacyId = trim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
+			if ( len( linkedLegacyId ) ) linkedLegacyIds[ linkedLegacyId ] = true;
+			var linkedPath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
+			if ( len( linkedPath ) ) linkedPaths[ linkedPath ] = true;
 		}
 		var units = [];
 		var excerpts = [];
 		for ( var inventoryUnit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) {
 			var inventoryId = trim( inventoryUnit.id ?: "" );
-			var inventoryPath = trim( inventoryUnit.path ?: inventoryUnit.filePath ?: "" );
-			if ( !( linkedLegacyIds.keyExists( inventoryId ) || linkedLegacyIds.keyExists( inventoryPath ) ) ) continue;
+			var inventoryPath = replace( trim( inventoryUnit.path ?: inventoryUnit.filePath ?: "" ), "\", "/", "all" );
+			if ( !( linkedLegacyIds.keyExists( inventoryId ) || linkedPaths.keyExists( lCase( inventoryPath ) ) ) ) continue;
 			units.append( inventoryUnit );
 			var body = trim( inventoryUnit.content ?: inventoryUnit.sourceExcerpt ?: inventoryUnit.excerpt ?: "" );
+			if ( !len( body ) ) body = readSourceExcerpt( arguments.projectPath, inventoryUnit );
 			if ( len( body ) ) excerpts.append( { unitId: inventoryId, path: inventoryPath, content: left( body, 4000 ) } );
 		}
 		return { inventorySlice: { units: units }, excerpts: excerpts };
+	}
+
+	private string function readSourceExcerpt( required string projectPath, required struct inventoryUnit ) {
+		var relativePath = replace( trim( arguments.inventoryUnit.filePath ?: arguments.inventoryUnit.path ?: "" ), "\", "/", "all" );
+		if (
+			!len( trim( arguments.projectPath ) ) ||
+			!len( relativePath ) ||
+			left( relativePath, 1 ) == "/" ||
+			reFind( "^[A-Za-z]:", relativePath ) ||
+			reFind( "(^|/)\.\.(/|$)", relativePath )
+		) return "";
+		try {
+			var projectRoot = new java:java.io.File( arguments.projectPath ).getCanonicalFile();
+			var sourceDocument = new java:java.io.File( projectRoot, relativePath ).getCanonicalFile();
+			var rootPath = lCase( replace( projectRoot.getCanonicalPath(), "\", "/", "all" ) ) & "/";
+			var sourcePath = lCase( replace( sourceDocument.getCanonicalPath(), "\", "/", "all" ) );
+			if ( left( sourcePath, len( rootPath ) ) != rootPath || !sourceDocument.isFile() ) return "";
+			var sourceContent = fileRead( sourceDocument.getCanonicalPath(), "UTF-8" );
+			var expectedHash = "";
+			for ( var ref in ( isArray( arguments.inventoryUnit.evidenceRefs ?: "" ) ? arguments.inventoryUnit.evidenceRefs : [] ) ) {
+				if ( len( trim( ref.contentHash ?: "" ) ) ) {
+					expectedHash = lCase( trim( ref.contentHash ) );
+					break;
+				}
+			}
+			if ( len( expectedHash ) && lCase( hash( sourceContent, "SHA-256" ) ) != expectedHash ) return "";
+			var lines = listToArray( replace( sourceContent, char( 13 ), "", "all" ), char( 10 ), true, true );
+			if ( !lines.len() ) return "";
+			var startLine = max( 1, int( val( arguments.inventoryUnit.startLine ?: 1 ) ) );
+			var endLine = min( lines.len(), max( startLine, int( val( arguments.inventoryUnit.endLine ?: startLine ) ) ) );
+			var excerptLines = [];
+			for ( var lineNumber = startLine; lineNumber <= endLine; lineNumber++ ) {
+				excerptLines.append( lines[ lineNumber ] );
+			}
+			return secretRedactionService.redactText( left( excerptLines.toList( char( 10 ) ), 4000 ) );
+		} catch ( any ignored ) {
+			return "";
+		}
 	}
 
 	private struct function extractPriorSlice( required struct plan, required struct phase ) {
@@ -205,6 +258,60 @@ class {
 		if ( len( trim( phaseOut.id ?: "" ) ) && trim( phaseOut.id ) != arguments.phaseId ) {
 			throw( type = "ModernizationRebuildException", message = "Rebuild fragment targeted a different phase id" );
 		}
+		if ( !isStruct( phaseOut ) || !structCount( phaseOut ) ) {
+			throw( type = "ModernizationRebuildException", message = "Rebuild fragment is missing its roadmap phase" );
+		}
+		assertCollectionMatchesPhase( arguments.fragment.targetUnits ?: [], phaseOut.unitIds ?: [], "target units" );
+		assertCollectionMatchesPhase( arguments.fragment.routeContracts ?: [], phaseOut.routeIds ?: [], "route contracts" );
+		assertCollectionMatchesPhase( arguments.fragment.samples ?: [], phaseOut.sampleIds ?: [], "samples" );
+		assertCollectionMatchesPhase( arguments.fragment.dbFindings ?: [], phaseOut.dbFindingIds ?: [], "database findings" );
+		assertCollectionMatchesPhase( arguments.fragment.dbTransitions ?: [], phaseOut.transitionIds ?: [], "database transitions" );
+		var phaseUnitIds = stringSet( phaseOut.unitIds ?: [] );
+		for ( var link in ( isArray( arguments.fragment.unitLinks ?: "" ) ? arguments.fragment.unitLinks : [] ) ) {
+			if ( !phaseUnitIds.keyExists( trim( link.targetUnitId ?: "" ) ) ) {
+				throw( type = "ModernizationRebuildException", message = "Rebuild fragment contains a unit link outside the rebuilt phase" );
+			}
+		}
+		if ( !sameStringSet( arguments.phase.dependencies ?: [], phaseOut.dependencies ?: [] ) ) {
+			throw( type = "ModernizationRebuildException", message = "Rebuild fragment cannot change phase dependencies" );
+		}
+	}
+
+	private void function assertCollectionMatchesPhase( required any items, required any listedIds, required string label ) {
+		var itemIds = {};
+		for ( var item in ( isArray( arguments.items ) ? arguments.items : [] ) ) {
+			var itemId = trim( item.id ?: item.itemId ?: "" );
+			if ( !len( itemId ) ) {
+				throw( type = "ModernizationRebuildException", message = "Rebuild #arguments.label# must have stable ids" );
+			}
+			itemIds[ itemId ] = true;
+		}
+		var phaseIds = stringSet( arguments.listedIds );
+		if ( itemIds.count() != phaseIds.count() ) {
+			throw( type = "ModernizationRebuildException", message = "Rebuild #arguments.label# do not match the rebuilt phase scope" );
+		}
+		for ( var itemId in itemIds ) {
+			if ( !phaseIds.keyExists( itemId ) ) {
+				throw( type = "ModernizationRebuildException", message = "Rebuild #arguments.label# contain an item outside the rebuilt phase" );
+			}
+		}
+	}
+
+	private struct function stringSet( required any values ) {
+		var output = {};
+		for ( var value in ( isArray( arguments.values ) ? arguments.values : [] ) ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) ) output[ normalized ] = true;
+		}
+		return output;
+	}
+
+	private boolean function sameStringSet( required any leftValues, required any rightValues ) {
+		var leftSet = stringSet( arguments.leftValues );
+		var rightSet = stringSet( arguments.rightValues );
+		if ( leftSet.count() != rightSet.count() ) return false;
+		for ( var value in leftSet ) if ( !rightSet.keyExists( value ) ) return false;
+		return true;
 	}
 
 	private struct function refingerprintSlice( required struct plan, required struct phase, required struct fragment ) {
@@ -257,9 +364,10 @@ class {
 		return kept;
 	}
 
-	private struct function collectIds( required any listedIds, required array incoming ) {
+	private struct function collectReplacementIds( required any oldIds, required any nextIds, required array incoming ) {
 		var ids = {};
-		for ( var id in ( isArray( arguments.listedIds ) ? arguments.listedIds : [] ) ) ids[ trim( id ) ] = true;
+		for ( var id in ( isArray( arguments.oldIds ) ? arguments.oldIds : [] ) ) ids[ trim( id ) ] = true;
+		for ( var id in ( isArray( arguments.nextIds ) ? arguments.nextIds : [] ) ) ids[ trim( id ) ] = true;
 		for ( var item in arguments.incoming ) ids[ trim( item.id ?: item.itemId ?: "" ) ] = true;
 		return ids;
 	}

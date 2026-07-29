@@ -3,7 +3,7 @@ class extends="testbox.system.BaseSpec" {
 			describe( "Modernization proposal orchestration", () => {
 			it( "preserves millisecond timestamps without int overflow", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
-					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "timestamp seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
 					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
 				} );
@@ -69,12 +69,210 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.partial ).toBeTrue();
 				expect( result.plan.target.units ).toBeEmpty();
 				expect( result.plan.samples ).toBeEmpty();
-				expect( result.errors.filter( ( item ) => item.message == "ignored-non-object-items" ) ).notToBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "ignored-non-object-items" ) ).toBeEmpty();
+				expect( ( result.notes ?: [] ).filter( ( item ) => item.message == "ignored-non-object-items" ) ).notToBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "empty-application-fragment" ) ).notToBeEmpty();
+			} );
+
+			it( "synthesizes packaging decisions for centralize, ColdBox modules, and side-app extracts", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "cfg-1", targetPath: "app/config/Coldbox.bx", sourcePath: "config/Coldbox.cfc", purpose: "config" },
+							{ id: "songs-h", targetPath: "app/handlers/Songs.bx", sourcePath: "handlers/Songs.cfc", purpose: "songs list" },
+							{ id: "songs-s", targetPath: "app/models/services/SongService.bx", sourcePath: "model/SongService.cfc", purpose: "songs service" },
+							{ id: "http-w", targetPath: "app/models/services/TunesHttpGateway.bx", sourcePath: "model/TunesHttpGateway.cfc", purpose: "http api worker", layer: "service" }
+						],
+						unitLinks: [],
+						routeContracts: [ { id: "route-songs", path: "/songs", method: "GET", targetUnitId: "songs-h" } ],
+						contexts: [],
+						extracts: [],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Slice", unitIds: [ "songs-h" ], routeIds: [ "route-songs" ], currentSlice: true } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-arch",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {}, signals: [ { signalId: "http.outbound", meaning: "Outbound HTTP integration" } ] }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.target.contexts ).notToBeEmpty();
+				expect( result.plan.target.contexts.filter( ( item ) => item.packaging == "centralized" ) ).notToBeEmpty();
+				expect( result.plan.target.contexts.filter( ( item ) => item.packaging == "coldbox-module" ) ).notToBeEmpty();
+				expect( result.plan.target.extracts ).notToBeEmpty();
+				expect( result.plan.target.extracts[ 1 ].suggestedBoundary ).toBe( "side-app" );
+				expect( result.plan.target.contexts.filter( ( item ) => !( isArray( item.evidenceRefs ?: "" ) && item.evidenceRefs.len() ) ) ).toBeEmpty();
+				expect( result.plan.unitLinks.filter( ( item ) => findNoCase( "module-extract", item.relation ?: "" ) && !( isArray( item.evidence ?: item.evidenceRefs ?: "" ) && ( item.evidence ?: item.evidenceRefs ).len() ) ) ).toBeEmpty();
+				expect( result.partial ).toBeFalse();
+				expect( result.errors.filter( ( item ) => item.message == "synthesized-architecture-packaging" ) ).toBeEmpty();
+				expect( ( result.notes ?: result.plan.generationNotes ?: [] ).filter( ( item ) => item.message == "synthesized-architecture-packaging" ) ).notToBeEmpty();
+			} );
+
+			it( "synthesizes a mapped roadmap when the provider roadmap is skipped for cost", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "cfg-1", targetPath: "app/config/Coldbox.bx", sourcePath: "config/Coldbox.cfc", purpose: "config" },
+							{ id: "songs-1", targetPath: "app/handlers/Songs.bx", sourcePath: "handlers/Songs.cfc", purpose: "songs" },
+							{ id: "artists-1", targetPath: "app/models/services/ArtistService.bx", sourcePath: "model/ArtistService.cfc", purpose: "artists" }
+						],
+						unitLinks: [],
+						routeContracts: [ { id: "route-songs", path: "/songs", method: "GET", targetUnitId: "songs-1" } ],
+						contexts: [],
+						extracts: [],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { throw: true, message: "cost-budget-exceeded" }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-synth-road",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.target.units ).notToBeEmpty();
+				expect( result.plan.roadmapPhases ).notToBeEmpty();
+				expect( result.plan.roadmapPhases.filter( ( phase ) => phase.currentSlice ?: false ) ).notToBeEmpty();
+				expect( result.plan.roadmapPhases.filter( ( phase ) => ( phase.unitIds ?: [] ).len() ).len() ).toBeGTE( 1 );
+				expect( result.errors.filter( ( item ) => item.message == "synthesized-from-application-maps" ) ).toBeEmpty();
+				expect( ( result.notes ?: result.plan.generationNotes ?: [] ).filter( ( item ) => item.message == "synthesized-from-application-maps" ) ).notToBeEmpty();
+			} );
+
+			it( "merges multiple application shards and keeps going when one shard fails", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": [
+						{ targetUnits: [ { id: "app-cfc", targetPath: "app/Application.bx", sourcePath: "Application.cfc", newProposal: false, purpose: "bootstrap" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+						{ throw: true, message: "Provider JSON was truncated mid-object" },
+						{ targetUnits: [ { id: "song-svc", targetPath: "app/models/services/SongService.bx", sourcePath: "model/SongService.cfc", purpose: "songs" } ], unitLinks: [ { id: "link-song", legacyUnitId: "song-1", targetUnitId: "song-svc" } ], routeContracts: [ { id: "route-songs", path: "/songs", method: "GET" } ], contexts: [], extracts: [], samples: [] }
+					],
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Foundation", unitIds: [ "app-cfc", "song-svc" ], routeIds: [ "route-songs" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var evidence = {
+					inventory: {
+						units: [
+							{ id: "u1", filePath: "Application.cfc" },
+							{ id: "u2", filePath: "config/Coldbox.cfc" },
+							{ id: "u3", filePath: "model/SongService.cfc" },
+							{ id: "u4", filePath: "model/ArtistService.cfc" },
+							{ id: "u5", filePath: "handlers/Songs.cfc" },
+							{ id: "u6", filePath: "views/songs/list.cfm" },
+							{ id: "u7", filePath: "model/AlbumService.cfc" },
+							{ id: "u8", filePath: "model/PlaylistService.cfc" },
+							{ id: "u9", filePath: "model/UserService.cfc" }
+						],
+						routeEvidence: [],
+						dependencies: [],
+						unresolved: []
+					},
+					coverage: {},
+					schemaEvidence: {}
+				};
+				var result = service.propose(
+					"run-shards",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2, maxCostUsd: 5, maxApplicationShards: 3, applicationShardSize: 3, applicationShardConcurrency: 3 } },
+					evidence
+				);
+				expect( result.ok ).toBeTrue();
+				expect( gateway.callCount() ).toBe( 5 );
+				expect( result.plan.target.units.len() ).toBeGTE( 2 );
+				expect( result.plan.routeContracts ).notToBeEmpty();
+				expect( result.plan.roadmapPhases ).notToBeEmpty();
+				expect( result.errors.filter( ( item ) => findNoCase( "truncated", item.message ?: "" ) ).len() ).toBeGTE( 1 );
+				expect( result.plan.metadata.applicationShards.accepted ).toBe( 2 );
+				expect( result.plan.metadata.applicationShards.total ).toBe( 3 );
+				var appOptions = gateway.optionsHistory().filter( ( item ) => ( item.role ?: "" ) == "modernization-application" );
+				expect( appOptions ).toHaveLength( 3 );
+				expect( appOptions.every( ( item ) => val( item.budgets.maxCostUsd ?: 0 ) <= 1.34 ) ).toBeTrue();
+			} );
+
+			it( "keeps application fragments when sample code mentions password assignments", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [ { id: "auth-unit", targetPath: "app/models/AuthService.bx", purpose: "Move password validation into a service", sampleCode: "function login() { var password = form.password; return password; }", newProposal: true, proposalReason: "auth extract" } ],
+						unitLinks: [],
+						routeContracts: [ { id: "login-route", path: "/login", method: "POST" } ],
+						contexts: [],
+						extracts: [],
+						samples: [ { id: "auth-sample", kind: "target-unit", sampleCode: "token = request.token" } ]
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Auth first", unitIds: [ "auth-unit" ], routeIds: [ "login-route" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-redact-safe", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.errors.filter( ( item ) => item.message == "redaction-failed" ) ).toBeEmpty();
+				expect( result.plan.target.units ).notToBeEmpty();
+				expect( result.plan.target.units[ 1 ].id ).toBe( "auth-unit" );
+				expect( result.plan.routeContracts ).notToBeEmpty();
+				expect( result.plan.roadmapPhases ).notToBeEmpty();
+			} );
+
+			it( "skips roadmap when the application role returns only empty collections", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [ { id: "db-1", problem: "schema absent" } ], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-hollow", name: "Should not appear" } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-empty-app", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				expect( result.plan.roadmapPhases ).toBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "empty-application-fragment" ) ).notToBeEmpty();
+				expect( gateway.callCount() ).toBe( 2 );
+			} );
+
+			it( "skips roadmap when the application role fails so hollow unmapped phases are not invented", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { throw: true, message: "Provider request failed" },
+					"modernization-database": { dbFindings: [ { id: "db-1", problem: "schema absent" } ], dbTransitions: [], samples: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-hollow", name: "Should not appear", unitIds: [], routeIds: [] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose( "run-no-app", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				expect( result.plan.roadmapPhases ).toBeEmpty();
+				expect( result.plan.dbFindings ).notToBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "skipped-without-application-fragment" ) ).notToBeEmpty();
+				expect( gateway.callCount() ).toBe( 2 );
 			} );
 
 			it( "retains a usable partial plan when the roadmap role fails", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
-					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "roadmap-fail seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
 					"modernization-roadmap": { throw: true, message: "provider down" }
 				} );
@@ -91,7 +289,7 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "honors the immutable task budget and skips roadmap generation", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
-					"modernization-application": { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "budget seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
 					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
 				} );
@@ -104,6 +302,87 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.ok ).toBeTrue();
 				expect( result.partial ).toBeTrue();
 				expect( gateway.callCount() ).toBe( 2 );
+			} );
+
+			it( "polishes provider aliases so routes, inventory links, currentSlice, and samples survive validation shape", () => {
+				var inventoryUnitId = "inv-cfajax-page";
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "TU-001", targetPath: "app/handlers/cfajax.cfc", sourcePath: "dashboard/cfajax.cfm", layer: "handler", legacyUnitIds: [ "26869f2f4f6713d252e37c04ee53717c" ] },
+							{ id: "TU-scaffold", targetPath: "app/config/Router.cfc", layer: "config" }
+						],
+						unitLinks: [
+							{ id: "UL-001", targetUnitId: "TU-001", legacyUnitId: "26869f2f4f6713d252e37c04ee53717c", relation: "coexist-route", evidenceRefs: [ "26869f2f4f6713d252e37c04ee53717c" ] }
+						],
+						routeContracts: [
+							{
+								id: "RC-001",
+								method: "GET",
+								legacyPath: "/dashboard/cfajax.cfm",
+								targetRoute: "/dashboard",
+								targetEvent: "dashboard.index",
+								rollbackNote: "Fall back to legacy cfajax.cfm",
+								request: { method: "GET", path: "/dashboard/cfajax.cfm" },
+								response: { contentType: "text/html" },
+								auth: "session",
+								sideEffects: [ "session" ],
+								evidence: [ "26869f2f4f6713d252e37c04ee53717c" ]
+							}
+						],
+						contexts: [],
+						extracts: [],
+						samples: [
+							{ id: "SP-001", sampleKind: "handler", targetPath: "app/handlers/cfajax.cfc", language: "cfml", relatedItemIds: [ "TU-001" ], irreversible: false, phaseId: "P-002", body: "component {}" }
+						]
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-roadmap": {
+						roadmapPhases: [
+							{ id: "P-002", name: "First slice", pattern: "vertical-slice", unitIds: [ "TU-001" ], routeIds: [ "RC-001" ], sampleIds: [ "SP-001" ], dependencies: [ "P-001" ], currentSlice: false, exitCriteria: [ "ok" ], rollback: "revert", parityIntent: "same" },
+							{ id: "P-001", name: "Foundation", pattern: "scaffold", unitIds: [ "TU-scaffold" ], routeIds: [], sampleIds: [], dependencies: [], currentSlice: false, exitCriteria: [ "ok" ], rollback: "revert", parityIntent: "same" }
+						],
+						assumptions: [],
+						samples: []
+					}
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var evidence = {
+					coverage: {},
+					inventory: {
+						units: [
+							{
+								id: inventoryUnitId,
+								filePath: "dashboard/cfajax.cfm",
+								unitType: "page",
+								symbolName: "cfajax",
+								startLine: 1,
+								endLine: 40,
+								evidenceRefs: [ { filePath: "dashboard/cfajax.cfm", contentHash: "26869f2f4f6713d252e37c04ee53717cabcdef0123456789" } ]
+							}
+						]
+					},
+					schemaEvidence: {}
+				};
+				var result = service.propose(
+					"run-polish",
+					{ target: { runtime: "lucee", layoutProfile: "modern" }, samplePolicy: { maxFiles: 40, currentPhasesOnly: true }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } },
+					evidence
+				);
+				expect( result.ok ).toBeTrue();
+				var plan = result.plan;
+				expect( plan.routeContracts[ 1 ].path ).toBe( "/dashboard/cfajax.cfm" );
+				expect( plan.routeContracts[ 1 ].rollback ).toBe( "Fall back to legacy cfajax.cfm" );
+				expect( plan.unitLinks[ 1 ].legacyUnitId ).toBe( inventoryUnitId );
+				expect( plan.target.units.filter( ( item ) => item.id == "TU-scaffold" )[ 1 ].newProposal ).toBeTrue();
+				expect( plan.roadmapPhases[ 1 ].id ).toBe( "P-001" );
+				expect( plan.roadmapPhases.filter( ( item ) => item.currentSlice ?: false ) ).notToBeEmpty();
+				expect( plan.samples ).notToBeEmpty();
+				expect( plan.samples[ 1 ].id ).toBe( "SP-001" );
 			} );
 
 			it( "repairs only the invalid fingerprint-listed item", () => {

@@ -24,6 +24,78 @@ class extends="testbox.system.BaseSpec" {
 				expect( merged.target.units.filter( ( u ) => u.id == "tu-old" )[ 1 ].targetPath ).toInclude( "Crime.bx" );
 				expect( merged.roadmapPhases.filter( ( p ) => p.id == "phase-2" ).len() ).toBe( 1 );
 			} );
+
+			it( "removes stale linked artifacts while retaining other phases", () => {
+				var service = new app.models.services.ModernizationSliceRebuildService();
+				var plan = {
+					target: { units: [ { id: "tu-old" }, { id: "tu-keep" } ] },
+					roadmapPhases: [
+						{ id: "phase-1", unitIds: [ "tu-old" ], routeIds: [ "route-old" ], sampleIds: [ "sample-old" ], dbFindingIds: [], transitionIds: [], dependencies: [] },
+						{ id: "phase-2", unitIds: [ "tu-keep" ], routeIds: [ "route-keep" ], sampleIds: [], dbFindingIds: [], transitionIds: [], dependencies: [ "phase-1" ] }
+					],
+					unitLinks: [],
+					routeContracts: [ { id: "route-old" }, { id: "route-keep" } ],
+					samples: [ { id: "sample-old" } ],
+					dbFindings: [], dbTransitions: []
+				};
+				var fragment = {
+					targetUnits: [ { id: "tu-new" } ],
+					roadmapPhase: { id: "phase-1", unitIds: [ "tu-new" ], routeIds: [ "route-new" ], sampleIds: [], dbFindingIds: [], transitionIds: [], dependencies: [] },
+					unitLinks: [],
+					routeContracts: [ { id: "route-new", targetUnitId: "tu-new" } ],
+					samples: [], dbFindings: [], dbTransitions: []
+				};
+				var merged = service.mergeFragment( plan, "phase-1", fragment );
+				expect( merged.routeContracts.some( ( item ) => item.id == "route-old" ) ).toBeFalse();
+				expect( merged.samples.some( ( item ) => item.id == "sample-old" ) ).toBeFalse();
+				expect( merged.routeContracts.some( ( item ) => item.id == "route-keep" ) ).toBeTrue();
+				expect( merged.routeContracts.some( ( item ) => item.id == "route-new" ) ).toBeTrue();
+			} );
+
+			it( "rejects fragment items outside the rebuilt phase declaration", () => {
+				var service = new app.models.services.ModernizationSliceRebuildService();
+				var plan = {
+					target: { units: [ { id: "tu-old" } ] },
+					roadmapPhases: [ { id: "phase-1", unitIds: [ "tu-old" ], routeIds: [], sampleIds: [], dbFindingIds: [], transitionIds: [], dependencies: [] } ],
+					unitLinks: [], routeContracts: [], samples: [], dbFindings: [], dbTransitions: []
+				};
+				var fragment = {
+					targetUnits: [ { id: "tu-outside" } ],
+					roadmapPhase: { id: "phase-1", unitIds: [ "tu-old" ], routeIds: [], sampleIds: [], dbFindingIds: [], transitionIds: [], dependencies: [] },
+					unitLinks: [], routeContracts: [], samples: [], dbFindings: [], dbTransitions: []
+				};
+				expect( () => service.mergeFragment( plan, "phase-1", fragment ) )
+					.toThrow( type = "ModernizationRebuildException" );
+			} );
+
+			it( "loads hash-matched source excerpts from the run workspace", () => {
+				var service = new app.models.services.ModernizationSliceRebuildService();
+				var testRoot = getTempDirectory() & "doublecheck-rebuild-#lCase( createUUID() )#";
+				var sourcePath = testRoot & "/legacy/Crime.cfc";
+				var source = "component {" & char( 10 ) & "function listCrimes() {" & char( 10 ) & "return [];" & char( 10 ) & "}" & char( 10 ) & "}";
+				try {
+					directoryCreate( testRoot & "/legacy", true );
+					fileWrite( sourcePath, source, "UTF-8" );
+					var legacyUnit = {
+						id: "lu-crime", filePath: "legacy/Crime.cfc", startLine: 2, endLine: 4,
+						evidenceRefs: [ {
+							filePath: "legacy/Crime.cfc",
+							contentHash: lCase( hash( fileRead( sourcePath, "UTF-8" ), "SHA-256" ) )
+						} ]
+					};
+					var plan = {
+						inventory: { units: [ legacyUnit ] },
+						target: { units: [ { id: "tu-crime", legacyUnitIds: [ "lu-crime" ] } ] }
+					};
+					var pack = service.buildEvidencePack( plan, { unitIds: [ "tu-crime" ] }, testRoot );
+					expect( pack.inventorySlice.units ).toHaveLength( 1 );
+					expect( pack.excerpts ).toHaveLength( 1 );
+					expect( pack.excerpts[ 1 ].content ).toInclude( "listCrimes" );
+					expect( pack.excerpts[ 1 ].content ).notToInclude( "component {" );
+				} finally {
+					if ( directoryExists( testRoot ) ) directoryDelete( testRoot, true );
+				}
+			} );
 		} );
 	}
 }

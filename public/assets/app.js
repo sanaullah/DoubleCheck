@@ -1934,6 +1934,7 @@ function setRun(run) {
 	if (run?.id && run.id !== previousRunId && run.runKind === "modernize") {
 		state.modernization.result = null;
 		state.modernization.selectedItem = null;
+		state.modernization.selectedPhaseId = "";
 		state.modernization.decisions = {};
 		state.modernization.decisionNotes = {};
 		state.modernization.notice = "";
@@ -2182,9 +2183,101 @@ function modernizationItemLabel(item) {
 		const symbol = item.symbolName || item.signature || "";
 		return symbol && symbol !== file ? `${file} · ${symbol}` : file;
 	}
-	if (item._modernizationType === "target-unit") return item.targetPath || item.pathHint || item.name || item.title || item.id || "Untitled target";
+	if (item._modernizationType === "target-unit") return item.targetPath || item.pathHint || item.path || item.name || item.title || item.id || "Untitled target";
 	if (item._modernizationType === "unit-link") return `${item.sourcePath || item.legacyUnitId || item.sourceUnitId || "Legacy unit"} → ${item.targetPath || item.targetUnitId || item.targetId || "Target unit"}`;
-	return item.name || item.title || item.filePath || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
+	if (item._modernizationType === "roadmap-phase") return item.name || item.title || item.goal || item.id || "Roadmap phase";
+	if (item._modernizationType === "route-contract") return `${item.method || "GET"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target"}`;
+	if (item._modernizationType === "db-finding") return item.objectRef || item.proposedChange || item.problem || item.id || "Database finding";
+	if (item._modernizationType === "db-transition") return item.migrationPath || item.operation || item.id || "Database transition";
+	if (item._modernizationType === "sample") return item.targetPath || item.path || item.sampleKind || item.id || "Sample";
+	if (item._modernizationType === "validation" || item.itemType === "validation") {
+		return item.title || item.message || item.detail || item.targetPath || item.path || item.itemId || item.id || "Validation note";
+	}
+	return item.name || item.title || item.message || item.filePath || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
+}
+
+function cleanLegacySourceLabel(item = {}) {
+	const source = String(item.sourcePath || item.sourceFile || item.filePath || "").trim();
+	if (source) return source;
+	const links = item.legacyUnitIds || item.legacyLinks || item.relatedLegacyIds || [];
+	const usable = (Array.isArray(links) ? links : [links])
+		.map((entry) => String(entry || "").trim())
+		.filter((entry) => entry && !/^no\s*colon$/i.test(entry) && entry !== "-" && entry !== "n/a");
+	if (usable.length) return usable.join(", ");
+	return "New proposal (no legacy file mapped)";
+}
+
+function phaseHasCodeLinks(phase = {}) {
+	return !!(
+		(Array.isArray(phase.unitIds) && phase.unitIds.length) ||
+		(Array.isArray(phase.routeIds) && phase.routeIds.length) ||
+		(Array.isArray(phase.dbFindingIds) && phase.dbFindingIds.length) ||
+		(Array.isArray(phase.transitionIds) && phase.transitionIds.length)
+	);
+}
+
+function phaseScaffoldEmptyHtml(kind = "files") {
+	const noun = kind === "routes" ? "routes" : kind === "database" ? "database notes" : kind === "targets" ? "target files" : "legacy files";
+	return `<p class="modernization-phase-empty"><strong>Scaffold / setup step</strong> — no ${noun} are mapped to this phase yet. Use the Definition of Done below for setup work, or pick a mapped slice on the Road (look for coexist / vertical-slice badges) to see what moves.</p>`;
+}
+
+function modernizationGenerationErrors(result = {}) {
+	const errors = result.generationErrors || result.errors || [];
+	return Array.isArray(errors)
+		? errors.filter((item) => item && (item.message || item.role) && !modernizationMessageIsNote(item))
+		: [];
+}
+
+function modernizationGenerationNotes(result = {}) {
+	const notes = result.generationNotes || [];
+	const fromErrors = (result.generationErrors || result.errors || []).filter((item) => modernizationMessageIsNote(item));
+	const merged = [...(Array.isArray(notes) ? notes : []), ...fromErrors];
+	return merged.filter((item) => item && (item.message || item.role));
+}
+
+function modernizationMessageIsNote(item = {}) {
+	const message = String(item.message || "").toLowerCase();
+	const severity = String(item.severity || "").toLowerCase();
+	if (severity === "info" || severity === "note") return true;
+	if (message.startsWith("synthesized-")) return true;
+	if (message === "cost-reserved-for-roadmap") return true;
+	if (message === "ignored-non-object-items") return true;
+	return false;
+}
+
+function modernizationPlanIsHollow(result = {}) {
+	const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
+	const targets = result.target?.units || [];
+	const routes = result.routeContracts || [];
+	if (targets.length || routes.length) return false;
+	const mapped = phases.some((phase) => phaseHasCodeLinks(phase));
+	const appFailed = modernizationGenerationErrors(result).some((item) => String(item.role || "") === "modernization-application");
+	return appFailed || (phases.length > 0 && !mapped);
+}
+
+function orderedRoadmapPhases(phases = []) {
+	const list = Array.isArray(phases) ? phases.slice() : [];
+	if (list.length < 2) return list;
+	const byId = new Map(list.map((phase) => [String(phase.id || ""), phase]));
+	const visiting = new Set();
+	const seen = new Set();
+	const ordered = [];
+	const visit = (id) => {
+		const key = String(id || "");
+		if (!key || seen.has(key) || !byId.has(key)) return;
+		if (visiting.has(key)) return;
+		visiting.add(key);
+		const phase = byId.get(key);
+		(phase.dependencies || []).forEach((dep) => visit(dep));
+		visiting.delete(key);
+		seen.add(key);
+		ordered.push(phase);
+	};
+	list.forEach((phase) => visit(phase.id));
+	list.forEach((phase) => {
+		if (!seen.has(String(phase.id || ""))) ordered.push(phase);
+	});
+	return ordered;
 }
 
 function modernizationItemMeta(item) {
@@ -2403,7 +2496,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 		host.appendChild(section);
 	};
 	if (item._modernizationType === "target-unit") {
-		add("Legacy source", item.sourcePath || item.sourceFile || item.filePath || "New proposal");
+		add("Legacy source", cleanLegacySourceLabel(item));
 		add("Proposed target", item.targetPath || item.pathHint);
 		add("Purpose", item.purpose || item.description || item.proposedRole);
 		add("Methods and signatures", item.signatures || item.symbolNames || item.methods);
@@ -2557,26 +2650,71 @@ function renderModernizationResult(result = {}) {
 		renderModernizationTransitionGuide(result);
 	}
 	if (elements.modernizationCoverageBanner) {
+		const genErrors = modernizationGenerationErrors(result);
+		const hollow = modernizationPlanIsHollow(result);
+		const genNotesPreview = modernizationGenerationNotes(result);
 		const bannerText = Array.isArray(coverage.banners) ? coverage.banners.join(" ") : "";
-		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "");
+		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "") || (genErrors.length || genNotesPreview.length ? "generation-errors" : "");
 		elements.modernizationCoverageBanner.hidden = !note;
 		if (note) {
 			const schema = coverage.schema || {};
 			const llm = coverage.llm || {};
 			const repo = coverage.repository || {};
+			const targetCount = result.target?.units?.length || 0;
 			const targetContextCount = result.target?.contexts?.length || 0;
 			const sourceCount = coverage.filesScanned || repo.indexed || 0;
-			elements.modernizationCoverageBanner.innerHTML = `<div class="modernization-confidence-heading"><div><p class="eyebrow">Plan confidence</p><strong>Evidence gaps to resolve before implementation</strong></div><span class="status-badge" data-state="warning">Needs input</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div>`;
-			const cards = elements.modernizationCoverageBanner.querySelectorAll("section");
-			elements.modernizationCoverageBanner.querySelector(".repository-detail").textContent = `${sourceCount} files indexed from ${repo.candidates || sourceCount} candidates; ${repo.oversized || 0} oversized and ${repo.skipped || 0} total files skipped.`;
-			cards[0].querySelector(".confidence-impact").textContent = "Impact: the legacy catalog and dependency map are incomplete outside the indexed files.";
-			cards[0].querySelector(".confidence-action").textContent = "Next: narrow the run scope to the application directory or raise the repository scan limits, then rerun.";
-			elements.modernizationCoverageBanner.querySelector(".schema-detail").textContent = schema.coverage === "absent" ? "No schema pack: 0 tables, columns, constraints, indexes, or routines verified." : `${schema.coverage || "unknown"}: ${schema.objects?.tables || 0} tables, ${schema.objects?.columns || 0} columns, ${schema.objects?.constraints || 0} constraints, ${schema.objects?.indexes || 0} indexes, ${schema.objects?.routines || 0} routines.`;
-			cards[1].querySelector(".confidence-impact").textContent = schema.coverage === "absent" ? "Impact: database findings and migration samples are advisory only and must not be implemented." : "Impact: database proposals are limited to the parsed schema objects shown above.";
-			cards[1].querySelector(".confidence-action").textContent = schema.coverage === "absent" ? "Next: in Modernize setup, choose Schema source and attach DDL/JSON or an in-repository schema path." : "Next: review unresolved schema objects in the Database tab before accepting transitions.";
-			elements.modernizationCoverageBanner.querySelector(".context-detail").textContent = `${llm.partitions || llm.planned || 0} source partitions prepared; ${targetContextCount} referenced by this proposal; ${llm.contextCharacters || 0} characters across ${llm.files || 0} files and ${llm.lineCount || 0} lines.`;
-			cards[2].querySelector(".confidence-impact").textContent = `Impact: ${llm.omittedPartitions || 0} source partitions were omitted, so the target and roadmap cover selected slices rather than the whole application.`;
-			cards[2].querySelector(".confidence-action").textContent = "Next: run one outcome or bounded context at a time; use the current plan only for the files explicitly mapped in Target structure.";
+			const cfmlFiles = coverage.cfmlFiles || coverage.cfmlInventory?.files || 0;
+			const appError = genErrors.find((item) => String(item.role || "") === "modernization-application");
+			const genNotes = modernizationGenerationNotes(result);
+			const hasMaps = targetCount > 0 || (result.routeContracts || []).length > 0;
+			const shardMeta = result.metadata?.applicationShards || {};
+			const failureLead = hollow
+				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Application proposal incomplete</strong><p>${appError ? `The application role failed (${appError.message || "provider-failed"}), so this plan has road text without file maps, routes, or samples.` : "This plan has roadmap phases but no target units or route contracts bound to legacy files."}</p><p class="confidence-action">Next: start a new Modernize run (or Rebuild once a mapped slice exists). Indexed inventory (${cfmlFiles || sourceCount} CFML/source files) is still browsable below.</p></div>`
+				: (genErrors.length
+					? `<div class="modernization-generation-alert"><strong>Partial generation</strong><p>${hasMaps ? `${targetCount} target units retained` : "No maps yet"}${shardMeta.accepted ? ` · application shards ${shardMeta.accepted}/${shardMeta.total || shardMeta.accepted}` : ""}. ${genErrors.slice(0, 3).map((item) => `${item.role || "role"}${item.shard ? ` #${item.shard}` : ""}: ${item.message || "failed"}`).join(" · ")}</p></div>`
+					: (genNotes.length
+						? `<div class="modernization-generation-alert" data-tone="info"><strong>Generation notes</strong><p>${hasMaps ? `${targetCount} target units · ` : ""}${shardMeta.accepted ? `shards ${shardMeta.accepted}/${shardMeta.total || shardMeta.accepted} · ` : ""}${genNotes.slice(0, 3).map((item) => item.message || "note").join(" · ")}</p></div>`
+						: ""));
+			elements.modernizationCoverageBanner.innerHTML = `${failureLead}<details class="modernization-confidence-details"${hollow ? "" : ""}><summary><span class="eyebrow">Plan confidence</span> · working limits of this run (optional)</summary><div class="modernization-confidence-heading"><strong>Modernize works within what this run indexed</strong><span class="status-badge" data-state="warning">Scoped</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div></details>`;
+			const cards = elements.modernizationCoverageBanner.querySelectorAll(".modernization-confidence-grid > section");
+			const jsIndexed = repo.supportedLanguages?.JavaScript || 0;
+			const jsCandidates = repo.candidateLanguages?.JavaScript || 0;
+			const cfmlComplete = !!repo.modernizationLanguagesComplete;
+			elements.modernizationCoverageBanner.querySelector(".repository-detail").textContent = cfmlComplete && repo.truncation
+				? `${cfmlFiles} CFML/BoxLang files fully indexed; ${sourceCount}/${repo.candidates || sourceCount} total files kept after scan budget (${jsIndexed} JS indexed${jsCandidates ? ` of ${jsCandidates}` : ""}; ${repo.skipped || 0} skipped).`
+				: `${sourceCount} files indexed from ${repo.candidates || sourceCount} candidates (${cfmlFiles} CFML); ${repo.oversized || 0} oversized and ${repo.skipped || 0} skipped.`;
+			cards[0].querySelector(".confidence-impact").textContent = cfmlComplete && repo.truncation
+				? "Impact: CFML modernization scope is complete. Skipped files are mostly JavaScript/assets, not missing ColdFusion pages."
+				: "Impact: catalogs and maps cover indexed files only — that is enough to plan slices inside the indexed set.";
+			cards[0].querySelector(".confidence-action").textContent = cfmlComplete && repo.truncation
+				? "Optional: ignore this warning for CFML strangler work, or point Modernize at the app folder to hide asset noise."
+				: (repo.truncation
+					? "Optional: narrow the project path to the app directory or raise DOUBLECHECK_SCAN_MAX_FILES if CFML files were skipped."
+					: "Repository scope for this path is complete.");
+			if (!repo.truncation) cards[0].querySelector(".confidence-action").textContent = "Repository scope for this path is complete.";
+			elements.modernizationCoverageBanner.querySelector(".schema-detail").textContent = schema.coverage === "absent" ? "No schema pack attached — database work stays advisory." : `${schema.coverage || "unknown"}: ${schema.objects?.tables || 0} tables, ${schema.objects?.columns || 0} columns, ${schema.objects?.constraints || 0} constraints, ${schema.objects?.indexes || 0} indexes, ${schema.objects?.routines || 0} routines.`;
+			cards[1].querySelector(".confidence-impact").textContent = schema.coverage === "absent" ? "Impact: you can still modernize application/route slices; do not implement DB migrations from inference alone." : "Impact: database proposals are limited to the parsed schema objects shown above.";
+			cards[1].querySelector(".confidence-action").textContent = schema.coverage === "absent" ? "Optional: in Modernize setup, attach DDL/JSON or an in-repo schema path when you need verified DB work." : "Next: review unresolved schema objects in Evidence and catalogs before accepting transitions.";
+			elements.modernizationCoverageBanner.querySelector(".context-detail").textContent = hollow
+				? `Context was prepared (${llm.partitions || llm.planned || 0} partitions, ${llm.files || 0} files) but the application proposal did not land (${targetCount} target units).`
+				: `${llm.partitions || llm.planned || 0} partitions prepared; ${targetContextCount} contexts / ${targetCount} target units in this proposal; ${llm.contextCharacters || 0} characters across ${llm.files || 0} files.`;
+			cards[2].querySelector(".confidence-impact").textContent = hollow
+				? "Impact: confidence gaps are secondary — rerun until target structure and mapped road slices appear."
+				: (Number(llm.omittedPartitions || 0) > 0 && targetCount > 0
+					? `Impact: prompt packing skipped ${llm.omittedPartitions} extra partitions, but ${targetCount} target units were still proposed — use Target structure as the authority.`
+					: (Number(llm.omittedPartitions || 0) > 0
+						? `Impact: ${llm.omittedPartitions} partitions were omitted; use Target structure as the authority for what this plan covers.`
+						: "Impact: AI context packing covered the prepared partitions for this run."));
+			cards[2].querySelector(".confidence-action").textContent = hollow
+				? "Next: rerun Modernize; prefer a smaller app directory if the provider timed out on the full tree."
+				: (targetCount > 0
+					? "Next: accept or rebuild one mapped slice at a time using only the files listed for that slice."
+					: "Next: accept or rebuild one mapped slice at a time using only the files listed for that slice.");
+			if (cfmlComplete && !hollow) {
+				elements.modernizationCoverageBanner.querySelector(".modernization-confidence-heading strong").textContent = "CFML scope is ready — other limits are optional";
+				elements.modernizationCoverageBanner.querySelector(".status-badge").textContent = "Ready";
+				elements.modernizationCoverageBanner.querySelector(".status-badge").dataset.state = "ok";
+			}
 		}
 	}
 	const paneRows = {
@@ -2606,7 +2744,44 @@ function selectedRoadPhase(result = {}) {
 		const match = phases.find((phase) => phase.id === state.modernization.selectedPhaseId);
 		if (match) return match;
 	}
-	return phases.find((phase) => phase.currentSlice) || phases[0];
+	const current = phases.find((phase) => phase.currentSlice);
+	if (current && phaseHasCodeLinks(current)) return current;
+	const firstLinked = phases.find((phase) => phaseHasCodeLinks(phase));
+	if (firstLinked) return firstLinked;
+	return current || phases[0];
+}
+
+function renderModernizationArchitecture(result = {}) {
+	const host = document.querySelector("#modernization-architecture");
+	if (!host) return;
+	const contexts = result.target?.contexts || result.contexts || [];
+	const extracts = result.target?.extracts || result.extracts || [];
+	const central = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "centralized" || item.stayInMonolith === true && String(item.packaging || "").toLowerCase() !== "coldbox-module");
+	const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module" || /module/i.test(item.name || ""));
+	const centralOnly = central.filter((item) => !modules.includes(item));
+	host.hidden = !(centralOnly.length || modules.length || extracts.length);
+	if (host.hidden) return;
+	const fill = (selector, items, emptyText) => {
+		const el = document.querySelector(selector);
+		if (!el) return;
+		el.innerHTML = "";
+		if (!items.length) {
+			el.innerHTML = `<p class="field-hint">${emptyText}</p>`;
+			return;
+		}
+		items.forEach((item) => {
+			const card = document.createElement("article");
+			card.className = "modernization-architecture-card";
+			card.innerHTML = `<strong></strong><p class="modernization-item-meta"></p><p class="architecture-recommendation"></p>`;
+			card.querySelector("strong").textContent = item.name || item.id || "Item";
+			card.querySelector(".modernization-item-meta").textContent = item.purpose || item.reason || item.suggestedModulePath || "";
+			card.querySelector(".architecture-recommendation").textContent = item.recommendation || item.dataBoundaryNote || item.sharedDatasourceRisk || "";
+			el.appendChild(card);
+		});
+	};
+	fill("#modernization-arch-central", centralOnly, "No centralized shell recommendations yet.");
+	fill("#modernization-arch-modules", modules, "No ColdBox module candidates yet — keep feature slices in the monolith.");
+	fill("#modernization-arch-extracts", extracts, "No side-app extract candidates. Prefer modules until outbound/schedule isolation is evidenced.");
 }
 
 function renderModernizationSolution(result = {}) {
@@ -2615,18 +2790,24 @@ function renderModernizationSolution(result = {}) {
 	const hasPlan = !!(result.roadmapPhases?.length || result.target?.units?.length || result.inventory?.units?.length);
 	host.hidden = !hasPlan;
 	if (!hasPlan) return;
-	const phase = selectedRoadPhase(result);
+	const hollow = modernizationPlanIsHollow(result);
+	const phases = orderedRoadmapPhases(result.roadmapPhases || []);
+	const phase = selectedRoadPhase({ ...result, roadmapPhases: phases.length ? phases : result.roadmapPhases });
 	if (phase?.id) state.modernization.selectedPhaseId = phase.id;
+	const mappedPhase = phaseHasCodeLinks(phase || {});
 	const road = result.coverage?.road || {};
 	const unslicedToggle = document.querySelector("#modernization-show-unsliced");
-	if (unslicedToggle) unslicedToggle.checked = !!state.modernization.showUnsliced;
+	const showInventory = !!state.modernization.showUnsliced || hollow;
+	if (unslicedToggle) unslicedToggle.checked = showInventory;
 	const coverageEl = document.querySelector("#modernization-road-coverage");
 	if (coverageEl) {
 		const onRoad = Number(road.onRoad ?? 0);
 		const notYet = Number(road.notYetSliced ?? 0);
 		const schemaAbsent = (result.coverage?.schema?.coverage || "") === "absent";
 		coverageEl.hidden = false;
-		coverageEl.textContent = `${onRoad} on road · ${notYet} not yet sliced${schemaAbsent ? " · schema inference-limited" : ""}`;
+		coverageEl.textContent = hollow
+			? `Narrative road only · ${(result.inventory?.units || []).length} legacy units indexed · rerun to get file maps`
+			: `${onRoad} on road · ${notYet} not yet sliced${schemaAbsent ? " · schema inference-limited" : ""}`;
 	}
 	const stackEl = document.querySelector("#modernization-source-stack");
 	if (stackEl) {
@@ -2638,14 +2819,16 @@ function renderModernizationSolution(result = {}) {
 	const findingIds = new Set((phase?.dbFindingIds || []).map(String));
 	const transitionIds = new Set((phase?.transitionIds || []).map(String));
 	const onRoadLegacy = new Set();
-	(result.target?.units || []).forEach((unit) => {
-		if (unitIds.size && !unitIds.has(String(unit.id))) return;
-		(unit.legacyUnitIds || []).forEach((id) => onRoadLegacy.add(String(id)));
-	});
-	(result.unitLinks || []).forEach((link) => {
-		if (unitIds.size && link.targetUnitId && !unitIds.has(String(link.targetUnitId))) return;
-		if (link.legacyUnitId) onRoadLegacy.add(String(link.legacyUnitId));
-	});
+	if (mappedPhase) {
+		(result.target?.units || []).forEach((unit) => {
+			if (unitIds.size && !unitIds.has(String(unit.id))) return;
+			(unit.legacyUnitIds || []).forEach((id) => onRoadLegacy.add(String(id)));
+		});
+		(result.unitLinks || []).forEach((link) => {
+			if (unitIds.size && link.targetUnitId && !unitIds.has(String(link.targetUnitId))) return;
+			if (link.legacyUnitId) onRoadLegacy.add(String(link.legacyUnitId));
+		});
+	}
 	const legacyList = document.querySelector("#modernization-legacy-list");
 	if (legacyList) {
 		legacyList.innerHTML = "";
@@ -2653,11 +2836,21 @@ function renderModernizationSolution(result = {}) {
 		const filtered = units.filter((unit) => {
 			const id = String(unit.id || "");
 			const onRoad = onRoadLegacy.has(id);
-			return state.modernization.showUnsliced ? true : onRoad;
+			if (showInventory) return true;
+			if (!mappedPhase) return false;
+			return onRoad;
 		});
 		if (!filtered.length) {
-			legacyList.innerHTML = `<p class="field-hint">${state.modernization.showUnsliced ? "No legacy units in inventory." : "No legacy units linked to this phase yet."}</p>`;
+			legacyList.innerHTML = !mappedPhase && !showInventory
+				? phaseScaffoldEmptyHtml("legacy")
+				: `<p class="field-hint">${showInventory ? "No legacy units in inventory." : "This mapped phase did not resolve to legacy catalog rows. Try another Road step or open Evidence and catalogs."}</p>`;
 		} else {
+			if (hollow) {
+				const note = document.createElement("p");
+				note.className = "modernization-phase-empty";
+				note.innerHTML = "<strong>Indexed legacy catalog</strong> — no phase has file maps yet, so the full indexed inventory is shown.";
+				legacyList.appendChild(note);
+			}
 			filtered.slice(0, 80).forEach((unit) => {
 				const row = document.createElement("button");
 				row.type = "button";
@@ -2673,16 +2866,25 @@ function renderModernizationSolution(result = {}) {
 	const roadList = document.querySelector("#modernization-road-list");
 	if (roadList) {
 		roadList.innerHTML = "";
-		(result.roadmapPhases || []).forEach((item, index) => {
+		if (hollow) {
+			const note = document.createElement("p");
+			note.className = "modernization-phase-empty";
+			note.innerHTML = "<strong>Narrative road (unmapped)</strong> — phases below are guidance text only. Rerun Modernize so the application role can attach targets and routes.";
+			roadList.appendChild(note);
+		}
+		phases.forEach((item, index) => {
 			const card = document.createElement("button");
 			card.type = "button";
-			card.className = "modernization-road-card";
+			const linked = phaseHasCodeLinks(item);
+			card.className = `modernization-road-card ${linked ? "is-mapped" : "is-scaffold"}`;
 			card.classList.toggle("is-selected", item.id === phase?.id);
 			card.dataset.phaseId = item.id || "";
 			card.innerHTML = `<span class="modernization-road-index">${index + 1}</span><span class="modernization-road-body"><strong></strong><span class="modernization-item-meta"></span></span><span class="status-badge"></span>`;
-			card.querySelector("strong").textContent = item.name || item.id || `Phase ${index + 1}`;
-			card.querySelector(".modernization-item-meta").textContent = item.goal || item.parityIntent || "";
-			card.querySelector(".status-badge").textContent = item.pattern || (item.currentSlice ? "current" : "phase");
+			card.querySelector("strong").textContent = item.name || item.goal || item.id || `Phase ${index + 1}`;
+			card.querySelector(".modernization-item-meta").textContent = (item.name && item.goal && item.name !== item.goal)
+				? item.goal
+				: (item.parityIntent || (linked ? "Mapped slice" : "Setup / scaffold — no file map yet"));
+			card.querySelector(".status-badge").textContent = item.pattern || (linked ? "mapped" : "scaffold");
 			card.addEventListener("click", () => {
 				state.modernization.selectedPhaseId = item.id || "";
 				renderModernizationSolution(state.modernization.result || result);
@@ -2692,40 +2894,64 @@ function renderModernizationSolution(result = {}) {
 	}
 	const routeStrip = document.querySelector("#modernization-route-strip");
 	if (routeStrip) {
-		const routes = (result.routeContracts || []).filter((route) => !routeIds.size || routeIds.has(String(route.id)));
-		routeStrip.innerHTML = routes.length
-			? `<h4>Routes</h4>${routes.map((route) => `<div class="modernization-route-row"><code></code><span></span></div>`).join("")}`
-			: `<p class="field-hint">No route contracts linked to this phase.</p>`;
-		[...routeStrip.querySelectorAll(".modernization-route-row")].forEach((row, index) => {
-			const route = routes[index];
-			row.querySelector("code").textContent = `${route.method || "GET"} ${route.legacyPath || route.path || "?"} → ${route.targetRoute || route.targetEvent || "?"}`;
-			row.querySelector("span").textContent = route.rollbackNote || route.rollback || "";
-		});
+		const routes = mappedPhase
+			? (result.routeContracts || []).filter((route) => !routeIds.size || routeIds.has(String(route.id)))
+			: [];
+		if (!mappedPhase) {
+			routeStrip.innerHTML = hollow
+				? `<p class="modernization-phase-empty"><strong>No route contracts</strong> — the application proposal did not produce routes for this run.</p>`
+				: phaseScaffoldEmptyHtml("routes");
+		} else {
+			routeStrip.innerHTML = routes.length
+				? `<h4>Routes</h4>${routes.map((route) => `<div class="modernization-route-row"><code></code><span></span></div>`).join("")}`
+				: `<p class="field-hint">No route contracts linked to this phase.</p>`;
+			[...routeStrip.querySelectorAll(".modernization-route-row")].forEach((row, index) => {
+				const route = routes[index];
+				row.querySelector("code").textContent = `${route.method || "GET"} ${route.legacyPath || route.path || "?"} → ${route.targetRoute || route.targetEvent || "?"}`;
+				row.querySelector("span").textContent = route.rollbackNote || route.rollback || "";
+			});
+		}
 	}
 	const targetTree = document.querySelector("#modernization-target-tree");
 	if (targetTree) {
-		const units = (result.target?.units || []).filter((unit) => !unitIds.size || unitIds.has(String(unit.id)));
-		targetTree.innerHTML = units.length ? "" : `<p class="field-hint">No target units linked to this phase.</p>`;
-		units.forEach((unit) => {
-			const row = document.createElement("button");
-			row.type = "button";
-			row.className = "modernization-solution-row";
-			row.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span>`;
-			row.querySelector(".modernization-item-title").textContent = unit.targetPath || unit.pathHint || unit.id;
-			row.querySelector(".modernization-item-meta").textContent = `${unit.layer || "target"} · ${(unit.symbolNames || []).slice(0, 3).join(", ") || "—"}`;
-			row.addEventListener("click", () => {
-				state.modernization.selectedItem = { ...unit, _modernizationType: "target-unit" };
-				renderModernizationDetail(state.modernization.selectedItem);
+		const units = mappedPhase
+			? (result.target?.units || []).filter((unit) => !unitIds.size || unitIds.has(String(unit.id)))
+			: [];
+		if (!mappedPhase) {
+			targetTree.innerHTML = hollow
+				? `<p class="modernization-phase-empty"><strong>No target structure</strong> — rerun Modernize so the application role can propose ColdBox handlers, models, and views from the indexed legacy files.</p>`
+				: phaseScaffoldEmptyHtml("targets");
+		} else {
+			targetTree.innerHTML = units.length ? "" : `<p class="field-hint">No target units linked to this phase.</p>`;
+			units.forEach((unit) => {
+				const row = document.createElement("button");
+				row.type = "button";
+				row.className = "modernization-solution-row";
+				row.innerHTML = `<span class="modernization-item-title"></span><span class="modernization-item-meta"></span>`;
+				row.querySelector(".modernization-item-title").textContent = unit.targetPath || unit.pathHint || unit.id;
+				row.querySelector(".modernization-item-meta").textContent = `${unit.layer || "target"} · ${(unit.symbolNames || []).slice(0, 3).join(", ") || "—"}`;
+				row.addEventListener("click", () => {
+					state.modernization.selectedItem = { ...unit, _modernizationType: "target-unit" };
+					renderModernizationDetail(state.modernization.selectedItem);
+				});
+				targetTree.appendChild(row);
 			});
-			targetTree.appendChild(row);
-		});
+		}
 	}
 	const sliceDb = document.querySelector("#modernization-slice-db");
 	if (sliceDb) {
-		const findings = (result.dbFindings || []).filter((item) => !findingIds.size || findingIds.has(String(item.id)));
-		const transitions = (result.dbTransitions || []).filter((item) => !transitionIds.size || transitionIds.has(String(item.id)));
+		const findings = mappedPhase
+			? (result.dbFindings || []).filter((item) => !findingIds.size || findingIds.has(String(item.id)))
+			: [];
+		const transitions = mappedPhase
+			? (result.dbTransitions || []).filter((item) => !transitionIds.size || transitionIds.has(String(item.id)))
+			: [];
 		const schemaAbsent = (result.coverage?.schema?.coverage || "") === "absent";
-		if (schemaAbsent && !findings.length && !transitions.length) {
+		if (!mappedPhase) {
+			sliceDb.innerHTML = hollow
+				? `<p class="modernization-phase-empty"><strong>Database notes</strong> — schema pack is still optional; application file maps must succeed first.</p>`
+				: phaseScaffoldEmptyHtml("database");
+		} else if (schemaAbsent && !findings.length && !transitions.length) {
 			sliceDb.innerHTML = `<p class="field-hint">No schema pack — database notes for this slice are inference-limited.</p>`;
 		} else if (!findings.length && !transitions.length) {
 			sliceDb.innerHTML = `<p class="field-hint">No database findings linked to this phase.</p>`;
@@ -2744,14 +2970,17 @@ function renderModernizationSolution(result = {}) {
 			});
 		}
 	}
+	renderModernizationArchitecture(result);
 	const dod = document.querySelector("#modernization-slice-dod");
 	if (dod && !phase) {
 		dod.innerHTML = `<p class="field-hint">Select a roadmap phase to review definition of done.</p>`;
 	} else if (dod) {
 		const exit = Array.isArray(phase.exitCriteria) ? phase.exitCriteria : [];
-		const isCurrent = !!(phase.currentSlice || phase.id === (result.roadmapPhases || []).find((item) => item.currentSlice)?.id || phase.id === (result.roadmapPhases || [])[0]?.id);
+		const isCurrent = !!(phase.currentSlice || phase.id === phases.find((item) => item.currentSlice)?.id || phase.id === phases.find((item) => phaseHasCodeLinks(item))?.id || phase.id === phases[0]?.id);
+		const eyebrow = hollow ? "Narrative step (unmapped)" : mappedPhase ? "Slice definition of done" : "Setup step definition of done";
 		dod.innerHTML = `
-			<div class="modernization-guide-heading"><div><p class="eyebrow">Slice definition of done</p><h3></h3></div><span class="status-badge"></span></div>
+			<div class="modernization-guide-heading"><div><p class="eyebrow">${eyebrow}</p><h3></h3></div><span class="status-badge"></span></div>
+			${hollow ? `<p class="modernization-phase-empty">Treat this as planning notes only until a rerun produces mapped targets. Rebuild will not invent missing application maps.</p>` : mappedPhase ? "" : `<p class="modernization-phase-empty">This step is scaffold/setup. Accept it when the exit criteria are true, then move to a mapped Road slice to modernize concrete files.</p>`}
 			<p class="modernization-dod-goal"></p>
 			<p class="modernization-dod-parity"></p>
 			<div class="modernization-dod-grid"><section><h4>Exit criteria</h4><ul class="exit"></ul></section><section><h4>Rollback</h4><p class="rollback"></p></section></div>
@@ -2764,7 +2993,7 @@ function renderModernizationSolution(result = {}) {
 			</div>
 			<p class="form-message" id="modernization-slice-action-status" role="status"></p>`;
 		dod.querySelector("h3").textContent = phase.name || phase.id;
-		dod.querySelector(".status-badge").textContent = phase.pattern || "phase";
+		dod.querySelector(".status-badge").textContent = phase.pattern || (mappedPhase ? "mapped" : "scaffold");
 		dod.querySelector(".modernization-dod-goal").textContent = phase.goal || "";
 		dod.querySelector(".modernization-dod-parity").textContent = phase.parityIntent ? `Parity: ${phase.parityIntent}` : "";
 		const exitList = dod.querySelector("ul.exit");
@@ -2831,11 +3060,50 @@ function renderModernizationTransitionGuide(result = {}) {
 	const metadata = result.metadata || {};
 	const runtime = metadata.runtime?.runtime || metadata.runtime || "boxlang";
 	const profile = metadata.targetProfile || target.layoutProfile || "modern";
-	const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
-	const units = Array.isArray(target.units) ? target.units : [];
-	const folders = [...new Set(units.map((unit) => String(unit.targetPath || "").split("/").slice(0, -1).join("/")).filter(Boolean))].sort();
+	const phases = orderedRoadmapPhases(result.roadmapPhases || []);
+	const mapped = phases.filter((phase) => phaseHasCodeLinks(phase));
+	const hollow = modernizationPlanIsHollow(result);
+	const next = mapped.find((phase) => phase.currentSlice) || mapped[0] || phases.find((phase) => phase.currentSlice) || phases[0];
 	const list = (items, empty) => items.length ? `<ul>${items.map((item) => `<li>${item}</li>`).join("")}</ul>` : `<p class="field-hint">${empty}</p>`;
-	host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">Recommended transition</p><h3>Move one bounded slice at a time</h3></div><span class="status-badge">${runtime} · ${profile}</span></div><div class="modernization-guide-grid"><section><h4>Target skeleton</h4>${list(folders.map((folder) => `<code>${folder}/</code>`), "No target folders were generated yet.")}<p class="field-hint">Target files are proposals only. Create the folders, then move one validated slice behind a route before retiring its legacy file.</p></section><section><h4>Safe order of work</h4>${list(["1. Confirm configuration and datasource access.", "2. Add the target handler/service without removing the legacy route.", "3. Compare response, side effects, and permissions on representative data.", "4. Switch the route, monitor, then retire the legacy unit."], "No transition steps available.")}</section><section><h4>Planned features</h4>${list(phases.slice(0, 6).map((phase, index) => `<strong>${index + 1}. ${phase.name || phase.id || "Migration phase"}</strong><br>${phase.description || "Review the phase details before implementation."}`), "No roadmap phases were generated.")}</section></div><div class="modernization-guide-actions"><strong>Before implementation</strong>${list(["Open Target structure to inspect each source → target mapping.", "Open Validation + decisions and resolve every blocking item.", "In Modernize setup, choose Schema source and attach a local .sql/.json file or repository schema path.", "Use the phase exit criteria and rollback text as the review checklist."], "No actions available.")}</div>`;
+	if (hollow) {
+		host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">How to use this plan</p><h3>Rerun until file maps appear</h3></div><span class="status-badge">${runtime} · ${profile}</span></div>
+			<p class="modernization-guide-next"><strong>Blocked:</strong> the application proposal failed or produced no targets, so the Road is narrative-only. Confidence cards (repo limits / schema / AI partitions) are secondary.</p>
+			<div class="modernization-guide-grid">
+				<section><h4>1. What you still have</h4>${list([
+					`${(result.inventory?.units || []).length} legacy units from the indexed tree are browsable in Legacy you have.`,
+					"Database findings may still appear, but stay advisory without a schema pack."
+				], "No inventory.")}</section>
+				<section><h4>2. What is missing</h4>${list([
+					"Target structure, route contracts, and phase→file links.",
+					"Accept/Rebuild cannot invent those maps from an empty application fragment."
+				], "Nothing missing.")}</section>
+				<section><h4>3. What to do next</h4>${list([
+					"Start a new Modernize run; prefer the application directory if the full repo times out the provider.",
+					"Attach a schema pack only when you need verified database migrations."
+				], "No next step.")}</section>
+			</div>`;
+		return;
+	}
+	host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">How to use this plan</p><h3>Follow the Road, one slice at a time</h3></div><span class="status-badge">${runtime} · ${profile}</span></div>
+		<p class="modernization-guide-next"><strong>Next:</strong> ${next ? `Review <em>${next.name || next.id}</em> in the Solution bands below, check exit criteria, then Accept or Rebuild that slice.` : "Complete a Modernize run to generate roadmap slices."}</p>
+		<div class="modernization-guide-grid">
+			<section><h4>1. Pick a Road step</h4>${list([
+				"Prefer badges like coexist-route or vertical-slice — those have file maps.",
+				"Scaffold / foundation steps are setup only; empty left/right panels are expected."
+			], "No road guidance.")}</section>
+			<section><h4>2. Review Definition of Done</h4>${list([
+				"Read goal, parity, exit criteria, and rollback for the selected step.",
+				"Accept when the slice is good enough; Rebuild if the proposal is wrong."
+			], "No DoD guidance.")}</section>
+			<section><h4>3. Then optional catalogs</h4>${list([
+				"Open Evidence and catalogs only for blockers or missing links.",
+				"Attach a schema pack in Modernize setup when database work matters."
+			], "No catalog guidance.")}</section>
+		</div>
+		<div class="modernization-guide-actions"><strong>Mapped slices on this plan</strong>${list(
+			mapped.slice(0, 6).map((phase, index) => `<strong>${index + 1}. ${phase.name || phase.id || "Slice"}</strong><br>${phase.goal || phase.parityIntent || phase.pattern || "Mapped modernization slice."}`),
+			mapped.length ? "No mapped slices." : "No file-mapped slices yet — start with a scaffold step’s exit criteria, then rebuild or rerun for a vertical slice."
+		)}</div>`;
 }
 
 function renderResult(result = {}) {

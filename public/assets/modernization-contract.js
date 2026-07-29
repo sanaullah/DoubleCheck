@@ -138,12 +138,15 @@
 			},
 			budgets: {
 				maxTasks: number(values, "maxTasks", 3),
-				maxTokens: number(values, "maxTokens", 12000),
-				maxTokensPerTask: number(values, "maxTokensPerTask", 6000),
-				maxDurationMs: number(values, "maxDurationMs", 900000),
+				maxTokens: Math.max(number(values, "maxTokens", 24000), 24000),
+				maxTokensPerTask: Math.max(number(values, "maxTokensPerTask", 8000), 8000),
+				maxDurationMs: Math.max(number(values, "maxDurationMs", 900000), 900000),
 				maxIterationsPerTask: number(values, "maxIterationsPerTask", 8),
 				maxToolOutputCharacters: number(values, "maxToolOutputCharacters", 48000),
-				maxCostUsd: number(values, "maxCostUsd", 5)
+				maxCostUsd: Math.max(number(values, "maxCostUsd", 40), 40),
+				maxApplicationShards: number(values, "maxApplicationShards", 20),
+				applicationShardSize: number(values, "applicationShardSize", 8),
+				applicationShardConcurrency: number(values, "applicationShardConcurrency", 8)
 			}
 		};
 	}

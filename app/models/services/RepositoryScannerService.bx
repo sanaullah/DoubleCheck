@@ -71,7 +71,8 @@ class {
 		required string projectPath,
 		string mode         = "working-tree",
 		string baseRevision = "",
-		string headRevision = "HEAD"
+		string headRevision = "HEAD",
+		struct options      = {}
 	) {
 		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
 		var supportedExtensions = supportedLanguageService.extensionMap();
@@ -91,8 +92,18 @@ class {
 			unreadable: 0,
 			limit     : 0
 		};
+		var candidateLanguageCounts = {};
+		var prioritizedPaths = prioritizeCandidatePaths(
+			candidateResult.paths,
+			arguments.options.priorityExtensions ?: ( arguments.options.modernize ?: false ? [ "cfm", "cfc", "bx", "bxm", "bxs", "java" ] : [] )
+		);
 
-		for ( var candidatePath in candidateResult.paths ) {
+		for ( var candidatePath in prioritizedPaths ) {
+			var extensionHint = lCase( listLast( replace( toString( candidatePath ), "\\", "/", "all" ), "." ) );
+			if ( len( extensionHint ) && supportedExtensions.keyExists( extensionHint ) ) {
+				var languageHint = supportedExtensions[ extensionHint ];
+				candidateLanguageCounts[ languageHint ] = val( candidateLanguageCounts[ languageHint ] ?: 0 ) + 1;
+			}
 			if ( files.len() >= maxFiles ) {
 				skipped.limit++;
 				continue;
@@ -216,6 +227,7 @@ class {
 		return {
 			files             : files,
 			candidateCount    : candidateResult.paths.len(),
+			candidateLanguages: candidateLanguageCounts,
 			languages         : languages,
 			totalBytes        : totalBytes,
 			skipped           : skipped,
@@ -227,6 +239,24 @@ class {
 			repositoryRevision: candidateResult.repositoryRevision ?: "",
 			error             : candidateResult.error ?: ""
 		};
+	}
+
+	/**
+	 * Prefer CFML/BoxLang/Java paths ahead of JS when a scan budget will truncate,
+	 * so Modernize does not burn the file cap on assets before legacy pages.
+	 */
+	array function prioritizeCandidatePaths( required array paths, array priorityExtensions = [] ) {
+		if ( !arguments.priorityExtensions.len() || arguments.paths.len() < 2 ) return arguments.paths;
+		var preferred = {};
+		for ( var extension in arguments.priorityExtensions ) preferred[ lCase( trim( extension ) ) ] = true;
+		var primary = [];
+		var secondary = [];
+		for ( var path in arguments.paths ) {
+			var extension = lCase( listLast( replace( toString( path ), "\\", "/", "all" ), "." ) );
+			if ( preferred.keyExists( extension ) ) primary.append( path );
+			else secondary.append( path );
+		}
+		return primary.append( secondary, true );
 	}
 
 	/**

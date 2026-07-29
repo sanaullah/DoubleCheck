@@ -83,6 +83,7 @@ class {
 		}
 		var lastError = "";
 		var spentUsd = 0;
+		var activeRequest = duplicate( arguments.request );
 		for ( var attempt = 0; attempt <= attemptLimit; attempt++ ) {
 			if ( isCancelled( arguments.runId, arguments.options ) ) {
 				throw( type = "RunCancelled", message = "Modernization provider request cancelled" );
@@ -94,8 +95,8 @@ class {
 			}
 			try {
 				var response = chatGateway.chat(
-					fitMessages( arguments.request.messages ?: [] ),
-					buildParams( arguments.request, budgets ),
+					fitMessages( activeRequest.messages ?: [] ),
+					buildParams( activeRequest, budgets ),
 					buildOptions( max( 1, maxDurationMs - elapsedMs ) )
 				);
 				var responseUsage = extractUsage( response );
@@ -103,12 +104,12 @@ class {
 				if ( !isStruct( payload ) ) {
 					throw( type = "ModernizationProviderResponseException", message = "Provider returned non-object JSON" );
 				}
-				var outputTokens = isNumeric( budgets.maxTokensPerTask ?: "" ) ? int( budgets.maxTokensPerTask ) : ( isNumeric( budgets.maxTokens ?: "" ) ? int( budgets.maxTokens ) : 6000 );
-				var outputLimit = max( 2048, min( 60000, outputTokens * 4 ) );
+				var outputTokens = isNumeric( budgets.maxTokensPerTask ?: "" ) ? int( budgets.maxTokensPerTask ) : ( isNumeric( budgets.maxTokens ?: "" ) ? int( budgets.maxTokens ) : 12000 );
+				var outputLimit = max( 2048, min( 120000, outputTokens * 4 ) );
 				if ( len( jsonSerialize( payload ) ) > outputLimit ) {
 					throw( type = "ModernizationProviderResponseException", message = "Provider response exceeded the modernization output budget" );
 				}
-				var usage = normalizeUsage( responseUsage, arguments.request, payload );
+				var usage = normalizeUsage( responseUsage, activeRequest, payload );
 				var costUsd = estimateCost( usage );
 				spentUsd += costUsd;
 				if ( isNumeric( budgets.maxCostUsd ?: "" ) && spentUsd > val( budgets.maxCostUsd ) ) {
@@ -116,12 +117,24 @@ class {
 					return { ok: false, payload: {}, attempt: attempt + 1, provider: provider, model: model, costUsd: spentUsd, usage: usage, error: "cost-budget-exceeded" };
 				}
 				emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usage } );
+				try {
+					var completeMsg = "Modernize provider complete runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# chars=#len( jsonSerialize( payload ) )# costUsd=#spentUsd#";
+					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( completeMsg );
+				} catch ( any ignored ) {}
 				return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: provider, model: model, costUsd: spentUsd, usage: usage };
 			} catch ( any error ) {
 				if ( lCase( error.type ?: "" ) == "runcancelled" ) rethrow;
-				lastError = secretRedactionService.redactText( error.message ?: "Provider request failed" );
+				lastError = classifyProviderError( error );
 				emitObservation( arguments.options, { stage: "provider-error", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, error: lastError } );
+				try {
+					var errorMsg = "Modernize provider error runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# error=#left( lastError, 240 )#";
+					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.warn( errorMsg );
+				} catch ( any ignored ) {}
 				if ( attempt < attemptLimit ) {
+					if ( isTruncatedJsonError( error ) ) {
+						activeRequest = shrinkRequestForRetry( activeRequest );
+						emitObservation( arguments.options, { stage: "provider-retry-shrink", runId: arguments.runId, attempt: attempt + 1, error: lastError } );
+					}
 					var delayMs = isNumeric( retryBackoffMs ?: "" ) ? max( 0, int( retryBackoffMs ) ) * ( attempt + 1 ) : 0;
 					if ( delayMs ) sleep( min( 1000, delayMs ) );
 				}
@@ -140,21 +153,56 @@ class {
 	}
 
 	private struct function buildParams( required struct request, struct budgets = {} ) {
-		var window = isNumeric( contextWindow ?: "" ) ? max( 1024, int( contextWindow ) ) : 8192;
-		var requestedTokens = isNumeric( arguments.budgets.maxTokensPerTask ?: "" ) ? int( arguments.budgets.maxTokensPerTask ) : min( 6000, max( 512, int( window * .25 ) ) );
-		var params = { temperature: 0, max_tokens: min( 6000, max( 512, requestedTokens ) ) };
+		var window = isNumeric( contextWindow ?: "" ) ? max( 1024, int( contextWindow ) ) : 128000;
+		var tokenCap = 16000;
+		var requestedTokens = isNumeric( arguments.budgets.maxTokensPerTask ?: "" )
+			? int( arguments.budgets.maxTokensPerTask )
+			: min( tokenCap, max( 1024, int( window * .12 ) ) );
+		var params = { temperature: 0, max_tokens: min( tokenCap, max( 1024, requestedTokens ) ) };
 		if ( len( trim( model ?: "" ) ) ) params.model = model;
 		if ( structKeyExists( arguments.request, "params" ) && isStruct( arguments.request.params ) ) structAppend( params, arguments.request.params, true );
 		// Provider/request metadata must not be able to bypass the immutable run
 		// output budget.  Clamp again after merging request params.
-		params.max_tokens = min( params.max_tokens ?: 6000, min( 6000, max( 512, requestedTokens ) ) );
+		params.max_tokens = min( params.max_tokens ?: tokenCap, min( tokenCap, max( 1024, requestedTokens ) ) );
 		return params;
 	}
 
 	private struct function buildOptions( numeric effectiveTimeout = 0 ) {
-		var result = { provider: provider, apiKey: apiKey, returnFormat: "json", timeout: arguments.effectiveTimeout > 0 ? arguments.effectiveTimeout : timeout };
+		// aiTimeout setting is seconds. Callers pass remaining wall-clock as ms.
+		var seconds = isNumeric( timeout ?: "" ) ? max( 30, int( timeout ) ) : 120;
+		if ( arguments.effectiveTimeout > 0 ) {
+			seconds = max( 30, int( arguments.effectiveTimeout / 1000 ) );
+		}
+		var result = { provider: provider, apiKey: apiKey, returnFormat: "json", timeout: seconds };
 		if ( len( trim( baseURL ?: "" ) ) ) result.baseURL = baseURL;
 		return result;
+	}
+
+	private string function classifyProviderError( required any error ) {
+		var raw = secretRedactionService.redactText( arguments.error.message ?: "Provider request failed" );
+		if ( isTruncatedJsonError( arguments.error ) ) {
+			return "Provider JSON was truncated mid-object (raise max tokens or keep the first slice small). " & left( raw, 240 );
+		}
+		return left( raw, 500 );
+	}
+
+	private boolean function isTruncatedJsonError( required any error ) {
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		if ( findNoCase( "parse json", message ) || findNoCase( "jsondeserialize", typeName ) || findNoCase( "json", typeName ) ) return true;
+		if ( findNoCase( "failed to parse json", message ) ) return true;
+		if ( findNoCase( "unexpected end", message ) || findNoCase( "unterminated", message ) ) return true;
+		return false;
+	}
+
+	private struct function shrinkRequestForRetry( required struct request ) {
+		var copy = duplicate( arguments.request );
+		var shrink = "RETRY CONSTRAINT: Your previous JSON was truncated. Return a smaller COMPLETE JSON object only, keys in order targetUnits, unitLinks, routeContracts, samples, contexts, extracts. Cap targetUnits at 3, unitLinks at 3, routeContracts at 3, samples at 2. contexts=[] and extracts=[]. Each evidenceRefs array at most 2 ids. sampleCode under 8 lines. Map only the shard paths already listed; do not invent a repo-wide contexts dump.";
+		if ( !isArray( copy.messages ?: "" ) ) copy.messages = [];
+		copy.messages.append( { role: "user", content: shrink } );
+		if ( !isStruct( copy.params ?: "" ) ) copy.params = {};
+		copy.params.max_tokens = 8000;
+		return copy;
 	}
 
 	private void function emitObservation( required struct options, required struct observation ) {

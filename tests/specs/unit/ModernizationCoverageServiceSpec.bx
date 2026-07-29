@@ -38,6 +38,62 @@ class extends="testbox.system.BaseSpec" {
             expect( coverage.road.notYetSliced ).toBe( 2 );
             expect( len( coverage.road.sourceStackNote ?: "" ) ).toBeGT( 0 );
         } );
+
+        it( "marks modernization languages complete when CFML candidates are fully indexed", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var result = service.assess(
+                {
+                    candidateCount: 100,
+                    candidateLanguages: { CFML: 10, JavaScript: 90 },
+                    files: [
+                        { filePath: "a.cfm", language: "CFML", sizeBytes: 10 },
+                        { filePath: "b.cfc", language: "CFML", sizeBytes: 10 }
+                    ],
+                    skipped: { limit: 80 },
+                    discoveryTruncated: true,
+                    scope: "full"
+                },
+                { files: [ { filePath: "a.cfm" }, { filePath: "b.cfc" } ], units: [], unresolved: [] },
+                { coverage: "absent" }
+            );
+            // Only 2 CFML files in scan.files but candidateLanguages says 10 — incomplete
+            expect( result.repository.modernizationLanguagesComplete ).toBeFalse();
+            result = service.assess(
+                {
+                    candidateCount: 100,
+                    candidateLanguages: { CFML: 2, JavaScript: 98 },
+                    files: [
+                        { filePath: "a.cfm", language: "CFML", sizeBytes: 10 },
+                        { filePath: "b.cfc", language: "CFML", sizeBytes: 10 },
+                        { filePath: "c.js", language: "JavaScript", sizeBytes: 10 }
+                    ],
+                    skipped: { limit: 97 },
+                    discoveryTruncated: true,
+                    scope: "full"
+                },
+                { files: [ { filePath: "a.cfm" }, { filePath: "b.cfc" } ], units: [], unresolved: [] },
+                { coverage: "absent" }
+            );
+            expect( result.repository.modernizationLanguagesComplete ).toBeTrue();
+            expect( result.repository.jsTruncated ).toBeTrue();
+        } );
+
+        it( "marks prepared LLM partitions completed once a proposal exists", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var coverage = service.assess(
+                scan = { files: [] },
+                inventory = { units: [] },
+                schemaPack = { coverage: "absent" },
+                context = { truncated: true, summary: { omittedPartitions: 2, files: 4, lineCount: 10 }, characters: 100 },
+                llm = { planned: 4, completed: 0, partitions: 4 }
+            );
+            coverage = service.enrichRoadCoverage( coverage, {
+                inventory: { units: [] },
+                target: { units: [ { id: "tu-1", targetPath: "app/handlers/a.cfc" } ] },
+                roadmapPhases: [ { id: "p1" } ]
+            } );
+            expect( coverage.llm.completed ).toBe( 4 );
+        } );
         } );
     }
 }

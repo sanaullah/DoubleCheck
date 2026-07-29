@@ -19,6 +19,35 @@ class extends="testbox.system.BaseSpec" {
 				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
 			} );
 
+			it( "retries with a shrink instruction when provider JSON is truncated", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					responses = [
+						"Failed to parse JSON {""targetUnits"":[{""id"":""tu-1"",""sampleCode"":""component {",
+						jsonSerialize( { targetUnits: [ { id: "tu-1", targetPath: "app/handlers/A.bx" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] } )
+					]
+				);
+				// First response must throw from normalizeResponse/jsonDeserialize.
+				chat.responses[ 1 ] = '{ "targetUnits": [ { "id": "tu-1", "sampleCode": "component {';
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.provider = "ollama";
+				service.apiKey = "";
+				service.model = "scripted";
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var observations = [];
+				var result = service.run(
+					"run-truncate",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 3, maxTokensPerTask: 12000 }, onObservation: ( item ) => observations.append( item ) }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits[ 1 ].id ).toBe( "tu-1" );
+				expect( chat.callCount() ).toBe( 2 );
+				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeTrue();
+			} );
+
 			it( "returns a bounded provider failure after malformed JSON retries", () => {
 				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "not-json" );
 				var service = new app.models.services.ModernizationAgentGateway();

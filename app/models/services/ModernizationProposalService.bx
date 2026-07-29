@@ -1,12 +1,20 @@
-/** Executes the three modernization roles and merges their bounded fragments. */
+/**
+ * Executes modernization roles and merges bounded fragments.
+ * Application mapping is sharded across many small agent calls so large
+ * CFML trees (e.g. CFTunes) do not truncate a single mid-object JSON dump.
+ */
 @singleton
 class {
 	property name="agentFactory" inject="ModernizationAgentFactory";
 	property name="agentGateway" inject="ModernizationAgentGateway";
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="identityService" inject="ModernizationIdentityService";
+	property name="log" inject="logbox:logger:{this}";
 	variables.cancelledRuns = {};
 	variables.maxItems = 200;
+	variables.defaultApplicationShards = 20;
+	variables.maxApplicationShards = 20;
+	variables.defaultShardSize = 8;
 
 	struct function propose(
 		required string runId,
@@ -21,49 +29,60 @@ class {
 		var startedAt = isNumeric( arguments.input.startedAt ?: "" ) ? val( arguments.input.startedAt ) : getTickCount();
 		var fragments = {};
 		var errors = [];
+		var notes = [];
 		var totalOutputCharacters = 0;
 		var totalCostUsd = 0;
-		var totalOutputLimit = isNumeric( budgets.maxTokens ?: "" ) ? max( 2048, int( budgets.maxTokens ) * 4 ) : 24000;
+		var shardCap = isNumeric( budgets.maxApplicationShards ?: "" ) ? max( 1, min( variables.maxApplicationShards, int( budgets.maxApplicationShards ) ) ) : variables.defaultApplicationShards;
+		var totalOutputLimit = isNumeric( budgets.maxTokens ?: "" ) ? max( 2048, int( budgets.maxTokens ) * 4 * max( 3, shardCap ) ) : 24000 * max( 3, shardCap );
 		var samplePolicy = structKeyExists( arguments.input, "samplePolicy" ) && isStruct( arguments.input.samplePolicy ) ? arguments.input.samplePolicy : {};
-		var roles = [ "modernization-application", "modernization-database" ];
-		// The two evidence roles are intentionally bounded by the immutable run
-		// task budget.  The roadmap role is the final task and only runs when a
-		// task slot and the wall-clock budget remain.
-		for ( var roleIndex = 1; roleIndex <= min( roles.len(), maxTasks ); roleIndex++ ) {
-			var role = roles[ roleIndex ];
+		var runtime = { runtime: arguments.input.target.runtime ?: arguments.input.runtime ?: "", profile: arguments.input.target.layoutProfile ?: arguments.input.profile ?: "" };
+
+		// Many small application agents in parallel waves beat one whole-repo JSON
+		// that truncates, and finish inside the wall-clock budget.
+		var appShards = buildApplicationShards( arguments.evidence, budgets );
+		logInfo( "Modernize proposal #arguments.runId#: #appShards.len()# application shard(s), concurrency=#( budgets.applicationShardConcurrency ?: 8 )#, maxDurationMs=#maxDurationMs#, maxCostUsd=#( budgets.maxCostUsd ?: '' )#" );
+		var appResult = runApplicationShards( arguments.runId, appShards, runtime, budgets, startedAt, maxDurationMs, totalOutputLimit, arguments.options );
+		var appMerged = appResult.fragment;
+		var appAccepted = appResult.accepted;
+		totalOutputCharacters = appResult.outputCharacters;
+		totalCostUsd = appResult.costUsd;
+		splitProposalMessages( appResult.errors, errors, notes );
+		if ( appAccepted > 0 ) fragments[ "modernization-application" ] = appMerged;
+		logInfo( "Modernize proposal #arguments.runId#: application shards accepted #appAccepted#/#appShards.len()#, costUsd=#totalCostUsd#, outputChars=#totalOutputCharacters#" );
+
+		// Database role remains a single call when the task budget allows it.
+		if ( maxTasks >= 2 ) {
 			if ( isCancelled( arguments.runId, arguments.options ) ) throw( type = "RunCancelled", message = "Modernization proposal cancelled" );
 			if ( getTickCount() - startedAt >= maxDurationMs ) {
-				errors.append( { role: role, message: "budget-exceeded", elapsedMs: getTickCount() - startedAt, maxDurationMs: maxDurationMs, startedAt: startedAt } );
-				break;
-			}
-			if ( totalOutputCharacters >= totalOutputLimit ) {
-				errors.append( { role: role, message: "total-output-budget-exceeded" } );
-				break;
-			}
-			if ( isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd >= val( budgets.maxCostUsd ) ) {
-				errors.append( { role: role, message: "cost-budget-exceeded" } );
-				break;
-			}
-			var runtime = { runtime: arguments.input.target.runtime ?: arguments.input.runtime ?: "", profile: arguments.input.target.layoutProfile ?: arguments.input.profile ?: "" };
-			var agentRequest = agentFactory.build( role, runtime, arguments.evidence, budgets );
-			var roleOptions = duplicate( arguments.options );
-			roleOptions.budgets = budgets;
-			roleOptions.startedAt = startedAt;
-			roleOptions.maxDurationMs = maxDurationMs;
-			roleOptions.role = role;
-			var response = agentGateway.run( arguments.runId, agentRequest, roleOptions );
-			totalCostUsd += isNumeric( response.costUsd ?: "" ) ? val( response.costUsd ) : 0;
-			if ( !( response.ok ?: false ) ) {
-				errors.append( { role: role, message: response.error ?: "provider-failed" } );
-			} else if ( !validFragment( role, response.payload ?: {} ) ) {
-				errors.append( { role: role, message: "malformed-role-output" } );
+				errors.append( { role: "modernization-database", message: "budget-exceeded", elapsedMs: getTickCount() - startedAt, maxDurationMs: maxDurationMs } );
+			} else if ( totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: "modernization-database", message: "total-output-budget-exceeded" } );
+			} else if ( isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd >= val( budgets.maxCostUsd ) ) {
+				errors.append( { role: "modernization-database", message: "cost-budget-exceeded" } );
 			} else {
-				var redactedFragment = redactPayload( response.payload ?: {} );
-				if ( !redactedFragment.count() && ( response.payload ?: {} ).count() ) errors.append( { role: role, message: "redaction-failed" } );
-				else fragments[ role ] = redactedFragment;
-				totalOutputCharacters += isNumeric( response.outputCharacters ?: "" ) ? int( response.outputCharacters ) : len( jsonSerialize( response.payload ?: {} ) );
+				var dbRequest = agentFactory.build( "modernization-database", runtime, arguments.evidence, budgets );
+				var dbOptions = duplicate( arguments.options );
+				dbOptions.budgets = budgets;
+				dbOptions.startedAt = getTickCount();
+				dbOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				dbOptions.role = "modernization-database";
+				var dbResponse = agentGateway.run( arguments.runId, dbRequest, dbOptions );
+				totalCostUsd += isNumeric( dbResponse.costUsd ?: "" ) ? val( dbResponse.costUsd ) : 0;
+				if ( !( dbResponse.ok ?: false ) ) {
+					errors.append( { role: "modernization-database", message: dbResponse.error ?: "provider-failed" } );
+				} else if ( !validFragment( "modernization-database", dbResponse.payload ?: {} ) ) {
+					errors.append( { role: "modernization-database", message: "malformed-role-output" } );
+				} else {
+					var redactedDb = redactPayload( dbResponse.payload ?: {} );
+					if ( !redactedDb.count() && ( dbResponse.payload ?: {} ).count() ) errors.append( { role: "modernization-database", message: "redaction-failed" } );
+					else {
+						fragments[ "modernization-database" ] = redactedDb;
+						totalOutputCharacters += isNumeric( dbResponse.outputCharacters ?: "" ) ? int( dbResponse.outputCharacters ) : len( jsonSerialize( dbResponse.payload ?: {} ) );
+					}
+				}
 			}
 		}
+
 		var costExceeded = isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd > val( budgets.maxCostUsd );
 		if ( costExceeded ) errors.append( { role: "modernization", message: "cost-budget-exceeded" } );
 		if ( !fragments.count() ) {
@@ -73,32 +92,59 @@ class {
 			return failure( firstMessage, errors );
 		}
 		var merged = mergeFragments( arguments.input, arguments.evidence, fragments, errors );
-		if ( !costExceeded && ( fragments.keyExists( "modernization-application" ) || fragments.keyExists( "modernization-database" ) ) ) {
+		if ( appAccepted > 0 && appShards.len() > 1 ) {
+			merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
+			merged.metadata.applicationShards = { accepted: appAccepted, total: appShards.len() };
+		}
+		// Roadmap without application substance invents unmapped phases. Require
+		// at least one target, link, route, or sample before planning the road.
+		if ( !fragments.keyExists( "modernization-application" ) ) {
+			errors.append( { role: "modernization-roadmap", message: "skipped-without-application-fragment" } );
+		} else if ( !applicationFragmentHasSubstance( merged ) ) {
+			errors.append( { role: "modernization-application", message: "empty-application-fragment" } );
+			errors.append( { role: "modernization-roadmap", message: "skipped-without-application-substance" } );
+		} else {
+			var canAffordRoadmap = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
 			if ( maxTasks < 3 || getTickCount() - startedAt >= maxDurationMs || totalOutputCharacters >= totalOutputLimit ) {
 				errors.append( { role: "modernization-roadmap", message: "budget-exceeded" } );
-				return { ok: true, plan: sortPlan( merged ), partial: errors.len() > 0, errors: errors };
-			}
+			} else if ( !canAffordRoadmap ) {
+				errors.append( { role: "modernization-roadmap", message: "cost-budget-exceeded" } );
+			} else {
+				logInfo( "Modernize proposal #arguments.runId#: starting roadmap role" );
 				var roadmapRequest = agentFactory.build( "modernization-roadmap", runtime, merged, budgets );
-			var roadmapOptions = duplicate( arguments.options );
-			roadmapOptions.budgets = budgets;
-			roadmapOptions.startedAt = startedAt;
-			roadmapOptions.maxDurationMs = maxDurationMs;
-			roadmapOptions.role = "modernization-roadmap";
-			var roadmap = agentGateway.run( arguments.runId, roadmapRequest, roadmapOptions );
-			totalCostUsd += isNumeric( roadmap.costUsd ?: "" ) ? val( roadmap.costUsd ) : 0;
-			if ( roadmap.ok ?: false && validFragment( "modernization-roadmap", roadmap.payload ?: {} ) ) {
-				var redactedRoadmap = redactPayload( roadmap.payload ?: {} );
-				if ( !redactedRoadmap.count() && ( roadmap.payload ?: {} ).count() ) errors.append( { role: "modernization-roadmap", message: "redaction-failed" } );
-				else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy, errors );
-			} else errors.append( { role: "modernization-roadmap", message: roadmap.error ?: ( roadmap.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
+				var roadmapOptions = duplicate( arguments.options );
+				roadmapOptions.budgets = budgets;
+				roadmapOptions.startedAt = getTickCount();
+				roadmapOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				roadmapOptions.role = "modernization-roadmap";
+				var roadmap = agentGateway.run( arguments.runId, roadmapRequest, roadmapOptions );
+				totalCostUsd += isNumeric( roadmap.costUsd ?: "" ) ? val( roadmap.costUsd ) : 0;
+				if ( roadmap.ok ?: false && validFragment( "modernization-roadmap", roadmap.payload ?: {} ) ) {
+					var redactedRoadmap = redactPayload( roadmap.payload ?: {} );
+					if ( !redactedRoadmap.count() && ( roadmap.payload ?: {} ).count() ) errors.append( { role: "modernization-roadmap", message: "redaction-failed" } );
+					else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy, errors );
+				} else errors.append( { role: "modernization-roadmap", message: roadmap.error ?: ( roadmap.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
+			}
 		}
-		var sampleLimit = isNumeric( samplePolicy.maxFiles ?: "" ) ? max( 1, int( samplePolicy.maxFiles ) ) : 40;
-		merged.samples = boundedStructArray( merged.samples ?: [], sampleLimit, errors, "samples" );
-		if ( ( samplePolicy.currentPhasesOnly ?: true ) && isArray( merged.roadmapPhases ?: "" ) ) merged.samples = currentSliceSamples( merged.samples ?: [], merged.roadmapPhases );
+		merged = polishPlan( merged, samplePolicy, errors );
+		if ( applicationFragmentHasSubstance( merged ) && ( !isArray( merged.roadmapPhases ?: "" ) || !merged.roadmapPhases.len() ) ) {
+			merged = applySynthesizedRoadmap( merged, notes );
+			merged = polishPlan( merged, samplePolicy, errors );
+		}
+		if ( applicationFragmentHasSubstance( merged ) && architectureDecisionsMissing( merged ) ) {
+			merged = applySynthesizedArchitecture( merged, arguments.evidence, notes );
+			merged = polishPlan( merged, samplePolicy, errors );
+		}
 		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
 		merged.metadata.promptVersion = agentFactory.version();
-		merged.generationErrors = errors;
-		return { ok: true, plan: sortPlan( merged ), partial: errors.len() > 0, errors: errors };
+		var finalErrors = [];
+		var finalNotes = duplicate( notes );
+		splitProposalMessages( errors, finalErrors, finalNotes );
+		merged.generationErrors = finalErrors;
+		merged.generationNotes = finalNotes;
+		var partial = finalErrors.len() > 0;
+		logInfo( "Modernize proposal #arguments.runId#: complete partial=#partial#, errors=#finalErrors.len()#, notes=#finalNotes.len()#, targets=#( isStruct( merged.target ?: '' ) && isArray( merged.target.units ?: '' ) ? merged.target.units.len() : 0 )#, phases=#( isArray( merged.roadmapPhases ?: '' ) ? merged.roadmapPhases.len() : 0 )#" );
+		return { ok: true, plan: sortPlan( merged ), partial: partial, errors: finalErrors, notes: finalNotes };
 	}
 
 	void function cancelRun( required string runId ) {
@@ -205,11 +251,25 @@ class {
 		for ( var unit in arguments.units ) {
 			if ( !isStruct( unit ) ) continue;
 			var copy = duplicate( unit );
-			var sourcePath = trim( copy.sourcePath ?: copy.sourceFile ?: copy.legacyPath ?: copy.filePath ?: copy.id ?: "" );
-			if ( len( sourcePath ) ) copy.sourcePath = replace( sourcePath, "\\", "/", "all" );
+			var sourcePath = trim( copy.sourcePath ?: copy.sourceFile ?: copy.legacyPath ?: copy.filePath ?: "" );
+			if ( !len( sourcePath ) ) {
+				var idHint = trim( copy.id ?: "" );
+				if ( find( "/", idHint ) || reFindNoCase( "\.(cfm|cfc|bx|bxm|js)$", idHint ) ) sourcePath = idHint;
+			}
+			sourcePath = replace( sourcePath, "\\", "/", "all" );
+			if ( reFindNoCase( "\(new\)|new proposal|new-proposal", sourcePath ) || reFindNoCase( "\(new\)", trim( copy.sourcePath ?: "" ) ) ) {
+				sourcePath = reReplaceNoCase( sourcePath, "\s*\(new\)\s*", "", "all" );
+				copy.newProposal = true;
+				if ( !len( trim( copy.proposalReason ?: "" ) ) ) copy.proposalReason = "Provider marked this target as a new scaffold without a legacy source file";
+			}
+			if ( len( sourcePath ) ) copy.sourcePath = sourcePath;
 			var candidate = trim( copy.targetPath ?: copy.pathHint ?: "" );
 			if ( !legalModernTargetPath( candidate, runtime, profile ) || !targetPathMatchesLayer( candidate, copy ) ) copy.targetPath = deriveTargetPath( copy, sourcePath, runtime, profile );
 			if ( len( trim( copy.evidenceRef ?: "" ) ) && !structKeyExists( copy, "evidenceRefs" ) && copy.evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
+			if ( !len( trim( copy.sourcePath ?: "" ) ) && !( copy.newProposal ?: false ) && !( copy.explicitProposal ?: false ) && !len( trim( copy.proposalReason ?: "" ) ) ) {
+				copy.newProposal = true;
+				copy.proposalReason = "Provider proposed a scaffold target without a legacy source path";
+			}
 			ensureIdentity( copy, "target-unit" );
 			output.append( copy );
 		}
@@ -261,24 +321,1070 @@ class {
 	}
 
 	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = []) {
-		var useCurrentSlice = structKeyExists( arguments.samplePolicy, "currentPhasesOnly" ) ? !!arguments.samplePolicy.currentPhasesOnly : true;
-			arguments.plan.roadmapPhases = boundedStructArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40, arguments.errors, "roadmapPhases" );
-			for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
-			arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
-			arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
-			for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
-			if ( useCurrentSlice ) arguments.plan.samples = currentSliceSamples( arguments.plan.samples, arguments.plan.roadmapPhases );
+		arguments.plan.roadmapPhases = boundedStructArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40, arguments.errors, "roadmapPhases" );
+		for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
+		arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
+		arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
+		for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
 		return arguments.plan;
+	}
+
+	/**
+	 * When the provider roadmap is skipped (cost/time), still emit mapped phases
+	 * from retained target/route ids so the Solution Road is usable.
+	 */
+	private struct function applySynthesizedRoadmap( required struct plan, array errors = [] ) {
+		var phases = synthesizeRoadmapPhases( arguments.plan );
+		if ( !phases.len() ) return arguments.plan;
+		arguments.plan.roadmapPhases = phases;
+		for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
+		arguments.errors.append( { role: "modernization-roadmap", message: "synthesized-from-application-maps", severity: "info" } );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.roadmapSource = "synthesized";
+		logInfo( "Modernize roadmap synthesized from application maps (#arguments.plan.roadmapPhases.len()# phase(s))" );
+		return arguments.plan;
+	}
+
+	private array function synthesizeRoadmapPhases( required struct plan ) {
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var routes = isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [];
+		if ( !units.len() && !routes.len() ) return [];
+		var foundation = [];
+		var feature = [];
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var path = lCase( trim( unit.targetPath ?: unit.sourcePath ?: unit.id ?: "" ) );
+			if ( reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes", path ) ) foundation.append( unit );
+			else feature.append( unit );
+		}
+		var phases = [];
+		if ( foundation.len() ) {
+			phases.append( {
+				id: "phase-foundation",
+				name: "Foundation and config",
+				goal: "Stand up modern Application/config/router coexistence before feature slices.",
+				pattern: "foundation",
+				dependencies: [],
+				unitIds: foundation.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) ),
+				routeIds: [],
+				dbFindingIds: [],
+				transitionIds: [],
+				sampleIds: [],
+				parityIntent: "Boot and config parity with legacy Application/ColdBox entrypoints.",
+				exitCriteria: [ "Modern app boots", "Router/config coexist with legacy", "No big-bang cutover" ],
+				rollback: "Keep legacy Application/config as default entry until coexist routes prove stable.",
+				implementerPrompt: "Implement foundation targets first. Do not migrate feature handlers until config and routing coexist.",
+				currentSlice: false
+			} );
+		}
+		var sliceUnits = feature.len() ? feature : units;
+		var sliceSize = min( 8, sliceUnits.len() );
+		var firstSlice = [];
+		for ( var i = 1; i <= sliceSize; i++ ) firstSlice.append( sliceUnits[ i ] );
+		var firstIds = firstSlice.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) );
+		var firstIdSet = {};
+		for ( var id in firstIds ) firstIdSet[ id ] = true;
+		var sliceRoutes = [];
+		for ( var route in routes ) {
+			if ( !isStruct( route ) ) continue;
+			var related = route.targetUnitId ?: "";
+			if ( !len( related ) && isArray( route.relatedItemIds ?: "" ) && route.relatedItemIds.len() ) related = route.relatedItemIds[ 1 ];
+			if ( len( related ) && firstIdSet.keyExists( related ) ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
+			else if ( !firstIdSet.count() ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
+			if ( sliceRoutes.len() >= 8 ) break;
+		}
+		if ( !sliceRoutes.len() ) {
+			for ( var route in routes ) {
+				if ( isStruct( route ) ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
+				if ( sliceRoutes.len() >= 6 ) break;
+			}
+		}
+		phases.append( {
+			id: "phase-first-slice",
+			name: "First vertical slice",
+			goal: "Deliver one coexist-route vertical slice with mapped targets and routes.",
+			pattern: "vertical-slice",
+			dependencies: foundation.len() ? [ "phase-foundation" ] : [],
+			unitIds: firstIds,
+			routeIds: sliceRoutes.filter( ( id ) => len( trim( id ) ) ),
+			dbFindingIds: [],
+			transitionIds: [],
+			sampleIds: [],
+			parityIntent: "Feature parity for the first mapped slice only.",
+			exitCriteria: [ "Coexist route serves the slice", "Target handlers/services compile", "Legacy path remains rollback" ],
+			rollback: "Route traffic back to legacy paths for this slice.",
+			implementerPrompt: "Implement only the listed target units and coexist routes. Keep unlisted legacy files untouched.",
+			currentSlice: true
+		} );
+		if ( sliceUnits.len() > sliceSize ) {
+			var later = [];
+			for ( var j = sliceSize + 1; j <= sliceUnits.len(); j++ ) later.append( sliceUnits[ j ].id ?: sliceUnits[ j ].itemId ?: "" );
+			phases.append( {
+				id: "phase-continue-strangler",
+				name: "Continue strangler slices",
+				goal: "Migrate remaining mapped targets in later coexist slices.",
+				pattern: "coexist-route",
+				dependencies: [ "phase-first-slice" ],
+				unitIds: later.filter( ( id ) => len( trim( id ) ) ),
+				routeIds: [],
+				dbFindingIds: [],
+				transitionIds: [],
+				sampleIds: [],
+				parityIntent: "Incremental strangler coverage for remaining mapped files.",
+				exitCriteria: [ "Each later slice has coexist routing", "No big-bang retirement" ],
+				rollback: "Leave later slices on legacy until accepted.",
+				implementerPrompt: "Rebuild one later slice at a time from the retained target map.",
+				currentSlice: false
+			} );
+		}
+		return phases;
+	}
+
+	private boolean function architectureDecisionsMissing( required struct plan ) {
+		var contexts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
+		var extracts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
+		return !contexts.len() && !extracts.len();
+	}
+
+	/**
+	 * Fill contexts/extracts from maps + signals when shards omitted them
+	 * (to avoid truncation). Follows modular-monolith-first packaging policy.
+	 */
+	private struct function applySynthesizedArchitecture( required struct plan, required struct evidence, array errors = [] ) {
+		var built = synthesizeArchitectureDecisions( arguments.plan, arguments.evidence );
+		if ( !built.contexts.len() && !built.extracts.len() && !built.unitLinks.len() ) return arguments.plan;
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [] };
+		arguments.plan.target.contexts = built.contexts;
+		arguments.plan.target.extracts = built.extracts;
+		if ( !isArray( arguments.plan.unitLinks ?: "" ) ) arguments.plan.unitLinks = [];
+		arguments.plan.unitLinks.append( built.unitLinks, true );
+		arguments.plan.unitLinks = dedupeById( arguments.plan.unitLinks );
+		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
+		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
+		for ( var link in built.unitLinks ) ensureIdentity( link, "unit-link" );
+		arguments.errors.append( { role: "modernization-application", message: "synthesized-architecture-packaging", severity: "info" } );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.architectureSource = "synthesized";
+		logInfo( "Modernize architecture packaging synthesized: contexts=#built.contexts.len()#, extracts=#built.extracts.len()#" );
+		return arguments.plan;
+	}
+
+	private struct function synthesizeArchitectureDecisions( required struct plan, required struct evidence ) {
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var signals = isArray( arguments.evidence.signals ?: "" ) ? arguments.evidence.signals : ( isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [] );
+		var evidenceByUnit = {};
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( unit.id ?: unit.itemId ?: "" );
+			if ( !len( unitId ) ) continue;
+			evidenceByUnit[ unitId ] = evidenceRefsForUnit( unit );
+		}
+		var contexts = [];
+		var extracts = [];
+		var unitLinks = [];
+		var centralIds = [];
+		var clusters = {};
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var id = trim( unit.id ?: unit.itemId ?: "" );
+			if ( !len( id ) ) continue;
+			var path = lCase( trim( unit.targetPath ?: unit.sourcePath ?: "" ) );
+			if ( isCentralPath( path ) ) {
+				centralIds.append( id );
+				continue;
+			}
+			var domain = architectureDomainKey( path, unit );
+			if ( !len( domain ) ) domain = "shared-feature";
+			if ( !clusters.keyExists( domain ) ) clusters[ domain ] = [];
+			clusters[ domain ].append( id );
+		}
+		if ( centralIds.len() ) {
+			contexts.append( {
+				id: "ctx-central-platform",
+				name: "Central platform (keep in monolith)",
+				purpose: "Bootstrap, config, routing, layouts, and shared security/session gates stay centralized in the modular monolith.",
+				packaging: "centralized",
+				recommendation: "Do not extract as a microservice. Keep Application/config/router/layouts/auth shell as shared ColdBox core.",
+				stayInMonolith: true,
+				targetUnitIds: centralIds,
+				evidenceRefs: evidenceRefsForUnitIds( centralIds, evidenceByUnit ),
+				newProposal: true,
+				proposalReason: "Synthesized packaging decision from mapped target units"
+			} );
+		}
+		var domainKeys = clusters.keyArray().sort( "textnocase" );
+		for ( var domain in domainKeys ) {
+			var memberIds = clusters[ domain ];
+			if ( memberIds.len() < 1 ) continue;
+			var moduleName = reReplace( domain, "[^a-z0-9]+", "", "all" );
+			if ( !len( moduleName ) ) moduleName = "feature";
+			var asModule = memberIds.len() >= 2;
+			contexts.append( {
+				id: "ctx-module-#moduleName#",
+				name: asModule ? "ColdBox module candidate: #domain#" : "Feature slice: #domain#",
+				purpose: asModule
+					? "Candidate HMVC ColdBox module (in-process) for the #domain# bounded context."
+					: "Keep #domain# as a monolith feature slice until more files justify a module boundary.",
+				packaging: asModule ? "coldbox-module" : "keep-monolith-slice",
+				recommendation: asModule
+					? "Prefer modules_app/#moduleName# (or app/modules/#moduleName#) over a microservice. Shared DB is OK; use WireBox module boundaries first."
+					: "Stay centralized until the slice grows; then promote to a ColdBox module, not a remote service.",
+				stayInMonolith: true,
+				targetUnitIds: memberIds,
+				suggestedModulePath: asModule ? "modules_app/#moduleName#/" : "",
+				evidenceRefs: evidenceRefsForUnitIds( memberIds, evidenceByUnit ),
+				newProposal: true,
+				proposalReason: "Synthesized packaging decision from mapped target units"
+			} );
+			if ( asModule ) {
+				for ( var memberId in memberIds ) {
+					unitLinks.append( {
+						id: "link-module-#moduleName#-#memberId#",
+						legacyUnitId: "",
+						targetUnitId: memberId,
+						relation: "module-extract",
+						notes: "Packaging proposal: ColdBox HMVC module #moduleName# (modular monolith, not microservice).",
+						confidence: 0.55,
+						validationStatus: "needs-review",
+						newProposal: true,
+						evidence: evidenceByUnit.keyExists( memberId ) ? evidenceByUnit[ memberId ] : [ { extractionMethod: "synthesized-packaging", note: "module-boundary" } ],
+						evidenceRefs: evidenceByUnit.keyExists( memberId ) ? evidenceByUnit[ memberId ] : [ { extractionMethod: "synthesized-packaging", note: "module-boundary" } ]
+					} );
+				}
+			}
+		}
+		var outbound = signals.filter( ( signal ) => isStruct( signal ) && listFindNoCase( "http.outbound,schedule.task", signal.signalId ?: "" ) );
+		if ( outbound.len() ) {
+			var extractUnitIds = [];
+			for ( var unit in units ) {
+				if ( !isStruct( unit ) ) continue;
+				var haystack = lCase( trim( ( unit.layer ?: "" ) & " " & ( unit.purpose ?: "" ) & " " & ( unit.targetPath ?: "" ) & " " & ( unit.sourcePath ?: "" ) ) );
+				if ( findNoCase( "http", haystack ) || findNoCase( "api", haystack ) || findNoCase( "schedule", haystack ) || findNoCase( "job", haystack ) || findNoCase( "worker", haystack ) || findNoCase( "export", haystack ) || findNoCase( "gateway", haystack ) ) {
+					extractUnitIds.append( unit.id ?: unit.itemId ?: "" );
+				}
+			}
+			extractUnitIds = extractUnitIds.filter( ( id ) => len( trim( id ) ) );
+			var signalIds = outbound.map( ( signal ) => signal.signalId ?: signal.id ?: "" ).filter( ( id ) => len( trim( id ) ) );
+			var extractEvidence = evidenceRefsForUnitIds( extractUnitIds, evidenceByUnit );
+			for ( var signalId in signalIds ) extractEvidence.append( { signalId: signalId, extractionMethod: "coupling-signal" } );
+			if ( !extractEvidence.len() ) extractEvidence = [ { extractionMethod: "synthesized-packaging", note: "side-app-candidate" } ];
+			extracts.append( {
+				id: "extract-side-integration",
+				name: "Side-app / worker extract candidate",
+				reason: "Outbound HTTP and/or scheduled work signals suggest isolating flaky integrations so they do not stall the main app.",
+				suggestedBoundary: "side-app",
+				packaging: "side-app-extract",
+				recommendation: "Only extract a companion worker/side-app when isolation pays off. Prefer a ColdBox module first. Microservice split is last resort and needs an explicit data boundary.",
+				dataBoundaryNote: "Default remains a shared datasource during early strangler. Do not invent database-per-service.",
+				sharedDatasourceRisk: "high — extracting while still sharing the monolith DB creates distributed-monolith risk unless dual-write/read boundaries are designed.",
+				targetUnitIds: extractUnitIds,
+				signalIds: signalIds,
+				evidenceRefs: extractEvidence,
+				newProposal: true
+			} );
+			for ( var extractId in extractUnitIds ) {
+				unitLinks.append( {
+					id: "link-side-#extractId#",
+					legacyUnitId: "",
+					targetUnitId: extractId,
+					relation: "extract-side-app",
+					notes: "Candidate companion process for outbound/scheduled isolation; keep modular monolith default unless data boundary is proven.",
+					confidence: 0.5,
+					validationStatus: "needs-review",
+					newProposal: true,
+					evidence: evidenceByUnit.keyExists( extractId ) ? evidenceByUnit[ extractId ] : [ { extractionMethod: "synthesized-packaging", note: "side-app" } ],
+					evidenceRefs: evidenceByUnit.keyExists( extractId ) ? evidenceByUnit[ extractId ] : [ { extractionMethod: "synthesized-packaging", note: "side-app" } ]
+				} );
+			}
+		}
+		if ( !contexts.len() && units.len() ) {
+			var fallbackIds = units.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) );
+			contexts.append( {
+				id: "ctx-modular-monolith-default",
+				name: "Modular monolith (default)",
+				purpose: "No strong extract signals yet — modernize as one ColdBox/BoxLang deployable with clear internal boundaries.",
+				packaging: "centralized",
+				recommendation: "Centralize shared concerns; grow HMVC modules before any microservice.",
+				stayInMonolith: true,
+				targetUnitIds: fallbackIds,
+				evidenceRefs: evidenceRefsForUnitIds( fallbackIds, evidenceByUnit ),
+				newProposal: true,
+				proposalReason: "Synthesized packaging decision from mapped target units"
+			} );
+		}
+		return { contexts: contexts, extracts: extracts, unitLinks: unitLinks };
+	}
+
+	private array function evidenceRefsForUnit( required struct unit ) {
+		var refs = [];
+		var existing = arguments.unit.evidenceRefs ?: arguments.unit.evidence ?: [];
+		if ( isArray( existing ) ) {
+			for ( var ref in existing ) {
+				if ( isStruct( ref ) ) refs.append( duplicate( ref ) );
+				else if ( len( trim( toString( ref ) ) ) ) refs.append( { ref: toString( ref ), extractionMethod: "unit-evidence" } );
+			}
+		}
+		var sourcePath = normalizeEvidencePath( arguments.unit.sourcePath ?: arguments.unit.sourceFile ?: arguments.unit.legacyPath ?: "" );
+		if ( len( sourcePath ) ) refs.append( { filePath: sourcePath, extractionMethod: "target-source-path" } );
+		var targetPath = normalizeEvidencePath( arguments.unit.targetPath ?: arguments.unit.pathHint ?: "" );
+		if ( len( targetPath ) ) refs.append( { filePath: targetPath, extractionMethod: "target-path", note: "proposed-target" } );
+		for ( var legacyId in ( isArray( arguments.unit.legacyUnitIds ?: "" ) ? arguments.unit.legacyUnitIds : [] ) ) {
+			if ( len( trim( toString( legacyId ) ) ) ) refs.append( { legacyUnitId: toString( legacyId ), extractionMethod: "legacy-unit" } );
+		}
+		if ( !refs.len() ) {
+			refs.append( {
+				extractionMethod: "synthesized-packaging",
+				targetUnitId: arguments.unit.id ?: arguments.unit.itemId ?: "",
+				note: "Derived from accepted application maps"
+			} );
+		}
+		return refs;
+	}
+
+	private array function evidenceRefsForUnitIds( required array unitIds, required struct evidenceByUnit ) {
+		var refs = [];
+		var seen = {};
+		for ( var unitId in arguments.unitIds ) {
+			var key = trim( toString( unitId ) );
+			if ( !len( key ) || !arguments.evidenceByUnit.keyExists( key ) ) continue;
+			for ( var ref in arguments.evidenceByUnit[ key ] ) {
+				var fingerprint = lCase( jsonSerialize( ref ) );
+				if ( seen.keyExists( fingerprint ) ) continue;
+				seen[ fingerprint ] = true;
+				refs.append( duplicate( ref ) );
+			}
+		}
+		if ( !refs.len() ) refs.append( { extractionMethod: "synthesized-packaging", note: "architecture-from-maps" } );
+		return refs;
+	}
+
+	private boolean function isCentralPath( required string path ) {
+		var lower = lCase( arguments.path );
+		return reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes|/layouts?/|/interceptors?/|wirebox|security|auth|session", lower ) > 0;
+	}
+
+	private string function architectureDomainKey( required string path, required struct unit ) {
+		var parts = listToArray( replace( arguments.path, "\", "/", "all" ), "/" );
+		for ( var i = 1; i <= parts.len(); i++ ) {
+			var piece = lCase( trim( parts[ i ] ) );
+			if ( !len( piece ) ) continue;
+			if ( listFindNoCase( "handlers,views,modules_app,modules,controllers", piece ) && i < parts.len() ) {
+				return sanitizeDomainToken( parts[ i + 1 ] );
+			}
+			if ( piece == "models" && i < parts.len() ) {
+				var next = lCase( trim( parts[ i + 1 ] ) );
+				if ( next == "services" && i + 1 < parts.len() ) return sanitizeDomainToken( parts[ i + 2 ] );
+				return sanitizeDomainToken( parts[ i + 1 ] );
+			}
+			if ( piece == "services" && i < parts.len() ) return sanitizeDomainToken( parts[ i + 1 ] );
+		}
+		var purpose = lCase( trim( arguments.unit.purpose ?: "" ) );
+		if ( len( purpose ) ) {
+			var token = listFirst( reReplace( purpose, "[^a-z0-9]+", "-", "all" ), "-" );
+			if ( len( token ) >= 3 ) return token;
+		}
+		return "";
+	}
+
+	private string function sanitizeDomainToken( required string value ) {
+		var token = reReplaceNoCase( trim( arguments.value ), "\.(bx|cfc|cfm|bxm)$", "" );
+		token = reReplaceNoCase( token, "(service|handler|controller|gateway)$", "" );
+		token = reReplace( lCase( token ), "[^a-z0-9]+", "", "all" );
+		token = reReplaceNoCase( token, "ies$", "y" );
+		if ( len( token ) > 4 && right( token, 1 ) == "s" ) token = left( token, len( token ) - 1 );
+		return len( token ) >= 3 ? token : "";
+	}
+
+	private boolean function applicationFragmentHasSubstance( required struct plan ) {
+		if ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) && arguments.plan.target.units.len() ) return true;
+		if ( isArray( arguments.plan.unitLinks ?: "" ) && arguments.plan.unitLinks.len() ) return true;
+		if ( isArray( arguments.plan.routeContracts ?: "" ) && arguments.plan.routeContracts.len() ) return true;
+		if ( isArray( arguments.plan.samples ?: "" ) && arguments.plan.samples.len() ) return true;
+		return false;
+	}
+
+	private struct function emptyApplicationFragment() {
+		return { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] };
+	}
+
+	/**
+	 * Run application shards in parallel waves so large trees finish inside the
+	 * wall-clock budget. Soft budget errors keep any shards that already succeeded.
+	 */
+	private struct function runApplicationShards(
+		required string runId,
+		required array appShards,
+		required struct runtime,
+		required struct budgets,
+		required numeric startedAt,
+		required numeric maxDurationMs,
+		required numeric totalOutputLimit,
+		struct options = {}
+	) {
+		var appMerged = emptyApplicationFragment();
+		var appAccepted = 0;
+		var errors = [];
+		var totalOutputCharacters = 0;
+		var totalCostUsd = 0;
+		var concurrency = isNumeric( arguments.budgets.applicationShardConcurrency ?: "" )
+			? max( 1, min( 12, int( arguments.budgets.applicationShardConcurrency ) ) )
+			: 8;
+		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
+		// Keep provider spend for database + roadmap so maps are not stranded without a road.
+		var reserveCost = 0;
+		if ( maxCost >= 10 ) reserveCost = max( 3, min( maxCost * 0.25, 10 ) );
+		else if ( maxCost > 0 ) reserveCost = maxCost * 0.2;
+		for ( var waveStart = 1; waveStart <= arguments.appShards.len(); waveStart += concurrency ) {
+			if ( isCancelled( arguments.runId, arguments.options ) ) throw( type = "RunCancelled", message = "Modernization proposal cancelled" );
+			var elapsedMs = getTickCount() - arguments.startedAt;
+			var remainingMs = arguments.maxDurationMs - elapsedMs;
+			// Keep a slice of the wall clock for database + roadmap after maps.
+			var reserveMs = waveStart == 1 ? 2000 : 120000;
+			if ( remainingMs <= reserveMs ) {
+				errors.append( { role: "modernization-application", message: "budget-exceeded", shard: waveStart, elapsedMs: elapsedMs, maxDurationMs: arguments.maxDurationMs } );
+				break;
+			}
+			if ( totalOutputCharacters >= arguments.totalOutputLimit ) {
+				errors.append( { role: "modernization-application", message: "total-output-budget-exceeded", shard: waveStart } );
+				break;
+			}
+			if ( maxCost > 0 && totalCostUsd >= ( maxCost - reserveCost ) ) {
+				errors.append( { role: "modernization-application", message: "cost-reserved-for-roadmap", severity: "info", shard: waveStart, reservedUsd: reserveCost, spentUsd: totalCostUsd, maxCostUsd: maxCost } );
+				logInfo( "Modernize application shards stopping early to reserve cost for roadmap (spent=#totalCostUsd#, reserve=#reserveCost#, max=#maxCost#)" );
+				break;
+			}
+			var waveEnd = min( arguments.appShards.len(), waveStart + concurrency - 1 );
+			var jobs = [];
+			var waveCostRemaining = maxCost > 0 ? max( 0, maxCost - reserveCost - totalCostUsd ) : 0;
+			var perShardCost = maxCost > 0 ? waveCostRemaining / max( 1, waveEnd - waveStart + 1 ) : 0;
+			for ( var shardIndex = waveStart; shardIndex <= waveEnd; shardIndex++ ) {
+				var shard = arguments.appShards[ shardIndex ];
+				emitProposalObservation( arguments.options, {
+					stage: "application-shard",
+					runId: arguments.runId,
+					shard: shardIndex,
+					shardTotal: arguments.appShards.len(),
+					paths: shard.shardMeta.paths ?: [],
+					parallel: concurrency > 1
+				} );
+				logInfo( "Modernize application shard #shardIndex#/#arguments.appShards.len()# starting (#( isArray( shard.shardMeta.paths ?: '' ) ? shard.shardMeta.paths.len() : 0 )# paths)" );
+				var appRequest = agentFactory.build( "modernization-application", arguments.runtime, shard, arguments.budgets );
+				appRequest.shardIndex = shardIndex;
+				var appOptions = duplicate( arguments.options );
+				appOptions.budgets = duplicate( arguments.budgets );
+				if ( maxCost > 0 ) appOptions.budgets.maxCostUsd = perShardCost;
+				// Per-call clock uses remaining overall budget so pipeline setup
+				// time does not make every shard fail as already overdue.
+				appOptions.startedAt = getTickCount();
+				appOptions.maxDurationMs = max( 5000, remainingMs );
+				appOptions.role = "modernization-application";
+				jobs.append( { shardIndex: shardIndex, request: appRequest, options: appOptions } );
+			}
+			var responses = invokeApplicationShardWave( arguments.runId, jobs, remainingMs );
+			for ( var jobOffset = 1; jobOffset <= jobs.len(); jobOffset++ ) {
+				var job = jobs[ jobOffset ];
+				var appResponse = jobOffset <= responses.len() ? responses[ jobOffset ] : { ok: false, error: "missing-shard-response" };
+				totalCostUsd += isNumeric( appResponse.costUsd ?: "" ) ? val( appResponse.costUsd ) : 0;
+				if ( !( appResponse.ok ?: false ) ) {
+					errors.append( { role: "modernization-application", message: appResponse.error ?: "provider-failed", shard: job.shardIndex } );
+					logInfo( "Modernize application shard #job.shardIndex# failed: #( appResponse.error ?: 'provider-failed' )#" );
+				} else if ( !validFragment( "modernization-application", appResponse.payload ?: {} ) ) {
+					errors.append( { role: "modernization-application", message: "malformed-role-output", shard: job.shardIndex } );
+					logInfo( "Modernize application shard #job.shardIndex# malformed-role-output" );
+				} else {
+					var redactedApp = redactPayload( appResponse.payload ?: {} );
+					if ( !redactedApp.count() && ( appResponse.payload ?: {} ).count() ) {
+						errors.append( { role: "modernization-application", message: "redaction-failed", shard: job.shardIndex } );
+						logInfo( "Modernize application shard #job.shardIndex# redaction-failed" );
+					} else {
+						appMerged = mergeApplicationFragments( appMerged, redactedApp );
+						appAccepted++;
+						totalOutputCharacters += isNumeric( appResponse.outputCharacters ?: "" ) ? int( appResponse.outputCharacters ) : len( jsonSerialize( appResponse.payload ?: {} ) );
+						logInfo( "Modernize application shard #job.shardIndex# accepted" );
+					}
+				}
+			}
+		}
+		return {
+			fragment: appMerged,
+			accepted: appAccepted,
+			errors: errors,
+			outputCharacters: totalOutputCharacters,
+			costUsd: totalCostUsd
+		};
+	}
+
+	private array function invokeApplicationShardWave( required string runId, required array jobs, required numeric remainingMs ) {
+		if ( !arguments.jobs.len() ) return [];
+		if ( arguments.jobs.len() == 1 ) {
+			return [ agentGateway.run( arguments.runId, arguments.jobs[ 1 ].request, arguments.jobs[ 1 ].options ) ];
+		}
+		try {
+			var tasks = [];
+			for ( var job in arguments.jobs ) {
+				tasks.append( createBoundShardTask( arguments.runId, job.request, job.options ) );
+			}
+			var settled = asyncAll( tasks ).get( max( 5, int( arguments.remainingMs / 1000 ) ), "seconds" );
+			return isArray( settled ) ? settled : [];
+		} catch ( any parallelError ) {
+			var responses = [];
+			for ( var fallbackJob in arguments.jobs ) {
+				if ( isCancelled( arguments.runId, fallbackJob.options ) ) throw( type = "RunCancelled", message = "Modernization proposal cancelled" );
+				responses.append( agentGateway.run( arguments.runId, fallbackJob.request, fallbackJob.options ) );
+			}
+			return responses;
+		}
+	}
+
+	/**
+	 * Bind shard args in a new function frame so parallel closures do not share
+	 * the loop's last request (classic async capture bug).
+	 */
+	private any function createBoundShardTask( required string runId, required struct request, required struct options ) {
+		var rid = arguments.runId;
+		var req = duplicate( arguments.request );
+		var opts = duplicate( arguments.options );
+		var gw = agentGateway;
+		return () => gw.run( rid, req, opts );
+	}
+
+	private struct function mergeApplicationFragments( required struct base, required struct next ) {
+		var merged = duplicate( arguments.base );
+		for ( var key in [ "targetUnits", "unitLinks", "routeContracts", "contexts", "extracts", "samples" ] ) {
+			if ( !isArray( merged[ key ] ?: "" ) ) merged[ key ] = [];
+			if ( isArray( arguments.next[ key ] ?: "" ) ) merged[ key ].append( arguments.next[ key ], true );
+			else if ( key == "targetUnits" && isArray( arguments.next.units ?: "" ) ) merged[ key ].append( arguments.next.units, true );
+		}
+		merged.targetUnits = dedupeById( merged.targetUnits );
+		merged.unitLinks = dedupeById( merged.unitLinks );
+		merged.routeContracts = dedupeById( merged.routeContracts );
+		merged.contexts = dedupeById( merged.contexts );
+		merged.extracts = dedupeById( merged.extracts );
+		merged.samples = dedupeById( merged.samples );
+		return merged;
+	}
+
+	/**
+	 * Partition inventory into foundation-first file batches so each agent sees
+	 * a small, completeable mapping job instead of the whole tree.
+	 */
+	private array function buildApplicationShards( required struct evidence, struct budgets = {} ) {
+		var shardSize = isNumeric( arguments.budgets.applicationShardSize ?: "" ) ? max( 2, min( 20, int( arguments.budgets.applicationShardSize ) ) ) : variables.defaultShardSize;
+		var shardCap = isNumeric( arguments.budgets.maxApplicationShards ?: "" ) ? max( 1, min( variables.maxApplicationShards, int( arguments.budgets.maxApplicationShards ) ) ) : variables.defaultApplicationShards;
+		var paths = prioritizedLegacyPaths( arguments.evidence );
+		if ( !paths.len() ) {
+			var single = duplicate( arguments.evidence );
+			single.shardMeta = { index: 1, total: 1, paths: [], foundation: true };
+			return [ single ];
+		}
+		var chunks = [];
+		for ( var offset = 1; offset <= paths.len(); offset += shardSize ) {
+			var slice = [];
+			for ( var i = offset; i <= min( paths.len(), offset + shardSize - 1 ); i++ ) {
+				slice.append( paths[ i ] );
+			}
+			chunks.append( slice );
+			if ( chunks.len() >= shardCap ) break;
+		}
+		var shards = [];
+		for ( var chunkIndex = 1; chunkIndex <= chunks.len(); chunkIndex++ ) {
+			shards.append( evidenceForShard( arguments.evidence, chunks[ chunkIndex ], chunkIndex, chunks.len() ) );
+		}
+		return shards;
+	}
+
+	private array function prioritizedLegacyPaths( required struct evidence ) {
+		var inventory = isStruct( arguments.evidence.inventory ?: "" ) ? arguments.evidence.inventory : {};
+		var seen = {};
+		var scored = [];
+		var appendPath = ( path ) => {
+			var normalized = normalizeLegacyPath( path );
+			if ( !len( normalized ) || seen.keyExists( lCase( normalized ) ) ) return;
+			seen[ lCase( normalized ) ] = true;
+			scored.append( { path: normalized, score: foundationScore( normalized ) } );
+		};
+		if ( isArray( inventory.units ?: "" ) ) {
+			for ( var unit in inventory.units ) {
+				if ( isStruct( unit ) ) appendPath( unit.filePath ?: unit.path ?: unit.sourcePath ?: "" );
+			}
+		}
+		if ( isArray( inventory.files ?: "" ) ) {
+			for ( var file in inventory.files ) {
+				if ( isStruct( file ) ) appendPath( file.filePath ?: file.path ?: "" );
+				else if ( isSimpleValue( file ) ) appendPath( file );
+			}
+		}
+		if ( isArray( inventory.routeEvidence ?: "" ) ) {
+			for ( var route in inventory.routeEvidence ) {
+				if ( isStruct( route ) ) appendPath( route.filePath ?: route.path ?: "" );
+			}
+		}
+		scored = scored.filter( ( item ) => isLikelyApplicationSource( item.path ) );
+		scored.sort( ( a, b ) => {
+			if ( a.score != b.score ) return b.score - a.score;
+			return compareNoCase( a.path, b.path );
+		} );
+		return scored.map( ( item ) => item.path );
+	}
+
+	private boolean function isLikelyApplicationSource( required string path ) {
+		var lower = lCase( arguments.path );
+		if ( !len( lower ) ) return false;
+		if ( reFindNoCase( "\.(cfc|cfm|cfml|bx|bxs|bxm)$", lower ) ) return true;
+		if ( findNoCase( "application.", lower ) || findNoCase( "router.", lower ) || findNoCase( "coldbox.", lower ) ) return true;
+		return false;
+	}
+
+	private numeric function foundationScore( required string path ) {
+		var lower = lCase( arguments.path );
+		var score = 0;
+		if ( reFindNoCase( "(^|/|\\)application\.(cfc|bx)$", lower ) ) score += 100;
+		if ( reFindNoCase( "coldbox\.(cfc|bx)$", lower ) ) score += 90;
+		if ( findNoCase( "router.", lower ) || findNoCase( "/routes", lower ) ) score += 80;
+		if ( findNoCase( "/config/", lower ) || findNoCase( "\config\", lower ) ) score += 70;
+		if ( findNoCase( "application.", lower ) ) score += 40;
+		if ( findNoCase( "index.", lower ) ) score += 20;
+		if ( findNoCase( "/model", lower ) || findNoCase( "/service", lower ) || findNoCase( "/handler", lower ) || findNoCase( "/controller", lower ) ) score += 10;
+		return score;
+	}
+
+	private string function normalizeLegacyPath( required any path ) {
+		return replace( replace( trim( toString( arguments.path ) ), "\", "/", "all" ), "//", "/", "all" );
+	}
+
+	private struct function evidenceForShard( required struct evidence, required array paths, required numeric index, required numeric total ) {
+		var pathSet = {};
+		for ( var path in arguments.paths ) pathSet[ lCase( path ) ] = true;
+		var inventory = isStruct( arguments.evidence.inventory ?: "" ) ? duplicate( arguments.evidence.inventory ) : {};
+		inventory.units = filterItemsByPath( inventory.units ?: [], pathSet );
+		inventory.files = filterItemsByPath( inventory.files ?: [], pathSet );
+		inventory.routeEvidence = filterItemsByPath( inventory.routeEvidence ?: [], pathSet );
+		inventory.dependencies = filterItemsByPath( inventory.dependencies ?: [], pathSet );
+		inventory.unresolved = filterItemsByPath( inventory.unresolved ?: [], pathSet );
+		var context = isStruct( arguments.evidence.context ?: "" ) ? duplicate( arguments.evidence.context ) : {};
+		if ( isArray( context.partitions ?: "" ) ) context.partitions = filterItemsByPath( context.partitions, pathSet );
+		if ( isArray( context.contexts ?: "" ) ) context.contexts = filterItemsByPath( context.contexts, pathSet );
+		if ( isArray( context.files ?: "" ) ) context.files = filterItemsByPath( context.files, pathSet );
+		var coverage = isStruct( arguments.evidence.coverage ?: "" ) ? {
+			version: arguments.evidence.coverage.version ?: "",
+			schemaCoverage: arguments.evidence.coverage.schemaCoverage ?: "",
+			banners: arguments.evidence.coverage.banners ?: [],
+			truncated: arguments.evidence.coverage.truncated ?: false,
+			cfmlFiles: arguments.evidence.coverage.cfmlFiles ?: 0
+		} : {};
+		return {
+			inventory: inventory,
+			schemaEvidence: { note: "Database role owns schema details; application shards map files only.", objects: [] },
+			signals: [],
+			coverage: coverage,
+			context: context,
+			shardMeta: {
+				index: arguments.index,
+				total: arguments.total,
+				paths: arguments.paths,
+				foundation: arguments.index == 1
+			}
+		};
+	}
+
+	private array function filterItemsByPath( required array items, required struct pathSet ) {
+		var output = [];
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) {
+				if ( isSimpleValue( item ) && arguments.pathSet.keyExists( lCase( normalizeLegacyPath( item ) ) ) ) output.append( item );
+				continue;
+			}
+			var candidate = normalizeLegacyPath( item.filePath ?: item.path ?: item.sourcePath ?: item.relativePath ?: "" );
+			if ( len( candidate ) && arguments.pathSet.keyExists( lCase( candidate ) ) ) output.append( item );
+		}
+		return output;
+	}
+
+	private void function emitProposalObservation( required struct options, required struct observation ) {
+		if ( structKeyExists( arguments.options, "onObservation" ) && isCustomFunction( arguments.options.onObservation ) ) {
+			try {
+				arguments.options.onObservation( duplicate( arguments.observation ) );
+			} catch ( any ignored ) {}
+		}
+	}
+
+	private void function splitProposalMessages( required array incoming, required array errors, required array notes ) {
+		for ( var item in arguments.incoming ) {
+			if ( !isStruct( item ) ) continue;
+			if ( isInformationalProposalMessage( item ) ) arguments.notes.append( item );
+			else arguments.errors.append( item );
+		}
+	}
+
+	private boolean function isInformationalProposalMessage( required struct item ) {
+		var message = lCase( trim( arguments.item.message ?: "" ) );
+		var severity = lCase( trim( arguments.item.severity ?: "" ) );
+		if ( severity == "info" || severity == "note" ) return true;
+		if ( findNoCase( "synthesized-", message ) == 1 ) return true;
+		if ( message == "cost-reserved-for-roadmap" ) return true;
+		if ( message == "ignored-non-object-items" ) return true;
+		return false;
+	}
+
+	private void function logInfo( required string message ) {
+		try {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				variables.log.info( arguments.message );
+			}
+		} catch ( any ignored ) {}
+	}
+
+	private void function appendModernizationLog( required string level, required string message ) {
+		// Kept for compatibility; logInfo delegates to the injected LogBox logger.
+	}
+
+	/**
+	 * Deterministic cleanup so common provider aliases validate and the Solution
+	 * UI gets a mapped current slice instead of an empty narrative road.
+	 */
+	private struct function polishPlan( required struct plan, struct samplePolicy = {}, array errors = [] ) {
+		var polished = arguments.plan;
+		polished.routeContracts = normalizeRouteContracts( polished.routeContracts ?: [] );
+		polished = resolveInventoryReferences( polished );
+		polished.samples = dedupeById( polished.samples ?: [] );
+		polished.roadmapPhases = orderRoadmapPhases( polished.roadmapPhases ?: [] );
+		polished.roadmapPhases = ensureCurrentSlice( polished.roadmapPhases ?: [] );
+		polished.roadmapPhases = ensurePhaseNames( polished.roadmapPhases ?: [] );
+		var sampleLimit = isNumeric( arguments.samplePolicy.maxFiles ?: "" ) ? max( 1, int( arguments.samplePolicy.maxFiles ) ) : 40;
+		polished.samples = boundedStructArray( polished.samples ?: [], sampleLimit, arguments.errors, "samples" );
+		if ( ( arguments.samplePolicy.currentPhasesOnly ?: true ) && isArray( polished.roadmapPhases ?: "" ) ) {
+			polished.samples = currentSliceSamples( polished.samples ?: [], polished.roadmapPhases );
+		}
+		for ( var item in polished.routeContracts ) ensureIdentity( item, "route-contract" );
+		for ( var item in polished.unitLinks ?: [] ) ensureIdentity( item, "unit-link" );
+		for ( var item in polished.target.units ?: [] ) ensureIdentity( item, "target-unit" );
+		for ( var item in polished.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
+		for ( var item in polished.samples ) ensureIdentity( item, "sample" );
+		return polished;
+	}
+
+	private array function ensurePhaseNames( required array phases ) {
+		var output = [];
+		for ( var phase in arguments.phases ) {
+			if ( !isStruct( phase ) ) continue;
+			var copy = duplicate( phase );
+			if ( !len( trim( copy.name ?: "" ) ) ) {
+				var goal = trim( copy.goal ?: "" );
+				if ( len( goal ) ) {
+					copy.name = len( goal ) > 90 ? left( goal, 87 ) & "..." : goal;
+				} else if ( len( trim( copy.pattern ?: "" ) ) ) {
+					copy.name = replace( copy.pattern, "-", " ", "all" );
+				} else {
+					copy.name = copy.id ?: "Roadmap phase";
+				}
+			}
+			output.append( copy );
+		}
+		return output;
+	}
+
+	private array function normalizeRouteContracts( required array routes ) {
+		var output = [];
+		for ( var route in arguments.routes ) {
+			if ( !isStruct( route ) ) continue;
+			var copy = duplicate( route );
+			var request = isStruct( copy.request ?: "" ) ? copy.request : {};
+			var path = trim( copy.path ?: copy.legacyPath ?: request.path ?: "" );
+			path = replace( path, "\\", "/", "all" );
+			if ( len( path ) && left( path, 1 ) != "/" ) path = "/" & path;
+			copy.path = path;
+			if ( !len( trim( copy.legacyPath ?: "" ) ) ) copy.legacyPath = path;
+			if ( !len( trim( copy.method ?: "" ) ) ) copy.method = uCase( trim( request.method ?: "GET" ) );
+			else copy.method = uCase( trim( copy.method ) );
+			if ( !structKeyExists( copy, "rollback" ) || !len( trim( copy.rollback ?: "" ) ) ) {
+				copy.rollback = trim( copy.rollbackNote ?: copy.rollbackIntent ?: copy.rollbackPlan ?: "Revert this route to the legacy path and remove the ColdBox mapping." );
+			}
+			if ( !isStruct( copy.request ?: "" ) ) copy.request = { method: copy.method, path: copy.path };
+			else {
+				if ( !len( trim( copy.request.path ?: "" ) ) ) copy.request.path = copy.path;
+				if ( !len( trim( copy.request.method ?: "" ) ) ) copy.request.method = copy.method;
+			}
+			if ( !structKeyExists( copy, "response" ) ) copy.response = { contentType: "text/html" };
+			if ( !structKeyExists( copy, "auth" ) ) copy.auth = "unknown";
+			if ( !structKeyExists( copy, "sideEffects" ) ) copy.sideEffects = [];
+			if ( !isArray( copy.evidence ?: "" ) ) {
+				var refs = copy.evidenceRefs ?: [];
+				copy.evidence = isArray( refs ) ? refs : ( len( trim( toString( refs ) ) ) ? [ refs ] : [] );
+			}
+			if ( !copy.evidence.len() ) {
+				copy.evidence = len( path )
+					? [ { filePath: path, extractionMethod: "route-path" } ]
+					: [ { extractionMethod: "new-proposal", note: "Route retained without file evidence" } ];
+			}
+			if ( !isArray( copy.evidenceRefs ?: "" ) || !copy.evidenceRefs.len() ) copy.evidenceRefs = copy.evidence;
+			output.append( copy );
+		}
+		return output;
+	}
+
+	private struct function resolveInventoryReferences( required struct plan ) {
+		var inventory = isStruct( arguments.plan.inventory ?: "" ) ? arguments.plan.inventory : {};
+		var units = isArray( inventory.units ?: "" ) ? inventory.units : [];
+		var lookup = buildInventoryLookup( units );
+		for ( var target in ( isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			if ( !isStruct( target ) ) continue;
+			var sourcePath = normalizeEvidencePath( target.sourcePath ?: target.sourceFile ?: target.legacyPath ?: "" );
+			var legacyIds = [];
+			for ( var legacyId in ( isArray( target.legacyUnitIds ?: "" ) ? target.legacyUnitIds : [] ) ) {
+				var resolved = resolveInventoryToken( legacyId, sourcePath, lookup );
+				if ( len( resolved ) && !arrayContainsNoCase( legacyIds, resolved ) ) legacyIds.append( resolved );
+			}
+			if ( !legacyIds.len() && len( sourcePath ) ) {
+				var preferred = preferredInventoryIdForPath( sourcePath, lookup );
+				if ( len( preferred ) ) legacyIds.append( preferred );
+			}
+			if ( legacyIds.len() ) target.legacyUnitIds = legacyIds;
+			if ( len( sourcePath ) && lookup.byPath.keyExists( sourcePath ) && ( target.newProposal ?: false ) ) {
+				structDelete( target, "newProposal" );
+				if ( structKeyExists( target, "proposalReason" ) && findNoCase( "without a legacy source path", target.proposalReason ?: "" ) ) structDelete( target, "proposalReason" );
+			}
+			var inventoryBacked = legacyIds.len() > 0 || ( len( sourcePath ) && lookup.byPath.keyExists( sourcePath ) );
+			if ( !inventoryBacked && !( target.newProposal ?: false ) && !( target.explicitProposal ?: false ) && !len( trim( target.proposalReason ?: "" ) ) ) {
+				target.newProposal = true;
+				target.proposalReason = len( sourcePath )
+					? "Proposed target could not be matched to indexed inventory; treat as an explicit scaffold"
+					: "Provider proposed a scaffold target without a legacy source path";
+			}
+		}
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( !isStruct( link ) ) continue;
+			var hint = "";
+			for ( var targetUnit in ( isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+				if ( ( targetUnit.id ?: "" ) == ( link.targetUnitId ?: "" ) ) {
+					hint = normalizeEvidencePath( targetUnit.sourcePath ?: "" );
+					break;
+				}
+			}
+			if ( !len( hint ) ) hint = normalizeEvidencePath( link.sourcePath ?: link.sourceFile ?: link.filePath ?: link.legacyUnitId ?: "" );
+			var resolvedLink = resolveInventoryToken( link.legacyUnitId ?: link.sourceUnitId ?: "", hint, lookup );
+			if ( len( resolvedLink ) ) {
+				link.legacyUnitId = resolvedLink;
+				if ( !len( trim( link.sourcePath ?: "" ) ) && lookup.byId.keyExists( resolvedLink ) ) {
+					link.sourcePath = normalizeEvidencePath( lookup.byId[ resolvedLink ].filePath ?: "" );
+				}
+			} else {
+				structDelete( link, "legacyUnitId" );
+				link.newProposal = true;
+				if ( !isArray( link.evidenceRefs ?: "" ) || !link.evidenceRefs.len() ) {
+					link.evidenceRefs = [ { extractionMethod: "new-proposal", note: "Scaffold link without resolvable legacy unit" } ];
+				}
+			}
+			if ( ( !isArray( link.evidence ?: "" ) || !link.evidence.len() ) && ( !isArray( link.evidenceRefs ?: "" ) || !link.evidenceRefs.len() ) ) {
+				var evidencePath = normalizeEvidencePath( link.sourcePath ?: hint ?: "" );
+				link.evidence = len( evidencePath )
+					? [ { filePath: evidencePath, extractionMethod: "inventory-resolve" } ]
+					: [ { extractionMethod: "new-proposal", note: "Unit link retained without file evidence" } ];
+				link.evidenceRefs = link.evidence;
+			} else if ( !isArray( link.evidence ?: "" ) || !link.evidence.len() ) {
+				link.evidence = link.evidenceRefs;
+			} else if ( !isArray( link.evidenceRefs ?: "" ) || !link.evidenceRefs.len() ) {
+				link.evidenceRefs = link.evidence;
+			}
+			if ( isArray( link.evidenceRefs ?: "" ) ) {
+				var rewritten = [];
+				for ( var evidenceRef in link.evidenceRefs ) {
+					var resolvedEvidence = resolveInventoryToken( evidenceRef, hint, lookup );
+					rewritten.append( len( resolvedEvidence ) ? resolvedEvidence : evidenceRef );
+				}
+				link.evidenceRefs = rewritten;
+			}
+		}
+		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
+			if ( !isStruct( route ) || !isArray( route.evidence ?: "" ) ) continue;
+			var rewrittenEvidence = [];
+			for ( var evidenceItem in route.evidence ) {
+				var resolvedRouteEvidence = resolveInventoryToken( evidenceItem, "", lookup );
+				rewrittenEvidence.append( len( resolvedRouteEvidence ) ? resolvedRouteEvidence : evidenceItem );
+			}
+			route.evidence = rewrittenEvidence;
+		}
+		return arguments.plan;
+	}
+
+	private struct function buildInventoryLookup( required array units ) {
+		var byId = {};
+		var byPath = {};
+		var byBasename = {};
+		var byHashPrefix = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var id = trim( unit.id ?: unit.itemId ?: "" );
+			var path = normalizeEvidencePath( unit.filePath ?: unit.path ?: "" );
+			if ( len( id ) ) byId[ id ] = unit;
+			if ( len( path ) ) {
+				if ( !byPath.keyExists( path ) ) byPath[ path ] = [];
+				byPath[ path ].append( unit );
+				var base = listLast( path, "/" );
+				if ( len( base ) ) {
+					if ( !byBasename.keyExists( base ) ) byBasename[ base ] = [];
+					byBasename[ base ].append( unit );
+				}
+			}
+			for ( var ref in ( isArray( unit.evidenceRefs ?: "" ) ? unit.evidenceRefs : [] ) ) {
+				var hashValue = lCase( trim( isStruct( ref ) ? ( ref.contentHash ?: "" ) : toString( ref ) ) );
+				if ( len( hashValue ) >= 16 ) byHashPrefix[ left( hashValue, 16 ) ] = unit;
+				if ( len( hashValue ) >= 32 ) byHashPrefix[ left( hashValue, 32 ) ] = unit;
+			}
+			if ( len( id ) >= 16 ) byHashPrefix[ left( lCase( id ), 16 ) ] = unit;
+		}
+		return { byId: byId, byPath: byPath, byBasename: byBasename, byHashPrefix: byHashPrefix };
+	}
+
+	private string function preferredInventoryIdForPath( required string path, required struct lookup ) {
+		var normalized = normalizeEvidencePath( arguments.path );
+		if ( !len( normalized ) ) return "";
+		var candidates = [];
+		if ( arguments.lookup.byPath.keyExists( normalized ) ) candidates = arguments.lookup.byPath[ normalized ];
+		else {
+			var base = listLast( normalized, "/" );
+			if ( len( base ) && arguments.lookup.byBasename.keyExists( base ) ) candidates = arguments.lookup.byBasename[ base ];
+		}
+		if ( !candidates.len() ) return "";
+		var best = candidates[ 1 ];
+		for ( var candidate in candidates ) {
+			var bestScore = inventoryUnitScore( best );
+			var candidateScore = inventoryUnitScore( candidate );
+			if ( candidateScore > bestScore || ( candidateScore == bestScore && val( candidate.startLine ?: 0 ) < val( best.startLine ?: 0 ) ) ) best = candidate;
+		}
+		return trim( best.id ?: best.itemId ?: "" );
+	}
+
+	private string function resolveInventoryToken( required any token, required string hintPath, required struct lookup ) {
+		var raw = trim( isStruct( arguments.token ) ? ( arguments.token.id ?: arguments.token.filePath ?: arguments.token.path ?: "" ) : toString( arguments.token ) );
+		if ( !len( raw ) ) return "";
+		if ( [ "new-proposal", "new", "none", "n/a", "-" ].contains( lCase( raw ) ) ) return "";
+		if ( arguments.lookup.byId.keyExists( raw ) ) return raw;
+		var asPath = normalizeEvidencePath( raw );
+		if ( len( asPath ) ) {
+			var fromPath = preferredInventoryIdForPath( asPath, arguments.lookup );
+			if ( len( fromPath ) ) return fromPath;
+		}
+		if ( len( trim( arguments.hintPath ) ) ) {
+			var fromHint = preferredInventoryIdForPath( arguments.hintPath, arguments.lookup );
+			if ( len( fromHint ) ) return fromHint;
+		}
+		var compact = lCase( reReplace( raw, "[^a-f0-9]", "", "all" ) );
+		if ( len( compact ) >= 16 && arguments.lookup.byHashPrefix.keyExists( left( compact, 16 ) ) ) return trim( arguments.lookup.byHashPrefix[ left( compact, 16 ) ].id ?: "" );
+		if ( len( compact ) >= 32 && arguments.lookup.byHashPrefix.keyExists( left( compact, 32 ) ) ) return trim( arguments.lookup.byHashPrefix[ left( compact, 32 ) ].id ?: "" );
+		// Drop unresolved hash-like tokens so validation does not keep dead IDs.
+		if ( len( compact ) >= 16 && compact == lCase( raw ) ) return "";
+		if ( find( "/", asPath ) || reFindNoCase( "\.(cfm|cfc|bx|bxm)$", asPath ) ) return raw;
+		return "";
+	}
+
+	private array function dedupeById( required array items ) {
+		var seen = {};
+		var output = [];
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var id = trim( item.id ?: item.itemId ?: "" );
+			if ( len( id ) && seen.keyExists( id ) ) continue;
+			if ( len( id ) ) seen[ id ] = true;
+			output.append( item );
+		}
+		return output;
+	}
+
+	private boolean function arrayContainsNoCase( required array values, required string needle ) {
+		for ( var value in arguments.values ) if ( compareNoCase( toString( value ), arguments.needle ) == 0 ) return true;
+		return false;
+	}
+
+	private numeric function inventoryUnitScore( required struct unit ) {
+		var kind = lCase( trim( arguments.unit.unitType ?: arguments.unit.layer ?: "" ) );
+		if ( kind == "page" || kind == "application" ) return 3;
+		if ( kind == "component" || kind == "custom-tag" ) return 2;
+		return 1;
+	}
+
+	private string function normalizeEvidencePath( required string path ) {
+		return lCase( replace( trim( arguments.path ), "\\", "/", "all" ) );
+	}
+
+	private array function orderRoadmapPhases( required array phases ) {
+		var list = [];
+		for ( var phase in arguments.phases ) if ( isStruct( phase ) ) list.append( phase );
+		if ( list.len() < 2 ) return list;
+		var hasDeps = false;
+		for ( var phase in list ) {
+			if ( isArray( phase.dependencies ?: "" ) && phase.dependencies.len() ) { hasDeps = true; break; }
+		}
+		if ( !hasDeps ) {
+			list.sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+			return list;
+		}
+		var byId = {};
+		for ( var phase in list ) byId[ trim( phase.id ?: phase.itemId ?: "" ) ] = phase;
+		var visiting = {};
+		var seen = {};
+		var ordered = [];
+		for ( var phase in list ) appendPhaseInDependencyOrder( phase.id ?: phase.itemId ?: "", byId, visiting, seen, ordered );
+		for ( var phase in list ) {
+			var leftover = trim( phase.id ?: phase.itemId ?: "" );
+			if ( !seen.keyExists( leftover ) ) ordered.append( phase );
+		}
+		return ordered;
+	}
+
+	private void function appendPhaseInDependencyOrder(
+		required string id,
+		required struct byId,
+		required struct visiting,
+		required struct seen,
+		required array ordered
+	) {
+		var key = trim( arguments.id );
+		if ( !len( key ) || arguments.seen.keyExists( key ) || !arguments.byId.keyExists( key ) ) return;
+		if ( arguments.visiting.keyExists( key ) ) return;
+		arguments.visiting[ key ] = true;
+		var node = arguments.byId[ key ];
+		for ( var dependency in ( isArray( node.dependencies ?: "" ) ? node.dependencies : [] ) ) {
+			appendPhaseInDependencyOrder( dependency, arguments.byId, arguments.visiting, arguments.seen, arguments.ordered );
+		}
+		structDelete( arguments.visiting, key );
+		arguments.seen[ key ] = true;
+		arguments.ordered.append( node );
+	}
+
+	private array function ensureCurrentSlice( required array phases ) {
+		var list = [];
+		for ( var phase in arguments.phases ) if ( isStruct( phase ) ) list.append( duplicate( phase ) );
+		if ( !list.len() ) return list;
+		var hasCurrent = false;
+		for ( var phase in list ) if ( phase.currentSlice ?: false ) { hasCurrent = true; break; }
+		if ( hasCurrent ) return list;
+		var pick = 0;
+		for ( var index = 1; index <= list.len(); index++ ) {
+			var candidate = list[ index ];
+			var linked = ( isArray( candidate.unitIds ?: "" ) && candidate.unitIds.len() ) || ( isArray( candidate.routeIds ?: "" ) && candidate.routeIds.len() );
+			var pattern = lCase( trim( candidate.pattern ?: "" ) );
+			if ( linked && ( pattern == "vertical-slice" || pattern == "coexist-route" || findNoCase( "slice", pattern ) ) ) { pick = index; break; }
+			if ( !pick && linked ) pick = index;
+		}
+		if ( !pick ) pick = 1;
+		list[ pick ].currentSlice = true;
+		return list;
 	}
 
 	private array function currentSliceSamples( required array samples, required array phases ) {
 		var currentPhaseIds = {};
-		for ( var phase in arguments.phases ) if ( isStruct( phase ) && ( phase.currentSlice ?: false ) ) currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
+		var allowedSampleIds = {};
+		for ( var phase in arguments.phases ) {
+			if ( !isStruct( phase ) || !( phase.currentSlice ?: false ) ) continue;
+			currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
+			for ( var sampleId in ( isArray( phase.sampleIds ?: "" ) ? phase.sampleIds : [] ) ) allowedSampleIds[ trim( sampleId ) ] = true;
+		}
 		var output = [];
 		for ( var sample in arguments.samples ) {
 			if ( !isStruct( sample ) ) continue;
 			var phaseId = sample.phaseId ?: sample.roadmapPhaseId ?: "";
-			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) ) output.append( sample );
+			var sampleId = trim( sample.id ?: sample.itemId ?: "" );
+			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) || ( len( sampleId ) && allowedSampleIds.keyExists( sampleId ) ) ) output.append( sample );
 		}
 		return output;
 	}
@@ -294,7 +1400,7 @@ class {
 			if ( isStruct( item ) ) output.append( item );
 			else rejected++;
 		}
-		if ( rejected ) arguments.errors.append( { role: "provider-contract", collection: arguments.collection, message: "ignored-non-object-items", count: rejected } );
+		if ( rejected ) arguments.errors.append( { role: "provider-contract", collection: arguments.collection, message: "ignored-non-object-items", severity: "info", count: rejected } );
 		return output;
 	}
 
@@ -315,13 +1421,11 @@ class {
 
 	private struct function redactPayload(required struct payload) {
 		try {
-			var redacted = secretRedactionService.redactText( jsonSerialize( arguments.payload ) );
-			var parsed = jsonDeserialize( redacted );
-			return isStruct( parsed ) ? parsed : {};
+			var redacted = secretRedactionService.redactStructured( arguments.payload );
+			return isStruct( redacted ) ? redacted : {};
 		} catch ( any ignored ) {
-			// Never persist a provider payload that could not pass redaction and
-			// JSON normalization; retaining raw output would violate the local
-			// privacy boundary.
+			// Never persist a provider payload that could not pass redaction;
+			// retaining raw output would violate the local privacy boundary.
 			return {};
 		}
 	}
@@ -362,10 +1466,11 @@ class {
 	/**
 	 * Provider order is not a durable ordering contract.  Sort every generated
 	 * collection by stable identity before persisting/exporting so retries and
-	 * different providers produce the same artifact ordering.
+	 * different providers produce the same artifact ordering. Roadmap phases stay
+	 * in dependency order from polishPlan so validation and the Road UI agree.
 	 */
 	private struct function sortPlan( required struct plan ) {
-		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "roadmapPhases", "samples", "assumptions" ];
+		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "assumptions" ];
 		for ( var path in collections ) {
 			var parts = path.listToArray( "." );
 			var parent = parts.len() == 2 ? arguments.plan[ parts[ 1 ] ] : arguments.plan;

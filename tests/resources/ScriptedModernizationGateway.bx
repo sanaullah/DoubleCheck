@@ -1,26 +1,50 @@
 /** Deterministic provider double for ModernizationProposalService specs. */
+import java:java.util.concurrent.atomic.AtomicInteger;
+
 class {
 	property name="responses" type="struct";
 	property name="enabled" type="boolean" default="true";
 	property name="calls" type="numeric" default="0";
 	property name="cancelled" type="array";
+	property name="roleIndexes" type="struct";
+	property name="requests" type="array";
+	property name="optionsLog" type="array";
 
 	function init( struct responses = {}, boolean enabled = true ) {
 		variables.responses = duplicate( arguments.responses );
 		variables.enabled = arguments.enabled;
+		variables.callCounter = new AtomicInteger( 0 );
 		variables.calls = 0;
 		variables.cancelled = [];
+		variables.roleIndexes = {};
+		variables.requests = [];
+		variables.optionsLog = [];
 		return this;
 	}
 
 	boolean function isEnabled() { return variables.enabled; }
 
 	struct function run( required string runId, required struct agentRequest, struct options = {} ) {
-		variables.calls++;
+		variables.calls = variables.callCounter.incrementAndGet();
+		variables.requests.append( duplicate( arguments.agentRequest ) );
+		variables.optionsLog.append( duplicate( arguments.options ) );
 		if ( variables.cancelled.contains( arguments.runId ) ) throw( type = "RunCancelled", message = "scripted cancellation" );
 		var role = structKeyExists( arguments.agentRequest, "role" ) ? arguments.agentRequest.role : "";
 		if ( variables.responses.keyExists( role ) ) {
 			var response = variables.responses[ role ];
+			if ( isArray( response ) ) {
+				if ( structKeyExists( arguments.agentRequest, "shardIndex" ) && isNumeric( arguments.agentRequest.shardIndex ) ) {
+					var shardIndex = int( arguments.agentRequest.shardIndex );
+					response = shardIndex <= response.len() ? response[ shardIndex ] : response[ response.len() ];
+				} else {
+					var index = 0;
+					lock name="scripted-mod-role-#role#" type="exclusive" timeout="5" {
+						index = ( variables.roleIndexes[ role ] ?: 0 ) + 1;
+						variables.roleIndexes[ role ] = index;
+					}
+					response = index <= response.len() ? response[ index ] : response[ response.len() ];
+				}
+			}
 			if ( isStruct( response ) && structKeyExists( response, "throw" ) && response.throw ) return { ok: false, payload: {}, attempt: 1, provider: "scripted", model: "scripted", error: structKeyExists( response, "message" ) ? response.message : "scripted failure" };
 			return { ok: true, payload: isStruct( response ) ? duplicate( response ) : response, attempt: 1, provider: "scripted", model: "scripted" };
 		}
@@ -28,5 +52,7 @@ class {
 	}
 
 	void function cancelRun( required string runId ) { variables.cancelled.append( arguments.runId ); }
-	numeric function callCount() { return variables.calls; }
+	numeric function callCount() { return variables.callCounter.get(); }
+	array function requestLog() { return variables.requests; }
+	array function optionsHistory() { return variables.optionsLog; }
 }
