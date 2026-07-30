@@ -6,7 +6,8 @@
 @singleton
 class {
 	property name="identityService" inject="ModernizationIdentityService";
-	variables.version = "cfml-inventory-conservative-v3";
+	variables.version       = "cfml-inventory-conservative-v3";
+	variables.patternCache  = {};
 
 	struct function build( required any scan ) {
 		var files = isStruct( arguments.scan ) ? ( arguments.scan.files ?: [] ) : arguments.scan;
@@ -483,13 +484,20 @@ class {
 		return lCase( hash( lCase( arguments.kind & "|" & normalizePath( arguments.identity ) ), "SHA-256" ) );
 	}
 	private any function javaPatternMatcher( required string expression, required string source ) {
-		// BoxLang source literals retain doubled backslashes while Java's regex
-		// bridge expects a single escape character. Normalize only the doubled
-		// form so the conservative patterns below compile consistently.
-		var expressionText = replace( arguments.expression, char( 92 ) & char( 92 ), char( 92 ), "all" );
-		return createObject( "java", "java.util.regex.Pattern" ).compile(
-			expressionText,
-			createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE
-		).matcher( arguments.source );
+		return compiledPattern( arguments.expression ).matcher( arguments.source );
+	}
+
+	private any function compiledPattern( required string expression ) {
+		if ( !structKeyExists( variables.patternCache, arguments.expression ) ) {
+			// BoxLang source literals retain doubled backslashes while Java's regex
+			// bridge expects a single escape character. Normalize only the doubled
+			// form so the conservative patterns below compile consistently.
+			var expressionText = replace( arguments.expression, char( 92 ) & char( 92 ), char( 92 ), "all" );
+			variables.patternCache[ arguments.expression ] = createObject( "java", "java.util.regex.Pattern" ).compile(
+				expressionText,
+				createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE
+			);
+		}
+		return variables.patternCache[ arguments.expression ];
 	}
 }

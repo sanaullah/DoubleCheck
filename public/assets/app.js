@@ -4128,6 +4128,10 @@ function openEventStream(run, afterSequence = 0) {
 			});
 		}
 	}));
+	source.onopen = () => {
+		// SSE is healthy again; the 2s status poll is only a fallback.
+		stopStatusPoll();
+	};
 	source.onerror = () => {
 		if (state.closingStream) {
 			return;
@@ -4147,8 +4151,10 @@ function openEventStream(run, afterSequence = 0) {
 		}
 		catchUpEvents(state.activeRun);
 		pollActiveRun();
+		if (!state.statusPoll) {
+			state.statusPoll = setInterval(pollActiveRun, 2000);
+		}
 	};
-	state.statusPoll = setInterval(pollActiveRun, 2000);
 }
 
 async function loadRuns() {

@@ -286,13 +286,63 @@ class {
 	}
 
 	private struct function metricsForRun( required string runId, required struct context ) {
-		var result = listScoped( arguments.context, { q: arguments.runId, page: 1, limit: 100 } );
-		for ( var item in result.data ) {
-			if ( item.run.id == arguments.runId ) {
-				return item.metrics;
-			}
+		var records = queryExecute(
+			"
+				SELECT
+					r.*,
+					s.files_scanned,
+					s.bytes_scanned,
+					s.findings_count,
+					s.languages,
+					s.ai_enabled,
+					COALESCE(f.critical_count, 0) AS critical_count,
+					COALESCE(f.high_count, 0) AS high_count,
+					COALESCE(f.medium_count, 0) AS medium_count,
+					COALESCE(f.low_count, 0) AS low_count,
+					COALESCE(f.info_count, 0) AS info_count,
+					COALESCE(sp.task_count, 0) AS specialist_count,
+					COALESCE(sp.completed_count, 0) AS specialist_completed,
+					COALESCE(sp.failed_count, 0) AS specialist_failed,
+					COALESCE(sp.roles, '') AS specialist_roles,
+					mp.state AS modernization_plan_state,
+					mp.validation_json AS modernization_validation_json
+				FROM review_runs r
+				LEFT JOIN review_summaries s ON s.run_id = r.id
+				LEFT JOIN modernization_plans mp ON mp.run_id = r.id
+				LEFT JOIN (
+					SELECT run_id,
+						SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS critical_count,
+						SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) AS high_count,
+						SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) AS medium_count,
+						SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS low_count,
+						SUM(CASE WHEN severity = 'info' THEN 1 ELSE 0 END) AS info_count
+					FROM review_findings
+					WHERE run_id = :runId
+					GROUP BY run_id
+				) f ON f.run_id = r.id
+				LEFT JOIN (
+					SELECT run_id,
+						COUNT(*) AS task_count,
+						SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS completed_count,
+						SUM(CASE WHEN status <> 'succeeded' THEN 1 ELSE 0 END) AS failed_count,
+						GROUP_CONCAT(DISTINCT role) AS roles
+					FROM review_specialist_results
+					WHERE run_id = :runId
+					GROUP BY run_id
+				) sp ON sp.run_id = r.id
+				WHERE r.id = :runId AND r.tenant_id = :tenantId
+				LIMIT 1
+			",
+			{
+				runId   : arguments.runId,
+				tenantId: arguments.context.tenantId
+			},
+			{ datasource: datasource }
+		);
+		if ( !records.recordCount ) {
+			return {};
 		}
-		return {};
+		return hydrateRow( records, 1 ).metrics;
 	}
 
 	private struct function metricDelta( required struct current, required struct baseline ) {
