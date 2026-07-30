@@ -80,6 +80,9 @@ if [ $DEBUG_MODE -eq 1 ]; then
     [ $CONSOLE_MODE -eq 1 ] && echo "[INFO] Debug mode enabled"
 fi
 
+# Ensure we're in the project root directory (script directory)
+cd "$(dirname "$0")"
+
 # Check JAR
 if [ ! -f ".engine/boxlang-miniserver-1.14.0.jar" ]; then
     echo -e "${RED}ERROR: boxlang-miniserver-1.14.0.jar not found${NC}"

@@ -134,6 +134,9 @@ if %DEBUG_MODE%==1 (
 exit /b 0
 
 :launch_server
+REM Ensure we're in the project root directory
+cd /d "%~dp0"
+
 REM Check if JAR exists
 if not exist .engine\boxlang-miniserver-1.14.0.jar (
     echo ERROR: boxlang-miniserver-1.14.0.jar not found at .engine\boxlang-miniserver-1.14.0.jar
