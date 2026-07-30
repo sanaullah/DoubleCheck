@@ -86,6 +86,8 @@ No other languages are product targets.
 
 ## Quick start
 
+### Option 1: With CommandBox (Recommended for Developers)
+
 **Requirements:** [CommandBox](https://commandbox.ortusbooks.com/) 6+ and a BoxLang-capable server (runtime modules such as `bx-ai` / `bx-sqlite` install on first start via `server.json`).
 
 ```powershell
@@ -98,6 +100,43 @@ box server start --console
 `setup` only creates `.env` if missing. On first start the app creates the SQLite file and schema when needed.
 
 `--console` keeps the server in the foreground and prints the bind URL (commonly `http://127.0.0.1:55452`). Open that URL for the workspace.
+
+### Option 2: No CommandBox (Standalone - JDK 21 Only)
+
+**Requirements:** JDK 21 or higher (Java runtime only — no other tools needed).
+
+**Windows:**
+```batch
+.\startup.bat
+```
+
+**macOS/Linux:**
+```bash
+bash startup.sh
+```
+
+The app launches on `http://localhost:8585` and opens your browser automatically. First run creates `.env` from `.env.example` and initializes the database.
+
+**Flags (both platforms):**
+```bash
+# Custom port
+startup.bat --port 9000
+
+# Don't open browser
+startup.sh --no-browser
+
+# Enable debug logging
+startup.sh --debug
+
+# Show help
+startup.sh --help
+```
+
+**All features work without CommandBox:**
+- ✓ Full UI and workspace
+- ✓ Code review and analysis
+- ✓ Basic findings (deterministic)
+- ✓ AI specialists (optional — add `OPENAI_API_KEY` to `.env`)
 
 | Resource | Path |
 |---|---|
