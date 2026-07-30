@@ -10,6 +10,7 @@ set HOST=127.0.0.1
 set OPEN_BROWSER=1
 set DEBUG_MODE=0
 set CONSOLE_MODE=0
+set JAVA_CMD=java
 
 REM Parse command-line arguments
 :parse_args
@@ -84,20 +85,33 @@ echo.
 exit /b 0
 
 :check_java
-REM Check if Java is installed
-for /f "tokens=*" %%i in ('java -version 2^>^&1') do (
-    set JAVA_VERSION=%%i
-    goto parse_version
+REM First try to find java in PATH
+where java >nul 2>&1
+if errorlevel 1 (
+    REM Java not in PATH, try JAVA_HOME
+    if not "!JAVA_HOME!"=="" (
+        set JAVA_CMD=!JAVA_HOME!\bin\java
+        if not exist !JAVA_CMD! (
+            call :java_not_found
+            exit /b 1
+        )
+    ) else (
+        call :java_not_found
+        exit /b 1
+    )
 )
 
-echo ERROR: Java is not installed or not in PATH
-echo.
-echo Please ensure JDK 21 or higher is installed and in your PATH
-echo Download from: https://www.oracle.com/java/technologies/downloads/
-exit /b 1
+REM Get Java version
+for /f "tokens=*" %%i in ('!JAVA_CMD! -version 2^>^&1 ^| findstr /R "version"') do (
+    set JAVA_VERSION=%%i
+)
 
-:parse_version
-REM Extract version number (e.g., "21.0.1")
+if "!JAVA_VERSION!"=="" (
+    echo ERROR: Could not determine Java version
+    exit /b 1
+)
+
+REM Extract major version number
 for /f "tokens=2 delims= " %%i in ("%JAVA_VERSION%") do (
     set VERSION_STR=%%i
 )
@@ -105,26 +119,44 @@ for /f "tokens=1 delims=." %%i in ("%VERSION_STR%") do (
     set MAJOR_VERSION=%%i
 )
 
-if "%MAJOR_VERSION%"=="" (
+if "!MAJOR_VERSION!"=="" (
     echo ERROR: Could not determine Java version
-    echo.
-    echo Please ensure JDK 21 or higher is installed
+    echo Version output: !JAVA_VERSION!
     exit /b 1
 )
 
 REM Check if version is 21 or higher
 if %MAJOR_VERSION% LSS 21 (
     echo ERROR: Java version too old
-    echo Current: %JAVA_VERSION%
+    echo Current: !JAVA_VERSION!
     echo Required: JDK 21 or higher
     echo.
     echo Download from: https://www.oracle.com/java/technologies/downloads/
     exit /b 1
 )
 
-echo Java version: %JAVA_VERSION%
+echo Java version: !JAVA_VERSION!
 echo.
 exit /b 0
+
+:java_not_found
+echo ERROR: Java (JDK 21 or higher) is not installed or not in PATH
+echo.
+echo Solutions:
+echo.
+echo 1. Add Java to PATH:
+echo    - Install JDK 21 from: https://www.oracle.com/java/technologies/downloads/
+echo    - Add C:\Program Files\Java\jdk-21.X.X\bin to your PATH
+echo.
+echo 2. OR set JAVA_HOME environment variable:
+echo    - setx JAVA_HOME "C:\Program Files\Java\jdk-21.X.X"
+echo    - Then restart your terminal
+echo.
+echo 3. OR Use BoxLang's Java:
+echo    - setx JAVA_HOME "C:\boxlang"
+echo    - Then run this script again
+echo.
+exit /b 1
 
 :setup_env
 REM Create .env from .env.example if .env doesn't exist
@@ -171,14 +203,14 @@ echo.
 if %CONSOLE_MODE%==1 (
     echo [INFO] Starting miniserver with console output...
     echo.
-    java -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    %JAVA_CMD% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
     echo.
     echo ================================================================================
     echo DoubleCheck has stopped
     echo ================================================================================
 ) else (
     REM Run miniserver in background and wait
-    start "DoubleCheck Server" /B java -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    start "DoubleCheck Server" /B %JAVA_CMD% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
 
     REM Wait for server to start
     timeout /t 3 /nobreak >nul

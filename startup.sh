@@ -11,6 +11,7 @@ HOST=127.0.0.1
 OPEN_BROWSER=1
 DEBUG_MODE=0
 CONSOLE_MODE=0
+JAVA_CMD="java"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -73,19 +74,35 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Check if Java is installed
-if ! command -v java &> /dev/null; then
-    echo -e "${RED}ERROR: Java is not installed or not in PATH${NC}"
+# Find Java
+if command -v java &> /dev/null; then
+    JAVA_CMD="java"
+elif [ -n "$JAVA_HOME" ] && [ -f "$JAVA_HOME/bin/java" ]; then
+    JAVA_CMD="$JAVA_HOME/bin/java"
+else
+    echo -e "${RED}ERROR: Java (JDK 21 or higher) is not installed or not in PATH${NC}"
     echo ""
-    echo "Please install JDK 21 or higher:"
-    echo "  - macOS (Homebrew): brew install openjdk@21"
-    echo "  - Linux (Ubuntu): sudo apt-get install openjdk-21-jdk"
-    echo "  - Download: https://www.oracle.com/java/technologies/downloads/"
+    echo "Solutions:"
+    echo ""
+    echo "1. Install Java (macOS with Homebrew):"
+    echo "   brew install openjdk@21"
+    echo ""
+    echo "2. Install Java (Linux - Ubuntu/Debian):"
+    echo "   sudo apt-get update"
+    echo "   sudo apt-get install openjdk-21-jdk"
+    echo ""
+    echo "3. Set JAVA_HOME environment variable:"
+    echo "   export JAVA_HOME=/path/to/jdk-21"
+    echo "   $0"
+    echo ""
+    echo "4. Download Java:"
+    echo "   https://www.oracle.com/java/technologies/downloads/"
+    echo ""
     exit 1
 fi
 
 # Check Java version
-JAVA_VERSION=$(java -version 2>&1 | head -1)
+JAVA_VERSION=$($JAVA_CMD -version 2>&1 | head -1)
 MAJOR_VERSION=$(echo "$JAVA_VERSION" | grep -oP '(?<=")[^"]*' | head -1 | cut -d. -f1)
 
 if [ -z "$MAJOR_VERSION" ]; then
@@ -96,7 +113,7 @@ if [ -z "$MAJOR_VERSION" ] || ! [[ "$MAJOR_VERSION" =~ ^[0-9]+$ ]]; then
     echo -e "${RED}ERROR: Could not determine Java version${NC}"
     echo "Version output: $JAVA_VERSION"
     echo ""
-    echo "Please ensure JDK 21 or higher is installed"
+    echo "Please install JDK 21 or higher and ensure it's in your PATH"
     exit 1
 fi
 
@@ -158,7 +175,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
     # Show full console output
     echo -e "${BLUE}[INFO]${NC} Starting miniserver with console output..."
     echo ""
-    java -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar
     echo ""
     echo "================================================================================"
     echo "DoubleCheck has stopped"
@@ -166,7 +183,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
 else
     # Run in background and show status
     echo -e "${BLUE}[INFO]${NC} Starting miniserver in background..."
-    java -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar &
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar &
     SERVER_PID=$!
 
     # Give server time to start
