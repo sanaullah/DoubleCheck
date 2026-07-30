@@ -138,6 +138,39 @@ startup.sh --help
 - ✓ Basic findings (deterministic)
 - ✓ AI specialists (optional — add `OPENAI_API_KEY` to `.env`)
 
+#### Java Setup (if needed)
+
+If you get "Java is not recognized", set up Java with one of these approaches:
+
+**Option A: Add Java to PATH (Recommended)**
+1. Install [JDK 21](https://www.oracle.com/java/technologies/downloads/)
+2. Add `C:\Program Files\Java\jdk-21.X.X\bin` to your system PATH
+3. Restart your terminal or IDE
+4. Run `startup.bat` or `startup.sh`
+
+**Option B: Set JAVA_HOME Environment Variable**
+```powershell
+# Windows (PowerShell)
+[Environment]::SetEnvironmentVariable("JAVA_HOME", "C:\Program Files\Java\jdk-21.X.X", "User")
+```
+
+```bash
+# macOS/Linux (add to ~/.bashrc or ~/.zshrc)
+export JAVA_HOME=/Library/Java/JavaVirtualMachines/openjdk-21.X.X/Contents/Home
+```
+
+Then restart your terminal and run the startup script.
+
+**Option C: Install Java with Package Manager**
+```bash
+# macOS (Homebrew)
+brew install openjdk@21
+
+# Linux (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install openjdk-21-jdk
+```
+
 | Resource | Path |
 |---|---|
 | Workspace | `/` (URL printed by CommandBox) |
