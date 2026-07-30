@@ -152,6 +152,119 @@ class {
 		}
 	}
 
+	/**
+	 * Rebuild a single db-finding or db-transition in isolation. Unlike rebuild()
+	 * this has no roadmap phase to scope against — it reads the prior item plus
+	 * schema evidence only, and replaces exactly that one item by id.
+	 */
+	struct function rebuildItem( required any run, required string itemType, required string itemId, required struct input ) {
+		ensureModernization( arguments.run );
+		var safeItemType = lCase( trim( arguments.itemType ) );
+		if ( ![ "db-finding", "db-transition" ].contains( safeItemType ) ) {
+			throw( type = "ValidationException", message = "Item rebuild is only supported for db-finding or db-transition" );
+		}
+		if ( !agentGateway.isEnabled() ) {
+			throw( type = "AIConfigurationException", message = "Modernization provider is not enabled" );
+		}
+		var runId = arguments.run.getId();
+		if ( variables.rebuildLocks.keyExists( runId ) ) {
+			throw( type = "ModernizationRebuildException", message = "A slice rebuild is already in progress for this run" );
+		}
+		variables.rebuildLocks[ runId ] = true;
+		try {
+			var planRecord = modernizationRepository.getPlan( runId );
+			if ( isNull( planRecord ) ) throw( type = "ValidationException", message = "Modernization plan is not available" );
+			var planFingerprint = trim( arguments.input.planFingerprint ?: "" );
+			if ( len( planFingerprint ) && planFingerprint != trim( planRecord.fingerprint ?: "" ) ) {
+				throw( type = "ModernizationDecisionConflict", message = "The modernization artifact changed; refresh before rebuilding" );
+			}
+			var plan = duplicate( planRecord.plan ?: {} );
+			var collection = safeItemType == "db-finding" ? "dbFindings" : "dbTransitions";
+			var priorItem = findItemById( isArray( plan[ collection ] ?: "" ) ? plan[ collection ] : [], arguments.itemId );
+			if ( isNull( priorItem ) ) throw( type = "ModernizationItemNotFound", message = "Modernization item was not found" );
+			var itemFingerprint = trim( arguments.input.itemFingerprint ?: "" );
+			if ( len( itemFingerprint ) && itemFingerprint != trim( priorItem.itemFingerprint ?: "" ) ) {
+				throw( type = "ModernizationDecisionConflict", message = "The modernization proposal changed; refresh before rebuilding" );
+			}
+			var note = secretRedactionService.redactText( left( trim( arguments.input.note ?: "" ), variables.maxNoteChars ) );
+			var runtime = {
+				runtime: plan.metadata.runtime.runtime ?: plan.metadata.runtime ?: "boxlang",
+				profile: plan.metadata.targetProfile ?: plan.target.layoutProfile ?: "modern"
+			};
+			var agentRequest = agentFactory.build(
+				"modernization-item-rebuild",
+				runtime,
+				{
+					itemType     : safeItemType,
+					itemId       : arguments.itemId,
+					note         : note,
+					priorItem    : priorItem,
+					schemaEvidence: plan.schemaEvidence ?: {}
+				},
+				{}
+			);
+			var gatewayResult = agentGateway.run( runId, agentRequest, { role: "modernization-item-rebuild" } );
+			if ( !( gatewayResult.ok ?: false ) ) {
+				throw( type = "ModernizationRebuildException", message = gatewayResult.error ?: "Item rebuild provider request failed" );
+			}
+			var payload = isStruct( gatewayResult.payload ?: "" ) ? gatewayResult.payload : {};
+			var redacted = {};
+			try {
+				redacted = secretRedactionService.redactStructured( payload );
+			} catch ( any ignored ) {
+				redacted = {};
+			}
+			if ( !isStruct( redacted ) || !redacted.count() ) {
+				throw( type = "ModernizationRebuildException", message = "Item rebuild response failed redaction" );
+			}
+			var replacements = isArray( redacted[ collection ] ?: "" ) ? redacted[ collection ] : [];
+			if ( replacements.len() != 1 ) {
+				throw( type = "ModernizationRebuildException", message = "Rebuild must return exactly one replacement #safeItemType#" );
+			}
+			var replacement = duplicate( replacements[ 1 ] );
+			var replacementId = trim( replacement.id ?: replacement.itemId ?: "" );
+			if ( len( replacementId ) && replacementId != arguments.itemId ) {
+				throw( type = "ModernizationRebuildException", message = "Rebuild fragment targeted a different item id" );
+			}
+			replacement.id = arguments.itemId;
+			replacement.itemFingerprint = identityService.itemFingerprint( safeItemType, replacement );
+			var items = isArray( plan[ collection ] ?: "" ) ? duplicate( plan[ collection ] ) : [];
+			var replaced = false;
+			for ( var index = 1; index <= items.len(); index++ ) {
+				if ( ( items[ index ].id ?: items[ index ].itemId ?: "" ) == arguments.itemId ) {
+					items[ index ] = replacement;
+					replaced = true;
+					break;
+				}
+			}
+			if ( !replaced ) items.append( replacement );
+			plan[ collection ] = items;
+			plan.state = "needs-review";
+			var validation = validationService.validate( plan, { inventory: plan.inventory ?: {} } );
+			modernizationRepository.savePlan( runId, plan, validation, planRecord.coverage ?: plan.coverage ?: {} );
+			decisionService.clearStaleDecisions( runId );
+			decisionService.refreshState( runId );
+			return {
+				result : runService.getResult( runId ),
+				rebuild: {
+					itemId  : arguments.itemId,
+					itemType: safeItemType,
+					attempt : gatewayResult.attempt ?: 1,
+					costUsd : gatewayResult.costUsd ?: 0
+				}
+			};
+		} finally {
+			structDelete( variables.rebuildLocks, runId );
+		}
+	}
+
+	private any function findItemById( required array items, required string itemId ) {
+		for ( var item in arguments.items ) {
+			if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+		}
+		return javacast( "null", "" );
+	}
+
 	struct function buildEvidencePack( required struct plan, required struct phase, required string projectPath ) {
 		var linkedLegacyIds = {};
 		var linkedPaths = {};

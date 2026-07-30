@@ -152,7 +152,11 @@ class {
 				architectureOptions.budgets = budgets;
 				architectureOptions.startedAt = getTickCount();
 				architectureOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
-				architectureOptions.maxRetries = 0;
+				// One retry (not zero) so a truncated-JSON response gets one chance at
+				// AgentGateway's shrink-and-retry mitigation instead of failing outright;
+				// the gateway's own time-budget check still bails cleanly if there's no
+				// time left for it.
+				architectureOptions.maxRetries = 1;
 				architectureOptions.role = "modernization-architecture";
 				var architecture = agentGateway.run( arguments.runId, architectureRequest, architectureOptions );
 				totalCostUsd += isNumeric( architecture.costUsd ?: "" ) ? val( architecture.costUsd ) : 0;
@@ -177,7 +181,8 @@ class {
 				roadmapOptions.budgets = budgets;
 				roadmapOptions.startedAt = getTickCount();
 				roadmapOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
-				roadmapOptions.maxRetries = 0;
+				// See the matching comment on architectureOptions.maxRetries above.
+				roadmapOptions.maxRetries = 1;
 				roadmapOptions.role = "modernization-roadmap";
 				var roadmap = agentGateway.run( arguments.runId, roadmapRequest, roadmapOptions );
 				totalCostUsd += isNumeric( roadmap.costUsd ?: "" ) ? val( roadmap.costUsd ) : 0;
@@ -709,27 +714,23 @@ class {
 			} );
 		}
 		var sliceUnits = feature.len() ? feature : units;
+		// applySynthesizedRoadmap() always runs before applySynthesizedArchitecture(),
+		// so target.contexts/.extracts here are either real architecture output or
+		// genuinely empty — never the single "keep everything centralized" fallback
+		// context. When real groups exist, follow them into one phase per group
+		// instead of an arbitrary count-based split.
+		var groups = synthesisRoadmapGroups( arguments.plan );
+		if ( groups.len() ) {
+			phases.append( synthesizeGroupedPhases( sliceUnits, routes, groups, foundation.len() ), true );
+			return phases;
+		}
 		var sliceSize = min( 8, sliceUnits.len() );
 		var firstSlice = [];
 		for ( var i = 1; i <= sliceSize; i++ ) firstSlice.append( sliceUnits[ i ] );
 		var firstIds = firstSlice.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) );
 		var firstIdSet = {};
 		for ( var id in firstIds ) firstIdSet[ id ] = true;
-		var sliceRoutes = [];
-		for ( var route in routes ) {
-			if ( !isStruct( route ) ) continue;
-			var related = route.targetUnitId ?: "";
-			if ( !len( related ) && isArray( route.relatedItemIds ?: "" ) && route.relatedItemIds.len() ) related = route.relatedItemIds[ 1 ];
-			if ( len( related ) && firstIdSet.keyExists( related ) ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
-			else if ( !firstIdSet.count() ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
-			if ( sliceRoutes.len() >= 8 ) break;
-		}
-		if ( !sliceRoutes.len() ) {
-			for ( var route in routes ) {
-				if ( isStruct( route ) ) sliceRoutes.append( route.id ?: route.itemId ?: "" );
-				if ( sliceRoutes.len() >= 6 ) break;
-			}
-		}
+		var sliceRoutes = routesForUnitIds( routes, firstIdSet, true );
 		phases.append( {
 			id: "phase-first-slice",
 			name: "First vertical slice",
@@ -737,7 +738,7 @@ class {
 			pattern: "vertical-slice",
 			dependencies: foundation.len() ? [ "phase-foundation" ] : [],
 			unitIds: firstIds,
-			routeIds: sliceRoutes.filter( ( id ) => len( trim( id ) ) ),
+			routeIds: sliceRoutes,
 			dbFindingIds: [],
 			transitionIds: [],
 			sampleIds: [],
@@ -768,6 +769,117 @@ class {
 				implementerPrompt: "Rebuild one later slice at a time from the retained target map.",
 				provenanceClass: "deterministically-derived",
 				currentSlice: false
+			} );
+		}
+		return phases;
+	}
+
+	/** Route ids whose target unit falls inside unitIdSet. Falls back to the
+	 * first few unlinked routes only when nothing in the plan is linked yet
+	 * (mirrors the previous inline behavior for the count-based fallback). */
+	private array function routesForUnitIds( required array routes, required struct unitIdSet, boolean fallbackToUnlinked = false ) {
+		var matched = [];
+		for ( var route in arguments.routes ) {
+			if ( !isStruct( route ) ) continue;
+			var related = route.targetUnitId ?: "";
+			if ( !len( related ) && isArray( route.relatedItemIds ?: "" ) && route.relatedItemIds.len() ) related = route.relatedItemIds[ 1 ];
+			if ( len( related ) && arguments.unitIdSet.keyExists( related ) ) matched.append( route.id ?: route.itemId ?: "" );
+			if ( matched.len() >= 8 ) break;
+		}
+		if ( !matched.len() && arguments.fallbackToUnlinked && !arguments.unitIdSet.count() ) {
+			for ( var route in arguments.routes ) {
+				if ( isStruct( route ) ) matched.append( route.id ?: route.itemId ?: "" );
+				if ( matched.len() >= 6 ) break;
+			}
+		}
+		return matched.filter( ( id ) => len( trim( id ) ) );
+	}
+
+	/** Real (non-degenerate) context/extract groupings, each with the units they
+	 * cover. Empty when the architecture role hasn't produced anything yet. */
+	private array function synthesisRoadmapGroups( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var groups = [];
+		for ( var ctx in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
+			if ( isStruct( ctx ) && isArray( ctx.targetUnitIds ?: "" ) && ctx.targetUnitIds.len() ) {
+				groups.append( { name: ctx.name ?: "Slice", targetUnitIds: ctx.targetUnitIds, kind: "context" } );
+			}
+		}
+		for ( var ext in ( isArray( target.extracts ?: "" ) ? target.extracts : [] ) ) {
+			if ( isStruct( ext ) && isArray( ext.targetUnitIds ?: "" ) && ext.targetUnitIds.len() ) {
+				groups.append( { name: ext.name ?: "Extract", targetUnitIds: ext.targetUnitIds, kind: "extract" } );
+			}
+		}
+		return groups;
+	}
+
+	/** One roadmap phase per context/extract group (capped at 8, same sizing
+	 * philosophy as the count-based fallback), chained sequentially so the Road
+	 * still reads as one strangler step at a time. Units no group covers land in
+	 * a trailing "continue strangler" phase, same shape the count-based path used. */
+	private array function synthesizeGroupedPhases( required array sliceUnits, required array routes, required array groups, required boolean hasFoundation ) {
+		var covered = {};
+		var phases = [];
+		var previousPhaseId = arguments.hasFoundation ? "phase-foundation" : "";
+		var index = 0;
+		for ( var group in arguments.groups ) {
+			if ( index >= 8 ) break;
+			var groupIds = [];
+			for ( var unitId in group.targetUnitIds ) {
+				var id = trim( toString( unitId ) );
+				if ( len( id ) && !covered.keyExists( id ) ) groupIds.append( id );
+			}
+			if ( !groupIds.len() ) continue;
+			for ( var id in groupIds ) covered[ id ] = true;
+			index++;
+			var idSet = {};
+			for ( var id in groupIds ) idSet[ id ] = true;
+			var isExtract = ( group.kind ?: "" ) == "extract";
+			phases.append( {
+				id: "phase-slice-" & index,
+				name: group.name,
+				goal: isExtract
+					? "Extract #group.name# behind a coexist boundary, verified before any deployment split."
+					: "Migrate the #group.name# slice behind ColdBox, one strangler step at a time.",
+				pattern: isExtract ? "side-app-extract" : "vertical-slice",
+				dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
+				unitIds: groupIds,
+				routeIds: routesForUnitIds( arguments.routes, idSet ),
+				dbFindingIds: [],
+				transitionIds: [],
+				sampleIds: [],
+				parityIntent: "Feature parity for the #group.name# slice only.",
+				exitCriteria: [ "Coexist route serves the slice", "Target handlers/services compile", "Legacy path remains rollback" ],
+				rollback: "Route traffic back to legacy paths for this slice.",
+				implementerPrompt: "Implement only the listed target units and coexist routes for #group.name#. Keep unlisted legacy files untouched.",
+				provenanceClass: "deterministically-derived",
+				currentSlice: index == 1
+			} );
+			previousPhaseId = "phase-slice-" & index;
+		}
+		var leftover = [];
+		for ( var unit in arguments.sliceUnits ) {
+			var id = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( id ) && !covered.keyExists( id ) ) leftover.append( id );
+		}
+		if ( leftover.len() ) {
+			phases.append( {
+				id: "phase-continue-strangler",
+				name: "Continue strangler slices",
+				goal: "Migrate remaining mapped targets not covered by an identified slice.",
+				pattern: "coexist-route",
+				dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
+				unitIds: leftover,
+				routeIds: [],
+				dbFindingIds: [],
+				transitionIds: [],
+				sampleIds: [],
+				parityIntent: "Incremental strangler coverage for remaining mapped files.",
+				exitCriteria: [ "Each later slice has coexist routing", "No big-bang retirement" ],
+				rollback: "Leave later slices on legacy until accepted.",
+				implementerPrompt: "Rebuild one later slice at a time from the retained target map.",
+				provenanceClass: "deterministically-derived",
+				currentSlice: !phases.len()
 			} );
 		}
 		return phases;

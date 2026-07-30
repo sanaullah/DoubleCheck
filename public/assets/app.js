@@ -2202,49 +2202,6 @@ function appendEvent(type, payload) {
 	timelineFromEvent(type, payload, message);
 }
 
-function modernizationItems(result = {}, pane = "") {
-	const target = result.target || {};
-	const database = result.schemaEvidence?.database || result.database || {};
-	const map = {
-		legacy: [result.inventory?.units || [], "legacy-unit"],
-		target: [(target.units || []).concat((result.samples || []).map((item) => ({ ...item, itemType: item.itemType || "sample" }))), "target-unit"],
-		routes: [result.routeContracts || [], "route-contract"],
-		database: [(result.dbFindings || []).map((item) => ({ ...item, itemType: item.itemType || "db-finding" })).concat((result.dbTransitions || database.findings || []).map((item) => ({ ...item, itemType: item.itemType || "db-transition" }))), "db-finding"],
-		links: [result.unitLinks || [], "unit-link"],
-		contexts: [(target.contexts || result.contexts || []).map((item) => ({ ...item, itemType: item.itemType || "context" })).concat((target.extracts || result.extracts || []).map((item) => ({ ...item, itemType: item.itemType || "extract" }))), "context"],
-		roadmap: [result.roadmapPhases || [], "roadmap-phase"]
-	};
-	const pair = map[pane] || [[], "item"];
-	return pair[0].map((item) => {
-		const typed = { ...item, _modernizationType: item.itemType || pair[1] };
-		const itemId = item.id || item.itemId || item.findingId || item.transitionId || "";
-		const messages = itemId ? (result.validation?.messages || []).filter((message) => message.itemId === itemId) : [];
-		if (messages.some((message) => (message.level || message.validationLevel) === "blocking")) typed.validationLevel = "blocking";
-		else if (messages.some((message) => (message.level || message.validationLevel) === "warning")) typed.validationLevel = "warning";
-		typed._validationMessages = messages.map((message) => message.message).filter(Boolean);
-		return typed;
-	});
-}
-
-function modernizationItemLabel(item) {
-	if (item._modernizationType === "legacy-unit") {
-		const file = item.filePath || item.path || "Unknown source file";
-		const symbol = item.symbolName || item.signature || "";
-		return symbol && symbol !== file ? `${file} · ${symbol}` : file;
-	}
-	if (item._modernizationType === "target-unit") return item.targetPath || item.pathHint || item.path || item.name || item.title || item.id || "Untitled target";
-	if (item._modernizationType === "unit-link") return `${item.sourcePath || item.legacyUnitId || item.sourceUnitId || "Legacy unit"} → ${item.targetPath || item.targetUnitId || item.targetId || "Target unit"}`;
-	if (item._modernizationType === "roadmap-phase") return item.name || item.title || item.goal || item.id || "Roadmap phase";
-	if (item._modernizationType === "route-contract") return `${item.method || "GET"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target"}`;
-	if (item._modernizationType === "db-finding") return item.objectRef || item.proposedChange || item.problem || item.id || "Database finding";
-	if (item._modernizationType === "db-transition") return item.migrationPath || item.operation || item.id || "Database transition";
-	if (item._modernizationType === "sample") return item.targetPath || item.path || item.sampleKind || item.id || "Sample";
-	if (item._modernizationType === "validation" || item.itemType === "validation") {
-		return item.title || item.message || item.detail || item.targetPath || item.path || item.itemId || item.id || "Validation note";
-	}
-	return item.name || item.title || item.message || item.filePath || item.path || item.targetPath || item.legacyPath || item.objectRef || item.findingId || item.transitionId || item.id || "Untitled proposal";
-}
-
 function cleanLegacySourceLabel(item = {}) {
 	const source = String(item.sourcePath || item.sourceFile || item.filePath || "").trim();
 	if (source) return source;
@@ -2256,52 +2213,9 @@ function cleanLegacySourceLabel(item = {}) {
 	return "New proposal (no legacy file mapped)";
 }
 
-function phaseHasCodeLinks(phase = {}) {
-	return !!(
-		(Array.isArray(phase.unitIds) && phase.unitIds.length) ||
-		(Array.isArray(phase.routeIds) && phase.routeIds.length) ||
-		(Array.isArray(phase.dbFindingIds) && phase.dbFindingIds.length) ||
-		(Array.isArray(phase.transitionIds) && phase.transitionIds.length)
-	);
-}
-
 function phaseScaffoldEmptyHtml(kind = "files") {
 	const noun = kind === "routes" ? "routes" : kind === "database" ? "database notes" : kind === "targets" ? "target files" : "legacy files";
 	return `<p class="modernization-phase-empty"><strong>Scaffold / setup step</strong> — no ${noun} are mapped to this phase yet. Use the Definition of Done below for setup work, or pick a mapped slice on the Road (look for coexist / vertical-slice badges) to see what moves.</p>`;
-}
-
-function modernizationGenerationErrors(result = {}) {
-	const errors = result.generationErrors || result.errors || [];
-	return Array.isArray(errors)
-		? errors.filter((item) => item && (item.message || item.role) && !modernizationMessageIsNote(item))
-		: [];
-}
-
-function modernizationGenerationNotes(result = {}) {
-	const notes = result.generationNotes || [];
-	const fromErrors = (result.generationErrors || result.errors || []).filter((item) => modernizationMessageIsNote(item));
-	const merged = [...(Array.isArray(notes) ? notes : []), ...fromErrors];
-	return merged.filter((item) => item && (item.message || item.role));
-}
-
-function modernizationMessageIsNote(item = {}) {
-	const message = String(item.message || "").toLowerCase();
-	const severity = String(item.severity || "").toLowerCase();
-	if (severity === "info" || severity === "note") return true;
-	if (message.startsWith("synthesized-")) return true;
-	if (message === "cost-reserved-for-roadmap") return true;
-	if (message === "ignored-non-object-items") return true;
-	return false;
-}
-
-function modernizationPlanIsHollow(result = {}) {
-	const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
-	const targets = result.target?.units || [];
-	const routes = result.routeContracts || [];
-	if (targets.length || routes.length) return false;
-	const mapped = phases.some((phase) => phaseHasCodeLinks(phase));
-	const appFailed = modernizationGenerationErrors(result).some((item) => String(item.role || "") === "modernization-application");
-	return appFailed || (phases.length > 0 && !mapped);
 }
 
 function orderedRoadmapPhases(phases = []) {
@@ -2327,28 +2241,6 @@ function orderedRoadmapPhases(phases = []) {
 		if (!seen.has(String(phase.id || ""))) ordered.push(phase);
 	});
 	return ordered;
-}
-
-function modernizationItemMeta(item) {
-	const validation = modernizationValidationStatus(item);
-	const provenance = item.provenanceClass || "unknown provenance";
-	if (item._modernizationType === "legacy-unit") {
-		const range = item.startLine ? ` · lines ${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ""}` : "";
-		return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signals · ${item.touchedTables?.length || 0} tables · ${provenance}`;
-	}
-	if (item._modernizationType === "target-unit") return `${item.layer || item.kind || "target"} · ${item.sourcePath || item.filePath || "new proposal"} · ${validation} · ${provenance}`;
-	if (item._modernizationType === "roadmap-phase") return `${item.pattern || "migration phase"} · ${(item.dependencies || []).length} dependencies · ${validation} · ${provenance}`;
-	if (item._modernizationType === "db-finding") return `${item.category || "database"} · ${item.severity || "unrated"} · ${item.expandContract || "review"} · ${provenance}`;
-	if (item._modernizationType === "route-contract") return `${item.method || "UNKNOWN"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target route"} · ${provenance}`;
-	return `${item._modernizationType} · ${validation} · ${provenance}`;
-}
-
-function modernizationValidationStatus(item) {
-	const value = String(item.validationStatus || item.validationLevel || item.status || "unknown").toLowerCase();
-	if (["passed", "pass", "ok", "succeeded", "valid"].includes(value)) return "valid";
-	if (["error", "failed", "fail", "blocking", "blocker"].includes(value)) return "blocking";
-	if (["warn", "warning"].includes(value)) return "warning";
-	return value;
 }
 
 function modernizationItemContext(item) {
@@ -2399,10 +2291,6 @@ function refreshModernizationFilterOptions(result = {}) {
 	apply(elements.modernizationPhase, optionsFor(allItems.map(modernizationItemPhase), state.modernization.phase, "All phases"), state.modernization.phase);
 }
 
-function modernizationItemKey(item) {
-	return item.itemFingerprint || item.id || item.itemId || item.findingId || item.transitionId || modernizationItemLabel(item);
-}
-
 function modernizationItemRouteId(item) {
 	return item.id || item.itemId || item.findingId || item.transitionId || modernizationItemKey(item);
 }
@@ -2427,6 +2315,19 @@ function modernizationEvidenceRefs(item = {}) {
 	}).filter((ref) => ref.label);
 }
 
+/**
+ * Some panes keep a header (a validation summary, or a "this section didn't
+ * complete" banner) alongside their item list, so the list must render into a
+ * nested child rather than the pane itself — pane.innerHTML would otherwise
+ * wipe that header on every re-render (e.g. after an item click). Panes with
+ * no such header still own the whole pane directly.
+ */
+function modernizationListContainer(pane) {
+	if (!pane) return pane;
+	const nested = pane.querySelector(".modernization-validation-items") || pane.querySelector(".modernization-pane-items");
+	return nested || pane;
+}
+
 function renderModernizationList(container, items) {
 	container.innerHTML = "";
 	const filtered = items.filter(modernizationItemMatches);
@@ -2443,7 +2344,7 @@ function renderModernizationList(container, items) {
 		card.querySelector(".modernization-item-title").textContent = modernizationItemLabel(item);
 		card.querySelector(".modernization-item-meta").textContent = modernizationItemMeta(item);
 		const decision = state.modernization.decisions[modernizationItemKey(item)] || item.decision || "undecided";
-		card.querySelector(".modernization-item-decision").textContent = ["legacy-unit", "context", "extract"].includes(item._modernizationType) ? "Evidence" : decision;
+		card.querySelector(".modernization-item-decision").textContent = item._modernizationType === "legacy-unit" ? "Evidence" : decision;
 		card.classList.toggle("is-selected", modernizationItemKey(item) === modernizationItemKey(state.modernization.selectedItem || {}));
 		container.appendChild(card);
 	});
@@ -2490,7 +2391,7 @@ function renderModernizationDetail(item) {
 		fields.append(dt, dd);
 	});
 	const key = modernizationItemKey(item);
-	const decisionTypes = ["target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample"];
+	const decisionTypes = ["target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample", "context", "extract"];
 	const canDecide = decisionTypes.includes(item._modernizationType);
 	if (!canDecide) {
 		const controls = detail.querySelector(".modernization-decision-controls");
@@ -2511,7 +2412,37 @@ function renderModernizationDetail(item) {
 	detail.querySelector(".secondary-button").addEventListener("click", async () => {
 		await clearModernizationDecision(item, detail.querySelector("p"));
 	});
+	if (["db-finding", "db-transition"].includes(item._modernizationType)) {
+		const rebuildSection = document.createElement("div");
+		rebuildSection.className = "modernization-decision-controls modernization-item-rebuild";
+		rebuildSection.innerHTML = `<label>Rebuild note <textarea rows="2" maxlength="1000" placeholder="Optional guidance for a redo of this item"></textarea></label><button type="button" class="secondary-button">Rebuild item</button><p role="status"></p>`;
+		rebuildSection.querySelector("button").addEventListener("click", async () => {
+			await rebuildModernizationItem(item, rebuildSection.querySelector("textarea").value, rebuildSection.querySelector("p"));
+		});
+		detail.appendChild(rebuildSection);
+	}
 	elements.modernizationItemDetail.appendChild(detail);
+}
+
+async function rebuildModernizationItem(item, note, statusElement) {
+	if (!state.activeRun?.id) return;
+	if (statusElement) statusElement.textContent = "Rebuilding item…";
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(modernizationItemRouteId(item))}/rebuild`, {
+			method: "POST",
+			body: JSON.stringify({
+				itemType: item._modernizationType,
+				itemFingerprint: item.itemFingerprint || "",
+				planFingerprint: state.modernization.result?.planFingerprint || "",
+				note: String(note || "").trim()
+			})
+		});
+		if (statusElement) statusElement.textContent = "Item rebuilt.";
+		if (payload?.data?.result) renderModernizationResult(payload.data.result);
+		else await loadResult(state.activeRun.id);
+	} catch (error) {
+		if (statusElement) statusElement.textContent = error.message || "Item rebuild failed.";
+	}
 }
 
 function renderModernizationDetailSummary(host, item = {}) {
@@ -2581,6 +2512,31 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Migration relation", item.relation || item.relationship || item.kind);
 		add("Transition notes", item.notes || item.description);
 		add("Confidence", item.confidence);
+	} else if (item._modernizationType === "context") {
+		add("Packaging", item.packaging === "coldbox-module" ? "ColdBox module candidate" : "Centralize (stay in the monolith)");
+		add("Purpose", item.purpose);
+		add("Why this grouping", item.recommendation);
+		add("Basis", modernizationEvidenceBasisNote(item));
+		add("Target units in this group", item.targetUnitIds);
+	} else if (item._modernizationType === "extract") {
+		add("Why extract", item.reason);
+		add("Suggested boundary", item.suggestedBoundary);
+		add("Data boundary", item.dataBoundaryNote);
+		add("Shared datasource risk", item.sharedDatasourceRisk);
+		add("Basis", modernizationEvidenceBasisNote(item));
+		add("Target units in this group", item.targetUnitIds);
+	} else if (item._modernizationType === "db-transition") {
+		add("Operation", item.operation);
+		add("Order", item.order);
+		add("Migration file", item.migrationPath);
+		add("Objects touched", item.objectsTouched);
+		add("Rollback", item.rollback);
+		add("Sample migration", item.sampleMigration || item.migrationCode, "modernization-code-sample");
+	} else if (item._modernizationType === "sample") {
+		add("Kind", item.sampleKind);
+		add("Target path", item.targetPath || item.path);
+		add("Language", item.language);
+		add("Code skeleton", item.code || item.sampleCode, "modernization-code-sample");
 	}
 	add("Validation issues", item._validationMessages);
 }
@@ -2773,12 +2729,22 @@ function renderModernizationResult(result = {}) {
 	};
 	Object.entries(paneRows).forEach(([pane, rows]) => {
 		const element = document.querySelector(`#modernization-pane-${pane}`);
-		if (element) renderModernizationList(element, rows);
+		if (!element) return;
+		const banner = modernizationPaneBanner(pane, result);
+		if (banner) {
+			element.innerHTML = `<p class="field-hint modernization-pane-banner">${banner}</p><div class="modernization-pane-items"></div>`;
+			renderModernizationList(modernizationListContainer(element), rows);
+		} else {
+			renderModernizationList(element, rows);
+		}
 	});
 	const validationPane = document.querySelector("#modernization-pane-validation");
 	if (validationPane) {
-		validationPane.innerHTML = `<div class="modernization-validation-summary"><strong>${validation.status || validation.overallStatus || "unknown"}</strong><span>${validation.blockingCount || validation.blockers || 0} blocking · ${validation.warningCount || validation.warnings || 0} warnings</span></div>`;
-		renderModernizationList(validationPane, (validation.items || validation.messages || []).map((item) => ({ ...item, _modernizationType: item.itemType || "validation" })));
+		// The summary counts and the item list are separate children so re-rendering
+		// the list later (e.g. after an item click) never wipes the summary — see
+		// modernizationListContainer().
+		validationPane.innerHTML = `<div class="modernization-validation-summary"><strong>${validation.status || validation.overallStatus || "unknown"}</strong><span>${validation.blockingCount || validation.blockers || 0} blocking · ${validation.warningCount || validation.warnings || 0} warnings</span></div><div class="modernization-validation-items"></div>`;
+		renderModernizationList(modernizationListContainer(validationPane), modernizationItems(result, "validation"));
 	}
 	const overviewPane = document.querySelector("#modernization-pane-overview");
 	if (overviewPane) overviewPane.innerHTML = `<p>${result.assumptions?.length || 0} assumptions · ${(result.signals || []).length} coupling signals · ${(result.samples || []).length} bounded samples</p><p class="field-hint">Every proposal item should point back to an evidence reference or be marked as a new proposal.</p>`;
@@ -2812,6 +2778,14 @@ function renderModernizationArchitecture(result = {}) {
 	const centralOnly = central.filter((item) => !modules.includes(item));
 	host.hidden = !(centralOnly.length || modules.length || extracts.length);
 	if (host.hidden) return;
+	const architectureCoverage = document.querySelector("#modernization-architecture-coverage");
+	if (architectureCoverage) {
+		const synthesized = result.metadata?.architectureSource === "synthesized";
+		architectureCoverage.hidden = !synthesized;
+		architectureCoverage.textContent = synthesized
+			? "This packaging view is a conservative default (everything centralized) — the architecture analysis step didn't complete for this run."
+			: "";
+	}
 	const fill = (selector, items, emptyText, { flagSpeculative = false } = {}) => {
 		const el = document.querySelector(selector);
 		if (!el) return;
@@ -2865,9 +2839,12 @@ function renderModernizationSolution(result = {}) {
 		const notYet = Number(road.notYetSliced ?? 0);
 		const schemaAbsent = (result.coverage?.schema?.coverage || "") === "absent";
 		coverageEl.hidden = false;
-		coverageEl.textContent = hollow
+		coverageEl.textContent = (hollow
 			? `Narrative road only · ${(result.inventory?.units || []).length} legacy units indexed · rerun to get file maps`
-			: `${onRoad} on road · ${notYet} not yet sliced${schemaAbsent ? " · schema inference-limited" : ""}`;
+			: `${onRoad} on road · ${notYet} not yet sliced${schemaAbsent ? " · schema inference-limited" : ""}`)
+			+ (result.metadata?.roadmapSource === "synthesized"
+				? " · Generic fallback road — the AI roadmap step didn't complete, so phases are grouped by file count, not by feature."
+				: "");
 	}
 	const stackEl = document.querySelector("#modernization-source-stack");
 	if (stackEl) {
@@ -3037,7 +3014,8 @@ function renderModernizationSolution(result = {}) {
 		dod.innerHTML = `<p class="field-hint">Select a roadmap phase to review definition of done.</p>`;
 	} else if (dod) {
 		const exit = Array.isArray(phase.exitCriteria) ? phase.exitCriteria : [];
-		const isCurrent = !!(phase.currentSlice || phase.id === phases.find((item) => item.currentSlice)?.id || phase.id === phases.find((item) => phaseHasCodeLinks(item))?.id || phase.id === phases[0]?.id);
+		const currentPhaseId = phases.find((item) => item.currentSlice)?.id ?? phases.find((item) => phaseHasCodeLinks(item))?.id ?? phases[0]?.id;
+		const isCurrent = phase.id === currentPhaseId;
 		const eyebrow = hollow ? "Narrative step (unmapped)" : mappedPhase ? "Slice definition of done" : "Setup step definition of done";
 		dod.innerHTML = `
 			<div class="modernization-guide-heading"><div><p class="eyebrow">${eyebrow}</p><h3></h3></div><span class="status-badge"></span></div>
@@ -3048,8 +3026,8 @@ function renderModernizationSolution(result = {}) {
 			<section class="modernization-dod-prompt"><h4>Implementer prompt</h4><pre></pre></section>
 			<label class="modernization-rebuild-note">Rebuild note <textarea id="modernization-rebuild-note" rows="2" maxlength="1000" placeholder="Optional guidance for a redo of this slice"></textarea></label>
 			<div class="modernization-dod-actions">
-				<button type="button" class="primary-button" data-slice-action="accept" ${isCurrent ? "" : "disabled"}>Accept slice</button>
-				<button type="button" class="secondary-button" data-slice-action="reject" ${isCurrent ? "" : "disabled"}>Reject slice</button>
+				<button type="button" class="primary-button" data-slice-action="accept" ${isCurrent ? "" : `disabled title="Only the current slice can be accepted or rejected — select it from the Road to act on it."`}>Accept slice</button>
+				<button type="button" class="secondary-button" data-slice-action="reject" ${isCurrent ? "" : `disabled title="Only the current slice can be accepted or rejected — select it from the Road to act on it."`}>Reject slice</button>
 				<button type="button" class="secondary-button" data-slice-action="rebuild">Rebuild slice</button>
 			</div>
 			<p class="form-message" id="modernization-slice-action-status" role="status"></p>`;
@@ -3114,6 +3092,32 @@ async function rebuildSlice(phase) {
 	}
 }
 
+/** One rolled-up line covering the whole plan (fallback sources, validation
+ * counts, undecided speculative packaging picks) so the user doesn't have to
+ * visit every band/tab to know if anything needs a second look. Empty string
+ * when there's nothing to flag. */
+function modernizationAttentionSummary(result = {}) {
+	const flags = [];
+	const metadata = result.metadata || {};
+	if (metadata.roadmapSource === "synthesized") flags.push("roadmap is a generic fallback");
+	if (metadata.architectureSource === "synthesized") flags.push("packaging is a conservative default");
+	const validation = result.validation || {};
+	const blocking = Number(validation.blocking ?? validation.blockingCount ?? 0);
+	const warnings = Number(validation.warnings ?? validation.warningCount ?? 0);
+	if (blocking) flags.push(`${blocking} blocking issue${blocking === 1 ? "" : "s"}`);
+	if (warnings) flags.push(`${warnings} warning${warnings === 1 ? "" : "s"}`);
+	const speculative = [
+		...(result.target?.contexts || result.contexts || []),
+		...(result.target?.extracts || result.extracts || [])
+	].filter((item) => String(item.evidenceBasis || "").toLowerCase() === "domain-clustering");
+	const undecided = speculative.filter((item) => {
+		const decision = state.modernization.decisions[modernizationItemKey(item)] || item.decision || "undecided";
+		return decision === "undecided";
+	});
+	if (undecided.length) flags.push(`${undecided.length} module/extract pick${undecided.length === 1 ? "" : "s"} still undecided`);
+	return flags.length ? `Needs attention: ${flags.join(" · ")}.` : "";
+}
+
 function renderModernizationTransitionGuide(result = {}) {
 	const host = document.querySelector("#modernization-transition-guide");
 	if (!host) return;
@@ -3126,8 +3130,11 @@ function renderModernizationTransitionGuide(result = {}) {
 	const hollow = modernizationPlanIsHollow(result);
 	const next = mapped.find((phase) => phase.currentSlice) || mapped[0] || phases.find((phase) => phase.currentSlice) || phases[0];
 	const list = (items, empty) => items.length ? `<ul>${items.map((item) => `<li>${item}</li>`).join("")}</ul>` : `<p class="field-hint">${empty}</p>`;
+	const attention = modernizationAttentionSummary(result);
+	const attentionLine = attention ? `<p class="modernization-guide-attention">${attention}</p>` : "";
 	if (hollow) {
 		host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">How to use this plan</p><h3>Rerun until file maps appear</h3></div><span class="status-badge">${runtime} · ${profile}</span></div>
+			${attentionLine}
 			<p class="modernization-guide-next"><strong>Blocked:</strong> the application proposal failed or produced no targets, so the Road is narrative-only. Confidence cards (repo limits / schema / AI partitions) are secondary.</p>
 			<div class="modernization-guide-grid">
 				<section><h4>1. What you still have</h4>${list([
@@ -3146,6 +3153,7 @@ function renderModernizationTransitionGuide(result = {}) {
 		return;
 	}
 	host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">How to use this plan</p><h3>Follow the Road, one slice at a time</h3></div><span class="status-badge">${runtime} · ${profile}</span></div>
+		${attentionLine}
 		<p class="modernization-guide-next"><strong>Next:</strong> ${next ? `Review <em>${next.name || next.id}</em> in the Solution bands below, check exit criteria, then Accept or Rebuild that slice.` : "Complete a Modernize run to generate roadmap slices."}</p>
 		<div class="modernization-guide-grid">
 			<section><h4>1. Pick a Road step</h4>${list([
@@ -5436,7 +5444,8 @@ elements.modernizationResults?.addEventListener("click", (event) => {
 	if (!itemButton || !state.modernization.result) return;
 	const rows = modernizationItems(state.modernization.result, state.modernization.activePane);
 	state.modernization.selectedItem = rows.find((item) => modernizationItemKey(item) === itemButton.dataset.modernizationItem) || null;
-	renderModernizationList(document.querySelector(`#modernization-pane-${state.modernization.activePane}`), rows);
+	const pane = document.querySelector(`#modernization-pane-${state.modernization.activePane}`);
+	if (pane) renderModernizationList(modernizationListContainer(pane), rows);
 	renderModernizationDetail(state.modernization.selectedItem);
 });
 

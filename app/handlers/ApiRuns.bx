@@ -261,6 +261,36 @@ class extends="coldbox.system.RestHandler" {
 		}
 	}
 
+	/**
+	 * Rebuild a single db-finding or db-transition in isolation (no roadmap
+	 * phase scope), for items that don't have a phase to rebuild through.
+	 *
+	 * @tags Runs
+	 * @response-200 Rebuilt item and refreshed plan result
+	 * @response-404 Run or item not found
+	 * @response-409 Plan or item changed since the client last fetched it
+	 */
+	function rebuildModernizationItem( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) body = {};
+			var rebuilt = modernizationSliceRebuildService.rebuildItem( run, body.itemType ?: rc.itemType ?: "", rc.itemId ?: "", body );
+			event.renderData( type = "json", data = { data: rebuilt } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ModernizationRebuildException" error ) {
+			event.renderData( statusCode = 400, type = "json", data = { error: { code: "modernization_rebuild_failed", message: error.message } } );
+		} catch ( "AIConfigurationException" error ) {
+			event.renderData( statusCode = 503, type = "json", data = { error: { code: "ai_unavailable", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
 	function updateFindingReview( event, rc, prc ) {
 		var run = runService.getScoped(
 				rc.id ?: "",

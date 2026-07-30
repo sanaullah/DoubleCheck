@@ -319,6 +319,69 @@ class extends="testbox.system.BaseSpec" {
 				expect( ( result.notes ?: result.plan.generationNotes ?: [] ).filter( ( item ) => item.message == "synthesized-from-application-maps" ) ).notToBeEmpty();
 			} );
 
+			it( "follows real architecture groupings into the synthesized roadmap instead of a count-based split", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "cfg-1", targetPath: "app/config/Coldbox.bx", sourcePath: "config/Coldbox.cfc", purpose: "config" },
+							{ id: "songs-1", targetPath: "app/handlers/Songs.bx", sourcePath: "handlers/Songs.cfc", purpose: "songs" },
+							{ id: "artists-1", targetPath: "app/models/services/ArtistService.bx", sourcePath: "model/ArtistService.cfc", purpose: "artists" },
+							{ id: "portal-1", targetPath: "app/handlers/Portal.bx", sourcePath: "handlers/Portal.cfc", purpose: "portal" },
+							{ id: "feedback-1", targetPath: "app/handlers/Feedback.bx", sourcePath: "handlers/Feedback.cfc", purpose: "feedback" }
+						],
+						unitLinks: [
+							{ id: "link-songs", targetUnitId: "songs-1", legacyUnitId: "songs-legacy", evidenceRefs: [ { filePath: "handlers/Songs.cfc", startLine: 1, endLine: 1 } ] },
+							{ id: "link-portal", targetUnitId: "portal-1", legacyUnitId: "portal-legacy", evidenceRefs: [ { filePath: "handlers/Portal.cfc", startLine: 1, endLine: 1 } ] }
+						],
+						routeContracts: [
+							{ id: "route-songs", path: "/songs", method: "GET", targetUnitId: "songs-1", unitLinkId: "link-songs", evidence: [ { filePath: "handlers/Songs.cfc", startLine: 1, endLine: 1 } ] },
+							{ id: "route-portal", path: "/portal", method: "GET", targetUnitId: "portal-1", unitLinkId: "link-portal", evidence: [ { filePath: "handlers/Portal.cfc", startLine: 1, endLine: 1 } ] }
+						],
+						contexts: [],
+						extracts: [],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-songs", name: "Songs and Artists", targetUnitIds: [ "songs-1", "artists-1" ], packaging: "coldbox-module", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-portal", name: "Portal", targetUnitIds: [ "portal-1" ], packaging: "centralized", evidenceBasis: "explicit-seam" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": { throw: true, message: "cost-budget-exceeded" }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-synth-road-grouped",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var phases = result.plan.roadmapPhases;
+				var phaseNames = phases.map( ( phase ) => phase.name );
+				expect( phaseNames ).toInclude( "Songs and Artists" );
+				expect( phaseNames ).toInclude( "Portal" );
+				expect( phaseNames ).notToInclude( "First vertical slice" );
+				var songsPhase = phases.filter( ( phase ) => phase.name == "Songs and Artists" )[ 1 ];
+				expect( songsPhase.unitIds ).toHaveLength( 2 );
+				expect( songsPhase.unitIds ).toInclude( "songs-1" );
+				expect( songsPhase.unitIds ).toInclude( "artists-1" );
+				expect( songsPhase.routeIds ).toInclude( "route-songs" );
+				var portalPhase = phases.filter( ( phase ) => phase.name == "Portal" )[ 1 ];
+				expect( portalPhase.unitIds ).toBe( [ "portal-1" ] );
+				expect( portalPhase.routeIds ).toInclude( "route-portal" );
+				// feedback-1 belongs to no context; it must still land somewhere, not be dropped.
+				var strangler = phases.filter( ( phase ) => phase.id == "phase-continue-strangler" );
+				expect( strangler ).notToBeEmpty();
+				expect( strangler[ 1 ].unitIds ).toInclude( "feedback-1" );
+				expect( phases.filter( ( phase ) => phase.currentSlice ?: false ) ).toHaveLength( 1 );
+			} );
+
 			it( "does not reserve disabled downstream-role budget from an application-only run", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": {

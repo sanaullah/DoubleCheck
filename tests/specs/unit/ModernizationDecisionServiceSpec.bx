@@ -49,6 +49,31 @@ class extends="testbox.system.BaseSpec" {
 				expect( repo.listDecisionEvents( "run-1" ).some( ( item ) => item.action == "cleared-stale" ) ).toBeTrue();
 			} );
 
+			it( "decides on packaging contexts and extracts without counting them as required", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: {
+						units: [],
+						contexts: [ { id: "ctx-1", itemFingerprint: "ctx-fp", packaging: "coldbox-module" } ],
+						extracts: [ { id: "ext-1", itemFingerprint: "ext-fp" } ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: []
+				} );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				var contextResult = service.decide( run, "ctx-1", { itemType: "context", itemFingerprint: "ctx-fp", decision: "accepted" } );
+				expect( contextResult.state.required ).toBe( 0 );
+				expect( contextResult.state.accepted ).toBe( 0 );
+				var extractResult = service.decide( run, "ext-1", { itemType: "extract", itemFingerprint: "ext-fp", decision: "rejected" } );
+				expect( extractResult.state.required ).toBe( 0 );
+				var decisions = repo.listDecisions( run.getId() );
+				expect( decisions.some( ( d ) => d.itemType == "context" && d.itemId == "ctx-1" && d.decision == "accepted" ) ).toBeTrue();
+				expect( decisions.some( ( d ) => d.itemType == "extract" && d.itemId == "ext-1" && d.decision == "rejected" ) ).toBeTrue();
+				expect( () => service.decide( run, "ctx-1", { itemType: "context", itemFingerprint: "stale-fp", decision: "accepted" } ) ).toThrow( type = "ModernizationDecisionConflict" );
+				var cleared = service.clear( run, "ext-1", { itemType: "extract", itemFingerprint: "ext-fp", planFingerprint: "plan-fp" } );
+				expect( cleared.decisions.some( ( d ) => d.itemType == "extract" && d.itemId == "ext-1" ) ).toBeFalse();
+			} );
+
 			it( "cascades roadmap-phase acceptance to linked target units and routes", () => {
 				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
 					target: { units: [ { id: "tu-1", itemFingerprint: "tu-fp" } ] },

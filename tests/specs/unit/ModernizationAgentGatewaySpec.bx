@@ -44,6 +44,34 @@ class extends="testbox.system.BaseSpec" {
 				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeTrue();
 			} );
 
+			it( "honors a per-call maxRetries:1 override for the truncation-shrink retry", () => {
+				// ModernizationProposalService now passes maxRetries:1 explicitly for the
+				// whole-repo architecture/roadmap roles (previously 0, which made the
+				// shrink-and-retry mitigation below unreachable for them). Prove the
+				// per-call option — not just the service-level default used by the test
+				// above — is what actually governs the retry.
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					responses = [
+						'{ "roadmapPhases": [ { "id": "phase-1", "name": "Truncated',
+						jsonSerialize( { roadmapPhases: [ { id: "phase-1", name: "Foundation" } ], samples: [], assumptions: [] } )
+					]
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var result = service.run(
+					"run-roadmap-truncate",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ maxRetries: 1, budgets: { maxIterations: 3, maxTokensPerTask: 12000 } }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.roadmapPhases[ 1 ].id ).toBe( "phase-1" );
+				expect( chat.callCount() ).toBe( 2 );
+			} );
+
 			it( "returns a bounded provider failure after malformed JSON retries", () => {
 				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "not-json" );
 				var service = new app.models.services.ModernizationAgentGateway();

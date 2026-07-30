@@ -96,6 +96,81 @@ class extends="testbox.system.BaseSpec" {
 					if ( directoryExists( testRoot ) ) directoryDelete( testRoot, true );
 				}
 			} );
+
+			describe( "rebuildItem", () => {
+				var buildService = () => {
+					var service = new app.models.services.ModernizationSliceRebuildService();
+					service.agentFactory = new app.models.services.ModernizationAgentFactory();
+					service.identityService = new app.models.services.ModernizationIdentityService();
+					service.validationService = new app.models.services.ModernizationValidationService();
+					service.secretRedactionService = new app.models.services.SecretRedactionService();
+					service.runService = { getResult: ( runId ) => ( {} ) };
+					return service;
+				};
+				var basePlan = () => ( {
+					schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					target: { units: [], contexts: [], extracts: [] },
+					inventory: {}, schemaEvidence: { sourceKind: "auto-discovered", tables: [ { name: "crime" } ] },
+					unitLinks: [], routeContracts: [], samples: [], roadmapPhases: [],
+					dbFindings: [ { id: "db-finding-1", itemFingerprint: "fp-old", category: "index", severity: "medium", evidenceRefs: [ "schemaEvidence-tables-crime" ] } ],
+					dbTransitions: []
+				} );
+
+				it( "replaces a db-finding by fingerprint and refreshes decision state", () => {
+					var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = basePlan() );
+					var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+						"modernization-item-rebuild": { dbFindings: [ { id: "db-finding-1", category: "index", severity: "high", objectRef: "crime", problem: "tightened", proposedChange: "add index", evidenceRefs: [ "schemaEvidence-tables-crime" ] } ], dbTransitions: [] }
+					} );
+					var service = buildService();
+					service.modernizationRepository = repo;
+					service.agentGateway = gateway;
+					service.decisionService = new app.models.services.ModernizationDecisionService();
+					service.decisionService.modernizationRepository = repo;
+					var run = new tests.resources.ScriptedModernizationRun();
+					var result = service.rebuildItem( run, "db-finding", "db-finding-1", { itemFingerprint: "fp-old" } );
+					expect( result.rebuild.itemId ).toBe( "db-finding-1" );
+					var saved = repo.planRecord.plan.dbFindings.filter( ( item ) => item.id == "db-finding-1" )[ 1 ];
+					expect( saved.severity ).toBe( "high" );
+					expect( saved.itemFingerprint ).notToBe( "fp-old" );
+				} );
+
+				it( "rejects a rebuild fragment that targets a different item id", () => {
+					var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = basePlan() );
+					var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+						"modernization-item-rebuild": { dbFindings: [ { id: "db-finding-other", category: "index" } ], dbTransitions: [] }
+					} );
+					var service = buildService();
+					service.modernizationRepository = repo;
+					service.agentGateway = gateway;
+					service.decisionService = new app.models.services.ModernizationDecisionService();
+					service.decisionService.modernizationRepository = repo;
+					var run = new tests.resources.ScriptedModernizationRun();
+					expect( () => service.rebuildItem( run, "db-finding", "db-finding-1", { itemFingerprint: "fp-old" } ) )
+						.toThrow( type = "ModernizationRebuildException" );
+				} );
+
+				it( "conflicts when the item fingerprint is stale", () => {
+					var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = basePlan() );
+					var service = buildService();
+					service.modernizationRepository = repo;
+					service.agentGateway = new tests.resources.ScriptedModernizationGateway();
+					service.decisionService = new app.models.services.ModernizationDecisionService();
+					service.decisionService.modernizationRepository = repo;
+					var run = new tests.resources.ScriptedModernizationRun();
+					expect( () => service.rebuildItem( run, "db-finding", "db-finding-1", { itemFingerprint: "stale-fp" } ) )
+						.toThrow( type = "ModernizationDecisionConflict" );
+				} );
+
+				it( "rejects item types other than db-finding/db-transition", () => {
+					var service = buildService();
+					service.modernizationRepository = new tests.resources.ScriptedModernizationDecisionRepository( plan = basePlan() );
+					service.agentGateway = new tests.resources.ScriptedModernizationGateway();
+					var run = new tests.resources.ScriptedModernizationRun();
+					expect( () => service.rebuildItem( run, "context", "ctx-1", {} ) )
+						.toThrow( type = "ValidationException" );
+				} );
+			} );
 		} );
 	}
 }

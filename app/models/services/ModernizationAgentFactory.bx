@@ -28,7 +28,7 @@ class {
 		struct budgets = {}
 	) {
 		var safeRole = lCase( trim( arguments.role ) );
-		if ( ![ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-architecture", "modernization-repair", "modernization-slice-rebuild" ].contains( safeRole ) ) {
+		if ( ![ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-architecture", "modernization-repair", "modernization-slice-rebuild", "modernization-item-rebuild" ].contains( safeRole ) ) {
 			throw( type = "ValidationException", message = "Unsupported modernization agent role" );
 		}
 		var runtimeName = trim( arguments.runtime.runtime ?: "" );
@@ -93,6 +93,11 @@ class {
 				return "Rebuild only roadmap phase `#phaseId#` and its linked target units, unitLinks, routeContracts, samples, and related db findings/transitions. Honor the user note when present: `#note#`. Do not rewrite unrelated phases. Improve idiomatic ColdBox naming and sample-contract compliance using the supplied legacy evidence pack. Emit a fragment with targetUnits, unitLinks, routeContracts, roadmapPhase, samples, and optional dbFindings/dbTransitions arrays.";
 			case "modernization-architecture":
 				return "Analyze the FULL aggregated target unit map, unitLinks, routeContracts, and coupling signals across the whole repository at once — not a narrow shard window. Group units that share one feature domain into a context (packaging centralized or coldbox-module); identify true side-app/microservice extract candidates separately. Prefer centralized packaging by default. Tier every non-centralized context and every extract as evidenceBasis=explicit-seam (genuine runtime/deployment seam plus data-boundary evidence: distinct datasource, outbound remote/HTTP call, scheduled or worker boundary) or evidenceBasis=domain-clustering (no seam yet, but a clear shared purpose, naming pattern, or coupling signal ties multiple units together); label domain-clustering picks as speculative in the recommendation text and never imply deployment isolation for them. Every context and extract needs targetUnitIds, evidenceRefs, evidenceBasis, and a short recommendation. Leave units that do not fit a coherent group uncovered rather than forcing a context. Do not invent units, signals, or evidence not present in the supplied map.";
+			case "modernization-item-rebuild":
+				var rebuildItemType = trim( arguments.evidence.itemType ?: "" );
+				var rebuildItemId = trim( arguments.evidence.itemId ?: "" );
+				var rebuildNote = trim( arguments.evidence.note ?: "" );
+				return "Rebuild only the single #rebuildItemType# with id `#rebuildItemId#`. Return exactly one replacement item with that same id in the matching array (dbFindings for a db-finding, dbTransitions for a db-transition) and leave the other array empty. Honor the user note when present: `#rebuildNote#`. Use only the supplied prior item and schemaEvidence; do not invent tables, columns, indexes, or procedures not already present there. Do not widen scope to other findings or transitions.";
 			default:
 				return "After application and database fragments are merged, produce a concise ordered roadmap using ONLY IDs present in the merged plan. Preserve coexistence. When target.contexts or target.extracts already group units into coherent feature domains, prefer one phase per coherent group over one catch-all phase — a group's targetUnitIds is a strong hint for that phase's unitIds. Only fall back to a single combined phase when no such grouping exists. Each phase needs goal/pattern, earlier-phase dependencies, linked unit/route/finding/transition ids, parity intent, exitCriteria, rollback, implementerPrompt, and linked sample ids. Put route IDs only in routeIds and target-unit IDs only in unitIds. Mark exactly one actionable mapped phase currentSlice=true. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions. Deduplicate assumptions and omit assumptions already represented by evidence.";
 		}
@@ -134,14 +139,27 @@ class {
 				dbTransitions: "array"
 			};
 		}
+		if ( arguments.role == "modernization-item-rebuild" ) {
+			return {
+				dbFindings: [ { id: "string", category: "type|constraint|index|design|cf-sql-mismatch|coverage", severity: "blocker|high|medium|low|info", objectRef: "string", problem: "string", proposedChange: "string", expandContract: "expand|backfill|contract|safe-now|defer", relatedLegacyUnitIds: [ "string" ], relatedTargetUnitIds: [ "string" ], evidenceRefs: [ "evidence-id" ], confidence: "0..1", validationStatus: "string" } ],
+				dbTransitions: [ { id: "string", dbFindingId: "string", operation: "expand|backfill|switch|contract", order: 1, migrationPath: "resources/database/migrations/YYYY_MM_DD_HHMMSS_name.bx", objectsTouched: [ "string" ], sampleMigration: "bounded up/down skeleton", rollback: "string", irreversible: false, evidenceRefs: [ "evidence-id" ] } ]
+			};
+		}
 		return { roadmapPhases: [ { id: "string", name: "string", goal: "string", pattern: "string", dependencies: [ "phase-id" ], unitIds: [ "string" ], routeIds: [ "string" ], dbFindingIds: [ "string" ], transitionIds: [ "string" ], parityIntent: "string", exitCriteria: [ "string" ], rollback: "string", implementerPrompt: "string", sampleIds: [ "string" ], currentSlice: false } ], samples: "array", assumptions: "array" };
 	}
 
 	private struct function boundedEvidence( required struct evidence, string role = "" ) {
 		var result = {};
+		// Architecture and roadmap see the whole repository map, not a 2-file shard —
+		// they need more room than a single application shard call needs per call, not
+		// less. 40000 stays below application's 48000 (shard scans include raw source
+		// excerpts; the whole-repo passes only see the already-compacted unit/link/route
+		// map via compactArchitectureEvidence/compactRoadmapEvidence).
 		var characterLimit = arguments.role == "modernization-application"
 			? 48000
-			: ( arguments.role == "modernization-database" ? 30000 : 24000 );
+			: ( arguments.role == "modernization-database"
+				? 30000
+				: ( [ "modernization-architecture", "modernization-roadmap" ].contains( arguments.role ) ? 40000 : 24000 ) );
 		var source = arguments.role == "modernization-roadmap"
 			? compactRoadmapEvidence( arguments.evidence )
 			: ( arguments.role == "modernization-architecture" ? compactArchitectureEvidence( arguments.evidence ) : arguments.evidence );
@@ -153,7 +171,9 @@ class {
 					? [ "invalidItems", "validation", "inventory", "schemaEvidence", "context" ]
 					: ( arguments.role == "modernization-architecture"
 						? [ "target", "unitLinks", "routeContracts", "signals", "coverage" ]
-						: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "coverage", "assumptions" ] ) ) );
+						: ( arguments.role == "modernization-item-rebuild"
+							? [ "priorItem", "schemaEvidence" ]
+							: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "coverage", "assumptions" ] ) ) ) );
 		var included = {};
 		for ( var key in orderedKeys ) {
 			if ( !source.keyExists( key ) ) continue;
