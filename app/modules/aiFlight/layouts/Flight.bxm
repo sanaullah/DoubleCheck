@@ -74,6 +74,17 @@
 	}
 	.brand span { color: var(--muted); font-weight: 450; font-size: 0.8rem; }
 	.meta { color: var(--muted); font-size: var(--text-sm); }
+	.stats-bar {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		margin-left: auto;
+		font-size: var(--text-sm);
+		font-family: var(--mono);
+		color: var(--muted);
+		white-space: nowrap;
+	}
+	.stats-bar .stat-chip b { color: var(--text); font-weight: 600; }
 	.workspace {
 		display: grid;
 		grid-template-columns: var(--list-w) 1fr;
@@ -697,6 +708,7 @@
 		<header class="top">
 			<h1 class="brand"><span class="brand-mark">AF</span> AiFlight <span>local traces</span></h1>
 			<div class="meta">Waterfall · sessions · replay</div>
+			<div class="stats-bar" id="stats-bar" aria-label="Usage totals"></div>
 		</header>
 		<bx:output>#view()#</bx:output>
 	</div>
@@ -762,6 +774,26 @@
 			if (n < 1000) return n + " ms";
 			if (n < 60000) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + " s";
 			return Math.floor(n / 60000) + "m " + Math.round((n % 60000) / 1000) + "s";
+		}
+
+		function liveDur(status, startTime, durationMs) {
+			if (status === "running") {
+				const start = parseMs(startTime);
+				if (start != null) return formatDuration(Date.now() - start) + "…";
+			}
+			return formatDuration(durationMs);
+		}
+
+		function durSpan(status, startTime, durationMs) {
+			return `<span class="live-dur" data-status="${esc(status || "")}" data-start="${esc(startTime || "")}" data-static="${Number(durationMs) || 0}">${esc(liveDur(status, startTime, durationMs))}</span>`;
+		}
+
+		function tickLiveDurations() {
+			document.querySelectorAll('.live-dur[data-status="running"]').forEach((el) => {
+				const start = parseMs(el.getAttribute("data-start"));
+				if (start == null) return;
+				el.textContent = formatDuration(Date.now() - start) + "…";
+			});
 		}
 
 		function formatCost(usageOrCost) {
@@ -1073,7 +1105,7 @@
 				</div>
 				<div class="trace-item-meta mono">
 					<time class="when" data-when="${started}">${esc(formatWhen(t.startedAt))}</time>
-					· ${esc(formatDuration(t.durationMs))}
+					· ${durSpan(t.status, t.startedAt, t.durationMs)}
 					· ${esc(t.totalTokens || 0)} tok
 					${cost ? " · $" + esc(cost) : ""}
 					· ${esc(t.observationCount || 0)} steps
@@ -1183,7 +1215,7 @@
 						<span class="obs-type ${type}">${type}</span>
 						<span class="obs-name" title="${esc(o.name || "")}">${esc(o.name || "")}</span>
 						<span class="badge ${esc(o.status || "")}">${esc(o.status || "")}</span>
-						<span class="obs-meta">${esc(formatDuration(o.durationMs))}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time></span>
+						<span class="obs-meta">${durSpan(o.status, o.startTime, o.durationMs)}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time></span>
 					</div>
 					<div class="obs-body">${body}</div>
 					${childHtml ? `<div class="obs-children">${childHtml}</div>` : ""}
@@ -1219,7 +1251,7 @@
 				const metaEl = node.querySelector(":scope > .obs-head .obs-meta");
 				if (metaEl) {
 					const cost = formatCost(o.usage);
-					metaEl.innerHTML = `${esc(formatDuration(o.durationMs))}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time>`;
+					metaEl.innerHTML = `${durSpan(o.status, o.startTime, o.durationMs)}${cost ? " · $" + esc(cost) : ""} · <time data-when="${esc(o.startTime || "")}">${esc(formatWhen(o.startTime))}</time>`;
 				}
 			});
 			return true;
@@ -1285,7 +1317,7 @@
 		function statsHtml(t, cost) {
 			return `
 				<div class="stat"><span>Started</span><b><time data-when="${esc(t.startedAt || "")}">${esc(formatWhen(t.startedAt))}</time></b></div>
-				<div class="stat"><span>Duration</span><b>${esc(formatDuration(t.durationMs))}</b></div>
+				<div class="stat"><span>Duration</span><b>${durSpan(t.status, t.startedAt, t.durationMs)}</b></div>
 				<div class="stat"><span>Tokens</span><b>${esc(t.totalTokens || 0)} <span class="muted">(p ${esc(t.promptTokens || 0)} / c ${esc(t.completionTokens || 0)})</span></b></div>
 				${cost ? `<div class="stat"><span>Cost</span><b>$${esc(cost)}</b></div>` : ""}
 				<div class="stat"><span>Model</span><b class="mono">${esc(t.model || "-")}</b></div>
@@ -1400,7 +1432,7 @@
 					<div class="replay-turn-meta">
 						<strong>${esc(t.name || "trace")}</strong>
 						<span class="badge ${esc(t.status || "")}">${esc(t.status || "")}</span>
-						<span>${esc(formatDuration(t.durationMs))}</span>
+						<span>${durSpan(t.status, t.startedAt, t.durationMs)}</span>
 						<span>${esc(t.totalTokens || 0)} tok</span>
 						${cost ? `<span>$${esc(cost)}</span>` : ""}
 						<span><time data-when="${esc(t.startedAt || "")}">${esc(formatWhen(t.startedAt))}</time></span>
@@ -1658,6 +1690,29 @@
 			});
 		});
 
+		let statsFp = "";
+		async function pollStats() {
+			try {
+				const res = await fetch("/aiflight/api/stats", { headers: { Accept: "application/json" } });
+				if (!res.ok) return;
+				const s = await res.json();
+				const fp = [s.traceCount, s.totalTokens, s.totalCost, s.todayTraceCount, s.todayTokens, s.todayCost, s.errorCount].join(":");
+				if (fp === statsFp) return;
+				statsFp = fp;
+				const bar = document.getElementById("stats-bar");
+				if (!bar) return;
+				const todayCost = formatCost(s.todayCost);
+				const totalCost = formatCost(s.totalCost);
+				bar.innerHTML = `
+					<span class="stat-chip">Today <b>${esc(s.todayTraceCount || 0)}</b> traces${todayCost ? ` · <b>$${esc(todayCost)}</b>` : ""}</span>
+					<span class="stat-chip">All-time <b>${esc(s.traceCount || 0)}</b> traces${totalCost ? ` · <b>$${esc(totalCost)}</b>` : ""}</span>
+					${s.errorCount ? `<span class="stat-chip">${esc(s.errorCount)} error${s.errorCount === 1 ? "" : "s"}</span>` : ""}
+				`;
+			} catch (e) {
+
+			}
+		}
+
 		async function pollList() {
 			try {
 				if (mode === "sessions") {
@@ -1722,11 +1777,16 @@
 			if (first) selectTrace(first.getAttribute("data-id"), true);
 		}
 
-		if (pollSeconds >= 1) setInterval(pollList, pollSeconds * 1000);
+		pollStats();
+		if (pollSeconds >= 1) {
+			setInterval(pollList, pollSeconds * 1000);
+			setInterval(pollStats, pollSeconds * 1000);
+		}
 		setInterval(() => {
 			hydrateTimes(listEl);
 			hydrateTimes(detailEl);
 		}, 30000);
+		setInterval(tickLiveDurations, 1000);
 		window.addEventListener("hashchange", () => {
 			const h = idFromHash();
 			if (!h) return;

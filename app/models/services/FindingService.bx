@@ -24,14 +24,18 @@ class {
 			var language = file.language ?: "";
 			var allowJsDynamic = language == "JavaScript";
 			var allowCfSql = language == "CFML" || language == "BoxLang";
-			var allowEmptyCatch = allowJsDynamic || allowCfSql;
+			var isJava = language == "Java";
+				var allowEmptyCatch = allowJsDynamic || allowCfSql || isJava;
 				var isCfml = language == "CFML";
 				var inCfQueryBlock = false;
 				var cfQueryHasInterpolation = false;
 				var cfQueryHasParam = false;
 				var cfQueryStartLine = 0;
+				var cfQueryOpenLine = 0;
 				var cfQueryEvidence = "";
 				var inCfFunctionBlock = false;
+				var inScriptFunctionBlock = false;
+				var scriptFunctionDepth = 0;
 				if ( isCfml && reFindNoCase( "Application\.cfc$", file.filePath ) ) {
 					var applicationSource = arrayToList( file.lines, char( 10 ) );
 					var missingHooks = [];
@@ -148,6 +152,7 @@ class {
 					if ( reFindNoCase( "<cfquery\b", sourceLine ) ) {
 						inCfQueryBlock = true;
 						cfQueryStartLine = lineNumber;
+						cfQueryOpenLine = lineNumber;
 						cfQueryEvidence = evidence;
 						cfQueryHasInterpolation = false;
 						cfQueryHasParam = false;
@@ -156,7 +161,14 @@ class {
 						if ( reFindNoCase( "<cfqueryparam\b", sourceLine ) ) {
 							cfQueryHasParam = true;
 						}
-						if ( reFindNoCase( "\b(SELECT|INSERT|UPDATE|DELETE)\b", sourceLine ) && reFind( "##[^##]+##", sourceLine ) ) {
+						// The opening tag line often interpolates only tag attributes
+						// (e.g. datasource="#dsn#"), not SQL text, so require a SQL
+						// verb on that specific line; any later line in the block is
+						// SQL body and counts on its own (queries commonly split the
+						// verb and the interpolated clause across lines).
+						var looksLikeSqlBody = lineNumber != cfQueryOpenLine ||
+							reFindNoCase( "\b(SELECT|INSERT|UPDATE|DELETE)\b", sourceLine );
+						if ( looksLikeSqlBody && reFind( "##[^##]+##", sourceLine ) ) {
 							cfQueryHasInterpolation = true;
 						}
 						if ( reFindNoCase( "</cfquery>", sourceLine ) ) {
@@ -185,7 +197,21 @@ class {
 					if ( reFindNoCase( "<cffunction\b", sourceLine ) ) {
 						inCfFunctionBlock = true;
 					}
-					if ( inCfFunctionBlock && reFindNoCase( "<cfset\s+(?!var\b)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) ) {
+					// Script functions have no closing tag to key off, so track brace
+					// depth from the opening "function ... {" line back to 0 instead.
+					if ( !inScriptFunctionBlock && reFindNoCase( "^\s*(?:(?:public|private|package|remote|static|final)\s+)*(?:[A-Za-z_][A-Za-z0-9_.$]*\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*\{", sourceLine ) ) {
+						inScriptFunctionBlock = true;
+						scriptFunctionDepth = braceDelta( sourceLine );
+					} else if ( inScriptFunctionBlock ) {
+						scriptFunctionDepth += braceDelta( sourceLine );
+						if ( scriptFunctionDepth <= 0 ) {
+							inScriptFunctionBlock = false;
+						}
+					}
+					if (
+						( inCfFunctionBlock && reFindNoCase( "<cfset\s+(?!var\b)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) ) ||
+						( inScriptFunctionBlock && reFindNoCase( "^\s*(?!var\s)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) )
+					) {
 						findings.append(
 								build(
 									category   = "reliability",
@@ -193,7 +219,7 @@ class {
 									severity   = "medium",
 									confidence = .75,
 									title      = "Function assigns a variable without var scoping",
-									message    = "The assignment inside <cffunction> has no var/local scope, so it leaks into a shared scope and can be overwritten by concurrent requests.",
+									message    = "The assignment inside the function has no var/local scope, so it leaks into a shared scope and can be overwritten by concurrent requests.",
 									filePath   = file.filePath,
 									startLine  = lineNumber,
 									endLine    = lineNumber,
@@ -207,15 +233,16 @@ class {
 						inCfFunctionBlock = false;
 					}
 
-					if ( reFindNoCase( "<cf(include|module)\b", sourceLine ) && reFindNoCase( "template\s*=\s*[""'][^""']*##[^""']*##", sourceLine ) ) {
+					// Script: include "path/#value#.cfm";
+					if ( reFindNoCase( "^\s*include\s+[""'][^""']*##[^""']*##[^""']*[""']", sourceLine ) ) {
 						findings.append(
 								build(
 									category   = "security",
 									ruleId     = "cfml/dynamic-include-path",
 									severity   = "high",
 									confidence = .85,
-									title      = "Include/module path is built from an interpolated value",
-									message    = "The template path is assembled with an interpolated value, which can let an attacker include an unintended file.",
+									title      = "Include path is built from an interpolated value",
+									message    = "The include path is assembled with an interpolated value, which can let an attacker include an unintended file.",
 									filePath   = file.filePath,
 									startLine  = lineNumber,
 									endLine    = lineNumber,
@@ -226,20 +253,122 @@ class {
 							);
 					}
 
-					if ( reFindNoCase( "<cflock\b", sourceLine ) && !reFindNoCase( "\b(scope|name)\s*=", sourceLine ) ) {
+					if ( reFindNoCase( "<cf(include|module)\b", sourceLine ) ) {
+						var includeTag = joinTagLines( file.lines, lineNumber );
+						if ( reFindNoCase( "template\s*=\s*[""'][^""']*##[^""']*##", includeTag.text ) ) {
+							findings.append(
+									build(
+										category   = "security",
+										ruleId     = "cfml/dynamic-include-path",
+										severity   = "high",
+										confidence = .85,
+										title      = "Include/module path is built from an interpolated value",
+										message    = "The template path is assembled with an interpolated value, which can let an attacker include an unintended file.",
+										filePath   = file.filePath,
+										startLine  = lineNumber,
+										endLine    = includeTag.endLine,
+										evidence   = evidence,
+										suggestion = "Resolve the target against an allow-listed set of template names instead of interpolating untrusted input into the path.",
+										source     = "deterministic"
+									)
+								);
+						}
+					}
+
+					if ( reFindNoCase( "<cflock\b", sourceLine ) ) {
+						var cflockTag = joinTagLines( file.lines, lineNumber );
+						if ( !reFindNoCase( "\b(scope|name)\s*=", cflockTag.text ) ) {
+							findings.append(
+									build(
+										category   = "reliability",
+										ruleId     = "cfml/deprecated-cflock-scope",
+										severity   = "medium",
+										confidence = .8,
+										title      = "cflock is missing an explicit scope or name",
+										message    = "The <cflock> tag has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
+										filePath   = file.filePath,
+										startLine  = lineNumber,
+										endLine    = cflockTag.endLine,
+										evidence   = evidence,
+										suggestion = "Add scope=""..."" or name=""..."" so the lock covers only the resource it protects.",
+										source     = "deterministic"
+									)
+								);
+						}
+					}
+
+					// Script: lock scope="session" timeout="10" { ... }
+					if ( reFindNoCase( "^\s*lock\b[^{]*\{", sourceLine ) && !reFindNoCase( "\b(scope|name)\s*=", sourceLine ) ) {
 						findings.append(
 								build(
 									category   = "reliability",
 									ruleId     = "cfml/deprecated-cflock-scope",
 									severity   = "medium",
 									confidence = .8,
-									title      = "cflock is missing an explicit scope or name",
-									message    = "The <cflock> tag has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
+									title      = "lock is missing an explicit scope or name",
+									message    = "The lock statement has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
 									filePath   = file.filePath,
 									startLine  = lineNumber,
 									endLine    = lineNumber,
 									evidence   = evidence,
 									suggestion = "Add scope=""..."" or name=""..."" so the lock covers only the resource it protects.",
+									source     = "deterministic"
+								)
+							);
+					}
+				}
+
+				if ( isJava ) {
+					if ( reFindNoCase( "\.printStackTrace\s*\(\s*\)", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "maintainability",
+									ruleId     = "java/print-stack-trace",
+									severity   = "low",
+									confidence = .9,
+									title      = "Exception printed to the console instead of logged",
+									message    = "printStackTrace() writes to stdout/stderr, which is easy to lose in production and bypasses structured logging.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Log the exception through the application's logger (e.g. logger.error( ""..."", e )) instead of printStackTrace().",
+									source     = "deterministic"
+								)
+							);
+					}
+					if ( reFindNoCase( "catch\s*\(\s*(?:final\s+)?(Exception|Throwable)\s+\w+\s*\)", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "reliability",
+									ruleId     = "java/generic-exception-catch",
+									severity   = "medium",
+									confidence = .8,
+									title      = "Overly broad exception type caught",
+									message    = "Catching Exception or Throwable hides which specific failures are expected and can swallow unrelated bugs (including Errors, for Throwable).",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Catch the specific exception type(s) the code actually expects, and let unexpected ones propagate.",
+									source     = "deterministic"
+								)
+							);
+					}
+					if ( reFindNoCase( "\bSystem\s*\.\s*(out|err)\s*\.\s*println\s*\(", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "maintainability",
+									ruleId     = "java/system-out-println",
+									severity   = "low",
+									confidence = .85,
+									title      = "Debug print statement left in source",
+									message    = "System.out/err.println bypasses structured logging (levels, formatting, log routing) and is easy to leave in by accident.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Replace with a call to the application's logger at an appropriate level.",
 									source     = "deterministic"
 								)
 							);
@@ -337,7 +466,31 @@ class {
 		return result;
 	}
 
-	private struct function build(
+	/**
+		 * Tag attributes commonly wrap across lines (e.g. `<cflock` on one line,
+		 * `scope="..."` on the next). Joins from startLine up to the line that
+		 * closes the tag with `>`, bounded by maxLookahead, so attribute checks
+		 * don't miss/misfire on wrapped tags.
+		 */
+		private numeric function braceDelta( required string sourceLine ) {
+			return len( reMatch( "\{", arguments.sourceLine ) ) - len( reMatch( "\}", arguments.sourceLine ) );
+		}
+
+		private struct function joinTagLines( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+			var text = "";
+			var endLine = arguments.startLine;
+			var limit = min( arguments.startLine + arguments.maxLookahead, arguments.lines.len() );
+			for ( var i = arguments.startLine; i <= limit; i++ ) {
+				text &= " " & arguments.lines[ i ];
+				endLine = i;
+				if ( find( ">", arguments.lines[ i ] ) ) {
+					break;
+				}
+			}
+			return { text: text, endLine: endLine };
+		}
+
+		private struct function build(
 		required string category,
 		required string ruleId,
 		required string severity,

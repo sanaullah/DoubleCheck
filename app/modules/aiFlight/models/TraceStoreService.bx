@@ -612,6 +612,58 @@ class {
 		return rows;
 	}
 
+	/**
+	 * All-time and today totals (traces, tokens, cost) - a local spend/usage
+	 * at-a-glance summary. Cost is opportunistic: only traces whose provider
+	 * response included a cost figure (e.g. OpenRouter) contribute to it.
+	 */
+	struct function getStats() {
+		var todayStart = dateTimeFormat(
+			createDateTime(
+				year( now() ),
+				month( now() ),
+				day( now() ),
+				0,
+				0,
+				0
+			),
+			"iso"
+		);
+		var q = executeQuery(
+			"
+				SELECT
+					COUNT(*) AS trace_count,
+					SUM(total_tokens) AS total_tokens,
+					SUM(IFNULL(cost, 0)) AS total_cost,
+					SUM(CASE WHEN started_at >= :today_start THEN 1 ELSE 0 END) AS today_trace_count,
+					SUM(CASE WHEN started_at >= :today_start THEN total_tokens ELSE 0 END) AS today_tokens,
+					SUM(CASE WHEN started_at >= :today_start THEN IFNULL(cost, 0) ELSE 0 END) AS today_cost,
+					SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+				FROM (
+					SELECT t.*,
+						( SELECT CAST(json_extract(o.usage_json, '$.cost') AS REAL)
+							FROM observations o
+							WHERE o.trace_id = t.id
+								AND json_extract(o.usage_json, '$.cost') IS NOT NULL
+							ORDER BY o.rowid DESC
+							LIMIT 1
+						) AS cost
+					FROM traces t
+				)
+			",
+			{ today_start: { value: todayStart, cfsqltype: "varchar" } }
+		);
+		return {
+			traceCount     : int( val( q.trace_count ?: 0 ) ),
+			totalTokens    : int( val( q.total_tokens ?: 0 ) ),
+			totalCost      : numberFormat( val( q.total_cost ?: 0 ), "0.000000" ) * 1,
+			todayTraceCount: int( val( q.today_trace_count ?: 0 ) ),
+			todayTokens    : int( val( q.today_tokens ?: 0 ) ),
+			todayCost      : numberFormat( val( q.today_cost ?: 0 ), "0.000000" ) * 1,
+			errorCount     : int( val( q.error_count ?: 0 ) )
+		};
+	}
+
 	array function listSessions( numeric limit = 50 ) {
 		var q = executeQuery(
 			"
@@ -954,16 +1006,16 @@ class {
 				-minutes,
 				now()
 			),
-			"yyyy-mm-dd'T'HH:nn:ss"
-		) & "Z";
+			"iso"
+		);
 		var emptyCutoff = dateTimeFormat(
 			dateAdd(
 				"n",
 				-1,
 				now()
 			),
-			"yyyy-mm-dd'T'HH:nn:ss"
-		) & "Z";
+			"iso"
+		);
 		var ended = isoNow();
 		var staleMsg = "Timed out: no close event within #minutes# minutes (still open)";
 		var emptyMsg = "Timed out: empty trace (no steps) after 1 minute";
@@ -1210,7 +1262,7 @@ class {
 	}
 
 	private string function isoNow() {
-		return dateTimeFormat( now(), "yyyy-mm-dd'T'HH:nn:ss" ) & "Z";
+		return dateTimeFormat( now(), "iso" );
 	}
 
 	private struct function queryOptions() {

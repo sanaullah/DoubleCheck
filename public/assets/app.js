@@ -348,6 +348,7 @@ function resetObservability() {
 	if (elements.observeFeed) elements.observeFeed.innerHTML = "";
 	if (elements.observePanel) elements.observePanel.hidden = true;
 	if (elements.jumpTrace) elements.jumpTrace.hidden = true;
+	if (elements.aiflightLink) elements.aiflightLink.href = "/aiflight/";
 	if (elements.observeRoleFilters) {
 		elements.observeRoleFilters.hidden = true;
 		elements.observeRoleFilters.innerHTML = "";
@@ -1475,6 +1476,7 @@ const elements = {
 	baseRevision: document.querySelector("#base-revision"),
 	cancel: document.querySelector("#cancel-button"),
 	jumpTrace: document.querySelector("#jump-trace-button"),
+	aiflightLink: document.querySelector("#aiflight-link"),
 	jumpFindings: document.querySelector("#jump-findings-button"),
 	commandExport: document.querySelector("#command-export-button"),
 	commandRunContext: document.querySelector("#command-run-context"),
@@ -1829,6 +1831,7 @@ function syncModernizationProviderToServer() {
 }
 
 async function loadProjects() {
+	if (!elements.projectId) return;
 	try {
 		const payload = await request("/api/v1/projects");
 		const projects = payload.data || [];
@@ -2004,6 +2007,9 @@ function setRun(run) {
 	elements.cancel.hidden = !run || state.terminal.has(status);
 	if (elements.jumpTrace) {
 		elements.jumpTrace.hidden = !run;
+	}
+	if (elements.aiflightLink) {
+		elements.aiflightLink.href = run?.id ? `/aiflight/#session/${encodeURIComponent(run.id)}` : "/aiflight/";
 	}
 	if (elements.jumpFindings) {
 		elements.jumpFindings.hidden = !run;
@@ -3156,6 +3162,7 @@ function renderResult(result = {}) {
 		renderModernizationResult(result);
 		return;
 	}
+	if (!elements.summary) return;
 	const scope = result.reviewScope || "";
 	const unavailable = scope === "working-tree-unavailable" || scope === "revision-diff-unavailable";
 	const hasPayload = !!(
@@ -4407,17 +4414,23 @@ async function loadHistoryComparison(run) {
 }
 
 function renderHistoryComparison(run, comparison = {}) {
-	const counts = comparison.counts || {};
 	elements.comparisonCounts.innerHTML = "";
 	if (!comparison.baseline) {
 		elements.comparisonCounts.innerHTML = emptyStateHtml({
 			icon: "history",
 			title: "No prior compatible run",
-			hint: "Need another completed run with the same repository and mode."
+			hint: comparison.runKind === "modernize"
+				? "Need another completed Modernize run for the same repository."
+				: "Need another completed run with the same repository and mode."
 		});
 		elements.comparisonMovements.innerHTML = "";
 		return;
 	}
+	if (comparison.runKind === "modernize") {
+		renderModernizeComparison(comparison);
+		return;
+	}
+	const counts = comparison.counts || {};
 	const labels = [
 		["new", "New"],
 		["unchanged", "Unchanged"],
@@ -4495,6 +4508,71 @@ function renderHistoryComparison(run, comparison = {}) {
 			icon: "findings",
 			title: "No finding movement recorded",
 			hint: "This baseline comparison has no new, resolved, or severity changes."
+		});
+	}
+}
+
+function renderModernizeComparison(comparison) {
+	const diff = comparison.diff || {};
+	const legacy = diff.legacyUnits || {};
+	const target = diff.targetUnits || {};
+	const decisions = diff.decisions || {};
+	const coverage = diff.coverage || {};
+
+	const chipDefs = [
+		["legacy-added", `${legacy.summary?.addedCount || 0} legacy added`],
+		["legacy-removed", `${legacy.summary?.removedCount || 0} legacy removed`],
+		["target-added", `${target.summary?.addedCount || 0} target added`],
+		["target-removed", `${target.summary?.removedCount || 0} target removed`],
+		["decisions-carried", `${decisions.summary?.unchangedCount || 0} decisions carried forward`],
+		["decisions-new", `${decisions.summary?.addedCount || 0} new decisions`]
+	];
+	chipDefs.forEach(([key, label]) => {
+		const chip = document.createElement("span");
+		chip.className = `comparison-chip is-${key}`;
+		chip.textContent = label;
+		elements.comparisonCounts.appendChild(chip);
+	});
+	const baselineWhen = new Date(comparison.baseline.createdAt).toLocaleString();
+	const note = document.createElement("span");
+	note.className = "comparison-baseline-note";
+	note.textContent = `vs ${baselineWhen}`;
+	elements.comparisonCounts.appendChild(note);
+
+	const coverageNote = document.createElement("div");
+	coverageNote.className = "comparison-execution-delta";
+	coverageNote.textContent = [
+		`On road ${formatSignedNumber(coverage.delta?.onRoadDelta)}`,
+		`Not yet sliced ${formatSignedNumber(coverage.delta?.notYetSlicedDelta)}`,
+		`Provider coverage ${coverage.baseline?.llmStatus || "unknown"} → ${coverage.current?.llmStatus || "unknown"}`
+	].join(" · ");
+	elements.comparisonCounts.appendChild(coverageNote);
+
+	elements.comparisonMovements.innerHTML = "";
+	const rows = [
+		...(legacy.added || []).map((item) => ({ type: "legacy-added", ...item })),
+		...(legacy.removed || []).map((item) => ({ type: "legacy-removed", ...item })),
+		...(target.added || []).map((item) => ({ type: "target-added", ...item })),
+		...(target.removed || []).map((item) => ({ type: "target-removed", ...item }))
+	];
+	rows.forEach((item) => {
+		const row = document.createElement("div");
+		row.className = "comparison-movement";
+		row.innerHTML = `
+			<span class="movement-type"></span>
+			<strong class="movement-title"></strong>
+			<small class="movement-location"></small>
+		`;
+		row.querySelector(".movement-type").textContent = item.type;
+		row.querySelector(".movement-title").textContent = item.symbolName || item.filePath || item.id;
+		row.querySelector(".movement-location").textContent = `${item.filePath || ""}${item.unitType ? ` · ${item.unitType}` : ""}`;
+		elements.comparisonMovements.appendChild(row);
+	});
+	if (!elements.comparisonMovements.childElementCount) {
+		elements.comparisonMovements.innerHTML = emptyStateHtml({
+			icon: "findings",
+			title: "No unit changes",
+			hint: "Legacy and target units are identical to the prior run."
 		});
 	}
 }

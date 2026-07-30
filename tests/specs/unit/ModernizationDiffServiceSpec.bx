@@ -1,0 +1,126 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "ModernizationDiffService", () => {
+			it( "treats every current item as added when there is no baseline", () => {
+				var service = new app.models.services.ModernizationDiffService();
+				var current = {
+					planFingerprint: "current-fp",
+					inventory      : { units: [ { id: "lu-1", filePath: "Order.cfc", symbolName: "Order", unitType: "class" } ] },
+					target         : { units: [] },
+					decisions      : [],
+					coverage       : { road: { onRoad: 0, notYetSliced: 1 }, llm: { status: "incomplete" }, schemaCoverage: "absent" }
+				};
+
+				var diff = service.compare( current );
+
+				expect( diff.version ).toBe( "modernization-diff-v1" );
+				expect( diff.summary.hasBaseline ).toBeFalse();
+				expect( diff.baselineFingerprint ).toBe( "" );
+				expect( diff.currentFingerprint ).toBe( "current-fp" );
+				expect( diff.legacyUnits.summary.addedCount ).toBe( 1 );
+				expect( diff.legacyUnits.added[ 1 ].id ).toBe( "lu-1" );
+				expect( diff.legacyUnits.added[ 1 ].symbolName ).toBe( "Order" );
+				expect( diff.coverage.current.notYetSliced ).toBe( 1 );
+				expect( diff.coverage.baseline.notYetSliced ).toBe( 0 );
+			} );
+
+			it( "classifies legacy units as added, removed, or unchanged by stable id", () => {
+				var service = new app.models.services.ModernizationDiffService();
+				var current = {
+					planFingerprint: "current-fp",
+					inventory      : {
+						units: [
+							{ id: "lu-1", filePath: "Order.cfc", symbolName: "Order", unitType: "class" },
+							{ id: "lu-2", filePath: "Cart.cfc", symbolName: "Cart", unitType: "class" }
+						]
+					},
+					target   : { units: [] },
+					decisions: [],
+					coverage : {}
+				};
+				var baseline = {
+					planFingerprint: "baseline-fp",
+					inventory      : {
+						units: [
+							{ id: "lu-1", filePath: "Order.cfc", symbolName: "Order", unitType: "class" },
+							{ id: "lu-3", filePath: "Legacy.cfc", symbolName: "Legacy", unitType: "class" }
+						]
+					},
+					target   : { units: [] },
+					decisions: [],
+					coverage : {}
+				};
+
+				var diff = service.compare( current, baseline );
+
+				expect( diff.summary.hasBaseline ).toBeTrue();
+				expect( diff.baselineFingerprint ).toBe( "baseline-fp" );
+				expect( diff.legacyUnits.unchanged ).toBe( [ "lu-1"] );
+				expect( diff.legacyUnits.added.map( ( item ) => item.id ) ).toBe( [ "lu-2"] );
+				expect( diff.legacyUnits.removed.map( ( item ) => item.id ) ).toBe( [ "lu-3"] );
+				expect( diff.legacyUnits.summary.addedCount ).toBe( 1 );
+				expect( diff.legacyUnits.summary.removedCount ).toBe( 1 );
+				expect( diff.legacyUnits.summary.unchangedCount ).toBe( 1 );
+			} );
+
+			it( "correlates decisions by itemId separately from legacy units", () => {
+				var service = new app.models.services.ModernizationDiffService();
+				var current = {
+					inventory: { units: [] },
+					target   : { units: [] },
+					decisions: [
+						{ itemId: "tu-1", decision: "accepted" },
+						{ itemId: "tu-2", decision: "rejected" }
+					],
+					coverage: {}
+				};
+				var baseline = {
+					inventory: { units: [] },
+					target   : { units: [] },
+					decisions: [ { itemId: "tu-1", decision: "accepted" } ],
+					coverage : {}
+				};
+
+				var diff = service.compare( current, baseline );
+
+				expect( diff.decisions.unchanged ).toBe( [ "tu-1"] );
+				expect( diff.decisions.added.map( ( item ) => item.id ) ).toBe( [ "tu-2"] );
+			} );
+
+			it( "computes coverage delta between the current and baseline road counters", () => {
+				var service = new app.models.services.ModernizationDiffService();
+				var current = {
+					inventory: { units: [] },
+					target   : { units: [] },
+					decisions: [],
+					coverage : { road: { onRoad: 5, notYetSliced: 1 }, llm: { status: "complete" }, schemaCoverage: "full-ddl" }
+				};
+				var baseline = {
+					inventory: { units: [] },
+					target   : { units: [] },
+					decisions: [],
+					coverage : { road: { onRoad: 2, notYetSliced: 4 }, llm: { status: "incomplete" }, schemaCoverage: "absent" }
+				};
+
+				var diff = service.compare( current, baseline );
+
+				expect( diff.coverage.delta.onRoadDelta ).toBe( 3 );
+				expect( diff.coverage.delta.notYetSlicedDelta ).toBe( -3 );
+				expect( diff.coverage.current.llmStatus ).toBe( "complete" );
+				expect( diff.coverage.baseline.llmStatus ).toBe( "incomplete" );
+			} );
+
+			it( "tolerates a plan with no inventory/target/decisions/coverage keys at all", () => {
+				var service = new app.models.services.ModernizationDiffService();
+				var diff = service.compare( {}, {} );
+
+				expect( diff.summary.hasBaseline ).toBeTrue();
+				expect( diff.legacyUnits.summary.addedCount ).toBe( 0 );
+				expect( diff.targetUnits.summary.addedCount ).toBe( 0 );
+				expect( diff.coverage.current.llmStatus ).toBe( "unknown" );
+			} );
+		} );
+	}
+
+}

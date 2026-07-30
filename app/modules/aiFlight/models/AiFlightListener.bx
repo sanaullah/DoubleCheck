@@ -468,7 +468,7 @@ class {
 								structKeyExists( arguments.interceptData, "metadata" ) && isStruct( arguments.interceptData.metadata )
 							)
 							? arguments.interceptData.metadata
-							: {}
+							: chatRequestUsageMetadata( arguments.interceptData )
 					}
 				);
 			traceId = trace.id;
@@ -737,6 +737,9 @@ class {
 
 	private string function sessionIdFor( required struct interceptData ) {
 		var conversationId = toString( arguments.interceptData.conversationId ?: "" );
+		if ( !len( conversationId ) ) {
+			conversationId = chatRequestTenantId( arguments.interceptData );
+		}
 		if ( len( conversationId ) ) {
 			return conversationId;
 		}
@@ -744,6 +747,42 @@ class {
 			request.aiFlightSessionId = createUUID();
 		}
 		return request.aiFlightSessionId;
+	}
+
+	/**
+	 * Host apps that call plain aiChat() (not aiAgent()) have no conversationId on
+	 * interceptData - bx-ai only exposes that on the agent-run announce points.
+	 * The chat-level events (onAIChatRequest/onAIChatResponse/onAIRateLimitHit/
+	 * onAIError) all carry the AiChatRequest object instead, which does expose a
+	 * tenantId (bx-ai's own multi-tenant usage-tracking field) - callers can stamp
+	 * their own correlation id there via options.tenantId to group related calls
+	 * into one AiFlight session.
+	 */
+	private string function chatRequestTenantId( required struct interceptData ) {
+		try {
+			if ( structKeyExists( arguments.interceptData, "chatRequest" ) ) {
+				return toString( arguments.interceptData.chatRequest.getTenantId() ?: "" );
+			}
+		} catch (any e) {
+
+			// not every event's chatRequest exposes this accessor - ignore
+		}
+		return "";
+	}
+
+	private struct function chatRequestUsageMetadata( required struct interceptData ) {
+		try {
+			if ( structKeyExists( arguments.interceptData, "chatRequest" ) ) {
+				var metadata = arguments.interceptData.chatRequest.getUsageMetadata();
+				if ( isStruct( metadata ) ) {
+					return metadata;
+				}
+			}
+		} catch (any e) {
+
+			// not every event's chatRequest exposes this accessor - ignore
+		}
+		return {};
 	}
 
 	private string function requestKeyFor( required struct interceptData, string sessionKey = "" ) {

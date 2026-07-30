@@ -6,7 +6,7 @@
 @singleton
 class {
 	property name="identityService" inject="ModernizationIdentityService";
-	variables.version = "cfml-inventory-conservative-v2";
+	variables.version = "cfml-inventory-conservative-v3";
 
 	struct function build( required any scan ) {
 		var files = isStruct( arguments.scan ) ? ( arguments.scan.files ?: [] ) : arguments.scan;
@@ -49,7 +49,24 @@ class {
 				// conservative extractor cannot parse. Method units are added below.
 				units.append( makeUnit( "component", path, listFirst( listLast( path, "/" ), "." ), 1, lines.len(), "regex-conservative-v1", file, [] ) );
 			}
+			if ( extension == "cfc" ) {
+				var declaration = extractComponentDeclaration( lines );
+				var declarationEvidence = evidence( path, declaration.declarationLine, lines[ declaration.declarationLine ] ?: "", file );
+				if ( len( declaration.extends ) ) {
+					dependencies.append( dependency( "extends", declaration.extends, declarationEvidence ) );
+				}
+				if ( len( declaration.implements ) ) {
+					for ( var contract in listToArray( declaration.implements, "," ) ) {
+						dependencies.append( dependency( "implements", trim( contract ), declarationEvidence ) );
+					}
+				}
+			}
 			var functionsFound = extractFunctions( path, lines, file );
+			if ( unitKind == "application" ) {
+				for ( var fn in functionsFound.units ) {
+					if ( isLifecycleFunction( fn.symbolName ) ) fn.unitType = "lifecycle-hook";
+				}
+			}
 			for ( var fn in functionsFound.units ) units.append( fn );
 			for ( var unresolvedItem in functionsFound.unresolved ) unresolved.append( unresolvedItem );
 
@@ -141,7 +158,11 @@ class {
 		var safeLines = commentSafeLines( arguments.lines );
 		for ( var lineNumber = 1; lineNumber <= safeLines.len(); lineNumber++ ) {
 			var sourceLine = toString( safeLines[ lineNumber ] );
-				var tagMatch = variables.javaPatternMatcher( "<cffunction\\s+[^>]*\\bname\\s*=[^A-Za-z0-9_]*([A-Za-z_][A-Za-z0-9_.-]*)[^>]*>", sourceLine );
+				// <cffunction> attributes commonly wrap across lines; only the
+				// closing tag needs the joined text, so a plain sourceLine match
+				// still short-circuits the common single-line case.
+				var tagSearchText = reFindNoCase( "<cffunction\b", sourceLine ) ? joinTagLines( safeLines, lineNumber ).text : sourceLine;
+				var tagMatch = variables.javaPatternMatcher( "<cffunction\\s+[^>]*\\bname\\s*=[^A-Za-z0-9_]*([A-Za-z_][A-Za-z0-9_.-]*)[^>]*>", tagSearchText );
 			if ( tagMatch.find() ) {
 				var endLine = findClosingTag( safeLines, lineNumber, "</cffunction>" );
 				var tagUnit = makeUnit( "function", arguments.path, tagMatch.group( 1 ), lineNumber, endLine, "tag-regex-v1", arguments.file, [ "signature", "access", "return" ] );
@@ -386,6 +407,50 @@ class {
 		var value = trim( mid( arguments.line, position + len( marker ), len( arguments.line ) ) );
 		if ( len( value ) >= 2 && ( ( left( value, 1 ) == char( 34 ) && right( value, 1 ) == char( 34 ) ) || ( left( value, 1 ) == char( 39 ) && right( value, 1 ) == char( 39 ) ) ) ) value = mid( value, 2, len( value ) - 2 );
 		return left( value, 160 );
+	}
+
+	private struct function extractComponentDeclaration( required array lines ) {
+		var safeLines = commentSafeLines( arguments.lines );
+		for ( var lineNumber = 1; lineNumber <= safeLines.len(); lineNumber++ ) {
+			var sourceLine = toString( safeLines[ lineNumber ] );
+			var isTag = reFindNoCase( "<cfcomponent\b", sourceLine ) > 0;
+			if ( isTag || reFindNoCase( "^\s*(?:final\s+|abstract\s+)?component\b", sourceLine ) ) {
+				// <cfcomponent extends="..." implements="..."> attributes commonly
+				// wrap across lines; script `component extends="..." {` does not.
+				var declarationText = isTag ? joinTagLines( safeLines, lineNumber ).text : sourceLine;
+				return {
+					declarationLine: lineNumber,
+					extends        : attributeValue( declarationText, "extends" ),
+					implements     : attributeValue( declarationText, "implements" )
+				};
+			}
+		}
+		return { declarationLine: 1, extends: "", implements: "" };
+	}
+
+	private struct function joinTagLines( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+		var text = "";
+		var limit = min( arguments.startLine + arguments.maxLookahead, arguments.lines.len() );
+		for ( var i = arguments.startLine; i <= limit; i++ ) {
+			text &= " " & toString( arguments.lines[ i ] );
+			if ( find( ">", arguments.lines[ i ] ) ) {
+				break;
+			}
+		}
+		return { text: text };
+	}
+
+	private string function attributeValue( required string line, required string name ) {
+		var matcher = variables.javaPatternMatcher( "(?i)\b#arguments.name#\s*=\s*[\""']([^\""']+)", arguments.line );
+		return matcher.find() ? matcher.group( 1 ) : "";
+	}
+
+	private boolean function isLifecycleFunction( required string name ) {
+		return listFindNoCase(
+				"onApplicationStart,onApplicationEnd,onRequestStart,onRequestEnd,onSessionStart,onSessionEnd,onError,onMissingTemplate,onAbort",
+				arguments.name
+			) >
+			0;
 	}
 
 	private string function classifyUnit(required string path) {

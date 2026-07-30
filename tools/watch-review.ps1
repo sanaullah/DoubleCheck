@@ -82,6 +82,12 @@ function Invoke-Review {
 
 Write-Host "[watch-review] Watching $ProjectPath (debounce: ${DebounceSeconds}s). Ctrl+C to stop." -ForegroundColor Cyan
 
+# Excludes DoubleCheck's own runtime state (.db, .tmp) and non-source
+# directories (.git, lib, runtime/boxlang_modules) - without this, a review
+# run's own writes to .db/doublecheck.db would re-trigger the watcher and
+# loop forever.
+$script:excludedPathPattern = '[\\/](\.db|\.git|\.tmp|lib|runtime[\\/]boxlang_modules)([\\/]|$)'
+
 $watcher = New-Object System.IO.FileSystemWatcher
 $watcher.Path = $ProjectPath
 $watcher.IncludeSubdirectories = $true
@@ -90,7 +96,10 @@ $watcher.EnableRaisingEvents = $true
 
 $lastChange = [DateTime]::MinValue
 $action = {
-	$script:lastChange = Get-Date
+	$changedPath = $Event.SourceEventArgs.FullPath
+	if ($changedPath -notmatch $script:excludedPathPattern) {
+		$script:lastChange = Get-Date
+	}
 }
 Register-ObjectEvent -InputObject $watcher -EventName Changed -Action $action | Out-Null
 Register-ObjectEvent -InputObject $watcher -EventName Created -Action $action | Out-Null

@@ -44,6 +44,75 @@ class extends="testbox.system.BaseSpec" {
 				expect( ruleIds ).toInclude( "maintenance/open-marker" );
 			} );
 
+			it( "flags printStackTrace, generic exception catches, and System.out.println in Java", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "src/main/java/App.java",
+						language: "Java",
+						lines   : [
+							"try {",
+							"    doWork();",
+							"} catch ( Exception e ) {",
+							"    e.printStackTrace();",
+							"}",
+							"System.out.println( ""done"" );"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "java/print-stack-trace" );
+				expect( ruleIds ).toInclude( "java/generic-exception-catch" );
+				expect( ruleIds ).toInclude( "java/system-out-println" );
+			} );
+
+			it( "does not flag a catch of a specific exception type in Java", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "src/main/java/App.java",
+						language: "Java",
+						lines   : [
+							"try {",
+							"    doWork();",
+							"} catch ( IOException e ) {",
+							"    logger.error( ""failed"", e );",
+							"}"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "java/generic-exception-catch" );
+				expect( ruleIds ).notToInclude( "java/print-stack-trace" );
+			} );
+
+			it( "flags an empty catch block in Java", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "src/main/java/App.java",
+						language: "Java",
+						lines   : [ "catch ( IOException e ) {}" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "errors/empty-catch" );
+			} );
+
+			it( "does not flag Java rules for CFML or JavaScript files", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Widget.cfc",
+						language: "CFML",
+						lines   : [ "// System.out.println( ""noop"" );", "catch ( Exception e ) {}" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "java/system-out-println" );
+				expect( ruleIds ).notToInclude( "java/generic-exception-catch" );
+			} );
+
 			it( "flags a cfquery block that interpolates without cfqueryparam", () => {
 				var service = new app.models.services.FindingService();
 				var findings = service.deterministic( [
@@ -56,6 +125,25 @@ class extends="testbox.system.BaseSpec" {
 							"SELECT * FROM users WHERE id = ##arguments.id##",
 							"</cfquery>",
 							"</cffunction>"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/query-missing-queryparam" );
+			} );
+
+			it( "flags a cfquery block where the SQL verb and interpolation are on different lines", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/UserGateway.cfc",
+						language: "CFML",
+						lines   : [
+							"<cfquery name=""q"" datasource=""##application.dsn##"">",
+							"SELECT *",
+							"FROM users",
+							"WHERE id = ##arguments.id##",
+							"</cfquery>"
 						]
 					}
 				] );
@@ -114,6 +202,102 @@ class extends="testbox.system.BaseSpec" {
 				expect( ruleIds ).notToInclude( "cfml/unscoped-variable" );
 			} );
 
+			it( "flags an unscoped assignment inside a script-style function", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cart.cfc",
+						language: "CFML",
+						lines   : [
+							"component {",
+							"    function total() {",
+							"        total = 0;",
+							"        return total;",
+							"    }",
+							"}"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/unscoped-variable" );
+			} );
+
+			it( "does not flag a var-scoped assignment inside a script-style function", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cart.cfc",
+						language: "CFML",
+						lines   : [
+							"component {",
+							"    function total() {",
+							"        var total = 0;",
+							"        return total;",
+							"    }",
+							"}"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/unscoped-variable" );
+			} );
+
+			it( "does not flag an unscoped assignment outside any function body", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cart.cfc",
+						language: "CFML",
+						lines   : [
+							"component {",
+							"    total = 0;",
+							"}"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/unscoped-variable" );
+			} );
+
+			it( "flags a script-style include with an interpolated path", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/views/page.cfm",
+						language: "CFML",
+						lines   : [ "include ""partials/##rc.section##.cfm"";" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/dynamic-include-path" );
+			} );
+
+			it( "flags a script-style lock without scope or name", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cache.cfc",
+						language: "CFML",
+						lines   : [ "lock timeout=""10"" {" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
+			it( "does not flag a script-style lock that has a scope", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cache.cfc",
+						language: "CFML",
+						lines   : [ "lock scope=""session"" timeout=""10"" {" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
 			it( "flags a cfinclude with an interpolated template path", () => {
 				var service = new app.models.services.FindingService();
 				var findings = service.deterministic( [
@@ -138,6 +322,39 @@ class extends="testbox.system.BaseSpec" {
 				] );
 				var ruleIds = findings.map( ( f ) => f.ruleId );
 				expect( ruleIds ).toInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
+			it( "does not flag a cflock whose scope attribute wraps to the next line", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cache.cfc",
+						language: "CFML",
+						lines   : [
+							"<cflock",
+							"	scope=""session""",
+							"	timeout=""10"">"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
+			it( "flags a cfinclude whose interpolated template attribute wraps to the next line", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/views/page.cfm",
+						language: "CFML",
+						lines   : [
+							"<cfinclude",
+							"	template=""##rc.section##.cfm"">"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/dynamic-include-path" );
 			} );
 
 			it( "does not flag a cflock that has a scope", () => {

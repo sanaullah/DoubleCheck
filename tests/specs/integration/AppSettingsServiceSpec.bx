@@ -1,0 +1,71 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe( "AppSettingsService", () => {
+			beforeEach( () => setup() );
+
+			it( "returns the fallback value when no override has been saved", () => {
+				var service = getInstance( "AppSettingsService" );
+				var result = service.get( "planMaxTasks", 6, "test-app-settings-fallback" );
+				expect( result ).toBe( 6 );
+			} );
+
+			it( "persists an override and returns it on the next read", () => {
+				var service = getInstance( "AppSettingsService" );
+				var tenantId = "test-app-settings-roundtrip";
+				try {
+					service.set( "planMaxTasks", 3, tenantId );
+					var result = service.get( "planMaxTasks", 6, tenantId );
+					expect( result ).toBe( "3" );
+				} finally {
+					queryExecute( "DELETE FROM app_settings WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "overwrites a previously saved value for the same key", () => {
+				var service = getInstance( "AppSettingsService" );
+				var tenantId = "test-app-settings-overwrite";
+				try {
+					service.set( "planMaxTasks", 3, tenantId );
+					service.set( "planMaxTasks", 5, tenantId );
+					expect( service.get( "planMaxTasks", 6, tenantId ) ).toBe( "5" );
+				} finally {
+					queryExecute( "DELETE FROM app_settings WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "setMany persists multiple keys in one call and getAll returns them together", () => {
+				var service = getInstance( "AppSettingsService" );
+				var tenantId = "test-app-settings-many";
+				try {
+					service.setMany( { planMaxTasks: 2, runDefaultTokenBudget: 4000 }, tenantId );
+					var all = service.getAll( tenantId );
+					expect( all.planMaxTasks ).toBe( "2" );
+					expect( all.runDefaultTokenBudget ).toBe( "4000" );
+				} finally {
+					queryExecute( "DELETE FROM app_settings WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "keeps overrides scoped to their own tenant", () => {
+				var service = getInstance( "AppSettingsService" );
+				var tenantA = "test-app-settings-tenant-a";
+				var tenantB = "test-app-settings-tenant-b";
+				try {
+					service.set( "planMaxTasks", 9, tenantA );
+					expect( service.get( "planMaxTasks", 6, tenantB ) ).toBe( 6 );
+				} finally {
+					queryExecute( "DELETE FROM app_settings WHERE tenant_id IN ( :a, :b )", { a: tenantA, b: tenantB } );
+				}
+			} );
+		} );
+	}
+}

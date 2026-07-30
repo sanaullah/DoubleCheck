@@ -8,6 +8,14 @@ class extends="coldbox.system.RestHandler" {
 
 	property name="securityContextService" inject="SecurityContextService";
 
+	property name="runRepository" inject="ReviewRunRepository";
+
+	property name="modernizationRepository" inject="ModernizationRepository";
+
+	property name="modernizationCoverageService" inject="ModernizationCoverageService";
+
+	property name="modernizationDiffService" inject="ModernizationDiffService";
+
 	function preHandler( event, rc, prc ) {
 		prc.securityContext = securityContextService.authenticate( event );
 	}
@@ -59,11 +67,7 @@ class extends="coldbox.system.RestHandler" {
 			return;
 		}
 		if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
-			event.renderData(
-					type       = "json",
-					statusCode = 422,
-					data       = { error: { code: "modernization_comparison_unsupported", message: "Baseline finding comparison is available for Review runs only." } }
-				);
+			event.renderData( type = "json", data = { data: compareModernizeScoped( run ) } );
 			return;
 		}
 		var comparison = historyService.compareScoped(
@@ -85,5 +89,65 @@ class extends="coldbox.system.RestHandler" {
 			return;
 		}
 		event.renderData( type = "json", data = { data: comparison } );
+	}
+
+	/**
+	 * Modernize's analog of ReviewHistoryService.compareScoped: legacy/target
+	 * unit + coverage diff against the prior Modernize run for the same
+	 * project. Lives on this request-scoped handler (not ReviewHistoryService,
+	 * an @singleton) - adding these same collaborators as ReviewHistoryService
+	 * properties destabilized WireBox's singleton resolution order elsewhere
+	 * in the app (an unrelated CoverageAssessmentService injection started
+	 * coming back null). See .docs/roadmap-cfml-depth-and-live-loop.md.
+	 */
+	private struct function compareModernizeScoped( required any run ) {
+		var baselineRun = runRepository.findPriorEligibleBaseline(
+				arguments.run.getProjectPath(),
+				arguments.run.getMode(),
+				arguments.run.getCreatedAt(),
+				arguments.run.getId(),
+				arguments.run.getTenantId(),
+				arguments.run.getProjectId(),
+				"modernize"
+			);
+		var currentPlan = loadModernizePlan( arguments.run.getId() );
+		if ( isNull( baselineRun ) ) {
+			return {
+				runId              : arguments.run.getId(),
+				runKind            : "modernize",
+				comparisonAvailable: true,
+				baseline           : javacast( "null", "" ),
+				diff               : modernizationDiffService.compare( currentPlan )
+			};
+		}
+		var baselinePlan = loadModernizePlan( baselineRun.getId() );
+		return {
+			runId              : arguments.run.getId(),
+			runKind            : "modernize",
+			comparisonAvailable: true,
+			baseline           : {
+				runId    : baselineRun.getId(),
+				createdAt: baselineRun.getCreatedAt()
+			},
+			diff: modernizationDiffService.compare( currentPlan, baselinePlan )
+		};
+	}
+
+	/** Minimal analog of ModernizationRunService.getResult() for diffing only: plan + road-enriched coverage + decisions. */
+	private struct function loadModernizePlan( required string runId ) {
+		var stored = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( stored ) ) {
+			return { inventory: {}, target: {}, decisions: [], coverage: {} };
+		}
+		var result = duplicate( stored.plan ?: {} );
+		result.coverage = stored.coverage ?: result.coverage ?: {};
+		result.planFingerprint = stored.fingerprint;
+		try {
+			result.coverage = modernizationCoverageService.enrichRoadCoverage( result.coverage, result );
+		} catch ( any ignored ) {
+			// Road coverage is additive; never fail comparison assembly.
+		}
+		result.decisions = modernizationRepository.listDecisions( arguments.runId );
+		return result;
 	}
 }

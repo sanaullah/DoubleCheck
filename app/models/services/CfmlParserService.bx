@@ -43,8 +43,10 @@ class {
 			var tagComponentMatch = match( "<cfcomponent\b", sourceLine );
 			// script: component extends="..." implements="..." { ... }
 			var scriptComponentMatch = match( "^\s*(?:final\s+|abstract\s+)?component\b", sourceLine );
-			if ( tagComponentMatch.find() || scriptComponentMatch.find() ) {
-				var componentName = attribute( sourceLine, "name" );
+			var isTagComponent = tagComponentMatch.find();
+			if ( isTagComponent || scriptComponentMatch.find() ) {
+				var componentTagText = isTagComponent ? joinTagLines( arguments.file.lines, lineNumber ).text : sourceLine;
+				var componentName = attribute( componentTagText, "name" );
 				symbols.append(
 						symbol(
 							"class",
@@ -55,12 +57,12 @@ class {
 					);
 				addAttributeDependency(
 					dependencies,
-					sourceLine,
+					componentTagText,
 					"extends",
 					"extends",
 					lineNumber
 				);
-				var implemented = attribute( sourceLine, "implements" );
+				var implemented = attribute( componentTagText, "implements" );
 				if ( len( implemented ) ) {
 					for ( var contract in listToArray( implemented, "," ) ) {
 						dependencies.append(
@@ -84,7 +86,7 @@ class {
 			);
 			var declaredFunction = "";
 			if ( tagFunctionMatch.find() ) {
-				declaredFunction = attribute( sourceLine, "name" );
+				declaredFunction = attribute( joinTagLines( arguments.file.lines, lineNumber ).text, "name" );
 				if ( len( declaredFunction ) ) {
 					addFunctionSymbols(
 						symbols,
@@ -122,7 +124,9 @@ class {
 
 			// <cfproperty name="..." type="...">  |  script: property name="..." type="...";
 			if ( reFindNoCase( "^\s*<?cfproperty\b|^\s*property\b", sourceLine ) ) {
-				var propertyName = attribute( sourceLine, "name" );
+				var isCfpropertyTag = reFindNoCase( "<cfproperty\b", sourceLine ) > 0;
+				var propertyTagText = isCfpropertyTag ? joinTagLines( arguments.file.lines, lineNumber ).text : sourceLine;
+				var propertyName = attribute( propertyTagText, "name" );
 				if ( len( propertyName ) ) {
 					symbols.append(
 							symbol(
@@ -135,7 +139,7 @@ class {
 				}
 				addTypeDependency(
 					dependencies,
-					attribute( sourceLine, "type" ),
+					attribute( propertyTagText, "type" ),
 					lineNumber,
 					sourceLine
 				);
@@ -145,7 +149,7 @@ class {
 			var tagImportMatch = match( "<cfimport\b", sourceLine );
 			var scriptImportMatch = match( "^\s*import\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
 			if ( tagImportMatch.find() ) {
-				var importPath = attribute( sourceLine, "path" );
+				var importPath = attribute( joinTagLines( arguments.file.lines, lineNumber ).text, "path" );
 				if ( len( importPath ) ) {
 					dependencies.append(
 							dependency(
@@ -170,9 +174,10 @@ class {
 			// <cfinclude template="...">  |  <cfmodule template="..." | name="...">
 			var includeMatch = match( "<cf(?:include|module)\b", sourceLine );
 			if ( includeMatch.find() ) {
-				var includeTarget = attribute( sourceLine, "template" );
+				var includeTagText = joinTagLines( arguments.file.lines, lineNumber ).text;
+				var includeTarget = attribute( includeTagText, "template" );
 				if ( !len( includeTarget ) ) {
-					includeTarget = attribute( sourceLine, "name" );
+					includeTarget = attribute( includeTagText, "name" );
 				}
 				if ( len( includeTarget ) ) {
 					dependencies.append(
@@ -432,6 +437,26 @@ class {
 			arguments.sourceLine
 		);
 		return attributeMatch.find() ? attributeMatch.group( 1 ) : "";
+	}
+
+	/**
+	 * Tag attributes commonly wrap across lines (e.g. `<cfcomponent` on one
+	 * line, `name="..."` on the next). Joins from startLine up to the line
+	 * that closes the tag with `>`, bounded by maxLookahead, so attribute
+	 * extraction doesn't silently miss symbols on wrapped tags.
+	 */
+	private struct function joinTagLines( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+		var text = "";
+		var endLine = arguments.startLine;
+		var limit = min( arguments.startLine + arguments.maxLookahead, arguments.lines.len() );
+		for ( var i = arguments.startLine; i <= limit; i++ ) {
+			text &= " " & arguments.lines[ i ];
+			endLine = i;
+			if ( find( ">", arguments.lines[ i ] ) ) {
+				break;
+			}
+		}
+		return { text: text, endLine: endLine };
 	}
 
 	private any function match( required string expression, required string source ) {

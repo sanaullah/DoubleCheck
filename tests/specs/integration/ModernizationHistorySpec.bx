@@ -55,24 +55,82 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				}
 			} );
 
-			it( "rejects Review baseline comparison for a Modernize run", () => {
+			it( "returns a quiet comparison when no compatible Modernize baseline exists", () => {
 				var runId = "modern-history-compare-#lCase( createUUID() )#";
-				var nowValue = dateTimeFormat( now(), "iso" );
 				try {
-					getInstance( "ReviewRunRepository" ).create( {
-						id: runId, tenantId: "default", projectId: "default",
-						projectPath: "C:/modern-history-compare", mode: "full", runKind: "modernize",
-						input: {}, baseRevision: "", headRevision: "HEAD", status: "succeeded",
-						progress: 100, currentPhase: "completed", message: "Comparison fixture",
-						policy: {}, budgets: {}, createdAt: nowValue, updatedAt: nowValue
-					} );
+					seedModernizeRun(
+						runId,
+						"C:/modern-history-compare",
+						"succeeded",
+						dateTimeFormat( now(), "iso" ),
+						{ inventory: { units: [] }, target: { units: [] }, decisions: [], coverage: {} }
+					);
 					var response = this.get( "/api/v1/history/#runId#/comparison" );
-					var responseStatus = response.getRenderData().statusCode ?: response.getResponse().getStatusCode();
-					expect( responseStatus ).toBe( 422 );
-					var body = jsonDeserialize( response.getRenderedContent() );
-					expect( body.error.code ).toBe( "modernization_comparison_unsupported" );
+					expect( response.getResponse() ).toHaveStatus( 200 );
+					var comparison = jsonDeserialize( response.getRenderedContent() ).data;
+					expect( comparison.runKind ).toBe( "modernize" );
+					expect( comparison.comparisonAvailable ).toBeTrue();
+					expect( isNull( comparison.baseline ) ).toBeTrue();
+					expect( comparison.diff.summary.hasBaseline ).toBeFalse();
 				} finally {
-					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+					cleanupModernizeRuns( [ runId] );
+				}
+			} );
+
+			it( "returns a real legacy/target unit diff when comparing two Modernize runs for the same project", () => {
+				var marker = lCase( createUUID() );
+				var path = "C:/modern-history-diff/#marker#";
+				var baselineId = "modern-history-diff-baseline-#marker#";
+				var currentId = "modern-history-diff-current-#marker#";
+				try {
+					seedModernizeRun(
+						baselineId,
+						path,
+						"succeeded",
+						dateTimeFormat( dateAdd( "n", -10, now() ), "iso" ),
+						{
+							inventory: { units: [
+								{ id: "lu-order", filePath: "Order.cfc", symbolName: "Order", unitType: "class" },
+								{ id: "lu-legacy", filePath: "Legacy.cfc", symbolName: "Legacy", unitType: "class" }
+							] },
+							target   : { units: [ { id: "tu-orders", targetPath: "app/handlers/Orders.bx", name: "Orders", kind: "handler", legacyUnitIds: [ "lu-order"] } ] },
+							decisions: [ { itemId: "tu-orders", decision: "accepted" } ],
+							coverage : { llm: { status: "incomplete" }, schemaCoverage: "absent" }
+						}
+					);
+					seedModernizeRun(
+						currentId,
+						path,
+						"succeeded",
+						dateTimeFormat( now(), "iso" ),
+						{
+							inventory: { units: [
+								{ id: "lu-order", filePath: "Order.cfc", symbolName: "Order", unitType: "class" },
+								{ id: "lu-cart", filePath: "Cart.cfc", symbolName: "Cart", unitType: "class" }
+							] },
+							target   : { units: [ { id: "tu-orders", targetPath: "app/handlers/Orders.bx", name: "Orders", kind: "handler", legacyUnitIds: [ "lu-order", "lu-cart"] } ] },
+							decisions: [ { itemId: "tu-orders", decision: "accepted" } ],
+							coverage : { llm: { status: "complete" }, schemaCoverage: "full-ddl" }
+						}
+					);
+
+					var response = this.get( "/api/v1/history/#currentId#/comparison" );
+					expect( response.getResponse() ).toHaveStatus( 200 );
+					var comparison = jsonDeserialize( response.getRenderedContent() ).data;
+
+					expect( comparison.runKind ).toBe( "modernize" );
+					expect( comparison.baseline.runId ).toBe( baselineId );
+					var diff = comparison.diff;
+					expect( diff.summary.hasBaseline ).toBeTrue();
+					expect( diff.legacyUnits.unchanged ).toBe( [ "lu-order"] );
+					expect( diff.legacyUnits.added.map( ( item ) => item.id ) ).toBe( [ "lu-cart"] );
+					expect( diff.legacyUnits.removed.map( ( item ) => item.id ) ).toBe( [ "lu-legacy"] );
+					expect( diff.targetUnits.unchanged ).toBe( [ "tu-orders"] );
+					expect( diff.decisions.unchanged ).toBe( [ "tu-orders"] );
+					expect( diff.coverage.delta.onRoadDelta ).toBe( 1 );
+					expect( diff.coverage.delta.notYetSlicedDelta ).toBe( -1 );
+				} finally {
+					cleanupModernizeRuns( [ baselineId, currentId] );
 				}
 			} );
 
@@ -84,5 +142,65 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				expect( body.error.code ).toBe( "invalid_run_kind" );
 			} );
 		} );
+	}
+
+	private void function seedModernizeRun(
+		required string runId,
+		required string projectPath,
+		required string status,
+		required string createdAt,
+		required struct plan
+	) {
+		getInstance( "ReviewRunRepository" ).create( {
+			id: arguments.runId, tenantId: "default", projectId: "default",
+			projectPath: arguments.projectPath, mode: "full", runKind: "modernize",
+			input: {}, baseRevision: "", headRevision: "HEAD", status: arguments.status,
+			progress: 100, currentPhase: "completed", message: "Modernize diff fixture",
+			policy: {}, budgets: {}, createdAt: arguments.createdAt, updatedAt: arguments.createdAt
+		} );
+		var modernizationRepository = getInstance( "ModernizationRepository" );
+		modernizationRepository.savePlan(
+			arguments.runId,
+			{
+				version  : "modernization-plan-v1",
+				state    : "needs-review",
+				metadata : { runId: arguments.runId },
+				inventory: arguments.plan.inventory ?: { units: [] },
+				target   : arguments.plan.target ?: { units: [] }
+			},
+			{ status: "warning", blockingCount: 0, warningCount: 0 },
+			arguments.plan.coverage ?: {}
+		);
+		// getResult() reads decisions from the modernization_decisions table
+		// (listDecisions), not from the plan JSON blob, so decisions have to
+		// be seeded as real rows via upsertDecision to show up in a diff.
+		for ( var decision in ( arguments.plan.decisions ?: [] ) ) {
+			modernizationRepository.upsertDecision( arguments.runId, {
+				itemType       : decision.itemType ?: "target-unit",
+				itemId         : decision.itemId,
+				decision       : decision.decision ?: "accepted",
+				itemFingerprint: decision.itemFingerprint ?: ""
+			} );
+		}
+		// findPriorEligibleBaseline inner-joins review_summaries - a modernize
+		// run gets one saved by ReviewRunService.executeRun in production, so
+		// the fixture needs one too or the baseline lookup silently finds nothing.
+		getInstance( "ReviewResultRepository" ).saveSummary(
+				runId              = arguments.runId,
+				summary            = "Modernize diff fixture",
+				languages          = [ "CFML"],
+				filesScanned       = 1,
+				bytesScanned       = 100,
+				findingsCount      = 0,
+				aiEnabled          = false,
+				reviewScope        = "full",
+				repositoryRevision = "fixture"
+			);
+	}
+
+	private void function cleanupModernizeRuns( required array runIds ) {
+		for ( var runId in arguments.runIds ) {
+			queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+		}
 	}
 }

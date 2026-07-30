@@ -31,6 +31,55 @@ class extends="testbox.system.BaseSpec" {
                 expect( result.units[ 1 ].filePath ).toBe( "dashboard/Application.cfc" );
             } );
 
+            it( "captures extends and implements from tag and script components", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "TagGateway.cfc",
+                        language: "ColdFusion",
+                        content: '<cfcomponent extends="app.models.BaseGateway" implements="app.models.IGateway,app.models.ILoggable">' & char( 10 )
+                            & '<cffunction name="find"></cffunction>' & char( 10 )
+                            & '</cfcomponent>',
+                        contentHash: "tag-gateway"
+                    },
+                    {
+                        filePath: "ScriptCart.cfc",
+                        language: "ColdFusion",
+                        content: 'component extends="app.models.BaseModel" {' & char( 10 )
+                            & '    function total() { return 0; }' & char( 10 )
+                            & '}',
+                        contentHash: "script-cart"
+                    }
+                ] } );
+                var extendsTargets = result.dependencies.filter( ( item ) => item.kind == "extends" ).map( ( item ) => item.target );
+                var implementsTargets = result.dependencies.filter( ( item ) => item.kind == "implements" ).map( ( item ) => item.target );
+
+                expect( extendsTargets ).toInclude( "app.models.BaseGateway" );
+                expect( extendsTargets ).toInclude( "app.models.BaseModel" );
+                expect( implementsTargets ).toInclude( "app.models.IGateway" );
+                expect( implementsTargets ).toInclude( "app.models.ILoggable" );
+            } );
+
+            it( "extracts a cffunction name and extends when attributes wrap across lines", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "WrappedGateway.cfc",
+                        language: "ColdFusion",
+                        content: '<cfcomponent' & char( 10 )
+                            & '    extends="app.models.BaseGateway">' & char( 10 )
+                            & '<cffunction' & char( 10 )
+                            & '    name="findUser">' & char( 10 )
+                            & '</cffunction>' & char( 10 )
+                            & '</cfcomponent>',
+                        contentHash: "wrapped-gateway"
+                    }
+                ] } );
+                var functionNames = result.units.filter( ( item ) => item.unitType == "function" ).map( ( item ) => item.symbolName );
+                var extendsTargets = result.dependencies.filter( ( item ) => item.kind == "extends" ).map( ( item ) => item.target );
+
+                expect( functionNames ).toInclude( "findUser" );
+                expect( extendsTargets ).toInclude( "app.models.BaseGateway" );
+            } );
+
             it( "keeps opaque components and function signatures visible", () => {
                 var result = new app.models.services.ModernizationInventoryService().build( { files: [
                     { filePath: "Opaque.cfc", language: "ColdFusion", content: "component { /* unsupported dynamic body */ }", contentHash: "opaque" },
@@ -75,9 +124,11 @@ class extends="testbox.system.BaseSpec" {
                         contentHash: "commented-lifecycle"
                     }
                 ] } );
-                var functions = result.units.filter( ( item ) => item.unitType == "function" );
-                expect( result.version ).toBe( "cfml-inventory-conservative-v2" );
+                var functions = result.units.filter( ( item ) => listFindNoCase( "function,lifecycle-hook", item.unitType ) );
+                expect( result.version ).toBe( "cfml-inventory-conservative-v3" );
                 expect( functions.map( ( item ) => item.symbolName ) ).toBe( [ "onApplicationStart", "onRequestStart" ] );
+                // Application.cfc lifecycle methods are tagged distinctly (Phase 3).
+                expect( functions.every( ( item ) => item.unitType == "lifecycle-hook" ) ).toBeTrue();
                 expect( functions.filter( ( item ) => item.symbolName == "onRequestStart" )[ 1 ].startLine ).toBe( 6 );
             } );
 

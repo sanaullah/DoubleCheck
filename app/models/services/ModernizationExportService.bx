@@ -94,6 +94,7 @@ class {
 		var decisions = arguments.result.decisions ?: [];
 		var roadmap = arguments.result.roadmapPhases ?: [];
 		var legacyUnits = inventory.units ?: [];
+		var legacyUnitRows = legacyUnitDisplayRows( legacyUnits, inventory.dependencies ?: [] );
 		var targetUnits = target.units ?: [];
 		var routes = arguments.result.routeContracts ?: [];
 		var dbFindings = arguments.result.dbFindings ?: [];
@@ -153,7 +154,7 @@ class {
 
 		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
 
-		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnits, [ "id", "path", "kind", "name", "confidence", "provenanceClass", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnitRows, [ "id", "path", "kind", "name", "extends", "implements", "access", "returnType", "evidenceRefs" ] );
 		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus", "provenanceClass", "evidenceRefs" ] );
 		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus", "provenanceClass", "evidence" ] );
 		appendRows( lines, mdHeading( 2, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus", "provenanceClass", "evidenceRefs" ] );
@@ -494,6 +495,43 @@ class {
 			if ( len( token ) && !ids.contains( token ) ) ids.append( token );
 		}
 		return ids;
+	}
+
+	/**
+	 * Inventory units use filePath/unitType/symbolName, not the
+	 * path/kind/name/confidence/provenanceClass shape appendRows was written
+	 * for (that shape matches LLM-proposed target units, not deterministically
+	 * extracted legacy units). Adapts field names and folds in extends/
+	 * implements dependency evidence keyed by filePath, so the Legacy catalog
+	 * section actually renders instead of showing only an id and evidenceRefs.
+	 */
+	private array function legacyUnitDisplayRows( required array units, required array dependencies ) {
+		var extendsByPath = {};
+		var implementsByPath = {};
+		for ( var dep in arguments.dependencies ) {
+			var depPath = dep.filePath ?: "";
+			if ( !len( depPath ) ) continue;
+			if ( dep.kind == "extends" ) {
+				extendsByPath[ depPath ] = dep.target ?: "";
+			} else if ( dep.kind == "implements" ) {
+				if ( !implementsByPath.keyExists( depPath ) ) implementsByPath[ depPath ] = [];
+				implementsByPath[ depPath ].append( dep.target ?: "" );
+			}
+		}
+		return arguments.units.map( ( item ) => {
+				var path = item.filePath ?: "";
+				return {
+					id        : item.id ?: "",
+					path      : path,
+					kind      : item.unitType ?: "",
+					name      : item.symbolName ?: "",
+					extends   : extendsByPath.keyExists( path ) ? extendsByPath[ path ] : "",
+					implements: implementsByPath.keyExists( path ) ? implementsByPath[ path ].toList( ", " ) : "",
+					access    : item.access ?: "",
+					returnType: item.returnType ?: "",
+					evidenceRefs: item.evidenceRefs ?: []
+				};
+			} );
 	}
 
 	private void function appendRows( required array lines, required string heading, required array rows, required array fields ) {

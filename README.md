@@ -59,7 +59,7 @@ Verified findings with severity, confidence, evidence snippets, and fix guidance
 
 ### Architecture — explore the graph
 
-For BoxLang projects, browse persisted symbols, dependencies, and impact paths from the run snapshot.
+For BoxLang and ColdFusion projects, browse persisted symbols, dependencies, and impact paths from the run snapshot.
 
 ![BoxLang architecture explorer](resources/docs/images/03-architecture.png)
 

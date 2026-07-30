@@ -1,0 +1,142 @@
+/**
+ * Compares two Modernize plan runs for the same project: legacy/target unit
+ * sets, decision carry-forward, and coverage movement. Mirrors
+ * ArchitectureDiffService's set-difference-by-id approach on the Review side.
+ *
+ * @see ArchitectureDiffService
+ * @see ModernizationRunService
+ */
+
+@singleton
+class {
+	variables.diffVersion = "modernization-diff-v1";
+
+	struct function compare( required struct currentPlan, any baselinePlan = javacast( "null", "" ) ) {
+		var currentLegacyUnits = isArray( arguments.currentPlan.inventory.units ?: "" ) ? arguments.currentPlan.inventory.units : [];
+		var currentTargetUnits = isArray( arguments.currentPlan.target.units ?: "" ) ? arguments.currentPlan.target.units : [];
+		var currentDecisions = isArray( arguments.currentPlan.decisions ?: "" ) ? arguments.currentPlan.decisions : [];
+		var currentFingerprint = arguments.currentPlan.planFingerprint ?: "";
+		var currentCoverage = coverageSnapshot( arguments.currentPlan.coverage ?: {} );
+
+		if ( isNull( arguments.baselinePlan ) ) {
+			return {
+				version            : variables.diffVersion,
+				baselineFingerprint: "",
+				currentFingerprint : currentFingerprint,
+				legacyUnits        : allAdded( currentLegacyUnits ),
+				targetUnits        : allAdded( currentTargetUnits ),
+				decisions          : allAdded( currentDecisions, "itemId" ),
+				coverage           : {
+					current : currentCoverage,
+					baseline: emptyCoverageSnapshot(),
+					delta   : coverageDelta( currentCoverage, emptyCoverageSnapshot() )
+				},
+				summary: { hasBaseline: false }
+			};
+		}
+
+		var baselineLegacyUnits = isArray( arguments.baselinePlan.inventory.units ?: "" ) ? arguments.baselinePlan.inventory.units : [];
+		var baselineTargetUnits = isArray( arguments.baselinePlan.target.units ?: "" ) ? arguments.baselinePlan.target.units : [];
+		var baselineDecisions = isArray( arguments.baselinePlan.decisions ?: "" ) ? arguments.baselinePlan.decisions : [];
+		var baselineFingerprint = arguments.baselinePlan.planFingerprint ?: "";
+		var baselineCoverage = coverageSnapshot( arguments.baselinePlan.coverage ?: {} );
+
+		return {
+			version            : variables.diffVersion,
+			baselineFingerprint: baselineFingerprint,
+			currentFingerprint : currentFingerprint,
+			legacyUnits        : diffById( currentLegacyUnits, baselineLegacyUnits ),
+			targetUnits        : diffById( currentTargetUnits, baselineTargetUnits ),
+			decisions          : diffById( currentDecisions, baselineDecisions, "itemId" ),
+			coverage           : {
+				current : currentCoverage,
+				baseline: baselineCoverage,
+				delta   : coverageDelta( currentCoverage, baselineCoverage )
+			},
+			summary: { hasBaseline: true }
+		};
+	}
+
+	/** Set-difference by idField; added/removed carry a display-friendly summary, unchanged is id-only. */
+	private struct function diffById( required array currentItems, required array baselineItems, string idField = "id" ) {
+		var currentIndex = {};
+		var baselineIndex = {};
+		for ( var item in arguments.currentItems ) {
+			var id = trim( item[ arguments.idField ] ?: "" );
+			if ( len( id ) ) currentIndex[ id ] = item;
+		}
+		for ( var item in arguments.baselineItems ) {
+			var id = trim( item[ arguments.idField ] ?: "" );
+			if ( len( id ) ) baselineIndex[ id ] = item;
+		}
+		var added = [];
+		var unchanged = [];
+		for ( var id in currentIndex ) {
+			if ( baselineIndex.keyExists( id ) ) {
+				unchanged.append( id );
+			} else {
+				added.append( itemSummary( currentIndex[ id ], id ) );
+			}
+		}
+		var removed = [];
+		for ( var id in baselineIndex ) {
+			if ( !currentIndex.keyExists( id ) ) {
+				removed.append( itemSummary( baselineIndex[ id ], id ) );
+			}
+		}
+		added.sort( ( a, b ) => compareNoCase( a.id, b.id ) );
+		removed.sort( ( a, b ) => compareNoCase( a.id, b.id ) );
+		unchanged.sort( "textnocase" );
+		return {
+			added    : added,
+			removed  : removed,
+			unchanged: unchanged,
+			summary  : { addedCount: added.len(), removedCount: removed.len(), unchangedCount: unchanged.len() }
+		};
+	}
+
+	/** No-baseline convenience: every current item is "added". */
+	private struct function allAdded( required array items, string idField = "id" ) {
+		var idFieldName = arguments.idField;
+		var added = arguments.items.map( ( item ) => itemSummary( item, trim( item[ idFieldName ] ?: "" ) ) );
+		added.sort( ( a, b ) => compareNoCase( a.id, b.id ) );
+		return {
+			added    : added,
+			removed  : [],
+			unchanged: [],
+			summary  : { addedCount: added.len(), removedCount: 0, unchangedCount: 0 }
+		};
+	}
+
+	private struct function itemSummary( required struct item, required string id ) {
+		return {
+			id        : arguments.id,
+			filePath  : arguments.item.filePath ?: arguments.item.targetPath ?: "",
+			symbolName: arguments.item.symbolName ?: arguments.item.name ?: "",
+			unitType  : arguments.item.unitType ?: arguments.item.kind ?: arguments.item.itemType ?: ""
+		};
+	}
+
+	private struct function coverageSnapshot( required struct coverage ) {
+		var road = isStruct( arguments.coverage.road ?: "" ) ? arguments.coverage.road : {};
+		var llm = isStruct( arguments.coverage.llm ?: "" ) ? arguments.coverage.llm : {};
+		var schema = isStruct( arguments.coverage.schema ?: "" ) ? arguments.coverage.schema : {};
+		return {
+			onRoad        : val( road.onRoad ?: 0 ),
+			notYetSliced  : val( road.notYetSliced ?: 0 ),
+			llmStatus     : llm.status ?: ( arguments.coverage.status ?: "unknown" ),
+			schemaCoverage: arguments.coverage.schemaCoverage ?: ( schema.coverage ?: "unknown" )
+		};
+	}
+
+	private struct function emptyCoverageSnapshot() {
+		return { onRoad: 0, notYetSliced: 0, llmStatus: "unknown", schemaCoverage: "unknown" };
+	}
+
+	private struct function coverageDelta( required struct current, required struct baseline ) {
+		return {
+			onRoadDelta      : arguments.current.onRoad - arguments.baseline.onRoad,
+			notYetSlicedDelta: arguments.current.notYetSliced - arguments.baseline.notYetSliced
+		};
+	}
+}

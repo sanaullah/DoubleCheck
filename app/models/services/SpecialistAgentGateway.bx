@@ -44,7 +44,8 @@ class {
 		function onProgress = ( detail ) => {
 
 		},
-		string contextPack  = ""
+		string contextPack  = "",
+		string runId        = ""
 	) {
 		// Resolved once per call (not cached on this singleton) so concurrent
 		// specialist tasks on different pool threads never cross-contaminate
@@ -63,11 +64,23 @@ class {
 			params.model = resolved.model;
 		}
 		var options = {
-			provider    : resolved.provider,
-			apiKey      : resolved.apiKey,
-			timeout     : resolved.timeout,
-			returnFormat: "single",
-			threadId    : arguments.definition.taskId
+			provider     : resolved.provider,
+			apiKey       : resolved.apiKey,
+			timeout      : resolved.timeout,
+			returnFormat : "single",
+			threadId     : arguments.definition.taskId,
+			// Correlates every LLM call this specialist task makes back to the
+			// review run that triggered it, so AiFlight groups them as one
+			// session instead of unrelated traces (conversationId powers the
+			// agent path's own interceptData; tenantId/usageMetadata power the
+			// plain chat fallback path via AiChatRequest - see AiFlightListener).
+			conversationId: arguments.runId,
+			tenantId      : arguments.runId,
+			usageMetadata : {
+				runId : arguments.runId,
+				taskId: arguments.definition.taskId,
+				role  : arguments.definition.role
+			}
 		};
 		if ( len( trim( resolved.baseURL ) ) ) {
 			options.baseURL = resolved.baseURL;
@@ -519,10 +532,13 @@ class {
 		var resolved = aiProviderResolver.resolve();
 		var systemPrompt = chatOnlyInstructions( arguments.definition );
 		var chatOptions = {
-			provider    : arguments.options.provider ?: resolved.provider,
-			apiKey      : arguments.options.apiKey ?: resolved.apiKey,
-			timeout     : arguments.options.timeout ?: resolved.timeout,
-			returnFormat: "single"
+			provider      : arguments.options.provider ?: resolved.provider,
+			apiKey        : arguments.options.apiKey ?: resolved.apiKey,
+			timeout       : arguments.options.timeout ?: resolved.timeout,
+			returnFormat  : "single",
+			conversationId: arguments.options.conversationId ?: "",
+			tenantId      : arguments.options.tenantId ?: "",
+			usageMetadata : arguments.options.usageMetadata ?: {}
 		};
 		if ( arguments.options.keyExists( "baseURL" ) ) {
 			chatOptions.baseURL = arguments.options.baseURL;
