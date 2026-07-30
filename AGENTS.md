@@ -1,7 +1,7 @@
 # DoubleCheck Agent Guide
 
 DoubleCheck is a local desktop “second pair of eyes” for developers working in
-BoxLang, ColdFusion, JavaScript, and Java. Keep changes focused on that product.
+BoxLang, ColdFusion, and JavaScript. Keep changes focused on that product.
 
 ## Source of Truth
 
@@ -24,7 +24,7 @@ the generated catalogs as project requirements.
 - Local-only application; SQLite and analysis run on the user's machine.
 - Desktop-only workspace; narrow-window breakage is preferable to a separate
   mobile experience.
-- Supported languages are BoxLang, ColdFusion, JavaScript, and Java only.
+- Supported languages are BoxLang, ColdFusion, and JavaScript only.
 - Basic review must work without an AI key. LLM specialists are optional.
 - This is a review and modernization assistant, not an automatic migrator.
 - Capability claims must reflect behavior that exists and is measured.

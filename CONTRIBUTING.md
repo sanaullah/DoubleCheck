@@ -1,7 +1,7 @@
 # Contributing to DoubleCheck
 
 DoubleCheck is a local, open-source code review and legacy-modernization
-assistant for **BoxLang, ColdFusion, JavaScript, and Java only**. Contributions
+assistant for **BoxLang, ColdFusion, and JavaScript only**. Contributions
 that stay inside that scope are welcome.
 
 ## Before you start

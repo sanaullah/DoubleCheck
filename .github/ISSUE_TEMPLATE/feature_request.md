@@ -19,7 +19,7 @@ Before opening, please confirm this fits DoubleCheck's product boundaries
 (see `AGENTS.md`):
 
 - [ ] Stays local-only / desktop-only (no SaaS, hosted, multi-tenant, or login wall)
-- [ ] Applies to BoxLang, ColdFusion, JavaScript, or Java only
+- [ ] Applies to BoxLang, ColdFusion, or JavaScript only
 - [ ] Isn't an automated ColdFusion→BoxLang migrator (DoubleCheck is a review
       and modernization *assist*, not an auto-migrator)
 

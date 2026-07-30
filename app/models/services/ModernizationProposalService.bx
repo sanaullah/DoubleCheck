@@ -118,14 +118,51 @@ class {
 			omittedPaths: shardCapOmissions
 		};
 		merged.coverage = applyGenerationCoverage( merged.coverage ?: {}, merged.metadata.applicationShards );
-		// Roadmap without application substance invents unmapped phases. Require
-		// at least one target, link, route, or sample before planning the road.
-		if ( !fragments.keyExists( "modernization-application" ) ) {
-			errors.append( { role: "modernization-roadmap", message: "skipped-without-application-fragment" } );
-		} else if ( !applicationFragmentHasSubstance( merged ) ) {
+		// Architecture and roadmap without application substance would invent
+		// unmapped groupings/phases. Require at least one target, link, route, or
+		// sample before running either.
+		var hasApplicationFragment = fragments.keyExists( "modernization-application" );
+		var hasApplicationSubstance = hasApplicationFragment && applicationFragmentHasSubstance( merged );
+		if ( hasApplicationFragment && !hasApplicationSubstance ) {
 			errors.append( { role: "modernization-application", message: "empty-application-fragment" } );
-			errors.append( { role: "modernization-roadmap", message: "skipped-without-application-substance" } );
+		}
+		if ( !hasApplicationFragment || !hasApplicationSubstance ) {
+			var skipMessage = hasApplicationFragment ? "skipped-without-application-substance" : "skipped-without-application-fragment";
+			errors.append( { role: "modernization-architecture", message: skipMessage } );
+			errors.append( { role: "modernization-roadmap", message: skipMessage } );
 		} else {
+			// Architecture pass first: a whole-repository view of units, links,
+			// routes, and signals so it can group features into packaging
+			// decisions the 2-file application shards never see. Its output
+			// (target.contexts/.extracts) is then available to the roadmap role
+			// below via compactRoadmapEvidence, so the road can follow those
+			// groupings into phases instead of one catch-all phase.
+			var canAffordArchitecture = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
+			if ( isCancelled( arguments.runId, arguments.options ) ) {
+				errors.append( { role: "modernization-architecture", message: "cancelled-after-partial-acceptance" } );
+			} else if ( maxTasks < 3 || getTickCount() - startedAt >= maxDurationMs || totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: "modernization-architecture", message: "budget-exceeded" } );
+			} else if ( !canAffordArchitecture ) {
+				errors.append( { role: "modernization-architecture", message: "cost-budget-exceeded" } );
+			} else {
+				logInfo( "Modernize proposal #arguments.runId#: starting architecture role" );
+				// merged already carries .signals through from mergeFragments().
+				var architectureRequest = agentFactory.build( "modernization-architecture", runtime, merged, budgets );
+				var architectureOptions = duplicate( arguments.options );
+				architectureOptions.budgets = budgets;
+				architectureOptions.startedAt = getTickCount();
+				architectureOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				architectureOptions.maxRetries = 0;
+				architectureOptions.role = "modernization-architecture";
+				var architecture = agentGateway.run( arguments.runId, architectureRequest, architectureOptions );
+				totalCostUsd += isNumeric( architecture.costUsd ?: "" ) ? val( architecture.costUsd ) : 0;
+				if ( architecture.ok ?: false && validFragment( "modernization-architecture", architecture.payload ?: {} ) ) {
+					var redactedArchitecture = redactPayload( architecture.payload ?: {} );
+					if ( !redactedArchitecture.count() && ( architecture.payload ?: {} ).count() ) errors.append( { role: "modernization-architecture", message: "redaction-failed" } );
+					else merged = mergeArchitecture( merged, redactedArchitecture, errors );
+				} else errors.append( { role: "modernization-architecture", message: architecture.error ?: ( architecture.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
+			}
+
 			var canAffordRoadmap = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
 			if ( isCancelled( arguments.runId, arguments.options ) ) {
 				errors.append( { role: "modernization-roadmap", message: "cancelled-after-partial-acceptance" } );
@@ -606,6 +643,23 @@ class {
 	}
 
 	/**
+	 * Merges the whole-repository architecture role's packaging proposals into
+	 * target.contexts/target.extracts. Runs before mergeRoadmap so the roadmap
+	 * role can use these groupings as candidate phase boundaries (it already
+	 * reads target.contexts/.extracts via compactRoadmapEvidence).
+	 */
+	private struct function mergeArchitecture(required struct plan, required struct architecture, array errors = []) {
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [] };
+		arguments.plan.target.contexts = isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
+		arguments.plan.target.extracts = isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
+		arguments.plan.target.contexts.append( boundedStructArray( arguments.architecture.contexts ?: [], variables.maxItems, arguments.errors, "target.contexts" ), true );
+		arguments.plan.target.extracts.append( boundedStructArray( arguments.architecture.extracts ?: [], variables.maxItems, arguments.errors, "target.extracts" ), true );
+		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
+		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
+		return arguments.plan;
+	}
+
+	/**
 	 * When the provider roadmap is skipped (cost/time), still emit mapped phases
 	 * from retained target/route ids so the Solution Road is usable.
 	 */
@@ -909,7 +963,8 @@ class {
 			: 3;
 		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
 		var maxTasks = isNumeric( arguments.budgets.maxTasks ?: "" ) ? max( 1, int( arguments.budgets.maxTasks ) ) : 3;
-		// Keep provider spend for database + roadmap so maps are not stranded without a road.
+		// Keep provider spend for database + architecture + roadmap so maps are
+		// not stranded without packaging decisions or a road.
 		var reserveCost = 0;
 		if ( maxTasks >= 2 ) {
 			if ( maxCost >= 10 ) reserveCost = max( 3, min( maxCost * 0.25, 10 ) );
@@ -1008,10 +1063,12 @@ class {
 		}
 		var elapsedMs = getTickCount() - arguments.context.startedAt;
 		var remainingMs = arguments.context.maxDurationMs - elapsedMs;
-		// Keep a slice of the wall clock for database + roadmap after maps: a
-		// tight reserve while still filling the initial concurrency window, a
-		// bigger one once we start backfilling freed slots.
-		var reserveMs = arguments.context.maxTasks >= 2 ? ( arguments.state.dispatchCount < arguments.context.concurrency ? 2000 : 120000 ) : 0;
+		// Keep a slice of the wall clock for database + architecture + roadmap
+		// after maps: a tight reserve while still filling the initial
+		// concurrency window, a bigger one once we start backfilling freed
+		// slots (widened from 120s to 180s now that a third sequential role
+		// runs after the shards).
+		var reserveMs = arguments.context.maxTasks >= 2 ? ( arguments.state.dispatchCount < arguments.context.concurrency ? 2000 : 180000 ) : 0;
 		if ( remainingMs <= reserveMs ) {
 			arguments.state.errors.append( { role: "modernization-application", message: "budget-exceeded", shard: arguments.state.nextShardIndex, elapsedMs: elapsedMs, maxDurationMs: arguments.context.maxDurationMs } );
 			arguments.state.stopReason = "budget-exceeded";
@@ -1024,7 +1081,7 @@ class {
 		}
 		if ( arguments.context.maxCost > 0 && arguments.state.totalCostUsd >= ( arguments.context.maxCost - arguments.context.reserveCost ) ) {
 			arguments.state.errors.append( { role: "modernization-application", message: "cost-reserved-for-roadmap", severity: "info", shard: arguments.state.nextShardIndex, reservedUsd: arguments.context.reserveCost, spentUsd: arguments.state.totalCostUsd, maxCostUsd: arguments.context.maxCost } );
-			logInfo( "Modernize application shards stopping early to reserve cost for roadmap (spent=#arguments.state.totalCostUsd#, reserve=#arguments.context.reserveCost#, max=#arguments.context.maxCost#)" );
+			logInfo( "Modernize application shards stopping early to reserve cost for architecture + roadmap (spent=#arguments.state.totalCostUsd#, reserve=#arguments.context.reserveCost#, max=#arguments.context.maxCost#)" );
 			arguments.state.stopReason = "cost-reserved-for-roadmap";
 			return false;
 		}
@@ -1445,6 +1502,20 @@ class {
 		return output;
 	}
 
+	/**
+	 * Provider (and repair) output is untrusted and can return an array where a
+	 * scalar string is expected. Coerces to a plain string so callers can trim()
+	 * it safely instead of crashing on a type mismatch.
+	 */
+	private string function scalarString( required any value ) {
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			return "";
+		}
+		return "";
+	}
+
 	private array function normalizeProviderList( required any value ) {
 		if ( isArray( arguments.value ) ) return duplicate( arguments.value );
 		if ( !isSimpleValue( arguments.value ) ) return [];
@@ -1557,20 +1628,23 @@ class {
 			if ( !isStruct( route ) ) continue;
 			var copy = duplicate( route );
 			var request = isStruct( copy.request ?: "" ) ? copy.request : {};
-			var path = trim( copy.path ?: copy.legacyPath ?: request.path ?: "" );
+			// Provider (and repair) output is untrusted and can return an array
+			// where a scalar string is expected (e.g. method: ["GET","POST"]);
+			// coerce defensively before trim() rather than crashing the run.
+			var path = trim( scalarString( copy.path ?: copy.legacyPath ?: request.path ?: "" ) );
 			path = replace( path, "\", "/", "all" );
 			if ( len( path ) && left( path, 1 ) != "/" ) path = "/" & path;
 			copy.path = path;
-			if ( !len( trim( copy.legacyPath ?: "" ) ) ) copy.legacyPath = path;
-			if ( !len( trim( copy.method ?: "" ) ) ) copy.method = uCase( trim( request.method ?: "GET" ) );
-			else copy.method = uCase( trim( copy.method ) );
-			if ( !structKeyExists( copy, "rollback" ) || !len( trim( copy.rollback ?: "" ) ) ) {
-				copy.rollback = trim( copy.rollbackNote ?: copy.rollbackIntent ?: copy.rollbackPlan ?: "Revert this route to the legacy path and remove the ColdBox mapping." );
+			if ( !len( trim( scalarString( copy.legacyPath ?: "" ) ) ) ) copy.legacyPath = path;
+			if ( !len( trim( scalarString( copy.method ?: "" ) ) ) ) copy.method = uCase( trim( scalarString( request.method ?: "GET" ) ) );
+			else copy.method = uCase( trim( scalarString( copy.method ) ) );
+			if ( !structKeyExists( copy, "rollback" ) || !len( trim( scalarString( copy.rollback ?: "" ) ) ) ) {
+				copy.rollback = trim( scalarString( copy.rollbackNote ?: copy.rollbackIntent ?: copy.rollbackPlan ?: "Revert this route to the legacy path and remove the ColdBox mapping." ) );
 			}
 			if ( !isStruct( copy.request ?: "" ) ) copy.request = { method: copy.method, path: copy.path };
 			else {
-				if ( !len( trim( copy.request.path ?: "" ) ) ) copy.request.path = copy.path;
-				if ( !len( trim( copy.request.method ?: "" ) ) ) copy.request.method = copy.method;
+				if ( !len( trim( scalarString( copy.request.path ?: "" ) ) ) ) copy.request.path = copy.path;
+				if ( !len( trim( scalarString( copy.request.method ?: "" ) ) ) ) copy.request.method = copy.method;
 			}
 			if ( !structKeyExists( copy, "response" ) ) copy.response = { contentType: "text/html" };
 			if ( !structKeyExists( copy, "auth" ) ) copy.auth = "unknown";
@@ -1973,7 +2047,9 @@ class {
 		if ( arguments.role == "modernization-repair" ) return structKeyExists( arguments.payload, "replacements" ) && isArray( arguments.payload.replacements );
 		var keys = arguments.role == "modernization-application"
 			? [ "targetUnits", "units", "unitLinks", "routeContracts", "contexts", "extracts", "samples" ]
-			: ( arguments.role == "modernization-database" ? [ "dbFindings", "dbTransitions", "samples" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] );
+			: ( arguments.role == "modernization-database"
+				? [ "dbFindings", "dbTransitions", "samples" ]
+				: ( arguments.role == "modernization-architecture" ? [ "contexts", "extracts" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] ) );
 		var present = false;
 		for ( var key in keys ) {
 			if ( !structKeyExists( arguments.payload, key ) ) continue;

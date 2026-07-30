@@ -1,12 +1,12 @@
 # DoubleCheck
 
-**Local second pair of eyes** for **BoxLang**, **ColdFusion**, **JavaScript**, and **Java**.
+**Local second pair of eyes** for **BoxLang**, **ColdFusion**, and **JavaScript**.
 
 Runs on your machine with SQLite — not SaaS, not hosted, not multi-tenant. A desktop helper beside Cursor (or similar): point at a repo, review with evidence, optional AI specialists when you want depth.
 
 [![Local-first](https://img.shields.io/badge/local--first-SQLite-2ea44f)](#quick-start)
 [![No login](https://img.shields.io/badge/auth-none-lightgrey)](#quick-start)
-[![Languages](https://img.shields.io/badge/languages-BoxLang%20%7C%20CFML%20%7C%20JS%20%7C%20Java-0e7490)](#supported-languages)
+[![Languages](https://img.shields.io/badge/languages-BoxLang%20%7C%20CFML%20%7C%20JS-0e7490)](#supported-languages)
 [![AI optional](https://img.shields.io/badge/AI-optional-informational)](#configuration)
 
 > Basic review works **without an AI key**. Deterministic checks always run; LLM specialists deepen selected areas when a provider is configured.
@@ -14,7 +14,7 @@ Runs on your machine with SQLite — not SaaS, not hosted, not multi-tenant. A d
 ## What it is
 
 DoubleCheck is a local desktop code review assistant for BoxLang, ColdFusion,
-JavaScript, and Java. It uses Git to scope reviews (working tree, revision range,
+and JavaScript. It uses Git to scope reviews (working tree, revision range,
 or full repository), indexes source files, runs deterministic checks without an
 AI key, and optionally sends bounded context to configurable LLM specialist
 agents with read-only tools. It produces structured, line-level findings with
@@ -78,7 +78,6 @@ Local traces for phases, specialist roles, generations, tool calls, and retries 
 | BoxLang | Deepest — graph, architecture, measured tier |
 | ColdFusion (CFML) | Graph, architecture, and deterministic rules without a key; LLM depth when an AI key is set |
 | JavaScript | In scope; lighter depth today |
-| Java | In scope; lighter depth today |
 
 No other languages are product targets.
 
@@ -269,7 +268,7 @@ tests/                    TestBox
 
 ## Contributing
 
-Prefer small, testable changes for **BoxLang, ColdFusion, JavaScript, or Java** only.
+Prefer small, testable changes for **BoxLang, ColdFusion, or JavaScript** only.
 
 Do **not** add SaaS, hosted multi-tenant architecture, login walls, or mobile UI layouts.
 

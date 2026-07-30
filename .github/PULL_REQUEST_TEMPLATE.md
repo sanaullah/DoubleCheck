@@ -5,7 +5,7 @@
 ## Scope check
 
 - [ ] Stays within DoubleCheck's product scope (local-only, desktop-only,
-      BoxLang/ColdFusion/JavaScript/Java only — see `AGENTS.md`)
+      BoxLang/ColdFusion/JavaScript only — see `AGENTS.md`)
 - [ ] No new SaaS/hosted/multi-tenant/login-wall surface area
 - [ ] API changes (if any) stay under `/api/v1/*` and update both
       `resources/apidocs/openapi.yaml` and `openapi.json`

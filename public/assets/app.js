@@ -1789,6 +1789,7 @@ async function loadSession() {
 		await loadCapabilities();
 		await loadProjects();
 		await loadRuns();
+		await resumeRunFromQuery();
 	} catch (error) {
 		if (elements.formMessage) {
 			elements.formMessage.textContent = error.message;
@@ -2811,7 +2812,7 @@ function renderModernizationArchitecture(result = {}) {
 	const centralOnly = central.filter((item) => !modules.includes(item));
 	host.hidden = !(centralOnly.length || modules.length || extracts.length);
 	if (host.hidden) return;
-	const fill = (selector, items, emptyText) => {
+	const fill = (selector, items, emptyText, { flagSpeculative = false } = {}) => {
 		const el = document.querySelector(selector);
 		if (!el) return;
 		el.innerHTML = "";
@@ -2822,16 +2823,25 @@ function renderModernizationArchitecture(result = {}) {
 		items.forEach((item) => {
 			const card = document.createElement("article");
 			card.className = "modernization-architecture-card";
-			card.innerHTML = `<strong></strong><p class="modernization-item-meta"></p><p class="architecture-recommendation"></p>`;
+			card.innerHTML = `<strong></strong><span class="architecture-basis-badge" hidden>Worth reviewing</span><p class="modernization-item-meta"></p><p class="architecture-recommendation"></p>`;
 			card.querySelector("strong").textContent = item.name || item.id || "Item";
 			card.querySelector(".modernization-item-meta").textContent = item.purpose || item.reason || item.suggestedModulePath || "";
 			card.querySelector(".architecture-recommendation").textContent = item.recommendation || item.dataBoundaryNote || item.sharedDatasourceRisk || "";
+			// Only module/extract picks are a bolder-than-default call worth
+			// flagging — a "keep it centralized" recommendation is already the
+			// safe default, so it never needs a "worth reviewing" badge even
+			// when the model recorded evidenceBasis=domain-clustering on it.
+			if (flagSpeculative && String(item.evidenceBasis || "").toLowerCase() === "domain-clustering") {
+				const badge = card.querySelector(".architecture-basis-badge");
+				badge.hidden = false;
+				badge.title = "Grouped by shared domain — no deployment seam evidenced yet";
+			}
 			el.appendChild(card);
 		});
 	};
 	fill("#modernization-arch-central", centralOnly, "No centralized shell recommendations yet.");
-	fill("#modernization-arch-modules", modules, "No ColdBox module candidates yet — keep feature slices in the monolith.");
-	fill("#modernization-arch-extracts", extracts, "No side-app extract candidates. Prefer modules until outbound/schedule isolation is evidenced.");
+	fill("#modernization-arch-modules", modules, "No ColdBox module candidates yet — keep feature slices in the monolith.", { flagSpeculative: true });
+	fill("#modernization-arch-extracts", extracts, "No side-app extract candidates. Prefer modules until outbound/schedule isolation is evidenced.", { flagSpeculative: true });
 }
 
 function renderModernizationSolution(result = {}) {
@@ -4234,7 +4244,12 @@ async function loadRuns() {
 			}
 			renderHistoryExecution(row.querySelector(".history-execution"), metrics);
 			row.querySelector(".created").textContent = new Date(run.createdAt).toLocaleString();
-			const open = () => watchRun(run);
+			// This history table only renders on the dashboard, which has no
+			// live-run or result panels of its own — navigate to the workspace
+			// page that does, instead of calling watchRun() into thin air.
+			const open = () => {
+				window.location.href = `/${isModernize ? "modernize" : "review"}?run=${encodeURIComponent(run.id)}`;
+			};
 			row.addEventListener("click", open);
 			row.querySelector(".history-open").addEventListener("click", (event) => {
 				event.stopPropagation();
@@ -4264,25 +4279,10 @@ async function loadRuns() {
 			});
 			row.querySelector(".history-trace").addEventListener("click", (event) => {
 				event.stopPropagation();
-				watchRun(run);
-				window.setTimeout(() => {
-					elements.observePanel?.scrollIntoView({ behavior: "smooth", block: "start" });
-				}, 250);
+				window.location.href = `/${isModernize ? "modernize" : "review"}?run=${encodeURIComponent(run.id)}&focus=trace`;
 			});
 			elements.history.appendChild(row);
 		});
-		// Only auto-resume when the URL explicitly asks for a run (?run=<id>).
-		// Refresh must not pick a folder path or jump into an in-flight review.
-		if (!state.activeRun && !state.didAutoResume) {
-			const resumeId = new URLSearchParams(window.location.search).get("run");
-			if (resumeId) {
-				const match = rows.map((item) => item.run).find((run) => run.id === resumeId);
-				if (match) {
-					state.didAutoResume = true;
-					watchRun(match);
-				}
-			}
-		}
 	} catch (error) {
 		elements.history.innerHTML = `<tr><td colspan="8">${emptyStateHtml({
 			icon: "inbox",
@@ -4291,6 +4291,32 @@ async function loadRuns() {
 		})}</td></tr>`;
 	} finally {
 		state.history.loading = false;
+	}
+}
+
+// Resumes a specific run when the page is loaded as /review?run=<id> or
+// /modernize?run=<id> (e.g. via the dashboard history table's Open/Trace
+// buttons). Fetches the run directly so it works even on pages that don't
+// render a history table of their own.
+async function resumeRunFromQuery() {
+	if (state.activeRun || state.didAutoResume) return;
+	const params = new URLSearchParams(window.location.search);
+	const resumeId = params.get("run");
+	if (!resumeId) return;
+	state.didAutoResume = true;
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(resumeId)}`);
+		watchRun(payload.data);
+		if (params.get("focus") === "trace") {
+			window.setTimeout(() => {
+				elements.observePanel?.scrollIntoView({ behavior: "smooth", block: "start" });
+			}, 250);
+		}
+	} catch (error) {
+		if (elements.formMessage) {
+			elements.formMessage.textContent = error.message || "Could not open the requested run.";
+			elements.formMessage.dataset.tone = "danger";
+		}
 	}
 }
 

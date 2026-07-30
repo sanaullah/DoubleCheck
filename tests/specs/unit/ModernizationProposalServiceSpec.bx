@@ -5,6 +5,7 @@ class extends="testbox.system.BaseSpec" {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "timestamp seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -14,7 +15,7 @@ class extends="testbox.system.BaseSpec" {
 				service.identityService = new app.models.services.ModernizationIdentityService();
 				var result = service.propose( "run-timestamp", { startedAt: getTickCount(), target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
 				expect( result.ok ).toBeTrue();
-				expect( gateway.callCount() ).toBe( 3 );
+				expect( gateway.callCount() ).toBe( 4 );
 			} );
 
 			it( "merges role fragments, adds stable identities and sorts deterministically", () => {
@@ -28,6 +29,7 @@ class extends="testbox.system.BaseSpec" {
 						],
 						samples: []
 					},
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [ { id: "phase-2" }, { id: "phase-1" } ], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -49,13 +51,14 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.plan.dbTransitions[ 2 ].objectsTouched ).toBeArray();
 				expect( result.plan.target.contexts[ 1 ].itemFingerprint ).notToBeEmpty();
 				expect( result.plan.metadata.schemaFingerprint ).toBe( "schema-content-fp" );
-				expect( gateway.callCount() ).toBe( 3 );
+				expect( gateway.callCount() ).toBe( 4 );
 			} );
 
 			it( "rewrites legacy source paths into legal target layout paths", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "dashboard/index.cfm", proposedRole: "page", targetPath: "dashboard/index.cfm" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -83,6 +86,7 @@ class extends="testbox.system.BaseSpec" {
 						samples: [ { id: "sample-dashboard", sampleKind: "handler", targetPath: "app/handlers/Dashboard.cfc", language: "boxlang", body: "class {}", relatedItemIds: [ "dashboard-handler" ], irreversible: false, phaseId: "phase-dashboard" } ]
 					},
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": {
 						roadmapPhases: [ { id: "phase-dashboard", unitIds: [ "dashboard-handler", "route-dashboard" ], routeIds: [], sampleIds: [ "sample-dashboard" ], dependencies: [], currentSlice: true } ],
 						assumptions: [ "Keep coexistence", "keep coexistence" ],
@@ -202,6 +206,7 @@ class extends="testbox.system.BaseSpec" {
 						samples: []
 					},
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Slice", unitIds: [ "songs-h" ], routeIds: [ "route-songs" ], currentSlice: true } ], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -226,6 +231,57 @@ class extends="testbox.system.BaseSpec" {
 				expect( ( result.notes ?: result.plan.generationNotes ?: [] ).filter( ( item ) => item.message == "synthesized-architecture-packaging" ) ).notToBeEmpty();
 			} );
 
+			it( "runs the architecture role before roadmap and merges its labeled packaging groups", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "pdf-h", targetPath: "app/handlers/Pdf.bx", sourcePath: "handlers/Pdf.cfc", purpose: "pdf tools" },
+							{ id: "pdf-s", targetPath: "app/models/services/PdfService.bx", sourcePath: "model/PdfService.cfc", purpose: "pdf tools" }
+						],
+						unitLinks: [],
+						routeContracts: [],
+						contexts: [],
+						extracts: [],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [ {
+							id: "ctx-pdf-tools",
+							name: "PDF tools",
+							packaging: "coldbox-module",
+							targetUnitIds: [ "pdf-h", "pdf-s" ],
+							recommendation: "Group the PDF handler and service; no deployment seam observed yet",
+							evidenceBasis: "domain-clustering",
+							evidenceRefs: [ { filePath: "handlers/Pdf.cfc" } ]
+						} ],
+						extracts: []
+					},
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-pdf", unitIds: [ "pdf-h", "pdf-s" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-architecture-pass",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeFalse();
+				var modules = result.plan.target.contexts.filter( ( item ) => item.packaging == "coldbox-module" );
+				expect( modules ).toHaveLength( 1 );
+				expect( modules[ 1 ].evidenceBasis ).toBe( "domain-clustering" );
+				expect( modules[ 1 ].itemFingerprint ).notToBeEmpty();
+				expect( result.errors.filter( ( item ) => item.message == "synthesized-architecture-packaging" ) ).toBeEmpty();
+				var roles = gateway.requestLog().map( ( item ) => item.role );
+				expect( roles.findNoCase( "modernization-architecture" ) ).toBeGT( 0 );
+				expect( roles.findNoCase( "modernization-roadmap" ) ).toBeGT( 0 );
+				expect( roles.findNoCase( "modernization-architecture" ) ).toBeLT( roles.findNoCase( "modernization-roadmap" ) );
+			} );
+
 			it( "synthesizes a mapped roadmap when the provider roadmap is skipped for cost", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": {
@@ -241,6 +297,7 @@ class extends="testbox.system.BaseSpec" {
 						samples: []
 					},
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { throw: true, message: "cost-budget-exceeded" }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -316,6 +373,7 @@ class extends="testbox.system.BaseSpec" {
 						{ targetUnits: [ { id: "song-svc", targetPath: "app/models/services/SongService.bx", sourcePath: "model/SongService.cfc", purpose: "songs" } ], unitLinks: [ { id: "link-song", legacyUnitId: "song-1", targetUnitId: "song-svc" } ], routeContracts: [ { id: "route-songs", path: "/songs", method: "GET" } ], contexts: [], extracts: [], samples: [] }
 					],
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Foundation", unitIds: [ "app-cfc", "song-svc" ], routeIds: [ "route-songs" ] } ], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -349,7 +407,7 @@ class extends="testbox.system.BaseSpec" {
 					evidence
 				);
 				expect( result.ok ).toBeTrue();
-				expect( gateway.callCount() ).toBe( 5 );
+				expect( gateway.callCount() ).toBe( 6 );
 				expect( result.plan.target.units.len() ).toBeGTE( 2 );
 				expect( result.plan.routeContracts ).toBeEmpty();
 				expect( ( result.notes ?: [] ).filter( ( item ) => item.message == "omitted-unbacked-route" ) ).notToBeEmpty();
@@ -430,6 +488,7 @@ class extends="testbox.system.BaseSpec" {
 						samples: [ { id: "auth-sample", kind: "target-unit", sampleCode: "token = request.token" } ]
 					},
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", name: "Auth first", unitIds: [ "auth-unit" ], routeIds: [ "login-route" ] } ], assumptions: [], samples: [] }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -489,6 +548,7 @@ class extends="testbox.system.BaseSpec" {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "roadmap-fail seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { throw: true, message: "provider down" }
 				} );
 				var service = new app.models.services.ModernizationProposalService();
@@ -517,6 +577,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.ok ).toBeTrue();
 				expect( result.partial ).toBeTrue();
 				expect( gateway.callCount() ).toBe( 2 );
+				expect( result.errors.filter( ( item ) => item.role == "modernization-architecture" && item.message == "budget-exceeded" ) ).notToBeEmpty();
 			} );
 
 			it( "polishes provider aliases so routes, inventory links, currentSlice, and samples survive validation shape", () => {
@@ -552,6 +613,7 @@ class extends="testbox.system.BaseSpec" {
 						]
 					},
 					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": {
 						roadmapPhases: [
 							{ id: "P-002", name: "First slice", pattern: "vertical-slice", unitIds: [ "TU-001" ], routeIds: [ "RC-001" ], sampleIds: [ "SP-001" ], dependencies: [ "P-001" ], currentSlice: false, exitCriteria: [ "ok" ], rollback: "revert", parityIntent: "same" },

@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Debounced file watcher for a "live second pair of eyes" loop while editing
-    BoxLang/ColdFusion/JavaScript/Java source. On each save it queues a
+    BoxLang/ColdFusion/JavaScript source. On each save it queues a
     working-tree run with fast=true (skips crew planning and specialist agents),
     polls the run until it finishes, then prints the findings.
 
