@@ -154,14 +154,14 @@ echo.
 if %CONSOLE_MODE%==1 (
     echo [INFO] Starting miniserver with console output...
     echo.
-    %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar miniserver.json
     echo.
     echo ================================================================================
     echo DoubleCheck has stopped
     echo ================================================================================
 ) else (
     REM Run miniserver in background
-    start "DoubleCheck Server" /B %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    start "DoubleCheck Server" /B %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar miniserver.json
 
     REM Wait for server to start
     timeout /t 3 /nobreak >nul

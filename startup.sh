@@ -102,7 +102,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
     # Console mode: show all output
     echo "[INFO] Starting miniserver with console output..."
     echo ""
-    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar miniserver.json
     echo ""
     echo "================================================================================"
     echo "DoubleCheck has stopped"
@@ -110,7 +110,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
 else
     # Background mode: clean output
     echo "[INFO] Starting miniserver in background..."
-    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar &
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar miniserver.json &
     SERVER_PID=$!
 
     sleep 2
