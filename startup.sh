@@ -4,23 +4,19 @@
 # Requires: JDK 21 or higher
 # Usage: ./startup.sh [--port PORT] [--host HOST] [--console] [--no-browser] [--debug] [--help]
 
-set -e
-
 PORT=8585
 HOST=127.0.0.1
 OPEN_BROWSER=1
 DEBUG_MODE=0
 CONSOLE_MODE=0
-JAVA_CMD="java"
 
-# Color codes for output
+# Color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Parse command-line arguments
+# Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --help)
@@ -37,127 +33,60 @@ while [[ $# -gt 0 ]]; do
             echo "  --debug              Enable debug mode"
             echo "  --help               Show this help message"
             echo ""
-            echo "Examples:"
-            echo "  $0"
-            echo "  $0 --console"
-            echo "  $0 --port 9000 --console"
-            echo "  $0 --port 9000 --no-browser"
-            echo "  $0 --debug"
-            echo ""
             exit 0
             ;;
-        --port)
-            PORT="$2"
-            shift 2
-            ;;
-        --host)
-            HOST="$2"
-            shift 2
-            ;;
-        --console)
-            CONSOLE_MODE=1
-            shift
-            ;;
-        --no-browser)
-            OPEN_BROWSER=0
-            shift
-            ;;
-        --debug)
-            DEBUG_MODE=1
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Use --help for usage information"
-            exit 1
-            ;;
+        --port) PORT="$2"; shift 2 ;;
+        --host) HOST="$2"; shift 2 ;;
+        --console) CONSOLE_MODE=1; shift ;;
+        --no-browser) OPEN_BROWSER=0; shift ;;
+        --debug) DEBUG_MODE=1; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-# Find Java
-if command -v java &> /dev/null; then
-    JAVA_CMD="java"
-elif [ -n "$JAVA_HOME" ] && [ -f "$JAVA_HOME/bin/java" ]; then
+# Find Java: JAVA_HOME first, then PATH
+if [ -n "$JAVA_HOME" ] && [ -f "$JAVA_HOME/bin/java" ]; then
     JAVA_CMD="$JAVA_HOME/bin/java"
+elif command -v java &> /dev/null; then
+    JAVA_CMD="java"
 else
-    echo -e "${RED}ERROR: Java (JDK 21 or higher) is not installed or not in PATH${NC}"
+    echo -e "${RED}ERROR: Java is not installed or not in PATH${NC}"
     echo ""
-    echo "Solutions:"
+    echo "Please install JDK 21 and either:"
+    echo "  1. Add Java bin directory to PATH, or"
+    echo "  2. Set JAVA_HOME environment variable"
     echo ""
-    echo "1. Install Java (macOS with Homebrew):"
-    echo "   brew install openjdk@21"
-    echo ""
-    echo "2. Install Java (Linux - Ubuntu/Debian):"
-    echo "   sudo apt-get update"
-    echo "   sudo apt-get install openjdk-21-jdk"
-    echo ""
-    echo "3. Set JAVA_HOME environment variable:"
-    echo "   export JAVA_HOME=/path/to/jdk-21"
-    echo "   $0"
-    echo ""
-    echo "4. Download Java:"
-    echo "   https://www.oracle.com/java/technologies/downloads/"
-    echo ""
+    echo "Download: https://www.oracle.com/java/technologies/downloads/"
     exit 1
 fi
 
-# Check Java version
+# Get Java version
 JAVA_VERSION=$($JAVA_CMD -version 2>&1 | head -1)
-MAJOR_VERSION=$(echo "$JAVA_VERSION" | grep -oP '(?<=")[^"]*' | head -1 | cut -d. -f1)
+echo "Java version: $JAVA_VERSION"
+echo ""
 
-if [ -z "$MAJOR_VERSION" ]; then
-    MAJOR_VERSION=$(echo "$JAVA_VERSION" | grep -oP '\d+' | head -1)
-fi
-
-if [ -z "$MAJOR_VERSION" ] || ! [[ "$MAJOR_VERSION" =~ ^[0-9]+$ ]]; then
-    echo -e "${RED}ERROR: Could not determine Java version${NC}"
-    echo "Version output: $JAVA_VERSION"
-    echo ""
-    echo "Please install JDK 21 or higher and ensure it's in your PATH"
-    exit 1
-fi
-
-if (( MAJOR_VERSION < 21 )); then
-    echo -e "${RED}ERROR: Java version too old${NC}"
-    echo "Current: $JAVA_VERSION"
-    echo "Required: JDK 21 or higher"
-    echo ""
-    echo "Download from: https://www.oracle.com/java/technologies/downloads/"
-    exit 1
-fi
-
-# Setup .env
+# Create .env if needed
 if [ -f .env ]; then
-    if [ $CONSOLE_MODE -eq 1 ]; then
-        echo -e "${BLUE}[INFO]${NC} Using existing .env file"
-    fi
-else
-    if [ -f .env.example ]; then
-        cp .env.example .env
-        echo -e "${BLUE}[INFO]${NC} Created .env from .env.example"
-    else
-        echo -e "${YELLOW}[WARN]${NC} .env.example not found"
-    fi
+    [ $CONSOLE_MODE -eq 1 ] && echo "[INFO] Using existing .env file"
+elif [ -f .env.example ]; then
+    cp .env.example .env
+    echo "[INFO] Created .env from .env.example"
 fi
+echo ""
 
 # Setup debug mode
 if [ $DEBUG_MODE -eq 1 ]; then
     export BOXLANG_DEBUG=true
-    if [ $CONSOLE_MODE -eq 1 ]; then
-        echo -e "${BLUE}[INFO]${NC} Debug mode enabled"
-    fi
-else
-    export BOXLANG_DEBUG=false
+    [ $CONSOLE_MODE -eq 1 ] && echo "[INFO] Debug mode enabled"
 fi
 
-# Check if JAR exists
+# Check JAR
 if [ ! -f ".engine/boxlang-miniserver-1.14.0.jar" ]; then
     echo -e "${RED}ERROR: boxlang-miniserver-1.14.0.jar not found${NC}"
-    echo "Expected location: .engine/boxlang-miniserver-1.14.0.jar"
     exit 1
 fi
 
-# Print startup banner
+# Startup
 echo ""
 echo "================================================================================"
 echo "Starting DoubleCheck Local Code Review"
@@ -167,13 +96,11 @@ echo "Server Configuration:"
 echo "  Host:     $HOST"
 echo "  Port:     $PORT"
 echo "  Java:     $JAVA_VERSION"
-echo "  JAR:      .engine/boxlang-miniserver-1.14.0.jar"
 echo ""
 
-# Launch miniserver
 if [ $CONSOLE_MODE -eq 1 ]; then
-    # Show full console output
-    echo -e "${BLUE}[INFO]${NC} Starting miniserver with console output..."
+    # Console mode: show all output
+    echo "[INFO] Starting miniserver with console output..."
     echo ""
     $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar
     echo ""
@@ -181,53 +108,28 @@ if [ $CONSOLE_MODE -eq 1 ]; then
     echo "DoubleCheck has stopped"
     echo "================================================================================"
 else
-    # Run in background and show status
-    echo -e "${BLUE}[INFO]${NC} Starting miniserver in background..."
+    # Background mode: clean output
+    echo "[INFO] Starting miniserver in background..."
     $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar &
     SERVER_PID=$!
 
-    # Give server time to start
     sleep 2
-
-    echo -e "${GREEN}[OK]${NC} Server is running (PID: $SERVER_PID)"
-    echo ""
-    echo "================================================================================"
-    echo "DoubleCheck is running"
-    echo "================================================================================"
-    echo ""
-    echo "  URL:              http://$HOST:$PORT"
-    echo "  Process ID:       $SERVER_PID"
-    echo "  Database:         .db/doublecheck.db"
-    echo ""
-    echo "To stop the server, press Ctrl+C or run: kill $SERVER_PID"
-    echo "To see detailed logs, restart with: $0 --console"
+    echo -e "${GREEN}[OK]${NC} Server is running on http://$HOST:$PORT"
     echo ""
 
-    # Open browser if requested
-    if [ $OPEN_BROWSER -eq 1 ]; then
-        echo -e "${BLUE}[INFO]${NC} Opening browser..."
+    [ $OPEN_BROWSER -eq 1 ] && {
         if command -v open &> /dev/null; then
-            # macOS
             open "http://$HOST:$PORT"
         elif command -v xdg-open &> /dev/null; then
-            # Linux
             xdg-open "http://$HOST:$PORT" 2>/dev/null || true
-        elif command -v wslview &> /dev/null; then
-            # WSL
-            wslview "http://$HOST:$PORT" 2>/dev/null || true
         fi
-    fi
+    }
 
+    echo "Access: http://$HOST:$PORT"
+    echo "Use --console flag for detailed logs"
     echo ""
 
-    # Wait for server process
     wait $SERVER_PID
-    EXIT_CODE=$?
-
-    echo ""
-    echo "================================================================================"
-    echo "DoubleCheck has stopped (Exit Code: $EXIT_CODE)"
-    echo "================================================================================"
 fi
 
 exit 0

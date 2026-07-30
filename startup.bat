@@ -10,7 +10,6 @@ set HOST=127.0.0.1
 set OPEN_BROWSER=1
 set DEBUG_MODE=0
 set CONSOLE_MODE=0
-set JAVA_CMD=java
 
 REM Parse command-line arguments
 :parse_args
@@ -50,7 +49,7 @@ shift
 goto parse_args
 
 :after_args
-call :check_java
+call :find_java
 if errorlevel 1 exit /b 1
 
 call :setup_env
@@ -79,84 +78,40 @@ echo Examples:
 echo   startup.bat
 echo   startup.bat --console
 echo   startup.bat --port 9000 --console
-echo   startup.bat --port 9000 --no-browser
-echo   startup.bat --debug
 echo.
 exit /b 0
 
-:check_java
-REM First try to find java in PATH
-where java >nul 2>&1
-if errorlevel 1 (
-    REM Java not in PATH, try JAVA_HOME
-    if not "!JAVA_HOME!"=="" (
-        set JAVA_CMD=!JAVA_HOME!\bin\java
-        if not exist !JAVA_CMD! (
-            call :java_not_found
-            exit /b 1
-        )
-    ) else (
-        call :java_not_found
-        exit /b 1
+:find_java
+REM Find Java: check JAVA_HOME first, then PATH
+if defined JAVA_HOME (
+    set JAVA_EXE=!JAVA_HOME!\bin\java.exe
+    if exist "!JAVA_EXE!" (
+        goto java_found
     )
 )
 
-REM Get Java version
-for /f "tokens=*" %%i in ('!JAVA_CMD! -version 2^>^&1 ^| findstr /R "version"') do (
+REM Try java from PATH
+set JAVA_EXE=java.exe
+%JAVA_EXE% -version >nul 2>&1
+if %ERRORLEVEL% equ 0 goto java_found
+
+REM Java not found
+echo ERROR: Java is not installed or not in PATH
+echo.
+echo Please install JDK 21 and either:
+echo   1. Add Java bin directory to PATH, or
+echo   2. Set JAVA_HOME environment variable
+echo.
+echo Download: https://www.oracle.com/java/technologies/downloads/
+exit /b 1
+
+:java_found
+for /f "tokens=*" %%i in ('%JAVA_EXE% -version 2^>^&1 ^| findstr /R "version"') do (
     set JAVA_VERSION=%%i
 )
-
-if "!JAVA_VERSION!"=="" (
-    echo ERROR: Could not determine Java version
-    exit /b 1
-)
-
-REM Extract major version number
-for /f "tokens=2 delims= " %%i in ("%JAVA_VERSION%") do (
-    set VERSION_STR=%%i
-)
-for /f "tokens=1 delims=." %%i in ("%VERSION_STR%") do (
-    set MAJOR_VERSION=%%i
-)
-
-if "!MAJOR_VERSION!"=="" (
-    echo ERROR: Could not determine Java version
-    echo Version output: !JAVA_VERSION!
-    exit /b 1
-)
-
-REM Check if version is 21 or higher
-if %MAJOR_VERSION% LSS 21 (
-    echo ERROR: Java version too old
-    echo Current: !JAVA_VERSION!
-    echo Required: JDK 21 or higher
-    echo.
-    echo Download from: https://www.oracle.com/java/technologies/downloads/
-    exit /b 1
-)
-
-echo Java version: !JAVA_VERSION!
+echo Java version: %JAVA_VERSION%
 echo.
 exit /b 0
-
-:java_not_found
-echo ERROR: Java (JDK 21 or higher) is not installed or not in PATH
-echo.
-echo Solutions:
-echo.
-echo 1. Add Java to PATH:
-echo    - Install JDK 21 from: https://www.oracle.com/java/technologies/downloads/
-echo    - Add C:\Program Files\Java\jdk-21.X.X\bin to your PATH
-echo.
-echo 2. OR set JAVA_HOME environment variable:
-echo    - setx JAVA_HOME "C:\Program Files\Java\jdk-21.X.X"
-echo    - Then restart your terminal
-echo.
-echo 3. OR Use BoxLang's Java:
-echo    - setx JAVA_HOME "C:\boxlang"
-echo    - Then run this script again
-echo.
-exit /b 1
 
 :setup_env
 REM Create .env from .env.example if .env doesn't exist
@@ -166,8 +121,6 @@ if exist .env (
     if exist .env.example (
         copy .env.example .env >nul
         echo [INFO] Created .env from .env.example
-    ) else (
-        echo [WARN] .env.example not found
     )
 )
 echo.
@@ -183,8 +136,7 @@ exit /b 0
 :launch_server
 REM Check if JAR exists
 if not exist .engine\boxlang-miniserver-1.14.0.jar (
-    echo ERROR: boxlang-miniserver-1.14.0.jar not found
-    echo Expected location: .engine\boxlang-miniserver-1.14.0.jar
+    echo ERROR: boxlang-miniserver-1.14.0.jar not found at .engine\boxlang-miniserver-1.14.0.jar
     exit /b 1
 )
 
@@ -197,41 +149,32 @@ echo Server Configuration:
 echo   Host:     %HOST%
 echo   Port:     %PORT%
 echo   Java:     %JAVA_VERSION%
-echo   JAR:      .engine\boxlang-miniserver-1.14.0.jar
 echo.
 
 if %CONSOLE_MODE%==1 (
     echo [INFO] Starting miniserver with console output...
     echo.
-    %JAVA_CMD% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
     echo.
     echo ================================================================================
     echo DoubleCheck has stopped
     echo ================================================================================
 ) else (
-    REM Run miniserver in background and wait
-    start "DoubleCheck Server" /B %JAVA_CMD% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
+    REM Run miniserver in background
+    start "DoubleCheck Server" /B %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
 
     REM Wait for server to start
     timeout /t 3 /nobreak >nul
 
-    echo [INFO] Server is starting...
-    echo [INFO] Open your browser to: http://%HOST%:%PORT%
+    echo [OK] Server is running on http://%HOST%:%PORT%
     echo.
 
     if %OPEN_BROWSER%==1 (
-        echo [INFO] Opening browser...
         start http://%HOST%:%PORT%
     )
 
-    echo.
-    echo ================================================================================
-    echo DoubleCheck is running
-    echo ================================================================================
-    echo.
-    echo Access the application at: http://%HOST%:%PORT%
-    echo Press Ctrl+C to stop the server
-    echo Use --console flag to see detailed logs
+    echo Access: http://%HOST%:%PORT%
+    echo Use --console flag for detailed logs
     echo.
 
     REM Keep process running
