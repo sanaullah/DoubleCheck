@@ -10,7 +10,7 @@ class {
 	property name="maxCharacters" inject="coldbox:setting:modernizeMaxContextCharacters";
 	property name="maxLinesPerFile" inject="coldbox:setting:modernizeMaxContextLinesPerFile";
 	property name="maxCharactersPerPartition" inject="coldbox:setting:modernizeMaxContextCharactersPerPartition";
-	variables.defaults = { maxPartitions: 40, maxCharacters: 60000, maxLinesPerFile: 120, maxCharactersPerPartition: 18000 };
+	variables.defaults = { maxPartitions: 100, maxCharacters: 240000, maxLinesPerFile: 160, maxCharactersPerPartition: 18000 };
 	variables.version = "modernization-context-partitions-v1";
 
 	function init() {
@@ -70,17 +70,45 @@ class {
 		paths.sort( "textnocase" );
 		var partitions = [];
 		var usedCharacters = 0;
-		var omitted = 0;
-		for ( var path in paths ) {
-			if ( partitions.len() >= maxPartitions ) { omitted++; continue; }
+		var omittedPaths = [];
+		for ( var pathIndex = 1; pathIndex <= paths.len(); pathIndex++ ) {
+			var path = paths[ pathIndex ];
+			if ( partitions.len() >= maxPartitions ) { omittedPaths.append( path ); continue; }
 			var file = indexed[ path ] ?: { filePath: path, contentHash: "", lines: [] };
-			var partition = buildPartition( path, file, pathGroups[ path ], arguments.signals, arguments.schemaPack, arguments.coverage, maxLines, maxPartitionChars, maxCharacters - usedCharacters );
-			if ( !len( partition.text ) && !partition.artifactRefs.len() ) { omitted++; continue; }
+			// Share the global character budget across the paths that remain.
+			// Sequentially spending the full per-partition cap caused the first
+			// alphabetic files to consume the budget and left later CFML files
+			// with no source text at all.
+			var remainingPaths = max( 1, paths.len() - partitions.len() );
+			var fairPartitionCharacters = max( 256, int( ( maxCharacters - usedCharacters ) / remainingPaths ) );
+			var partition = buildPartition(
+				path,
+				file,
+				pathGroups[ path ],
+				arguments.signals,
+				arguments.schemaPack,
+				arguments.coverage,
+				maxLines,
+				min( maxPartitionChars, fairPartitionCharacters ),
+				maxCharacters - usedCharacters
+			);
+			if ( !len( partition.text ) && !partition.artifactRefs.len() ) { omittedPaths.append( path ); continue; }
 			partitions.append( partition );
 			usedCharacters += len( partition.text );
-			if ( usedCharacters >= maxCharacters ) { omitted += paths.len() - partitions.len(); break; }
+			if ( usedCharacters >= maxCharacters ) {
+				for ( var omittedIndex = pathIndex + 1; omittedIndex <= paths.len(); omittedIndex++ ) omittedPaths.append( paths[ omittedIndex ] );
+				break;
+			}
 		}
-		var summary = { partitionCount: partitions.len(), characters: usedCharacters, files: paths.len(), omittedPartitions: omitted, truncated: omitted > 0 || coverageTruncated( arguments.coverage ), lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 ) };
+		var summary = {
+			partitionCount: partitions.len(),
+			characters: usedCharacters,
+			files: paths.len(),
+			omittedPartitions: omittedPaths.len(),
+			omittedPaths: omittedPaths,
+			truncated: omittedPaths.len() > 0 || coverageTruncated( arguments.coverage ),
+			lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 )
+		};
 		return { version: variables.version, partitions: partitions, contexts: partitions, files: partitions, summary: summary, truncated: summary.truncated, characters: usedCharacters, fingerprint: stableHash( variables.version & "|" & partitions.map( ( item ) => item.fingerprint ).toList( "|" ) ) };
 	}
 
@@ -97,7 +125,9 @@ class {
 		required numeric maxPartitionChars,
 		required numeric availableCharacters
 	) {
-		var lines = isArray( arguments.file.lines ) ? arguments.file.lines : listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true );
+		var lines = structKeyExists( arguments.file, "lines" ) && isArray( arguments.file.lines )
+			? arguments.file.lines
+			: listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true );
 		if ( !lines.len() && len( arguments.file.content ?: "" ) ) lines = [ arguments.file.content ];
 		var ranges = selectRanges( arguments.units, lines.len(), arguments.maxLines );
 		var rendered = [];
@@ -173,7 +203,7 @@ class {
 		return ( repository.truncation ?: false ) || ( llm.truncated ?: false );
 	}
 	private numeric function numericSetting(any value, required numeric fallback) { var number = isNull( arguments.value ?: javacast( "null", "" ) ) ? 0 : val( arguments.value ); return number > 0 ? number : arguments.fallback; }
-	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" ); }
+	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\", "/", "all" ), "//", "/", "all" ); }
 	private string function normalizeText(required string text) { return replace( replace( arguments.text ?: "", char( 13 ), "", "all" ), char( 0 ), "", "all" ); }
 	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
 }

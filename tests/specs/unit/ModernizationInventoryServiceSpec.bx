@@ -10,10 +10,25 @@ class extends="testbox.system.BaseSpec" {
                 ] } );
                 expect( result.noModernizationScope ).toBeFalse();
                 expect( result.units.len() ).toBeGT( 2 );
+                expect( result.units.map( ( item ) => item.unitType ) ).toInclude( "application" );
                 expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "include" );
                 expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "http" );
                 expect( result.routeEvidence.len() ).toBe( 1 );
                 expect( result.routeEvidence[ 1 ].method ).toBe( "GET" );
+            } );
+
+            it( "normalizes Windows paths before classifying nested Application files", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "dashboard" & char( 92 ) & "Application.cfc",
+                        language: "ColdFusion",
+                        content: "component { function onRequestStart() {} }",
+                        contentHash: "nested-application"
+                    }
+                ] } );
+                expect( result.files[ 1 ].filePath ).toBe( "dashboard/Application.cfc" );
+                expect( result.units.filter( ( item ) => item.unitType == "application" ) ).toHaveLength( 1 );
+                expect( result.units[ 1 ].filePath ).toBe( "dashboard/Application.cfc" );
             } );
 
             it( "keeps opaque components and function signatures visible", () => {
@@ -25,6 +40,59 @@ class extends="testbox.system.BaseSpec" {
                 var listUnit = result.units.filter( ( item ) => item.symbolName == "list" )[ 1 ];
                 expect( listUnit.signature ).toInclude( "list(" );
                 expect( listUnit.parameters.len() ).toBeGT( 0 );
+            } );
+
+            it( "ignores comments and non-navigation attributes when extracting routes and schedules", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "portal.cfm",
+                        language: "ColdFusion",
+                        content: '<!--- Available on the GSA schedule --->' & char( 10 )
+                            & '<cffile action="write" file="report.txt">' & char( 10 )
+                            & '<cfpdf action="read" source="report.pdf">' & char( 10 )
+                            & '<link href="assets/site.css" rel="stylesheet">' & char( 10 )
+                            & '<a href="dashboard/index.cfm">Dashboard</a>',
+                        contentHash: "portal"
+                    }
+                ] } );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).notToInclude( "schedule" );
+                expect( result.routeEvidence.len() ).toBe( 1 );
+                expect( result.routeEvidence[ 1 ].legacyPath ).toBe( "dashboard/index.cfm" );
+                expect( result.routeEvidence[ 1 ].routeKind ).toBe( "anchor" );
+            } );
+
+            it( "does not extract functions from CFML comments and preserves live line numbers", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "Application.cfc",
+                        language: "ColdFusion",
+                        content: '<cffunction name="onApplicationStart"></cffunction>' & char( 10 )
+                            & '<!---' & char( 10 )
+                            & '<cffunction name="onError">' & char( 10 )
+                            & '</cffunction>' & char( 10 )
+                            & '--->' & char( 10 )
+                            & 'public void function onRequestStart() {}',
+                        contentHash: "commented-lifecycle"
+                    }
+                ] } );
+                var functions = result.units.filter( ( item ) => item.unitType == "function" );
+                expect( result.version ).toBe( "cfml-inventory-conservative-v2" );
+                expect( functions.map( ( item ) => item.symbolName ) ).toBe( [ "onApplicationStart", "onRequestStart" ] );
+                expect( functions.filter( ( item ) => item.symbolName == "onRequestStart" )[ 1 ].startLine ).toBe( 6 );
+            } );
+
+            it( "extracts the declared name from tag and script remote methods", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "Api.cfc",
+                        language: "ColdFusion",
+                        content: '<cffunction name="loadCrime" access="remote"></cffunction>' & char( 10 )
+                            & 'remote struct function saveCrime() { return {}; }',
+                        contentHash: "api"
+                    }
+                ] } );
+                expect( result.routeEvidence.map( ( item ) => item.legacyPath ) ).toInclude( "remote:loadCrime" );
+                expect( result.routeEvidence.map( ( item ) => item.legacyPath ) ).toInclude( "remote:saveCrime" );
             } );
 
             it( "returns a typed result for an empty CFML scope", () => {
@@ -40,7 +108,7 @@ class extends="testbox.system.BaseSpec" {
                 for ( var row = 1; row <= listing.recordCount; row++ ) {
                     if ( lCase( listing.type[ row ] ?: "" ) != "file" ) continue;
                     var file = createObject( "java", "java.io.File" ).init( listing.directory[ row ] & createObject( "java", "java.io.File" ).separator & listing.name[ row ] ).getCanonicalFile();
-                    var relative = replace( root.toPath().relativize( file.toPath() ).toString(), "\\", "/", "all" );
+                    var relative = replace( root.toPath().relativize( file.toPath() ).toString(), "\", "/", "all" );
                     files.append( { filePath: relative, language: "ColdFusion", content: fileRead( file.getPath() ), contentHash: lCase( hash( fileRead( file.getPath() ), "SHA-256" ) ) } );
                 }
                 var result = new app.models.services.ModernizationInventoryService().build( { files: files, scope: "full" } );

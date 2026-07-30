@@ -1,3 +1,11 @@
+// Detect current workspace from URL/page
+function getCurrentWorkspace() {
+	const path = window.location.pathname;
+	if (path.startsWith("/modernize")) return "modernize";
+	if (path.startsWith("/review")) return "review";
+	return "dashboard";
+}
+
 const state = {
 	activeRun: null,
 	eventSource: null,
@@ -47,7 +55,7 @@ const state = {
 		specialistCompleted: 0,
 		specialistTotal: 0
 	},
-	workspace: "review",
+	workspace: getCurrentWorkspace(),
 	modernization: {
 		result: null,
 		activePane: "overview",
@@ -1584,9 +1592,16 @@ const elements = {
 	modernizationRemoteAckWrap: document.querySelector("#remote-provider-ack-wrap"),
 	modernizationRemoteAck: document.querySelector("#remote-provider-ack"),
 	startRunButton: document.querySelector("#start-run-button"),
-	settingsForm: document.querySelector("#settings-form"),
-	settingsReset: document.querySelector("#settings-reset"),
-	settingsStatus: document.querySelector("#settings-status")
+	preferencesForm: document.querySelector("#preferences-form"),
+	preferencesReset: document.querySelector("#preferences-reset"),
+	preferencesStatus: document.querySelector("#preferences-status"),
+	providerTableBody: document.querySelector("#provider-table-body"),
+	providerForm: document.querySelector("#provider-form"),
+	providerCancelEdit: document.querySelector("#provider-cancel-edit"),
+	providerSaveButton: document.querySelector("#provider-save-button"),
+	providerFormStatus: document.querySelector("#provider-form-status"),
+	runDefaultsForm: document.querySelector("#run-defaults-form"),
+	runDefaultsStatus: document.querySelector("#run-defaults-status")
 };
 
 const reviewPresets = {
@@ -1620,7 +1635,7 @@ const reviewPresets = {
 			maxTasks: 6,
 			maxTokens: 12000,
 			maxTokensPerTask: 6000,
-			maxDurationMs: 900000,
+			maxDurationMs: 600000,
 			maxIterationsPerTask: 8,
 			maxToolOutputCharacters: 48000,
 			maxCostUsd: 5
@@ -1642,7 +1657,7 @@ const reviewPresets = {
 			maxTasks: 6,
 			maxTokens: 24000,
 			maxTokensPerTask: 6000,
-			maxDurationMs: 1800000,
+			maxDurationMs: 600000,
 			maxIterationsPerTask: 16,
 			maxToolOutputCharacters: 96000,
 			maxCostUsd: 10
@@ -1675,8 +1690,10 @@ function updateNewReviewSummary() {
 		elements.advancedSummary.textContent = `${maxTasks} tasks · ${tokenLabel} tokens · $${maxCost} max`;
 	}
 	if (elements.readinessDetail) {
-		elements.readinessDetail.textContent =
-			`${modeLabels[elements.mode?.value] || "Working tree"} · ${preset.label} · ${state.workspace === "modernize" ? "Proposal only · Read-only" : "Read-only"}`;
+		const scopeLabel = modeLabels[elements.mode?.value] || "Working tree";
+		elements.readinessDetail.textContent = state.workspace === "modernize"
+			? `${scopeLabel} · Proposal only · Read-only`
+			: `${scopeLabel} · ${preset.label} · Read-only`;
 	}
 	if (elements.readinessLabel) {
 		elements.readinessLabel.textContent = state.workspace === "modernize"
@@ -1685,6 +1702,31 @@ function updateNewReviewSummary() {
 	}
 	if (elements.reviewGoalCount) {
 		elements.reviewGoalCount.textContent = `${elements.reviewGoal?.value.length || 0} / 500`;
+	}
+}
+
+// Modernize's ReviewRunService.normalizeModernizationBudgets() ceiling is
+// 16,000 tokens/task and $200; plain Review's ReviewPolicyService ceiling
+// (from .env) is 6,000 tokens/task and $50. The shared advanced-limits
+// inputs must reflect whichever backend will validate the submitted run so
+// the browser does not block values the server would accept, or accept
+// values the server will reject.
+const budgetCeilings = {
+	review: { maxTokensPerTask: 6000, maxCostUsd: 50 },
+	modernize: { maxTokensPerTask: 16000, maxCostUsd: 200 }
+};
+
+function updateBudgetCeilingsForWorkspace(modernize) {
+	const ceilings = modernize ? budgetCeilings.modernize : budgetCeilings.review;
+	const tokensInput = elements.form?.elements.maxTokensPerTask;
+	if (tokensInput) {
+		tokensInput.max = String(ceilings.maxTokensPerTask);
+		if (Number(tokensInput.value) > ceilings.maxTokensPerTask) tokensInput.value = String(ceilings.maxTokensPerTask);
+	}
+	const costInput = elements.form?.elements.maxCostUsd;
+	if (costInput) {
+		costInput.max = String(ceilings.maxCostUsd);
+		if (Number(costInput.value) > ceilings.maxCostUsd) costInput.value = String(ceilings.maxCostUsd);
 	}
 }
 
@@ -2282,15 +2324,16 @@ function orderedRoadmapPhases(phases = []) {
 
 function modernizationItemMeta(item) {
 	const validation = modernizationValidationStatus(item);
+	const provenance = item.provenanceClass || "unknown provenance";
 	if (item._modernizationType === "legacy-unit") {
 		const range = item.startLine ? ` · lines ${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ""}` : "";
-		return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signals · ${item.touchedTables?.length || 0} tables`;
+		return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signals · ${item.touchedTables?.length || 0} tables · ${provenance}`;
 	}
-	if (item._modernizationType === "target-unit") return `${item.layer || item.kind || "target"} · ${item.sourcePath || item.filePath || "new proposal"} · ${validation}`;
-	if (item._modernizationType === "roadmap-phase") return `${item.pattern || "migration phase"} · ${(item.dependencies || []).length} dependencies · ${validation}`;
-	if (item._modernizationType === "db-finding") return `${item.category || "database"} · ${item.severity || "unrated"} · ${item.expandContract || "review"}`;
-	if (item._modernizationType === "route-contract") return `${item.method || "GET"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target route"}`;
-	return `${item._modernizationType} · ${validation}`;
+	if (item._modernizationType === "target-unit") return `${item.layer || item.kind || "target"} · ${item.sourcePath || item.filePath || "new proposal"} · ${validation} · ${provenance}`;
+	if (item._modernizationType === "roadmap-phase") return `${item.pattern || "migration phase"} · ${(item.dependencies || []).length} dependencies · ${validation} · ${provenance}`;
+	if (item._modernizationType === "db-finding") return `${item.category || "database"} · ${item.severity || "unrated"} · ${item.expandContract || "review"} · ${provenance}`;
+	if (item._modernizationType === "route-contract") return `${item.method || "UNKNOWN"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target route"} · ${provenance}`;
+	return `${item._modernizationType} · ${validation} · ${provenance}`;
 }
 
 function modernizationValidationStatus(item) {
@@ -2639,7 +2682,7 @@ function renderModernizationResult(result = {}) {
 		const target = result.target || {};
 		const targetRuntime = result.metadata?.runtime?.runtime || result.metadata?.runtime || "not specified";
 		const targetProfile = result.metadata?.targetProfile || target.layoutProfile || "not specified";
-		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Evidence contexts</span><strong>${(target.contexts || []).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Context coverage</dt><dd>${llm.partitions || llm.planned || 0} prepared · ${(target.contexts || []).length} used · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
+		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Architecture decisions</span><strong>${(target.contexts || []).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Coverage status</dt><dd>${coverage.status || (coverage.complete === true ? "complete" : "incomplete")}</dd><dt>Provider coverage</dt><dd>${llm.status || "not-observed"} · ${llm.completed || 0} completed · ${llm.failed || 0} failed · ${llm.omitted || llm.omittedPartitions || 0} omitted</dd><dt>Source context prepared</dt><dd>${llm.partitions || llm.planned || 0} partitions · ${llm.files || 0} files · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
 		const queuedSummary = runStatus === "queued" ? "Modernize is queued; the plan will appear after the shared repository scan." : runStatus === "running" ? "Modernize is building an evidence-backed plan. Proposal items will appear as stages complete." : runStatus === "failed" ? (state.activeRun?.message || "Modernize could not generate a plan.") : runStatus === "cancelled" ? "Modernize was cancelled before a complete plan was generated." : runStatus === "partial" ? "A partial Modernize plan was retained with review gates." : "Modernization proposal is ready for review.";
 		elements.modernizationOverview.querySelector(".result-summary").textContent = result.summary || queuedSummary;
 		const notice = elements.modernizationOverview.querySelector(".modernization-notice");
@@ -2654,7 +2697,7 @@ function renderModernizationResult(result = {}) {
 		const hollow = modernizationPlanIsHollow(result);
 		const genNotesPreview = modernizationGenerationNotes(result);
 		const bannerText = Array.isArray(coverage.banners) ? coverage.banners.join(" ") : "";
-		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "") || (genErrors.length || genNotesPreview.length ? "generation-errors" : "");
+		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.complete === false ? "Coverage is incomplete; review the explicit gaps before accepting this plan." : "") || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "") || (genErrors.length || genNotesPreview.length ? "generation-errors" : "");
 		elements.modernizationCoverageBanner.hidden = !note;
 		if (note) {
 			const schema = coverage.schema || {};
@@ -2695,9 +2738,10 @@ function renderModernizationResult(result = {}) {
 			elements.modernizationCoverageBanner.querySelector(".schema-detail").textContent = schema.coverage === "absent" ? "No schema pack attached — database work stays advisory." : `${schema.coverage || "unknown"}: ${schema.objects?.tables || 0} tables, ${schema.objects?.columns || 0} columns, ${schema.objects?.constraints || 0} constraints, ${schema.objects?.indexes || 0} indexes, ${schema.objects?.routines || 0} routines.`;
 			cards[1].querySelector(".confidence-impact").textContent = schema.coverage === "absent" ? "Impact: you can still modernize application/route slices; do not implement DB migrations from inference alone." : "Impact: database proposals are limited to the parsed schema objects shown above.";
 			cards[1].querySelector(".confidence-action").textContent = schema.coverage === "absent" ? "Optional: in Modernize setup, attach DDL/JSON or an in-repo schema path when you need verified DB work." : "Next: review unresolved schema objects in Evidence and catalogs before accepting transitions.";
+			const gapCount = Array.isArray(llm.gaps) ? llm.gaps.length : 0;
 			elements.modernizationCoverageBanner.querySelector(".context-detail").textContent = hollow
-				? `Context was prepared (${llm.partitions || llm.planned || 0} partitions, ${llm.files || 0} files) but the application proposal did not land (${targetCount} target units).`
-				: `${llm.partitions || llm.planned || 0} partitions prepared; ${targetContextCount} contexts / ${targetCount} target units in this proposal; ${llm.contextCharacters || 0} characters across ${llm.files || 0} files.`;
+				? `Provider coverage ${llm.status || "incomplete"}: context was prepared (${llm.partitions || llm.planned || 0} partitions, ${llm.files || 0} files) but the application proposal did not land (${targetCount} target units; ${gapCount} explicit gaps).`
+				: `Provider coverage ${llm.status || "unknown"}: ${llm.completed || 0} shards completed, ${llm.failed || 0} failed, ${llm.omitted || llm.omittedPartitions || 0} omitted; ${targetContextCount} contexts / ${targetCount} target units; ${gapCount} explicit gaps.`;
 			cards[2].querySelector(".confidence-impact").textContent = hollow
 				? "Impact: confidence gaps are secondary — rerun until target structure and mapped road slices appear."
 				: (Number(llm.omittedPartitions || 0) > 0 && targetCount > 0
@@ -2710,7 +2754,7 @@ function renderModernizationResult(result = {}) {
 				: (targetCount > 0
 					? "Next: accept or rebuild one mapped slice at a time using only the files listed for that slice."
 					: "Next: accept or rebuild one mapped slice at a time using only the files listed for that slice.");
-			if (cfmlComplete && !hollow) {
+			if (cfmlComplete && !hollow && coverage.complete !== false && llm.status !== "incomplete") {
 				elements.modernizationCoverageBanner.querySelector(".modernization-confidence-heading strong").textContent = "CFML scope is ready — other limits are optional";
 				elements.modernizationCoverageBanner.querySelector(".status-badge").textContent = "Ready";
 				elements.modernizationCoverageBanner.querySelector(".status-badge").dataset.state = "ok";
@@ -2894,6 +2938,7 @@ function renderModernizationSolution(result = {}) {
 	}
 	const routeStrip = document.querySelector("#modernization-route-strip");
 	if (routeStrip) {
+		const routeObservation = result.coverage?.observations?.routes?.state || "not-observed";
 		const routes = mappedPhase
 			? (result.routeContracts || []).filter((route) => !routeIds.size || routeIds.has(String(route.id)))
 			: [];
@@ -2904,7 +2949,7 @@ function renderModernizationSolution(result = {}) {
 		} else {
 			routeStrip.innerHTML = routes.length
 				? `<h4>Routes</h4>${routes.map((route) => `<div class="modernization-route-row"><code></code><span></span></div>`).join("")}`
-				: `<p class="field-hint">No route contracts linked to this phase.</p>`;
+				: `<p class="field-hint">No route contracts linked to this phase · source state: ${routeObservation}.</p>`;
 			[...routeStrip.querySelectorAll(".modernization-route-row")].forEach((row, index) => {
 				const route = routes[index];
 				row.querySelector("code").textContent = `${route.method || "GET"} ${route.legacyPath || route.path || "?"} → ${route.targetRoute || route.targetEvent || "?"}`;
@@ -4480,64 +4525,326 @@ async function loadHealth() {
 	}
 }
 
-const settingsKey = "doubleCheck.preferences.v1";
+const localPreferencesKey = "doubleCheck.preferences.v1";
 
-function readLocalSettings() {
+// defaultPreset/defaultMode live server-side (AppSettingsService) so they apply the
+// same way regardless of which device opens the Review page; rememberProject/projectPath
+// stay device-local since a remembered filesystem path is meaningless on another machine.
+function readLocalPreferences() {
 	try {
-		return {
-			defaultPreset: "balanced",
-			defaultMode: "full",
-			rememberProject: false,
-			projectPath: "",
-			...JSON.parse(localStorage.getItem(settingsKey) || "{}")
-		};
+		return { rememberProject: false, projectPath: "", ...JSON.parse(localStorage.getItem(localPreferencesKey) || "{}") };
 	} catch {
-		return { defaultPreset: "balanced", defaultMode: "full", rememberProject: false, projectPath: "" };
+		return { rememberProject: false, projectPath: "" };
 	}
 }
 
-function applyLocalSettings() {
-	const settings = readLocalSettings();
-	if (elements.settingsForm) {
-		elements.settingsForm.elements.defaultPreset.value = settings.defaultPreset;
-		elements.settingsForm.elements.defaultMode.value = settings.defaultMode;
-		elements.settingsForm.elements.rememberProject.checked = !!settings.rememberProject;
+function writeLocalPreferences(prefs) {
+	localStorage.setItem(localPreferencesKey, JSON.stringify({
+		rememberProject: !!prefs.rememberProject,
+		projectPath: prefs.rememberProject ? (prefs.projectPath || "").trim() : ""
+	}));
+}
+
+async function applyStartupPreferences() {
+	const local = readLocalPreferences();
+	let defaultPreset = "balanced";
+	let defaultMode = "full";
+	try {
+		const payload = await request("/api/v1/app-settings");
+		defaultPreset = payload.data?.defaultPreset || defaultPreset;
+		defaultMode = payload.data?.defaultMode || defaultMode;
+	} catch {
+		// Settings endpoint unreachable (e.g. very first boot) - built-in defaults still apply.
 	}
-	const presetInput = elements.form?.querySelector(
-		`[name="reviewPreset"][value="${settings.defaultPreset}"]`
-	);
+	const presetInput = elements.form?.querySelector(`[name="reviewPreset"][value="${defaultPreset}"]`);
 	if (presetInput) {
 		presetInput.checked = true;
-		applyReviewPreset(settings.defaultPreset);
+		applyReviewPreset(defaultPreset);
 	}
-	if (elements.mode && settings.defaultMode) {
-		elements.mode.value = settings.defaultMode;
+	if (elements.mode && defaultMode) {
+		elements.mode.value = defaultMode;
 	}
-	if (settings.rememberProject && settings.projectPath && elements.projectPath) {
-		elements.projectPath.value = settings.projectPath;
+	if (local.rememberProject && local.projectPath && elements.projectPath) {
+		elements.projectPath.value = local.projectPath;
 	}
 	updateRevisionFields();
 	updateNewReviewSummary();
+	if (elements.preferencesForm) {
+		elements.preferencesForm.elements.defaultPreset.value = defaultPreset;
+		elements.preferencesForm.elements.defaultMode.value = defaultMode;
+		elements.preferencesForm.elements.rememberProject.checked = !!local.rememberProject;
+	}
 }
 
-elements.settingsForm?.addEventListener("submit", (event) => {
-	event.preventDefault();
-	const formData = new FormData(elements.settingsForm);
-	const rememberProject = formData.get("rememberProject") === "on";
-	localStorage.setItem(settingsKey, JSON.stringify({
-		defaultPreset: formData.get("defaultPreset") || "balanced",
-		defaultMode: formData.get("defaultMode") || "full",
-		rememberProject,
-		projectPath: rememberProject ? (elements.projectPath?.value || "").trim() : ""
-	}));
-	elements.settingsStatus.textContent = "Settings saved on this device.";
-	applyLocalSettings();
+// Captures the current project path as "remembered" the moment it changes on the Review
+// page, since the Dashboard's preferences form has no project-path field of its own to read.
+elements.projectPath?.addEventListener("change", () => {
+	const local = readLocalPreferences();
+	if (local.rememberProject) {
+		writeLocalPreferences({ rememberProject: true, projectPath: elements.projectPath.value || "" });
+	}
 });
 
-elements.settingsReset?.addEventListener("click", () => {
-	localStorage.removeItem(settingsKey);
-	elements.settingsStatus.textContent = "Settings reset.";
-	applyLocalSettings();
+elements.preferencesForm?.addEventListener("submit", async (event) => {
+	event.preventDefault();
+	const formData = new FormData(elements.preferencesForm);
+	const rememberProject = formData.get("rememberProject") === "on";
+	const existing = readLocalPreferences();
+	writeLocalPreferences({ rememberProject, projectPath: rememberProject ? existing.projectPath : "" });
+	try {
+		await request("/api/v1/app-settings", {
+			method: "PUT",
+			body: JSON.stringify({
+				defaultPreset: formData.get("defaultPreset") || "balanced",
+				defaultMode: formData.get("defaultMode") || "full"
+			})
+		});
+		elements.preferencesStatus.textContent = "Preferences saved.";
+	} catch (error) {
+		elements.preferencesStatus.textContent = error.message || "Could not save preferences.";
+	}
+});
+
+elements.preferencesReset?.addEventListener("click", async () => {
+	localStorage.removeItem(localPreferencesKey);
+	try {
+		await request("/api/v1/app-settings", {
+			method: "PUT",
+			body: JSON.stringify({ defaultPreset: "balanced", defaultMode: "full" })
+		});
+	} catch {
+		// Local reset still applies even if the server write fails.
+	}
+	elements.preferencesStatus.textContent = "Preferences reset.";
+	await applyStartupPreferences();
+});
+
+const providerTypeLabels = {
+	openai: "OpenAI",
+	"openai-compatible": "OpenAI-compatible",
+	openrouter: "OpenRouter",
+	ollama: "Ollama (local)",
+	docker: "Docker Model Runner (local)",
+	lmstudio: "LM Studio (local)",
+	llamacpp: "llama.cpp (local)"
+};
+
+function resetProviderForm() {
+	if (!elements.providerForm) return;
+	elements.providerForm.reset();
+	elements.providerForm.elements.id.value = "";
+	elements.providerForm.elements.apiKey.placeholder = "Provider API key";
+	if (elements.providerSaveButton) elements.providerSaveButton.textContent = "Add provider";
+	if (elements.providerCancelEdit) elements.providerCancelEdit.hidden = true;
+}
+
+function fillProviderForm(profile) {
+	if (!elements.providerForm) return;
+	const form = elements.providerForm;
+	form.elements.id.value = profile.id;
+	form.elements.name.value = profile.name || "";
+	form.elements.provider.value = profile.provider || "openrouter";
+	form.elements.baseUrl.value = profile.baseUrl || "";
+	form.elements.model.value = profile.model || "";
+	form.elements.apiKey.value = "";
+	form.elements.apiKey.placeholder = profile.hasApiKey ? `Leave blank to keep ${profile.apiKey || "saved key"}` : "Provider API key";
+	form.elements.timeoutSeconds.value = profile.timeoutSeconds || 120;
+	form.elements.contextWindow.value = profile.contextWindow || 128000;
+	form.elements.inputUsdPerMillion.value = profile.inputUsdPerMillion || 0;
+	form.elements.outputUsdPerMillion.value = profile.outputUsdPerMillion || 0;
+	if (elements.providerSaveButton) elements.providerSaveButton.textContent = "Save changes";
+	if (elements.providerCancelEdit) elements.providerCancelEdit.hidden = false;
+	form.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function loadProviders() {
+	if (!elements.providerTableBody) return;
+	elements.providerTableBody.innerHTML = `<tr><td colspan="6">${emptyStateHtml({
+		icon: "history",
+		title: "Loading providers…"
+	})}</td></tr>`;
+	try {
+		const payload = await request("/api/v1/ai-providers");
+		const profiles = payload.data || [];
+		if (!profiles.length) {
+			elements.providerTableBody.innerHTML = `<tr><td colspan="6">${emptyStateHtml({
+				icon: "inbox",
+				title: "No saved providers",
+				hint: "Add a provider below, or leave empty to keep using the environment-configured connection."
+			})}</td></tr>`;
+			return;
+		}
+		elements.providerTableBody.innerHTML = "";
+		profiles.forEach((profile) => {
+			const row = document.createElement("tr");
+			row.dataset.providerId = profile.id;
+			row.innerHTML = `
+				<td class="name"></td>
+				<td class="type"></td>
+				<td class="model"></td>
+				<td class="provider-key"></td>
+				<td></td>
+				<td>
+					<div class="provider-actions">
+						<button type="button" class="secondary-button" data-provider-action="activate">Activate</button>
+						<button type="button" class="secondary-button" data-provider-action="test">Test</button>
+						<button type="button" class="secondary-button" data-provider-action="edit">Edit</button>
+						<button type="button" class="danger-button" data-provider-action="delete">Delete</button>
+					</div>
+				</td>
+			`;
+			row.querySelector(".name").textContent = profile.name;
+			row.querySelector(".type").textContent = providerTypeLabels[profile.provider] || profile.provider;
+			row.querySelector(".model").textContent = profile.model;
+			row.querySelector(".provider-key").textContent = profile.hasApiKey ? profile.apiKey : "—";
+			const statusCell = row.children[4];
+			const badge = document.createElement("span");
+			badge.className = `status-badge ${profile.isActive ? "succeeded" : ""}`;
+			badge.textContent = profile.isActive ? "Active" : "Inactive";
+			statusCell.appendChild(badge);
+			const activateButton = row.querySelector('[data-provider-action="activate"]');
+			if (profile.isActive && activateButton) {
+				activateButton.disabled = true;
+				activateButton.textContent = "Active";
+			}
+			elements.providerTableBody.appendChild(row);
+		});
+	} catch (error) {
+		elements.providerTableBody.innerHTML = `<tr><td colspan="6">${emptyStateHtml({
+			icon: "alert",
+			title: "Could not load providers",
+			hint: error.message || "Check the local server and try again."
+		})}</td></tr>`;
+	}
+}
+
+elements.providerForm?.addEventListener("submit", async (event) => {
+	event.preventDefault();
+	const formData = new FormData(elements.providerForm);
+	const id = formData.get("id");
+	const body = {
+		name: formData.get("name") || "",
+		provider: formData.get("provider") || "",
+		baseUrl: formData.get("baseUrl") || "",
+		model: formData.get("model") || "",
+		timeoutSeconds: Number(formData.get("timeoutSeconds") || 120),
+		contextWindow: Number(formData.get("contextWindow") || 128000),
+		inputUsdPerMillion: Number(formData.get("inputUsdPerMillion") || 0),
+		outputUsdPerMillion: Number(formData.get("outputUsdPerMillion") || 0)
+	};
+	const apiKey = (formData.get("apiKey") || "").trim();
+	if (apiKey || !id) body.apiKey = apiKey;
+	elements.providerFormStatus.textContent = "Saving…";
+	try {
+		await request(id ? `/api/v1/ai-providers/${id}` : "/api/v1/ai-providers", {
+			method: id ? "PUT" : "POST",
+			body: JSON.stringify(body)
+		});
+		elements.providerFormStatus.textContent = "Provider saved.";
+		resetProviderForm();
+		await loadProviders();
+	} catch (error) {
+		elements.providerFormStatus.textContent = error.message || "Could not save provider.";
+	}
+});
+
+elements.providerCancelEdit?.addEventListener("click", () => {
+	resetProviderForm();
+	elements.providerFormStatus.textContent = "";
+});
+
+elements.providerTableBody?.addEventListener("click", async (event) => {
+	const button = event.target.closest("[data-provider-action]");
+	if (!button) return;
+	const row = button.closest("tr");
+	const id = row?.dataset.providerId;
+	if (!id) return;
+	const action = button.dataset.providerAction;
+	if (action === "edit") {
+		try {
+			const payload = await request(`/api/v1/ai-providers/${id}`);
+			fillProviderForm(payload.data || {});
+			elements.providerFormStatus.textContent = "";
+		} catch (error) {
+			elements.providerFormStatus.textContent = error.message || "Could not load provider.";
+		}
+		return;
+	}
+	if (action === "delete") {
+		if (!window.confirm("Delete this provider profile?")) return;
+		try {
+			await request(`/api/v1/ai-providers/${id}`, { method: "DELETE" });
+			await loadProviders();
+		} catch (error) {
+			elements.providerFormStatus.textContent = error.message || "Could not delete provider.";
+		}
+		return;
+	}
+	if (action === "activate") {
+		try {
+			await request(`/api/v1/ai-providers/${id}/activate`, { method: "POST" });
+			await loadProviders();
+		} catch (error) {
+			elements.providerFormStatus.textContent = error.message || "Could not activate provider.";
+		}
+		return;
+	}
+	if (action === "test") {
+		const originalText = button.textContent;
+		button.disabled = true;
+		button.textContent = "Testing…";
+		try {
+			const payload = await request(`/api/v1/ai-providers/${id}/smoke`, { method: "POST" });
+			elements.providerFormStatus.textContent = payload.data?.ok
+				? "Connection succeeded."
+				: (payload.data?.message || "Connection test did not confirm success.");
+		} catch (error) {
+			elements.providerFormStatus.textContent = error.message || "Connection test failed.";
+		} finally {
+			button.disabled = false;
+			button.textContent = originalText;
+		}
+	}
+});
+
+async function loadRunDefaults() {
+	if (!elements.runDefaultsForm) return;
+	try {
+		const payload = await request("/api/v1/app-settings");
+		const settings = payload.data || {};
+		const form = elements.runDefaultsForm;
+		[
+			"planMaxTasks", "runDefaultTokenBudget", "runMaxTokenBudget",
+			"runDefaultTokensPerTask", "runMaxTokensPerTask", "runDefaultDurationMs", "runMaxDurationMs",
+			"runDefaultIterationsPerTask", "runMaxIterationsPerTask", "runDefaultToolOutputCharacters",
+			"runMaxToolOutputCharacters", "runDefaultCostUsd", "runMaxCostUsd", "observabilityPreviewCharacters"
+		].forEach((key) => {
+			if (form.elements[key] && settings[key] !== undefined) form.elements[key].value = settings[key];
+		});
+		if (form.elements.observabilityEnabled) form.elements.observabilityEnabled.checked = !!settings.observabilityEnabled;
+	} catch (error) {
+		elements.runDefaultsStatus.textContent = error.message || "Could not load run defaults.";
+	}
+}
+
+elements.runDefaultsForm?.addEventListener("submit", async (event) => {
+	event.preventDefault();
+	const formData = new FormData(elements.runDefaultsForm);
+	const body = {};
+	[
+		"planMaxTasks", "runDefaultTokenBudget", "runMaxTokenBudget",
+		"runDefaultTokensPerTask", "runMaxTokensPerTask", "runDefaultDurationMs", "runMaxDurationMs",
+		"runDefaultIterationsPerTask", "runMaxIterationsPerTask", "runDefaultToolOutputCharacters",
+		"runMaxToolOutputCharacters", "runDefaultCostUsd", "runMaxCostUsd", "observabilityPreviewCharacters"
+	].forEach((key) => { body[key] = Number(formData.get(key)); });
+	body.observabilityEnabled = formData.get("observabilityEnabled") === "on";
+	elements.runDefaultsStatus.textContent = "Saving…";
+	try {
+		await request("/api/v1/app-settings", { method: "PUT", body: JSON.stringify(body) });
+		elements.runDefaultsStatus.textContent = "Run defaults saved.";
+	} catch (error) {
+		elements.runDefaultsStatus.textContent = error.message || "Could not save run defaults.";
+	}
 });
 
 function setModernizationWorkspace(kind) {
@@ -4548,6 +4855,7 @@ function setModernizationWorkspace(kind) {
 		? "Watch repository evidence, proposal roles, validation gates, and plan milestones for the active run."
 		: "Watch pipeline stages, crew progress, and live milestones for the active run.";
 	if (elements.modernizationFields) elements.modernizationFields.hidden = !modernize;
+	updateBudgetCeilingsForWorkspace(modernize);
 	if (elements.modernizationResults) elements.modernizationResults.hidden = !modernize;
 	if (elements.workspaceHint) elements.workspaceHint.textContent = modernize
 		? "Modernize builds a reviewable migration plan from CFML evidence; it never writes source files."
@@ -4691,47 +4999,73 @@ elements.modernizationTargetRuntime?.addEventListener("change", () => {
 elements.modernizationSchemaSource?.addEventListener("change", updateModernizationSchemaFields);
 elements.modernizationSchemaFile?.addEventListener("change", () => {
 		const file = elements.modernizationSchemaFile.files?.[0];
-		if (elements.modernizationSchemaStatus) elements.modernizationSchemaStatus.textContent = file ? `${file.name} selected · read locally on submit` : "Schema input is optional. Missing schema remains visible as inference-limited coverage.";
+		if (elements.modernizationSchemaStatus) elements.modernizationSchemaStatus.textContent = file ? `${file.name} selected · read locally on submit` : "Repository SQL will be auto-discovered locally; no usable DDL remains visible as inference-limited coverage.";
 });
+
+function setRunSubmitBusy(busy) {
+	const button = elements.startRunButton;
+	if (!button) return;
+	if (busy) {
+		button.dataset.idleLabel = button.textContent;
+		button.disabled = true;
+		button.classList.add("is-loading");
+		button.innerHTML = "";
+		const spinner = document.createElement("span");
+		spinner.className = "button-spinner";
+		spinner.setAttribute("aria-hidden", "true");
+		const label = document.createElement("span");
+		label.textContent = state.workspace === "modernize" ? "Starting modernization…" : "Starting review…";
+		button.append(spinner, label);
+	} else {
+		button.disabled = false;
+		button.classList.remove("is-loading");
+		if (button.dataset.idleLabel) button.textContent = button.dataset.idleLabel;
+	}
+}
 
 elements.form?.addEventListener("submit", async (event) => {
 	event.preventDefault();
-	if (state.workspace === "modernize") {
-		await submitModernization();
-		return;
-	}
-	elements.formMessage.textContent = "";
-	const formData = new FormData(elements.form);
-	const body = Object.fromEntries(formData);
-	body.policy = {
-		allowedRoles: formData.getAll("allowedRole"),
-		reviewGoal: String(formData.get("reviewGoal") || "").trim()
-	};
-	body.budgets = {
-		maxTasks: Number(formData.get("maxTasks")),
-		maxTokens: Number(formData.get("maxTokens")),
-		maxTokensPerTask: Number(formData.get("maxTokensPerTask")),
-		maxDurationMs: Number(formData.get("maxDurationMs")),
-		maxIterationsPerTask: Number(formData.get("maxIterationsPerTask")),
-		maxToolOutputCharacters: Number(formData.get("maxToolOutputCharacters")),
-		maxCostUsd: Number(formData.get("maxCostUsd"))
-	};
-	delete body.allowedRole;
-	delete body.reviewGoal;
-	delete body.reviewPreset;
-	delete body.maxTasks;
-	delete body.maxTokens;
-	delete body.maxTokensPerTask;
-	delete body.maxDurationMs;
-	delete body.maxIterationsPerTask;
-	delete body.maxToolOutputCharacters;
-	delete body.maxCostUsd;
+	setRunSubmitBusy(true);
 	try {
-		const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(body) });
-		watchRun(payload.data);
-		loadRuns();
-	} catch (error) {
-		elements.formMessage.textContent = error.message;
+		if (state.workspace === "modernize") {
+			await submitModernization();
+			return;
+		}
+		elements.formMessage.textContent = "";
+		const formData = new FormData(elements.form);
+		const body = Object.fromEntries(formData);
+		body.policy = {
+			allowedRoles: formData.getAll("allowedRole"),
+			reviewGoal: String(formData.get("reviewGoal") || "").trim()
+		};
+		body.budgets = {
+			maxTasks: Number(formData.get("maxTasks")),
+			maxTokens: Number(formData.get("maxTokens")),
+			maxTokensPerTask: Number(formData.get("maxTokensPerTask")),
+			maxDurationMs: Number(formData.get("maxDurationMs")),
+			maxIterationsPerTask: Number(formData.get("maxIterationsPerTask")),
+			maxToolOutputCharacters: Number(formData.get("maxToolOutputCharacters")),
+			maxCostUsd: Number(formData.get("maxCostUsd"))
+		};
+		delete body.allowedRole;
+		delete body.reviewGoal;
+		delete body.reviewPreset;
+		delete body.maxTasks;
+		delete body.maxTokens;
+		delete body.maxTokensPerTask;
+		delete body.maxDurationMs;
+		delete body.maxIterationsPerTask;
+		delete body.maxToolOutputCharacters;
+		delete body.maxCostUsd;
+		try {
+			const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(body) });
+			watchRun(payload.data);
+			loadRuns();
+		} catch (error) {
+			elements.formMessage.textContent = error.message;
+		}
+	} finally {
+		setRunSubmitBusy(false);
 	}
 });
 
@@ -5047,10 +5381,12 @@ elements.modernizationExportActions?.addEventListener("click", (event) => {
 });
 
 loadHealth();
-applyLocalSettings();
+applyStartupPreferences();
+loadProviders();
+loadRunDefaults();
 loadSession();
 renderResult();
-setModernizationWorkspace(elements.runKind?.value || "review");
+setModernizationWorkspace(state.workspace === "modernize" ? "modernize" : "review");
 selectModernizationPane(state.modernization.activePane);
 updateModernizationProviderDisclosure();
 updateModernizationTargetProfiles();

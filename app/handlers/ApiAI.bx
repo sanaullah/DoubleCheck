@@ -9,11 +9,7 @@ class extends="coldbox.system.RestHandler" {
 
 	property name="specialistGateway" inject="SpecialistAgentGateway";
 
-	property name="aiProvider" inject="coldbox:setting:aiProvider";
-
-	property name="aiModel" inject="coldbox:setting:aiModel";
-
-	property name="aiBaseURL" inject="coldbox:setting:aiBaseURL";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
 
 	property name="log" inject="logbox:logger:{this}";
 
@@ -21,10 +17,14 @@ class extends="coldbox.system.RestHandler" {
 
 	/**
 	 * GET /api/v1/ai/smoke
-	 * Live provider connectivity check for local development.
+	 * Live provider connectivity check for local development. Optional
+	 * ?profileId= tests a specific saved provider profile without switching
+	 * the active one; omitted tests the currently active/default connection.
 	 */
 	function smoke( event, rc, prc ) {
-		if ( !aiReviewService.isEnabled() ) {
+		var profileId = trim( rc.profileId ?: "" );
+		var resolved = aiProviderResolver.resolve( profileId );
+		if ( !aiReviewService.isEnabled( profileId ) ) {
 			event.renderData(
 					type       = "json",
 					statusCode = 503,
@@ -41,19 +41,23 @@ class extends="coldbox.system.RestHandler" {
 
 		specialistGateway.resetCircuit();
 		try {
-			var result = aiReviewService.smokeTest();
+			var result = aiReviewService.smokeTest( profileId );
 			event.renderData(
 					type = "json",
 					data = {
 						data: {
-							success   : result.success,
-							enabled   : true,
-							provider  : result.provider,
-							model     : result.model,
-							baseHost  : result.baseHost,
-							durationMs: result.durationMs,
-							response  : result.response,
-							circuit   : specialistGateway.circuitStatus()
+							success         : result.success,
+							enabled         : true,
+							provider        : result.provider,
+							model           : result.model,
+							baseHost        : result.baseHost,
+							durationMs      : result.durationMs,
+							responseFormat  : result.responseFormat,
+							response        : result.response,
+							outputCharacters: result.outputCharacters,
+							usage           : result.usage,
+							errorClass      : result.errorClass,
+							circuit         : specialistGateway.circuitStatus()
 						}
 					}
 				);
@@ -63,8 +67,8 @@ class extends="coldbox.system.RestHandler" {
 					{
 						type      : error.type ?: "",
 						message   : secretRedactionService.redactText( error.message ?: "" ),
-						provider  : aiProvider,
-						model     : aiModel,
+						provider  : resolved.provider,
+						model     : resolved.model,
 						stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
 					}
 				);
@@ -73,14 +77,15 @@ class extends="coldbox.system.RestHandler" {
 					statusCode = 502,
 					data       = {
 						data: {
-							success : false,
-							enabled : true,
-							provider: aiProvider,
-							model   : aiModel,
-							baseURL : aiBaseURL,
-							message : error.message,
-							type    : error.type ?: "",
-							circuit : specialistGateway.circuitStatus()
+							success   : false,
+							enabled   : true,
+							provider  : resolved.provider,
+							model     : resolved.model,
+							baseURL   : resolved.baseURL,
+							message   : error.message,
+							type      : error.type ?: "",
+							errorClass: error.type ?: "ProviderException",
+							circuit   : specialistGateway.circuitStatus()
 						}
 					}
 				);

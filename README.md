@@ -76,7 +76,7 @@ Local traces for phases, specialist roles, generations, tool calls, and retries 
 | Language | Status |
 |---|---|
 | BoxLang | Deepest — graph, architecture, measured tier |
-| ColdFusion (CFML) | Review + LLM depth when an AI key is set |
+| ColdFusion (CFML) | Graph, architecture, and deterministic rules without a key; LLM depth when an AI key is set |
 | JavaScript | In scope; lighter depth today |
 | Java | In scope; lighter depth today |
 
@@ -88,7 +88,7 @@ No other languages are product targets.
 
 ### Option 1: With CommandBox (Recommended for Developers)
 
-**Requirements:** [CommandBox](https://commandbox.ortusbooks.com/) 6+ and a BoxLang-capable server (runtime modules such as `bx-ai` / `bx-sqlite` install on first start via `server.json`).
+**Requirements:** [CommandBox](https://commandbox.ortusbooks.com/) 6+ and a BoxLang-capable server (runtime modules such as `bx-ai` / `bx-sqlite` install on first start).
 
 ```powershell
 box install
@@ -179,9 +179,37 @@ sudo apt-get install openjdk-21-jdk
 | OpenAPI JSON | `/api/v1/openapi.json` |
 | OpenAPI YAML | `/api/v1/openapi.yaml` |
 
+---
+
+## Running tests
+
+**With CommandBox:**
 ```powershell
 box testbox run
 ```
+
+**Standalone (JDK 21 only, no CommandBox):**
+```batch
+REM Windows
+.\test.bat
+```
+```bash
+# macOS/Linux
+./test.sh
+```
+
+Both start the miniserver, run the full TestBox suite, print TestBox's plain-text
+`Final Stats` summary (`[Passed: N] [Failed: N] [Errors: N]`), exit non-zero on
+any failure, and always stop the server before returning — no server is left
+running afterward. Flags: `--json`, `--junit`, `--tap`, `--html` for other report
+formats, `--verbose` for server startup detail.
+
+To browse results interactively instead, start the app (`startup.bat` /
+`startup.sh`) and open `http://localhost:8585/tests/runner.bxm`. The richer
+`/tests/index.bxm` TestBox Run IDE (with its own CSS/JS) does not render
+correctly under the standalone miniserver — its static assets 404/500 because
+of how miniserver rewrites unmatched paths to `index.bxm`. `runner.bxm` is
+unaffected and is what `test.bat`/`test.sh` use.
 
 ---
 
@@ -207,6 +235,22 @@ Local-only: no auth, tenants, or hosted production mode.
 | `DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS` | `30000` | Specialist context-pack budget |
 
 Raising scan limits indexes more source for deterministic rules. Specialists still receive bounded context packs; raise plan/token/`AI_CONTEXT_WINDOW` knobs separately if prompts hit context errors.
+
+---
+
+## Live review loop
+
+While editing, run a lightweight watcher that queues a fast, deterministic-only
+review (crew planning and specialist agents skipped) on every save:
+
+```powershell
+pwsh tools/watch-review.ps1 -ProjectPath C:\path\to\your\project
+```
+
+Findings print to the terminal a few seconds after each save. This calls the
+same local `POST /api/v1/runs` endpoint as the workspace UI with
+`mode: "working-tree", fast: true` — no separate server or subsystem. Run a
+normal (non-fast) review from the workspace UI for full specialist depth.
 
 ---
 

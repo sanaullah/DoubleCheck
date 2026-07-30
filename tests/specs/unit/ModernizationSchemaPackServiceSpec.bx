@@ -75,6 +75,34 @@ class extends="testbox.system.BaseSpec" {
                     if ( name == "sqlserver.sql" ) expect( result.dmlRemoved ).toBeGT( 0 );
                 }
             } );
+
+            it( "auto-discovers and streams MySQL DDL from a large repository dump", () => {
+                var root = getTempDirectory() & "doublecheck-modernize-discovery-" & replace( createUUID(), "-", "", "all" );
+                directoryCreate( root & "/assets", true );
+                try {
+                    var dump = "-- MySQL dump" & char( 10 )
+                        & "CREATE TABLE `config` (" & char( 10 )
+                        & "  `id` int(11) NOT NULL," & char( 10 )
+                        & "  `name` varchar(255)" & char( 10 )
+                        & ");" & char( 10 )
+                        & "INSERT INTO `config` VALUES (1,'" & repeatString( "private-row-data", 1000 ) & "');" & char( 10 )
+                        & "CREATE TABLE `portalsetting` (" & char( 10 )
+                        & "  `id` int(11) NOT NULL" & char( 10 )
+                        & ");";
+                    fileWrite( root & "/assets/mysql5databaseBackup.sql", dump );
+
+                    var result = new app.models.services.ModernizationSchemaPackService().discover( root, { maxBytes: 4096 } );
+
+                    expect( result.sourceKind ).toBe( "auto-discovered" );
+                    expect( result.relativePath ).toBe( "assets/mysql5databaseBackup.sql" );
+                    expect( result.tables.map( ( item ) => item.name ) ).toInclude( "config" );
+                    expect( result.tables.map( ( item ) => item.name ) ).toInclude( "portalsetting" );
+                    expect( result.sanitizedText ).notToInclude( "private-row-data" );
+                    expect( result.discovery.sourceBytes ).toBeGT( result.discovery.retainedBytes );
+                } finally {
+                    directoryDelete( root, true );
+                }
+            } );
         } );
     }
 }

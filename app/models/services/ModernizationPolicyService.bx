@@ -2,8 +2,7 @@
 @singleton
 class {
 	property name="aiReviewService" inject="AIReviewService";
-	property name="aiProvider" inject="coldbox:setting:aiProvider";
-	property name="aiLocalProvider" inject="coldbox:setting:aiLocalProvider";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
 	property name="modernizationDefaultColdboxMajor" inject="coldbox:setting:modernizationDefaultColdboxMajor";
 	property name="modernizationDefaultCliMajor" inject="coldbox:setting:modernizationDefaultCliMajor";
 	property name="modernizationMaxFiles" inject="coldbox:setting:modernizationMaxFiles";
@@ -49,7 +48,11 @@ class {
 		if ( vendor == "mssql" ) vendor = "sqlserver";
 		if ( vendor == "postgres" ) vendor = "postgresql";
 		var outcomes = normalizeOutcomes( structKeyExists( arguments.input, "outcomes" ) ? arguments.input.outcomes : [] );
-		var localProvider = toBoolean( aiLocalProvider );
+		var executionInput = { model: "" };
+		if ( structKeyExists( arguments.input, "execution" ) && isStruct( arguments.input.execution ) ) structAppend( executionInput, arguments.input.execution, true );
+		var modelOverride = boundedText( executionInput.model ?: "", "execution.model", 120 );
+		var resolved = aiProviderResolver.resolve();
+		var localProvider = resolved.isLocal;
 		var remoteProvider = !localProvider;
 		if ( structKeyExists( arguments.input, "privacy" ) && isStruct( arguments.input.privacy ) && structKeyExists( arguments.input.privacy, "remoteProvider" ) ) remoteProvider = toBoolean( arguments.input.privacy.remoteProvider );
 		if ( !localProvider && !toBoolean( privacy.remoteEgressAcknowledged ?: false ) ) {
@@ -82,13 +85,17 @@ class {
 			samplePolicy: {
 				maxFiles: boundedInteger( ( isNumeric( samplePolicy.maxFiles ) && val( samplePolicy.maxFiles ) > 0 ) ? samplePolicy.maxFiles : maxFiles, "samplePolicy.maxFiles", 1, maxFiles ),
 				currentPhasesOnly: toBoolean( samplePolicy.currentPhasesOnly )
+			},
+			execution: {
+				provider: lCase( trim( resolved.provider ?: "" ) ),
+				model: len( modelOverride ) ? modelOverride : trim( resolved.model ?: "" )
 			}
 		};
 		normalized.fingerprint = lCase( hash( serializeCanonical( normalized ), "SHA-256" ) );
 		return {
 			input: normalized,
 			fingerprint: normalized.fingerprint,
-			provider: aiProvider,
+			provider: resolved.provider,
 			providerEnabled: isProviderEnabled(),
 			schemaPackRequest: normalized.schemaPack
 		};
@@ -100,7 +107,7 @@ class {
 			valid: true,
 			enabled: normalized.providerEnabled,
 			provider: normalized.provider,
-			local: toBoolean( aiLocalProvider ),
+			local: aiProviderResolver.resolve().isLocal,
 			fingerprint: normalized.fingerprint,
 			input: normalized.input,
 			schemaPackRequest: normalized.schemaPackRequest

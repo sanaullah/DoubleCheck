@@ -86,8 +86,10 @@
 		const schemaFormat = schemaSource === "attached-dump"
 			? (schemaFileName.endsWith(".json") ? "structured-json-v1" : "inline-ddl")
 			: schemaSource === "repo-path" ? "sql-ddl" : "";
+		const modelOverride = String(first(values, "modelOverride", "")).trim();
 		const normalizedInput = {
 			provider,
+			execution: { model: modelOverride },
 			outcomes: list(values, "outcomes").concat(String(first(values, "outcome", "")).trim() ? [String(first(values, "outcome", "")).trim()] : []),
 			source: {
 				engine: String(first(values, "sourceEngine", "unknown")).trim().toLowerCase(),
@@ -144,9 +146,9 @@
 				maxIterationsPerTask: number(values, "maxIterationsPerTask", 8),
 				maxToolOutputCharacters: number(values, "maxToolOutputCharacters", 48000),
 				maxCostUsd: Math.max(number(values, "maxCostUsd", 40), 40),
-				maxApplicationShards: number(values, "maxApplicationShards", 20),
-				applicationShardSize: number(values, "applicationShardSize", 8),
-				applicationShardConcurrency: number(values, "applicationShardConcurrency", 8)
+				maxApplicationShards: number(values, "maxApplicationShards", 40),
+				applicationShardSize: number(values, "applicationShardSize", 2),
+				applicationShardConcurrency: number(values, "applicationShardConcurrency", 3)
 			}
 		};
 	}

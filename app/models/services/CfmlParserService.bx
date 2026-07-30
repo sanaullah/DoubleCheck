@@ -1,0 +1,441 @@
+/**
+ * Parses CFML (.cfc/.cfm) sources into symbols, dependencies, and impact edges for the graph.
+ * Mirrors BoxLangParserService's contract so ArchitectureIndexService can dispatch to either.
+ *
+ * @see BoxLangParserService
+ * @see ArchitectureIndexService
+ */
+
+@singleton
+class {
+	variables.parserVersion = "cfml-symbol-parser-v1";
+
+	string function getVersion() {
+		return variables.parserVersion;
+	}
+
+	boolean function supports( required struct file ) {
+		return arguments.file.language == "CFML";
+	}
+
+	struct function parse( required struct file ) {
+		var symbols = [];
+		var dependencies = [];
+		var normalizedPath = replace(
+			arguments.file.filePath,
+			"\",
+			"/",
+			"all"
+		);
+		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.cfc$", normalizedPath ) > 0;
+		var isApplicationCfc = reFindNoCase( "(^|/)Application\.cfc$", normalizedPath ) > 0;
+		var className = listFirst( listLast( normalizedPath, "/" ), "." );
+
+		for ( var lineNumber = 1; lineNumber <= arguments.file.lines.len(); lineNumber++ ) {
+			var sourceLine = arguments.file.lines[ lineNumber ];
+			var trimmed = trim( sourceLine );
+			if ( !len( trimmed ) ) {
+				continue;
+			}
+
+			// <cfcomponent name="..." extends="..." implements="...">
+			var tagComponentMatch = match( "<cfcomponent\b", sourceLine );
+			// script: component extends="..." implements="..." { ... }
+			var scriptComponentMatch = match( "^\s*(?:final\s+|abstract\s+)?component\b", sourceLine );
+			if ( tagComponentMatch.find() || scriptComponentMatch.find() ) {
+				var componentName = attribute( sourceLine, "name" );
+				symbols.append(
+						symbol(
+							"class",
+							len( componentName ) ? componentName : className,
+							lineNumber,
+							sourceLine
+						)
+					);
+				addAttributeDependency(
+					dependencies,
+					sourceLine,
+					"extends",
+					"extends",
+					lineNumber
+				);
+				var implemented = attribute( sourceLine, "implements" );
+				if ( len( implemented ) ) {
+					for ( var contract in listToArray( implemented, "," ) ) {
+						dependencies.append(
+								dependency(
+									"implements",
+									trim( contract ),
+									lineNumber,
+									sourceLine
+								)
+							);
+					}
+				}
+			}
+
+			// <cffunction name="...">
+			var tagFunctionMatch = match( "<cffunction\b", sourceLine );
+			// script: [modifiers] function name(...)
+			var scriptFunctionMatch = match(
+				"^\s*(?:(?:public|private|package|remote|static|final|abstract)\s+)*(?:([A-Za-z_][A-Za-z0-9_.]*)\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)",
+				sourceLine
+			);
+			var declaredFunction = "";
+			if ( tagFunctionMatch.find() ) {
+				declaredFunction = attribute( sourceLine, "name" );
+				if ( len( declaredFunction ) ) {
+					addFunctionSymbols(
+						symbols,
+						declaredFunction,
+						lineNumber,
+						sourceLine,
+						isHandler,
+						isApplicationCfc
+					);
+				}
+			} else if ( scriptFunctionMatch.find() ) {
+				declaredFunction = scriptFunctionMatch.group( 2 );
+				addFunctionSymbols(
+					symbols,
+					declaredFunction,
+					lineNumber,
+					sourceLine,
+					isHandler,
+					isApplicationCfc
+				);
+				var returnType = isNull( scriptFunctionMatch.group( 1 ) ) ? "" : scriptFunctionMatch.group( 1 );
+				addTypeDependency(
+					dependencies,
+					returnType,
+					lineNumber,
+					sourceLine
+				);
+				addParameterTypes(
+					dependencies,
+					scriptFunctionMatch.group( 3 ),
+					lineNumber,
+					sourceLine
+				);
+			}
+
+			// <cfproperty name="..." type="...">  |  script: property name="..." type="...";
+			if ( reFindNoCase( "^\s*<?cfproperty\b|^\s*property\b", sourceLine ) ) {
+				var propertyName = attribute( sourceLine, "name" );
+				if ( len( propertyName ) ) {
+					symbols.append(
+							symbol(
+								"property",
+								propertyName,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+				addTypeDependency(
+					dependencies,
+					attribute( sourceLine, "type" ),
+					lineNumber,
+					sourceLine
+				);
+			}
+
+			// <cfimport ...>  |  script: import ...;
+			var tagImportMatch = match( "<cfimport\b", sourceLine );
+			var scriptImportMatch = match( "^\s*import\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
+			if ( tagImportMatch.find() ) {
+				var importPath = attribute( sourceLine, "path" );
+				if ( len( importPath ) ) {
+					dependencies.append(
+							dependency(
+								"imports",
+								importPath,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+			} else if ( scriptImportMatch.find() ) {
+				dependencies.append(
+						dependency(
+							"imports",
+							scriptImportMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+
+			// <cfinclude template="...">  |  <cfmodule template="..." | name="...">
+			var includeMatch = match( "<cf(?:include|module)\b", sourceLine );
+			if ( includeMatch.find() ) {
+				var includeTarget = attribute( sourceLine, "template" );
+				if ( !len( includeTarget ) ) {
+					includeTarget = attribute( sourceLine, "name" );
+				}
+				if ( len( includeTarget ) ) {
+					dependencies.append(
+							dependency(
+								"includes",
+								includeTarget,
+								lineNumber,
+								sourceLine
+							)
+						);
+				}
+			}
+
+			// new Component(...)  |  createObject( "component", "path" )
+			var constructionMatch = match( "\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
+			while ( constructionMatch.find() ) {
+				dependencies.append(
+						dependency(
+							"constructs",
+							constructionMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+			var createObjectMatch = match(
+				"\bcreateObject\s*\(\s*[""']component[""']\s*,\s*[""']([^""']+)[""']",
+				sourceLine
+			);
+			if ( createObjectMatch.find() ) {
+				dependencies.append(
+						dependency(
+							"constructs",
+							createObjectMatch.group( 1 ),
+							lineNumber,
+							sourceLine
+						)
+					);
+			}
+
+			if ( isTest ) {
+				addTestBoxSymbols(
+					symbols,
+					sourceLine,
+					lineNumber
+				);
+			}
+
+			addCallDependencies(
+				dependencies,
+				sourceLine,
+				lineNumber,
+				declaredFunction
+			);
+		}
+
+		return {
+			parserVersion: variables.parserVersion,
+			symbols      : symbols,
+			dependencies : dependencies
+		};
+	}
+
+	private void function addFunctionSymbols(
+		required array symbols,
+		required string declaredFunction,
+		required numeric lineNumber,
+		required string sourceLine,
+		required boolean isHandler,
+		required boolean isApplicationCfc
+	) {
+		arguments.symbols.append(
+				symbol(
+					"function",
+					arguments.declaredFunction,
+					arguments.lineNumber,
+					arguments.sourceLine
+				)
+			);
+		if ( arguments.isHandler && !isLifecycleFunction( arguments.declaredFunction ) ) {
+			arguments.symbols.append(
+					symbol(
+						"handler-action",
+						arguments.declaredFunction,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+		if ( arguments.isApplicationCfc && isLifecycleFunction( arguments.declaredFunction ) ) {
+			arguments.symbols.append(
+					symbol(
+						"lifecycle-hook",
+						arguments.declaredFunction,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private void function addTestBoxSymbols(
+		required array symbols,
+		required string sourceLine,
+		required numeric lineNumber
+	) {
+		var testMatch = match(
+			"\b(describe|feature|story|scenario|given|when|it|then)\s*\(\s*[""']([^""']+)[""']",
+			arguments.sourceLine
+		);
+		while ( testMatch.find() ) {
+			var testFunction = lCase( testMatch.group( 1 ) );
+			arguments.symbols.append(
+					symbol(
+						listFindNoCase(
+								"describe,feature,story,scenario,given,when",
+								testFunction
+							)
+							? "test-suite"
+							: "test",
+						testMatch.group( 2 ),
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private void function addCallDependencies(
+		required array dependencies,
+		required string sourceLine,
+		required numeric lineNumber,
+		string declaredFunction = ""
+	) {
+		var ignored = "if,for,while,switch,catch,function,new,return,throw,component,cfif,cfloop,createobject,describe,feature,story,scenario,given,when,it,then,beforeEach,afterEach,aroundEach,beforeAll,afterAll";
+		var callMatch = match(
+			"\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\(",
+			arguments.sourceLine
+		);
+		while ( callMatch.find() ) {
+			var target = callMatch.group( 1 );
+			var leafName = listLast( target, "." );
+			if ( listFindNoCase( ignored, leafName ) || ( len( arguments.declaredFunction ) && leafName == arguments.declaredFunction ) ) {
+				continue;
+			}
+			arguments.dependencies.append(
+					dependency(
+						"calls",
+						target,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private void function addParameterTypes(
+		required array dependencies,
+		required string parameters,
+		required numeric lineNumber,
+		required string sourceLine
+	) {
+		for ( var parameter in listToArray( arguments.parameters, "," ) ) {
+			var parameterMatch = match(
+				"^\s*(?:required\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s+[A-Za-z_][A-Za-z0-9_]*",
+				parameter
+			);
+			if ( parameterMatch.find() ) {
+				addTypeDependency(
+					arguments.dependencies,
+					parameterMatch.group( 1 ),
+					arguments.lineNumber,
+					arguments.sourceLine
+				);
+			}
+		}
+	}
+
+	private void function addTypeDependency(
+		required array dependencies,
+		required string target,
+		required numeric lineNumber,
+		required string sourceLine
+	) {
+		var builtInTypes = "any,array,binary,boolean,date,function,guid,numeric,query,string,struct,uuid,void,xml,component";
+		if ( len( trim( arguments.target ) ) && !listFindNoCase( builtInTypes, trim( arguments.target ) ) ) {
+			arguments.dependencies.append(
+					dependency(
+						"type-reference",
+						trim( arguments.target ),
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private boolean function isLifecycleFunction( required string name ) {
+		return listFindNoCase(
+				"onApplicationStart,onApplicationEnd,onRequestStart,onRequestEnd,onSessionStart,onSessionEnd,onError,onMissingTemplate,onAbort",
+				arguments.name
+			) >
+			0;
+	}
+
+	private struct function symbol(
+		required string kind,
+		required string name,
+		required numeric line,
+		required string evidence
+	) {
+		return {
+			kind    : arguments.kind,
+			name    : arguments.name,
+			line    : arguments.line,
+			evidence: left( trim( arguments.evidence ), 500 )
+		};
+	}
+
+	private struct function dependency(
+		required string kind,
+		required string target,
+		required numeric line,
+		required string evidence
+	) {
+		return {
+			kind    : arguments.kind,
+			target  : arguments.target,
+			line    : arguments.line,
+			evidence: left( trim( arguments.evidence ), 500 )
+		};
+	}
+
+	private void function addAttributeDependency(
+		required array dependencies,
+		required string sourceLine,
+		required string attributeName,
+		required string kind,
+		required numeric lineNumber
+	) {
+		var target = attribute( arguments.sourceLine, arguments.attributeName );
+		if ( len( target ) ) {
+			arguments.dependencies.append(
+					dependency(
+						arguments.kind,
+						target,
+						arguments.lineNumber,
+						arguments.sourceLine
+					)
+				);
+		}
+	}
+
+	private string function attribute( required string sourceLine, required string attributeName ) {
+		var attributeMatch = match(
+			"\b#arguments.attributeName#\s*=\s*[""']([^""']+)[""']",
+			arguments.sourceLine
+		);
+		return attributeMatch.find() ? attributeMatch.group( 1 ) : "";
+	}
+
+	private any function match( required string expression, required string source ) {
+		return createObject( "java", "java.util.regex.Pattern" ).compile( arguments.expression,
+				createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE ).matcher( arguments.source );
+	}
+}

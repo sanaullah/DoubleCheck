@@ -25,6 +25,41 @@ class {
 			var allowJsDynamic = language == "JavaScript";
 			var allowCfSql = language == "CFML" || language == "BoxLang";
 			var allowEmptyCatch = allowJsDynamic || allowCfSql;
+				var isCfml = language == "CFML";
+				var inCfQueryBlock = false;
+				var cfQueryHasInterpolation = false;
+				var cfQueryHasParam = false;
+				var cfQueryStartLine = 0;
+				var cfQueryEvidence = "";
+				var inCfFunctionBlock = false;
+				if ( isCfml && reFindNoCase( "Application\.cfc$", file.filePath ) ) {
+					var applicationSource = arrayToList( file.lines, char( 10 ) );
+					var missingHooks = [];
+					if ( !reFindNoCase( "\bfunction\s+onError\b|<cffunction\s+name\s*=\s*[""']onError[""']", applicationSource ) ) {
+						missingHooks.append( "onError" );
+					}
+					if ( !reFindNoCase( "\bfunction\s+onSessionEnd\b|<cffunction\s+name\s*=\s*[""']onSessionEnd[""']", applicationSource ) ) {
+						missingHooks.append( "onSessionEnd" );
+					}
+					if ( missingHooks.len() ) {
+						findings.append(
+								build(
+									category   = "maintainability",
+									ruleId     = "cfml/application-lifecycle-gap",
+									severity   = "info",
+									confidence = .7,
+									title      = "Application.cfc is missing lifecycle hooks",
+									message    = "Application.cfc does not define " & missingHooks.toList( ", " ) & ", so failures or session teardown in these phases go unhandled.",
+									filePath   = file.filePath,
+									startLine  = 1,
+									endLine    = 1,
+									evidence   = file.lines.len() ? trim( file.lines[ 1 ] ) : "",
+									suggestion = "Add the missing lifecycle method(s) so errors and session cleanup are handled explicitly instead of falling through to defaults.",
+									source     = "deterministic"
+								)
+							);
+					}
+				}
 			for ( var lineNumber = 1; lineNumber <= file.lines.len(); lineNumber++ ) {
 				var sourceLine = file.lines[ lineNumber ];
 				var evidence = trim( sourceLine );
@@ -108,6 +143,107 @@ class {
 								source     = "deterministic"
 							)
 						);
+				}
+				if ( isCfml ) {
+					if ( reFindNoCase( "<cfquery\b", sourceLine ) ) {
+						inCfQueryBlock = true;
+						cfQueryStartLine = lineNumber;
+						cfQueryEvidence = evidence;
+						cfQueryHasInterpolation = false;
+						cfQueryHasParam = false;
+					}
+					if ( inCfQueryBlock ) {
+						if ( reFindNoCase( "<cfqueryparam\b", sourceLine ) ) {
+							cfQueryHasParam = true;
+						}
+						if ( reFindNoCase( "\b(SELECT|INSERT|UPDATE|DELETE)\b", sourceLine ) && reFind( "##[^##]+##", sourceLine ) ) {
+							cfQueryHasInterpolation = true;
+						}
+						if ( reFindNoCase( "</cfquery>", sourceLine ) ) {
+							if ( cfQueryHasInterpolation && !cfQueryHasParam ) {
+								findings.append(
+										build(
+											category   = "security",
+											ruleId     = "cfml/query-missing-queryparam",
+											severity   = "high",
+											confidence = .9,
+											title      = "SQL query interpolates a value without cfqueryparam",
+											message    = "The <cfquery> block binds a value with string interpolation and never uses <cfqueryparam>, leaving the query open to injection.",
+											filePath   = file.filePath,
+											startLine  = cfQueryStartLine,
+											endLine    = lineNumber,
+											evidence   = cfQueryEvidence,
+											suggestion = "Wrap the interpolated value in <cfqueryparam value=""##value##"" cfsqltype=""cf_sql_..."">  instead of concatenating it into the SQL text.",
+											source     = "deterministic"
+										)
+									);
+							}
+							inCfQueryBlock = false;
+						}
+					}
+
+					if ( reFindNoCase( "<cffunction\b", sourceLine ) ) {
+						inCfFunctionBlock = true;
+					}
+					if ( inCfFunctionBlock && reFindNoCase( "<cfset\s+(?!var\b)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "reliability",
+									ruleId     = "cfml/unscoped-variable",
+									severity   = "medium",
+									confidence = .75,
+									title      = "Function assigns a variable without var scoping",
+									message    = "The assignment inside <cffunction> has no var/local scope, so it leaks into a shared scope and can be overwritten by concurrent requests.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Prefix the assignment with var (or local.) so it stays private to this function call.",
+									source     = "deterministic"
+								)
+							);
+					}
+					if ( reFindNoCase( "</cffunction>", sourceLine ) ) {
+						inCfFunctionBlock = false;
+					}
+
+					if ( reFindNoCase( "<cf(include|module)\b", sourceLine ) && reFindNoCase( "template\s*=\s*[""'][^""']*##[^""']*##", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "security",
+									ruleId     = "cfml/dynamic-include-path",
+									severity   = "high",
+									confidence = .85,
+									title      = "Include/module path is built from an interpolated value",
+									message    = "The template path is assembled with an interpolated value, which can let an attacker include an unintended file.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Resolve the target against an allow-listed set of template names instead of interpolating untrusted input into the path.",
+									source     = "deterministic"
+								)
+							);
+					}
+
+					if ( reFindNoCase( "<cflock\b", sourceLine ) && !reFindNoCase( "\b(scope|name)\s*=", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "reliability",
+									ruleId     = "cfml/deprecated-cflock-scope",
+									severity   = "medium",
+									confidence = .8,
+									title      = "cflock is missing an explicit scope or name",
+									message    = "The <cflock> tag has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Add scope=""..."" or name=""..."" so the lock covers only the resource it protects.",
+									source     = "deterministic"
+								)
+							);
+					}
 				}
 				var markerComment = reFindNoCase( "^\s*(//|/\*|\*|<!--).*\b(TODO|FIXME)\b", sourceLine ) ||
 					( left( evidence, 1 ) == char( 35 ) && reFindNoCase( "\b(TODO|FIXME)\b", sourceLine ) );

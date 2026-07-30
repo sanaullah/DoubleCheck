@@ -1,15 +1,14 @@
 /**
  * Renders a persisted Modernize run for local download.
  *
- * Modernization artifacts are intentionally limited to JSON and Markdown.
- * SARIF is a Review finding format and must not be used to imply that a
- * modernization proposal is a compiler/security finding set.
+ * SARIF represents validation and coverage gates, not modernization proposals
+ * as compiler/security findings.
  */
 
 @singleton
 class {
 	property name="secretRedactionService" inject="SecretRedactionService";
-	variables.supportedFormats = [ "json", "markdown" ];
+	variables.supportedFormats = [ "json", "markdown", "sarif" ];
 
 	function init() {
 		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
@@ -21,7 +20,7 @@ class {
 		if ( !variables.supportedFormats.contains( normalized ) ) {
 			throw(
 				type = "ValidationException",
-				message = "Unsupported Modernize export format. Use json or markdown."
+				message = "Unsupported Modernize export format. Use json, markdown, or sarif."
 			);
 		}
 
@@ -37,6 +36,14 @@ class {
 				"application/json",
 				"doublecheck-modernization-#runToken#.json",
 				toJson( arguments.run, arguments.result )
+			);
+		}
+		if ( normalized == "sarif" ) {
+			return package(
+				normalized,
+				"application/sarif+json",
+				"doublecheck-modernization-#runToken#.sarif.json",
+				toSarif( arguments.run, arguments.result )
 			);
 		}
 
@@ -79,6 +86,7 @@ class {
 		var planMetadata = arguments.result.metadata ?: {};
 		var coverageSchema = coverage.schema ?: {};
 		var coverageRoad = coverage.road ?: {};
+		var coverageLlm = coverage.llm ?: {};
 		var schemaEvidence = arguments.result.schemaEvidence ?: {};
 		var inventory = arguments.result.inventory ?: {};
 		var target = arguments.result.target ?: {};
@@ -102,6 +110,7 @@ class {
 		lines.append( "- **Scope:** `" & escapeMarkdown( arguments.run.mode ?: "full" ) & "`" );
 		lines.append( "- **Run status:** `" & escapeMarkdown( arguments.run.status ?: "" ) & "`" );
 		lines.append( "- **Plan state:** `" & escapeMarkdown( arguments.result.planState ?: arguments.result.state ?: "needs-review" ) & "`" );
+		lines.append( "- **Plan fingerprint:** `" & escapeMarkdown( arguments.result.planFingerprint ?: "" ) & "`" );
 		lines.append( "" );
 
 		lines.append( mdHeading( 2, "Strangler coexistence" ) );
@@ -121,6 +130,17 @@ class {
 		lines.append( coverageLine( "Schema source", coverage.schemaSource ?: schemaEvidence.source ?: "none" ) );
 		lines.append( coverageLine( "Schema coverage", coverage.schemaCoverage ?: coverageSchema.coverage ?: "unknown" ) );
 		lines.append( coverageLine( "Coverage status", coverage.status ?: coverage.coverageStatus ?: "unknown" ) );
+		lines.append( coverageLine( "Provider coverage", coverageLlm.status ?: "unknown" ) );
+		lines.append( coverageLine( "Provider shards completed", coverageLlm.completed ?: 0 ) );
+		lines.append( coverageLine( "Provider shards failed", coverageLlm.failed ?: 0 ) );
+		lines.append( coverageLine( "Provider shards omitted", coverageLlm.omitted ?: coverageLlm.omittedPartitions ?: 0 ) );
+		if ( isArray( coverageLlm.gaps ?: "" ) ) {
+			for ( var gap in coverageLlm.gaps ) {
+				if ( !isStruct( gap ) ) continue;
+				var gapPaths = isArray( gap.paths ?: "" ) ? gap.paths.toList( ", " ) : "";
+				lines.append( "- **Coverage gap:** " & escapeMarkdown( ( gap.kind ?: "gap" ) & " · " & ( gap.reason ?: gap.status ?: "unknown" ) & ( len( gapPaths ) ? " · " & gapPaths : "" ) ) );
+			}
+		}
 		if ( len( coverage.note ?: "" ) ) lines.append( "- **Coverage note:** " & escapeMarkdown( coverage.note ) );
 		if ( isArray( coverage.banners ?: "" ) ) {
 			for ( var banner in coverage.banners ) {
@@ -133,14 +153,14 @@ class {
 
 		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
 
-		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnits, [ "id", "path", "kind", "name", "confidence" ] );
-		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus" ] );
-		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus" ] );
-		appendRows( lines, mdHeading( 2, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus" ] );
-		appendRows( lines, mdHeading( 2, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus" ] );
+		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnits, [ "id", "path", "kind", "name", "confidence", "provenanceClass", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus", "provenanceClass", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus", "provenanceClass", "evidence" ] );
+		appendRows( lines, mdHeading( 2, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus", "provenanceClass", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus", "provenanceClass", "evidenceRefs" ] );
 		appendArchitecturePackaging( lines, contexts, extracts );
-		appendRows( lines, mdHeading( 2, "Contexts and extracts" ), contexts, [ "id", "name", "packaging", "purpose", "recommendation", "stayInMonolith" ] );
-		appendRows( lines, mdHeading( 2, "Side-app extract candidates" ), extracts, [ "id", "name", "suggestedBoundary", "reason", "sharedDatasourceRisk", "recommendation" ] );
+		appendRows( lines, mdHeading( 2, "Contexts and extracts" ), contexts, [ "id", "name", "packaging", "purpose", "recommendation", "stayInMonolith", "provenanceClass", "evidenceRefs" ] );
+		appendRows( lines, mdHeading( 2, "Side-app extract candidates" ), extracts, [ "id", "name", "suggestedBoundary", "reason", "sharedDatasourceRisk", "recommendation", "provenanceClass", "evidenceRefs" ] );
 		appendSamples( lines, samples );
 		appendRows( lines, mdHeading( 2, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ] );
 
@@ -160,6 +180,178 @@ class {
 		lines.append( "" );
 		lines.append( "> AI-proposed artifacts are bounded skeletons. Validate them against the immutable evidence snapshot before applying changes." );
 		return arrayToList( lines, char( 10 ) );
+	}
+
+	string function toSarif( required struct run, required struct result ) {
+		var plan = sanitizeExportValue( duplicate( arguments.result ), "", "" );
+		var coverage = isStruct( plan.coverage ?: "" ) ? plan.coverage : {};
+		var validation = isStruct( plan.validation ?: "" ) ? plan.validation : {};
+		var messages = isArray( validation.messages ?: "" ) ? validation.messages : [];
+		var gaps = isStruct( coverage.llm ?: "" ) && isArray( coverage.llm.gaps ?: "" )
+			? coverage.llm.gaps
+			: [];
+		var results = [];
+		var rules = {};
+		var planFingerprint = trim( plan.planFingerprint ?: "" );
+
+		for ( var message in messages ) {
+			if ( !isStruct( message ) ) continue;
+			var category = lCase( trim( message.category ?: "validation" ) );
+			var ruleId = "doublecheck/modernization/" & ruleToken( category );
+			rules[ ruleId ] = {
+				id: ruleId,
+				shortDescription: { text: "Modernization " & category & " validation" }
+			};
+			var itemId = trim( message.itemId ?: "" );
+			var item = findPlanItem( plan, itemId );
+			var row = {
+				ruleId: ruleId,
+				level: sarifLevel( message.level ?: message.validationLevel ?: "warning" ),
+				message: { text: toString( message.message ?: "Modernization validation requires review" ) },
+				properties: {
+					category: category,
+					itemId: itemId,
+					validationLevel: message.validationLevel ?: message.level ?: "warning",
+					planState: plan.planState ?: plan.state ?: "needs-review",
+					coverageStatus: coverage.status ?: "unknown"
+				}
+			};
+			var location = sarifLocation( item );
+			if ( location.count() ) row.locations = [ location ];
+			row.fingerprints = {
+				"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|" & ruleId & "|" & itemId & "|" & row.message.text, "SHA-256" ) )
+			};
+			results.append( row );
+		}
+
+		for ( var gapIndex = 1; gapIndex <= gaps.len(); gapIndex++ ) {
+			var gap = gaps[ gapIndex ];
+			if ( !isStruct( gap ) ) continue;
+			var gapRule = "doublecheck/modernization/coverage-gap";
+			rules[ gapRule ] = {
+				id: gapRule,
+				shortDescription: { text: "Modernization coverage gap" }
+			};
+			var paths = isArray( gap.paths ?: "" ) ? gap.paths : [];
+			var gapText = "Coverage gap: " & ( gap.kind ?: "unknown" ) & " (" & ( gap.reason ?: gap.status ?: "unknown" ) & ")";
+			if ( paths.len() ) gapText &= " — " & paths.toList( ", " );
+			var gapRow = {
+				ruleId: gapRule,
+				level: "warning",
+				message: { text: gapText },
+				properties: {
+					kind: gap.kind ?: "unknown",
+					reason: gap.reason ?: gap.status ?: "unknown",
+					status: gap.status ?: "unknown",
+					paths: duplicate( paths ),
+					planState: plan.planState ?: plan.state ?: "needs-review",
+					coverageStatus: coverage.status ?: "unknown"
+				},
+				fingerprints: {
+					"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|coverage-gap|" & gapIndex & "|" & gapText, "SHA-256" ) )
+				}
+			};
+			if ( paths.len() ) {
+				gapRow.locations = [ {
+					physicalLocation: {
+						artifactLocation: { uri: replace( toString( paths[ 1 ] ), "\", "/", "all" ) }
+					}
+				} ];
+			}
+			results.append( gapRow );
+		}
+
+		var ruleList = [];
+		var ruleIds = structKeyArray( rules );
+		ruleIds.sort( "textnocase" );
+		for ( var ruleId in ruleIds ) ruleList.append( rules[ ruleId ] );
+		var payload = {
+			version: "2.1.0",
+			runs: [ {
+				tool: {
+					driver: {
+						name: "DoubleCheck Modernization",
+						informationUri: "https://github.com/ortus-solutions/DoubleCheck",
+						rules: ruleList
+					}
+				},
+				invocations: [ {
+					executionSuccessful: val( validation.blockingCount ?: validation.blocking ?: 0 ) == 0 && !!( coverage.complete ?: false ),
+					properties: {
+						runId: arguments.run.id ?: "",
+						runKind: arguments.run.runKind ?: "modernize",
+						runStatus: arguments.run.status ?: "",
+						planState: plan.planState ?: plan.state ?: "needs-review",
+						planFingerprint: planFingerprint,
+						coverageStatus: coverage.status ?: "unknown",
+						coverageComplete: !!( coverage.complete ?: false ),
+						blockingCount: val( validation.blockingCount ?: validation.blocking ?: 0 ),
+						warningCount: val( validation.warningCount ?: validation.warnings ?: 0 )
+					}
+				} ],
+				results: results,
+				properties: {
+					schemaVersion: plan.schemaVersion ?: "modernization-plan-v1",
+					provider: plan.metadata.providerId ?: "",
+					model: plan.metadata.model ?: ""
+				}
+			} ]
+		};
+		payload[ "$schema" ] = "https://json.schemastore.org/sarif-2.1.0.json";
+		return jsonSerialize( payload );
+	}
+
+	private struct function findPlanItem( required struct plan, required string itemId ) {
+		if ( !len( arguments.itemId ) ) return {};
+		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
+			var parts = path.listToArray( "." );
+			var owner = parts.len() == 2 ? ( arguments.plan[ parts[ 1 ] ] ?: {} ) : arguments.plan;
+			var key = parts[ parts.len() ];
+			for ( var item in ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [] ) ) {
+				if ( trim( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+			}
+		}
+		return {};
+	}
+
+	private struct function sarifLocation( required struct item ) {
+		if ( !arguments.item.count() ) return {};
+		var refs = isArray( arguments.item.evidenceRefs ?: "" )
+			? arguments.item.evidenceRefs
+			: ( isArray( arguments.item.evidence ?: "" ) ? arguments.item.evidence : [] );
+		var path = trim( arguments.item.sourcePath ?: arguments.item.filePath ?: "" );
+		var startLine = 0;
+		var endLine = 0;
+		for ( var ref in refs ) {
+			if ( !isStruct( ref ) ) continue;
+			if ( len( trim( ref.filePath ?: "" ) ) ) path = trim( ref.filePath );
+			startLine = val( ref.startLine ?: 0 );
+			endLine = val( ref.endLine ?: startLine );
+			if ( len( path ) ) break;
+		}
+		if ( !len( path ) ) return {};
+		var physical = {
+			artifactLocation: { uri: replace( path, "\", "/", "all" ) }
+		};
+		if ( startLine > 0 ) {
+			physical.region = {
+				startLine: int( startLine ),
+				endLine: int( max( startLine, endLine ) )
+			};
+		}
+		return { physicalLocation: physical };
+	}
+
+	private string function sarifLevel( required string level ) {
+		var normalized = lCase( trim( arguments.level ) );
+		if ( normalized == "blocking" || normalized == "error" ) return "error";
+		if ( normalized == "warning" ) return "warning";
+		return "note";
+	}
+
+	private string function ruleToken( required string value ) {
+		var token = lCase( reReplace( arguments.value, "[^a-zA-Z0-9._-]", "-", "all" ) );
+		return len( token ) ? token : "validation";
 	}
 
 	private void function appendArchitecturePackaging( required array lines, required array contexts, required array extracts ) {
@@ -221,6 +413,7 @@ class {
 			arguments.lines.append( mdHeading( 3, phaseIndex & ". " & escapeMarkdown( phase.name ?: phase.title ?: "Phase" ) ) );
 			arguments.lines.append( "" );
 			arguments.lines.append( "- **Pattern:** `" & escapeMarkdown( phase.pattern ?: "phase" ) & "`" );
+			arguments.lines.append( "- **Provenance:** `" & escapeMarkdown( phase.provenanceClass ?: "unknown" ) & "`" );
 			if ( len( phase.goal ?: "" ) ) arguments.lines.append( "- **Goal:** " & escapeMarkdown( phase.goal ) );
 			if ( len( phase.parityIntent ?: "" ) ) arguments.lines.append( "- **Parity:** " & escapeMarkdown( phase.parityIntent ) );
 			var phaseRoutes = arguments.routes.filter( ( route ) => !routeIds.len() || routeIds.contains( toString( route.id ?: "" ) ) );
@@ -338,6 +531,7 @@ class {
 			arguments.lines.append( mdHeading( 3, escapeMarkdown( sample.sampleKind ?: sample.kind ?: "sample" ) & " · " & escapeMarkdown( sample.targetPath ?: sample.path ?: "target" ) ) );
 			arguments.lines.append( "" );
 			arguments.lines.append( "- **Validation level:** `" & escapeMarkdown( sample.validationLevel ?: sample.validationStatus ?: "syntax-unchecked" ) & "`" );
+			arguments.lines.append( "- **Provenance:** `" & escapeMarkdown( sample.provenanceClass ?: "unknown" ) & "`" );
 			arguments.lines.append( "- **Irreversible:** `" & ( sample.irreversible ?: sample.forwardOnly ?: false ) & "`" );
 			if ( isArray( sample.relatedItemIds ?: "" ) && sample.relatedItemIds.len() ) arguments.lines.append( "- **Related items:** `" & escapeMarkdown( arrayToList( sample.relatedItemIds, ", " ) ) & "`" );
 			var code = sample.code ?: sample.content ?: "";
@@ -375,11 +569,17 @@ class {
 	}
 
 	private void function sortExportCollections( required struct payload ) {
-		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
+		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
 			var parts = path.listToArray( "." );
 			var owner = parts.len() == 2 ? ( arguments.payload[ parts[ 1 ] ] ?: {} ) : arguments.payload;
 			var key = parts[ parts.len() ];
 			if ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ) owner[ key ].sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+		}
+		if ( isArray( arguments.payload.dbTransitions ?: "" ) ) {
+			arguments.payload.dbTransitions.sort( ( first, second ) => {
+				var orderCompare = val( first.order ?: 0 ) - val( second.order ?: 0 );
+				return orderCompare != 0 ? orderCompare : compareNoCase( identityKey( first ), identityKey( second ) );
+			} );
 		}
 	}
 
@@ -408,7 +608,7 @@ class {
 
 	private boolean function isTransientExportKey( required string key, required string path ) {
 		if ( [ "inlineContent", "rawContent", "originalText", "providerKey", "apiKey", "api_key" ].contains( arguments.key ) ) return true;
-		return reFindNoCase( "schemaEvidence\\.(?:text|sanitizedText|inlineContent|raw)", arguments.path ) > 0;
+		return reFindNoCase( "schemaEvidence[.](?:text|sanitizedText|inlineContent|raw)", arguments.path ) > 0;
 	}
 
 	private boolean function isSensitiveExportKey( required string key ) {

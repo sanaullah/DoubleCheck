@@ -1,0 +1,173 @@
+/**
+ * Validates and orchestrates CRUD for user-managed AI provider profiles.
+ *
+ * @see AIProviderProfileRepository
+ * @see AIProviderResolverService
+ */
+@singleton
+class {
+	property name="profileRepository" inject="AIProviderProfileRepository";
+	property name="aiReviewService" inject="AIReviewService";
+
+	variables.allowedProviders = [ "openai", "openai-compatible", "openrouter", "ollama", "docker", "lmstudio", "llamacpp" ];
+
+	array function list( required string tenantId ) {
+		return profileRepository.list( arguments.tenantId ).map( ( profile ) => masked( profile ) );
+	}
+
+	struct function get( required string tenantId, required string id ) {
+		var profile = profileRepository.get( arguments.tenantId, arguments.id );
+		if ( !profile.count() ) notFound();
+		return masked( profile );
+	}
+
+	struct function create( required string tenantId, required struct input ) {
+		var normalized = normalizeInput( arguments.input, {} );
+		var created = profileRepository.create( arguments.tenantId, {
+			id                 : lCase( createUUID() ),
+			name               : normalized.name,
+			provider           : normalized.provider,
+			baseUrl            : normalized.baseUrl,
+			apiKey             : normalized.apiKey,
+			model              : normalized.model,
+			timeoutSeconds     : normalized.timeoutSeconds,
+			contextWindow      : normalized.contextWindow,
+			inputUsdPerMillion : normalized.inputUsdPerMillion,
+			outputUsdPerMillion: normalized.outputUsdPerMillion,
+			isActive           : false
+		} );
+		// The first profile a user ever adds becomes active automatically -
+		// otherwise adding one profile would silently do nothing until the
+		// user separately discovers and clicks "Activate".
+		if ( profileRepository.countForTenant( arguments.tenantId ) == 1 ) {
+			created = profileRepository.setActive( arguments.tenantId, created.id );
+		}
+		return masked( created );
+	}
+
+	struct function update( required string tenantId, required string id, required struct input ) {
+		var existing = profileRepository.get( arguments.tenantId, arguments.id );
+		if ( !existing.count() ) notFound();
+		var normalized = normalizeInput( arguments.input, existing );
+		var changes = {
+			name               : normalized.name,
+			provider           : normalized.provider,
+			baseUrl            : normalized.baseUrl,
+			model              : normalized.model,
+			timeoutSeconds     : normalized.timeoutSeconds,
+			contextWindow      : normalized.contextWindow,
+			inputUsdPerMillion : normalized.inputUsdPerMillion,
+			outputUsdPerMillion: normalized.outputUsdPerMillion
+		};
+		// Omitting apiKey in the request body leaves the stored key untouched,
+		// so the UI never has to round-trip the real secret through an edit form.
+		if ( structKeyExists( arguments.input, "apiKey" ) ) {
+			changes.apiKey = normalized.apiKey;
+		}
+		return masked( profileRepository.update( arguments.tenantId, arguments.id, changes ) );
+	}
+
+	/**
+	 * Deleting the active profile is always safe: AIProviderResolverService
+	 * falls back to the env-derived connection when no profile is active, so
+	 * deleting the last profile just reverts to zero-config behavior rather
+	 * than leaving the app unusable.
+	 */
+	void function delete( required string tenantId, required string id ) {
+		var existing = profileRepository.get( arguments.tenantId, arguments.id );
+		if ( !existing.count() ) notFound();
+		profileRepository.delete( arguments.tenantId, arguments.id );
+		if ( existing.isActive ) {
+			// Keep an active profile if others remain, so a multi-profile user
+			// doesn't silently fall back to .env just because they deleted
+			// whichever one happened to be active.
+			var remaining = profileRepository.list( arguments.tenantId );
+			if ( remaining.len() ) profileRepository.setActive( arguments.tenantId, remaining[ 1 ].id );
+		}
+	}
+
+	struct function activate( required string tenantId, required string id ) {
+		var existing = profileRepository.get( arguments.tenantId, arguments.id );
+		if ( !existing.count() ) notFound();
+		return masked( profileRepository.setActive( arguments.tenantId, arguments.id ) );
+	}
+
+	/** Tests a saved profile's connection without changing which one is active. */
+	struct function smokeTest( required string tenantId, required string id ) {
+		var existing = profileRepository.get( arguments.tenantId, arguments.id );
+		if ( !existing.count() ) notFound();
+		return aiReviewService.smokeTest( arguments.id );
+	}
+
+	private struct function normalizeInput( required struct input, required struct fallback ) {
+		var name = boundedText( arguments.input.name ?: arguments.fallback.name ?: "", "name", 120 );
+		if ( !len( name ) ) validationError( "name is required" );
+		var provider = lCase( trim( arguments.input.provider ?: arguments.fallback.provider ?: "" ) );
+		if ( !variables.allowedProviders.contains( provider ) ) {
+			validationError( "provider must be one of: " & variables.allowedProviders.toList( ", " ) );
+		}
+		var baseUrl = boundedText( arguments.input.baseUrl ?: arguments.fallback.baseUrl ?: "", "baseUrl", 500 );
+		if ( !len( baseUrl ) ) validationError( "baseUrl is required" );
+		if ( !reFindNoCase( "^https?://", baseUrl ) ) validationError( "baseUrl must start with http:// or https://" );
+		var model = boundedText( arguments.input.model ?: arguments.fallback.model ?: "", "model", 200 );
+		if ( !len( model ) ) validationError( "model is required" );
+		var apiKey = boundedText( arguments.input.apiKey ?: "", "apiKey", 500 );
+		var timeoutSeconds = boundedInteger( arguments.input.timeoutSeconds ?: arguments.fallback.timeoutSeconds ?: 120, "timeoutSeconds", 1, 3600 );
+		var contextWindow = boundedInteger( arguments.input.contextWindow ?: arguments.fallback.contextWindow ?: 128000, "contextWindow", 512, 2000000 );
+		var inputUsdPerMillion = boundedDecimal( arguments.input.inputUsdPerMillion ?: arguments.fallback.inputUsdPerMillion ?: 0, "inputUsdPerMillion" );
+		var outputUsdPerMillion = boundedDecimal( arguments.input.outputUsdPerMillion ?: arguments.fallback.outputUsdPerMillion ?: 0, "outputUsdPerMillion" );
+		return {
+			name               : name,
+			provider           : provider,
+			baseUrl            : baseUrl,
+			model              : model,
+			apiKey             : apiKey,
+			timeoutSeconds     : timeoutSeconds,
+			contextWindow      : contextWindow,
+			inputUsdPerMillion : inputUsdPerMillion,
+			outputUsdPerMillion: outputUsdPerMillion
+		};
+	}
+
+	private struct function masked( required struct profile ) {
+		var copy = duplicate( arguments.profile );
+		copy.apiKey = maskSecret( copy.apiKey ?: "" );
+		copy.hasApiKey = len( arguments.profile.apiKey ?: "" ) > 0;
+		return copy;
+	}
+
+	private string function maskSecret( required string value ) {
+		if ( !len( arguments.value ) ) return "";
+		if ( len( arguments.value ) <= 4 ) return "****";
+		return "****" & right( arguments.value, 4 );
+	}
+
+	private string function boundedText( required any value, required string field, required numeric maximum ) {
+		if ( !isSimpleValue( arguments.value ) ) validationError( "#arguments.field# must be text" );
+		var text = trim( toString( arguments.value ) );
+		if ( len( text ) > arguments.maximum ) validationError( "#arguments.field# exceeds the maximum length" );
+		return text;
+	}
+
+	private numeric function boundedInteger( required any value, required string field, required numeric minimum, required numeric maximum ) {
+		if ( !isNumeric( arguments.value ) || val( arguments.value ) < arguments.minimum || val( arguments.value ) > arguments.maximum ) {
+			validationError( "#arguments.field# must be a number between #arguments.minimum# and #arguments.maximum#" );
+		}
+		return int( val( arguments.value ) );
+	}
+
+	private numeric function boundedDecimal( required any value, required string field ) {
+		if ( !isNumeric( arguments.value ) || val( arguments.value ) < 0 ) {
+			validationError( "#arguments.field# must be a non-negative number" );
+		}
+		return val( arguments.value );
+	}
+
+	private void function validationError( required string message ) {
+		throw( type = "ValidationException", message = arguments.message );
+	}
+
+	private void function notFound() {
+		throw( type = "AIProviderProfileNotFound", message = "Provider profile not found" );
+	}
+}

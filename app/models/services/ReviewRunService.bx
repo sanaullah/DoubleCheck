@@ -725,7 +725,8 @@ class {
 				tasks  : [],
 				error  : ""
 			};
-			if ( specialistReviewService.isEnabled() ) {
+			var fastMode = run.getPolicy().fast ?: false;
+			if ( specialistReviewService.isEnabled() && !fastMode ) {
 				crewProposal = crewPlannerService.propose(
 						architectureModel,
 						graph,
@@ -812,16 +813,18 @@ class {
 				status    = "running",
 				progress  = 55,
 				phase     = "specialist-review",
-				message   = specialistReviewService.isEnabled()
-					? "Running bounded specialist agents with controlled read-only tools"
-					: "Specialist AI is not configured; retaining deterministic review",
+				message   = fastMode
+					? "Fast mode: skipping specialist agents, retaining deterministic review"
+					: ( specialistReviewService.isEnabled()
+						? "Running bounded specialist agents with controlled read-only tools"
+						: "Specialist AI is not configured; retaining deterministic review" ),
 				eventType = "task.progress"
 			);
 			checkCancellation( arguments.runId );
 			renewOwnedLease( arguments.runId, arguments.leaseToken );
 			var specialistRunId = arguments.runId;
 			var specialistResult = specialistReviewService.review(
-					planMemento,
+					fastMode ? { tasks: [] } : planMemento,
 					scan.files,
 					graph,
 					{
@@ -906,7 +909,9 @@ class {
 					filesReviewed : specialistResult.filesReviewed,
 					charactersSent: specialistResult.charactersSent
 				}
-				: aiReviewService.review( scan.files );
+				: ( fastMode
+					? { enabled: false, findings: [], summary: "", error: "", filesReviewed: 0, charactersSent: 0 }
+					: aiReviewService.review( scan.files ) );
 			if ( !specialistResult.enabled ) {
 				findings.append( aiResult.findings, true );
 			}
@@ -1106,15 +1111,15 @@ class {
 			var maxTokens = isNumeric( budgetInput.maxTokens ) ? max( 256, min( 48000, int( budgetInput.maxTokens ) ) ) : 24000;
 			var maxTokensPerTask = isNumeric( budgetInput.maxTokensPerTask ) ? max( 256, min( 16000, int( budgetInput.maxTokensPerTask ) ) ) : 8000;
 			maxTokens = max( maxTokens, maxTokensPerTask );
-			var maxDuration = isNumeric( budgetInput.maxDurationMs ) ? max( 1000, min( 1800000, int( budgetInput.maxDurationMs ) ) ) : 900000;
+			var maxDuration = isNumeric( budgetInput.maxDurationMs ) ? max( 1000, min( 3600000, int( budgetInput.maxDurationMs ) ) ) : 900000;
 			var maxIterations = isNumeric( budgetInput.maxIterations ) || isNumeric( budgetInput.maxIterationsPerTask ) ? max( 1, min( 16, int( isNumeric( budgetInput.maxIterations ) ? budgetInput.maxIterations : budgetInput.maxIterationsPerTask ) ) ) : 2;
 			var maxTasks = isNumeric( budgetInput.maxTasks ) ? max( 1, min( 6, int( budgetInput.maxTasks ) ) ) : 3;
 			var maxToolOutput = isNumeric( budgetInput.maxToolOutputCharacters ) ? max( 1000, min( 100000, int( budgetInput.maxToolOutputCharacters ) ) ) : 48000;
-			var maxCost = isNumeric( budgetInput.maxCostUsd ) ? max( 0, min( 100, val( budgetInput.maxCostUsd ) ) ) : 40;
+			var maxCost = isNumeric( budgetInput.maxCostUsd ) ? max( 0, min( 200, val( budgetInput.maxCostUsd ) ) ) : 40;
 			var maxRepairRounds = isNumeric( budgetInput.maxRepairRounds ) ? max( 0, min( 2, int( budgetInput.maxRepairRounds ) ) ) : 2;
-			var maxApplicationShards = isNumeric( budgetInput.maxApplicationShards ) ? max( 1, min( 20, int( budgetInput.maxApplicationShards ) ) ) : 20;
-			var applicationShardSize = isNumeric( budgetInput.applicationShardSize ) ? max( 2, min( 20, int( budgetInput.applicationShardSize ) ) ) : 8;
-			var applicationShardConcurrency = isNumeric( budgetInput.applicationShardConcurrency ) ? max( 1, min( 12, int( budgetInput.applicationShardConcurrency ) ) ) : 8;
+			var maxApplicationShards = isNumeric( budgetInput.maxApplicationShards ) ? max( 1, min( 40, int( budgetInput.maxApplicationShards ) ) ) : 40;
+			var applicationShardSize = isNumeric( budgetInput.applicationShardSize ) ? max( 2, min( 20, int( budgetInput.applicationShardSize ) ) ) : 2;
+			var applicationShardConcurrency = isNumeric( budgetInput.applicationShardConcurrency ) ? max( 1, min( 12, int( budgetInput.applicationShardConcurrency ) ) ) : 3;
 		return {
 			maxTokens: maxTokens, maxTokensPerTask: maxTokensPerTask, maxDurationMs: maxDuration,
 			maxIterations: maxIterations, maxIterationsPerTask: maxIterations, maxTasks: maxTasks,

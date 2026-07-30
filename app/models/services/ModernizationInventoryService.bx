@@ -6,7 +6,7 @@
 @singleton
 class {
 	property name="identityService" inject="ModernizationIdentityService";
-	variables.version = "cfml-inventory-conservative-v1";
+	variables.version = "cfml-inventory-conservative-v2";
 
 	struct function build( required any scan ) {
 		var files = isStruct( arguments.scan ) ? ( arguments.scan.files ?: [] ) : arguments.scan;
@@ -53,8 +53,12 @@ class {
 			for ( var fn in functionsFound.units ) units.append( fn );
 			for ( var unresolvedItem in functionsFound.unresolved ) unresolved.append( unresolvedItem );
 
+			var cfmlCommentOpen = false;
 			for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
 				var sourceLine = toString( lines[ lineNumber ] );
+				var commentSafe = stripCfmlComments( sourceLine, cfmlCommentOpen );
+				cfmlCommentOpen = commentSafe.open;
+				sourceLine = commentSafe.text;
 				var trimmed = trim( sourceLine );
 				if ( !len( trimmed ) ) continue;
 				var lineEvidence = evidence( path, lineNumber, sourceLine, file );
@@ -75,8 +79,8 @@ class {
 				if ( ( reFindNoCase( "createObject|cfinvoke", sourceLine ) && reFindNoCase( "(arguments|variables|url|form)[.]", sourceLine ) ) || ( findNoCase( "<cfinvoke", sourceLine ) && find( char( 35 ), sourceLine ) ) ) {
 					unresolved.append( unresolvedEvidence( "dynamic-component", path, lineNumber, sourceLine ) );
 				}
-				if ( reFindNoCase( "(cfhttp|httpRequest|httpClient|fetch)", sourceLine ) ) dependencies.append( dependency( "http", "outbound", lineEvidence ) );
-				if ( findNoCase( "cfschedule", sourceLine ) || findNoCase( "schedule", sourceLine ) || findNoCase( "onschedule", lCase( sourceLine ) ) ) dependencies.append( dependency( "schedule", "scheduled-work", lineEvidence ) );
+				if ( reFindNoCase( "(?:<cfhttp\b|\bhttpRequest\b|\bhttpClient\b|\bnew\s+Http\s*\(|\bfetch\s*\()", sourceLine ) ) dependencies.append( dependency( "http", "outbound", lineEvidence ) );
+				if ( reFindNoCase( "(?:<cfschedule\b|\bscheduler(?:New|Start|Stop)?\b|\bonSchedule\b|\bschedule\s*\()", sourceLine ) ) dependencies.append( dependency( "schedule", "scheduled-work", lineEvidence ) );
 				if ( reFindNoCase( "(cf_file|fileRead|fileWrite|fileCopy|fileMove|directoryList|directoryCreate|fileUpload|cffile)", sourceLine ) ) dependencies.append( dependency( "filesystem", "filesystem", lineEvidence ) );
 				if ( ( findNoCase( "createobject", sourceLine ) && findNoCase( "java", sourceLine ) ) || findNoCase( "new java.", sourceLine ) ) dependencies.append( dependency( "java", "java-interop", lineEvidence ) );
 				if ( reFindNoCase( "(datasource|this[.]datasource)[ ]*=", sourceLine ) ) dependencies.append( dependency( "datasource", extractQuotedOrValue( sourceLine, "datasource" ), lineEvidence ) );
@@ -134,13 +138,14 @@ class {
 
 	private struct function extractFunctions( required string path, required array lines, required struct file ) {
 		var result = { units: [], unresolved: [] };
-		for ( var lineNumber = 1; lineNumber <= arguments.lines.len(); lineNumber++ ) {
-			var sourceLine = toString( arguments.lines[ lineNumber ] );
+		var safeLines = commentSafeLines( arguments.lines );
+		for ( var lineNumber = 1; lineNumber <= safeLines.len(); lineNumber++ ) {
+			var sourceLine = toString( safeLines[ lineNumber ] );
 				var tagMatch = variables.javaPatternMatcher( "<cffunction\\s+[^>]*\\bname\\s*=[^A-Za-z0-9_]*([A-Za-z_][A-Za-z0-9_.-]*)[^>]*>", sourceLine );
 			if ( tagMatch.find() ) {
-				var endLine = findClosingTag( arguments.lines, lineNumber, "</cffunction>" );
+				var endLine = findClosingTag( safeLines, lineNumber, "</cffunction>" );
 				var tagUnit = makeUnit( "function", arguments.path, tagMatch.group( 1 ), lineNumber, endLine, "tag-regex-v1", arguments.file, [ "signature", "access", "return" ] );
-				tagUnit.parameters = extractTagArguments( arguments.lines, lineNumber, endLine );
+				tagUnit.parameters = extractTagArguments( safeLines, lineNumber, endLine );
 				var tagParameterNames = tagUnit.parameters.map( ( item ) => item.name ).toList( ", " );
 				tagUnit.signature = tagMatch.group( 1 ) & "(" & tagParameterNames & ")";
 				result.units.append( tagUnit );
@@ -149,7 +154,7 @@ class {
 				var fnMatch = variables.javaPatternMatcher( "(?:(?:public|private|protected|remote|static|final)\\s+)*(?:[A-Za-z_][A-Za-z0-9_.$]*\\s+)?function\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(([^)]*)\\)", sourceLine );
 			if ( fnMatch.find() ) {
 				var fnName = fnMatch.group( 1 );
-				var endLine = findFunctionEnd( arguments.lines, lineNumber );
+				var endLine = findFunctionEnd( safeLines, lineNumber );
 				var unit = makeUnit( "function", arguments.path, fnName, lineNumber, endLine, "script-regex-v1", arguments.file, [ "signature", "access", "return" ] );
 				unit.signature = "#fnName#(#trim( fnMatch.group( 2 ) )#)";
 				unit.parameters = parseParameters( fnMatch.group( 2 ) );
@@ -157,6 +162,17 @@ class {
 			}
 		}
 		return result;
+	}
+
+	private array function commentSafeLines( required array lines ) {
+		var output = [];
+		var cfmlCommentOpen = false;
+		for ( var line in arguments.lines ) {
+			var safe = stripCfmlComments( toString( line ), cfmlCommentOpen );
+			cfmlCommentOpen = safe.open;
+			output.append( safe.text );
+		}
+		return output;
 	}
 
 	private array function parseParameters( required string parameterText ) {
@@ -243,25 +259,108 @@ class {
 	}
 
 	private struct function routeFromLine(required string path, required numeric lineNumber, required string line, required struct file) {
-		var matcher = variables.javaPatternMatcher( "(?i)(action|href|url)[ ]*=[^A-Za-z0-9_./:?&=-]*([^[:space:]>]+)", arguments.line );
-		if ( matcher.find() ) {
-			var routePath = matcher.group( 2 );
-			var methodMatch = variables.javaPatternMatcher( "(?i)method[ ]*=[^A-Za-z]*([A-Za-z]+)", arguments.line );
-			var method = methodMatch.find() ? uCase( methodMatch.group( 1 ) ) : "GET";
-			return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:#routePath#" ), legacyPath: routePath, method: method, filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: find( char( 35 ), routePath ) > 0 };
+		var routeKind = "";
+		var attribute = "";
+		var method = "GET";
+		if ( reFindNoCase( "<cflocation\b", arguments.line ) ) {
+			routeKind = "redirect";
+			attribute = "url";
+		} else if ( reFindNoCase( "<(?:cf)?form\b", arguments.line ) ) {
+			routeKind = "form-action";
+			attribute = "action";
+			var methodMatch = variables.javaPatternMatcher( "(?i)\bmethod\s*=\s*[\""']([A-Za-z]+)", arguments.line );
+			method = methodMatch.find() ? uCase( methodMatch.group( 1 ) ) : "GET";
+		} else if ( reFindNoCase( "<a\b", arguments.line ) ) {
+			routeKind = "anchor";
+			attribute = "href";
+		} else if ( reFindNoCase( "\blocation[.]href\s*=", arguments.line ) ) {
+			routeKind = "client-redirect";
+			var locationMatch = variables.javaPatternMatcher( "(?i)\blocation[.]href\s*=\s*[\""']([^\""']+)", arguments.line );
+			if ( locationMatch.find() ) {
+				var locationPath = trim( locationMatch.group( 1 ) );
+				if ( isApplicationRoute( locationPath ) ) return routeEvidenceItem( arguments.path, arguments.lineNumber, arguments.line, arguments.file, locationPath, method, routeKind );
+			}
+			return javacast( "null", "" );
+		} else {
+			return javacast( "null", "" );
 		}
-		if ( reFindNoCase( "<form\\b|<a\\b|\\burl\\s*=", arguments.line ) ) {
-			return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#dynamic" ), legacyPath: "", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: true };
+		var matcher = variables.javaPatternMatcher( "(?i)\b#attribute#\s*=\s*[\""']([^\""']+)", arguments.line );
+		if ( matcher.find() ) {
+			var routePath = trim( matcher.group( 1 ) );
+			if ( isApplicationRoute( routePath ) ) return routeEvidenceItem( arguments.path, arguments.lineNumber, arguments.line, arguments.file, routePath, method, routeKind );
 		}
 		return javacast( "null", "" );
 	}
 
 	private struct function remoteRouteFromLine(required string path, required numeric lineNumber, required string line, required struct file) {
 		if ( !reFindNoCase( "\bremote\b.*\bfunction\b|<cffunction\b.*\baccess\s*=\s*[\""']remote", arguments.line ) ) return javacast( "null", "" );
-		var matcher = variables.javaPatternMatcher( "(?i)(?:function\s+|name\s*=\s*[\""'])([A-Za-z_][A-Za-z0-9_]*)", arguments.line );
+		var expression = findNoCase( "<cffunction", arguments.line )
+			? "(?i)\bname\s*=\s*[\""']([A-Za-z_][A-Za-z0-9_]*)"
+			: "(?i)\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)";
+		var matcher = variables.javaPatternMatcher( expression, arguments.line );
 		if ( !matcher.find() ) return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:remote" ), legacyPath: "", method: "UNKNOWN", routeKind: "remote-cfc-method", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "remote-cfc-regex-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: true };
 		var name = matcher.group( 1 );
 		return { id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:remote:#name#" ), legacyPath: "remote:#name#", method: "UNKNOWN", routeKind: "remote-cfc-method", filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "remote-cfc-regex-v1", evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ], unresolved: false };
+	}
+
+	private struct function routeEvidenceItem(
+		required string path,
+		required numeric lineNumber,
+		required string line,
+		required struct file,
+		required string routePath,
+		required string method,
+		required string routeKind
+	) {
+		return {
+			id: stableItemId( "route", "#arguments.path#:#arguments.lineNumber#:#arguments.routeKind#:#arguments.routePath#" ),
+			legacyPath: arguments.routePath,
+			method: arguments.method,
+			routeKind: arguments.routeKind,
+			filePath: arguments.path,
+			startLine: arguments.lineNumber,
+			endLine: arguments.lineNumber,
+			extractionMethod: "route-attribute-regex-v2",
+			evidenceRefs: [ evidence( arguments.path, arguments.lineNumber, arguments.line, arguments.file ) ],
+			unresolved: find( char( 35 ), arguments.routePath ) > 0
+		};
+	}
+
+	private boolean function isApplicationRoute( required string value ) {
+		var route = trim( arguments.value );
+		if ( !len( route ) || left( route, 1 ) == char( 35 ) || left( route, 1 ) == "?" ) return false;
+		if ( reFindNoCase( "^(?:https?:|mailto:|javascript:|data:|tel:)", route ) ) return false;
+		var withoutQuery = listFirst( route, char( 63 ) & char( 35 ) );
+		var extension = find( ".", listLast( withoutQuery, "/" ) ) ? lCase( listLast( withoutQuery, "." ) ) : "";
+		if ( len( extension ) && !listFindNoCase( "cfm,cfc,cfml,bx,bxm,html,htm", extension ) ) return false;
+		return left( route, 1 ) == "/" || find( "/", route ) || listFindNoCase( "cfm,cfc,cfml,bx,bxm,html,htm", extension );
+	}
+
+	private struct function stripCfmlComments( required string line, required boolean open ) {
+		var value = arguments.line;
+		var inside = arguments.open;
+		var guard = 0;
+		while ( guard++ < 20 ) {
+			if ( inside ) {
+				var closeAt = find( "--->", value );
+				if ( !closeAt ) return { text: "", open: true };
+				value = closeAt + 4 <= len( value )
+					? mid( value, closeAt + 4, len( value ) - closeAt - 3 )
+					: "";
+				inside = false;
+			}
+			var openAt = find( "<!---", value );
+			if ( !openAt ) break;
+			var closeAt = find( "--->", value, openAt + 5 );
+			if ( !closeAt ) {
+				value = openAt > 1 ? left( value, openAt - 1 ) : "";
+				inside = true;
+				break;
+			}
+			value = ( openAt > 1 ? left( value, openAt - 1 ) : "" )
+				& ( closeAt + 4 <= len( value ) ? mid( value, closeAt + 4, len( value ) - closeAt - 3 ) : "" );
+		}
+		return { text: value, open: inside };
 	}
 
 	private struct function sqlReferences( required string line ) {
@@ -291,7 +390,7 @@ class {
 
 	private string function classifyUnit(required string path) {
 		var lower = lCase( arguments.path );
-		if ( reFindNoCase( "(^|/)application\\.cfc$", lower ) ) return "application";
+		if ( reFindNoCase( "(^|/)application[.]cfc$", lower ) ) return "application";
 		if ( reFindNoCase( "(^|/)(customtags?|tags)(/|$)", lower ) ) return "custom-tag";
 		return "component";
 	}
@@ -312,7 +411,7 @@ class {
 		return arguments.lines.len();
 	}
 
-	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" ); }
+	private string function normalizePath(required string path) { return replace( replace( arguments.path ?: "", "\", "/", "all" ), "//", "/", "all" ); }
 	private string function normalizeText(required string text) { return replace( replace( arguments.text, char( 13 ), "", "all" ), char( 0 ), "", "all" ); }
 	private string function stableItemId(required string kind, required string identity) {
 		try { if ( !isNull( variables.identityService ?: javacast( "null", "" ) ) ) return variables.identityService.itemId( arguments.kind, arguments.identity ); } catch ( any ignore ) {}

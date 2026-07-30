@@ -85,7 +85,25 @@ class {
 			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 ),
 			files: val( contextSummary.files ?: ( isArray( partitions ) ? partitions.len() : 0 ) ),
 			lineCount: val( contextSummary.lineCount ?: 0 ),
-			omittedPartitions: val( contextSummary.omittedPartitions ?: 0 )
+			omittedPartitions: val( contextSummary.omittedPartitions ?: 0 ),
+			omittedPaths: isArray( contextSummary.omittedPaths ?: "" ) ? duplicate( contextSummary.omittedPaths ) : [],
+			gaps: isArray( llm.gaps ?: "" ) ? duplicate( llm.gaps ) : []
+		};
+		llmCoverage.complete = llmCoverage.failed == 0 && llmCoverage.omittedPartitions == 0 && !llmCoverage.truncated && llmCoverage.completed >= llmCoverage.planned;
+		llmCoverage.status = llmCoverage.complete ? "complete" : "incomplete";
+		var scannerUncertain = repository.truncation || cfml.truncated || cfml.unresolved > 0;
+		var routeObserved = ( inventory.routeEvidence ?: [] ).len() > 0;
+		var lifecycleObserved = false;
+		for ( var unit in inventory.units ?: [] ) {
+			if ( lCase( trim( unit.unitType ?: unit.kind ?: "" ) ) == "application" ) {
+				lifecycleObserved = true;
+				break;
+			}
+		}
+		var observations = {
+			routes: observationState( routeObserved, scannerUncertain ),
+			schema: observationState( schema.coverage != "absent", schema.unresolved > 0 ),
+			lifecycle: observationState( lifecycleObserved, scannerUncertain )
 		};
 		var banners = [];
 		if ( repository.truncation ) banners.append( "Repository inventory is partial because scan budgets were reached." );
@@ -93,7 +111,8 @@ class {
 		if ( cfml.noScope ) banners.append( "No CFML scope was found; modernization enrichment is not available." );
 		if ( llmCoverage.truncated ) banners.append( "LLM context was bounded and some evidence ranges were omitted." );
 		var schemaCoverageLabel = schema.coverage == "absent" ? "inference-limited" : schema.coverage;
-		return { version: variables.version, repository: repository, filesScanned: repository.indexed, cfmlFiles: cfml.files, cfmlInventory: cfml, schema: schema, schemaCoverage: schemaCoverageLabel, llm: llmCoverage, banners: banners, truncated: repository.truncation || cfml.truncated || llmCoverage.truncated, complete: !repository.truncation && !cfml.truncated && !llmCoverage.truncated, fingerprint: stableHash( variables.version & "|" & jsonSerialize( { repository: repository, cfml: cfml, schema: schema, llm: llmCoverage } ) ) };
+		var complete = !repository.truncation && !cfml.truncated && llmCoverage.complete;
+		return { version: variables.version, repository: repository, filesScanned: repository.indexed, cfmlFiles: cfml.files, cfmlInventory: cfml, schema: schema, schemaCoverage: schemaCoverageLabel, llm: llmCoverage, observations: observations, banners: banners, truncated: repository.truncation || cfml.truncated || llmCoverage.truncated, status: complete ? "complete" : "incomplete", complete: complete, fingerprint: stableHash( variables.version & "|" & jsonSerialize( { repository: repository, cfml: cfml, schema: schema, llm: llmCoverage, observations: observations } ) ) };
 	}
 
 	struct function build(struct scan = {}, struct inventory = {}, struct schemaPack = {}, struct context = {}, struct llm = {}) returntype="struct" { return assess( arguments.scan, arguments.inventory, arguments.schemaPack, arguments.context, arguments.llm ); }
@@ -144,23 +163,14 @@ class {
 			notYetSliced   : max( 0, total - onRoad ),
 			sourceStackNote: sourceStackNote
 		};
-		// Context partitions are prepared before the proposal roles run. Once a
-		// plan has target units or roadmap phases, treat prepared partitions as
-		// consumed so confidence does not read as "0 completed".
-		if ( isStruct( result.llm ?: "" ) ) {
-			var llm = duplicate( result.llm );
-			var planned = val( llm.planned ?: llm.partitions ?: 0 );
-			var hasProposal = ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) && arguments.plan.target.units.len() )
-				|| ( isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len() );
-			if ( hasProposal && val( llm.completed ?: 0 ) <= 0 && planned > 0 ) {
-				llm.completed = planned;
-				result.llm = llm;
-			}
-		}
 		return result;
 	}
 
 	private numeric function sumSkipped(required struct skipped) { var total = 0; for ( var key in arguments.skipped ) total += val( arguments.skipped[ key ] ?: 0 ); return total; }
 	private numeric function countStatus(required array items, required string status) { var count = 0; for ( var item in arguments.items ) if ( ( item.status ?: "" ) == arguments.status ) count++; return count; }
+	private struct function observationState( required boolean observed, required boolean uncertain ) {
+		if ( arguments.observed ) return { state: "observed", provenanceClass: "source-observed" };
+		return { state: arguments.uncertain ? "needs-review" : "not-observed", provenanceClass: "not-observed" };
+	}
 	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
 }

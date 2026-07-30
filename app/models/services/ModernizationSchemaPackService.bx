@@ -142,6 +142,71 @@ class {
 		return ingest( arguments.input, arguments.projectPath, arguments.options );
 	}
 
+	/**
+	 * Finds the strongest repository SQL schema candidate when the user leaves
+	 * schema input on "infer". Large database dumps are streamed and reduced to
+	 * DDL before the ordinary bounded/redacted ingestion path sees them.
+	 */
+	struct function discover( required string projectPath, struct options = {} ) {
+		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
+		if ( !root.isDirectory() ) return {};
+		var maxByteLimit = numericSetting( arguments.options.maxBytes ?: variables.maxBytes, variables.defaults.maxBytes );
+		var maxFileLimit = numericSetting( arguments.options.maxFiles ?: variables.maxFiles, variables.defaults.maxFiles );
+		var listing = directoryList( root.getPath(), true, "query" );
+		var candidates = [];
+		for ( var row = 1; row <= listing.recordCount; row++ ) {
+			if ( lCase( listing.type[ row ] ?: "file" ) != "file" ) continue;
+			if ( lCase( listLast( listing.name[ row ] ?: "", "." ) ) != "sql" ) continue;
+			var candidate = createObject( "java", "java.io.File" )
+				.init( listing.directory[ row ] & createObject( "java", "java.io.File" ).separator & listing.name[ row ] )
+				.getCanonicalFile();
+			if ( !candidate.toPath().startsWith( root.toPath() ) ) continue;
+			var relativePath = normalizePath( root.toPath().relativize( candidate.toPath() ).toString() );
+			candidates.append( { file: candidate, relativePath: relativePath, score: schemaCandidateScore( relativePath ) } );
+		}
+		candidates.sort( ( first, second ) => {
+			if ( first.score != second.score ) return second.score - first.score;
+			return compareNoCase( first.relativePath, second.relativePath );
+		} );
+		var best = {};
+		var bestScore = -1;
+		var inspected = 0;
+		for ( var candidate in candidates ) {
+			if ( inspected++ >= min( maxFileLimit, 20 ) ) break;
+			try {
+				var streamed = streamSchemaDdl( candidate.file.getPath(), maxByteLimit );
+				if ( !len( trim( streamed.text ) ) ) continue;
+				var pack = ingest(
+					{ sourceKind: "inline-ddl", inlineContent: streamed.text },
+					"",
+					{ maxBytes: maxByteLimit, maxFiles: maxFileLimit, maxStatements: arguments.options.maxStatements ?: variables.maxStatements }
+				);
+				var objectScore = pack.tables.len() * 1000 + pack.columns.len() * 10 + pack.constraints.len() * 5 + pack.indexes.len() * 5 + pack.routines.len();
+				if ( objectScore <= bestScore ) continue;
+				pack.source = "auto-discovered-repo-ddl";
+				pack.sourceKind = "auto-discovered";
+				pack.relativePath = candidate.relativePath;
+				pack.files = [ candidate.relativePath ];
+				pack.dmlRemoved = val( pack.dmlRemoved ?: 0 ) + streamed.omittedLines;
+				pack.discovery = {
+					mode: candidate.file.length() > maxByteLimit ? "streamed-ddl" : "bounded-ddl",
+					candidateCount: candidates.len(),
+					inspected: inspected,
+					sourceBytes: candidate.file.length(),
+					retainedBytes: byteLength( streamed.text ),
+					omittedLines: streamed.omittedLines,
+					truncated: streamed.truncated
+				};
+				best = pack;
+				bestScore = objectScore;
+			} catch ( any ignored ) {
+				// Automatic inference is best-effort. Explicit user-selected schema
+				// input still reports its validation/limit errors normally.
+			}
+		}
+		return best;
+	}
+
 	private struct function ingestStructured( required struct descriptor, required numeric maxBytes, required numeric maxStatements ) {
 		var raw = descriptor.data ?: descriptor.content ?: descriptor.inlineContent ?: descriptor.json ?: descriptor;
 		var parsed = raw;
@@ -232,7 +297,7 @@ class {
 			throw( type="ModernizationSchemaPackInputException", message="A repository-relative schema path is required" );
 		}
 		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
-		var requested = replace( trim( arguments.relativePath ), "\\", "/", "all" );
+		var requested = replace( trim( arguments.relativePath ), "\", "/", "all" );
 		if ( reFind( "^(?:[A-Za-z]:|/|\\\\)", requested ) || listFind( requested, "..", "/" ) ) {
 			throw( type="ModernizationSchemaPackInputException", message="Schema path must be relative to the selected project" );
 		}
@@ -292,7 +357,7 @@ class {
 		for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
 			var line = trim( lines[ lineNumber ] );
 			if ( !len( line ) || left( line, 2 ) == "--" ) continue;
-			var tableMatch = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.$-]+)", line );
+			var tableMatch = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\[]?([A-Za-z0-9_.$-]+)[`\]]?", line );
 			if ( tableMatch.find() ) {
 				var tableName = tableMatch.group( 1 );
 				if ( !tableNames.keyExists( lCase( tableName ) ) ) {
@@ -301,12 +366,12 @@ class {
 				}
 				continue;
 			}
-			var indexMatch = match( "(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+([A-Za-z0-9_.$-]+)\s+ON\s+([A-Za-z0-9_.$-]+)", line );
+			var indexMatch = match( "(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+[`\[]?([A-Za-z0-9_.$-]+)[`\]]?\s+ON\s+[`\[]?([A-Za-z0-9_.$-]+)[`\]]?", line );
 			if ( indexMatch.find() ) {
 				indexes.append( { name: indexMatch.group( 1 ), table: indexMatch.group( 2 ), evidence: [ evidenceRef( lineNumber, line ) ] } );
 				continue;
 			}
-			var routineMatch = match( "(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION|VIEW|TRIGGER)\s+([A-Za-z0-9_.$-]+)", line );
+			var routineMatch = match( "(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION|VIEW|TRIGGER)\s+[`\[]?([A-Za-z0-9_.$-]+)[`\]]?", line );
 			if ( routineMatch.find() ) {
 				routines.append( { kind: lCase( routineMatch.group( 1 ) ), name: routineMatch.group( 2 ), evidence: [ evidenceRef( lineNumber, line ) ] } );
 				continue;
@@ -327,7 +392,7 @@ class {
 		var currentTable = "";
 		for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
 			var line = trim( lines[ lineNumber ] );
-			var tableStart = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.$-]+)", line );
+			var tableStart = match( "(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\[]?([A-Za-z0-9_.$-]+)[`\]]?", line );
 			if ( tableStart.find() ) {
 				currentTable = tableStart.group( 1 );
 				var openParen = find( "(", line );
@@ -335,7 +400,7 @@ class {
 				var closeParen = reverseClose ? len( line ) - reverseClose + 1 : 0;
 				if ( openParen && closeParen > openParen ) {
 					for ( var inlineDefinition in listToArray( mid( line, openParen + 1, closeParen - openParen - 1 ), "," ) ) {
-						var inlineColumn = match( "(?i)^\s*([A-Za-z_][A-Za-z0-9_$-]*)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", inlineDefinition );
+						var inlineColumn = match( "(?i)^\s*[`\[]?([A-Za-z_][A-Za-z0-9_$-]*)[`\]]?\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", inlineDefinition );
 						if ( inlineColumn.find() && !listFindNoCase( "constraint,primary,foreign,unique,check,index", inlineColumn.group( 1 ) ) ) columns.append( { table: currentTable, name: inlineColumn.group( 1 ), type: trim( inlineColumn.group( 2 ) ), evidence: [ evidenceRef( lineNumber, inlineDefinition ) ] } );
 					}
 					currentTable = "";
@@ -345,7 +410,7 @@ class {
 			if ( !len( currentTable ) ) continue;
 			if ( reFind( "^\)\s*;?$", line ) ) { currentTable = ""; continue; }
 			var columnLine = reReplace( line, "^\s*,\s*", "" );
-			var columnMatch = match( "(?i)^([A-Za-z_][A-Za-z0-9_$-]*)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", columnLine );
+			var columnMatch = match( "(?i)^[`\[]?([A-Za-z_][A-Za-z0-9_$-]*)[`\]]?\s+([A-Za-z]+(?:\s+[A-Za-z]+)?(?:\s*\([^)]*\))?)", columnLine );
 			if ( columnMatch.find() && !listFindNoCase( "constraint,primary,foreign,unique,check,index", columnMatch.group( 1 ) ) ) {
 				columns.append( { table: currentTable, name: columnMatch.group( 1 ), type: trim( columnMatch.group( 2 ) ), evidence: [ evidenceRef( lineNumber, line ) ] } );
 			}
@@ -391,6 +456,62 @@ class {
 		var value = uCase( trim( arguments.line ) );
 		for ( var keyword in [ "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "UPSERT " ] ) if ( left( value, len( keyword ) ) == keyword ) return true;
 		return false;
+	}
+
+	private struct function streamSchemaDdl( required string path, required numeric maxBytes ) {
+		var handle = fileOpen( arguments.path, "read" );
+		var kept = [];
+		var retainedBytes = 0;
+		var omittedLines = 0;
+		var capturing = false;
+		var truncated = false;
+		var headerLines = 0;
+		try {
+			while ( !fileIsEOF( handle ) ) {
+				var line = fileReadLine( handle );
+				var trimmed = trim( line );
+				var startsDdl = reFindNoCase(
+					"^(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|INDEX|UNIQUE\s+INDEX|PROCEDURE|FUNCTION|VIEW|TRIGGER|DATABASE)|ALTER\s+TABLE)\b",
+					trimmed
+				) > 0;
+				if ( !capturing && startsDdl ) capturing = true;
+				var keepHeader = headerLines < 40 && (
+					findNoCase( "mysql", line )
+					|| findNoCase( "postgres", line )
+					|| findNoCase( "sql server", line )
+					|| findNoCase( "microsoft", line )
+					|| findNoCase( "oracle", line )
+					|| findNoCase( "sqlite", line )
+				);
+				if ( capturing || keepHeader ) {
+					var lineBytes = byteLength( line ) + 1;
+					if ( retainedBytes + lineBytes > arguments.maxBytes ) {
+						truncated = true;
+						break;
+					}
+					kept.append( line );
+					retainedBytes += lineBytes;
+					if ( find( ";", line ) ) capturing = false;
+				} else if ( len( trimmed ) ) {
+					omittedLines++;
+				}
+				headerLines++;
+			}
+		} finally {
+			fileClose( handle );
+		}
+		return { text: kept.toList( char( 10 ) ), omittedLines: omittedLines, truncated: truncated, bytes: retainedBytes };
+	}
+
+	private numeric function schemaCandidateScore( required string path ) {
+		var lower = lCase( arguments.path );
+		var score = 1;
+		if ( find( "schema", lower ) ) score += 100;
+		if ( find( "database", lower ) || find( "/db/", "/" & lower ) ) score += 80;
+		if ( find( "backup", lower ) || find( "dump", lower ) ) score += 60;
+		if ( find( "migration", lower ) ) score += 40;
+		if ( find( "test", lower ) || find( "fixture", lower ) || find( "sample", lower ) ) score -= 20;
+		return score;
 	}
 
 	/**
@@ -478,7 +599,7 @@ class {
 	}
 
 	private string function normalizePath( required string path ) {
-		return replace( replace( arguments.path ?: "", "\\", "/", "all" ), "//", "/", "all" );
+		return replace( replace( arguments.path ?: "", "\", "/", "all" ), "//", "/", "all" );
 	}
 
 	/** Redact both sensitive keys and token-like scalar values in structured evidence. */

@@ -29,6 +29,8 @@ class {
 	property name="defaultCostUsd" inject="coldbox:setting:runDefaultCostUsd";
 
 	property name="maxCostUsd" inject="coldbox:setting:runMaxCostUsd";
+
+	property name="appSettingsService" inject="AppSettingsService";
 	variables.policyVersion = "review-policy-v1";
 	variables.budgetVersion = "run-budgets-v2";
 	variables.allowedRoles = [
@@ -52,23 +54,41 @@ class {
 		}
 		var roles = normalizeRoles( requestedPolicy.allowedRoles ?: [] );
 		var reviewGoal = normalizeReviewGoal( requestedPolicy.reviewGoal ?: "" );
+		var fast = isBoolean( arguments.input.fast ?: "" ) ? arguments.input.fast : false;
+		// Each resolved* value checks the Settings-panel override first,
+		// falling back to the coldbox:setting (env-derived) value injected
+		// above when no override has been saved - read fresh every call so
+		// a Settings change applies to the very next run.
+		var resolvedMaxTasks = appSettingsService.get( "planMaxTasks", maxTasks );
+		var resolvedDefaultTokenBudget = appSettingsService.get( "runDefaultTokenBudget", defaultTokenBudget );
+		var resolvedMaxTokenBudget = appSettingsService.get( "runMaxTokenBudget", maxTokenBudget );
+		var resolvedDefaultTokensPerTask = appSettingsService.get( "runDefaultTokensPerTask", defaultTokensPerTask );
+		var resolvedMaxTokensPerTask = appSettingsService.get( "runMaxTokensPerTask", maxTokensPerTask );
+		var resolvedDefaultDurationMs = appSettingsService.get( "runDefaultDurationMs", defaultDurationMs );
+		var resolvedMaxDurationMs = appSettingsService.get( "runMaxDurationMs", maxDurationMs );
+		var resolvedDefaultIterationsPerTask = appSettingsService.get( "runDefaultIterationsPerTask", defaultIterationsPerTask );
+		var resolvedMaxIterationsPerTask = appSettingsService.get( "runMaxIterationsPerTask", maxIterationsPerTask );
+		var resolvedDefaultToolOutputCharacters = appSettingsService.get( "runDefaultToolOutputCharacters", defaultToolOutputCharacters );
+		var resolvedMaxToolOutputCharacters = appSettingsService.get( "runMaxToolOutputCharacters", maxToolOutputCharacters );
+		var resolvedDefaultCostUsd = appSettingsService.get( "runDefaultCostUsd", defaultCostUsd );
+		var resolvedMaxCostUsd = appSettingsService.get( "runMaxCostUsd", maxCostUsd );
 		var taskLimit = boundedInteger(
-			requestedBudgets.maxTasks ?: maxTasks,
+			requestedBudgets.maxTasks ?: resolvedMaxTasks,
 			"budgets.maxTasks",
 			1,
-			maxTasks
+			resolvedMaxTasks
 		);
 		var tokenLimit = boundedInteger(
-			requestedBudgets.maxTokens ?: defaultTokenBudget,
+			requestedBudgets.maxTokens ?: resolvedDefaultTokenBudget,
 			"budgets.maxTokens",
 			128,
-			maxTokenBudget
+			resolvedMaxTokenBudget
 		);
 		var perTaskLimit = boundedInteger(
-			requestedBudgets.maxTokensPerTask ?: defaultTokensPerTask,
+			requestedBudgets.maxTokensPerTask ?: resolvedDefaultTokensPerTask,
 			"budgets.maxTokensPerTask",
 			128,
-			maxTokensPerTask
+			resolvedMaxTokensPerTask
 		);
 		if ( perTaskLimit > tokenLimit ) {
 			validationError(
@@ -76,33 +96,34 @@ class {
 			);
 		}
 		var durationLimit = boundedInteger(
-			requestedBudgets.maxDurationMs ?: defaultDurationMs,
+			requestedBudgets.maxDurationMs ?: resolvedDefaultDurationMs,
 			"budgets.maxDurationMs",
 			1000,
-			maxDurationMs
+			resolvedMaxDurationMs
 		);
 		var iterationLimit = boundedInteger(
-			requestedBudgets.maxIterationsPerTask ?: defaultIterationsPerTask,
+			requestedBudgets.maxIterationsPerTask ?: resolvedDefaultIterationsPerTask,
 			"budgets.maxIterationsPerTask",
 			1,
-			maxIterationsPerTask
+			resolvedMaxIterationsPerTask
 		);
 		var toolOutputLimit = boundedInteger(
-			requestedBudgets.maxToolOutputCharacters ?: defaultToolOutputCharacters,
+			requestedBudgets.maxToolOutputCharacters ?: resolvedDefaultToolOutputCharacters,
 			"budgets.maxToolOutputCharacters",
 			1000,
-			maxToolOutputCharacters
+			resolvedMaxToolOutputCharacters
 		);
 		var costLimit = boundedDecimal(
-			requestedBudgets.maxCostUsd ?: defaultCostUsd,
+			requestedBudgets.maxCostUsd ?: resolvedDefaultCostUsd,
 			"budgets.maxCostUsd",
 			.01,
-			maxCostUsd
+			resolvedMaxCostUsd
 		);
 		var policy = {
 			version     : variables.policyVersion,
 			allowedRoles: roles,
-			reviewGoal  : reviewGoal
+			reviewGoal  : reviewGoal,
+			fast        : fast
 		};
 		policy.fingerprint = stableHash( policy.version & "|" & roles.toList( "," ) & "|" & reviewGoal );
 		var budgets = {

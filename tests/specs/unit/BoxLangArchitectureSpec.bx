@@ -43,9 +43,14 @@ class extends="testbox.system.BaseSpec" {
 
 						var service = prepareMock( new app.models.services.ArchitectureIndexService() );
 						service.$property(
-								"parserService",
+								"boxLangParserService",
 								"variables",
 								parser
+							);
+						service.$property(
+								"cfmlParserService",
+								"variables",
+								new app.models.services.CfmlParserService()
 							);
 						service.$property(
 								"graphRepository",
@@ -61,6 +66,69 @@ class extends="testbox.system.BaseSpec" {
 						expect( second.cacheHits ).toBe( 1 );
 						expect( second.symbolCount ).toBe( first.symbolCount );
 						expect( second.dependencyCount ).toBe( first.dependencyCount );
+					}
+				);
+
+				it(
+					"dispatches CFML files to CfmlParserService alongside BoxLang files",
+					() => {
+						var graphRepository = prepareMock( new app.models.repositories.AnalysisGraphRepository() );
+						graphRepository.$( "findCached" ).$results( javacast( "null", "" ) );
+						graphRepository.$( "saveCached" );
+						graphRepository.$(
+								"findBaselineGraph",
+								{ runId: "", symbols: [], dependencies: [] }
+							);
+						graphRepository.$( "replaceRunGraph" );
+
+						var service = prepareMock( new app.models.services.ArchitectureIndexService() );
+						service.$property(
+								"boxLangParserService",
+								"variables",
+								new app.models.services.BoxLangParserService()
+							);
+						service.$property(
+								"cfmlParserService",
+								"variables",
+								new app.models.services.CfmlParserService()
+							);
+						service.$property(
+								"graphRepository",
+								"variables",
+								graphRepository
+							);
+
+						var boxLangContent = "class { function index() {} }";
+						var cfmlContent = "<cfcomponent name=""Legacy""><cffunction name=""run""></cffunction></cfcomponent>";
+						var jsContent = "function noop() {}";
+						var files = [
+							{
+								filePath   : "app/handlers/Reviews.bx",
+								language   : "BoxLang",
+								contentHash: lCase( hash( boxLangContent, "SHA-256" ) ),
+								content    : boxLangContent,
+								lines      : listToArray( boxLangContent, char( 10 ), true, true )
+							},
+							{
+								filePath   : "app/models/Legacy.cfc",
+								language   : "CFML",
+								contentHash: lCase( hash( cfmlContent, "SHA-256" ) ),
+								content    : cfmlContent,
+								lines      : listToArray( cfmlContent, char( 10 ), true, true )
+							},
+							{
+								filePath   : "public/assets/demo.js",
+								language   : "JavaScript",
+								contentHash: lCase( hash( jsContent, "SHA-256" ) ),
+								content    : jsContent,
+								lines      : listToArray( jsContent, char( 10 ), true, true )
+							}
+						];
+						var metrics = service.index( "run-cfml-dispatch", files );
+
+						expect( metrics.filesAnalyzed ).toBe( 2 );
+						expect( metrics.parserVersion ).toInclude( "boxlang-symbol-parser" );
+						expect( metrics.parserVersion ).toInclude( "cfml-symbol-parser" );
 					}
 				);
 

@@ -43,6 +43,164 @@ class extends="testbox.system.BaseSpec" {
 				expect( ruleIds ).toInclude( "secrets/hardcoded-credential" );
 				expect( ruleIds ).toInclude( "maintenance/open-marker" );
 			} );
+
+			it( "flags a cfquery block that interpolates without cfqueryparam", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/UserGateway.cfc",
+						language: "CFML",
+						lines   : [
+							"<cffunction name=""findUser"">",
+							"<cfquery name=""q"">",
+							"SELECT * FROM users WHERE id = ##arguments.id##",
+							"</cfquery>",
+							"</cffunction>"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/query-missing-queryparam" );
+			} );
+
+			it( "does not flag a cfquery block that uses cfqueryparam", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/UserGateway.cfc",
+						language: "CFML",
+						lines   : [
+							"<cfquery name=""q"">",
+							"SELECT * FROM users WHERE id = <cfqueryparam value=""##arguments.id##"" cfsqltype=""cf_sql_integer"">",
+							"</cfquery>"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/query-missing-queryparam" );
+			} );
+
+			it( "flags an unscoped assignment inside a cffunction", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cart.cfc",
+						language: "CFML",
+						lines   : [
+							"<cffunction name=""total"">",
+							"<cfset total = 0>",
+							"</cffunction>"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/unscoped-variable" );
+			} );
+
+			it( "does not flag a var-scoped assignment inside a cffunction", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cart.cfc",
+						language: "CFML",
+						lines   : [
+							"<cffunction name=""total"">",
+							"<cfset var total = 0>",
+							"</cffunction>"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/unscoped-variable" );
+			} );
+
+			it( "flags a cfinclude with an interpolated template path", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/views/page.cfm",
+						language: "CFML",
+						lines   : [ "<cfinclude template=""##rc.section##.cfm"">" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/dynamic-include-path" );
+			} );
+
+			it( "flags a cflock without scope or name", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cache.cfc",
+						language: "CFML",
+						lines   : [ "<cflock timeout=""10"" type=""exclusive"">" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
+			it( "does not flag a cflock that has a scope", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Cache.cfc",
+						language: "CFML",
+						lines   : [ "<cflock scope=""session"" timeout=""10"" type=""exclusive"">" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/deprecated-cflock-scope" );
+			} );
+
+			it( "flags an Application.cfc missing onError and onSessionEnd", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "Application.cfc",
+						language: "CFML",
+						lines   : [ "component {", "function onApplicationStart() { return true; }", "}" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).toInclude( "cfml/application-lifecycle-gap" );
+			} );
+
+			it( "does not flag an Application.cfc that defines onError and onSessionEnd", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "Application.cfc",
+						language: "CFML",
+						lines   : [
+							"component {",
+							"function onError( exception, eventName ) { return true; }",
+							"function onSessionEnd( sessionScope, appScope ) { return true; }",
+							"}"
+						]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/application-lifecycle-gap" );
+			} );
+
+			it( "does not flag CFML rules for BoxLang or JavaScript files", () => {
+				var service = new app.models.services.FindingService();
+				var findings = service.deterministic( [
+					{
+						filePath: "app/models/Widget.bx",
+						language: "BoxLang",
+						lines   : [ "<cflock timeout=""10"" type=""exclusive"">" ]
+					},
+					{
+						filePath: "public/assets/demo.js",
+						language: "JavaScript",
+						lines   : [ "<cflock timeout=""10"" type=""exclusive"">" ]
+					}
+				] );
+				var ruleIds = findings.map( ( f ) => f.ruleId );
+				expect( ruleIds ).notToInclude( "cfml/deprecated-cflock-scope" );
+			} );
 		} );
 	}
 

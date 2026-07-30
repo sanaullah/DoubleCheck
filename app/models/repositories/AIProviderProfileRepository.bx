@@ -1,0 +1,186 @@
+/**
+ * Durable storage for user-managed AI provider connection profiles.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	array function list( required string tenantId ) {
+		var records = queryExecute(
+			"
+				SELECT id, name, provider, base_url, api_key, model, timeout_seconds,
+					context_window, input_usd_per_million, output_usd_per_million,
+					is_active, created_at, updated_at
+				FROM ai_provider_profiles
+				WHERE tenant_id = :tenantId
+				ORDER BY created_at ASC
+			",
+			{ tenantId: arguments.tenantId },
+			{ datasource: datasource }
+		);
+		return mapRows( records );
+	}
+
+	numeric function countForTenant( required string tenantId ) {
+		var records = queryExecute(
+			"SELECT COUNT(*) AS total FROM ai_provider_profiles WHERE tenant_id = :tenantId",
+			{ tenantId: arguments.tenantId },
+			{ datasource: datasource }
+		);
+		return records.recordCount ? val( records.total[ 1 ] ) : 0;
+	}
+
+	struct function get( required string tenantId, required string id ) {
+		var records = queryExecute(
+			"
+				SELECT id, name, provider, base_url, api_key, model, timeout_seconds,
+					context_window, input_usd_per_million, output_usd_per_million,
+					is_active, created_at, updated_at
+				FROM ai_provider_profiles
+				WHERE tenant_id = :tenantId AND id = :id
+			",
+			{ tenantId: arguments.tenantId, id: arguments.id },
+			{ datasource: datasource }
+		);
+		return records.recordCount ? mapRow( records, 1 ) : {};
+	}
+
+	struct function getActive( required string tenantId ) {
+		var records = queryExecute(
+			"
+				SELECT id, name, provider, base_url, api_key, model, timeout_seconds,
+					context_window, input_usd_per_million, output_usd_per_million,
+					is_active, created_at, updated_at
+				FROM ai_provider_profiles
+				WHERE tenant_id = :tenantId AND is_active = 1
+				LIMIT 1
+			",
+			{ tenantId: arguments.tenantId },
+			{ datasource: datasource }
+		);
+		return records.recordCount ? mapRow( records, 1 ) : {};
+	}
+
+	struct function create( required string tenantId, required struct profile ) {
+		var nowValue = timestamp();
+		queryExecute(
+			"
+				INSERT INTO ai_provider_profiles (
+					id, tenant_id, name, provider, base_url, api_key, model,
+					timeout_seconds, context_window, input_usd_per_million,
+					output_usd_per_million, is_active, created_at, updated_at
+				) VALUES (
+					:id, :tenantId, :name, :provider, :baseUrl, :apiKey, :model,
+					:timeoutSeconds, :contextWindow, :inputUsdPerMillion,
+					:outputUsdPerMillion, :isActive, :createdAt, :updatedAt
+				)
+			",
+			{
+				id                  : arguments.profile.id,
+				tenantId            : arguments.tenantId,
+				name                : arguments.profile.name,
+				provider            : arguments.profile.provider,
+				baseUrl             : arguments.profile.baseUrl,
+				apiKey              : arguments.profile.apiKey,
+				model               : arguments.profile.model,
+				timeoutSeconds      : arguments.profile.timeoutSeconds,
+				contextWindow       : arguments.profile.contextWindow,
+				inputUsdPerMillion  : arguments.profile.inputUsdPerMillion,
+				outputUsdPerMillion : arguments.profile.outputUsdPerMillion,
+				isActive            : arguments.profile.isActive ? 1 : 0,
+				createdAt           : nowValue,
+				updatedAt           : nowValue
+			},
+			{ datasource: datasource }
+		);
+		return get( arguments.tenantId, arguments.profile.id );
+	}
+
+	struct function update( required string tenantId, required string id, required struct changes ) {
+		var setClauses = [];
+		var params = { tenantId: arguments.tenantId, id: arguments.id, updatedAt: timestamp() };
+		for ( var field in arguments.changes ) {
+			setClauses.append( "#columnFor( field )# = :#field#" );
+			params[ field ] = arguments.changes[ field ];
+		}
+		if ( !setClauses.len() ) return get( arguments.tenantId, arguments.id );
+		setClauses.append( "updated_at = :updatedAt" );
+		queryExecute(
+			"UPDATE ai_provider_profiles SET #setClauses.toList( ', ' )# WHERE tenant_id = :tenantId AND id = :id",
+			params,
+			{ datasource: datasource }
+		);
+		return get( arguments.tenantId, arguments.id );
+	}
+
+	boolean function delete( required string tenantId, required string id ) {
+		var records = queryExecute(
+			"DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId AND id = :id",
+			{ tenantId: arguments.tenantId, id: arguments.id },
+			{ datasource: datasource }
+		);
+		return true;
+	}
+
+	struct function setActive( required string tenantId, required string id ) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"UPDATE ai_provider_profiles SET is_active = 0, updated_at = :updatedAt WHERE tenant_id = :tenantId",
+				{ tenantId: arguments.tenantId, updatedAt: timestamp() },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"UPDATE ai_provider_profiles SET is_active = 1, updated_at = :updatedAt WHERE tenant_id = :tenantId AND id = :id",
+				{ tenantId: arguments.tenantId, id: arguments.id, updatedAt: timestamp() },
+				{ datasource: datasource }
+			);
+		}
+		return get( arguments.tenantId, arguments.id );
+	}
+
+	private string function columnFor( required string field ) {
+		var columns = {
+			name               : "name",
+			provider           : "provider",
+			baseUrl            : "base_url",
+			apiKey             : "api_key",
+			model              : "model",
+			timeoutSeconds     : "timeout_seconds",
+			contextWindow      : "context_window",
+			inputUsdPerMillion : "input_usd_per_million",
+			outputUsdPerMillion: "output_usd_per_million"
+		};
+		return columns[ arguments.field ] ?: arguments.field;
+	}
+
+	private array function mapRows( required query records ) {
+		var result = [];
+		for ( var row = 1; row <= arguments.records.recordCount; row++ ) {
+			result.append( mapRow( arguments.records, row ) );
+		}
+		return result;
+	}
+
+	private struct function mapRow( required query records, required numeric row ) {
+		return {
+			id                 : arguments.records.id[ arguments.row ],
+			name               : arguments.records.name[ arguments.row ],
+			provider           : arguments.records.provider[ arguments.row ],
+			baseUrl            : arguments.records.base_url[ arguments.row ],
+			apiKey             : arguments.records.api_key[ arguments.row ],
+			model              : arguments.records.model[ arguments.row ],
+			timeoutSeconds     : val( arguments.records.timeout_seconds[ arguments.row ] ),
+			contextWindow      : val( arguments.records.context_window[ arguments.row ] ),
+			inputUsdPerMillion : val( arguments.records.input_usd_per_million[ arguments.row ] ),
+			outputUsdPerMillion: val( arguments.records.output_usd_per_million[ arguments.row ] ),
+			isActive           : val( arguments.records.is_active[ arguments.row ] ) == 1,
+			createdAt          : arguments.records.created_at[ arguments.row ],
+			updatedAt          : arguments.records.updated_at[ arguments.row ]
+		};
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

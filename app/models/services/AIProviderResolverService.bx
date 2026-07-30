@@ -1,0 +1,74 @@
+/**
+ * Resolves the AI provider connection/cost info to use for the next call.
+ *
+ * Reads the active (or a specific) provider profile fresh from SQLite on
+ * every call - deliberately not cached/injected - so switching the active
+ * profile takes effect on the very next provider call with no server
+ * restart or framework reinit required. Falls back to the env-derived
+ * coldbox:setting values (the same ones used app-wide before this feature
+ * existed) when no profile has ever been added, so zero-config behavior is
+ * unchanged for users who never touch AI provider profiles.
+ *
+ * @see AIProviderProfileRepository
+ * @see AiProviderInferenceService
+ */
+@singleton
+class {
+	property name="profileRepository" inject="AIProviderProfileRepository";
+	property name="inference" inject="AiProviderInferenceService";
+
+	property name="fallbackProvider" inject="coldbox:setting:aiProvider";
+	property name="fallbackBaseURL" inject="coldbox:setting:aiBaseURL";
+	property name="fallbackApiKey" inject="coldbox:setting:aiApiKey";
+	property name="fallbackModel" inject="coldbox:setting:aiModel";
+	property name="fallbackTimeout" inject="coldbox:setting:aiTimeout";
+	property name="fallbackContextWindow" inject="coldbox:setting:aiContextWindow";
+	property name="fallbackMaxPromptCharacters" inject="coldbox:setting:aiMaxPromptCharacters";
+	property name="fallbackInputUsdPerMillion" inject="coldbox:setting:specialistInputUsdPerMillion";
+	property name="fallbackOutputUsdPerMillion" inject="coldbox:setting:specialistOutputUsdPerMillion";
+
+	/**
+	 * Resolves connection/cost info for the given profile, the active
+	 * profile if profileId is omitted, or the env-derived fallback if no
+	 * profile matches (including when none has ever been added).
+	 */
+	struct function resolve( string profileId = "", string tenantId = "default" ) {
+		var profile = len( arguments.profileId )
+			? profileRepository.get( arguments.tenantId, arguments.profileId )
+			: profileRepository.getActive( arguments.tenantId );
+		if ( !profile.count() ) return fallback();
+		return {
+			profileId          : profile.id,
+			profileName        : profile.name,
+			provider           : profile.provider,
+			baseURL            : profile.baseUrl,
+			apiKey             : profile.apiKey,
+			model              : profile.model,
+			timeout            : profile.timeoutSeconds,
+			contextWindow      : profile.contextWindow,
+			maxPromptCharacters: val( fallbackMaxPromptCharacters ),
+			isLocal            : inference.isLocal( profile.provider, profile.baseUrl ),
+			inputUsdPerMillion : profile.inputUsdPerMillion,
+			outputUsdPerMillion: profile.outputUsdPerMillion
+		};
+	}
+
+	private struct function fallback() {
+		var provider = trim( fallbackProvider );
+		var baseURL = trim( fallbackBaseURL );
+		return {
+			profileId          : "",
+			profileName        : "",
+			provider           : provider,
+			baseURL            : baseURL,
+			apiKey             : fallbackApiKey,
+			model              : fallbackModel,
+			timeout            : val( fallbackTimeout ),
+			contextWindow      : val( fallbackContextWindow ),
+			maxPromptCharacters: val( fallbackMaxPromptCharacters ),
+			isLocal            : inference.isLocal( provider, baseURL ),
+			inputUsdPerMillion : val( fallbackInputUsdPerMillion ),
+			outputUsdPerMillion: val( fallbackOutputUsdPerMillion )
+		};
+	}
+}

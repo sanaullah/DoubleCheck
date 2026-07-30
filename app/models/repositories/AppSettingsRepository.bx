@@ -1,0 +1,47 @@
+/**
+ * Durable storage for flat key/value app setting overrides.
+ */
+
+@singleton
+class {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	struct function getAll( required string tenantId ) {
+		var records = queryExecute(
+			"SELECT setting_key, setting_value FROM app_settings WHERE tenant_id = :tenantId",
+			{ tenantId: arguments.tenantId },
+			{ datasource: datasource }
+		);
+		var result = {};
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			result[ records.setting_key[ row ] ] = records.setting_value[ row ];
+		}
+		return result;
+	}
+
+	void function set( required string tenantId, required string key, required string value ) {
+		queryExecute(
+			"
+				INSERT INTO app_settings ( tenant_id, setting_key, setting_value, updated_at )
+				VALUES ( :tenantId, :key, :value, :updatedAt )
+				ON CONFLICT ( tenant_id, setting_key )
+				DO UPDATE SET setting_value = excluded.setting_value, updated_at = excluded.updated_at
+			",
+			{
+				tenantId : arguments.tenantId,
+				key      : arguments.key,
+				value    : arguments.value,
+				updatedAt: dateTimeFormat( now(), "iso" )
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	void function setMany( required string tenantId, required struct values ) {
+		bx:transaction datasource="#datasource#" {
+			for ( var key in arguments.values ) {
+				set( arguments.tenantId, key, toString( arguments.values[ key ] ) );
+			}
+		}
+	}
+}

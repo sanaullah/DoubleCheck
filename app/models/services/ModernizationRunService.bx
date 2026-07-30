@@ -21,6 +21,8 @@ class {
 	property name="log" inject="logbox:logger:{this}";
 	property name="applicationErrorLogService" inject="ApplicationErrorLogService";
 
+	variables.pipelineContractVersion = "modernization-pipeline-v2";
+
 	struct function execute(required any run, required struct scan, struct callbacks = {}) {
 		var runId = arguments.run.getId();
 		var pipelineCallbacks = arguments.callbacks;
@@ -115,6 +117,8 @@ class {
 			var proposalInput = duplicate( input );
 				proposalInput.runId = runId;
 				proposalInput.budgets = arguments.run.getBudgets() ?: {};
+			proposalInput.sourceRevision = arguments.scan.repositoryRevision ?: "";
+			proposalInput.sourceFingerprint = sourceFingerprint;
 			proposalInput.startedAt = pipelineStartedAt;
 			var proposalCheckpoint = reusableCheckpoint( priorCheckpoints, "proposal", inputFingerprint, sourceFingerprint );
 			var proposalCheckpointValue = !isNull( proposalCheckpoint ) ? ( proposalCheckpoint.payload.value ?: proposalCheckpoint.payload ) : {};
@@ -150,10 +154,17 @@ class {
 			plan.metadata.remoteProviderDisclosure = ( input.privacy.remoteProvider ?: false )
 				? "Bounded, redacted modernization context may be sent to the configured remote provider."
 				: "Modernization provider execution is configured as local; no remote egress is expected.";
+				coverage = isStruct( plan.coverage ?: "" ) ? plan.coverage : coverage;
+				result.coverage = coverage;
 				plan.coverage = coverage;
 				emit( arguments.callbacks, 82, "modernization-validation", "Checking proposal structure, evidence, and safety gates" );
 				var validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
 				plan.validation = validation;
+				// Persist the accepted artifact before any repair/cancellation
+				// boundary. A later interruption may leave validation gates open,
+				// but must not discard already accepted provider fragments.
+				plan.state = "needs-review";
+				modernizationRepository.savePlan( runId, plan, validation, coverage );
 				// Repair is deliberately bounded and fingerprint-scoped.  A repair
 				// response can replace only invalid items identified by this report;
 				// valid items and the rest of the artifact remain untouched.
@@ -175,8 +186,11 @@ class {
 						{
 							isCancelled: () => isCancelled( pipelineCallbacks ),
 							budgets: arguments.run.getBudgets() ?: {},
-							startedAt: proposalInput.startedAt,
-							maxDurationMs: val( ( arguments.run.getBudgets() ?: {} ).maxDurationMs ?: 180000 ),
+							startedAt: getTickCount(),
+							maxDurationMs: max(
+								5000,
+								val( ( arguments.run.getBudgets() ?: {} ).maxDurationMs ?: 180000 ) - ( getTickCount() - pipelineStartedAt )
+							),
 							onObservation: ( observation ) => {
 								if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
 							}
@@ -229,7 +243,26 @@ class {
 			checkCancellation( arguments.callbacks );
 			return terminal( result, terminalStatus, message, planState );
 		} catch ( "RunCancelled" error ) {
-			return terminal( result, "cancelled", "Modernization run cancelled", "needs-review" );
+			try {
+				var retained = modernizationRepository.getPlan( runId );
+				if ( !isNull( retained ) ) {
+					var retainedPlan = duplicate( retained.plan ?: {} );
+					var retainedCoverage = markIncompleteCoverage( retained.coverage ?: retainedPlan.coverage ?: result.coverage ?: {}, "cancelled" );
+					retainedPlan.coverage = retainedCoverage;
+					retainedPlan.state = "needs-review";
+					retainedPlan.generationErrors = isArray( retainedPlan.generationErrors ?: "" ) ? retainedPlan.generationErrors : [];
+					retainedPlan.generationErrors.append( { stage: "modernization", message: "cancelled", provenanceClass: "not-observed" } );
+					modernizationRepository.savePlan( runId, retainedPlan, retained.validation ?: retainedPlan.validation ?: {}, retainedCoverage );
+					result = flattenPlan( retainedPlan, result );
+					result.coverage = retainedCoverage;
+					result.validation = retained.validation ?: retainedPlan.validation ?: {};
+					result.errors.append( { stage: "modernization", message: "cancelled" } );
+				}
+			} catch ( any ignored ) {
+				// Checkpoints still preserve deterministic work if plan retention
+				// itself is unavailable during cancellation.
+			}
+			return terminal( result, "cancelled", "Modernization run cancelled; accepted fragments were retained with incomplete coverage", "needs-review" );
 		} catch ( any error ) {
 			if ( findNoCase( "LeaseLostException", error.type ?: "" ) ) rethrow;
 			var failureMessage = secretRedactionService.redactText( error.message ?: "Modernization run failed" );
@@ -286,7 +319,9 @@ class {
 
 	private struct function schemaPackFromInput(required struct input, required string projectPath) {
 		var descriptor = arguments.input.schemaPack ?: {};
-		if ( !isStruct( descriptor ) || ( descriptor.sourceKind ?: "none" ) == "none" ) return {};
+		if ( !isStruct( descriptor ) || ( descriptor.sourceKind ?: "none" ) == "none" ) {
+			return schemaPackService.discover( arguments.projectPath );
+		}
 		if ( structKeyExists( descriptor, "sanitizedText" ) || structKeyExists( descriptor, "tables" ) ) return descriptor;
 		return schemaPackService.ingest( descriptor, arguments.projectPath );
 	}
@@ -297,6 +332,7 @@ class {
 	}
 	private void function checkpoint(required string runId, required string stage, required any payload, required numeric progress, struct provenance = {}) {
 			var status = isStruct( arguments.payload ) && structKeyExists( arguments.payload, "ok" ) && !arguments.payload.ok ? "failed" : "succeeded";
+			arguments.provenance.pipelineContractVersion = variables.pipelineContractVersion;
 			modernizationRepository.saveCheckpoint( arguments.runId, arguments.stage, { status: status, progress: arguments.progress, payload: { value: arguments.payload, provenance: arguments.provenance } } );
 		}
 	private any function reusableCheckpoint(required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint) {
@@ -304,7 +340,11 @@ class {
 			if ( ( item.stage ?: "" ) != arguments.stage || ( item.status ?: "" ) != "succeeded" ) continue;
 			var payload = item.payload ?: {};
 			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
-			if ( ( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint && ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint ) return item;
+			if (
+				( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint
+				&& ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint
+				&& ( provenance.pipelineContractVersion ?: "" ) == variables.pipelineContractVersion
+			) return item;
 		}
 		return javacast( "null", "" );
 	}
@@ -373,5 +413,23 @@ class {
 		arguments.result.message = arguments.message;
 		arguments.result.planState = arguments.planState;
 		return arguments.result;
+	}
+	private struct function markIncompleteCoverage( required struct coverage, required string reason ) {
+		var result = duplicate( arguments.coverage );
+		result.complete = false;
+		result.status = "incomplete";
+		result.llm = isStruct( result.llm ?: "" ) ? result.llm : {};
+		result.llm.complete = false;
+		result.llm.status = "incomplete";
+		result.llm.gaps = isArray( result.llm.gaps ?: "" ) ? result.llm.gaps : [];
+		if ( !result.llm.gaps.some( ( item ) => isStruct( item ) && ( item.reason ?: "" ) == arguments.reason ) ) {
+			result.llm.gaps.append( {
+				kind: "run-interruption",
+				status: "incomplete",
+				reason: arguments.reason,
+				provenanceClass: "not-observed"
+			} );
+		}
+		return result;
 	}
 }

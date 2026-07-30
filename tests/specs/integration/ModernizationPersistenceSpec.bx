@@ -33,13 +33,52 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 
                     modernizationRepository.saveSchemaPack( runId, { sourceKind: "inline-ddl", format: "sql-ddl", contentHash: "hash", sanitized: { coverage: "partial-ddl" } } );
                     modernizationRepository.saveCheckpoint( runId, "inventory", { status: "completed", progress: 25, payload: { files: 2 } } );
-                    modernizationRepository.savePlan( runId, { version: "modernization-plan-v1", state: "needs-review", metadata: { runId: runId } }, { blocking: 0 }, { schemaCoverage: "partial-ddl" } );
+                    modernizationRepository.savePlan(
+                        runId,
+                        {
+                            version: "modernization-plan-v1",
+                            state: "needs-review",
+                            metadata: {
+                                runId: runId,
+                                sourceFingerprint: "source-fp",
+                                inventoryFingerprint: "inventory-fp",
+                                contextFingerprint: "context-fp",
+                                promptVersion: "modernization-prompt-v5",
+                                providerId: "openrouter",
+                                model: "fixture-model",
+                                provenanceContract: { version: "modernization-provenance-v1" }
+                            },
+                            target: {
+                                units: [ {
+                                    id: "unit-1",
+                                    itemFingerprint: "fp-1",
+                                    targetPath: "app/handlers/Orders.bx",
+                                    provenanceClass: "provider-suggested"
+                                } ]
+                            }
+                        },
+                        { blocking: 0 },
+                        {
+                            status: "incomplete",
+                            complete: false,
+                            schemaCoverage: "partial-ddl",
+                            llm: {
+                                status: "incomplete",
+                                gaps: [ { kind: "application-shard", reason: "provider-failed", provenanceClass: "not-observed" } ]
+                            }
+                        }
+                    );
                     modernizationRepository.upsertDecision( runId, { itemType: "target-unit", itemId: "unit-1", decision: "accepted", itemFingerprint: "fp-1", note: "ok" } );
                     modernizationRepository.appendDecisionEvent( runId, { itemType: "target-unit", itemId: "unit-1", action: "accepted", decision: { decision: "accepted" } } );
 
                     expect( modernizationRepository.getSchemaPack( runId ).sanitized.coverage ).toBe( "partial-ddl" );
                     expect( modernizationRepository.getCheckpoints( runId ).len() ).toBe( 1 );
-                    expect( modernizationRepository.getPlan( runId ).state ).toBe( "needs-review" );
+                    var persistedPlan = modernizationRepository.getPlan( runId );
+                    expect( persistedPlan.state ).toBe( "needs-review" );
+                    expect( persistedPlan.plan.metadata.sourceFingerprint ).toBe( "source-fp" );
+                    expect( persistedPlan.plan.target.units[ 1 ].provenanceClass ).toBe( "provider-suggested" );
+                    expect( persistedPlan.coverage.complete ).toBeFalse();
+                    expect( persistedPlan.coverage.llm.gaps[ 1 ].provenanceClass ).toBe( "not-observed" );
                     expect( modernizationRepository.listDecisions( runId ).len() ).toBe( 1 );
                     expect( modernizationRepository.listDecisionEvents( runId ).len() ).toBe( 1 );
                 } finally {

@@ -78,7 +78,7 @@ class extends="testbox.system.BaseSpec" {
             expect( result.repository.jsTruncated ).toBeTrue();
         } );
 
-        it( "marks prepared LLM partitions completed once a proposal exists", () => {
+        it( "does not report prepared partitions as completed without usage evidence", () => {
             var service = new app.models.services.ModernizationCoverageService();
             var coverage = service.assess(
                 scan = { files: [] },
@@ -92,7 +92,32 @@ class extends="testbox.system.BaseSpec" {
                 target: { units: [ { id: "tu-1", targetPath: "app/handlers/a.cfc" } ] },
                 roadmapPhases: [ { id: "p1" } ]
             } );
-            expect( coverage.llm.completed ).toBe( 4 );
+            expect( coverage.llm.completed ).toBe( 0 );
+            expect( coverage.llm.status ).toBe( "incomplete" );
+            expect( coverage.complete ).toBeFalse();
+        } );
+
+        it( "distinguishes not-observed facts from scanner uncertainty", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var completeScan = service.assess(
+                scan = { files: [ { filePath: "index.cfm", language: "CFML" } ], candidateLanguages: { CFML: 1 } },
+                inventory = { files: [ { filePath: "index.cfm" } ], units: [], routeEvidence: [], unresolved: [] },
+                schemaPack = { coverage: "absent" },
+                context = {},
+                llm = {}
+            );
+            expect( completeScan.observations.routes.state ).toBe( "not-observed" );
+            expect( completeScan.observations.routes.provenanceClass ).toBe( "not-observed" );
+
+            var uncertainScan = service.assess(
+                scan = { files: [ { filePath: "index.cfm", language: "CFML" } ], candidateLanguages: { CFML: 2 }, discoveryTruncated: true },
+                inventory = { files: [ { filePath: "index.cfm" } ], units: [], routeEvidence: [], unresolved: [] },
+                schemaPack = { coverage: "absent" },
+                context = {},
+                llm = {}
+            );
+            expect( uncertainScan.observations.routes.state ).toBe( "needs-review" );
+            expect( uncertainScan.observations.routes.provenanceClass ).toBe( "not-observed" );
         } );
         } );
     }

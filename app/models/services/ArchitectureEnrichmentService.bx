@@ -9,23 +9,13 @@
 class {
 	property name="chatGateway" inject="AIChatGateway";
 
-	property name="provider" inject="coldbox:setting:aiProvider";
-
-	property name="baseURL" inject="coldbox:setting:aiBaseURL";
-
-	property name="apiKey" inject="coldbox:setting:aiApiKey";
-
-	property name="model" inject="coldbox:setting:aiModel";
-
-	property name="timeout" inject="coldbox:setting:aiTimeout";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
 
 	property name="factLimit" inject="coldbox:setting:architectureEnrichmentFactLimit";
 
 	property name="maxPromptCharacters" inject="coldbox:setting:architectureEnrichmentMaxCharacters";
 
 	property name="maxInferredFacts" inject="coldbox:setting:architectureEnrichmentMaxFacts";
-
-	property name="contextWindow" inject="coldbox:setting:aiContextWindow";
 
 	property name="log" inject="logbox:logger:{this}";
 
@@ -36,7 +26,8 @@ class {
 	variables.maxInferredFacts = 50;
 
 	boolean function isEnabled() {
-		return chatGateway.isEnabled( provider, apiKey );
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
 	}
 
 	string function cacheKey(
@@ -47,8 +38,9 @@ class {
 	}
 
 	struct function enrich( required app.models.domain.ArchitectureModel architectureModel ) {
+		var resolved = aiProviderResolver.resolve();
 		var base = arguments.architectureModel.getMemento();
-		if ( !isEnabled() || !base.facts.len() ) {
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) || !base.facts.len() ) {
 			return {
 				model: withEnrichment(
 					base,
@@ -56,8 +48,8 @@ class {
 						enabled   : false,
 						used      : false,
 						version   : variables.enrichmentVersion,
-						provider  : provider,
-						model     : model,
+						provider  : resolved.provider,
+						model     : resolved.model,
 						addedFacts: 0,
 						error     : ""
 					}
@@ -68,12 +60,12 @@ class {
 				signature : signature()
 			};
 		}
-		var payload = buildPayload( base.facts );
+		var payload = buildPayload( resolved, base.facts );
 		try {
 			var response = chatGateway.chat(
 					payload,
-					buildParams(),
-					buildOptions()
+					buildParams( resolved ),
+					buildOptions( resolved )
 				);
 			var inferredFacts = normalize( response, base.facts );
 			var enriched = duplicate( base );
@@ -86,8 +78,8 @@ class {
 				enabled   : true,
 				used      : true,
 				version   : variables.enrichmentVersion,
-				provider  : provider,
-				model     : model,
+				provider  : resolved.provider,
+				model     : resolved.model,
 				addedFacts: inferredFacts.len(),
 				error     : ""
 			};
@@ -105,8 +97,8 @@ class {
 						{
 							type      : error.type ?: "",
 							message   : secretRedactionService.redactText( error.message ?: "" ),
-							provider  : provider,
-							model     : model,
+							provider  : resolved.provider,
+							model     : resolved.model,
 							stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
 						}
 					);
@@ -118,8 +110,8 @@ class {
 						enabled   : true,
 						used      : false,
 						version   : variables.enrichmentVersion,
-						provider  : provider,
-						model     : model,
+						provider  : resolved.provider,
+						model     : resolved.model,
 						addedFacts: 0,
 						error     : "Architecture enrichment unavailable"
 					}
@@ -196,12 +188,12 @@ class {
 		return inferred;
 	}
 
-	private array function buildPayload( required array facts ) {
+	private array function buildPayload( required struct resolved, required array facts ) {
 		var factRecords = [];
 		var characters = 0;
 		var maximumFacts = numericSetting( variables.factLimit, 200 );
 		var maximumCharacters = numericSetting( variables.maxPromptCharacters, 30000 );
-		var window = isNumeric( contextWindow ) ? max( 1024, int( val( contextWindow ) ) ) : 128000;
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
 		maximumCharacters = min( maximumCharacters, max( 1000, int( window * .75 * 2 ) ) );
 		for ( var item in arguments.facts ) {
 			var record = {
@@ -254,35 +246,36 @@ class {
 		];
 	}
 
-	private struct function buildParams() {
-		var window = isNumeric( contextWindow ) ? max( 1024, int( val( contextWindow ) ) ) : 128000;
+	private struct function buildParams( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
 		var params = {
 			temperature: 0,
 			max_tokens : min( 2000, max( 256, int( window * .25 ) ) )
 		};
-		if ( len( trim( model ) ) ) {
-			params.model = model;
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
 		}
 		return params;
 	}
 
-	private struct function buildOptions() {
+	private struct function buildOptions( required struct resolved ) {
 		var options = {
-			provider    : provider,
-			apiKey      : apiKey,
+			provider    : arguments.resolved.provider,
+			apiKey      : arguments.resolved.apiKey,
 			returnFormat: "json",
-			timeout     : timeout
+			timeout     : arguments.resolved.timeout
 		};
-		if ( len( trim( baseURL ) ) ) {
-			options.baseURL = baseURL;
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
 		}
 		return options;
 	}
 
 	private string function signature() {
+		var resolved = aiProviderResolver.resolve();
 		return variables.enrichmentVersion & ":" & (
-			isEnabled() ? "enabled" : "disabled"
-		) & ":" & lCase( provider ) & ":" & lCase( model );
+			chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ? "enabled" : "disabled"
+		) & ":" & lCase( resolved.provider ) & ":" & lCase( resolved.model );
 	}
 
 	private numeric function numericSetting( required any value, required numeric fallback ) {

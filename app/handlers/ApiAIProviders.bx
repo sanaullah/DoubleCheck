@@ -1,0 +1,106 @@
+/**
+ * REST: user-managed AI provider connection profiles (add/edit/activate/test/delete).
+ *
+ * @see AIProviderProfileService
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="profileService" inject="AIProviderProfileService";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	function preHandler( event, rc, prc, action, eventArguments ) {
+		prc.securityContext = securityContextService.authenticate( event );
+	}
+
+	/** GET /api/v1/ai-providers */
+	function index( event, rc, prc ) {
+		event.renderData( type = "json", data = { data: profileService.list( prc.securityContext.tenantId ) } );
+	}
+
+	/** GET /api/v1/ai-providers/:id */
+	function show( event, rc, prc ) {
+		try {
+			event.renderData( type = "json", data = { data: profileService.get( prc.securityContext.tenantId, rc.id ?: "" ) } );
+		} catch ("AIProviderProfileNotFound" error) {
+			notFound( event );
+		}
+	}
+
+	/** POST /api/v1/ai-providers */
+	function create( event, rc, prc ) {
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) || !body.count() ) body = rc;
+			var profile = profileService.create( prc.securityContext.tenantId, isStruct( body ) ? body : {} );
+			event.setHTTPHeader( name = "Location", value = "/api/v1/ai-providers/#profile.id#" );
+			event.renderData( type = "json", statusCode = 201, data = { data: profile } );
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	/** PUT /api/v1/ai-providers/:id */
+	function update( event, rc, prc ) {
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) || !body.count() ) body = rc;
+			event.renderData( type = "json", data = { data: profileService.update( prc.securityContext.tenantId, rc.id ?: "", isStruct( body ) ? body : {} ) } );
+		} catch ("AIProviderProfileNotFound" error) {
+			notFound( event );
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	/** DELETE /api/v1/ai-providers/:id */
+	function delete( event, rc, prc ) {
+		try {
+			profileService.delete( prc.securityContext.tenantId, rc.id ?: "" );
+			event.renderData( type = "json", statusCode = 204, data = {} );
+		} catch ("AIProviderProfileNotFound" error) {
+			notFound( event );
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	/** POST /api/v1/ai-providers/:id/activate */
+	function activate( event, rc, prc ) {
+		try {
+			event.renderData( type = "json", data = { data: profileService.activate( prc.securityContext.tenantId, rc.id ?: "" ) } );
+		} catch ("AIProviderProfileNotFound" error) {
+			notFound( event );
+		}
+	}
+
+	/** POST /api/v1/ai-providers/:id/smoke */
+	function smoke( event, rc, prc ) {
+		try {
+			event.renderData( type = "json", data = { data: profileService.smokeTest( prc.securityContext.tenantId, rc.id ?: "" ) } );
+		} catch ("AIProviderProfileNotFound" error) {
+			notFound( event );
+		} catch (any error) {
+			event.renderData(
+					type       = "json",
+					statusCode = 502,
+					data       = { error: { code: "provider_smoke_failed", message: error.message } }
+				);
+		}
+	}
+
+	private void function notFound( required event ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 404,
+				data       = { error: { code: "provider_not_found", message: "Provider profile not found" } }
+			);
+	}
+
+	private void function validationError( required event, required string message ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 422,
+				data       = { error: { code: "validation_failed", message: arguments.message } }
+			);
+	}
+}

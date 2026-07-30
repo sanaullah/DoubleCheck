@@ -7,9 +7,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
-				service.model = "scripted";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
 				service.maxRetries = 2;
 				var observations = [];
 				var result = service.run( "run-1", { messages: [ { role: "user", content: "evidence" } ] }, { onObservation: ( item ) => observations.append( item ) } );
@@ -31,9 +29,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
-				service.model = "scripted";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
 				service.maxRetries = 2;
 				service.retryBackoffMs = 0;
 				var observations = [];
@@ -53,8 +49,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
 				service.maxRetries = 1;
 				var result = service.run( "run-2", { messages: [] }, { budgets: { maxIterations: 2 } } );
 				expect( result.ok ).toBeFalse();
@@ -66,8 +61,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
 				service.cancelRun( "run-3" );
 				expect( () => service.run( "run-3", { messages: [] } ) ).toThrow( type = "RunCancelled" );
 				expect( chat.callCount() ).toBe( 0 );
@@ -78,8 +72,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
 				var result = service.run( "run-4", { messages: [] }, { budgets: { maxCostUsd: 0 } } );
 				expect( result.ok ).toBeFalse();
 				expect( result.error ).toBe( "cost-budget-exceeded" );
@@ -92,9 +85,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
-				service.model = "scripted";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
 				service.maxRetries = 1;
 				// Missing skill service → tool path unavailable → chat must still succeed.
 				service.skillService = javacast( "null", "" );
@@ -119,8 +110,7 @@ class extends="testbox.system.BaseSpec" {
 				var service = new app.models.services.ModernizationAgentGateway();
 				service.chatGateway = chat;
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
-				service.provider = "ollama";
-				service.apiKey = "";
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
 				service.skillService = javacast( "null", "" );
 				var result = service.run(
 					"run-6",
@@ -138,6 +128,67 @@ class extends="testbox.system.BaseSpec" {
 				service.skillService = new app.models.services.ModernizationSkillService();
 				var tools = service.buildSkillTools();
 				expect( tools.len() ).toBeGTE( 1 );
+			} );
+
+			it( "derives 30, 90, and 600 second provider timeouts from the remaining run budget", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				var resolved = new tests.resources.StubAIProviderResolver( {
+					provider: "openrouter",
+					apiKey  : "redacted-test-key",
+					baseURL : "https://openrouter.ai/api/v1",
+					timeout : 600
+				} ).resolve();
+				makePublic( service, "buildOptions" );
+
+				var thirty = service.buildOptions( resolved, 30000 );
+				var ninety = service.buildOptions( resolved, 90000 );
+				var sixHundred = service.buildOptions( resolved, 600000 );
+				var providerCapped = service.buildOptions( resolved, 900000 );
+
+				expect( thirty.timeout ).toBe( 30 );
+				expect( ninety.timeout ).toBe( 90 );
+				expect( sixHundred.timeout ).toBe( 600 );
+				expect( providerCapped.timeout ).toBe( 600 );
+				expect( sixHundred.provider ).toBe( "openrouter" );
+				expect( sixHundred.returnFormat ).toBe( "json" );
+				expect( sixHundred.baseURL ).toBe( "https://openrouter.ai/api/v1" );
+			} );
+
+			it( "passes messages, model params, JSON format, provider, timeout, and base URL to aiChat", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					response = { roadmapPhases: [] }
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider: "openrouter",
+					apiKey  : "redacted-test-key",
+					model   : "test/model",
+					baseURL : "https://openrouter.ai/api/v1",
+					timeout : 600
+				} );
+
+				var messages = [
+					{ role: "system", content: "Return JSON" },
+					{ role: "user", content: "Build a bounded roadmap" }
+				];
+				var result = service.run(
+					"run-options",
+					{ messages: messages, params: { temperature: 0, max_tokens: 2048 } },
+					{ maxDurationMs: 90000, budgets: { maxTokensPerTask: 2048 } }
+				);
+
+				expect( result.ok ).toBeTrue();
+				expect( chat.lastPrompt ).toBe( messages );
+				expect( chat.lastParams.model ).toBe( "test/model" );
+				expect( chat.lastParams.temperature ).toBe( 0 );
+				expect( chat.lastParams.max_tokens ).toBe( 2048 );
+				expect( chat.lastOptions.provider ).toBe( "openrouter" );
+				expect( chat.lastOptions.returnFormat ).toBe( "json" );
+				expect( chat.lastOptions.timeout ).toBeGTE( 89 );
+				expect( chat.lastOptions.timeout ).toBeLTE( 90 );
+				expect( chat.lastOptions.baseURL ).toBe( "https://openrouter.ai/api/v1" );
 			} );
 		} );
 	}

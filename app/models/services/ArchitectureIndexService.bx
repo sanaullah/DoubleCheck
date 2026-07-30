@@ -1,13 +1,17 @@
 /**
- * Builds and stores the content-addressed BoxLang symbol/dependency graph for a run.
+ * Builds and stores the content-addressed symbol/dependency graph for a run,
+ * dispatching each file to whichever parser (BoxLang, CFML) supports it.
  *
  * @see BoxLangParserService
+ * @see CfmlParserService
  * @see AnalysisGraphRepository
  */
 
 @singleton
 class {
-	property name="parserService" inject="BoxLangParserService";
+	property name="boxLangParserService" inject="BoxLangParserService";
+
+	property name="cfmlParserService" inject="CfmlParserService";
 
 	property name="graphRepository" inject="AnalysisGraphRepository";
 
@@ -18,9 +22,11 @@ class {
 	variables.impactMaxNodes = 2000;
 
 	struct function index( required string runId, required array files ) {
+		var parsers = [ boxLangParserService, cfmlParserService ];
 		var parsedFiles = [];
+		var usedParserVersions = [];
 		var metrics = {
-			parserVersion   : parserService.getVersion(),
+			parserVersion   : "",
 			filesAnalyzed   : 0,
 			parserExecutions: 0,
 			cacheHits       : 0,
@@ -31,16 +37,21 @@ class {
 		};
 
 		for ( var file in arguments.files ) {
-			if ( !parserService.supports( file ) ) {
+			var parser = resolveParser( parsers, file );
+			if ( isNull( parser ) ) {
 				continue;
 			}
+			var fileParserVersion = parser.getVersion();
+			if ( !usedParserVersions.contains( fileParserVersion ) ) {
+				usedParserVersions.append( fileParserVersion );
+			}
 			metrics.filesAnalyzed++;
-			var parsed = graphRepository.findCached( file.contentHash, metrics.parserVersion );
+			var parsed = graphRepository.findCached( file.contentHash, fileParserVersion );
 			if ( isNull( parsed ) ) {
-				parsed = parserService.parse( file );
+				parsed = parser.parse( file );
 				graphRepository.saveCached(
 						contentHash   = file.contentHash,
-						parserVersion = metrics.parserVersion,
+						parserVersion = fileParserVersion,
 						language      = file.language,
 						parsed        = parsed
 					);
@@ -52,10 +63,11 @@ class {
 					materialize(
 						file,
 						parsed,
-						metrics.parserVersion
+						fileParserVersion
 					)
 				);
 		}
+		metrics.parserVersion = usedParserVersions.sort( "text" ).toList( "+" );
 
 		var baseline = graphRepository.findBaselineGraph( arguments.runId, numericSetting( variables.impactMaxNodes, 2000 ) );
 		metrics.baselineRunId = baseline.runId;
@@ -176,6 +188,15 @@ class {
 			}
 		}
 		return impacts;
+	}
+
+	private any function resolveParser( required array parsers, required struct file ) {
+		for ( var parser in arguments.parsers ) {
+			if ( parser.supports( arguments.file ) ) {
+				return parser;
+			}
+		}
+		return javacast( "null", "" );
 	}
 
 	private void function resolveTargets( required array symbols, required array dependencies ) {

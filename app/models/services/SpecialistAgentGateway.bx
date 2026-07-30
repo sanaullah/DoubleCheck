@@ -10,19 +10,7 @@
 class {
 	property name="chatGateway" inject="AIChatGateway";
 
-	property name="provider" inject="coldbox:setting:aiProvider";
-
-	property name="apiKey" inject="coldbox:setting:aiApiKey";
-
-	property name="baseURL" inject="coldbox:setting:aiBaseURL";
-
-	property name="model" inject="coldbox:setting:aiModel";
-
-	property name="timeout" inject="coldbox:setting:aiTimeout";
-
-	property name="contextWindow" inject="coldbox:setting:aiContextWindow";
-
-	property name="localProvider" inject="coldbox:setting:aiLocalProvider";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
 
 	property name="maxRetries" inject="coldbox:setting:specialistMaxRetries";
 
@@ -44,7 +32,8 @@ class {
 	variables.circuits = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
 
 	boolean function isEnabled() {
-		return chatGateway.isEnabled( provider, apiKey );
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
 	}
 
 	any function run(
@@ -57,6 +46,10 @@ class {
 		},
 		string contextPack  = ""
 	) {
+		// Resolved once per call (not cached on this singleton) so concurrent
+		// specialist tasks on different pool threads never cross-contaminate
+		// each other's provider/key - see AIProviderResolverService.
+		var resolved = aiProviderResolver.resolve();
 		var params = {
 			temperature: 0,
 			max_tokens : providerMaxTokens( arguments.definition.maxTokens )
@@ -66,18 +59,18 @@ class {
 		if ( supportsNativeJsonObjectFormat() ) {
 			params.response_format = { type: "json_object" };
 		}
-		if ( len( trim( model ) ) ) {
-			params.model = model;
+		if ( len( trim( resolved.model ) ) ) {
+			params.model = resolved.model;
 		}
 		var options = {
-			provider    : provider,
-			apiKey      : apiKey,
-			timeout     : timeout,
+			provider    : resolved.provider,
+			apiKey      : resolved.apiKey,
+			timeout     : resolved.timeout,
 			returnFormat: "single",
 			threadId    : arguments.definition.taskId
 		};
-		if ( len( trim( baseURL ) ) ) {
-			options.baseURL = baseURL;
+		if ( len( trim( resolved.baseURL ) ) ) {
+			options.baseURL = resolved.baseURL;
 		}
 		assertAvailable();
 		var attempts = 0;
@@ -170,14 +163,15 @@ class {
 		}
 		normalized._execution = {
 			attempts: attempts,
-			provider: provider,
+			provider: resolved.provider,
 			streamed: true
 		};
 		return normalized;
 	}
 
+	/** Self-contained (no args) so external callers like SpecialistReviewService.ensureExecutor() are unaffected. */
 	string function getProviderKey() {
-		return lCase( trim( provider ) );
+		return lCase( trim( aiProviderResolver.resolve().provider ) );
 	}
 
 	struct function circuitStatus() {
@@ -224,6 +218,7 @@ class {
 	) {
 		var progressCallback = arguments.onProgress;
 		var counters = { llmRound: 0, llmStartedAt: {} };
+		var resolved = aiProviderResolver.resolve();
 		var agent = aiAgent(
 			name         = arguments.definition.name,
 			description  = arguments.definition.description,
@@ -242,8 +237,8 @@ class {
 								"provider-llm",
 								"LLM request",
 								extractLlmInput( ctx ),
-								params.model ?: model,
-								options.provider ?: provider,
+								params.model ?: resolved.model,
+								options.provider ?: resolved.provider,
 								{},
 								0
 							);
@@ -258,8 +253,8 @@ class {
 								"provider-llm-done",
 								"LLM response",
 								extractLlmOutput( ctx ),
-								params.model ?: model,
-								options.provider ?: provider,
+								params.model ?: resolved.model,
+								options.provider ?: resolved.provider,
 								extractUsage( ctx ),
 								durationMs
 							);
@@ -309,24 +304,24 @@ class {
 								maxTokens    : arguments.definition.maxTokens,
 								maxIterations: arguments.definition.maxIterations,
 								toolCount    : arguments.tools.len(),
-								provider     : arguments.options.provider ?: provider,
-								model        : arguments.params.model ?: model,
-								baseURL      : len( trim( baseURL ) ) ? baseURL : "(default)"
+								provider     : arguments.options.provider ?: resolved.provider,
+								model        : arguments.params.model ?: resolved.model,
+								baseURL      : len( trim( resolved.baseURL ) ) ? resolved.baseURL : "(default)"
 							}
 						),
 						{
 							role     : arguments.definition.role,
-							provider : arguments.options.provider ?: provider,
-							model    : arguments.params.model ?: model,
+							provider : arguments.options.provider ?: resolved.provider,
+							model    : arguments.params.model ?: resolved.model,
 							toolCount: arguments.tools.len(),
 							maxTokens: arguments.definition.maxTokens
 						},
 						{
 							observationType: "span",
-							model          : arguments.params.model ?: model,
+							model          : arguments.params.model ?: resolved.model,
 							modelParameters: {
-								provider     : arguments.options.provider ?: provider,
-								model        : arguments.params.model ?: model,
+								provider     : arguments.options.provider ?: resolved.provider,
+								model        : arguments.params.model ?: resolved.model,
 								maxTokens    : arguments.definition.maxTokens,
 								maxIterations: arguments.definition.maxIterations,
 								toolCount    : arguments.tools.len()
@@ -350,10 +345,10 @@ class {
 						},
 						{
 							observationType: "span",
-							model          : arguments.params.model ?: model,
+							model          : arguments.params.model ?: resolved.model,
 							modelParameters: {
-								provider  : arguments.options.provider ?: provider,
-								model     : arguments.params.model ?: model,
+								provider  : arguments.options.provider ?: resolved.provider,
+								model     : arguments.params.model ?: resolved.model,
 								characters: len( arguments.input )
 							}
 						}
@@ -382,10 +377,10 @@ class {
 							},
 							{
 								observationType: "span",
-								model          : arguments.params.model ?: model,
+								model          : arguments.params.model ?: resolved.model,
 								modelParameters: {
-									provider: arguments.options.provider ?: provider,
-									model   : arguments.params.model ?: model
+									provider: arguments.options.provider ?: resolved.provider,
+									model   : arguments.params.model ?: resolved.model
 								}
 							}
 						)
@@ -465,7 +460,7 @@ class {
 									{ io: "output" },
 									{
 										observationType: "span",
-										model          : arguments.params.model ?: model
+										model          : arguments.params.model ?: resolved.model
 									}
 								)
 							}
@@ -521,17 +516,18 @@ class {
 		boolean primaryPath = false
 	) {
 		assertNotCancelled( arguments.control );
+		var resolved = aiProviderResolver.resolve();
 		var systemPrompt = chatOnlyInstructions( arguments.definition );
 		var chatOptions = {
-			provider    : arguments.options.provider ?: provider,
-			apiKey      : arguments.options.apiKey ?: apiKey,
-			timeout     : arguments.options.timeout ?: timeout,
+			provider    : arguments.options.provider ?: resolved.provider,
+			apiKey      : arguments.options.apiKey ?: resolved.apiKey,
+			timeout     : arguments.options.timeout ?: resolved.timeout,
 			returnFormat: "single"
 		};
 		if ( arguments.options.keyExists( "baseURL" ) ) {
 			chatOptions.baseURL = arguments.options.baseURL;
-		} else if ( len( trim( baseURL ) ) ) {
-			chatOptions.baseURL = baseURL;
+		} else if ( len( trim( resolved.baseURL ) ) ) {
+			chatOptions.baseURL = resolved.baseURL;
 		}
 		var chatParams = duplicate( arguments.params );
 		structDelete( chatParams, "response_format" );
@@ -563,7 +559,7 @@ class {
 						summarizeMessages( messages ),
 						{
 							round   : 1,
-							model   : chatParams.model ?: model,
+							model   : chatParams.model ?: resolved.model,
 							provider: chatOptions.provider,
 							io      : "input",
 							mode    : arguments.primaryPath ? "chat-context" : "chat-fallback"
@@ -572,10 +568,10 @@ class {
 							observationType: "generation",
 							input          : summarizeMessages( messages ),
 							output         : "",
-							model          : chatParams.model ?: model,
+							model          : chatParams.model ?: resolved.model,
 							modelParameters: {
 								provider        : chatOptions.provider,
-								model           : chatParams.model ?: model,
+								model           : chatParams.model ?: resolved.model,
 								mode            : arguments.primaryPath ? "chat-context" : "chat-fallback",
 								contextChars    : len( arguments.contextPack ),
 								contextTruncated: fitted.truncated,
@@ -614,7 +610,7 @@ class {
 							safeText( chatResponse ),
 							{
 								round     : 1,
-								model     : chatParams.model ?: model,
+								model     : chatParams.model ?: resolved.model,
 								provider  : chatOptions.provider,
 								io        : "output",
 								mode      : arguments.primaryPath ? "chat-context" : "chat-fallback",
@@ -624,11 +620,11 @@ class {
 								observationType: "generation",
 								input          : "",
 								output         : safeText( chatResponse ),
-								model          : chatParams.model ?: model,
+								model          : chatParams.model ?: resolved.model,
 								durationMs     : chatDurationMs,
 								modelParameters: {
 									provider  : chatOptions.provider,
-									model     : chatParams.model ?: model,
+									model     : chatParams.model ?: resolved.model,
 									mode      : arguments.primaryPath ? "chat-context" : "chat-fallback",
 									durationMs: chatDurationMs,
 									maxTokens : chatParams.max_tokens ?: 0
@@ -1440,12 +1436,13 @@ class {
 	}
 
 	private boolean function supportsNativeJsonObjectFormat() {
-		var name = lCase( trim( provider ) );
+		var name = lCase( trim( aiProviderResolver.resolve().provider ) );
 		return listFindNoCase( "openai,azure-openai", name ) > 0;
 	}
 
 	private boolean function shouldPreferChatWithContext() {
-		var name = lCase( trim( provider ) );
+		var resolved = aiProviderResolver.resolve();
+		var name = lCase( trim( resolved.provider ) );
 		if (
 			listFindNoCase(
 				"openai-compatible,nanogpt,nano-gpt,openrouter,together,groq",
@@ -1454,7 +1451,7 @@ class {
 		) {
 			return true;
 		}
-		var modelName = lCase( trim( model ) );
+		var modelName = lCase( trim( resolved.model ) );
 		return findNoCase( "kimi", modelName ) > 0 || findNoCase( "moonshot", modelName ) > 0;
 	}
 
@@ -1468,7 +1465,7 @@ class {
 	}
 
 	private boolean function isReasoningHeavyModel() {
-		var modelName = lCase( trim( model ) );
+		var modelName = lCase( trim( aiProviderResolver.resolve().model ) );
 		return findNoCase( "kimi", modelName ) > 0 || findNoCase( "moonshot", modelName ) > 0 ||
 					reFindNoCase( "(^|/)o[0-9]", modelName ) > 0 ||
 				findNoCase( "reasoning", modelName ) > 0 ||
@@ -1570,15 +1567,12 @@ class {
 	}
 
 	private numeric function numericContextWindow() {
-		if ( isNumeric( contextWindow ) && val( contextWindow ) >= 1024 ) {
-			return int( val( contextWindow ) );
+		var resolved = aiProviderResolver.resolve();
+		if ( isNumeric( resolved.contextWindow ) && val( resolved.contextWindow ) >= 1024 ) {
+			return int( val( resolved.contextWindow ) );
 		}
 		// Local OpenAI-compatible servers commonly load 8k contexts.
-		if ( isTrue( localProvider ?: false ) ) {
-			return 8192;
-		}
-		var host = lCase( trim( toString( baseURL ?: "" ) ) );
-		if ( reFindNoCase( "localhost|127\.0\.0\.1", host ) > 0 ) {
+		if ( resolved.isLocal ) {
 			return 8192;
 		}
 		return 128000;
@@ -1781,11 +1775,12 @@ class {
 		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
 			return;
 		}
+		var resolved = aiProviderResolver.resolve();
 		var detail = {
 			type      : arguments.error.type ?: "",
 			message   : redactSecrets( arguments.error.message ?: "" ),
-			provider  : provider,
-			model     : model,
+			provider  : resolved.provider,
+			model     : resolved.model,
 			attempt   : arguments.attempt,
 			stackTrace: redactSecrets( arguments.error.stackTrace ?: "" )
 		};

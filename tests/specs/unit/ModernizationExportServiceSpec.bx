@@ -11,16 +11,25 @@ class extends="testbox.system.BaseSpec" {
 				run = { id: "modernize1", projectPath: "C:/legacy-shop", mode: "full", runKind: "modernize", status: "succeeded" };
 				result = {
 					schemaVersion: "modernization-plan-v1",
+					planFingerprint: repeatString( "a", 64 ),
 					planState: "needs-review",
 					summary: "Plan with an evidence-backed route transition.",
 					coverage: {
 						schema: { coverage: "inference-limited" },
 						banners: [ "Attach a schema pack for stronger proposals." ],
+						status: "incomplete",
+						llm: {
+							status: "incomplete",
+							completed: 1,
+							failed: 1,
+							omitted: 0,
+							gaps: [ { kind: "application-shard", reason: "provider-failed", paths: [ "legacy/admin.cfm" ] } ]
+						},
 						road: { onRoad: 1, notYetSliced: 4, sourceStackNote: "" }
 					},
-					inventory: { units: [ { id: "legacy-1", path: "order.cfm", kind: "template" } ] },
-					target: { units: [ { id: "target-1", path: "app/handlers/Orders.bx", targetPath: "app/handlers/Orders.bx", validationStatus: "warning" } ] },
-					routeContracts: [ { id: "route-1", method: "GET", legacyPath: "/order.cfm", targetRoute: "/orders", rollbackNote: "Flip route back to order.cfm", validationStatus: "valid" } ],
+					inventory: { units: [ { id: "legacy-1", path: "order.cfm", kind: "template", provenanceClass: "source-observed" } ] },
+					target: { units: [ { id: "target-1", path: "app/handlers/Orders.bx", targetPath: "app/handlers/Orders.bx", validationStatus: "warning", provenanceClass: "provider-suggested" } ] },
+					routeContracts: [ { id: "route-1", method: "GET", legacyPath: "/order.cfm", targetRoute: "/orders", rollbackNote: "Flip route back to order.cfm", validationStatus: "valid", provenanceClass: "provider-suggested" } ],
 					dbFindings: [],
 					dbTransitions: [],
 					samples: [ { targetPath: "app/handlers/Orders.bx", language: "boxlang", code: "class { function index(){} }" } ],
@@ -35,7 +44,8 @@ class extends="testbox.system.BaseSpec" {
 							routeIds: [ "route-1" ],
 							exitCriteria: [ "Route returns matching payload", "Legacy file still present" ],
 							rollback: "Point /orders back to order.cfm",
-							implementerPrompt: "Implement Orders.bx behind coexist routing."
+							implementerPrompt: "Implement Orders.bx behind coexist routing.",
+							provenanceClass: "provider-suggested"
 						}
 					],
 					validation: { status: "warning", blocking: 0, warnings: 1 },
@@ -50,6 +60,8 @@ class extends="testbox.system.BaseSpec" {
 				expect( report.content ).toInclude( "DoubleCheck Modernization Plan" );
 				expect( report.content ).toInclude( "order.cfm" );
 				expect( report.content ).toInclude( "Attach a schema pack" );
+				expect( report.content ).toInclude( "provider-failed" );
+				expect( report.content ).toInclude( "provider-suggested" );
 			} );
 
 			it( "orders Markdown as strangler coverage then Solution road before legacy catalog", () => {
@@ -79,8 +91,15 @@ class extends="testbox.system.BaseSpec" {
 				expect( payload.routeContracts ).toHaveLength( 1 );
 			} );
 
-			it( "rejects SARIF because Modernize is not a finding export", () => {
-				expect( () => service.export( run, result, "sarif" ) ).toThrow( "ValidationException" );
+			it( "exports SARIF validation and coverage gates without recasting proposals as findings", () => {
+				var report = service.export( run, result, "sarif" );
+				var payload = jsonDeserialize( report.content );
+				expect( report.contentType ).toBe( "application/sarif+json" );
+				expect( payload.version ).toBe( "2.1.0" );
+				expect( payload.runs[ 1 ].invocations[ 1 ].properties.planFingerprint ).toBe( repeatString( "a", 64 ) );
+				expect( payload.runs[ 1 ].invocations[ 1 ].properties.coverageStatus ).toBe( "incomplete" );
+				expect( payload.runs[ 1 ].invocations[ 1 ].executionSuccessful ).toBeFalse();
+				expect( payload.runs[ 1 ].results ).notToBeEmpty();
 			} );
 		} );
 	}

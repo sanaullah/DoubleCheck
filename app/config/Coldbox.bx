@@ -7,7 +7,8 @@ class {
 	function configure() {
 		var openAIBaseURL = getSystemSetting( "OPENAI_API_BASE", "" );
 		var configuredAiProvider = lCase( trim( getSystemSetting( "AI_PROVIDER", "" ) ) );
-		var isLocalAi = [ "ollama", "docker", "lmstudio", "llamacpp" ].contains( configuredAiProvider ) || reFindNoCase( "localhost|127\.0\.0\.1", openAIBaseURL ) > 0;
+		var effectiveAiProvider = resolveAiProvider( configuredAiProvider, openAIBaseURL );
+		var isLocalAi = [ "ollama", "docker", "lmstudio", "llamacpp" ].contains( effectiveAiProvider ) || reFindNoCase( "localhost|127[.]0[.]0[.]1", openAIBaseURL ) > 0;
 		// Local LM Studio / Ollama need much longer per-task walls than cloud APIs.
 		var defaultRunDurationMs = isLocalAi ? 900000 : 120000;
 		var maxRunDurationMs = isLocalAi ? 1800000 : 600000;
@@ -150,10 +151,7 @@ class {
 			runDefaultCostUsd : getSystemSetting( "DOUBLECHECK_RUN_DEFAULT_COST_USD", 5 ),
 			runMaxCostUsd     : getSystemSetting( "DOUBLECHECK_RUN_MAX_COST_USD", 50 ),
 			defaultProjectPath: applicationRoot.getCanonicalPath(),
-			aiProvider        : getSystemSetting(
-				"AI_PROVIDER",
-				len( openAIBaseURL ) ? "openai-compatible" : "openai"
-			),
+			aiProvider        : effectiveAiProvider,
 			aiBaseURL            : openAIBaseURL,
 			aiApiKey             : getSystemSetting( "OPENAI_API_KEY", getSystemSetting( "AI_API_KEY", "" ) ),
 			aiModel              : getSystemSetting( "DEFAULT_MODEL", getSystemSetting( "AI_MODEL", "" ) ),
@@ -172,9 +170,9 @@ class {
 			modernizationSchemaMaxStatements: getSystemSetting( "DOUBLECHECK_MODERNIZE_SCHEMA_MAX_STATEMENTS", 5000 ),
 			modernizeEvidenceMaxFiles: getSystemSetting( "DOUBLECHECK_MODERNIZE_EVIDENCE_MAX_FILES", 100 ),
 			modernizeEvidenceMaxBytes: getSystemSetting( "DOUBLECHECK_MODERNIZE_EVIDENCE_MAX_BYTES", 1048576 ),
-			modernizeMaxContextPartitions: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_PARTITIONS", 40 ),
-			modernizeMaxContextCharacters: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_CHARACTERS", 60000 ),
-			modernizeMaxContextLinesPerFile: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_LINES_PER_FILE", 120 ),
+			modernizeMaxContextPartitions: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_PARTITIONS", 100 ),
+			modernizeMaxContextCharacters: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_CHARACTERS", 240000 ),
+			modernizeMaxContextLinesPerFile: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_LINES_PER_FILE", 160 ),
 			modernizeMaxContextCharactersPerPartition: getSystemSetting( "DOUBLECHECK_MODERNIZE_MAX_CONTEXT_CHARACTERS_PER_PARTITION", 18000 )
 		};
 
@@ -385,6 +383,23 @@ class {
 			modelsLocation  : "models",
 			eventAction     : "index"
 		};
+	}
+
+	private string function resolveAiProvider( required string configuredProvider, required string baseURL ) {
+		var configured = lCase( trim( arguments.configuredProvider ) );
+		var endpoint = trim( arguments.baseURL );
+		var knownOpenRouterEndpoint = reFindNoCase( "^https?://(?:www[.])?openrouter[.]ai(?:/|$)", endpoint ) > 0;
+		var knownOpenAIEndpoint = reFindNoCase( "^https?://api[.]openai[.]com(?:/|$)", endpoint ) > 0;
+		if ( !len( configured ) ) {
+			return knownOpenRouterEndpoint
+				? "openrouter"
+				: ( knownOpenAIEndpoint || !len( endpoint ) ? "openai" : "openai-compatible" );
+		}
+		// Migrate legacy generic settings for known first-class bx-ai endpoints
+		// without rewriting an operator's existing .env.
+		if ( configured == "openai-compatible" && knownOpenRouterEndpoint ) return "openrouter";
+		if ( configured == "openai-compatible" && knownOpenAIEndpoint ) return "openai";
+		return configured;
 	}
 
 	/**

@@ -1,6 +1,32 @@
 class extends="testbox.system.BaseSpec" {
 	function run() {
-			describe( "Modernization pipeline lifecycle", () => {
+		describe( "Modernization pipeline lifecycle", () => {
+			it( "does not reuse checkpoints from an older pipeline contract", () => {
+				var service = new app.models.services.ModernizationRunService();
+				makePublic( service, "reusableCheckpoint" );
+				var oldCheckpoint = {
+					stage: "inventory",
+					status: "succeeded",
+					payload: {
+						provenance: {
+							inputFingerprint: "input-fp",
+							sourceFingerprint: "source-fp"
+						}
+					}
+				};
+				var currentCheckpoint = duplicate( oldCheckpoint );
+				currentCheckpoint.payload.provenance.pipelineContractVersion = "modernization-pipeline-v2";
+
+				var oldResult = service.reusableCheckpoint( [ oldCheckpoint ], "inventory", "input-fp", "source-fp" );
+				var currentResult = service.reusableCheckpoint( [ currentCheckpoint ], "inventory", "input-fp", "source-fp" );
+				var changedSourceResult = service.reusableCheckpoint( [ currentCheckpoint ], "inventory", "input-fp", "changed-source-fp" );
+				var changedInputResult = service.reusableCheckpoint( [ currentCheckpoint ], "inventory", "changed-input-fp", "source-fp" );
+				expect( isNull( oldResult ) ).toBeTrue();
+				expect( isNull( currentResult ) ).toBeFalse();
+				expect( isNull( changedSourceResult ) ).toBeTrue();
+				expect( isNull( changedInputResult ) ).toBeTrue();
+			} );
+
 				it( "fails safely when the shared scan contains no CFML scope", () => {
 				var repository = new tests.resources.ScriptedModernizationRepository();
 				var inventory = new tests.resources.ScriptedModernizationInventory( { noModernizationScope: true, type: "NoModernizationScope", units: [], dependencies: [], routeEvidence: [], unresolved: [] } );
@@ -28,6 +54,88 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.status ).toBe( "cancelled" );
 				expect( result.planState ).toBe( "needs-review" );
 				expect( repository.checkpointWrites ).toBe( 0 );
+			} );
+
+			it( "persists an accepted partial plan when cancellation arrives after proposal", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				var control = { cancelled: false };
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				service.inventoryService = {
+					build: ( scan ) => {
+						return {
+							noModernizationScope: false,
+							fingerprint: "inventory-fp",
+							files: [ { filePath: "legacy/index.cfm" } ],
+							units: [ { id: "legacy-index", filePath: "legacy/index.cfm" } ],
+							dependencies: [],
+							routeEvidence: [],
+							unresolved: []
+						};
+					}
+				};
+				service.schemaPackService = { discover: ( path ) => { return { coverage: "absent", fingerprint: "schema-fp" }; } };
+				service.evidenceDiscoveryService = { discover: ( path, options ) => { return { routeEvidence: [] }; } };
+				service.signalService = { build: ( inventory, schema, extra ) => { return { signals: [] }; } };
+				service.contextPackService = {
+					build: ( scan, inventory, signals, options ) => {
+						return { fingerprint: "context-fp", contexts: [], summary: { files: 1, omittedPartitions: 0 }, truncated: false };
+					}
+				};
+				service.coverageService = {
+					assess: ( scan, inventory, schema, context, llm ) => {
+						return { complete: true, status: "complete", repository: { truncation: false, modernizationLanguagesComplete: true }, llm: { complete: true, status: "complete", gaps: [] } };
+					}
+				};
+				service.proposalService = {
+					propose: ( runId, input, evidence, options ) => {
+						control.cancelled = true;
+						return {
+							ok: true,
+							partial: false,
+							errors: [],
+							plan: {
+								version: "modernization-plan-v1",
+								metadata: { provenanceContract: { version: "modernization-provenance-v1" } },
+								coverage: evidence.coverage,
+								assumptions: [],
+								inventory: evidence.inventory,
+								schemaEvidence: evidence.schemaEvidence,
+								signals: [],
+								target: { units: [ { id: "accepted-target", itemFingerprint: "accepted-fp", targetPath: "app/handlers/Index.bx", provenanceClass: "provider-suggested" } ], contexts: [], extracts: [] },
+								unitLinks: [],
+								dbFindings: [],
+								dbTransitions: [],
+								routeContracts: [],
+								roadmapPhases: [],
+								samples: [],
+								validation: {},
+								decisions: []
+							}
+						};
+					},
+					cancelRun: ( runId ) => {}
+				};
+				service.validationService = { validate: ( plan, context ) => { return { ok: true, blocking: 0, warnings: 0, messages: [] }; } };
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				var run = new tests.resources.ScriptedModernizationRun(
+					"run-cancel-after-proposal",
+					"modernize",
+					getTempDirectory(),
+					{ target: { runtime: "boxlang", layoutProfile: "modern" } },
+					{ fingerprint: "input-fp" },
+					{ maxDurationMs: 900000 }
+				);
+				var result = service.execute(
+					run,
+					{ files: [ { filePath: "legacy/index.cfm", content: "index" } ], repositoryRevision: "rev-1", discoveryTruncated: false },
+					{ checkCancellation: () => control.cancelled }
+				);
+				expect( result.status ).toBe( "cancelled", jsonSerialize( result ) );
+				expect( result.target.units.map( ( item ) => item.id ) ).toInclude( "accepted-target" );
+				expect( result.coverage.complete ).toBeFalse();
+				expect( result.coverage.llm.gaps.some( ( item ) => ( item.reason ?: "" ) == "cancelled" ) ).toBeTrue();
+				expect( repository.getPlan( run.getId() ) ).notToBeNull();
 			} );
 		} );
 	}

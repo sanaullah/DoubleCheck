@@ -1,0 +1,139 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"CFML symbol parsing",
+			() => {
+				it(
+					"extracts symbols and dependencies from a tag-based component",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"<cfcomponent name=""UserGateway"" extends=""app.models.BaseGateway"" implements=""app.models.IGateway"">",
+							"<cfproperty name=""datasource"" type=""string"">",
+							"<cffunction name=""findUser"" access=""public"" returntype=""query"">",
+							"<cfargument name=""id"" type=""numeric"" required=""true"">",
+							"<cfset var result = queryExecute( ""SELECT * FROM users"" )>",
+							"<cfinclude template=""partials/audit.cfm"">",
+							"<cfreturn result>",
+							"</cffunction>",
+							"</cfcomponent>"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "app/models/UserGateway.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var symbolKinds = parsed.symbols.map( ( item ) => item.kind );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+						var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+						expect( parsed.parserVersion ).toBe( parser.getVersion() );
+						expect( symbolNames ).toInclude( "UserGateway" );
+						expect( symbolKinds ).toInclude( "class" );
+						expect( symbolNames ).toInclude( "findUser" );
+						expect( symbolKinds ).toInclude( "function" );
+						expect( symbolNames ).toInclude( "datasource" );
+						expect( symbolKinds ).toInclude( "property" );
+						expect( dependencyTargets ).toInclude( "app.models.BaseGateway" );
+						expect( dependencyKinds ).toInclude( "extends" );
+						expect( dependencyTargets ).toInclude( "app.models.IGateway" );
+						expect( dependencyKinds ).toInclude( "implements" );
+						expect( dependencyTargets ).toInclude( "partials/audit.cfm" );
+						expect( dependencyKinds ).toInclude( "includes" );
+					}
+				);
+
+				it(
+					"extracts symbols from a script-based component",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"component extends=""app.models.BaseModel"" {",
+							"    property name=""total"" type=""numeric"";",
+							"    function calculateTotal( required numeric quantity ) {",
+							"        var gateway = new app.models.PricingGateway();",
+							"        return gateway.priceFor( arguments.quantity );",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "app/models/Cart.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+						var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+						expect( symbolNames ).toInclude( "Cart" );
+						expect( symbolNames ).toInclude( "calculateTotal" );
+						expect( dependencyTargets ).toInclude( "app.models.BaseModel" );
+						expect( dependencyKinds ).toInclude( "extends" );
+						expect( dependencyTargets ).toInclude( "app.models.PricingGateway" );
+						expect( dependencyKinds ).toInclude( "constructs" );
+					}
+				);
+
+				it(
+					"tags Application.cfc lifecycle methods distinctly from regular functions",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"component {",
+							"    function onApplicationStart() {",
+							"        return true;",
+							"    }",
+							"    function onError( exception, eventName ) {",
+							"        writeLog( type=""error"", text=exception.message );",
+							"    }",
+							"    function helperMethod() {",
+							"        return true;",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "Application.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var lifecycleNames = parsed.symbols
+							.filter( ( item ) => item.kind == "lifecycle-hook" )
+							.map( ( item ) => item.name );
+
+						expect( lifecycleNames ).toInclude( "onApplicationStart" );
+						expect( lifecycleNames ).toInclude( "onError" );
+						expect( lifecycleNames ).notToInclude( "helperMethod" );
+					}
+				);
+
+				it(
+					"only supports CFML files",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						expect( parser.supports( { language: "CFML" } ) ).toBeTrue();
+						expect( parser.supports( { language: "BoxLang" } ) ).toBeFalse();
+						expect( parser.supports( { language: "JavaScript" } ) ).toBeFalse();
+					}
+				);
+			}
+		);
+	}
+
+}

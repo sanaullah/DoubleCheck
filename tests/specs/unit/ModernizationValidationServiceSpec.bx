@@ -12,11 +12,30 @@ class extends="testbox.system.BaseSpec" {
 			it( "accepts a complete route contract with stable identity", () => {
 				var service = new app.models.services.ModernizationValidationService();
 				var report = service.validate( {
-					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: {}, coverage: {}, assumptions: [], signals: [], inventory: {}, schemaEvidence: {}, target: { units: [] },
-					unitLinks: [], dbFindings: [], dbTransitions: [], roadmapPhases: [ { id: "phase-1", itemFingerprint: "fp" } ], samples: [], validation: {}, decisions: [],
-					routeContracts: [ { id: "route-1", itemFingerprint: "fp", method: "GET", path: "/health", request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {}, evidence: [ { evidenceId: "route-e1" } ] } ]
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" }, coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-health", filePath: "legacy/health.cfm" } ] },
+					schemaEvidence: {},
+					target: { units: [ {
+						id: "target-health", itemFingerprint: "target-fp", targetPath: "app/handlers/Health.bx",
+						sourcePath: "legacy/health.cfm", legacyUnitIds: [ "legacy-health" ],
+						evidenceRefs: [ { filePath: "legacy/health.cfm" } ]
+					} ] },
+					unitLinks: [ {
+						id: "link-health", itemFingerprint: "link-fp", legacyUnitId: "legacy-health",
+						targetUnitId: "target-health", sourcePath: "legacy/health.cfm",
+						evidenceRefs: [ { filePath: "legacy/health.cfm" } ]
+					} ],
+					dbFindings: [], dbTransitions: [],
+					roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp", unitIds: [ "target-health" ], routeIds: [ "route-1" ] } ],
+					samples: [], validation: {}, decisions: [],
+					routeContracts: [ {
+						id: "route-1", itemFingerprint: "route-fp", method: "GET", path: "/health",
+						targetUnitId: "target-health", unitLinkId: "link-health",
+						request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {},
+						evidence: [ { filePath: "legacy/health.cfm" } ]
+					} ]
 				} );
-					expect( report.ok ).toBeTrue();
+				expect( report.ok ).toBeTrue( jsonSerialize( report.messages ) );
 				expect( report.blocking ).toBe( 0 );
 			} );
 
@@ -30,6 +49,28 @@ class extends="testbox.system.BaseSpec" {
 				expect( report.ok ).toBeFalse();
 				expect( report.blocking ).toBeGT( 2 );
 				expect( report.levels.dialect ).toBe( "dialect-checked" );
+			} );
+
+			it( "accepts a cfmigrations timestamp and inspects sampleMigration safety", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: {}, coverage: {}, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [ {
+						id: "finding-1", itemFingerprint: "finding-fp", evidenceRefs: [ "schema.sql##L1" ]
+					} ],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp", dbFindingId: "finding-1",
+						operation: "expand", order: 1,
+						migrationPath: "resources/database/migrations/2025_03_20_120000_change.bx",
+						evidenceRefs: [ "schema.sql##L1" ],
+						sampleMigration: "component { function up( schema, query ) { query.execute( ""ALTER TABLE test ADD x INT"" ); } function down( schema, query ) {} }"
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.messages.some( ( item ) => findNoCase( "cfmigrations timestamp", item.message ?: "" ) ) ).toBeFalse();
+				expect( report.messages.some( ( item ) => findNoCase( "must not execute query text", item.message ?: "" ) ) ).toBeTrue();
 			} );
 
 			it( "keeps unresolved and truncated coverage visible as warnings", () => {
@@ -101,6 +142,54 @@ class extends="testbox.system.BaseSpec" {
 				};
 				var report = service.validate( plan, { inventory: plan.inventory } );
 				expect( report.messages.some( ( m ) => ( m.category ?: "" ) == "sample-contract" ) ).toBeTrue();
+			} );
+
+			it( "blocks named schema claims when DDL was not observed", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1",
+					metadata: {},
+					coverage: {},
+					inventory: {},
+					schemaEvidence: { coverage: "absent" },
+					target: { units: [] },
+					unitLinks: [],
+					dbFindings: [ {
+						id: "db-invented",
+						itemFingerprint: "db-invented-fp",
+						category: "index",
+						objectRef: "orders.customer_id",
+						evidenceRefs: [ { filePath: "legacy/query.cfm" } ]
+					} ],
+					dbTransitions: [],
+					routeContracts: [],
+					roadmapPhases: [],
+					samples: []
+				} );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "dbFindings" && findNoCase( "DDL was not observed", item.message ?: "" )
+				) ).toBeTrue();
+			} );
+
+			it( "requires provenance classes when the plan declares the provenance contract", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1",
+					metadata: { provenanceContract: { version: "modernization-provenance-v1" } },
+					coverage: {},
+					inventory: {},
+					schemaEvidence: {},
+					target: { units: [ { id: "tu-1", itemFingerprint: "tu-fp", targetPath: "app/handlers/Test.bx", newProposal: true, proposalReason: "test" } ] },
+					unitLinks: [],
+					dbFindings: [],
+					dbTransitions: [],
+					routeContracts: [],
+					roadmapPhases: [],
+					samples: []
+				} );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "target.units" && findNoCase( "provenanceClass", item.message ?: "" )
+				) ).toBeTrue();
 			} );
 		} );
 	}

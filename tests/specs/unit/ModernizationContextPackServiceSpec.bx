@@ -21,6 +21,75 @@ class extends="testbox.system.BaseSpec" {
             var second = new app.models.services.ModernizationContextPackService().build( inventory, {}, {}, {}, [ file ], { maxCharacters: 5000 } );
             expect( first.fingerprint ).notToBe( second.fingerprint );
         } );
+
+        it( "builds a partition from scanner records that only carry content", () => {
+            var file = {
+                filePath: "legacy/index.cfm",
+                language: "ColdFusion",
+                content: "<cfoutput>Observed source</cfoutput>",
+                contentHash: "content-only"
+            };
+            var result = new app.models.services.ModernizationContextPackService().build(
+                {
+                    files: [ file ],
+                    units: [ { filePath: file.filePath, layer: "page", startLine: 1, endLine: 1 } ]
+                },
+                {},
+                {},
+                {},
+                [ file ],
+                { maxCharacters: 5000 }
+            );
+            expect( result.partitions ).toHaveLength( 1 );
+            expect( result.partitions[ 1 ].text ).toInclude( "Observed source" );
+        } );
+
+        it( "shares a tight character budget across every eligible source path", () => {
+            var files = [];
+            var units = [];
+            for ( var index = 1; index <= 4; index++ ) {
+                var path = "legacy/file#index#.cfm";
+                var file = {
+                    filePath: path,
+                    content: "line one for #path#\nline two for #path#\nline three for #path#",
+                    lines: [ "line one for #path#", "line two for #path#", "line three for #path#" ],
+                    contentHash: "hash-#index#"
+                };
+                files.append( file );
+                units.append( { filePath: path, layer: "page", startLine: 1, endLine: 3 } );
+            }
+            var result = new app.models.services.ModernizationContextPackService().build(
+                { files: files, units: units },
+                {},
+                {},
+                {},
+                files,
+                { maxCharacters: 700, maxPartitions: 10, maxCharactersPerPartition: 500 }
+            );
+            expect( result.partitions ).toHaveLength( 4 );
+            expect( result.partitions[ 4 ].text ).toInclude( "legacy/file4.cfm" );
+            expect( result.summary.omittedPartitions ).toBe( 0 );
+            expect( result.summary.omittedPaths ).toBeEmpty();
+        } );
+
+        it( "names every source path omitted by a partition cap", () => {
+            var files = [
+                { filePath: "a.cfm", content: "a", contentHash: "a" },
+                { filePath: "b.cfm", content: "b", contentHash: "b" },
+                { filePath: "c.cfm", content: "c", contentHash: "c" }
+            ];
+            var result = new app.models.services.ModernizationContextPackService().build(
+                { files: files, units: [] },
+                {},
+                {},
+                {},
+                files,
+                { maxPartitions: 2, maxCharacters: 5000 }
+            );
+            expect( result.summary.omittedPartitions ).toBe( 1 );
+            expect( result.summary.omittedPaths ).toBe( [ "c.cfm" ] );
+            expect( result.truncated ).toBeTrue();
+        } );
         } );
     }
 }

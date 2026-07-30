@@ -16,26 +16,16 @@ class {
 
 	property name="log" inject="logbox:logger:{this}";
 
-	property name="provider" inject="coldbox:setting:aiProvider";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
 
-	property name="baseURL" inject="coldbox:setting:aiBaseURL";
-
-	property name="apiKey" inject="coldbox:setting:aiApiKey";
-
-	property name="model" inject="coldbox:setting:aiModel";
-
-	property name="timeout" inject="coldbox:setting:aiTimeout";
-
-	property name="maxPromptCharacters" inject="coldbox:setting:aiMaxPromptCharacters";
-
-	property name="contextWindow" inject="coldbox:setting:aiContextWindow";
-
-	boolean function isEnabled() {
-		return chatGateway.isEnabled( provider, apiKey );
+	boolean function isEnabled( string profileId = "" ) {
+		var resolved = aiProviderResolver.resolve( arguments.profileId );
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
 	}
 
 	struct function review( required array files ) {
-		if ( !isEnabled() || !arguments.files.len() ) {
+		var resolved = aiProviderResolver.resolve();
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) || !arguments.files.len() ) {
 			return {
 				enabled       : false,
 				findings      : [],
@@ -45,12 +35,12 @@ class {
 				charactersSent: 0
 			};
 		}
-		var payload = buildPayload( arguments.files );
+		var payload = buildPayload( resolved, arguments.files );
 		try {
 			var response = chatGateway.chat(
 					payload.messages,
-					buildParams(),
-					buildOptions( "json" )
+					buildParams( resolved ),
+					buildOptions( resolved, "json" )
 				);
 			return {
 				enabled       : true,
@@ -67,8 +57,8 @@ class {
 						{
 							type      : error.type ?: "",
 							message   : secretRedactionService.redactText( error.message ?: "" ),
-							provider  : provider,
-							model     : model,
+							provider  : resolved.provider,
+							model     : resolved.model,
 							fileCount : payload.filesReviewed,
 							stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
 						}
@@ -85,38 +75,71 @@ class {
 		}
 	}
 
-	struct function smokeTest() {
-		if ( !isEnabled() ) {
+	/** profileId lets a Settings-panel "test connection" action target a saved-but-not-active profile. */
+	struct function smokeTest( string profileId = "" ) {
+		var resolved = aiProviderResolver.resolve( arguments.profileId );
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ) {
 			throw(
 				type    = "AIConfigurationException",
 				message = "OPENAI_API_KEY is not configured"
 			);
 		}
 		var startedAt = getTickCount();
-		var marker = "OK";
+		var prompt = [
+			{
+				role   : "system",
+				content: "Return only one JSON object with exactly two string fields: marker and responseFormat."
+			},
+			{
+				role   : "user",
+				content: 'Return {"marker":"OK","responseFormat":"json"}.'
+			}
+		];
 		var response = chatGateway.chat(
-				"Reply with exactly #marker# and no other text.",
+				prompt,
 				{
-					model      : model,
+					model      : resolved.model,
 					temperature: 0,
-					max_tokens : 128
+					max_tokens : 64
 				},
-				buildOptions( "single" )
+				buildOptions( resolved, "json" )
 			);
+		if ( !isStruct( response ) ) {
+			throw(
+				type    = "AIProviderResponseException",
+				message = "Provider smoke response was not a JSON object"
+			);
+		}
+		var marker = trim( toString( response.marker ?: "" ) );
+		var responseFormat = lCase( trim( toString( response.responseFormat ?: "" ) ) );
+		var promptCharacters = 0;
+		for ( var message in prompt ) promptCharacters += len( message.content ?: "" );
+		var responseCharacters = len( jsonSerialize( response ) );
+		var promptTokens = max( 1, int( promptCharacters / 4 ) );
+		var completionTokens = max( 1, int( responseCharacters / 4 ) );
 		return {
-			success   : findNoCase( marker, response ) > 0,
-			provider  : provider,
-			model     : model,
-			baseHost  : len( baseURL ) ? createObject( "java", "java.net.URI" ).init( baseURL ).getHost() : "",
-			durationMs: getTickCount() - startedAt,
-			response  : trim( response )
+			success         : marker == "OK" && responseFormat == "json",
+			provider        : resolved.provider,
+			model           : resolved.model,
+			baseHost        : len( resolved.baseURL ) ? createObject( "java", "java.net.URI" ).init( resolved.baseURL ).getHost() : "",
+			durationMs      : getTickCount() - startedAt,
+			responseFormat  : "json",
+			response        : response,
+			outputCharacters: responseCharacters,
+			usage           : {
+				promptTokens    : promptTokens,
+				completionTokens: completionTokens,
+				totalTokens     : promptTokens + completionTokens,
+				source          : "estimated-from-characters"
+			},
+			errorClass      : ""
 		};
 	}
 
-	private struct function buildPayload( required array files ) {
+	private struct function buildPayload( required struct resolved, required array files ) {
 		var source = "";
 		var filesReviewed = 0;
-		var promptCap = promptCharacterBudget();
+		var promptCap = promptCharacterBudget( arguments.resolved );
 		for ( var file in arguments.files ) {
 			var block = "FILE: " & file.filePath & " (" & file.language & ")" & char( 10 );
 			for ( var lineNumber = 1; lineNumber <= file.lines.len(); lineNumber++ ) {
@@ -176,35 +199,35 @@ class {
 		};
 	}
 
-	private struct function buildParams() {
-		var window = isNumeric( contextWindow ) ? max( 1024, int( val( contextWindow ) ) ) : 128000;
+	private struct function buildParams( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
 		var params = {
 			temperature: .1,
 			max_tokens : min( 3000, max( 256, int( window * .25 ) ) )
 		};
-		if ( len( trim( model ) ) ) {
-			params.model = model;
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
 		}
 		return params;
 	}
 
-	private numeric function promptCharacterBudget() {
-		var window = isNumeric( contextWindow ) ? max( 1024, int( val( contextWindow ) ) ) : 128000;
-		var configured = isNumeric( maxPromptCharacters ) ? max( 1000, int( val( maxPromptCharacters ) ) ) : 60000;
+	private numeric function promptCharacterBudget( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
+		var configured = isNumeric( arguments.resolved.maxPromptCharacters ) ? max( 1000, int( val( arguments.resolved.maxPromptCharacters ) ) ) : 60000;
 		// ~2 chars/token; reserve ~25% of the window for completion.
 		var fitted = max( 1000, int( window * .75 * 2 ) );
 		return min( configured, fitted );
 	}
 
-	private struct function buildOptions( required string returnFormat ) {
+	private struct function buildOptions( required struct resolved, required string returnFormat ) {
 		var options = {
-			provider    : provider,
-			apiKey      : apiKey,
+			provider    : arguments.resolved.provider,
+			apiKey      : arguments.resolved.apiKey,
 			returnFormat: arguments.returnFormat,
-			timeout     : timeout
+			timeout     : arguments.resolved.timeout
 		};
-		if ( len( trim( baseURL ) ) ) {
-			options.baseURL = baseURL;
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
 		}
 		return options;
 	}

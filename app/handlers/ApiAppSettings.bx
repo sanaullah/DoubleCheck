@@ -1,0 +1,134 @@
+/**
+ * REST: server-wide Review run-budget defaults/ceilings and the observability
+ * toggle, editable from the Settings panel. Falls back to the env-derived
+ * coldbox:setting values (the same ones ReviewPolicyService already uses)
+ * when no override has been saved.
+ *
+ * @see AppSettingsService
+ * @see ReviewPolicyService
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="appSettingsService" inject="AppSettingsService";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	property name="planMaxTasks" inject="coldbox:setting:planMaxTasks";
+	property name="runDefaultTokenBudget" inject="coldbox:setting:runDefaultTokenBudget";
+	property name="runMaxTokenBudget" inject="coldbox:setting:runMaxTokenBudget";
+	property name="runDefaultTokensPerTask" inject="coldbox:setting:runDefaultTokensPerTask";
+	property name="runMaxTokensPerTask" inject="coldbox:setting:runMaxTokensPerTask";
+	property name="runDefaultDurationMs" inject="coldbox:setting:runDefaultDurationMs";
+	property name="runMaxDurationMs" inject="coldbox:setting:runMaxDurationMs";
+	property name="runDefaultIterationsPerTask" inject="coldbox:setting:runDefaultIterationsPerTask";
+	property name="runMaxIterationsPerTask" inject="coldbox:setting:runMaxIterationsPerTask";
+	property name="runDefaultToolOutputCharacters" inject="coldbox:setting:runDefaultToolOutputCharacters";
+	property name="runMaxToolOutputCharacters" inject="coldbox:setting:runMaxToolOutputCharacters";
+	property name="runDefaultCostUsd" inject="coldbox:setting:runDefaultCostUsd";
+	property name="runMaxCostUsd" inject="coldbox:setting:runMaxCostUsd";
+	property name="observabilityEnabled" inject="coldbox:setting:observabilityEnabled";
+	property name="observabilityPreviewCharacters" inject="coldbox:setting:observabilityPreviewCharacters";
+
+	function preHandler( event, rc, prc, action, eventArguments ) {
+		prc.securityContext = securityContextService.authenticate( event );
+	}
+
+	/** GET /api/v1/app-settings */
+	function index( event, rc, prc ) {
+		event.renderData( type = "json", data = { data: effectiveSettings( prc.securityContext.tenantId ) } );
+	}
+
+	/** PUT /api/v1/app-settings - accepts a partial struct of any subset of the fields below. */
+	function update( event, rc, prc ) {
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) || !body.count() ) body = rc;
+			var values = validated( isStruct( body ) ? body : {} );
+			appSettingsService.setMany( values, prc.securityContext.tenantId );
+			event.renderData( type = "json", data = { data: effectiveSettings( prc.securityContext.tenantId ) } );
+		} catch ("ValidationException" error) {
+			event.renderData(
+					type       = "json",
+					statusCode = 422,
+					data       = { error: { code: "validation_failed", message: error.message } }
+				);
+		}
+	}
+
+	private struct function fieldDefinitions() {
+		return {
+			planMaxTasks                  : { fallback: planMaxTasks, min: 1, max: 20 },
+			runDefaultTokenBudget         : { fallback: runDefaultTokenBudget, min: 128, max: 200000 },
+			runMaxTokenBudget             : { fallback: runMaxTokenBudget, min: 128, max: 200000 },
+			runDefaultTokensPerTask       : { fallback: runDefaultTokensPerTask, min: 128, max: 100000 },
+			runMaxTokensPerTask           : { fallback: runMaxTokensPerTask, min: 128, max: 100000 },
+			runDefaultDurationMs          : { fallback: runDefaultDurationMs, min: 1000, max: 7200000 },
+			runMaxDurationMs              : { fallback: runMaxDurationMs, min: 1000, max: 7200000 },
+			runDefaultIterationsPerTask   : { fallback: runDefaultIterationsPerTask, min: 1, max: 100 },
+			runMaxIterationsPerTask       : { fallback: runMaxIterationsPerTask, min: 1, max: 100 },
+			runDefaultToolOutputCharacters: { fallback: runDefaultToolOutputCharacters, min: 1000, max: 1000000 },
+			runMaxToolOutputCharacters    : { fallback: runMaxToolOutputCharacters, min: 1000, max: 1000000 },
+			runDefaultCostUsd             : { fallback: runDefaultCostUsd, min: .01, max: 10000 },
+			runMaxCostUsd                 : { fallback: runMaxCostUsd, min: .01, max: 10000 },
+			observabilityPreviewCharacters: { fallback: observabilityPreviewCharacters, min: 100, max: 20000 }
+		};
+	}
+
+	/** Non-numeric local-default preferences, folded into this same panel per user request. */
+	private struct function stringFieldDefinitions() {
+		return {
+			defaultPreset: { fallback: "balanced", options: [ "quick", "balanced", "deep" ] },
+			defaultMode  : { fallback: "full", options: [ "full", "working-tree", "revision-diff" ] }
+		};
+	}
+
+	private struct function effectiveSettings( required string tenantId ) {
+		var overrides = appSettingsService.getAll( arguments.tenantId );
+		var result = {};
+		for ( var key in fieldDefinitions() ) {
+			var definition = fieldDefinitions()[ key ];
+			result[ key ] = overrides.keyExists( key ) ? val( overrides[ key ] ) : val( definition.fallback );
+		}
+		for ( var key in stringFieldDefinitions() ) {
+			var definition = stringFieldDefinitions()[ key ];
+			result[ key ] = overrides.keyExists( key ) ? overrides[ key ] : definition.fallback;
+		}
+		result.observabilityEnabled = overrides.keyExists( "observabilityEnabled" )
+			? isTrue( overrides.observabilityEnabled )
+			: isTrue( observabilityEnabled );
+		return result;
+	}
+
+	private struct function validated( required struct input ) {
+		var definitions = fieldDefinitions();
+		var stringDefinitions = stringFieldDefinitions();
+		var values = {};
+		for ( var key in arguments.input ) {
+			if ( key == "observabilityEnabled" ) {
+				values[ key ] = isTrue( arguments.input[ key ] ) ? "true" : "false";
+				continue;
+			}
+			if ( stringDefinitions.keyExists( key ) ) {
+				var stringDefinition = stringDefinitions[ key ];
+				var candidateText = trim( toString( arguments.input[ key ] ) );
+				if ( !stringDefinition.options.contains( candidateText ) ) {
+					throw( type = "ValidationException", message = "#key# must be one of: " & stringDefinition.options.toList( ", " ) );
+				}
+				values[ key ] = candidateText;
+				continue;
+			}
+			if ( !definitions.keyExists( key ) ) continue;
+			var definition = definitions[ key ];
+			var candidate = arguments.input[ key ];
+			if ( !isNumeric( candidate ) || val( candidate ) < definition.min || val( candidate ) > definition.max ) {
+				throw( type = "ValidationException", message = "#key# must be a number between #definition.min# and #definition.max#" );
+			}
+			values[ key ] = val( candidate );
+		}
+		return values;
+	}
+
+	private boolean function isTrue( required any value ) {
+		if ( isBoolean( arguments.value ) ) return arguments.value;
+		return listFindNoCase( "true,1,yes,on", trim( toString( arguments.value ) ) ) > 0;
+	}
+}

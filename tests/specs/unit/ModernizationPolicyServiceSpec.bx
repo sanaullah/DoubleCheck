@@ -3,8 +3,8 @@ class extends="testbox.system.BaseSpec" {
 		describe( "Modernization input policy", () => {
 			it( "accepts the supported runtime/layout matrix and produces a stable fingerprint", () => {
 				var service = new app.models.services.ModernizationPolicyService();
-				service.aiLocalProvider = true;
-				service.aiProvider = "ollama";
+				var resolverStub = new tests.resources.StubAIProviderResolver( { isLocal: true, provider: "ollama", model: "qwen3:8b" } );
+				service.aiProviderResolver = resolverStub;
 				service.modernizationMaxFiles = 40;
 				service.modernizationMaxOutcomes = 12;
 				service.modernizationDefaultColdboxMajor = "8";
@@ -15,11 +15,15 @@ class extends="testbox.system.BaseSpec" {
 				expect( first.input.target.runtime ).toBe( "lucee" );
 				expect( first.fingerprint ).toBe( second.fingerprint );
 				expect( first.input.schemaPack.sourceKind ).toBe( "none" );
+				expect( first.input.execution.provider ).toBe( "ollama" );
+				expect( first.input.execution.model ).toBe( "qwen3:8b" );
+				resolverStub.set( { model: "qwen3:14b" } );
+				expect( service.normalize( input ).fingerprint ).notToBe( first.fingerprint );
 			} );
 
 			it( "rejects an illegal runtime/layout combination", () => {
 				var service = new app.models.services.ModernizationPolicyService();
-				service.aiLocalProvider = true;
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { isLocal: true } );
 				service.modernizationMaxFiles = 40;
 				service.modernizationMaxOutcomes = 12;
 				expect( () => service.normalize( { target: { runtime: "lucee", language: "cfml", layoutProfile: "boxlang" } } ) ).toThrow( "ValidationException" );
@@ -27,7 +31,7 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "requires an explicit acknowledgement for remote providers", () => {
 				var service = new app.models.services.ModernizationPolicyService();
-				service.aiLocalProvider = false;
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { isLocal: false } );
 				service.modernizationMaxFiles = 40;
 				service.modernizationMaxOutcomes = 12;
 				expect( () => service.normalize( { privacy: { remoteProvider: true } } ) ).toThrow( "ValidationException" );
@@ -38,7 +42,7 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "rejects unknown source engines and database vendors", () => {
 				var service = new app.models.services.ModernizationPolicyService();
-				service.aiLocalProvider = true;
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { isLocal: true } );
 				service.modernizationMaxFiles = 40;
 				service.modernizationMaxOutcomes = 12;
 				expect( () => service.normalize( { source: { engine: "not-an-engine" } } ) ).toThrow( "ValidationException" );
@@ -47,7 +51,7 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "fails closed when no enabled provider is available", () => {
 				var service = new app.models.services.ModernizationPolicyService();
-				service.aiLocalProvider = true;
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { isLocal: true } );
 				expect( () => service.ensureProviderEnabled() ).toThrow( "ValidationException" );
 			} );
 		} );
