@@ -9,14 +9,13 @@ set PORT=8585
 set HOST=127.0.0.1
 set OPEN_BROWSER=1
 set DEBUG_MODE=0
-set SHOW_HELP=0
 
 REM Parse command-line arguments
 :parse_args
-if "%~1"=="" goto check_java
+if "%~1"=="" goto after_args
 if "%~1"=="--help" (
-    set SHOW_HELP=1
-    goto show_usage
+    call :show_usage
+    exit /b 0
 )
 if "%~1"=="--port" (
     set PORT=%~2
@@ -43,6 +42,18 @@ if "%~1"=="--debug" (
 shift
 goto parse_args
 
+:after_args
+call :check_java
+if errorlevel 1 exit /b 1
+
+call :setup_env
+call :launch_server
+exit /b 0
+
+REM ============================================================================
+REM SUBROUTINES
+REM ============================================================================
+
 :show_usage
 echo.
 echo DoubleCheck - Code Review for BoxLang, ColdFusion, JavaScript, and Java
@@ -62,7 +73,7 @@ echo   startup.bat --port 9000
 echo   startup.bat --port 9000 --no-browser
 echo   startup.bat --debug
 echo.
-if "%SHOW_HELP%"=="1" exit /b 0
+exit /b 0
 
 :check_java
 REM Check if Java is installed
@@ -70,6 +81,12 @@ for /f "tokens=*" %%i in ('java -version 2^>^&1') do (
     set JAVA_VERSION=%%i
     goto parse_version
 )
+
+echo ERROR: Java is not installed or not in PATH
+echo.
+echo Please ensure JDK 21 or higher is installed and in your PATH
+echo Download from: https://www.oracle.com/java/technologies/downloads/
+exit /b 1
 
 :parse_version
 REM Extract version number (e.g., "21.0.1")
@@ -83,8 +100,7 @@ for /f "tokens=1 delims=." %%i in ("%VERSION_STR%") do (
 if "%MAJOR_VERSION%"=="" (
     echo ERROR: Could not determine Java version
     echo.
-    echo Please ensure JDK 21 or higher is installed and in your PATH
-    echo Download from: https://www.oracle.com/java/technologies/downloads/
+    echo Please ensure JDK 21 or higher is installed
     exit /b 1
 )
 
@@ -100,6 +116,7 @@ if %MAJOR_VERSION% LSS 21 (
 
 echo Java version: %JAVA_VERSION%
 echo.
+exit /b 0
 
 :setup_env
 REM Create .env from .env.example if .env doesn't exist
@@ -115,18 +132,15 @@ if exist .env (
 )
 echo.
 
-:setup_debug
 if %DEBUG_MODE%==1 (
     set BOXLANG_DEBUG=true
     echo Debug mode enabled
 ) else (
     set BOXLANG_DEBUG=false
 )
+exit /b 0
 
 :launch_server
-echo Starting DoubleCheck...
-echo.
-
 REM Check if JAR exists
 if not exist .engine\boxlang-miniserver-1.14.0.jar (
     echo ERROR: boxlang-miniserver-1.14.0.jar not found
@@ -134,18 +148,15 @@ if not exist .engine\boxlang-miniserver-1.14.0.jar (
     exit /b 1
 )
 
-REM Create miniserver config with port/host (optional, miniserver.json uses defaults)
-REM The miniserver.json in project root will be used
+echo Starting DoubleCheck...
 echo Launching miniserver on %HOST%:%PORT%...
 echo.
 
 REM Launch the miniserver
 java -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar
 
-REM If we get here, the server was stopped
 echo.
 echo DoubleCheck has stopped
 exit /b 0
 
-:cleanup
 endlocal
