@@ -502,6 +502,80 @@
 	.wf-row.error .wf-label { color: var(--err); font-weight: 600; }
 	.wf-row.abandoned .wf-bar { opacity: 0.4; }
 	.wf-row.abandoned .wf-label { color: var(--muted); opacity: 0.7; }
+	.metrics-panel {
+		margin: 0 0 18px;
+		padding: 12px 14px;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+	}
+	.metrics-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+		gap: 12px;
+		margin-top: 10px;
+	}
+	.metric-card {
+		padding: 10px;
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		text-align: center;
+	}
+	.metric-label {
+		font-size: var(--text-xs);
+		color: var(--muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		font-weight: 700;
+		margin-bottom: 4px;
+	}
+	.metric-value {
+		font-size: 1.1rem;
+		font-weight: 600;
+		color: var(--text);
+		font-family: var(--mono);
+	}
+	.obs-filters {
+		margin: 0 0 18px;
+		padding: 12px 14px;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+	}
+	.filters-row {
+		display: flex;
+		gap: 8px;
+		margin-top: 10px;
+		flex-wrap: wrap;
+	}
+	.filter-input, .filter-select {
+		font: inherit;
+		padding: var(--ctrl-pad);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg);
+		color: var(--text);
+		font-size: var(--text-sm);
+		min-height: var(--ctrl-h);
+		flex: 1;
+		min-width: 120px;
+	}
+	.filter-input::placeholder { color: var(--muted); }
+	.filter-btn {
+		font: inherit;
+		padding: var(--ctrl-pad);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--panel-2);
+		color: var(--text);
+		font-size: var(--text-sm);
+		font-weight: 600;
+		cursor: pointer;
+		min-height: var(--ctrl-h);
+		white-space: nowrap;
+	}
+	.filter-btn:hover { background: color-mix(in srgb, var(--accent) 15%, var(--panel-2)); }
 	.chat-block { margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
 	.chat-msg {
 		padding: 10px 12px;
@@ -897,6 +971,15 @@
 			URL.revokeObjectURL(a.href);
 		}
 
+		function downloadFile(filename, content, type) {
+			const blob = new Blob([content], { type: type || "text/plain" });
+			const a = document.createElement("a");
+			a.href = URL.createObjectURL(blob);
+			a.download = filename;
+			a.click();
+			URL.revokeObjectURL(a.href);
+		}
+
 		async function copyCurrentLink(btn) {
 			const url = location.origin + location.pathname + location.search + location.hash;
 			try {
@@ -1218,6 +1301,55 @@
 			return `<div class="waterfall"><div class="section-head"><div class="waterfall-title">Waterfall</div><p class="section-purpose">When each step ran and how long it took (hierarchical view)</p></div>${rows}</div>`;
 		}
 
+		function buildMetricsPanel(t) {
+			const obsCount = Array.isArray(t.observations) ? t.observations.length : 0;
+			const tokenBreakdown = t.observations ? t.observations.reduce((sum, o) => sum + (val(o.usage?.totalTokens) || 0), 0) : 0;
+			return `<div class="metrics-panel">
+				<div class="section-head"><div class="section-title">Metrics</div></div>
+				<div class="metrics-grid">
+					<div class="metric-card">
+						<div class="metric-label">Observations</div>
+						<div class="metric-value">${esc(obsCount)}</div>
+					</div>
+					<div class="metric-card">
+						<div class="metric-label">Total Duration</div>
+						<div class="metric-value">${esc(formatDuration(val(t.durationMs)))}</div>
+					</div>
+					<div class="metric-card">
+						<div class="metric-label">Tokens</div>
+						<div class="metric-value">${esc(val(t.totalTokens || 0))}</div>
+					</div>
+					<div class="metric-card">
+						<div class="metric-label">Cost</div>
+						<div class="metric-value">$${esc(formatCost(t.usage) || val(t.cost || 0))}</div>
+					</div>
+				</div>
+			</div>`;
+		}
+
+		function buildObservationFilters(traceId) {
+			return `<div class="obs-filters">
+				<div class="section-head"><div class="section-title">Filter observations</div></div>
+				<div class="filters-row">
+					<input type="text" class="filter-input" placeholder="Search..." data-filter="search" aria-label="Search observations">
+					<select class="filter-select" data-filter="type" aria-label="Observation type">
+						<option value="">All types</option>
+						<option value="generation">Generation</option>
+						<option value="tool">Tool</option>
+						<option value="span">Span</option>
+						<option value="event">Event</option>
+					</select>
+					<select class="filter-select" data-filter="status" aria-label="Status">
+						<option value="">All status</option>
+						<option value="ok">OK</option>
+						<option value="error">Error</option>
+						<option value="running">Running</option>
+					</select>
+					<button class="filter-btn" data-filter-reset>Reset</button>
+				</div>
+			</div>`;
+		}
+
 		function buildTree(observations, preferredOpen) {
 			const byParent = {};
 			const roots = [];
@@ -1435,6 +1567,8 @@
 				${feedbackBar}
 				${metadataChips(t.metadata)}
 				${buildWaterfall(t)}
+				${buildMetricsPanel(t)}
+				${buildObservationFilters(t.id)}
 				${showPreview ? `<div class="section-head"><div class="section-title">Output preview</div></div>${renderIo(t.outputPreview, "preview", "preview-block")}` : ""}
 				<div class="tree">
 					<div class="section-head tree-title-wrap"><div class="section-title">Observation tree</div><p class="section-purpose">Nested generations, tools, spans, and events for this trace</p></div>
@@ -1646,16 +1780,22 @@
 				(async () => {
 					try {
 						if (kind === "trace") {
-							const data = await loadDetail(eid || selectedId);
-							downloadJson("ai-flight-trace-" + (data.id || eid) + ".json", data);
+							const tid = eid || selectedId;
+							// Export as JSON from new API
+							const res = await fetch(`/aiflight/api/trace/${encodeURIComponent(tid)}/export?format=json`);
+							if (!res.ok) throw new Error("export failed");
+							const data = await res.text();
+							downloadFile("ai-flight-trace-" + tid.slice(0, 8) + ".json", data, "application/json");
 						} else if (kind === "session") {
 							const base = root.getAttribute("data-session-url") || "/aiflight/api/session/";
 							const res = await fetch(base + encodeURIComponent(eid || selectedSessionId), { headers: { Accept: "application/json" } });
 							if (!res.ok) throw new Error("session export failed");
 							const data = await res.json();
-							downloadJson("ai-flight-session-" + (data.id || eid) + ".json", data);
+							downloadJson("ai-flight-session-" + (data.id || eid).slice(0, 8) + ".json", data);
 						}
-					} catch (e) {}
+					} catch (e) {
+						console.error("export error:", e);
+					}
 				})();
 				return;
 			}
@@ -1674,6 +1814,13 @@
 				});
 				listFp = "";
 				pollList().then(() => selectSession(sess.getAttribute("data-open-session"), true));
+				return;
+			}
+			const filterReset = ev.target.closest("[data-filter-reset]");
+			if (filterReset) {
+				detailEl.querySelectorAll(".filter-input, .filter-select").forEach((inp) => {
+					inp.value = "";
+				});
 				return;
 			}
 			const turn = ev.target.closest(".replay-turn");
