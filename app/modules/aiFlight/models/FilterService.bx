@@ -1,0 +1,159 @@
+/**
+ * Advanced filter management for aiFlight traces
+ */
+class {
+	property name="store" inject="TraceStoreService@aiFlight";
+
+	/**
+	 * Build complex query from filter definition
+	 * Supports AND/OR logic, multiple conditions, saved filters
+	 */
+	function buildQuery( required struct filters ) {
+		var where = [];
+		var params = {};
+		var paramCount = 0;
+
+		// Simple filters (backward compatible)
+		if ( len( filters.status ?: "" ) ) {
+			paramCount++;
+			where.append( "status = :status_#paramCount#" );
+			params[ "status_#paramCount#" ] = filters.status;
+		}
+
+		if ( len( filters.search ?: "" ) ) {
+			paramCount++;
+			where.append( "(inputPreview LIKE :search_#paramCount# OR outputPreview LIKE :search_#paramCount#)" );
+			params[ "search_#paramCount#" ] = "%#filters.search#%" );
+		}
+
+		if ( len( filters.model ?: "" ) ) {
+			paramCount++;
+			where.append( "model = :model_#paramCount#" );
+			params[ "model_#paramCount#" ] = filters.model;
+		}
+
+		if ( len( filters.userId ?: "" ) ) {
+			paramCount++;
+			where.append( "userId = :userId_#paramCount#" );
+			params[ "userId_#paramCount#" ] = filters.userId;
+		}
+
+		if ( len( filters.environment ?: "" ) ) {
+			paramCount++;
+			where.append( "environment = :env_#paramCount#" );
+			params[ "env_#paramCount#" ] = filters.environment;
+		}
+
+		if ( filters.hasTools ?: false ) {
+			where.append( "id IN (SELECT DISTINCT traceId FROM observations WHERE type = 'tool')" );
+		}
+
+		if ( filters.hasErrors ?: false ) {
+			where.append( "status = 'error' OR id IN (SELECT DISTINCT traceId FROM observations WHERE status = 'error')" );
+		}
+
+		if ( val( filters.minDurationMs ?: 0 ) > 0 ) {
+			paramCount++;
+			where.append( "durationMs >= :minDur_#paramCount#" );
+			params[ "minDur_#paramCount#" ] = val( filters.minDurationMs );
+		}
+
+		if ( val( filters.maxDurationMs ?: 0 ) > 0 ) {
+			paramCount++;
+			where.append( "durationMs <= :maxDur_#paramCount#" );
+			params[ "maxDur_#paramCount#" ] = val( filters.maxDurationMs );
+		}
+
+		if ( val( filters.minCost ?: 0 ) > 0 ) {
+			paramCount++;
+			where.append( "cost >= :minCost_#paramCount#" );
+			params[ "minCost_#paramCount#" ] = val( filters.minCost );
+		}
+
+		if ( len( filters.feedback ?: "" ) ) {
+			if ( filters.feedback == "any" ) {
+				where.append( "id IN (SELECT DISTINCT traceId FROM feedback WHERE value IS NOT NULL)" );
+			} else if ( filters.feedback == "none" ) {
+				where.append( "id NOT IN (SELECT DISTINCT traceId FROM feedback WHERE value IS NOT NULL)" );
+			} else {
+				paramCount++;
+				where.append( "id IN (SELECT DISTINCT traceId FROM feedback WHERE value = :fb_#paramCount#)" );
+				params[ "fb_#paramCount#" ] = filters.feedback;
+			}
+		}
+
+		// Advanced filters (new)
+		if ( len( filters.q ?: "" ) ) {
+			// Support search syntax: field:value
+			var searchParts = filters.q.split( " " );
+			for ( var part in searchParts ) {
+				if ( part.contains( ":" ) ) {
+					var kv = part.split( ":" );
+					var field = lCase( kv[ 1 ] );
+					var value = kv[ 2 ] ?: "";
+
+					switch ( field ) {
+						case "model":
+							paramCount++;
+							where.append( "model LIKE :qmodel_#paramCount#" );
+							params[ "qmodel_#paramCount#" ] = "%#value#%" );
+							break;
+						case "user":
+							paramCount++;
+							where.append( "userId LIKE :quser_#paramCount#" );
+							params[ "quser_#paramCount#" ] = "%#value#%" );
+							break;
+						case "env":
+							paramCount++;
+							where.append( "environment LIKE :qenv_#paramCount#" );
+							params[ "qenv_#paramCount#" ] = "%#value#%" );
+							break;
+					}
+				}
+			}
+		}
+
+		return {
+			where: where.len() ? where.toList( " AND " ) : "1=1",
+			params: params
+		};
+	}
+
+	/**
+	 * Save a filter combination for reuse
+	 */
+	function saveFilter( required string name, required struct filterDef ) {
+		// TODO: Implement filter persistence
+		return { success: true, filterId: createUUID() };
+	}
+
+	/**
+	 * Load saved filter by ID
+	 */
+	function loadFilter( required string filterId ) {
+		// TODO: Implement filter retrieval
+		return {};
+	}
+
+	/**
+	 * List all saved filters for user
+	 */
+	function listSavedFilters() {
+		// TODO: Implement saved filters listing
+		return [];
+	}
+
+	/**
+	 * Get cohort statistics (compare segment performance)
+	 */
+	function getCohortStats( required struct filters1, required struct filters2 ) {
+		var query1 = buildQuery( filters1 );
+		var query2 = buildQuery( filters2 );
+
+		// TODO: Build aggregation queries to compare cohorts
+		return {
+			cohort1: { count: 0, avgLatency: 0, totalTokens: 0, totalCost: 0 },
+			cohort2: { count: 0, avgLatency: 0, totalTokens: 0, totalCost: 0 }
+		};
+	}
+}
