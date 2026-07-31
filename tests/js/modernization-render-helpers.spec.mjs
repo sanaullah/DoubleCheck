@@ -137,9 +137,12 @@ assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extr
 
 // buildModernizationArchitectureSubgraph: turns target.contexts/target.extracts
 // into the {nodes,edges} shape ArchitectureFlow.layoutFlowPositions() expects.
+// Every context gets its own node regardless of packaging — a centralized
+// context is still a real packaging decision, not something to fold away.
 {
 	const result = {
 		target: {
+			units: [ { id: "u1" }, { id: "u2" }, { id: "u3" }, { id: "u4" }, { id: "u5" } ],
 			contexts: [
 				{ id: "ctx-central", name: "Config", packaging: "centralized", targetUnitIds: [ "u1" ] },
 				{ id: "ctx-crime", name: "Crime", packaging: "coldbox-module", targetUnitIds: [ "u2", "u3" ], dependsOnContextIds: [ "ext-spell" ] }
@@ -151,23 +154,48 @@ assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extr
 	};
 	const subgraph = helpers.buildModernizationArchitectureSubgraph(result);
 	assert.equal(subgraph.mode, "modernization-architecture");
-	// Core (monolith) + one coldbox-module + one extract; the centralized
-	// context does not get its own node, it is folded into core's unit count.
-	assert.equal(subgraph.nodes.length, 3);
+	// core + centralized context + coldbox-module + extract
+	assert.equal(subgraph.nodes.length, 4);
 	const core = subgraph.nodes.find((n) => n.id === "core");
 	assert.ok(core, "core node exists");
+	// u5 belongs to no context/extract at all -> counted as ungrouped on core.
 	assert.equal(core.unitCount, 1);
+	const central = subgraph.nodes.find((n) => n.id === "ctx-central");
+	assert.equal(central.role, "centralized");
+	assert.equal(central.unitCount, 1);
 	const crime = subgraph.nodes.find((n) => n.id === "ctx-crime");
 	assert.equal(crime.role, "module");
 	assert.equal(crime.unitCount, 2);
 	const spell = subgraph.nodes.find((n) => n.id === "ext-spell");
 	assert.equal(spell.role, "extract");
-	// Every module/extract gets an edge back to core, plus the explicit
+	// Every context/extract gets an edge back to core, plus the explicit
 	// dependsOnContextIds edge from Crime to Spellcheck.
+	assert.ok(subgraph.edges.some((e) => e.from === "core" && e.to === "ctx-central"));
 	assert.ok(subgraph.edges.some((e) => e.from === "core" && e.to === "ctx-crime"));
 	assert.ok(subgraph.edges.some((e) => e.from === "core" && e.to === "ext-spell"));
 	assert.ok(subgraph.edges.some((e) => e.from === "ctx-crime" && e.to === "ext-spell"));
-	assert.equal(subgraph.edges.length, 3);
+	assert.equal(subgraph.edges.length, 4);
+}
+
+// buildModernizationArchitectureSubgraph: a plan where every context stays
+// centralized (0 coldbox-module, 0 extracts) is the expected, common outcome
+// of a "modular monolith first" run — the map must still show it, not
+// collapse to a single, empty-looking core node.
+{
+	const result = {
+		target: {
+			units: [ { id: "u1" }, { id: "u2" } ],
+			contexts: [
+				{ id: "ctx-a", name: "AJAX & Configuration Management", packaging: "centralized", targetUnitIds: [ "u1" ] },
+				{ id: "ctx-b", name: "Crime & User Services", packaging: "centralized", targetUnitIds: [ "u2" ] }
+			],
+			extracts: []
+		}
+	};
+	const subgraph = helpers.buildModernizationArchitectureSubgraph(result);
+	assert.equal(subgraph.nodes.length, 3, "core + two centralized contexts, not just core");
+	assert.ok(subgraph.nodes.some((n) => n.id === "ctx-a" && n.role === "centralized"));
+	assert.ok(subgraph.nodes.some((n) => n.id === "ctx-b" && n.role === "centralized"));
 }
 
 // buildModernizationArchitectureSubgraph: degrades gracefully with no

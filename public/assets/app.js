@@ -2565,6 +2565,39 @@ function modernizationResolveTargetUnitLabels(targetUnitIds) {
 	});
 }
 
+/**
+ * Fills an <ol> with the shared migrationSteps rendering (legacy file:symbol
+ * → target file:method, plus action/note) — used both by the generic
+ * proposal-item detail panel (context/extract/roadmap-phase) and by the
+ * primary "Slice Definition of Done" panel under the Road, so the guide
+ * looks identical wherever a user finds it.
+ */
+function renderMigrationStepsInto(ol, steps) {
+	ol.innerHTML = "";
+	(Array.isArray(steps) ? steps : []).forEach((step) => {
+		const li = document.createElement("li");
+		const legacyRef = step.legacyRef || {};
+		const targetRef = step.targetRef || {};
+		const from = [legacyRef.filePath, legacyRef.symbolName].filter(Boolean).join(":");
+		const to = [targetRef.targetPath, targetRef.methodName].filter(Boolean).join(":");
+		const action = document.createElement("strong");
+		action.textContent = step.action || "Step";
+		li.appendChild(action);
+		if (from || to) {
+			const path = document.createElement("code");
+			path.textContent = `${from || "?"} → ${to || "?"}`;
+			li.append(document.createTextNode(" — "), path);
+		}
+		if (step.note) {
+			const note = document.createElement("span");
+			note.className = "field-hint";
+			note.textContent = ` ${step.note}`;
+			li.appendChild(note);
+		}
+		ol.appendChild(li);
+	});
+}
+
 function renderModernizationDetailSummary(host, item = {}) {
 	if (!host) return;
 	const addMigrationSteps = (steps) => {
@@ -2575,28 +2608,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 		section.appendChild(heading);
 		const ol = document.createElement("ol");
 		ol.className = "modernization-migration-steps";
-		steps.forEach((step) => {
-			const li = document.createElement("li");
-			const legacyRef = step.legacyRef || {};
-			const targetRef = step.targetRef || {};
-			const from = [legacyRef.filePath, legacyRef.symbolName].filter(Boolean).join(":");
-			const to = [targetRef.targetPath, targetRef.methodName].filter(Boolean).join(":");
-			const action = document.createElement("strong");
-			action.textContent = step.action || "Step";
-			li.appendChild(action);
-			if (from || to) {
-				const path = document.createElement("code");
-				path.textContent = `${from || "?"} → ${to || "?"}`;
-				li.append(document.createTextNode(" — "), path);
-			}
-			if (step.note) {
-				const note = document.createElement("span");
-				note.className = "field-hint";
-				note.textContent = ` ${step.note}`;
-				li.appendChild(note);
-			}
-			ol.appendChild(li);
-		});
+		renderMigrationStepsInto(ol, steps);
 		section.appendChild(ol);
 		host.appendChild(section);
 	};
@@ -2653,6 +2665,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Exit checklist", Array.isArray(item.exitCriteria) ? item.exitCriteria : (item.exitCriteria ? [item.exitCriteria] : []));
 		add("Rollback", item.rollback);
 		add("Implementer prompt", item.implementerPrompt);
+		addMigrationSteps(item.migrationSteps);
 	} else if (item._modernizationType === "db-finding") {
 		add("Problem", item.problem || item.message);
 		add("Proposed change", item.proposedChange || item.recommendation);
@@ -3038,10 +3051,10 @@ function renderModernizationArchitectureMap(result = {}) {
 
 	const nodeHtml = layout.nodes.map((n) => {
 		const sel = selectedId && selectedId === n.id ? " is-selected" : "";
-		const roleClass = n.role === "core" ? " is-core" : n.role === "extract" ? " is-extract" : " is-module";
+		const roleClass = n.role === "core" ? " is-core" : n.role === "extract" ? " is-extract" : n.role === "centralized" ? " is-centralized" : " is-module";
 		const speculative = n.item && String(n.item.evidenceBasis || "").toLowerCase() === "domain-clustering";
 		const subLabel = n.role === "core"
-			? `${n.unitCount} centralized unit${n.unitCount === 1 ? "" : "s"}`
+			? (n.unitCount > 0 ? `${n.unitCount} ungrouped unit${n.unitCount === 1 ? "" : "s"}` : "shared app bootstrap")
 			: `${n.unitCount} unit${n.unitCount === 1 ? "" : "s"}${speculative ? " · speculative" : ""}`;
 		// Risk dot: deterministic, from ModernizationRiskService's read-time
 		// overlay (cross-referenced review findings for this project) — no
@@ -3311,6 +3324,7 @@ function renderModernizationSolution(result = {}) {
 			<p class="modernization-dod-parity"></p>
 			<div class="modernization-dod-grid"><section><h4>Exit criteria</h4><ul class="exit"></ul></section><section><h4>Rollback</h4><p class="rollback"></p></section></div>
 			<section class="modernization-dod-prompt"><h4>Implementer prompt</h4><pre></pre></section>
+			<section class="modernization-dod-migration-steps" hidden><h4>Migration steps</h4><ol class="modernization-migration-steps"></ol></section>
 			<label class="modernization-rebuild-note">Rebuild note <textarea id="modernization-rebuild-note" rows="2" maxlength="1000" placeholder="Optional guidance for a redo of this slice"></textarea></label>
 			<div class="modernization-dod-actions">
 				<button type="button" class="primary-button" data-slice-action="accept" ${isCurrent ? "" : `disabled title="Only the current slice can be accepted or rejected — select it from the Road to act on it."`}>Accept slice</button>
@@ -3331,6 +3345,12 @@ function renderModernizationSolution(result = {}) {
 		});
 		dod.querySelector(".rollback").textContent = phase.rollback || "No rollback note.";
 		dod.querySelector("pre").textContent = phase.implementerPrompt || "No implementer prompt.";
+		const migrationSteps = Array.isArray(phase.migrationSteps) ? phase.migrationSteps : [];
+		const migrationStepsSection = dod.querySelector(".modernization-dod-migration-steps");
+		if (migrationSteps.length && migrationStepsSection) {
+			migrationStepsSection.hidden = false;
+			renderMigrationStepsInto(migrationStepsSection.querySelector("ol"), migrationSteps);
+		}
 		dod.querySelector('[data-slice-action="accept"]').addEventListener("click", () => saveSliceDecision(phase, "accepted"));
 		dod.querySelector('[data-slice-action="reject"]').addEventListener("click", () => saveSliceDecision(phase, "rejected"));
 		dod.querySelector('[data-slice-action="rebuild"]').addEventListener("click", () => rebuildSlice(phase));

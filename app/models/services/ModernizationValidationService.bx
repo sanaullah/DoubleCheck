@@ -97,7 +97,10 @@ class {
 			if ( !len( trim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
 				if ( !variables.allowedEvidenceBasis.contains( lCase( trim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
 		}
-		var migrationGuideReport = validateArchitectureMigrationGuide( target, inventoryPaths, messages );
+		var packagingGuideReport = validateArchitecturePackagingFields( target, messages );
+		blocking += packagingGuideReport.blocking;
+		var roadmapPhasesForGuide = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
+		var migrationGuideReport = validateRoadmapMigrationGuide( roadmapPhasesForGuide, target, inventoryPaths, messages );
 		blocking += migrationGuideReport.blocking;
 		warnings += migrationGuideReport.warnings;
 
@@ -311,20 +314,60 @@ class {
 	}
 
 	/**
-	 * Checks the system-architect "migration guide" fields on every
-	 * target.contexts/target.extracts packaging decision: moduleSlug must be
-	 * a safe relative folder name; dependsOnContextIds must reference a real
+	 * Checks the system-architect packaging fields on every
+	 * target.contexts/target.extracts decision: moduleSlug must be a safe
+	 * relative folder name, and dependsOnContextIds must reference a real
 	 * context/extract in this plan (these feed the architecture map's edges
-	 * directly, so a dangling id must never reach the UI); every
+	 * directly, so a dangling id must never reach the UI). The architecture
+	 * role does not produce migrationSteps — see validateRoadmapMigrationGuide()
+	 * for why that guide lives on roadmap phases instead.
+	 */
+	private struct function validateArchitecturePackagingFields( required struct target, required array messages ) {
+		var report = { blocking: 0 };
+		var groups = [];
+		for ( var context in ( isArray( arguments.target.contexts ?: "" ) ? arguments.target.contexts : [] ) ) {
+			groups.append( { item: context, collection: "target.contexts" } );
+		}
+		for ( var extract in ( isArray( arguments.target.extracts ?: "" ) ? arguments.target.extracts : [] ) ) {
+			groups.append( { item: extract, collection: "target.extracts" } );
+		}
+		var groupIds = {};
+		for ( var group in groups ) {
+			var groupItemId = trim( group.item.id ?: group.item.itemId ?: "" );
+			if ( len( groupItemId ) ) groupIds[ groupItemId ] = true;
+		}
+		for ( var group in groups ) {
+			var item = group.item;
+			var id = trim( item.id ?: item.itemId ?: "" );
+			var moduleSlug = trim( item.moduleSlug ?: "" );
+			if ( len( moduleSlug ) && !safeRelativePath( moduleSlug ) ) {
+				addMessage( arguments.messages, group.collection, "blocking", "Item #id# has an unsafe moduleSlug", id ); report.blocking++;
+			}
+			for ( var dependsOnId in ( isArray( item.dependsOnContextIds ?: "" ) ? item.dependsOnContextIds : [] ) ) {
+				if ( !groupIds.keyExists( trim( toString( dependsOnId ) ) ) ) {
+					addMessage( arguments.messages, group.collection, "blocking", "Item #id# has a dangling dependsOnContextIds reference", id ); report.blocking++;
+				}
+			}
+		}
+		return report;
+	}
+
+	/**
+	 * Checks the system-architect "migration guide" on every roadmap phase:
+	 * migrationSteps lives here rather than on target.contexts/target.extracts
+	 * because the roadmap role is already sharded to one small, bounded group
+	 * per call (unlike the whole-repository architecture call), so every
+	 * phase can carry a concrete guide without risking the overload/timeout
+	 * failure a heavier unsharded architecture call hit in practice. Every
 	 * migrationSteps entry must cite a legacyRef.filePath that is actually in
 	 * the inventory and a targetRef.targetPath that actually belongs to one
-	 * of this same group's own targetUnitIds (never an invented/foreign
-	 * file). A non-centralized packaging decision (coldbox-module context, or
-	 * any extract) with zero migration steps is a warning, not a blocker — it
-	 * makes a degraded/thin provider response visible instead of shipping
-	 * another guide-less card.
+	 * of this same phase's own unitIds (never an invented/foreign file). A
+	 * provider-suggested phase with zero migration steps is a warning, not a
+	 * blocker — it makes a degraded/thin provider response visible instead of
+	 * shipping another guide-less slice. Deterministic/synthesized phases
+	 * never had a chance to produce one, so they're exempt from that warning.
 	 */
-	private struct function validateArchitectureMigrationGuide( required struct target, required struct inventoryPaths, required array messages ) {
+	private struct function validateRoadmapMigrationGuide( required array phases, required struct target, required struct inventoryPaths, required array messages ) {
 		var report = { blocking: 0, warnings: 0 };
 		var unitTargetPaths = {};
 		for ( var unit in ( isArray( arguments.target.units ?: "" ) ? arguments.target.units : [] ) ) {
@@ -332,57 +375,33 @@ class {
 			var unitTargetPath = lCase( replace( trim( unit.targetPath ?: unit.pathHint ?: "" ), "\", "/", "all" ) );
 			if ( len( unitId ) && len( unitTargetPath ) ) unitTargetPaths[ unitId ] = unitTargetPath;
 		}
-		var groups = [];
-		for ( var context in ( isArray( arguments.target.contexts ?: "" ) ? arguments.target.contexts : [] ) ) {
-			groups.append( { item: context, collection: "target.contexts", isCentralized: lCase( trim( context.packaging ?: "" ) ) != "coldbox-module" } );
-		}
-		for ( var extract in ( isArray( arguments.target.extracts ?: "" ) ? arguments.target.extracts : [] ) ) {
-			groups.append( { item: extract, collection: "target.extracts", isCentralized: false } );
-		}
-		var groupIds = {};
-		for ( var group in groups ) {
-			var groupItemId = trim( group.item.id ?: group.item.itemId ?: "" );
-			if ( len( groupItemId ) ) groupIds[ groupItemId ] = true;
-		}
+		for ( var phase in arguments.phases ) {
+			if ( !isStruct( phase ) ) continue;
+			var id = trim( phase.id ?: phase.itemId ?: "" );
+			var phaseUnitIds = {};
+			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) phaseUnitIds[ trim( toString( unitId ) ) ] = true;
 
-		for ( var group in groups ) {
-			var item = group.item;
-			var id = trim( item.id ?: item.itemId ?: "" );
-			var groupUnitIds = {};
-			for ( var unitId in ( isArray( item.targetUnitIds ?: "" ) ? item.targetUnitIds : [] ) ) groupUnitIds[ trim( toString( unitId ) ) ] = true;
-
-			var moduleSlug = trim( item.moduleSlug ?: "" );
-			if ( len( moduleSlug ) && !safeRelativePath( moduleSlug ) ) {
-				addMessage( arguments.messages, group.collection, "blocking", "Item #id# has an unsafe moduleSlug", id ); report.blocking++;
-			}
-
-			for ( var dependsOnId in ( isArray( item.dependsOnContextIds ?: "" ) ? item.dependsOnContextIds : [] ) ) {
-				if ( !groupIds.keyExists( trim( toString( dependsOnId ) ) ) ) {
-					addMessage( arguments.messages, group.collection, "blocking", "Item #id# has a dangling dependsOnContextIds reference", id ); report.blocking++;
-				}
-			}
-
-			var steps = isArray( item.migrationSteps ?: "" ) ? item.migrationSteps : [];
+			var steps = isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps : [];
 			for ( var step in steps ) {
 				if ( !isStruct( step ) ) continue;
 				var legacyRef = isStruct( step.legacyRef ?: "" ) ? step.legacyRef : {};
 				var legacyPath = lCase( replace( trim( legacyRef.filePath ?: "" ), "\", "/", "all" ) );
 				if ( !len( legacyPath ) || !arguments.inventoryPaths.keyExists( legacyPath ) ) {
-					addMessage( arguments.messages, group.collection, "blocking", "Item #id# migration step cites a legacyRef.filePath not in inventory evidence", id ); report.blocking++;
+					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a legacyRef.filePath not in inventory evidence", id ); report.blocking++;
 				}
 				var targetRef = isStruct( step.targetRef ?: "" ) ? step.targetRef : {};
 				var stepTargetPath = lCase( replace( trim( targetRef.targetPath ?: "" ), "\", "/", "all" ) );
-				var matchesGroupUnit = false;
-				for ( var groupUnitId in groupUnitIds ) {
-					if ( len( stepTargetPath ) && ( unitTargetPaths[ groupUnitId ] ?: "" ) == stepTargetPath ) { matchesGroupUnit = true; break; }
+				var matchesPhaseUnit = false;
+				for ( var phaseUnitId in phaseUnitIds ) {
+					if ( len( stepTargetPath ) && ( unitTargetPaths[ phaseUnitId ] ?: "" ) == stepTargetPath ) { matchesPhaseUnit = true; break; }
 				}
-				if ( !len( stepTargetPath ) || !matchesGroupUnit ) {
-					addMessage( arguments.messages, group.collection, "blocking", "Item #id# migration step cites a targetRef.targetPath not among this group's own target units", id ); report.blocking++;
+				if ( !len( stepTargetPath ) || !matchesPhaseUnit ) {
+					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a targetRef.targetPath not among this phase's own units", id ); report.blocking++;
 				}
 			}
 
-			if ( !group.isCentralized && !steps.len() ) {
-				addMessage( arguments.messages, group.collection, "warning", "Item #id# is a packaging decision with no migration guide", id ); report.warnings++;
+			if ( !steps.len() && lCase( trim( phase.provenanceClass ?: "" ) ) == "provider-suggested" ) {
+				addMessage( arguments.messages, "roadmapPhases", "warning", "Phase #id# has no migration guide", id ); report.warnings++;
 			}
 		}
 		return report;

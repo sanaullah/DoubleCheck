@@ -167,7 +167,6 @@
 		const extracts = result.target?.extracts || result.extracts || [];
 		const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module");
 		const central = contexts.filter((item) => !modules.includes(item));
-		const centralUnitCount = central.reduce((sum, item) => sum + (Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0), 0);
 
 		const nodes = [];
 		const idById = new Map();
@@ -176,15 +175,25 @@
 			nodes.push(node);
 			idById.set(id, node);
 		};
-		addNode("core", "ColdBox Monolith", "core", null, centralUnitCount);
-		modules.forEach((item) => {
+		const groupedUnitIds = new Set();
+		const addGroupNode = (item, role) => {
 			const id = String(item.id || item.itemId || "");
-			if (id) addNode(id, item.name || id, "module", item, Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0);
-		});
-		extracts.forEach((item) => {
-			const id = String(item.id || item.itemId || "");
-			if (id) addNode(id, item.name || id, "extract", item, Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0);
-		});
+			if (!id) return;
+			const unitIds = Array.isArray(item.targetUnitIds) ? item.targetUnitIds : [];
+			unitIds.forEach((unitId) => groupedUnitIds.add(String(unitId)));
+			addNode(id, item.name || id, role, item, unitIds.length);
+		};
+		// "Centralized" packaging is the default, expected outcome for most
+		// groups in a modular-monolith-first plan — it must still get its own
+		// node, not be folded away into an invisible unit count on "core".
+		// Otherwise a run that (correctly) keeps everything centralized shows
+		// an empty map instead of the packaging picture it actually made.
+		central.forEach((item) => addGroupNode(item, "centralized"));
+		modules.forEach((item) => addGroupNode(item, "module"));
+		extracts.forEach((item) => addGroupNode(item, "extract"));
+		const units = result.target?.units || [];
+		const ungroupedCount = units.filter((unit) => !groupedUnitIds.has(String(unit.id || unit.itemId || ""))).length;
+		addNode("core", "ColdBox Monolith", "core", null, ungroupedCount);
 
 		const edgeKeys = new Set();
 		const edges = [];
@@ -195,7 +204,7 @@
 			edgeKeys.add(key);
 			edges.push({ from, to });
 		};
-		[...modules, ...extracts].forEach((item) => {
+		[...central, ...modules, ...extracts].forEach((item) => {
 			const id = String(item.id || item.itemId || "");
 			if (!id || !idById.has(id)) return;
 			addEdge("core", id);

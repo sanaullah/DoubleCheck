@@ -282,7 +282,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( roles.findNoCase( "modernization-architecture" ) ).toBeLT( roles.findNoCase( "modernization-roadmap" ) );
 			} );
 
-			it( "carries moduleSlug, dependsOnContextIds, and migrationSteps through merge/polish unchanged", () => {
+			it( "carries architecture moduleSlug and dependsOnContextIds through merge/polish unchanged", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": {
 						targetUnits: [ { id: "pdf-h", targetPath: "app/handlers/Pdf.bx", sourcePath: "handlers/Pdf.cfc", purpose: "pdf tools" } ],
@@ -299,13 +299,7 @@ class extends="testbox.system.BaseSpec" {
 							evidenceBasis: "explicit-seam",
 							evidenceRefs: [ { filePath: "handlers/Pdf.cfc" } ],
 							moduleSlug: "pdf-tools",
-							dependsOnContextIds: [],
-							migrationSteps: [ {
-								order: 1, action: "Move PDF generation into a handler",
-								legacyRef: { filePath: "handlers/Pdf.cfc", symbolName: "generate" },
-								targetRef: { targetPath: "app/handlers/Pdf.bx", methodName: "generate" },
-								note: "Preserve legacy query params"
-							} ]
+							dependsOnContextIds: []
 						} ],
 						extracts: []
 					},
@@ -324,10 +318,86 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.ok ).toBeTrue();
 				var ctx = result.plan.target.contexts.filter( ( item ) => item.id == "ctx-pdf-tools" )[ 1 ];
 				expect( ctx.moduleSlug ).toBe( "pdf-tools" );
-				expect( ctx.migrationSteps ).toHaveLength( 1 );
-				expect( ctx.migrationSteps[ 1 ].legacyRef.filePath ).toBe( "handlers/Pdf.cfc" );
-				expect( ctx.migrationSteps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Pdf.bx" );
 				expect( ctx.itemFingerprint ).notToBeEmpty();
+			} );
+
+			it( "carries roadmap phase migrationSteps through merge/polish unchanged", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [ { id: "pdf-h", targetPath: "app/handlers/Pdf.bx", sourcePath: "handlers/Pdf.cfc", purpose: "pdf tools" } ],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [ {
+						id: "phase-pdf", unitIds: [ "pdf-h" ],
+						migrationSteps: [ {
+							order: 1, action: "Move PDF generation into a handler",
+							legacyRef: { filePath: "handlers/Pdf.cfc", symbolName: "generate" },
+							targetRef: { targetPath: "app/handlers/Pdf.bx", methodName: "generate" },
+							note: "Preserve legacy query params"
+						} ]
+					} ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-roadmap-guide",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var phase = result.plan.roadmapPhases.filter( ( item ) => item.id == "phase-pdf" )[ 1 ];
+				expect( phase.migrationSteps ).toHaveLength( 1 );
+				expect( phase.migrationSteps[ 1 ].legacyRef.filePath ).toBe( "handlers/Pdf.cfc" );
+				expect( phase.migrationSteps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Pdf.bx" );
+				expect( phase.itemFingerprint ).notToBeEmpty();
+			} );
+
+			it( "prunes a non-current phase's sampleIds when currentSliceSamples() drops its sample, instead of leaving a dangling reference", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "u1", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc" },
+							{ id: "u2", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc" }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": {
+						roadmapPhases: [
+							{ id: "phase-a", unitIds: [ "u1" ], currentSlice: true, sampleIds: [ "sample-a" ] },
+							{ id: "phase-b", unitIds: [ "u2" ], currentSlice: false, sampleIds: [ "sample-b" ] }
+						],
+						assumptions: [],
+						samples: [
+							{ id: "sample-a", sampleKind: "app", targetPath: "app/handlers/A.bx", language: "boxlang", code: "component {}" },
+							{ id: "sample-b", sampleKind: "app", targetPath: "app/handlers/B.bx", language: "boxlang", code: "component {}" }
+						]
+					}
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-sample-prune",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				// Only the current slice's sample survives pruning...
+				expect( result.plan.samples.map( ( item ) => item.id ) ).toBe( [ "sample-a" ] );
+				// ...so phase-b must not keep referencing the sample that got pruned.
+				var phaseB = result.plan.roadmapPhases.filter( ( item ) => item.id == "phase-b" )[ 1 ];
+				expect( phaseB.sampleIds ).toBeEmpty();
+				var phaseA = result.plan.roadmapPhases.filter( ( item ) => item.id == "phase-a" )[ 1 ];
+				expect( phaseA.sampleIds ).toBe( [ "sample-a" ] );
 			} );
 
 			it( "synthesizes a mapped roadmap when the provider roadmap is skipped for cost", () => {
