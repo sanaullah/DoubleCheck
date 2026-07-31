@@ -742,6 +742,9 @@
 		let detailContentFp = "";
 		let detailMetaFp = "";
 		let detailPollTimer = null;
+		let anyRunning = false;
+		let idleCycles = 0;
+		let livePollTimer = null;
 		let openSessionIds = new Set();
 		let viewMode = "empty"; // empty | trace | session
 
@@ -1720,6 +1723,7 @@
 					if (!res.ok) throw new Error("sessions failed");
 					const data = await res.json();
 					const rows = Array.isArray(data.sessions) ? data.sessions : [];
+					anyRunning = rows.some((s) => s.status === "running" || (s.traces || []).some((t) => t.status === "running"));
 					const fp = fingerprint(rows, "sessions");
 					if (fp !== listFp) {
 						listFp = fp;
@@ -1736,6 +1740,7 @@
 					if (!res.ok) throw new Error("list failed");
 					const data = await res.json();
 					const rows = Array.isArray(data.traces) ? data.traces : [];
+					anyRunning = rows.some((t) => t.status === "running");
 					const fp = fingerprint(rows, "traces");
 					if (fp !== listFp) {
 						listFp = fp;
@@ -1778,9 +1783,19 @@
 		}
 
 		pollStats();
+		// Poll at the configured cadence only while a trace/session is actually
+		// running. Idle (nothing in flight) backs off up to 20s so an open
+		// AiFlight tab does not hammer the backend indefinitely with no new data.
+		async function livePollTick() {
+			await Promise.all([pollList(), pollStats()]);
+			idleCycles = anyRunning ? 0 : idleCycles + 1;
+			const delayMs = anyRunning
+				? pollSeconds * 1000
+				: Math.min(pollSeconds * 1000 * (2 + idleCycles), 20000);
+			livePollTimer = setTimeout(livePollTick, delayMs);
+		}
 		if (pollSeconds >= 1) {
-			setInterval(pollList, pollSeconds * 1000);
-			setInterval(pollStats, pollSeconds * 1000);
+			livePollTimer = setTimeout(livePollTick, pollSeconds * 1000);
 		}
 		setInterval(() => {
 			hydrateTimes(listEl);

@@ -6,6 +6,8 @@
 class extends="coldbox.system.RestHandler" {
 	property name="securityContextService" inject="SecurityContextService";
 
+	property name="repositoryScannerService" inject="RepositoryScannerService";
+
 	function preHandler(
 		event,
 		rc,
@@ -21,6 +23,43 @@ class extends="coldbox.system.RestHandler" {
 		event.renderData(
 				type = "json",
 				data = { data: securityContextService.projectsFor( prc.securityContext ) }
+			);
+	}
+
+	/**
+	 * Lists reviewable files under a project path for the /review directory
+	 * picker (right-hand file tree). Read-only; does not read file contents.
+	 *
+	 * @tags Projects
+	 * @hint Lists supported source files under a project path for the review file picker
+	 * @param-projectPath { "name":"projectPath", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-mode { "name":"mode", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @response-200 File list for the directory picker
+	 * @response-422 Validation error
+	 */
+	function tree( event, rc, prc ) {
+		securityContextService.authorize( prc.securityContext, "projects:read" );
+		try {
+			var projectPath = securityContextService.authorizeProjectPath(
+					prc.securityContext,
+					rc.projectId ?: "",
+					rc.projectPath ?: ""
+				);
+			var result = repositoryScannerService.listSourceFiles(
+					projectPath = projectPath,
+					mode        = len( trim( rc.mode ?: "" ) ) ? rc.mode : "full"
+				);
+			event.renderData( type = "json", data = { data: result } );
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	private void function validationError( required event, required string message ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 422,
+				data       = { error: { code: "validation_failed", message: arguments.message } }
 			);
 	}
 }

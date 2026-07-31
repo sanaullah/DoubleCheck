@@ -97,6 +97,15 @@ class {
 			candidateResult.paths,
 			arguments.options.priorityExtensions ?: ( arguments.options.modernize ?: false ? [ "cfm", "cfc", "bx", "bxm", "bxs" ] : [] )
 		);
+		// The /review file picker can narrow a scan to a chosen subset; an
+		// empty/omitted list means "scan everything" (existing behavior).
+		var hasFileSelection = isArray( arguments.options.selectedFiles ?: "" ) && arguments.options.selectedFiles.len() > 0;
+		var selectedFileSet = {};
+		if ( hasFileSelection ) {
+			for ( var selectedPath in arguments.options.selectedFiles ) {
+				selectedFileSet[ normalizePath( toString( selectedPath ) ) ] = true;
+			}
+		}
 
 		for ( var candidatePath in prioritizedPaths ) {
 			var extensionHint = lCase( listLast( replace( toString( candidatePath ), "\\", "/", "all" ), "." ) );
@@ -121,6 +130,10 @@ class {
 						.relativize( candidate.toPath() )
 						.toString() );
 				if ( shouldIgnore( relativePath ) ) {
+					skipped.ignored++;
+					continue;
+				}
+				if ( hasFileSelection && !selectedFileSet.keyExists( relativePath ) ) {
 					skipped.ignored++;
 					continue;
 				}
@@ -237,6 +250,64 @@ class {
 			baseRevision      : candidateResult.baseRevision ?: "",
 			headRevision      : candidateResult.headRevision ?: "",
 			repositoryRevision: candidateResult.repositoryRevision ?: "",
+			error             : candidateResult.error ?: ""
+		};
+	}
+
+	/**
+	 * Lightweight file listing for the /review directory picker: same
+	 * discovery/ignore/extension rules as scan(), but skips reading file
+	 * contents so a large repository can be browsed quickly.
+	 */
+	struct function listSourceFiles(
+		required string projectPath,
+		string mode         = "full",
+		string baseRevision = "",
+		string headRevision = "HEAD"
+	) {
+		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
+		var supportedExtensions = supportedLanguageService.extensionMap();
+		var candidateResult = candidatePaths(
+			root,
+			arguments.mode,
+			arguments.baseRevision,
+			arguments.headRevision
+		);
+		var files = [];
+		var seen = {};
+		for ( var candidatePath in candidateResult.paths ) {
+			if ( files.len() >= maxFiles ) {
+				break;
+			}
+			try {
+				var candidate = createObject( "java", "java.io.File" ).init( candidatePath ).getCanonicalFile();
+				var revisionContent = len( candidateResult.contentRevision ?: "" );
+				if ( !candidate.toPath().startsWith( root.toPath() ) || ( !revisionContent && !candidate.isFile() ) ) {
+					continue;
+				}
+				var relativePath = normalizePath( root
+						.toPath()
+						.relativize( candidate.toPath() )
+						.toString() );
+				if ( seen.keyExists( relativePath ) || shouldIgnore( relativePath ) ) {
+					continue;
+				}
+				seen[ relativePath ] = true;
+				var extension = lCase( listLast( relativePath, "." ) );
+				if ( !supportedExtensions.keyExists( extension ) ) {
+					continue;
+				}
+				files.append( { filePath: relativePath, language: supportedExtensions[ extension ] } );
+			} catch (any ignored) {
+				continue;
+			}
+		}
+		files.sort( ( a, b ) => compareNoCase( a.filePath, b.filePath ) );
+		return {
+			files             : files,
+			scope             : candidateResult.scope,
+			gitAvailable      : candidateResult.gitAvailable,
+			discoveryTruncated: candidateResult.discoveryTruncated ?: false,
 			error             : candidateResult.error ?: ""
 		};
 	}

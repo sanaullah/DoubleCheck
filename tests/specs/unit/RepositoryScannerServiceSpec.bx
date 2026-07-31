@@ -17,5 +17,82 @@ class extends="testbox.system.BaseSpec" {
 				expect( ordered[ 4 ] ).toInclude( "vendor.js" );
 			} );
 		} );
+
+		describe( "Repository scanner file picker support", () => {
+			it( "lists supported files without reading their contents", () => {
+				var fixture = createFixture();
+				try {
+					var result = configuredService().listSourceFiles( projectPath = fixture.path );
+					var paths = result.files.map( ( file ) => file.filePath );
+					expect( paths.some( ( path ) => right( path, 11 ) == "src/main.bx" ) ).toBeTrue();
+					expect( paths.some( ( path ) => findNoCase( "/vendor/", "/" & path ) ) ).toBeFalse();
+					expect( result.files[ 1 ] ).notToHaveKey( "content" );
+					expect( result.files[ 1 ] ).notToHaveKey( "contentHash" );
+				} finally {
+					removeFixture( fixture.path );
+				}
+			} );
+
+			it( "narrows a scan to only the selected files when selectedFiles is provided", () => {
+				var fixture = createFixture();
+				try {
+					var service = configuredService();
+					var scoped = service.scan(
+							projectPath = fixture.path,
+							mode        = "full",
+							options     = { selectedFiles: [ "src/main.bx"] }
+						);
+					var scopedPaths = scoped.files.map( ( file ) => file.filePath );
+					expect( scopedPaths ).toInclude( "src/main.bx" );
+					expect( scopedPaths.some( ( path ) => path != "src/main.bx" ) ).toBeFalse();
+
+					var everything = service.scan( projectPath = fixture.path, mode = "full" );
+					expect( everything.files.len() ).toBeGT( scoped.files.len() );
+				} finally {
+					removeFixture( fixture.path );
+				}
+			} );
+		} );
+	}
+
+	private any function configuredService() {
+		var service = new app.models.services.RepositoryScannerService();
+		service.supportedLanguageService = new app.models.services.SupportedLanguageService();
+		service.gitRepositoryService = new app.models.services.GitRepositoryService();
+		service.secretRedactionService = new app.models.services.SecretRedactionService();
+		service.maxFiles = 250;
+		service.maxBytes = 10485760;
+		service.maxFileBytes = 524288;
+		service.maxEntries = 5000;
+		return service;
+	}
+
+	private struct function createFixture() {
+		var path = getTempDirectory() & "doublecheck-scan-" & replace(
+			lCase( createUUID() ),
+			"-",
+			"",
+			"all"
+		);
+		directoryCreate( path & "/src", true, true );
+		directoryCreate( path & "/vendor", true, true );
+		fileWrite( path & "/src/main.bx", "function run() {}" );
+		fileWrite( path & "/src/helper.bx", "function help() {}" );
+		fileWrite( path & "/vendor/secret.bx", "secret" );
+		return {
+			path: path,
+			root: createObject( "java", "java.io.File" ).init( path ).getCanonicalFile()
+		};
+	}
+
+	private void function removeFixture( required string path ) {
+		var canonical = createObject( "java", "java.io.File" ).init( arguments.path ).getCanonicalFile();
+		var tempRoot = createObject( "java", "java.io.File" ).init( getTempDirectory() ).getCanonicalFile();
+		if (
+			canonical.toPath().startsWith( tempRoot.toPath() ) && findNoCase( "doublecheck-scan-", canonical.getName() ) == 1 &&
+				directoryExists( canonical.getPath() )
+		) {
+			directoryDelete( canonical.getPath(), true );
+		}
 	}
 }

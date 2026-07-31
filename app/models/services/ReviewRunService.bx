@@ -76,7 +76,6 @@ class {
 	property name="workerEnabled" inject="coldbox:setting:workerEnabled";
 
 	property name="log" inject="logbox:logger:{this}";
-	property name="applicationErrorLogService" inject="ApplicationErrorLogService";
 	variables.terminalStatuses = [ "succeeded", "partial", "failed", "cancelled"];
 	variables.activeFutures = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
 	variables.activeLeaseTokens = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
@@ -160,6 +159,7 @@ class {
 			};
 		} else {
 			runContract = reviewPolicyService.normalize( arguments.input );
+			runInput = normalizeSelectedFiles( arguments.input.selectedFiles ?: [] );
 		}
 
 		var nowValue = timestamp();
@@ -516,14 +516,19 @@ class {
 				startedAt = timestamp(),
 				eventType = "phase.started"
 			);
+			var runInputForScan = run.getInput() ?: {};
+			var scanOptions = ( lCase( run.getRunKind() ?: "review" ) == "modernize" )
+				? { modernize: true, priorityExtensions: [ "cfm", "cfc", "bx", "bxm", "bxs" ] }
+				: {};
+			if ( isArray( runInputForScan.selectedFiles ?: "" ) && runInputForScan.selectedFiles.len() ) {
+				scanOptions.selectedFiles = runInputForScan.selectedFiles;
+			}
 			var scan = scannerService.scan(
 					projectPath  = run.getProjectPath(),
 					mode         = run.getMode(),
 					baseRevision = run.getBaseRevision(),
 					headRevision = run.getHeadRevision(),
-					options      = ( lCase( run.getRunKind() ?: "review" ) == "modernize" )
-						? { modernize: true, priorityExtensions: [ "cfm", "cfc", "bx", "bxm", "bxs" ] }
-						: {}
+					options      = scanOptions
 				);
 			renewOwnedLease( arguments.runId, arguments.leaseToken );
 			// The repository scan is shared by both workspaces. Persist the
@@ -1003,7 +1008,6 @@ class {
 				return;
 			}
 			var errorReference = lCase( createUUID() );
-			applicationErrorLogService.error( "Review worker run #arguments.runId# failed [#errorReference#]", { errorType: error.type ?: "", message: error.message ?: "", stackTrace: error.stackTrace ?: "" } );
 			runRepository.setErrorReference( arguments.runId, errorReference );
 			log.error(
 					"Review run #arguments.runId# failed (reference #errorReference#)",
@@ -1128,6 +1132,31 @@ class {
 			maxApplicationShards: maxApplicationShards, applicationShardSize: applicationShardSize,
 			applicationShardConcurrency: applicationShardConcurrency
 		};
+	}
+
+	/**
+	 * The right-hand file picker on /review lets a user narrow a scan to a
+	 * subset of the discovered files. An empty/omitted list means "scan
+	 * everything", preserving prior behavior for callers that never send it.
+	 */
+	private struct function normalizeSelectedFiles( required any requested ) {
+		if ( !isArray( arguments.requested ) || !arguments.requested.len() ) {
+			return {};
+		}
+		var normalized = [];
+		var seen = {};
+		for ( var item in arguments.requested ) {
+			var candidate = trim( replace( toString( item ), "\", "/", "all" ) );
+			if ( !len( candidate ) || seen.keyExists( candidate ) ) {
+				continue;
+			}
+			seen[ candidate ] = true;
+			normalized.append( candidate );
+			if ( normalized.len() >= 5000 ) {
+				break;
+			}
+		}
+		return normalized.len() ? { selectedFiles: normalized } : {};
 	}
 
 	private any function transition(

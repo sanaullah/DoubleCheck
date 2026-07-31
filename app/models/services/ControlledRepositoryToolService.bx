@@ -14,6 +14,8 @@ class {
 
 	property name="toolTimeoutMs" inject="coldbox:setting:specialistToolTimeoutMs";
 
+	property name="budgetEnforcementEnabled" inject="coldbox:setting:specialistBudgetEnforcementEnabled";
+
 	property name="secretRedactionService" inject="SecretRedactionService";
 	variables.toolVersion = "controlled-repository-tools-v1";
 	variables.allowedTools = [ "read_indexed_range", "search_indexed_code", "lookup_symbols", "lookup_dependencies", "lookup_tests"];
@@ -159,14 +161,18 @@ class {
 			if ( !variables.allowedTools.contains( normalizedTool ) ) {
 				policyError( "Tool is not allowlisted" );
 			}
-			if ( arguments.toolSession.calls >= arguments.toolSession.callLimit ) {
+			if (
+				isTrue( budgetEnforcementEnabled ) &&
+					arguments.toolSession.calls >= arguments.toolSession.callLimit
+			) {
 				policyError( "Tool call limit reached" );
 			}
 			if (
-				arguments
-					.toolSession
-					.seen
-					.keyExists( signature )
+				isTrue( budgetEnforcementEnabled ) &&
+					arguments
+						.toolSession
+						.seen
+						.keyExists( signature )
 			) {
 				policyError( "Repeated tool call rejected" );
 			}
@@ -474,14 +480,14 @@ class {
 
 	private any function boundOutput( required struct toolSession, required any output ) {
 		var encoded = jsonSerialize( arguments.output );
+		var enforceBudget = isTrue( budgetEnforcementEnabled );
 		var remainingCharacters = arguments.toolSession.outputLimit - arguments.toolSession.outputCharacters;
-		if ( remainingCharacters <= 0 ) {
+		if ( enforceBudget && remainingCharacters <= 0 ) {
 			policyError( "Tool output budget reached" );
 		}
-		var maximumCharacters = min(
-			numericSetting( variables.maxOutputCharacters, 12000 ),
-			remainingCharacters
-		);
+		var maximumCharacters = enforceBudget
+			? min( numericSetting( variables.maxOutputCharacters, 12000 ), remainingCharacters )
+			: numericSetting( variables.maxOutputCharacters, 12000 );
 		if ( len( encoded ) <= maximumCharacters ) {
 			return arguments.output;
 		}
@@ -497,7 +503,7 @@ class {
 			);
 			truncated.output = sliceLength ? left( encoded, sliceLength ) : "";
 		}
-		if ( len( jsonSerialize( truncated ) ) > maximumCharacters ) {
+		if ( enforceBudget && len( jsonSerialize( truncated ) ) > maximumCharacters ) {
 			policyError( "Tool output budget reached" );
 		}
 		return truncated;
@@ -548,6 +554,13 @@ class {
 
 	private numeric function numericSetting( required any value, required numeric fallback ) {
 		return isNumeric( arguments.value ) ? max( 1, int( val( arguments.value ) ) ) : arguments.fallback;
+	}
+
+	private boolean function isTrue( required any value ) {
+		if ( isBoolean( arguments.value ) ) {
+			return arguments.value;
+		}
+		return listFindNoCase( "true,1,yes,on", trim( toString( arguments.value ) ) ) > 0;
 	}
 
 	private string function stableHash( required string value ) {

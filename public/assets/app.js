@@ -42,6 +42,13 @@ const state = {
 	architectureGraph: null,
 	architectureSelectedPath: "",
 	architectureReviewScope: "full",
+	projectTree: {
+		path: "",
+		files: [],
+		selected: new Set(),
+		loading: false,
+		error: ""
+	},
 	history: {
 		page: 1,
 		totalPages: 0,
@@ -1480,6 +1487,14 @@ const elements = {
 	jumpFindings: document.querySelector("#jump-findings-button"),
 	commandExport: document.querySelector("#command-export-button"),
 	commandRunContext: document.querySelector("#command-run-context"),
+	runConfigDetails: document.querySelector("#run-config-details"),
+	runConfigGrid: document.querySelector("#run-config-grid"),
+	projectTreePanel: document.querySelector("#project-tree-panel"),
+	projectTree: document.querySelector("#project-tree"),
+	projectTreeCount: document.querySelector("#project-tree-count"),
+	projectTreeRefresh: document.querySelector("#project-tree-refresh"),
+	projectTreeSelectAll: document.querySelector("#project-tree-select-all"),
+	projectTreeSelectNone: document.querySelector("#project-tree-select-none"),
 	pipelineSteps: document.querySelector("#pipeline-steps"),
 	commandFiles: document.querySelector("#command-files"),
 	commandLanguages: document.querySelector("#command-languages"),
@@ -1603,7 +1618,8 @@ const elements = {
 	providerSaveButton: document.querySelector("#provider-save-button"),
 	providerFormStatus: document.querySelector("#provider-form-status"),
 	runDefaultsForm: document.querySelector("#run-defaults-form"),
-	runDefaultsStatus: document.querySelector("#run-defaults-status")
+	runDefaultsStatus: document.querySelector("#run-defaults-status"),
+	settingsPanel: document.querySelector("#settings-panel")
 };
 
 const reviewPresets = {
@@ -1899,6 +1915,72 @@ function scopeLabel(mode = "") {
 	}[mode] || mode || "—";
 }
 
+function addRunConfigRow(grid, label, value) {
+	if (value === null || value === undefined || value === "") return;
+	const dt = document.createElement("dt");
+	dt.textContent = label;
+	const dd = document.createElement("dd");
+	dd.textContent = value;
+	grid.appendChild(dt);
+	grid.appendChild(dd);
+}
+
+// Renders exactly what was submitted when this run was created, so opening a
+// run from history shows the real values instead of a guessed preset label.
+function renderRunConfig(run) {
+	const details = elements.runConfigDetails;
+	const grid = elements.runConfigGrid;
+	if (!details || !grid) return;
+	grid.innerHTML = "";
+	if (!run) {
+		details.hidden = true;
+		return;
+	}
+	addRunConfigRow(grid, "Project path", run.projectPath);
+	addRunConfigRow(grid, "Scope", scopeLabel(run.mode));
+	if (run.mode === "revision-diff") {
+		addRunConfigRow(grid, "Base revision", run.baseRevision);
+		addRunConfigRow(grid, "Head revision", run.headRevision);
+	}
+	if (run.runKind === "modernize") {
+		const input = run.input || {};
+		const source = input.source || {};
+		const target = input.target || {};
+		const database = input.database || {};
+		const execution = input.execution || {};
+		const schemaPack = input.schemaPack || {};
+		addRunConfigRow(grid, "Source engine", source.engine);
+		addRunConfigRow(grid, "Source version", source.version);
+		addRunConfigRow(grid, "Java version", source.javaVersion);
+		addRunConfigRow(grid, "Target runtime", target.runtime);
+		addRunConfigRow(grid, "Target language", target.language);
+		addRunConfigRow(grid, "Layout profile", target.layoutProfile);
+		addRunConfigRow(grid, "ColdBox major", target.coldboxMajor);
+		addRunConfigRow(grid, "CLI major", target.cliMajor);
+		addRunConfigRow(grid, "Database vendor", database.vendor && database.vendor !== "unknown" ? database.vendor : "");
+		addRunConfigRow(grid, "Database version", database.version);
+		addRunConfigRow(grid, "Database schema", database.schema);
+		addRunConfigRow(grid, "Collation", database.collation);
+		addRunConfigRow(grid, "Timezone", database.timezone);
+		addRunConfigRow(grid, "Schema source", schemaPack.sourceKind);
+		addRunConfigRow(grid, "Provider", execution.provider);
+		addRunConfigRow(grid, "Model", execution.model);
+		addRunConfigRow(grid, "Remote egress acknowledged", input.privacy?.remoteEgressAcknowledged ? "Yes" : "");
+		addRunConfigRow(grid, "Outcomes", Array.isArray(input.outcomes) && input.outcomes.length ? input.outcomes.join(", ") : "");
+	} else {
+		const policy = run.policy || {};
+		addRunConfigRow(grid, "Focus areas", Array.isArray(policy.allowedRoles) && policy.allowedRoles.length ? policy.allowedRoles.join(", ") : "All roles");
+		addRunConfigRow(grid, "Review goal", policy.reviewGoal);
+		addRunConfigRow(grid, "Fast mode", policy.fast ? "Yes" : "");
+	}
+	const budgets = run.budgets || {};
+	addRunConfigRow(grid, "Max tasks", budgets.maxTasks);
+	addRunConfigRow(grid, "Token budget", budgets.maxTokens);
+	addRunConfigRow(grid, "Tokens per task", budgets.maxTokensPerTask);
+	addRunConfigRow(grid, "Max cost ($)", budgets.maxCostUsd);
+	details.hidden = grid.children.length === 0;
+}
+
 function updatePipeline(run) {
 	if (!elements.pipelineSteps) return;
 	const status = run?.status || "Idle";
@@ -1976,6 +2058,9 @@ function updateCommandMetrics(run = state.activeRun) {
 function setRun(run) {
 	const previousRunId = state.activeRun?.id || "";
 	state.activeRun = run;
+	// The file picker is only useful while setting up a new run; once one is
+	// active/finished, the panel gives its space back to progress/results.
+	if (elements.projectTreePanel) elements.projectTreePanel.hidden = !!run;
 	if (run?.runKind) state.workspace = run.runKind === "modernize" ? "modernize" : "review";
 	if (run?.id && run.id !== previousRunId && run.runKind === "modernize") {
 		state.modernization.result = null;
@@ -2023,6 +2108,7 @@ function setRun(run) {
 			? `${run.runKind === "modernize" ? "Modernize" : "Review"} · ${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
 			: `Start a ${state.workspace === "modernize" ? "Modernize plan" : "review"} to monitor its pipeline and evidence.`;
 	}
+	renderRunConfig(run);
 	updatePipeline(run);
 	updateCommandMetrics(run);
 	renderObserveIdentity();
@@ -4687,6 +4773,7 @@ async function applyStartupPreferences() {
 	}
 	updateRevisionFields();
 	updateNewReviewSummary();
+	loadProjectTree();
 	if (elements.preferencesForm) {
 		elements.preferencesForm.elements.defaultPreset.value = defaultPreset;
 		elements.preferencesForm.elements.defaultMode.value = defaultMode;
@@ -5175,6 +5262,17 @@ elements.form?.addEventListener("submit", async (event) => {
 		delete body.maxIterationsPerTask;
 		delete body.maxToolOutputCharacters;
 		delete body.maxCostUsd;
+		// Only restrict the scan when the tree was loaded for THIS exact path
+		// (not stale from a previous path edited without a Refresh) AND the
+		// user actually deselected something — otherwise this stays absent so
+		// scans behave exactly as before the file picker existed.
+		const currentProjectPath = (elements.projectPath?.value || "").trim();
+		if (
+			state.projectTree.path && state.projectTree.path === currentProjectPath &&
+			state.projectTree.files.length && state.projectTree.selected.size < state.projectTree.files.length
+		) {
+			body.selectedFiles = [...state.projectTree.selected];
+		}
 		try {
 			const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(body) });
 			watchRun(payload.data);
@@ -5229,6 +5327,159 @@ elements.form?.querySelectorAll("[name='reviewPreset']").forEach((input) => {
 ].forEach((name) => {
 	elements.form?.elements[name]?.addEventListener("input", updateNewReviewSummary);
 });
+
+// Builds a nested { dirs: Map, files: [] } tree from flat repository-relative
+// paths so the picker can render collapsible folders without the backend
+// having to walk directories twice (once for files, once for structure).
+function buildProjectTreeNode() {
+	return { dirs: new Map(), files: [] };
+}
+
+function insertProjectTreePath(root, filePath) {
+	const segments = filePath.split("/").filter(Boolean);
+	const fileName = segments.pop();
+	let node = root;
+	for (const segment of segments) {
+		if (!node.dirs.has(segment)) node.dirs.set(segment, buildProjectTreeNode());
+		node = node.dirs.get(segment);
+	}
+	node.files.push({ name: fileName, filePath });
+}
+
+function projectTreeCheckedState(node) {
+	const allPaths = [];
+	(function collect(n) {
+		n.files.forEach((f) => allPaths.push(f.filePath));
+		n.dirs.forEach((child) => collect(child));
+	})(node);
+	if (!allPaths.length) return "none";
+	const selectedCount = allPaths.filter((p) => state.projectTree.selected.has(p)).length;
+	if (selectedCount === 0) return "none";
+	if (selectedCount === allPaths.length) return "all";
+	return "some";
+}
+
+function projectTreeAllPaths(node) {
+	const paths = [];
+	(function collect(n) {
+		n.files.forEach((f) => paths.push(f.filePath));
+		n.dirs.forEach((child) => collect(child));
+	})(node);
+	return paths;
+}
+
+function renderProjectTreeNode(node, dirPath, depth) {
+	const dirNames = [...node.dirs.keys()].sort((a, b) => a.localeCompare(b));
+	const sortedFiles = [...node.files].sort((a, b) => a.name.localeCompare(b.name));
+	const dirsHtml = dirNames.map((name) => {
+		const child = node.dirs.get(name);
+		const childPath = dirPath ? `${dirPath}/${name}` : name;
+		const checkedState = projectTreeCheckedState(child);
+		return `<details class="project-tree-dir" open data-dir-path="${escapeHtml(childPath)}">
+			<summary><input type="checkbox" data-dir-toggle="${escapeHtml(childPath)}" ${checkedState === "all" ? "checked" : ""} ${checkedState === "some" ? "data-indeterminate=\"true\"" : ""}> ${escapeHtml(name)}</summary>
+			${renderProjectTreeNode(child, childPath, depth + 1)}
+		</details>`;
+	}).join("");
+	const filesHtml = sortedFiles.map((file) => `<label class="project-tree-file">
+		<input type="checkbox" data-file-toggle="${escapeHtml(file.filePath)}" ${state.projectTree.selected.has(file.filePath) ? "checked" : ""}>
+		${escapeHtml(file.name)}
+	</label>`).join("");
+	return dirsHtml + filesHtml;
+}
+
+function escapeHtml(value) {
+	return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[ch]));
+}
+
+function renderProjectTreeCount() {
+	if (!elements.projectTreeCount) return;
+	const total = state.projectTree.files.length;
+	elements.projectTreeCount.textContent = total ? `${state.projectTree.selected.size} / ${total} selected` : "";
+}
+
+function renderProjectTree() {
+	if (!elements.projectTree) return;
+	renderProjectTreeCount();
+	if (state.projectTree.loading) {
+		elements.projectTree.innerHTML = `<p class="field-hint">Loading files…</p>`;
+		return;
+	}
+	if (state.projectTree.error) {
+		elements.projectTree.innerHTML = `<p class="field-hint" data-tone="danger">${escapeHtml(state.projectTree.error)}</p>`;
+		return;
+	}
+	if (!state.projectTree.files.length) {
+		elements.projectTree.innerHTML = `<p class="field-hint">Enter a project path on the left, then Refresh to preview its files.</p>`;
+		return;
+	}
+	const root = buildProjectTreeNode();
+	state.projectTree.files.forEach((file) => insertProjectTreePath(root, file.filePath));
+	elements.projectTree.innerHTML = renderProjectTreeNode(root, "", 0);
+	elements.projectTree.querySelectorAll("[data-indeterminate]").forEach((el) => { el.indeterminate = true; });
+}
+
+async function loadProjectTree() {
+	const path = (elements.projectPath?.value || "").trim();
+	if (!elements.projectTreePanel) return;
+	if (!path) {
+		state.projectTree = { path: "", files: [], selected: new Set(), loading: false, error: "" };
+		renderProjectTree();
+		return;
+	}
+	state.projectTree.loading = true;
+	state.projectTree.error = "";
+	renderProjectTree();
+	try {
+		const mode = elements.mode?.value || "full";
+		const payload = await request(`/api/v1/projects/tree?projectPath=${encodeURIComponent(path)}&mode=${encodeURIComponent(mode)}`);
+		const files = payload.data?.files || [];
+		state.projectTree = {
+			path,
+			files,
+			selected: new Set(files.map((f) => f.filePath)),
+			loading: false,
+			error: ""
+		};
+	} catch (error) {
+		state.projectTree.loading = false;
+		state.projectTree.error = error.message || "Could not load files for this path.";
+	}
+	renderProjectTree();
+}
+
+elements.projectTreeRefresh?.addEventListener("click", loadProjectTree);
+elements.projectTreeSelectAll?.addEventListener("click", () => {
+	state.projectTree.selected = new Set(state.projectTree.files.map((f) => f.filePath));
+	renderProjectTree();
+});
+elements.projectTreeSelectNone?.addEventListener("click", () => {
+	state.projectTree.selected = new Set();
+	renderProjectTree();
+});
+elements.projectTree?.addEventListener("change", (event) => {
+	const fileToggle = event.target.closest("[data-file-toggle]");
+	if (fileToggle) {
+		const path = fileToggle.getAttribute("data-file-toggle");
+		if (fileToggle.checked) state.projectTree.selected.add(path);
+		else state.projectTree.selected.delete(path);
+		renderProjectTreeCount();
+		return;
+	}
+	const dirToggle = event.target.closest("[data-dir-toggle]");
+	if (dirToggle) {
+		const dirPath = dirToggle.getAttribute("data-dir-toggle");
+		const details = dirToggle.closest("[data-dir-path]");
+		const root = buildProjectTreeNode();
+		state.projectTree.files.forEach((file) => insertProjectTreePath(root, file.filePath));
+		let node = root;
+		dirPath.split("/").filter(Boolean).forEach((segment) => { node = node.dirs.get(segment); });
+		const paths = node ? projectTreeAllPaths(node) : [];
+		if (dirToggle.checked) paths.forEach((p) => state.projectTree.selected.add(p));
+		else paths.forEach((p) => state.projectTree.selected.delete(p));
+		renderProjectTree();
+	}
+});
+elements.projectPath?.addEventListener("change", loadProjectTree);
 
 elements.cancel?.addEventListener("click", async () => {
 	if (!state.activeRun) return;
@@ -5501,9 +5752,19 @@ elements.modernizationExportActions?.addEventListener("click", (event) => {
 
 loadHealth();
 applyStartupPreferences();
-loadProviders();
-loadRunDefaults();
 loadSession();
+// AI providers and run defaults live inside the collapsed Settings <details>
+// on the dashboard. Loading them eagerly on every page load fired two extra
+// requests (including a redundant second /api/v1/app-settings fetch) before
+// the user ever opened that panel. Load once, lazily, on first expand.
+let settingsPanelLoaded = false;
+elements.settingsPanel?.addEventListener("toggle", () => {
+	if (elements.settingsPanel.open && !settingsPanelLoaded) {
+		settingsPanelLoaded = true;
+		loadProviders();
+		loadRunDefaults();
+	}
+});
 renderResult();
 setModernizationWorkspace(state.workspace === "modernize" ? "modernize" : "review");
 selectModernizationPane(state.modernization.activePane);

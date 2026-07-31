@@ -232,6 +232,7 @@ Local-only: no auth, tenants, or hosted production mode.
 | `DOUBLECHECK_SCAN_MAX_FILES` | `250` | Max indexed files |
 | `AI_CONTEXT_WINDOW` | local `8192` / cloud `128000` | Model context window |
 | `DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS` | `30000` | Specialist context-pack budget |
+| `DOUBLECHECK_SPECIALIST_BUDGET_ENFORCEMENT_ENABLED` | `false` | Enforce per-task cost estimate, tool call limit, repeated-call dedup, and tool output cap. Off by default — these were rejecting specialist tasks/tool calls too aggressively |
 
 Raising scan limits indexes more source for deterministic rules. Specialists still receive bounded context packs; raise plan/token/`AI_CONTEXT_WINDOW` knobs separately if prompts hit context errors.
 
