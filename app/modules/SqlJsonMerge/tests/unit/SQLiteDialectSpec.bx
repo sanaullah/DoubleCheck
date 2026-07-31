@@ -1,0 +1,111 @@
+/**
+ * Unit tests for SQLiteDialect
+ * Tests SQLite-specific SQL generation
+ */
+component extends="testbox.system.BaseSpec" {
+
+	function beforeAll() {
+		variables.dialect = new SqlJsonMerge.models.SQLiteDialect();
+	}
+
+	function run() {
+		describe("SQLiteDialect", () => {
+			it("should generate valid GUID SQL", () => {
+				var sql = variables.dialect.generateGUID();
+				expect(sql).toContain("randomblob(16)");
+				expect(sql).toContain("hex");
+				expect(sql).toContain("guid");
+			});
+
+			it("should generate datetime SQL", () => {
+				var sql = variables.dialect.getDatabaseDateTime();
+				expect(sql).toContain("datetime('now')");
+				expect(sql).toContain("dateTime");
+			});
+
+			it("should generate UTC datetime SQL", () => {
+				var sql = variables.dialect.getDatabaseUTCDateTime();
+				expect(sql).toContain("datetime('now', 'utc')");
+				expect(sql).toContain("UTCDateTime");
+			});
+
+			it("should return TEMPORARY TABLE pattern", () => {
+				var pattern = variables.dialect.getTempTableNamePattern();
+				expect(pattern).toBe("TEMPORARY TABLE");
+			});
+
+			it("should generate column metadata query", () => {
+				var parseResult = {table: "users", schema: "main", database: ""};
+				var sql = variables.dialect.getColumnMetadataQuery("users", parseResult);
+				expect(sql).toContain("pragma_table_info");
+				expect(sql).toContain("columnName");
+				expect(sql).toContain("typeName");
+			});
+
+			it("should generate temp table check query", () => {
+				var sql = variables.dialect.getTempTableCheckQuery("tmp_table");
+				expect(sql).toContain("sqlite_master");
+				expect(sql).toContain("tmp_table");
+			});
+
+			it("should generate CREATE TEMPORARY TABLE statement", () => {
+				var columns = [
+					{columnName: "id", typeName: "INTEGER", columnSize: 0, bNullable: false, defaultValue: ""},
+					{columnName: "name", typeName: "VARCHAR", columnSize: 255, bNullable: true, defaultValue: ""}
+				];
+				var sql = variables.dialect.getTempTableCreateSQL("tmp_users", columns);
+				expect(sql).toContain("CREATE TEMPORARY TABLE");
+				expect(sql).toContain("tmp_users");
+				expect(sql).toContain("id");
+				expect(sql).toContain("INTEGER");
+			});
+
+			it("should parse simple table names", () => {
+				var parsed = variables.dialect.parseTableNameComponents("users");
+				expect(parsed.table).toBe("users");
+				expect(parsed.schema).toBe("main");
+				expect(parsed.database).toBe("");
+				expect(parsed.name).toBe("main.users");
+			});
+
+			it("should parse schema.table names", () => {
+				var parsed = variables.dialect.parseTableNameComponents("dbo.users");
+				expect(parsed.table).toBe("users");
+				expect(parsed.schema).toBe("dbo");
+				expect(parsed.database).toBe("");
+				expect(parsed.name).toBe("dbo.users");
+			});
+
+			it("should generate INSERT SQL from JSON", () => {
+				var data = [{id: 1, name: "Alice"}, {id: 2, name: "Bob"}];
+				var columns = {
+					id: {bInJson: true, type: "int", bWriteable: true},
+					name: {bInJson: true, type: "varchar", bWriteable: true}
+				};
+				var sql = variables.dialect.getJsonInsertSQL(data, "users", columns);
+				expect(sql).toContain("INSERT INTO users");
+				expect(sql).toContain("VALUES");
+				expect(sql).toContain("NULL");
+			});
+
+			it("should generate UPSERT SQL from JSON", () => {
+				var data = [{id: 1, name: "Alice"}];
+				var columns = {
+					id: {bInJson: true, type: "int", bWriteable: false},
+					name: {bInJson: true, type: "varchar", bWriteable: true}
+				};
+				var sql = variables.dialect.getJsonMergeSQL(
+					data,
+					"users",
+					["id"],
+					["name"],
+					columns
+				);
+				expect(sql).toContain("INSERT INTO users");
+				expect(sql).toContain("ON CONFLICT");
+				expect(sql).toContain("DO UPDATE SET");
+			});
+		});
+	}
+
+}

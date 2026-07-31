@@ -1,0 +1,184 @@
+/**
+ * SQLite-specific database dialect implementation.
+ * SQLite has limited JSON support and lacks many advanced features of other databases,
+ * but is perfect for local development and single-machine deployments.
+ */
+component extends="DatabaseDialect" accessors=true {
+
+	string function generateGUID() {
+		return "SELECT lower(hex(randomblob(16))) AS guid";
+	}
+
+	string function getDatabaseDateTime() {
+		return "SELECT datetime('now') AS dateTime";
+	}
+
+	string function getDatabaseUTCDateTime() {
+		return "SELECT datetime('now', 'utc') AS UTCDateTime";
+	}
+
+	string function getJsonInsertSQL(
+		required array data,
+		required string tableName,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var sql = "INSERT INTO #tableName# (#getColumnList(columns)#) VALUES ";
+		var rows = [];
+
+		for (var row in data) {
+			var values = [];
+			for (var colName in columns) {
+				if (columns[colName].bInJson) {
+					var val = row[colName] ?: "";
+					values.append(formatValue(val, columns[colName].type));
+				}
+			}
+			rows.append("(" & arrayToList(values, ", ") & ")");
+		}
+
+		sql &= arrayToList(rows, ", ");
+		return sql;
+	}
+
+	string function getJsonMergeSQL(
+		required array data,
+		required string tableName,
+		required array targets,
+		required array updateFields,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var updateCols = updateFields.len() ? updateFields : columns.keyArray().filter((k) => columns[k].bWriteable);
+		var sql = "INSERT INTO #tableName# (#getColumnList(columns)#) VALUES ";
+		var rows = [];
+
+		for (var row in data) {
+			var values = [];
+			for (var colName in columns) {
+				if (columns[colName].bInJson) {
+					var val = row[colName] ?: "";
+					values.append(formatValue(val, columns[colName].type));
+				}
+			}
+			rows.append("(" & arrayToList(values, ", ") & ")");
+		}
+
+		sql &= arrayToList(rows, ", ");
+		sql &= " ON CONFLICT(#arrayToList(targets, ", ")#) DO UPDATE SET ";
+
+		var updates = [];
+		for (var col in updateCols) {
+			if (!targets.find(col)) {
+				updates.append("#col# = excluded.#col#");
+			}
+		}
+
+		sql &= arrayToList(updates, ", ");
+		return sql;
+	}
+
+	string function getColumnMetadataQuery(
+		required string tableName,
+		required struct parseResult
+	) {
+		return "
+			SELECT
+				name AS columnName,
+				type AS typeName,
+				CASE WHEN notnull = 0 THEN 1 ELSE 0 END AS bNullable,
+				CASE WHEN pk > 0 THEN 1 ELSE 0 END AS bAutoIncrement,
+				0 AS bComputed,
+				COALESCE(dflt_value, '') AS defaultValue,
+				0 AS columnSize,
+				0 AS precision,
+				0 AS scale
+			FROM pragma_table_info('#parseResult.table#')
+			ORDER BY cid
+		";
+	}
+
+	string function getTempTableCheckQuery(required string tempTableName) {
+		return "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name='#tempTableName#'";
+	}
+
+	string function getTempTableCreateSQL(
+		required string tableName,
+		required array columns
+	) {
+		var colDefs = [];
+		for (var col in columns) {
+			var def = "[#col.columnName#] #col.typeName#";
+			if (col.typeName contains "varchar" || col.typeName contains "char") {
+				def &= "(#(col.columnSize == -1 ? 'max' : col.columnSize)#)";
+			}
+			def &= " #(col.bNullable ? 'NULL' : 'NOT NULL')#";
+			if (col.defaultValue.len()) {
+				def &= " DEFAULT #col.defaultValue#";
+			}
+			colDefs.append(def);
+		}
+
+		return "CREATE TEMPORARY TABLE #tableName# (#arrayToList(colDefs, ', ')#)";
+	}
+
+	string function getTempTableNamePattern() {
+		return "TEMPORARY TABLE";
+	}
+
+	struct function parseTableNameComponents(required string fullTableName) {
+		var components = {
+			name: arguments.fullTableName,
+			tempName: "tmp_#replace(createUUID(), '-', '_', 'all')#"
+		};
+
+		var dotCount = listLen(fullTableName, ".");
+
+		if (dotCount == 2) {
+			components.schema = listGetAt(fullTableName, 1, ".");
+			components.table = listGetAt(fullTableName, 2, ".");
+			components.database = "";
+			components.name = components.schema & "." & components.table;
+		} else if (dotCount == 1) {
+			components.schema = "main";
+			components.table = listGetAt(fullTableName, 1, ".");
+			components.database = "";
+		} else {
+			components.schema = "main";
+			components.table = fullTableName;
+			components.database = "";
+		}
+
+		components._name = components.name.replace(".", "_", "all");
+		return components;
+	}
+
+	private string function getColumnList(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bInJson) {
+				cols.append("[" & colName & "]");
+			}
+		}
+		return arrayToList(cols, ", ");
+	}
+
+	private string function formatValue(required any val, required string type) {
+		if (val == "") {
+			return "NULL";
+		}
+
+		if (type contains "int" || type contains "decimal" || type contains "float" || type contains "numeric") {
+			return val;
+		}
+
+		if (type contains "date" || type contains "time") {
+			return "'" & val & "'";
+		}
+
+		// String types - escape single quotes
+		var escaped = val.toString().replace("'", "''", "all");
+		return "'" & escaped & "'";
+	}
+
+}

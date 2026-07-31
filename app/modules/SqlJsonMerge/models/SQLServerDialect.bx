@@ -1,0 +1,254 @@
+/**
+ * SQL Server-specific database dialect implementation.
+ * SQL Server has excellent JSON support via OPENJSON and advanced MERGE functionality.
+ * This implementation leverages the original QueryUtility's T-SQL patterns.
+ */
+component extends="DatabaseDialect" accessors=true {
+
+	string function generateGUID() {
+		return "SELECT newid() AS guid";
+	}
+
+	string function getDatabaseDateTime() {
+		return "SELECT getdate() AS dateTime";
+	}
+
+	string function getDatabaseUTCDateTime() {
+		return "SELECT getutcdate() AS UTCDateTime";
+	}
+
+	string function getJsonInsertSQL(
+		required array data,
+		required string tableName,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var sql = "";
+
+		// Handle session context if provided
+		if (!sessionContext.isEmpty()) {
+			sessionContext.each((key, value) => {
+				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & chr(10);
+			});
+		}
+
+		var jsonData = serializeJSON(data);
+
+		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & chr(10);
+		sql &= "INSERT INTO #tableName# (#getSelectColumnList(columns)#)" & chr(10);
+		sql &= "SELECT #getSelectColumnList(columns)#" & chr(10);
+		sql &= "FROM OPENJSON(@jsonData)" & chr(10);
+		sql &= "WITH (#getJsonSchema(columns)#)";
+
+		return sql;
+	}
+
+	string function getJsonMergeSQL(
+		required array data,
+		required string tableName,
+		required array targets,
+		required array updateFields,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var sql = "";
+
+		// Handle session context if provided
+		if (!sessionContext.isEmpty()) {
+			sessionContext.each((key, value) => {
+				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & chr(10);
+			});
+		}
+
+		var jsonData = serializeJSON(data);
+
+		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & chr(10);
+		sql &= "MERGE #tableName# AS TARGET" & chr(10);
+		sql &= "USING (SELECT DISTINCT * FROM OPENJSON(@jsonData) WITH (#getJsonSchema(columns)#)) AS SOURCE" & chr(10);
+		sql &= "ON (#getMergeOnClause(targets)#)" & chr(10);
+
+		// WHEN MATCHED - UPDATE
+		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
+		if (updateCols.len()) {
+			sql &= "WHEN MATCHED THEN UPDATE SET" & chr(10);
+			var updates = updateCols.map((col) => {
+				if (!targets.find(col)) {
+					return "TARGET.[" & col & "] = SOURCE.[" & col & "]";
+				}
+				return "";
+			}).filter((str) => str.len());
+			sql &= arrayToList(updates, "," & chr(10)) & chr(10);
+		}
+
+		// WHEN NOT MATCHED - INSERT
+		var insertCols = getWriteableColumns(columns);
+		sql &= "WHEN NOT MATCHED THEN INSERT (#getQualifiedColumnList(insertCols)#)" & chr(10);
+		sql &= "VALUES (#getSourceColumnList(insertCols)#);";
+
+		return sql;
+	}
+
+	string function getColumnMetadataQuery(
+		required string tableName,
+		required struct parseResult
+	) {
+		// Check if it's a temporary table
+		if (left(parseResult.table, 1) == "#") {
+			return "
+				SELECT
+					c.name AS columnName,
+					t.name AS typeName,
+					c.max_length AS columnSize,
+					c.precision,
+					c.scale,
+					c.is_nullable AS bNullable,
+					c.is_identity AS bAutoIncrement,
+					c.is_computed AS bComputed,
+					ISNULL(dc.definition, '') AS defaultValue
+				FROM tempdb.sys.columns c
+				JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id
+				LEFT JOIN tempdb.sys.default_constraints dc ON c.default_object_id = dc.object_id
+				WHERE c.object_id = OBJECT_ID('tempdb..#parseResult.table#')
+				ORDER BY c.column_id
+			";
+		}
+
+		// Regular table with optional database prefix
+		var dbPrefix = parseResult.database.len() ? parseResult.database & "." : "";
+		var schemaTable = "#dbPrefix##parseResult.schema#.#parseResult.table#";
+
+		return "
+			SELECT
+				c.name AS columnName,
+				t.name AS typeName,
+				c.max_length AS columnSize,
+				c.precision,
+				c.scale,
+				c.is_nullable AS bNullable,
+				c.is_identity AS bAutoIncrement,
+				c.is_computed AS bComputed,
+				ISNULL(dc.definition, '') AS defaultValue
+			FROM #dbPrefix#sys.columns c
+			JOIN #dbPrefix#sys.types t ON c.user_type_id = t.user_type_id
+			LEFT JOIN #dbPrefix#sys.default_constraints dc ON c.default_object_id = dc.object_id
+			WHERE c.object_id = OBJECT_ID('#schemaTable#')
+			ORDER BY c.column_id
+		";
+	}
+
+	string function getTempTableCheckQuery(required string tempTableName) {
+		return "SELECT COUNT(*) AS cnt FROM tempdb.sys.tables WHERE name = '#tempTableName#'";
+	}
+
+	string function getTempTableCreateSQL(
+		required string tableName,
+		required array columns
+	) {
+		var colDefs = [];
+		for (var col in columns) {
+			var def = "[#col.columnName#] #col.typeName#";
+			if (col.typeName contains "char" || col.typeName contains "varchar") {
+				def &= "(#(col.columnSize == -1 ? 'max' : col.columnSize)#)";
+			} else if (col.typeName contains "numeric" || col.typeName contains "decimal") {
+				def &= "(#col.precision#, #col.scale#)";
+			}
+			def &= " NULL";
+			if (col.defaultValue.len()) {
+				def &= " DEFAULT #col.defaultValue#";
+			}
+			colDefs.append(def);
+		}
+
+		return "DROP TABLE IF EXISTS #tableName#; CREATE TABLE #tableName# (#arrayToList(colDefs, ', ')#);";
+	}
+
+	string function getTempTableNamePattern() {
+		return "##";
+	}
+
+	struct function parseTableNameComponents(required string fullTableName) {
+		var components = {
+			name: arguments.fullTableName,
+			tempName: "##table_" & replace(createUUID(), "-", "_", "all")
+		};
+
+		var dotCount = listLen(fullTableName, ".");
+
+		if (dotCount == 3) {
+			components.database = listGetAt(fullTableName, 1, ".");
+			components.schema = listGetAt(fullTableName, 2, ".");
+			components.table = listGetAt(fullTableName, 3, ".");
+		} else if (dotCount == 2) {
+			components.database = "";
+			components.schema = listGetAt(fullTableName, 1, ".");
+			components.table = listGetAt(fullTableName, 2, ".");
+		} else {
+			components.database = (left(fullTableName, 1) == "##") ? "tempdb" : "";
+			components.schema = (left(fullTableName, 1) == "##") ? "" : "dbo";
+			components.table = fullTableName;
+		}
+
+		if (components.database != "") {
+			components.name = components.database & "." & components.schema & "." & components.table;
+		} else if (components.schema != "") {
+			components.name = components.schema & "." & components.table;
+		}
+
+		components._name = components.name.replace(".", "_", "all");
+		return components;
+	}
+
+	private string function getSelectColumnList(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bWriteable) {
+				cols.append("[" & colName & "]");
+			}
+		}
+		return arrayToList(cols, ", ");
+	}
+
+	private string function getJsonSchema(required struct columns) {
+		var schemaParts = [];
+		for (var colName in columns) {
+			var col = columns[colName];
+			if (col.bInJson) {
+				var typeDef = listFirst(col.typeName, " ");
+				if (col.typeName contains "char" || col.typeName contains "varchar") {
+					typeDef &= " (#(col.columnSize == -1 ? 'max' : col.columnSize)#)";
+				} else if (col.typeName contains "numeric" || col.typeName contains "decimal") {
+					typeDef &= " (#col.precision#, #col.scale#)";
+				}
+				schemaParts.append("[" & colName & "] " & typeDef);
+			}
+		}
+		return arrayToList(schemaParts, ", ");
+	}
+
+	private array function getWriteableColumns(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bWriteable && columns[colName].bInJson) {
+				cols.append(colName);
+			}
+		}
+		return cols;
+	}
+
+	private string function getMergeOnClause(required array targets) {
+		var conditions = [];
+		for (var target in targets) {
+			conditions.append("TARGET.[" & target & "] = SOURCE.[" & target & "]");
+		}
+		return arrayToList(conditions, " AND ");
+	}
+
+	private string function getQualifiedColumnList(required array columns) {
+		return arrayToList(columns.map((col) => "[" & col & "]"), ", ");
+	}
+
+	private string function getSourceColumnList(required array columns) {
+		return arrayToList(columns.map((col) => "SOURCE.[" & col & "]"), ", ");
+	}
+
+}

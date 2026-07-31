@@ -1,0 +1,74 @@
+/**
+ * Factory for creating database dialect instances.
+ * Detects the database type from BoxLang datasource configuration
+ * and returns the appropriate dialect implementation.
+ */
+component accessors=true singleton {
+
+	property name="dialectCache" type="struct" default="#{}#";
+
+	/**
+	 * Get the dialect for a specific datasource.
+	 * Caches dialect instances to avoid repeated instantiation.
+	 *
+	 * @param datasourceName Name of the datasource (from boxlang.json)
+	 *
+	 * @return DatabaseDialect implementation instance
+	 */
+	function getDialect(required string datasourceName) {
+		if (dialectCache.keyExists(datasourceName)) {
+			return dialectCache[datasourceName];
+		}
+
+		var dialect = detectAndCreateDialect(datasourceName);
+		dialectCache[datasourceName] = dialect;
+		return dialect;
+	}
+
+	/**
+	 * Detect database type from datasource configuration and create appropriate dialect.
+	 *
+	 * @param datasourceName Name of the datasource to detect
+	 *
+	 * @return DatabaseDialect implementation instance
+	 */
+	private function detectAndCreateDialect(required string datasourceName) {
+		// Get datasource config from BoxLang settings
+		var configService = new coldbox.system.core.services.ConfigService(
+			getPageContext().getServletContext()
+		);
+
+		// Try multiple ways to get the datasource config
+		var config = try {
+			var boxConfig = fileRead(expandPath("/boxlang.json"));
+			var parsed = deserializeJSON(boxConfig);
+			return parsed.datasources[datasourceName] ?: {};
+		} catch (any e) {
+			return {};
+		}
+
+		var driver = config.driver ?: "sqlite";
+
+		switch (driver) {
+			case "sqlserver":
+				return new SqlJsonMerge.models.SQLServerDialect();
+			case "postgresql":
+				return new SqlJsonMerge.models.PostgreSQLDialect();
+			case "mysql":
+				return new SqlJsonMerge.models.MySQLDialect();
+			case "oracle":
+				return new SqlJsonMerge.models.OracleDialect();
+			case "sqlite":
+			default:
+				return new SqlJsonMerge.models.SQLiteDialect();
+		}
+	}
+
+	/**
+	 * Clear the dialect cache. Useful for testing or when configuration changes.
+	 */
+	function clearCache() {
+		dialectCache = {};
+	}
+
+}

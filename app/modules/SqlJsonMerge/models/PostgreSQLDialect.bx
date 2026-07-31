@@ -1,0 +1,188 @@
+/**
+ * PostgreSQL-specific database dialect implementation.
+ * PostgreSQL has strong JSON support via json_to_recordset and powerful UPSERT with ON CONFLICT.
+ */
+component extends="DatabaseDialect" accessors=true {
+
+	string function generateGUID() {
+		return "SELECT gen_random_uuid() AS guid";
+	}
+
+	string function getDatabaseDateTime() {
+		return "SELECT NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'Etc/UTC' AS dateTime";
+	}
+
+	string function getDatabaseUTCDateTime() {
+		return "SELECT NOW() AT TIME ZONE 'UTC' AS UTCDateTime";
+	}
+
+	string function getJsonInsertSQL(
+		required array data,
+		required string tableName,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var jsonData = serializeJSON(data);
+		var colList = getColumnList(columns);
+
+		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
+		sql &= "SELECT #colList#" & chr(10);
+		sql &= "FROM json_to_recordset('#jsonData#'::json) AS t(#getJsonCastList(columns)#)";
+
+		return sql;
+	}
+
+	string function getJsonMergeSQL(
+		required array data,
+		required string tableName,
+		required array targets,
+		required array updateFields,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var jsonData = serializeJSON(data);
+		var colList = getColumnList(columns);
+		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
+
+		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
+		sql &= "SELECT #colList#" & chr(10);
+		sql &= "FROM json_to_recordset('#jsonData#'::json) AS t(#getJsonCastList(columns)#)" & chr(10);
+		sql &= "ON CONFLICT (#arrayToList(targets, ', ')#) DO UPDATE SET" & chr(10);
+
+		var updates = [];
+		for (var col in updateCols) {
+			if (!targets.find(col)) {
+				updates.append("#col# = EXCLUDED.#col#");
+			}
+		}
+
+		sql &= arrayToList(updates, ", ");
+		return sql;
+	}
+
+	string function getColumnMetadataQuery(
+		required string tableName,
+		required struct parseResult
+	) {
+		var schema = parseResult.schema.len() ? parseResult.schema : "public";
+
+		return "
+			SELECT
+				a.attname AS columnName,
+				t.typname AS typeName,
+				a.attlen AS columnSize,
+				CASE WHEN t.typtype = 'n' THEN t.typlen ELSE 0 END AS precision,
+				0 AS scale,
+				NOT a.attnotnull AS bNullable,
+				(a.attidentity != '') AS bAutoIncrement,
+				a.attgenerated != '' AS bComputed,
+				COALESCE(d.adsrc, '') AS defaultValue
+			FROM pg_attribute a
+			JOIN pg_type t ON a.atttypid = t.oid
+			JOIN pg_class c ON a.attrelid = c.oid
+			JOIN pg_namespace n ON c.relnamespace = n.oid
+			LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+			WHERE n.nspname = '#schema#'
+			AND c.relname = '#parseResult.table#'
+			AND a.attnum > 0
+			ORDER BY a.attnum
+		";
+	}
+
+	string function getTempTableCheckQuery(required string tempTableName) {
+		return "SELECT COUNT(*) AS cnt FROM pg_temp.pg_class WHERE relname = '#tempTableName#'";
+	}
+
+	string function getTempTableCreateSQL(
+		required string tableName,
+		required array columns
+	) {
+		var colDefs = [];
+		for (var col in columns) {
+			var def = "#col.columnName# #col.typeName#";
+			if (col.typeName contains "varchar") {
+				def &= "(#(col.columnSize == -1 ? 255 : col.columnSize)#)";
+			} else if (col.typeName contains "numeric" || col.typeName contains "decimal") {
+				def &= "(#col.precision#, #col.scale#)";
+			}
+			def &= " #(col.bNullable ? '' : 'NOT NULL')#";
+			if (col.defaultValue.len()) {
+				def &= " DEFAULT #col.defaultValue#";
+			}
+			colDefs.append(def);
+		}
+
+		return "CREATE TEMPORARY TABLE #tableName# (#arrayToList(colDefs, ', ')#)";
+	}
+
+	string function getTempTableNamePattern() {
+		return "TEMPORARY TABLE";
+	}
+
+	struct function parseTableNameComponents(required string fullTableName) {
+		var components = {
+			name: arguments.fullTableName,
+			tempName: "tmp_" & replace(createUUID(), "-", "_", "all"),
+			database: ""
+		};
+
+		var dotCount = listLen(fullTableName, ".");
+
+		if (dotCount == 2) {
+			components.schema = listGetAt(fullTableName, 1, ".");
+			components.table = listGetAt(fullTableName, 2, ".");
+		} else if (dotCount == 1) {
+			components.schema = "public";
+			components.table = listGetAt(fullTableName, 1, ".");
+		} else {
+			components.schema = "public";
+			components.table = fullTableName;
+		}
+
+		components._name = components.name.replace(".", "_", "all");
+		return components;
+	}
+
+	private string function getColumnList(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bInJson) {
+				cols.append(colName);
+			}
+		}
+		return arrayToList(cols, ", ");
+	}
+
+	private string function getJsonCastList(required struct columns) {
+		var casts = [];
+		for (var colName in columns) {
+			if (columns[colName].bInJson) {
+				var pgType = mapTypeToPostgreSQL(columns[colName].typeName);
+				casts.append("#colName# #pgType#");
+			}
+		}
+		return arrayToList(casts, ", ");
+	}
+
+	private array function getWriteableColumns(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bWriteable && columns[colName].bInJson) {
+				cols.append(colName);
+			}
+		}
+		return cols;
+	}
+
+	private string function mapTypeToPostgreSQL(required string sqlType) {
+		if (sqlType contains "int") return "integer";
+		if (sqlType contains "bigint") return "bigint";
+		if (sqlType contains "decimal" || sqlType contains "numeric") return "numeric";
+		if (sqlType contains "float" || sqlType contains "double") return "double precision";
+		if (sqlType contains "date") return "date";
+		if (sqlType contains "time") return "timestamp";
+		if (sqlType contains "char" || sqlType contains "varchar" || sqlType contains "text") return "text";
+		return "text";
+	}
+
+}

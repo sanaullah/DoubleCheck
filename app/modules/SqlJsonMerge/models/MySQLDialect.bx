@@ -1,0 +1,190 @@
+/**
+ * MySQL-specific database dialect implementation.
+ * MySQL has JSON support via JSON_TABLE and INSERT...ON DUPLICATE KEY UPDATE for UPSERT operations.
+ */
+component extends="DatabaseDialect" accessors=true {
+
+	string function generateGUID() {
+		return "SELECT UUID() AS guid";
+	}
+
+	string function getDatabaseDateTime() {
+		return "SELECT NOW() AS dateTime";
+	}
+
+	string function getDatabaseUTCDateTime() {
+		return "SELECT UTC_TIMESTAMP() AS UTCDateTime";
+	}
+
+	string function getJsonInsertSQL(
+		required array data,
+		required string tableName,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var jsonData = serializeJSON(data);
+		var colList = getColumnList(columns);
+
+		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
+		sql &= "SELECT #colList#" & chr(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
+		sql &= getJsonTableColumns(columns) & chr(10);
+		sql &= ")) AS jt";
+
+		return sql;
+	}
+
+	string function getJsonMergeSQL(
+		required array data,
+		required string tableName,
+		required array targets,
+		required array updateFields,
+		required struct columns,
+		struct sessionContext = {}
+	) {
+		var jsonData = serializeJSON(data);
+		var colList = getColumnList(columns);
+		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
+
+		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
+		sql &= "SELECT #colList#" & chr(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
+		sql &= getJsonTableColumns(columns) & chr(10);
+		sql &= ")) AS jt" & chr(10);
+		sql &= "ON DUPLICATE KEY UPDATE" & chr(10);
+
+		var updates = [];
+		for (var col in updateCols) {
+			if (!targets.find(col)) {
+				updates.append("#col# = VALUES(#col#)");
+			}
+		}
+
+		sql &= arrayToList(updates, ", ");
+		return sql;
+	}
+
+	string function getColumnMetadataQuery(
+		required string tableName,
+		required struct parseResult
+	) {
+		var database = parseResult.database.len() ? parseResult.database : "DATABASE()";
+
+		return "
+			SELECT
+				COLUMN_NAME AS columnName,
+				DATA_TYPE AS typeName,
+				COALESCE(CHARACTER_MAXIMUM_LENGTH, 0) AS columnSize,
+				COALESCE(NUMERIC_PRECISION, 0) AS precision,
+				COALESCE(NUMERIC_SCALE, 0) AS scale,
+				CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END AS bNullable,
+				CASE WHEN EXTRA LIKE '%auto_increment%' THEN 1 ELSE 0 END AS bAutoIncrement,
+				CASE WHEN EXTRA LIKE '%generated%' THEN 1 ELSE 0 END AS bComputed,
+				COALESCE(COLUMN_DEFAULT, '') AS defaultValue
+			FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA = #database#
+			AND TABLE_NAME = '#parseResult.table#'
+			ORDER BY ORDINAL_POSITION
+		";
+	}
+
+	string function getTempTableCheckQuery(required string tempTableName) {
+		return "SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '#tempTableName#' AND TABLE_SCHEMA = DATABASE()";
+	}
+
+	string function getTempTableCreateSQL(
+		required string tableName,
+		required array columns
+	) {
+		var colDefs = [];
+		for (var col in columns) {
+			var def = "`#col.columnName#` #col.typeName#";
+			if (col.typeName contains "varchar" || col.typeName contains "char") {
+				def &= "(#(col.columnSize == -1 ? 255 : col.columnSize)#)";
+			} else if (col.typeName contains "numeric" || col.typeName contains "decimal") {
+				def &= "(#col.precision#, #col.scale#)";
+			}
+			def &= " #(col.bNullable ? '' : 'NOT NULL')#";
+			if (col.defaultValue.len()) {
+				def &= " DEFAULT #col.defaultValue#";
+			}
+			colDefs.append(def);
+		}
+
+		return "CREATE TEMPORARY TABLE `#tableName#` (#arrayToList(colDefs, ', ')#)";
+	}
+
+	string function getTempTableNamePattern() {
+		return "TEMPORARY TABLE";
+	}
+
+	struct function parseTableNameComponents(required string fullTableName) {
+		var components = {
+			name: arguments.fullTableName,
+			tempName: "tmp_" & replace(createUUID(), "-", "_", "all"),
+			database: ""
+		};
+
+		var dotCount = listLen(fullTableName, ".");
+
+		if (dotCount == 2) {
+			components.database = listGetAt(fullTableName, 1, ".");
+			components.table = listGetAt(fullTableName, 2, ".");
+			components.schema = "";
+		} else if (dotCount == 1) {
+			components.database = "";
+			components.schema = "";
+			components.table = listGetAt(fullTableName, 1, ".");
+		} else {
+			components.database = "";
+			components.schema = "";
+			components.table = fullTableName;
+		}
+
+		components._name = components.name.replace(".", "_", "all");
+		return components;
+	}
+
+	private string function getColumnList(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bInJson) {
+				cols.append("`" & colName & "`");
+			}
+		}
+		return arrayToList(cols, ", ");
+	}
+
+	private string function getJsonTableColumns(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bInJson) {
+				var mysqlType = mapTypeToMySQL(columns[colName].typeName);
+				cols.append("`" & colName & "` " & mysqlType & " PATH '$." & colName & "'");
+			}
+		}
+		return arrayToList(cols, ", " & chr(10));
+	}
+
+	private array function getWriteableColumns(required struct columns) {
+		var cols = [];
+		for (var colName in columns) {
+			if (columns[colName].bWriteable && columns[colName].bInJson) {
+				cols.append(colName);
+			}
+		}
+		return cols;
+	}
+
+	private string function mapTypeToMySQL(required string sqlType) {
+		if (sqlType contains "bigint") return "BIGINT";
+		if (sqlType contains "int") return "INT";
+		if (sqlType contains "decimal" || sqlType contains "numeric") return "DECIMAL";
+		if (sqlType contains "float" || sqlType contains "double") return "DOUBLE";
+		if (sqlType contains "date") return "DATE";
+		if (sqlType contains "time") return "TIMESTAMP";
+		if (sqlType contains "char" || sqlType contains "varchar" || sqlType contains "text") return "VARCHAR(255)";
+		return "VARCHAR(255)";
+	}
+
+}

@@ -1,0 +1,342 @@
+/**
+ * JsonMerge Service - Multi-database JSON merge and insert operations.
+ * Moved and refactored from app/models/services/QueryUtility.cfc
+ * Now uses database dialects for SQL Server, PostgreSQL, Oracle, MySQL, and SQLite compatibility.
+ */
+component singleton accessors=true {
+
+	property name="dialectFactory" inject="DatabaseDialectFactory@SqlJsonMerge.models";
+
+	/**
+	 * Query execution with retry logic for transient failures.
+	 * Retries up to 5 times for deadlocks, timeouts, and connection resets.
+	 */
+	function qe(
+		required string sql,
+		struct bindings = {},
+		struct options = {},
+		numeric count = 1
+	) {
+		var retryLimit = 5;
+
+		try {
+			return queryExecute(arguments.sql, arguments.bindings, arguments.options);
+		} catch (any error) {
+			if (
+				(error.message contains "deadlock" || error.message contains "timed out" || error.message contains "Connection reset") &&
+				arguments.count <= retryLimit
+			) {
+				sleep(1000);
+				return qe(arguments.sql, arguments.bindings, arguments.options, arguments.count + 1);
+			}
+			rethrow;
+		}
+	}
+
+	/**
+	 * Converts a query object to an array of structs.
+	 * Each row becomes an ordered struct in the result array.
+	 */
+	array function queryToArrayOfStructs(required any q) {
+		var queryColumns = getMetadata(arguments.q).map(function (item) {
+			return item.name;
+		});
+
+		return queryReduce(
+			arguments.q,
+			function (results, row) {
+				var rowData = structNew("ordered");
+				for (var column in queryColumns) {
+					rowData[column] = row[column];
+				}
+				results.append(rowData);
+				return results;
+			},
+			[]
+		);
+	}
+
+	/**
+	 * Bulk insert JSON data into a table using the appropriate database dialect.
+	 * Generates and executes database-specific INSERT SQL.
+	 */
+	struct function jsonInsert(
+		required array data,
+		required string tableName,
+		boolean bReturnSQL = false,
+		string datasource = "",
+		struct sessionContext = {}
+	) {
+		if ((isStruct(arguments.data) && arguments.data.isEmpty()) || len(arguments.data) == 0) {
+			return false;
+		}
+
+		var tickCountDB = getTickCount();
+		var queryOptions = {result: "result"};
+
+		if (datasource.len()) {
+			queryOptions.datasource = arguments.datasource;
+		}
+
+		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
+		var columns = columnData(arguments.tableName, arguments.datasource);
+		var jsonData = cleanJsonData(arguments.data, columns);
+
+		columns = columns.filter((k, c) => {
+			return c.bInJson;
+		});
+
+		var sql = dialect.getJsonInsertSQL(
+			data = arguments.data,
+			tableName = arguments.tableName,
+			columns = columns,
+			sessionContext = sessionContext
+		);
+
+		var build = ((getTickCount() - tickCountDB) / 1000);
+
+		if (bReturnSQL) {
+			return sql;
+		}
+
+		tickCountDB = getTickCount();
+		var queryOut = {query: qe(sql, {}, queryOptions)};
+		var execute = ((getTickCount() - tickCountDB) / 1000);
+
+		queryOut.timing = {
+			build: build,
+			execute: execute,
+			message: "(#numberFormat(data.len(), "9,999,999")# record#((data.len() == 1) ? "" : "s")#) || Build SQL: " & build & " || DB Execution: " & execute
+		};
+		queryOut.result = result;
+
+		return queryOut;
+	}
+
+	/**
+	 * UPSERT (INSERT/UPDATE) JSON data using the appropriate database dialect.
+	 * Handles matching on key columns and updating specified fields on match.
+	 */
+	struct function jsonMerge(
+		required array data,
+		required string tableName,
+		required array targets = [],
+		required array update = [],
+		boolean bDelete = false,
+		boolean bReturnSQL = false,
+		string datasource = "",
+		struct sessionContext = {},
+		string deleteClause = ""
+	) {
+		if ((isStruct(arguments.data) && arguments.data.isEmpty()) || arguments.data.len() == 0) {
+			return false;
+		}
+
+		var tickCountDB = getTickCount();
+		var queryOptions = {result: "result"};
+
+		if (datasource.len()) {
+			queryOptions.datasource = arguments.datasource;
+		}
+
+		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
+		var columns = columnData(arguments.tableName, arguments.datasource);
+		var jsonData = cleanJsonData(arguments.data, columns);
+
+		// Fix case for provided targets
+		var matchTargets = [];
+		arguments.targets.each((item) => {
+			return matchTargets.append(columns[item].name);
+		});
+
+		arguments.targets = matchTargets;
+
+		columns = columns.filter((k, c) => {
+			return c.bInJson;
+		});
+
+		var sql = dialect.getJsonMergeSQL(
+			data = arguments.data,
+			tableName = arguments.tableName,
+			targets = arguments.targets,
+			updateFields = arguments.update,
+			columns = columns,
+			sessionContext = sessionContext
+		);
+
+		var build = ((getTickCount() - tickCountDB) / 1000);
+
+		if (bReturnSQL) {
+			return sql;
+		}
+
+		tickCountDB = getTickCount();
+		var queryOut = {query: qe(sql, {}, queryOptions)};
+		var execute = ((getTickCount() - tickCountDB) / 1000);
+
+		queryOut.timing = {
+			build: build,
+			execute: execute,
+			message: "#numberFormat(data.len(), "9,999,999")# record#((data.len() == 1) ? "" : "s")# to #arguments.tableName# || Build SQL: " & build & " || DB Execution: " & execute
+		};
+
+		queryOut.result = result;
+
+		return queryOut;
+	}
+
+	/**
+	 * Retrieve column metadata for a table.
+	 * Returns detailed column information including type, size, nullable status, etc.
+	 */
+	struct function columnData(required string tableName, string datasource = "") {
+		var base = dbInfo(type="columns", table=arguments.tableName, datasource=arguments.datasource);
+
+		return base
+			.sort((a, b) => {
+				return compare(a.columnName, b.columnName);
+			})
+			.reduce((o, column) => {
+				o[column.columnName] = {
+					name: column.columnName,
+					type: column.typeName,
+					bNullable: column.bNullable,
+					bWriteable: !column.bAutoIncrement && !column.bComputed,
+					typeString: listFirst(column.typeName, " ") &
+						((column.typeName contains "char")
+							? " (#(column.columnSize == -1 ? 'max' : column.columnSize)#)"
+							: (column.typeName == "decimal")
+							? "(#column.precision#, #column.scale#)"
+							: ""),
+					qualified: chr(9) & "[" & column.columnName & "] " & "," & chr(10)
+				};
+				o[column.columnName].withType = chr(9) & "[" & o[column.columnName].name & "] " & o[column.columnName].typeString & "," & chr(10);
+				return o;
+			}, {});
+	}
+
+	/**
+	 * Clean and prepare JSON data for database operations.
+	 * Handles type conversions, null handling, quote escaping, and column validation.
+	 */
+	string function cleanJsonData(required array json, required struct columnData) {
+		var incomingColumns = json[1].keyArray();
+		var verifyColumns = [];
+
+		columnData = columnData.map((k, v) => {
+			v.bInJson = incomingColumns.findNoCase(k) > 0;
+			return v;
+		});
+
+		// Catch any mismatch/spelling corrections
+		incomingColumns.each((item) => {
+			if (!structKeyExists(columnData, item)) {
+				verifyColumns.append(item);
+			}
+		}, true);
+
+		if (verifyColumns.len()) {
+			throw(message="Following columns don't match with DB Schema " & verifyColumns.toList());
+		}
+
+		// Filter out only columns which exist in json
+		columnData = columnData.filter((k, v) => {
+			return v.bInJson > 0;
+		}, true);
+
+		var tier1 = json[1]
+			.reduce((o, k, v) => {
+				return o & columnData[k].name & ": " & ((isStruct(v)) ? 'out["#k#"].value' : 'out["#k#"]') & ", ";
+			}, "{ ")
+			.left(-2) & " }";
+
+		var tier2 = columnData
+			.reduce((o, k, v) => {
+				return o &
+					k &
+					": " &
+					(
+						(v.type contains "date")
+							? 'dateTimeFormat( out["#k#"], "yyyy-mm-dd HH:nn:ss" )'
+							: (v.type contains "char" || v.type contains "text")
+							? 'replace( out["#k#"], "''", "''''", "all" )'
+							: (["int", "bigint", "float", "smallint", "tinyint"].find(v.type))
+							? '( isInstanceOf( out["#k#"], "java.lang.Boolean" ) ? ( out["#k#"] ? 1 : 0 ) : val( out["#k#"] ) )'
+							: (["bit"].find(v.type))
+							? 'val((( out["#k#"].toString().len() && out["#k#"] ) ? 1 : 0))'
+							: 'out["#k#"]'
+					) & ", ";
+			}, "{ ")
+			.left(-2) & " }";
+
+		var tier3 = columnData
+			.reduce((o, k, v) => {
+				return o &
+					k &
+					": " &
+					((v.bNullable) ? '(( out["#k#"].toString().trim().len() ) ? out["#k#"] : javacast( "null", out["#k#"] ))' : 'out["#k#"]') &
+					", ";
+			}, "{ ")
+			.left(-2) & " }";
+
+		var cleanJson = arguments.json.map((row) => {
+			var out = duplicate(row);
+			out = evaluate(tier1);
+			out = evaluate(tier2);
+			out = evaluate(tier3);
+			return out;
+		}, true);
+
+		arguments.json = "";
+
+		return serializeJSON(cleanJson);
+	}
+
+	/**
+	 * Get comprehensive database information (tables or columns).
+	 * Uses the appropriate dialect to generate database-specific queries.
+	 */
+	function dbInfo(
+		required string type,
+		string table = "",
+		string dbname = "",
+		string datasource = ""
+	) {
+		if (type == "tables" && (isNull(dbname) || dbname == "")) {
+			throw(type="Database", message="Database name must be provided for type='tables'.");
+		}
+
+		var parsedTable = {};
+		if (!isNull(table) && table != "") {
+			parsedTable = parseTableName(table);
+		}
+
+		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
+		var queryStr = "";
+		var queryOptions = {};
+
+		if (type == "tables") {
+			queryStr = "SELECT TABLE_CATALOG AS tableCatalog, TABLE_SCHEMA AS tableSchema, TABLE_NAME AS tableName, TABLE_TYPE AS tableType FROM #dbname#.INFORMATION_SCHEMA.TABLES";
+		} else if (type == "columns" && !isNull(table) && table != "") {
+			queryStr = dialect.getColumnMetadataQuery(table, parsedTable);
+		} else {
+			throw(type="Database", message="Invalid type or missing table name.");
+		}
+
+		if (!isNull(datasource) && datasource != "" && datasource != "default") {
+			queryOptions.datasource = datasource;
+		}
+
+		return queryExecute(queryStr, [], queryOptions);
+	}
+
+	/**
+	 * Parse a fully qualified table name into its components.
+	 * Handles database.schema.table format and database-specific defaults.
+	 */
+	struct function parseTableName(required string fullTableName) {
+		var dialect = dialectFactory.getDialect("doublecheck");
+		return dialect.parseTableNameComponents(fullTableName);
+	}
+
+}
