@@ -8,6 +8,8 @@ class {
 
 	property name="filterService" inject="FilterService@aiFlight";
 
+	property name="searchService" inject="SearchService@aiFlight";
+
 	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
 
 	function preHandler( event, rc, prc ) {
@@ -367,6 +369,113 @@ class {
 		};
 		var stats = filterService.getCohortStats( filters1, filters2 );
 		event.renderData( type = "json", data = stats );
+	}
+
+	function apiSearch( event, rc, prc ) {
+		var query = trim( rc.q ?: "" );
+		if ( !len( query ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_q" },
+					statusCode = 400
+				);
+			return;
+		}
+		var limit = int( val( rc.limit ?: 50 ) );
+		var offset = int( val( rc.offset ?: 0 ) );
+		var results = searchService.search( query, { limit: limit, offset: offset } );
+		event.renderData( type = "json", data = results );
+	}
+
+	function apiSearchSuggestions( event, rc, prc ) {
+		var prefix = trim( rc.prefix ?: "" );
+		if ( !len( prefix ) ) {
+			event.renderData( type = "json", data = { suggestions: [] } );
+			return;
+		}
+		var limit = int( val( rc.limit ?: 10 ) );
+		var suggestions = searchService.getSearchSuggestions( prefix, limit );
+		event.renderData( type = "json", data = { suggestions: suggestions } );
+	}
+
+	function apiSaveSearchQuery( event, rc, prc ) {
+		var name = trim( rc.name ?: "" );
+		var query = trim( rc.q ?: "" );
+		if ( !len( name ) || !len( query ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_name_or_q" },
+					statusCode = 400
+				);
+			return;
+		}
+		var result = searchService.saveSearchQuery( name, query );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiRecentSearches( event, rc, prc ) {
+		var limit = int( val( rc.limit ?: 5 ) );
+		var searches = searchService.getRecentSearches( limit );
+		event.renderData( type = "json", data = { searches: searches } );
+	}
+
+	function apiObservationFeedback( event, rc, prc ) {
+		var method = uCase( event.getHTTPMethod() );
+		var obsId = trim( rc.obsId ?: rc.id ?: "" );
+
+		if ( !len( obsId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_obsId" },
+					statusCode = 400
+				);
+			return;
+		}
+
+		if ( method == "PUT" || method == "POST" ) {
+			var body = {};
+			try {
+				body = event.getHTTPContent( json = true );
+			} catch (any e) {
+				body = rc;
+			}
+
+			var rating = int( val( body.rating ?: rc.rating ?: 0 ) );
+			var feedback = toString( body.feedback ?: rc.feedback ?: "" );
+			var signal = toString( body.signal ?: rc.signal ?: "" );
+
+			// Signal types: copied, resubmitted, time_spent, quality_issue, helpful
+			if ( rating >= 1 && rating <= 5 ) {
+				// Store rating feedback
+				store.upsertObservationFeedback( obsId, rating, feedback, signal );
+			}
+
+			event.renderData( type = "json", data = { success: true } );
+			return;
+		}
+
+		if ( method == "DELETE" ) {
+			store.clearObservationFeedback( obsId );
+			event.renderData( type = "json", data = {}, statusCode = 204 );
+			return;
+		}
+
+		event.renderData(
+				type       = "json",
+				data       = { error: "method_not_allowed" },
+				statusCode = 405
+			);
+	}
+
+	function apiFeedbackStats( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		if ( len( traceId ) ) {
+			var stats = store.getTraceFeedbackStats( traceId );
+			event.renderData( type = "json", data = stats );
+		} else {
+			var globalStats = store.getGlobalFeedbackStats();
+			event.renderData( type = "json", data = globalStats );
+		}
 	}
 
 	private boolean function flag( required any value ) {
