@@ -3,11 +3,12 @@
  * Each concrete implementation handles the nuances of a specific database system
  * (SQL Server, PostgreSQL, MySQL, Oracle, SQLite).
  */
-component abstract accessors=true {
+abstract class {
 
 	/**
 	 * Returns the SQL function to generate a database-specific GUID/UUID.
 	 * Must be executable with queryExecute() to retrieve a generated ID.
+	 * The result column must be aliased "guid".
 	 * Example: NEWID() for SQL Server, gen_random_uuid() for PostgreSQL
 	 *
 	 * @return The SQL function call that generates a GUID
@@ -17,6 +18,7 @@ component abstract accessors=true {
 	/**
 	 * Returns the SQL function to get the current database datetime in the database's timezone.
 	 * Must be executable with queryExecute() to retrieve the current datetime.
+	 * The result column must be aliased "dateTime".
 	 * Example: GETDATE() for SQL Server, NOW() for PostgreSQL
 	 *
 	 * @return The SQL function call that returns current datetime
@@ -26,6 +28,7 @@ component abstract accessors=true {
 	/**
 	 * Returns the SQL function to get the current database datetime in UTC.
 	 * Must be executable with queryExecute() to retrieve the current UTC datetime.
+	 * The result column must be aliased "UTCDateTime".
 	 * Example: GETUTCDATE() for SQL Server, NOW() AT TIME ZONE 'UTC' for PostgreSQL
 	 *
 	 * @return The SQL function call that returns current UTC datetime
@@ -36,9 +39,13 @@ component abstract accessors=true {
 	 * Generates database-specific SQL for inserting JSON data into a table.
 	 * This is the complex operation that differs significantly across databases.
 	 *
-	 * @param data Array of structs to insert
+	 * @param data Array of structs to insert (raw, for row counts / dialects that build literal SQL)
 	 * @param tableName Target table name
 	 * @param columns Struct of column metadata with type information
+	 * @param jsonData Pre-cleaned, SQL-string-safe JSON representation of data (quotes already escaped).
+	 *                 Dialects that embed JSON text inside a SQL string literal MUST use this value
+	 *                 instead of re-serializing `data`, since it has already been escaped for safe
+	 *                 embedding by JsonMerge.cleanJsonData().
 	 * @param sessionContext Optional session context variables (SQL Server: sp_set_session_context)
 	 *
 	 * @return Complete INSERT SQL statement for the JSON data
@@ -47,6 +54,7 @@ component abstract accessors=true {
 		required array data,
 		required string tableName,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	);
 
@@ -54,11 +62,13 @@ component abstract accessors=true {
 	 * Generates database-specific SQL for UPSERT (INSERT/UPDATE) operations using JSON data.
 	 * Implements MERGE (SQL Server/Oracle) or INSERT...ON CONFLICT/DUPLICATE KEY UPDATE (other DBs).
 	 *
-	 * @param data Array of structs to merge
+	 * @param data Array of structs to merge (raw, for row counts / dialects that build literal SQL)
 	 * @param tableName Target table name
 	 * @param targets Array of column names that define uniqueness
 	 * @param updateFields Array of column names to update on match (empty = update all)
 	 * @param columns Struct of column metadata with type information
+	 * @param jsonData Pre-cleaned, SQL-string-safe JSON representation of data (quotes already escaped).
+	 *                 See getJsonInsertSQL for details.
 	 * @param sessionContext Optional session context variables
 	 *
 	 * @return Complete MERGE/UPSERT SQL statement for the JSON data
@@ -69,6 +79,7 @@ component abstract accessors=true {
 		required array targets,
 		required array updateFields,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	);
 
@@ -85,6 +96,16 @@ component abstract accessors=true {
 		required string tableName,
 		required struct parseResult
 	);
+
+	/**
+	 * Returns SQL query to list tables within a given database/catalog.
+	 * Must return columns: tableCatalog, tableSchema, tableName, tableType
+	 *
+	 * @param dbname Database/catalog name to list tables for
+	 *
+	 * @return SQL query that lists tables
+	 */
+	abstract string function getTableListQuery(required string dbname);
 
 	/**
 	 * Returns SQL query to check if a temporary table exists.

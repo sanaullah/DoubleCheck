@@ -3,7 +3,7 @@
  * Oracle has MERGE support (similar to SQL Server) and JSON capabilities via json_table.
  * Oracle 12c+ recommended for JSON support.
  */
-component extends="DatabaseDialect" accessors=true {
+class extends="DatabaseDialect" {
 
 	string function generateGUID() {
 		return "SELECT SYS_GUID() AS guid FROM dual";
@@ -21,16 +21,16 @@ component extends="DatabaseDialect" accessors=true {
 		required array data,
 		required string tableName,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
 		// Oracle JSON support via json_table (12c+)
-		var jsonData = serializeJSON(data);
 		var colList = getColumnList(columns);
 
-		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
-		sql &= "SELECT #colList#" & chr(10);
-		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
-		sql &= getJsonTableColumns(columns) & chr(10);
+		var sql = "INSERT INTO #tableName# (#colList#)" & char(10);
+		sql &= "SELECT #colList#" & char(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & char(10);
+		sql &= getJsonTableColumns(columns) & char(10);
 		sql &= ") jt";
 
 		return sql;
@@ -42,33 +42,33 @@ component extends="DatabaseDialect" accessors=true {
 		required array targets,
 		required array updateFields,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
-		var jsonData = serializeJSON(data);
 		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
 
-		var sql = "MERGE INTO #tableName# t" & chr(10);
-		sql &= "USING (SELECT " & getSelectColumns(columns) & chr(10);
-		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
-		sql &= getJsonTableColumns(columns) & chr(10);
-		sql &= ")) s" & chr(10);
-		sql &= "ON (#getMergeOnClause(targets)#)" & chr(10);
+		var sql = "MERGE INTO #tableName# t" & char(10);
+		sql &= "USING (SELECT " & getSelectColumns(columns) & char(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & char(10);
+		sql &= getJsonTableColumns(columns) & char(10);
+		sql &= ")) s" & char(10);
+		sql &= "ON (#getMergeOnClause(targets)#)" & char(10);
 
 		// WHEN MATCHED - UPDATE
 		if (updateCols.len()) {
-			sql &= "WHEN MATCHED THEN UPDATE SET" & chr(10);
+			sql &= "WHEN MATCHED THEN UPDATE SET" & char(10);
 			var updates = updateCols.map((col) => {
 				if (!targets.find(col)) {
 					return "t.#col# = s.#col#";
 				}
 				return "";
 			}).filter((str) => str.len());
-			sql &= arrayToList(updates, ", " & chr(10)) & chr(10);
+			sql &= arrayToList(updates, ", " & char(10)) & char(10);
 		}
 
 		// WHEN NOT MATCHED - INSERT
 		var insertCols = getWriteableColumns(columns);
-		sql &= "WHEN NOT MATCHED THEN INSERT (#arrayToList(insertCols, ', ')#)" & chr(10);
+		sql &= "WHEN NOT MATCHED THEN INSERT (#arrayToList(insertCols, ', ')#)" & char(10);
 		sql &= "VALUES (#arrayToList(insertCols.map((col) => "s.#col#"), ", ")#)";
 
 		return sql;
@@ -78,8 +78,28 @@ component extends="DatabaseDialect" accessors=true {
 		required string tableName,
 		required struct parseResult
 	) {
-		var owner = parseResult.schema.len() ? parseResult.schema : "USER";
-		var tableRef = owner.len() ? owner & ".#parseResult.table#" : parseResult.table;
+		var hasExplicitSchema = parseResult.schema.len() && parseResult.schema != "PUBLIC";
+
+		// When no explicit schema is given, query the current user's own columns via
+		// USER_TAB_COLUMNS rather than filtering ALL_TAB_COLUMNS by the literal string
+		// "USER" (which does not resolve to the connected schema name).
+		if (!hasExplicitSchema) {
+			return "
+				SELECT
+					COLUMN_NAME AS columnName,
+					DATA_TYPE AS typeName,
+					DATA_LENGTH AS columnSize,
+					DATA_PRECISION AS precision,
+					DATA_SCALE AS scale,
+					NULLABLE AS bNullable,
+					VIRTUAL_COLUMN AS bAutoIncrement,
+					0 AS bComputed,
+					DEFAULT_LENGTH AS defaultValue
+				FROM USER_TAB_COLUMNS
+				WHERE TABLE_NAME = UPPER('#parseResult.table#')
+				ORDER BY COLUMN_ID
+			";
+		}
 
 		return "
 			SELECT
@@ -94,8 +114,20 @@ component extends="DatabaseDialect" accessors=true {
 				DEFAULT_LENGTH AS defaultValue
 			FROM ALL_TAB_COLUMNS
 			WHERE TABLE_NAME = UPPER('#parseResult.table#')
-			AND OWNER = UPPER('#owner#')
+			AND OWNER = UPPER('#parseResult.schema#')
 			ORDER BY COLUMN_ID
+		";
+	}
+
+	string function getTableListQuery(required string dbname) {
+		return "
+			SELECT
+				NULL AS tableCatalog,
+				OWNER AS tableSchema,
+				TABLE_NAME AS tableName,
+				'TABLE' AS tableType
+			FROM ALL_TABLES
+			WHERE OWNER = UPPER('#dbname#')
 		";
 	}
 
@@ -149,6 +181,7 @@ component extends="DatabaseDialect" accessors=true {
 			components.table = fullTableName;
 		}
 
+		components.name = components.schema & "." & components.table;
 		components._name = components.name.replace(".", "_", "all");
 		return components;
 	}
@@ -181,7 +214,7 @@ component extends="DatabaseDialect" accessors=true {
 				cols.append("#colName# #oracleType# PATH '$." & colName & "'");
 			}
 		}
-		return arrayToList(cols, ", " & chr(10));
+		return arrayToList(cols, ", " & char(10));
 	}
 
 	private array function getWriteableColumns(required struct columns) {

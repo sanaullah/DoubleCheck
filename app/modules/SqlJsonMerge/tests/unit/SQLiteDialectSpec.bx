@@ -2,10 +2,10 @@
  * Unit tests for SQLiteDialect
  * Tests SQLite-specific SQL generation
  */
-component extends="testbox.system.BaseSpec" {
+class extends="testbox.system.BaseSpec" {
 
 	function beforeAll() {
-		variables.dialect = new SqlJsonMerge.models.SQLiteDialect();
+		variables.dialect = new app.modules.SqlJsonMerge.models.SQLiteDialect();
 	}
 
 	function run() {
@@ -77,15 +77,28 @@ component extends="testbox.system.BaseSpec" {
 			});
 
 			it("should generate INSERT SQL from JSON", () => {
-				var data = [{id: 1, name: "Alice"}, {id: 2, name: "Bob"}];
+				// Second row omits "name" entirely to exercise the NULL-for-missing-key path.
+				var data = [{id: 1, name: "Alice"}, {id: 2}];
 				var columns = {
 					id: {bInJson: true, type: "int", bWriteable: true},
 					name: {bInJson: true, type: "varchar", bWriteable: true}
 				};
-				var sql = variables.dialect.getJsonInsertSQL(data, "users", columns);
+				// SQLite builds literal SQL from `data` directly and ignores jsonData,
+				// so a placeholder is sufficient here.
+				var sql = variables.dialect.getJsonInsertSQL(data, "users", columns, "[]");
 				expect(sql).toContain("INSERT INTO users");
 				expect(sql).toContain("VALUES");
 				expect(sql).toContain("NULL");
+			});
+
+			it("should escape single quotes in string values", () => {
+				var data = [{id: 1, name: "O'Brien"}];
+				var columns = {
+					id: {bInJson: true, type: "int", bWriteable: true},
+					name: {bInJson: true, type: "varchar", bWriteable: true}
+				};
+				var sql = variables.dialect.getJsonInsertSQL(data, "users", columns, "[]");
+				expect(sql).toContain("O''Brien");
 			});
 
 			it("should generate UPSERT SQL from JSON", () => {
@@ -99,7 +112,8 @@ component extends="testbox.system.BaseSpec" {
 					"users",
 					["id"],
 					["name"],
-					columns
+					columns,
+					"[]"
 				);
 				expect(sql).toContain("INSERT INTO users");
 				expect(sql).toContain("ON CONFLICT");

@@ -3,7 +3,7 @@
  * SQL Server has excellent JSON support via OPENJSON and advanced MERGE functionality.
  * This implementation leverages the original QueryUtility's T-SQL patterns.
  */
-component extends="DatabaseDialect" accessors=true {
+class extends="DatabaseDialect" {
 
 	string function generateGUID() {
 		return "SELECT newid() AS guid";
@@ -21,6 +21,7 @@ component extends="DatabaseDialect" accessors=true {
 		required array data,
 		required string tableName,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
 		var sql = "";
@@ -28,16 +29,14 @@ component extends="DatabaseDialect" accessors=true {
 		// Handle session context if provided
 		if (!sessionContext.isEmpty()) {
 			sessionContext.each((key, value) => {
-				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & chr(10);
+				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & char(10);
 			});
 		}
 
-		var jsonData = serializeJSON(data);
-
-		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & chr(10);
-		sql &= "INSERT INTO #tableName# (#getSelectColumnList(columns)#)" & chr(10);
-		sql &= "SELECT #getSelectColumnList(columns)#" & chr(10);
-		sql &= "FROM OPENJSON(@jsonData)" & chr(10);
+		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & char(10);
+		sql &= "INSERT INTO #tableName# (#getSelectColumnList(columns)#)" & char(10);
+		sql &= "SELECT #getSelectColumnList(columns)#" & char(10);
+		sql &= "FROM OPENJSON(@jsonData)" & char(10);
 		sql &= "WITH (#getJsonSchema(columns)#)";
 
 		return sql;
@@ -49,6 +48,7 @@ component extends="DatabaseDialect" accessors=true {
 		required array targets,
 		required array updateFields,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
 		var sql = "";
@@ -56,33 +56,31 @@ component extends="DatabaseDialect" accessors=true {
 		// Handle session context if provided
 		if (!sessionContext.isEmpty()) {
 			sessionContext.each((key, value) => {
-				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & chr(10);
+				sql &= "EXEC sp_set_session_context @key = N'#key#', @value = #value#;" & char(10);
 			});
 		}
 
-		var jsonData = serializeJSON(data);
-
-		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & chr(10);
-		sql &= "MERGE #tableName# AS TARGET" & chr(10);
-		sql &= "USING (SELECT DISTINCT * FROM OPENJSON(@jsonData) WITH (#getJsonSchema(columns)#)) AS SOURCE" & chr(10);
-		sql &= "ON (#getMergeOnClause(targets)#)" & chr(10);
+		sql &= "DECLARE @jsonData VARCHAR(MAX) = '#jsonData#';" & char(10);
+		sql &= "MERGE #tableName# AS TARGET" & char(10);
+		sql &= "USING (SELECT DISTINCT * FROM OPENJSON(@jsonData) WITH (#getJsonSchema(columns)#)) AS SOURCE" & char(10);
+		sql &= "ON (#getMergeOnClause(targets)#)" & char(10);
 
 		// WHEN MATCHED - UPDATE
 		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
 		if (updateCols.len()) {
-			sql &= "WHEN MATCHED THEN UPDATE SET" & chr(10);
+			sql &= "WHEN MATCHED THEN UPDATE SET" & char(10);
 			var updates = updateCols.map((col) => {
 				if (!targets.find(col)) {
 					return "TARGET.[" & col & "] = SOURCE.[" & col & "]";
 				}
 				return "";
 			}).filter((str) => str.len());
-			sql &= arrayToList(updates, "," & chr(10)) & chr(10);
+			sql &= arrayToList(updates, "," & char(10)) & char(10);
 		}
 
 		// WHEN NOT MATCHED - INSERT
 		var insertCols = getWriteableColumns(columns);
-		sql &= "WHEN NOT MATCHED THEN INSERT (#getQualifiedColumnList(insertCols)#)" & chr(10);
+		sql &= "WHEN NOT MATCHED THEN INSERT (#getQualifiedColumnList(insertCols)#)" & char(10);
 		sql &= "VALUES (#getSourceColumnList(insertCols)#);";
 
 		return sql;
@@ -133,6 +131,17 @@ component extends="DatabaseDialect" accessors=true {
 			LEFT JOIN #dbPrefix#sys.default_constraints dc ON c.default_object_id = dc.object_id
 			WHERE c.object_id = OBJECT_ID('#schemaTable#')
 			ORDER BY c.column_id
+		";
+	}
+
+	string function getTableListQuery(required string dbname) {
+		return "
+			SELECT
+				TABLE_CATALOG AS tableCatalog,
+				TABLE_SCHEMA AS tableSchema,
+				TABLE_NAME AS tableName,
+				TABLE_TYPE AS tableType
+			FROM #dbname#.INFORMATION_SCHEMA.TABLES
 		";
 	}
 

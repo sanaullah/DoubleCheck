@@ -132,12 +132,21 @@ class {
 		}
 	}
 
-	struct function executeTask(
+	/**
+	 * Synchronous prep (tool session, definition, context pack, cost-budget
+	 * check) - the part of the old executeTask() that has no provider I/O and
+	 * so stays a single pool-thread hop. Mirrors the original try/catch
+	 * boundary exactly: toolSession/definition/input are built unprotected
+	 * (a throw here propagates raw, same as before), everything from the
+	 * context-pack render onward is caught and converted to a failedTask()
+	 * result instead of propagating - same as the original catch(any error).
+	 */
+	private struct function prepareTask(
 		required struct task,
 		required array files,
 		required struct graph,
-		struct control = {},
-		struct options = {}
+		required struct control,
+		required struct options
 	) {
 		var startedAt = getTickCount();
 		assertNotCancelled( arguments.control, arguments.options );
@@ -190,159 +199,28 @@ class {
 				redactionCount : contextPack.redactionCount,
 				truncated      : contextPack.truncated
 			};
-			if (
-				isTrue( budgetEnforcementEnabled ) &&
-					estimatedCost >
-						numericDecimal(
-							arguments
-									.task
-									.budget
-									.maxCostUsd ?:
-								estimatedCost,
-							estimatedCost
-						)
-			) {
-				return failedTask(
-					arguments.task,
-					definition,
-					toolSession,
-					"budget_exceeded",
-					"Specialist cost budget exceeded",
-					promptCharacters,
-					startedAt
-				);
-			}
-			var currentTask = arguments.task;
-			var currentOptions = arguments.options;
-			var response = gateway.run(
-					definition,
-					toolService.buildAITools( toolSession ),
-					input,
-					arguments.control,
-					( detail ) => progress(
-						currentOptions,
-						currentTask,
-						detail
-					),
-					contextPack.text,
-					trim( arguments.options.runId ?: "" )
-				);
-			assertNotCancelled( arguments.control, arguments.options );
-			var validResponse = validateResponse( response, arguments.task );
-			if ( isTrue( observabilityEnabled ) ) {
-				var acceptedPreview = previewText(
-					{
-						summary : validResponse.summary ?: "",
-						findings: validResponse.findings ?: []
-					}
-				);
-				var contextPackCharacters = 0;
-				if (
-					isStruct( definition.provenance.contextPack ?: "" ) &&
-						isNumeric(
-							definition
-									.provenance
-									.contextPack
-									.characters ?:
-								""
-						)
-				) {
-					contextPackCharacters = int(
-						val( definition
-								.provenance
-								.contextPack
-								.characters )
+			var budgetExceeded = isTrue( budgetEnforcementEnabled ) &&
+				estimatedCost >
+					numericDecimal(
+						arguments
+								.task
+								.budget
+								.maxCostUsd ?:
+							estimatedCost,
+						estimatedCost
 					);
-				}
-				progress(
-					currentOptions,
-					currentTask,
-					{
-						stage  : "response-accepted",
-						status : "running",
-						message: "Accepted structured specialist response",
-						observe: {
-							kind           : "response",
-							observationType: "span",
-							title          : "Normalized specialist JSON",
-							preview        : acceptedPreview,
-							input          : "",
-							output         : acceptedPreview,
-							truncated      : findNoCase( "[truncated]", acceptedPreview ) > 0,
-							// Prompt size prepared for the specialist call (not preview length).
-							characters     : promptCharacters,
-							model          : definition.provenance.model ?: "",
-							modelParameters: {
-								provider: response._execution?.provider ?: "",
-								attempts: response._execution?.attempts ?: 1,
-								model   : definition.provenance.model ?: ""
-							},
-							meta: {
-								findingCount         : ( validResponse.findings ?: [] ).len(),
-								attempts             : response._execution?.attempts ?: 1,
-								provider             : response._execution?.provider ?: "",
-								budgetCeilingUsd     : definition.provenance.estimatedMaximumCostUsd ?: 0,
-								promptCharacters     : promptCharacters,
-								previewCharacters    : len( acceptedPreview ),
-								contextPackCharacters: contextPackCharacters,
-								contextPackTruncated : isStruct( definition.provenance.contextPack ?: "" ) &&
-									isTrue(
-										definition
-												.provenance
-												.contextPack
-												.truncated ?:
-											false
-									),
-								contextPackRanges: isStruct( definition.provenance.contextPack ?: "" )
-									? int(
-										val(
-											definition
-													.provenance
-													.contextPack
-													.includedRanges ?:
-												0
-										)
-									)
-									: 0,
-								thinContext: contextPackCharacters > 0 && contextPackCharacters < 1500,
-								io         : "output"
-							}
-						}
-					},
-					true
-				);
-			}
-			var normalized = findingService.normalizeAI( validResponse, arguments.files );
-			var provenance = duplicate( definition.provenance );
-			provenance.attempts = response._execution?.attempts ?: 1;
-			for ( var finding in normalized ) {
-				finding.source = "specialist/#arguments.task.role#";
-				finding.provenance = duplicate( provenance );
-				finding.provenance.taskId = arguments.task.id;
-			}
-			var result = new app.models.domain.AgentResult(
-				{
-					version: "agent-result-v1",
-					taskId : arguments.task.id,
-					role   : arguments.task.role,
-					status : "succeeded",
-					summary: left(
-						trim( validResponse.summary ?: "" ),
-						numericSetting( maxSummaryCharacters, 2000 )
-					),
-					findings  : normalized,
-					toolAudit : toolService.audit( toolSession ),
-					provenance: provenance,
-					error     : "",
-					durationMs: getTickCount() - startedAt
-				}
-			);
 			return {
-				result        : result,
-				charactersSent: promptCharacters
+				ready           : true,
+				failedResult    : javacast( "null", "" ),
+				startedAt       : startedAt,
+				toolSession     : toolSession,
+				definition      : definition,
+				input           : input,
+				promptCharacters: promptCharacters,
+				contextPack     : contextPack,
+				budgetExceeded  : budgetExceeded
 			};
 		} catch ("RunCancelled" cancelled) {
-			toolService.cancel( toolSession );
 			rethrow;
 		} catch (any error) {
 			logSpecialistError(
@@ -355,16 +233,250 @@ class {
 			);
 			var failureStatus = error.type == "SpecialistCircuitOpen" ? "circuit_open" : "failed";
 			var failureMessage = friendlyFailureMessage( error );
-			return failedTask(
+			return {
+				ready           : false,
+				failedResult    : failedTask(
+					arguments.task,
+					definition,
+					toolSession,
+					failureStatus,
+					failureMessage,
+					promptCharacters,
+					startedAt
+				),
+				startedAt       : startedAt,
+				toolSession     : toolSession,
+				definition      : definition,
+				input           : input,
+				promptCharacters: promptCharacters,
+				contextPack     : {},
+				budgetExceeded  : false
+			};
+		}
+	}
+
+	/**
+	 * Response validation, observability progress, finding normalization, and
+	 * AgentResult construction - the part of the old executeTask() that ran
+	 * after gateway.run() returned. Unchanged logic, just parameterized by the
+	 * prepareTask() struct instead of closing over local vars.
+	 */
+	private struct function assembleSuccess(
+		required struct task,
+		required array files,
+		required struct control,
+		required struct options,
+		required struct prep,
+		required any response
+	) {
+		assertNotCancelled( arguments.control, arguments.options );
+		var definition = arguments.prep.definition;
+		var promptCharacters = arguments.prep.promptCharacters;
+		var validResponse = validateResponse( arguments.response, arguments.task );
+		if ( isTrue( observabilityEnabled ) ) {
+			var acceptedPreview = previewText(
+				{
+					summary : validResponse.summary ?: "",
+					findings: validResponse.findings ?: []
+				}
+			);
+			var contextPackCharacters = 0;
+			if (
+				isStruct( definition.provenance.contextPack ?: "" ) &&
+					isNumeric(
+						definition
+								.provenance
+								.contextPack
+								.characters ?:
+							""
+					)
+			) {
+				contextPackCharacters = int(
+					val( definition
+							.provenance
+							.contextPack
+							.characters )
+				);
+			}
+			progress(
+				arguments.options,
 				arguments.task,
-				definition,
-				toolSession,
-				failureStatus,
-				failureMessage,
-				promptCharacters,
-				startedAt
+				{
+					stage  : "response-accepted",
+					status : "running",
+					message: "Accepted structured specialist response",
+					observe: {
+						kind           : "response",
+						observationType: "span",
+						title          : "Normalized specialist JSON",
+						preview        : acceptedPreview,
+						input          : "",
+						output         : acceptedPreview,
+						truncated      : findNoCase( "[truncated]", acceptedPreview ) > 0,
+						// Prompt size prepared for the specialist call (not preview length).
+						characters     : promptCharacters,
+						model          : definition.provenance.model ?: "",
+						modelParameters: {
+							provider: arguments.response._execution?.provider ?: "",
+							attempts: arguments.response._execution?.attempts ?: 1,
+							model   : definition.provenance.model ?: ""
+						},
+						meta: {
+							findingCount         : ( validResponse.findings ?: [] ).len(),
+							attempts             : arguments.response._execution?.attempts ?: 1,
+							provider             : arguments.response._execution?.provider ?: "",
+							budgetCeilingUsd     : definition.provenance.estimatedMaximumCostUsd ?: 0,
+							promptCharacters     : promptCharacters,
+							previewCharacters    : len( acceptedPreview ),
+							contextPackCharacters: contextPackCharacters,
+							contextPackTruncated : isStruct( definition.provenance.contextPack ?: "" ) &&
+								isTrue(
+									definition
+											.provenance
+											.contextPack
+											.truncated ?:
+										false
+								),
+							contextPackRanges: isStruct( definition.provenance.contextPack ?: "" )
+								? int(
+									val(
+										definition
+												.provenance
+												.contextPack
+												.includedRanges ?:
+											0
+									)
+								)
+								: 0,
+							thinContext: contextPackCharacters > 0 && contextPackCharacters < 1500,
+							io         : "output"
+						}
+					}
+				},
+				true
 			);
 		}
+		var normalized = findingService.normalizeAI( validResponse, arguments.files );
+		var provenance = duplicate( definition.provenance );
+		provenance.attempts = arguments.response._execution?.attempts ?: 1;
+		for ( var finding in normalized ) {
+			finding.source = "specialist/#arguments.task.role#";
+			finding.provenance = duplicate( provenance );
+			finding.provenance.taskId = arguments.task.id;
+		}
+		var result = new app.models.domain.AgentResult(
+			{
+				version: "agent-result-v1",
+				taskId : arguments.task.id,
+				role   : arguments.task.role,
+				status : "succeeded",
+				summary: left(
+					trim( validResponse.summary ?: "" ),
+					numericSetting( maxSummaryCharacters, 2000 )
+				),
+				findings  : normalized,
+				toolAudit : toolService.audit( arguments.prep.toolSession ),
+				provenance: provenance,
+				error     : "",
+				durationMs: getTickCount() - arguments.prep.startedAt
+			}
+		);
+		return {
+			result        : result,
+			charactersSent: promptCharacters
+		};
+	}
+
+	/**
+	 * Future-returning counterpart to the old executeTask(): prep runs on the
+	 * bounded pool same as before, but the provider call goes through
+	 * gateway.runAsyncRetry() so retry backoff no longer occupies a pool
+	 * thread. The .handle() below re-creates the original unified try/catch -
+	 * both an async provider failure and a synchronous validate/normalize
+	 * failure funnel through the same RunCancelled/generic-error handling.
+	 */
+	private any function executeTaskAsync(
+		required struct task,
+		required array files,
+		required struct graph,
+		required struct control,
+		required struct options,
+		required string executorName
+	) {
+		var currentTask = arguments.task;
+		var currentFiles = arguments.files;
+		var currentGraph = arguments.graph;
+		var currentControl = arguments.control;
+		var currentOptions = arguments.options;
+		var currentExecutorName = arguments.executorName;
+
+		return asyncRun(
+			() => prepareTask( currentTask, currentFiles, currentGraph, currentControl, currentOptions ),
+			currentExecutorName
+		).thenCompose( ( prep ) => {
+			if ( !prep.ready ) {
+				return futureNew( prep.failedResult );
+			}
+			if ( prep.budgetExceeded ) {
+				return futureNew(
+					failedTask(
+						currentTask,
+						prep.definition,
+						prep.toolSession,
+						"budget_exceeded",
+						"Specialist cost budget exceeded",
+						prep.promptCharacters,
+						prep.startedAt
+					)
+				);
+			}
+			return gateway.runAsyncRetry(
+					prep.definition,
+					toolService.buildAITools( prep.toolSession ),
+					prep.input,
+					currentExecutorName,
+					currentControl,
+					( detail ) => progress(
+						currentOptions,
+						currentTask,
+						detail
+					),
+					prep.contextPack.text,
+					trim( currentOptions.runId ?: "" )
+				).handle( ( response, asyncError ) => {
+					try {
+						if ( !isNull( asyncError ) ) {
+							throw( object = gateway.unwrapAsyncError( asyncError ) );
+						}
+						return futureNew( assembleSuccess( currentTask, currentFiles, currentControl, currentOptions, prep, response ) );
+					} catch ("RunCancelled" cancelled) {
+						toolService.cancel( prep.toolSession );
+						rethrow;
+					} catch (any error) {
+						logSpecialistError(
+							"Specialist task failed",
+							error,
+							{
+								taskId: currentTask.id,
+								role  : currentTask.role
+							}
+						);
+						var failureStatus = error.type == "SpecialistCircuitOpen" ? "circuit_open" : "failed";
+						var failureMessage = friendlyFailureMessage( error );
+						return futureNew(
+							failedTask(
+								currentTask,
+								prep.definition,
+								prep.toolSession,
+								failureStatus,
+								failureMessage,
+								prep.promptCharacters,
+								prep.startedAt
+							)
+						);
+					}
+				} ).thenCompose( ( f ) => f );
+		} );
 	}
 
 	private struct function launchTask(
@@ -423,18 +535,20 @@ class {
 			},
 			true
 		);
-		var future = asyncRun(
-			() => executeTask(
-				currentTask,
-				currentFiles,
-				currentGraph,
-				control,
-				currentOptions
-			),
+		// .orTimeout()'s string-unit convenience only resolves on a genuine
+		// BoxFuture; executeTaskAsync()'s chain ends in .thenCompose(), which
+		// downgrades to a plain java.util.concurrent.CompletableFuture, so the
+		// TimeUnit enum is passed explicitly here.
+		var future = executeTaskAsync(
+			currentTask,
+			currentFiles,
+			currentGraph,
+			control,
+			currentOptions,
 			arguments.executorName
 		).orTimeout(
 				numericSetting( currentTask.budget.maxDurationMs ?: 120000, 120000 ),
-				"milliseconds"
+				createObject( "java", "java.util.concurrent.TimeUnit" ).MILLISECONDS
 			);
 		return {
 			task      : currentTask,

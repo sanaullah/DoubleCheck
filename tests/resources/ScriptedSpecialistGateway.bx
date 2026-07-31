@@ -153,6 +153,75 @@ class {
 		}
 	}
 
+	/**
+	 * Async counterpart to run(), matching SpecialistAgentGateway.runAsyncRetry()'s
+	 * signature so SpecialistReviewService's production call site works unchanged
+	 * against this test double. No retry orchestration here - this fixture's
+	 * run() never needs retrying (failRoles throws once, deliberately, and tests
+	 * exercising real retry/backoff use the real gateway via configuredNativeGateway()
+	 * instead), so this is a plain async wrapper.
+	 */
+	any function runAsyncRetry(
+		required struct definition,
+		required array tools,
+		required string input,
+		required string executorName,
+		struct control      = {},
+		function onProgress = ( detail ) => {
+
+		},
+		string contextPack  = "",
+		string runId        = ""
+	) {
+		var currentDefinition = arguments.definition;
+		var currentTools = arguments.tools;
+		var currentInput = arguments.input;
+		var currentControl = arguments.control;
+		var currentProgress = arguments.onProgress;
+		return asyncRun(
+			() => run( currentDefinition, currentTools, currentInput, currentControl, currentProgress ),
+			arguments.executorName
+		);
+	}
+
+	/** Mirrors SpecialistAgentGateway.unwrapAsyncError() - see that method for why this unwrap is needed. */
+	any function unwrapAsyncError( required any error ) {
+		var current = arguments.error;
+		var hops = 0;
+		while ( hops < 8 ) {
+			var className = "";
+			try {
+				className = current.getClass().getName();
+			} catch ( any ignoredClass ) {
+				return current;
+			}
+			var message = "";
+			try {
+				message = toString( current.message ?: "" );
+			} catch ( any ignoredMessage ) {
+				message = "";
+			}
+			var isWrapper = className == "java.util.concurrent.CompletionException" ||
+				className == "java.util.concurrent.ExecutionException" ||
+				( className == "ortus.boxlang.runtime.types.exceptions.BoxRuntimeException" && findNoCase( "Error invoking", message ) > 0 );
+			if ( !isWrapper ) {
+				return current;
+			}
+			var next = "";
+			try {
+				next = current.getCause();
+			} catch ( any ignoredCause ) {
+				return current;
+			}
+			if ( isNull( next ) || isSimpleValue( next ) ) {
+				return current;
+			}
+			current = next;
+			hops++;
+		}
+		return current;
+	}
+
 	numeric function callCount() {
 		return variables.calls.get();
 	}

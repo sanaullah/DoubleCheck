@@ -1,0 +1,226 @@
+/**
+ * Covers SpecialistAgentGateway.runAsyncRetry() - the non-blocking counterpart to
+ * run() added so exponential backoff between retries doesn't occupy a bounded
+ * specialist-pool thread. No dedicated spec existed for SpecialistAgentGateway
+ * before this file; SpecialistOrchestrationSpec.bx covers run() indirectly
+ * through SpecialistReviewService.
+ *
+ * @see app.models.services.SpecialistAgentGateway
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"SpecialistAgentGateway.runAsyncRetry()",
+			() => {
+				it(
+					"succeeds on the first attempt",
+					() => {
+						var attempts = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+						var gateway = configuredNativeGateway();
+						gateway.$(
+								method   = "invokeAgent",
+								callback = ( definition, tools, input, params, options, control, onProgress ) => {
+									attempts.incrementAndGet();
+									return "{""summary"":""ok"",""findings"":[]}";
+								}
+							);
+						var executorName = ensureTestExecutor( "async-happy" );
+						var response = gateway.runAsyncRetry(
+								definitionFixture(),
+								[],
+								"input",
+								executorName
+							).get();
+						expect( response.summary ).toBe( "ok" );
+						expect( response._execution.attempts ).toBe( 1 );
+						expect( attempts.get() ).toBe( 1 );
+					}
+				);
+
+				it(
+					"retries a transient failure and succeeds, matching run()'s attempt semantics",
+					() => {
+						var attempts = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+						var gateway = configuredNativeGateway();
+						gateway.$(
+								method   = "invokeAgent",
+								callback = ( definition, tools, input, params, options, control, onProgress ) => {
+									if ( attempts.incrementAndGet() < 3 ) {
+										throw( type = "ProviderFailure", message = "retry" );
+									}
+									return "{""summary"":""ok"",""findings"":[]}";
+								}
+							);
+						var executorName = ensureTestExecutor( "async-retry-success" );
+						var response = gateway.runAsyncRetry(
+								definitionFixture(),
+								[],
+								"input",
+								executorName
+							).get();
+						expect( response.summary ).toBe( "ok" );
+						expect( response._execution.attempts ).toBe( 3 );
+						expect( gateway.circuitStatus().open ).toBeFalse();
+					}
+				);
+
+				it(
+					"exhausts retries, opens the circuit, and surfaces the original provider error via unwrapAsyncError()",
+					() => {
+						var gateway = configuredNativeGateway();
+						gateway.$property(
+								"maxRetries",
+								"variables",
+								0
+							);
+						gateway.$property(
+								"circuitFailureThreshold",
+								"variables",
+								1
+							);
+						gateway.$(
+								method   = "invokeAgent",
+								callback = ( definition, tools, input, params, options, control, onProgress ) => {
+									throw( type = "ProviderFailure", message = "down" );
+								}
+							);
+						var executorName = ensureTestExecutor( "async-exhausted" );
+						var future = gateway.runAsyncRetry(
+								definitionFixture(),
+								[],
+								"input",
+								executorName
+							);
+						var caughtType = "";
+						try {
+							future.get();
+						} catch ( any rawError ) {
+							caughtType = gateway.unwrapAsyncError( rawError ).type;
+						}
+						expect( caughtType ).toBe( "ProviderFailure" );
+						expect( gateway.circuitStatus().open ).toBeTrue();
+					}
+				);
+
+				it(
+					"frees the bounded pool thread during backoff so an independent queued task isn't starved",
+					() => {
+						// Real proof of the whole feature: on a 1-thread pool, a task
+						// that needs one backoff cycle should not block a second,
+						// independent, fast task from running during that wait.
+						var gateway = configuredNativeGateway();
+						gateway.$property(
+								"retryBackoffMs",
+								"variables",
+								300
+							);
+						var flakyAttempts = createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 );
+						var healthyRanAt = createObject( "java", "java.util.concurrent.atomic.AtomicLong" ).init( -1 );
+						var startedAt = getTickCount();
+						gateway.$(
+								method   = "invokeAgent",
+								callback = ( definition, tools, input, params, options, control, onProgress ) => {
+									if ( arguments.definition.role == "flaky" ) {
+										if ( flakyAttempts.incrementAndGet() == 1 ) {
+											throw( type = "ProviderFailure", message = "fail once" );
+										}
+										return "{""summary"":""flaky-done"",""findings"":[]}";
+									}
+									sleep( 30 );
+									healthyRanAt.set( getTickCount() - startedAt );
+									return "{""summary"":""healthy-done"",""findings"":[]}";
+								}
+							);
+						var executorName = ensureTestExecutor( "async-thread-freeing", 1 );
+						var flakyDefinition = definitionFixture();
+						flakyDefinition.role = "flaky";
+						var healthyDefinition = definitionFixture();
+						healthyDefinition.role = "healthy";
+
+						var flakyFuture = gateway.runAsyncRetry(
+								flakyDefinition,
+								[],
+								"input",
+								executorName
+							);
+						var healthyFuture = gateway.runAsyncRetry(
+								healthyDefinition,
+								[],
+								"input",
+								executorName
+							);
+
+						healthyFuture.get();
+						flakyFuture.get();
+
+						// The healthy task must complete well before the flaky task's
+						// 300ms backoff elapses - proof the single pool thread served
+						// it during the backoff window rather than being blocked in
+						// sleep(). A generous margin keeps this stable under CI load.
+						expect( healthyRanAt.get() ).toBeLT( 250 );
+					}
+				);
+			}
+		);
+	}
+
+	private any function configuredNativeGateway() {
+		var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+		gateway.$property(
+				"aiProviderResolver",
+				"variables",
+				new tests.resources.StubAIProviderResolver( {
+					provider: "fake-provider",
+					apiKey  : "fake-key",
+					baseURL : "",
+					model   : "fake-model",
+					timeout : 1
+				} )
+			);
+		gateway.$property(
+				"maxRetries",
+				"variables",
+				2
+			);
+		gateway.$property(
+				"retryBackoffMs",
+				"variables",
+				1
+			);
+		gateway.$property(
+				"circuitFailureThreshold",
+				"variables",
+				10
+			);
+		gateway.$property(
+				"circuitCooldownMs",
+				"variables",
+				30000
+			);
+		return gateway;
+	}
+
+	private struct function definitionFixture() {
+		return {
+			name         : "TestAgent",
+			description  : "Test",
+			instructions : "Return JSON.",
+			taskId       : "task-1",
+			role         : "security",
+			maxTokens    : 128,
+			maxIterations: 2
+		};
+	}
+
+	private string function ensureTestExecutor( required string label, numeric threads = 2 ) {
+		var executorName = "spec-" & arguments.label & "-" & left( lCase( hash( createUUID(), "SHA-256" ) ), 8 );
+		executorNew(
+			type       = "fixed",
+			name       = executorName,
+			maxThreads = arguments.threads
+		);
+		return executorName;
+	}
+
+}

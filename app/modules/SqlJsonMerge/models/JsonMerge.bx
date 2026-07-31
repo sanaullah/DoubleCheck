@@ -3,13 +3,22 @@
  * Moved and refactored from app/models/services/QueryUtility.cfc
  * Now uses database dialects for SQL Server, PostgreSQL, Oracle, MySQL, and SQLite compatibility.
  */
-component singleton accessors=true {
+@singleton
+class {
 
-	property name="dialectFactory" inject="DatabaseDialectFactory@SqlJsonMerge.models";
+	property name="dialectFactory" inject="DatabaseDialectFactory@SqlJsonMerge";
+
+	// Populated via WireBox injection when resolved through the container. When this
+	// component is instantiated directly with `new` (e.g. from a BIF), the injection
+	// does not fire, so resolveDatasource() below falls back to a sane default.
+	property name="defaultDatasource" inject="coldbox:setting:datasource";
 
 	/**
 	 * Query execution with retry logic for transient failures.
-	 * Retries up to 5 times for deadlocks, timeouts, and connection resets.
+	 * Retries up to 5 times for deadlocks, timeouts, connection resets, and the
+	 * SQLite/HikariCP statement-pointer race ("Cannot invoke ... isClosed() ...
+	 * this.pointer is null") that surfaces intermittently when a pooled statement
+	 * is reused across nested singleton-scoped queryExecute() calls.
 	 */
 	function qe(
 		required string sql,
@@ -23,7 +32,13 @@ component singleton accessors=true {
 			return queryExecute(arguments.sql, arguments.bindings, arguments.options);
 		} catch (any error) {
 			if (
-				(error.message contains "deadlock" || error.message contains "timed out" || error.message contains "Connection reset") &&
+				(
+					error.message contains "deadlock" ||
+					error.message contains "timed out" ||
+					error.message contains "Connection reset" ||
+					error.message contains "isClosed" ||
+					error.message contains "pointer is null"
+				) &&
 				arguments.count <= retryLimit
 			) {
 				sleep(1000);
@@ -38,9 +53,7 @@ component singleton accessors=true {
 	 * Each row becomes an ordered struct in the result array.
 	 */
 	array function queryToArrayOfStructs(required any q) {
-		var queryColumns = getMetadata(arguments.q).map(function (item) {
-			return item.name;
-		});
+		var queryColumns = listToArray(arguments.q.columnList);
 
 		return queryReduce(
 			arguments.q,
@@ -72,15 +85,16 @@ component singleton accessors=true {
 		}
 
 		var tickCountDB = getTickCount();
-		var queryOptions = {result: "result"};
+		var resolvedDatasource = resolveDatasource(arguments.datasource);
+		var queryOptions = {datasource: resolvedDatasource};
 
-		if (datasource.len()) {
-			queryOptions.datasource = arguments.datasource;
-		}
+		var dialect = dialectFactory.getDialect(resolvedDatasource);
+		var columns = columnData(arguments.tableName, resolvedDatasource);
 
-		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
-		var columns = columnData(arguments.tableName, arguments.datasource);
-		var jsonData = cleanJsonData(arguments.data, columns);
+		// cleanJsonData() escapes quotes and normalizes types for safe embedding in SQL
+		// text - dialects MUST use this cleaned JSON, not the raw incoming data, or
+		// string values containing an apostrophe will break/inject the generated SQL.
+		var cleanedJsonData = cleanJsonData(arguments.data, columns);
 
 		columns = columns.filter((k, c) => {
 			return c.bInJson;
@@ -90,6 +104,7 @@ component singleton accessors=true {
 			data = arguments.data,
 			tableName = arguments.tableName,
 			columns = columns,
+			jsonData = cleanedJsonData,
 			sessionContext = sessionContext
 		);
 
@@ -108,7 +123,7 @@ component singleton accessors=true {
 			execute: execute,
 			message: "(#numberFormat(data.len(), "9,999,999")# record#((data.len() == 1) ? "" : "s")#) || Build SQL: " & build & " || DB Execution: " & execute
 		};
-		queryOut.result = result;
+		queryOut.result = {recordCount: queryOut.query.recordCount};
 
 		return queryOut;
 	}
@@ -120,8 +135,8 @@ component singleton accessors=true {
 	struct function jsonMerge(
 		required array data,
 		required string tableName,
-		required array targets = [],
-		required array update = [],
+		array targets = [],
+		array update = [],
 		boolean bDelete = false,
 		boolean bReturnSQL = false,
 		string datasource = "",
@@ -133,15 +148,15 @@ component singleton accessors=true {
 		}
 
 		var tickCountDB = getTickCount();
-		var queryOptions = {result: "result"};
+		var resolvedDatasource = resolveDatasource(arguments.datasource);
+		var queryOptions = {datasource: resolvedDatasource};
 
-		if (datasource.len()) {
-			queryOptions.datasource = arguments.datasource;
-		}
+		var dialect = dialectFactory.getDialect(resolvedDatasource);
+		var columns = columnData(arguments.tableName, resolvedDatasource);
 
-		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
-		var columns = columnData(arguments.tableName, arguments.datasource);
-		var jsonData = cleanJsonData(arguments.data, columns);
+		// cleanJsonData() escapes quotes and normalizes types for safe embedding in SQL
+		// text - dialects MUST use this cleaned JSON, not the raw incoming data.
+		var cleanedJsonData = cleanJsonData(arguments.data, columns);
 
 		// Fix case for provided targets
 		var matchTargets = [];
@@ -161,6 +176,7 @@ component singleton accessors=true {
 			targets = arguments.targets,
 			updateFields = arguments.update,
 			columns = columns,
+			jsonData = cleanedJsonData,
 			sessionContext = sessionContext
 		);
 
@@ -180,7 +196,7 @@ component singleton accessors=true {
 			message: "#numberFormat(data.len(), "9,999,999")# record#((data.len() == 1) ? "" : "s")# to #arguments.tableName# || Build SQL: " & build & " || DB Execution: " & execute
 		};
 
-		queryOut.result = result;
+		queryOut.result = {recordCount: queryOut.query.recordCount};
 
 		return queryOut;
 	}
@@ -208,9 +224,9 @@ component singleton accessors=true {
 							: (column.typeName == "decimal")
 							? "(#column.precision#, #column.scale#)"
 							: ""),
-					qualified: chr(9) & "[" & column.columnName & "] " & "," & chr(10)
+					qualified: char(9) & "[" & column.columnName & "] " & "," & char(10)
 				};
-				o[column.columnName].withType = chr(9) & "[" & o[column.columnName].name & "] " & o[column.columnName].typeString & "," & chr(10);
+				o[column.columnName].withType = char(9) & "[" & o[column.columnName].name & "] " & o[column.columnName].typeString & "," & char(10);
 				return o;
 			}, {});
 	}
@@ -218,6 +234,8 @@ component singleton accessors=true {
 	/**
 	 * Clean and prepare JSON data for database operations.
 	 * Handles type conversions, null handling, quote escaping, and column validation.
+	 * The returned JSON string has string values with single quotes escaped so it can
+	 * be safely embedded directly inside a single-quoted SQL string literal.
 	 */
 	string function cleanJsonData(required array json, required struct columnData) {
 		var incomingColumns = json[1].keyArray();
@@ -244,52 +262,42 @@ component singleton accessors=true {
 			return v.bInJson > 0;
 		}, true);
 
-		var tier1 = json[1]
-			.reduce((o, k, v) => {
-				return o & columnData[k].name & ": " & ((isStruct(v)) ? 'out["#k#"].value' : 'out["#k#"]') & ", ";
-			}, "{ ")
-			.left(-2) & " }";
-
-		var tier2 = columnData
-			.reduce((o, k, v) => {
-				return o &
-					k &
-					": " &
-					(
-						(v.type contains "date")
-							? 'dateTimeFormat( out["#k#"], "yyyy-mm-dd HH:nn:ss" )'
-							: (v.type contains "char" || v.type contains "text")
-							? 'replace( out["#k#"], "''", "''''", "all" )'
-							: (["int", "bigint", "float", "smallint", "tinyint"].find(v.type))
-							? '( isInstanceOf( out["#k#"], "java.lang.Boolean" ) ? ( out["#k#"] ? 1 : 0 ) : val( out["#k#"] ) )'
-							: (["bit"].find(v.type))
-							? 'val((( out["#k#"].toString().len() && out["#k#"] ) ? 1 : 0))'
-							: 'out["#k#"]'
-					) & ", ";
-			}, "{ ")
-			.left(-2) & " }";
-
-		var tier3 = columnData
-			.reduce((o, k, v) => {
-				return o &
-					k &
-					": " &
-					((v.bNullable) ? '(( out["#k#"].toString().trim().len() ) ? out["#k#"] : javacast( "null", out["#k#"] ))' : 'out["#k#"]') &
-					", ";
-			}, "{ ")
-			.left(-2) & " }";
-
+		// Transform each row directly (no evaluate() - BoxLang has no dynamic
+		// string-eval BIF). For every column: unwrap struct-shaped values, coerce
+		// by DB type (date formatting, quote escaping, numeric/bit normalization),
+		// then apply null handling for nullable columns.
 		var cleanJson = arguments.json.map((row) => {
-			var out = duplicate(row);
-			out = evaluate(tier1);
-			out = evaluate(tier2);
-			out = evaluate(tier3);
+			var out = {};
+
+			for (var colKey in columnData) {
+				var colInfo = columnData[colKey];
+				var rawVal = structKeyExists(row, colKey) ? row[colKey] : "";
+				var val1 = isStruct(rawVal) ? rawVal.value : rawVal;
+
+				var val2 = val1;
+				if (colInfo.type contains "date") {
+					val2 = dateTimeFormat(val1, "yyyy-mm-dd HH:nn:ss");
+				} else if (colInfo.type contains "char" || colInfo.type contains "text") {
+					val2 = replace(val1.toString(), "'", "''", "all");
+				} else if (["int", "bigint", "float", "smallint", "tinyint"].find(colInfo.type)) {
+					val2 = isInstanceOf(val1, "java.lang.Boolean") ? (val1 ? 1 : 0) : val(val1);
+				} else if (colInfo.type == "bit") {
+					val2 = val((val1.toString().len() && val1) ? 1 : 0);
+				}
+
+				if (colInfo.bNullable) {
+					out[colInfo.name] = (val2.toString().trim().len()) ? val2 : javacast("null", val2);
+				} else {
+					out[colInfo.name] = val2;
+				}
+			}
+
 			return out;
 		}, true);
 
 		arguments.json = "";
 
-		return serializeJSON(cleanJson);
+		return jsonSerialize(cleanJson);
 	}
 
 	/**
@@ -306,17 +314,19 @@ component singleton accessors=true {
 			throw(type="Database", message="Database name must be provided for type='tables'.");
 		}
 
+		var resolvedDatasource = resolveDatasource(arguments.datasource);
+		var dialect = dialectFactory.getDialect(resolvedDatasource);
+
 		var parsedTable = {};
 		if (!isNull(table) && table != "") {
-			parsedTable = parseTableName(table);
+			parsedTable = parseTableName(table, resolvedDatasource);
 		}
 
-		var dialect = dialectFactory.getDialect(datasource.len() ? datasource : "doublecheck");
 		var queryStr = "";
 		var queryOptions = {};
 
 		if (type == "tables") {
-			queryStr = "SELECT TABLE_CATALOG AS tableCatalog, TABLE_SCHEMA AS tableSchema, TABLE_NAME AS tableName, TABLE_TYPE AS tableType FROM #dbname#.INFORMATION_SCHEMA.TABLES";
+			queryStr = dialect.getTableListQuery(dbname);
 		} else if (type == "columns" && !isNull(table) && table != "") {
 			queryStr = dialect.getColumnMetadataQuery(table, parsedTable);
 		} else {
@@ -327,16 +337,32 @@ component singleton accessors=true {
 			queryOptions.datasource = datasource;
 		}
 
-		return queryExecute(queryStr, [], queryOptions);
+		return qe(queryStr, {}, queryOptions);
 	}
 
 	/**
-	 * Parse a fully qualified table name into its components.
-	 * Handles database.schema.table format and database-specific defaults.
+	 * Parse a fully qualified table name into its components using the naming
+	 * conventions of the dialect that corresponds to the given datasource.
 	 */
-	struct function parseTableName(required string fullTableName) {
-		var dialect = dialectFactory.getDialect("doublecheck");
+	struct function parseTableName(required string fullTableName, string datasource = "") {
+		var dialect = dialectFactory.getDialect(resolveDatasource(arguments.datasource));
 		return dialect.parseTableNameComponents(fullTableName);
+	}
+
+	/**
+	 * Resolve the effective datasource name: the explicit argument if provided,
+	 * otherwise the injected ColdBox default, falling back to "doublecheck" when
+	 * this component was instantiated directly (bypassing WireBox injection, as
+	 * BIFs do) and defaultDatasource was therefore never populated.
+	 */
+	private string function resolveDatasource(string datasource = "") {
+		if (arguments.datasource.len()) {
+			return arguments.datasource;
+		}
+		if (!isNull(defaultDatasource) && len(defaultDatasource)) {
+			return defaultDatasource;
+		}
+		return "doublecheck";
 	}
 
 }

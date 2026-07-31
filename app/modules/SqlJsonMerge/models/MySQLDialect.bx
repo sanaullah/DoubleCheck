@@ -2,7 +2,7 @@
  * MySQL-specific database dialect implementation.
  * MySQL has JSON support via JSON_TABLE and INSERT...ON DUPLICATE KEY UPDATE for UPSERT operations.
  */
-component extends="DatabaseDialect" accessors=true {
+class extends="DatabaseDialect" {
 
 	string function generateGUID() {
 		return "SELECT UUID() AS guid";
@@ -20,15 +20,15 @@ component extends="DatabaseDialect" accessors=true {
 		required array data,
 		required string tableName,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
-		var jsonData = serializeJSON(data);
 		var colList = getColumnList(columns);
 
-		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
-		sql &= "SELECT #colList#" & chr(10);
-		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
-		sql &= getJsonTableColumns(columns) & chr(10);
+		var sql = "INSERT INTO #tableName# (#colList#)" & char(10);
+		sql &= "SELECT #colList#" & char(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & char(10);
+		sql &= getJsonTableColumns(columns) & char(10);
 		sql &= ")) AS jt";
 
 		return sql;
@@ -40,18 +40,18 @@ component extends="DatabaseDialect" accessors=true {
 		required array targets,
 		required array updateFields,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
-		var jsonData = serializeJSON(data);
 		var colList = getColumnList(columns);
 		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
 
-		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
-		sql &= "SELECT #colList#" & chr(10);
-		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & chr(10);
-		sql &= getJsonTableColumns(columns) & chr(10);
-		sql &= ")) AS jt" & chr(10);
-		sql &= "ON DUPLICATE KEY UPDATE" & chr(10);
+		var sql = "INSERT INTO #tableName# (#colList#)" & char(10);
+		sql &= "SELECT #colList#" & char(10);
+		sql &= "FROM JSON_TABLE('#jsonData#', '$[*]' COLUMNS (" & char(10);
+		sql &= getJsonTableColumns(columns) & char(10);
+		sql &= ")) AS jt" & char(10);
+		sql &= "ON DUPLICATE KEY UPDATE" & char(10);
 
 		var updates = [];
 		for (var col in updateCols) {
@@ -68,7 +68,7 @@ component extends="DatabaseDialect" accessors=true {
 		required string tableName,
 		required struct parseResult
 	) {
-		var database = parseResult.database.len() ? parseResult.database : "DATABASE()";
+		var databaseExpr = parseResult.database.len() ? "'#parseResult.database#'" : "DATABASE()";
 
 		return "
 			SELECT
@@ -82,9 +82,21 @@ component extends="DatabaseDialect" accessors=true {
 				CASE WHEN EXTRA LIKE '%generated%' THEN 1 ELSE 0 END AS bComputed,
 				COALESCE(COLUMN_DEFAULT, '') AS defaultValue
 			FROM INFORMATION_SCHEMA.COLUMNS
-			WHERE TABLE_SCHEMA = #database#
+			WHERE TABLE_SCHEMA = #databaseExpr#
 			AND TABLE_NAME = '#parseResult.table#'
 			ORDER BY ORDINAL_POSITION
+		";
+	}
+
+	string function getTableListQuery(required string dbname) {
+		return "
+			SELECT
+				TABLE_CATALOG AS tableCatalog,
+				TABLE_SCHEMA AS tableSchema,
+				TABLE_NAME AS tableName,
+				TABLE_TYPE AS tableType
+			FROM INFORMATION_SCHEMA.TABLES
+			WHERE TABLE_SCHEMA = '#dbname#'
 		";
 	}
 
@@ -163,7 +175,7 @@ component extends="DatabaseDialect" accessors=true {
 				cols.append("`" & colName & "` " & mysqlType & " PATH '$." & colName & "'");
 			}
 		}
-		return arrayToList(cols, ", " & chr(10));
+		return arrayToList(cols, ", " & char(10));
 	}
 
 	private array function getWriteableColumns(required struct columns) {

@@ -2,14 +2,14 @@
  * PostgreSQL-specific database dialect implementation.
  * PostgreSQL has strong JSON support via json_to_recordset and powerful UPSERT with ON CONFLICT.
  */
-component extends="DatabaseDialect" accessors=true {
+class extends="DatabaseDialect" {
 
 	string function generateGUID() {
 		return "SELECT gen_random_uuid() AS guid";
 	}
 
 	string function getDatabaseDateTime() {
-		return "SELECT NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'Etc/UTC' AS dateTime";
+		return "SELECT NOW() AS dateTime";
 	}
 
 	string function getDatabaseUTCDateTime() {
@@ -20,13 +20,13 @@ component extends="DatabaseDialect" accessors=true {
 		required array data,
 		required string tableName,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
-		var jsonData = serializeJSON(data);
 		var colList = getColumnList(columns);
 
-		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
-		sql &= "SELECT #colList#" & chr(10);
+		var sql = "INSERT INTO #tableName# (#colList#)" & char(10);
+		sql &= "SELECT #colList#" & char(10);
 		sql &= "FROM json_to_recordset('#jsonData#'::json) AS t(#getJsonCastList(columns)#)";
 
 		return sql;
@@ -38,16 +38,16 @@ component extends="DatabaseDialect" accessors=true {
 		required array targets,
 		required array updateFields,
 		required struct columns,
+		required string jsonData,
 		struct sessionContext = {}
 	) {
-		var jsonData = serializeJSON(data);
 		var colList = getColumnList(columns);
 		var updateCols = updateFields.len() ? updateFields : getWriteableColumns(columns);
 
-		var sql = "INSERT INTO #tableName# (#colList#)" & chr(10);
-		sql &= "SELECT #colList#" & chr(10);
-		sql &= "FROM json_to_recordset('#jsonData#'::json) AS t(#getJsonCastList(columns)#)" & chr(10);
-		sql &= "ON CONFLICT (#arrayToList(targets, ', ')#) DO UPDATE SET" & chr(10);
+		var sql = "INSERT INTO #tableName# (#colList#)" & char(10);
+		sql &= "SELECT #colList#" & char(10);
+		sql &= "FROM json_to_recordset('#jsonData#'::json) AS t(#getJsonCastList(columns)#)" & char(10);
+		sql &= "ON CONFLICT (#arrayToList(targets, ', ')#) DO UPDATE SET" & char(10);
 
 		var updates = [];
 		for (var col in updateCols) {
@@ -74,9 +74,9 @@ component extends="DatabaseDialect" accessors=true {
 				CASE WHEN t.typtype = 'n' THEN t.typlen ELSE 0 END AS precision,
 				0 AS scale,
 				NOT a.attnotnull AS bNullable,
-				(a.attidentity != '') AS bAutoIncrement,
+				(a.attidentity != '' OR COALESCE(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%') AS bAutoIncrement,
 				a.attgenerated != '' AS bComputed,
-				COALESCE(d.adsrc, '') AS defaultValue
+				COALESCE(pg_get_expr(d.adbin, d.adrelid), '') AS defaultValue
 			FROM pg_attribute a
 			JOIN pg_type t ON a.atttypid = t.oid
 			JOIN pg_class c ON a.attrelid = c.oid
@@ -86,6 +86,18 @@ component extends="DatabaseDialect" accessors=true {
 			AND c.relname = '#parseResult.table#'
 			AND a.attnum > 0
 			ORDER BY a.attnum
+		";
+	}
+
+	string function getTableListQuery(required string dbname) {
+		return "
+			SELECT
+				table_catalog AS tableCatalog,
+				table_schema AS tableSchema,
+				table_name AS tableName,
+				table_type AS tableType
+			FROM information_schema.tables
+			WHERE table_catalog = '#dbname#'
 		";
 	}
 
@@ -139,6 +151,7 @@ component extends="DatabaseDialect" accessors=true {
 			components.table = fullTableName;
 		}
 
+		components.name = components.schema & "." & components.table;
 		components._name = components.name.replace(".", "_", "all");
 		return components;
 	}

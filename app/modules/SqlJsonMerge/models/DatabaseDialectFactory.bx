@@ -3,7 +3,8 @@
  * Detects the database type from BoxLang datasource configuration
  * and returns the appropriate dialect implementation.
  */
-component accessors=true singleton {
+@singleton
+class {
 
 	property name="dialectCache" type="struct" default="#{}#";
 
@@ -20,47 +21,66 @@ component accessors=true singleton {
 			return dialectCache[datasourceName];
 		}
 
-		var dialect = detectAndCreateDialect(datasourceName);
+		var dialect = createDialectForDriver(detectDriver(datasourceName));
 		dialectCache[datasourceName] = dialect;
 		return dialect;
 	}
 
 	/**
-	 * Detect database type from datasource configuration and create appropriate dialect.
+	 * Detect the JDBC driver name configured for a datasource by reading the
+	 * application's boxlang.json. Falls back to "sqlite" if the datasource
+	 * cannot be found or the configuration cannot be read.
 	 *
 	 * @param datasourceName Name of the datasource to detect
 	 *
-	 * @return DatabaseDialect implementation instance
+	 * @return Driver identifier string (e.g. "sqlite", "sqlserver", "postgresql", "mysql", "oracle")
 	 */
-	private function detectAndCreateDialect(required string datasourceName) {
-		// Get datasource config from BoxLang settings
-		var configService = new coldbox.system.core.services.ConfigService(
-			getPageContext().getServletContext()
-		);
+	private string function detectDriver(required string datasourceName) {
+		// boxlang.json commonly lives at the project root, but some setups keep it
+		// under /runtime - check both locations.
+		var candidatePaths = ["/runtime/boxlang.json", "/boxlang.json"];
 
-		// Try multiple ways to get the datasource config
-		var config = try {
-			var boxConfig = fileRead(expandPath("/boxlang.json"));
-			var parsed = deserializeJSON(boxConfig);
-			return parsed.datasources[datasourceName] ?: {};
-		} catch (any e) {
-			return {};
+		for (var candidate in candidatePaths) {
+			try {
+				var fullPath = expandPath(candidate);
+				if (fileExists(fullPath)) {
+					var parsed = jsonDeserialize(fileRead(fullPath));
+					if (
+						structKeyExists(parsed, "datasources") &&
+						structKeyExists(parsed.datasources, datasourceName) &&
+						structKeyExists(parsed.datasources[datasourceName], "driver")
+					) {
+						return parsed.datasources[datasourceName].driver;
+					}
+				}
+			} catch (any e) {
+				// Ignore and try the next candidate path
+			}
 		}
 
-		var driver = config.driver ?: "sqlite";
+		return "sqlite";
+	}
 
-		switch (driver) {
+	/**
+	 * Instantiate the concrete dialect for a given driver identifier.
+	 *
+	 * @param driver Driver identifier (e.g. "sqlserver", "postgresql")
+	 *
+	 * @return DatabaseDialect implementation instance
+	 */
+	private function createDialectForDriver(required string driver) {
+		switch (arguments.driver) {
 			case "sqlserver":
-				return new SqlJsonMerge.models.SQLServerDialect();
+				return new app.modules.SqlJsonMerge.models.SQLServerDialect();
 			case "postgresql":
-				return new SqlJsonMerge.models.PostgreSQLDialect();
+				return new app.modules.SqlJsonMerge.models.PostgreSQLDialect();
 			case "mysql":
-				return new SqlJsonMerge.models.MySQLDialect();
+				return new app.modules.SqlJsonMerge.models.MySQLDialect();
 			case "oracle":
-				return new SqlJsonMerge.models.OracleDialect();
+				return new app.modules.SqlJsonMerge.models.OracleDialect();
 			case "sqlite":
 			default:
-				return new SqlJsonMerge.models.SQLiteDialect();
+				return new app.modules.SqlJsonMerge.models.SQLiteDialect();
 		}
 	}
 
