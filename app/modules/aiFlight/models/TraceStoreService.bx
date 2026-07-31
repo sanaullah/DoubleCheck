@@ -865,6 +865,81 @@ class {
 		return true;
 	}
 
+	struct function getTraceMetrics( required string traceId ) {
+		var trace = getTrace( arguments.traceId );
+		if ( !trace.count() ) {
+			return {};
+		}
+		var obs = listObservations( arguments.traceId );
+		var byType = {};
+		var byModel = {};
+		var totalTokens = val( trace.totalTokens ?: 0 );
+		var totalCost = val( trace.cost ?: 0 );
+
+		for ( var o in obs ) {
+			var type = o.type ?: "event";
+			var model = o.model ?: "unknown";
+			var obsTokens = val( o.usage.totalTokens ?: 0 );
+			var obsCost = val( o.usage.cost ?: 0 );
+			var obsDuration = val( o.durationMs ?: 0 );
+
+			if ( !structKeyExists( byType, type ) ) {
+				byType[ type ] = {
+					type: type,
+					count: 0,
+					totalTokens: 0,
+					totalCost: 0,
+					totalDuration: 0,
+					avgDuration: 0
+				};
+			}
+			byType[ type ].count++;
+			byType[ type ].totalTokens += obsTokens;
+			byType[ type ].totalCost += obsCost;
+			byType[ type ].totalDuration += obsDuration;
+
+			if ( !structKeyExists( byModel, model ) ) {
+				byModel[ model ] = {
+					model: model,
+					count: 0,
+					totalTokens: 0,
+					totalCost: 0
+				};
+			}
+			byModel[ model ].count++;
+			byModel[ model ].totalTokens += obsTokens;
+			byModel[ model ].totalCost += obsCost;
+		}
+
+		for ( var type in byType ) {
+			var count = byType[ type ].count ?: 1;
+			byType[ type ].avgDuration = int( byType[ type ].totalDuration / count );
+		}
+
+		var typeMetrics = [];
+		for ( var type in byType ) {
+			typeMetrics.append( byType[ type ] );
+		}
+
+		var modelMetrics = [];
+		for ( var model in byModel ) {
+			modelMetrics.append( byModel[ model ] );
+		}
+
+		return {
+			trace: trace,
+			summary: {
+				totalDuration: trace.durationMs ?: 0,
+				totalTokens: totalTokens,
+				totalCost: totalCost,
+				avgCostPerTrace: totalTokens > 0 ? totalCost / totalTokens : 0,
+				observationCount: arrayLen( obs )
+			},
+			byType: typeMetrics,
+			byModel: modelMetrics
+		};
+	}
+
 	struct function upsertFeedback(
 		required string traceId,
 		required string value,
