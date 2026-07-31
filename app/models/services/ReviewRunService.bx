@@ -22,6 +22,8 @@ class {
 
 	property name="resultRepository" inject="ReviewResultRepository";
 
+	property name="observabilityTraceService" inject="ObservabilityTraceService";
+
 	property name="architectureIndexService" inject="ArchitectureIndexService";
 
 	property name="graphRepository" inject="AnalysisGraphRepository";
@@ -952,6 +954,22 @@ class {
 					findings,
 					aiResult
 				);
+			// Precompute the trace summary once, here, so the history list can read
+			// it straight off review_summaries instead of exporting the full trace
+			// (up to 1000 events) for this run on every page view - see
+			// ReviewHistoryService.hydrateRow().
+			var traceExport = observabilityTraceService.exportTraces( arguments.runId, 1000 );
+			var traceProviders = {};
+			var traceModels = {};
+			for ( var observation in traceExport.observations ) {
+				var observationProvider = observation.modelParameters.provider ?: observation.metadata.provider ?: "";
+				if ( len( trim( toString( observationProvider ) ) ) ) {
+					traceProviders[ toString( observationProvider ) ] = true;
+				}
+				if ( len( trim( observation.model ?: "" ) ) ) {
+					traceModels[ observation.model ] = true;
+				}
+			}
 			resultRepository.saveSummary(
 					runId              = arguments.runId,
 					summary            = summary,
@@ -967,7 +985,15 @@ class {
 					baseRevision       = scan.baseRevision,
 					headRevision       = scan.headRevision,
 					discoveryTruncated = scan.discoveryTruncated,
-					skipped            = scan.skipped
+					skipped            = scan.skipped,
+					hasAiTraceMetrics  = true,
+					aiProviders        = traceProviders.keyArray().sort( "textnocase" ),
+					aiModels           = traceModels.keyArray().sort( "textnocase" ),
+					aiPromptTokens     = traceExport.summary.promptTokens,
+					aiCompletionTokens = traceExport.summary.completionTokens,
+					aiTotalTokens      = traceExport.summary.totalTokens,
+					aiRetries          = traceExport.summary.retries,
+					aiObservationCount = traceExport.summary.observationCount
 				);
 			var finalStatus = len( aiResult.error ) || scan.discoveryTruncated ? "partial" : "succeeded";
 			var completedMessage = "";

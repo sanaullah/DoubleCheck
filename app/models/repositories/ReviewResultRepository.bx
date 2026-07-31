@@ -110,7 +110,19 @@ class {
 		string baseRevision        = "",
 		string headRevision        = "",
 		boolean discoveryTruncated = false,
-		struct skipped             = {}
+		struct skipped             = {},
+		// When omitted, the ai_* trace columns are left NULL and
+		// ReviewHistoryService.hydrateRow() falls back to a live trace export
+		// for this run (used by callers - e.g. modernize runs, early-exit
+		// scans - that have no meaningful trace summary to precompute yet).
+		boolean hasAiTraceMetrics  = false,
+		array aiProviders          = [],
+		array aiModels             = [],
+		numeric aiPromptTokens     = 0,
+		numeric aiCompletionTokens = 0,
+		numeric aiTotalTokens      = 0,
+		numeric aiRetries          = 0,
+		numeric aiObservationCount = 0
 	) {
 		queryExecute(
 			"
@@ -118,12 +130,18 @@ class {
 					run_id, summary, languages, files_scanned, bytes_scanned,
 					findings_count, ai_enabled, ai_files_reviewed, ai_characters_sent,
 					review_scope, repository_revision, base_revision, head_revision,
-					discovery_truncated, skipped_json, created_at
+					discovery_truncated, skipped_json,
+					ai_providers_json, ai_models_json, ai_prompt_tokens, ai_completion_tokens,
+					ai_total_tokens, ai_retries, ai_observation_count,
+					created_at
 				) VALUES (
 					:runId, :summary, :languages, :filesScanned, :bytesScanned,
 					:findingsCount, :aiEnabled, :aiFilesReviewed, :aiCharactersSent,
 					:reviewScope, :repositoryRevision, :baseRevision, :headRevision,
-					:discoveryTruncated, :skippedJson, :createdAt
+					:discoveryTruncated, :skippedJson,
+					:aiProvidersJson, :aiModelsJson, :aiPromptTokens, :aiCompletionTokens,
+					:aiTotalTokens, :aiRetries, :aiObservationCount,
+					:createdAt
 				)
 				ON CONFLICT ( run_id ) DO UPDATE SET
 					summary = excluded.summary,
@@ -140,6 +158,13 @@ class {
 					head_revision = excluded.head_revision,
 					discovery_truncated = excluded.discovery_truncated,
 					skipped_json = excluded.skipped_json,
+					ai_providers_json = excluded.ai_providers_json,
+					ai_models_json = excluded.ai_models_json,
+					ai_prompt_tokens = excluded.ai_prompt_tokens,
+					ai_completion_tokens = excluded.ai_completion_tokens,
+					ai_total_tokens = excluded.ai_total_tokens,
+					ai_retries = excluded.ai_retries,
+					ai_observation_count = excluded.ai_observation_count,
 					created_at = excluded.created_at
 			",
 			{
@@ -158,7 +183,40 @@ class {
 				headRevision      : arguments.headRevision,
 				discoveryTruncated: arguments.discoveryTruncated ? 1 : 0,
 				skippedJson       : jsonSerialize( normalizeSkipped( arguments.skipped ) ),
-				createdAt         : timestamp()
+				aiProvidersJson: {
+					value: jsonSerialize( arguments.aiProviders ),
+					null : !arguments.hasAiTraceMetrics
+				},
+				aiModelsJson: {
+					value: jsonSerialize( arguments.aiModels ),
+					null : !arguments.hasAiTraceMetrics
+				},
+				aiPromptTokens: {
+					value    : arguments.aiPromptTokens,
+					cfsqltype: "integer",
+					null     : !arguments.hasAiTraceMetrics
+				},
+				aiCompletionTokens: {
+					value    : arguments.aiCompletionTokens,
+					cfsqltype: "integer",
+					null     : !arguments.hasAiTraceMetrics
+				},
+				aiTotalTokens: {
+					value    : arguments.aiTotalTokens,
+					cfsqltype: "integer",
+					null     : !arguments.hasAiTraceMetrics
+				},
+				aiRetries: {
+					value    : arguments.aiRetries,
+					cfsqltype: "integer",
+					null     : !arguments.hasAiTraceMetrics
+				},
+				aiObservationCount: {
+					value    : arguments.aiObservationCount,
+					cfsqltype: "integer",
+					null     : !arguments.hasAiTraceMetrics
+				},
+				createdAt: timestamp()
 			},
 			{ datasource: datasource }
 		);

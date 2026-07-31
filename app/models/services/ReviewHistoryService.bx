@@ -116,6 +116,13 @@ class {
 					s.findings_count,
 					s.languages,
 					s.ai_enabled,
+					s.ai_providers_json,
+					s.ai_models_json,
+					s.ai_prompt_tokens,
+					s.ai_completion_tokens,
+					s.ai_total_tokens,
+					s.ai_retries,
+					s.ai_observation_count,
 					COALESCE(f.critical_count, 0) AS critical_count,
 					COALESCE(f.high_count, 0) AS high_count,
 					COALESCE(f.medium_count, 0) AS medium_count,
@@ -295,6 +302,13 @@ class {
 					s.findings_count,
 					s.languages,
 					s.ai_enabled,
+					s.ai_providers_json,
+					s.ai_models_json,
+					s.ai_prompt_tokens,
+					s.ai_completion_tokens,
+					s.ai_total_tokens,
+					s.ai_retries,
+					s.ai_observation_count,
 					COALESCE(f.critical_count, 0) AS critical_count,
 					COALESCE(f.high_count, 0) AS high_count,
 					COALESCE(f.medium_count, 0) AS medium_count,
@@ -443,18 +457,20 @@ class {
 				durationAvailable = false;
 			}
 		}
-		var traces = observabilityTraceService.exportTraces( records.id[ row ], 1000 );
-		var providers = {};
-		var models = {};
-		for ( var observation in traces.observations ) {
-			var provider = observation.modelParameters.provider ?: observation.metadata.provider ?: "";
-			if ( len( trim( toString( provider ) ) ) ) {
-				providers[ toString( provider ) ] = true;
-			}
-			if ( len( trim( observation.model ?: "" ) ) ) {
-				models[ observation.model ] = true;
-			}
-		}
+		var aiSummary = numericOrNull( records, "ai_observation_count", row );
+		var aiTrace = isNull( aiSummary )
+			// Legacy rows and run kinds that don't precompute trace metrics
+			// (e.g. modernize, early-exit scans) still export live.
+			? liveTraceSummary( records.id[ row ] )
+			: {
+				providers       : deserializeStringArray( nullable( records, "ai_providers_json", row ) ),
+				models          : deserializeStringArray( nullable( records, "ai_models_json", row ) ),
+				promptTokens    : numericOrNull( records, "ai_prompt_tokens", row ) ?: 0,
+				completionTokens: numericOrNull( records, "ai_completion_tokens", row ) ?: 0,
+				totalTokens     : numericOrNull( records, "ai_total_tokens", row ) ?: 0,
+				retries         : numericOrNull( records, "ai_retries", row ) ?: 0,
+				observationCount: aiSummary
+			};
 		var roles = len( records.specialist_roles[ row ] ) ? listToArray( records.specialist_roles[ row ] ) : [];
 		roles.sort( "textnocase" );
 		var runKind = nullable( records, "run_kind", row ) ?: "review";
@@ -509,17 +525,53 @@ class {
 					coverage : records.specialist_count[ row ] ? records.specialist_completed[ row ] / records.specialist_count[ row ] : 0
 				},
 				ai: {
-					providers       : providers.keyArray().sort( "textnocase" ),
-					models          : models.keyArray().sort( "textnocase" ),
-					promptTokens    : traces.summary.promptTokens,
-					completionTokens: traces.summary.completionTokens,
-					totalTokens     : traces.summary.totalTokens,
-					retries         : traces.summary.retries,
+					providers       : aiTrace.providers.sort( "textnocase" ),
+					models          : aiTrace.models.sort( "textnocase" ),
+					promptTokens    : aiTrace.promptTokens,
+					completionTokens: aiTrace.completionTokens,
+					totalTokens     : aiTrace.totalTokens,
+					retries         : aiTrace.retries,
 					failures        : records.specialist_failed[ row ] + ( records.status[ row ] == "failed" ? 1 : 0 ),
-					available       : traces.summary.observationCount > 0
+					available       : aiTrace.observationCount > 0
 				}
 			}
 		};
+	}
+
+	private struct function liveTraceSummary( required string runId ) {
+		var traces = observabilityTraceService.exportTraces( arguments.runId, 1000 );
+		var providers = {};
+		var models = {};
+		for ( var observation in traces.observations ) {
+			var provider = observation.modelParameters.provider ?: observation.metadata.provider ?: "";
+			if ( len( trim( toString( provider ) ) ) ) {
+				providers[ toString( provider ) ] = true;
+			}
+			if ( len( trim( observation.model ?: "" ) ) ) {
+				models[ observation.model ] = true;
+			}
+		}
+		return {
+			providers       : providers.keyArray(),
+			models          : models.keyArray(),
+			promptTokens    : traces.summary.promptTokens,
+			completionTokens: traces.summary.completionTokens,
+			totalTokens     : traces.summary.totalTokens,
+			retries         : traces.summary.retries,
+			observationCount: traces.summary.observationCount
+		};
+	}
+
+	private array function deserializeStringArray( string json = "" ) {
+		if ( !len( arguments.json ) ) {
+			return [];
+		}
+		try {
+			var parsed = jsonDeserialize( arguments.json );
+			return isArray( parsed ) ? parsed : [];
+		} catch (any ignored) {
+			return [];
+		}
 	}
 
 	private struct function summarize( required array rows ) {
