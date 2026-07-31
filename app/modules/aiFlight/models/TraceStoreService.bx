@@ -961,6 +961,80 @@ class {
 		return errors;
 	}
 
+	string function exportTrace( required struct trace, required array observations, required string format ) {
+		if ( arguments.format == "json" ) {
+			return exportTraceJson( arguments.trace, arguments.observations );
+		} else if ( arguments.format == "csv" ) {
+			return exportTraceCsv( arguments.trace, arguments.observations );
+		} else if ( arguments.format == "markdown" ) {
+			return exportTraceMarkdown( arguments.trace, arguments.observations );
+		}
+		return "";
+	}
+
+	private string function exportTraceJson( required struct trace, required array observations ) {
+		var exported = duplicate( arguments.trace );
+		exported.observations = arguments.observations;
+		return jsonSerialize( exported );
+	}
+
+	private string function exportTraceCsv( required struct trace, required array observations ) {
+		var lines = [];
+		lines.append( "traceId,type,name,status,durationMs,startTime,model,provider,inputPreview,outputPreview,totalTokens,cost" );
+		for ( var o in arguments.observations ) {
+			var row = csvValue( o.id ?: "" ) & "," &
+				csvValue( o.type ?: "" ) & "," &
+				csvValue( o.name ?: "" ) & "," &
+				csvValue( o.status ?: "" ) & "," &
+				val( o.durationMs ?: 0 ) & "," &
+				csvValue( o.startTime ?: "" ) & "," &
+				csvValue( o.model ?: "" ) & "," &
+				csvValue( o.provider ?: "" ) & "," &
+				csvValue( left( o.inputText ?: "", 100 ) ) & "," &
+				csvValue( left( o.outputText ?: "", 100 ) ) & "," &
+				val( o.usage.totalTokens ?: 0 ) & "," &
+				val( o.usage.cost ?: 0 );
+			lines.append( row );
+		}
+		return arrayToList( lines, chr(10) );
+	}
+
+	private string function exportTraceMarkdown( required struct trace, required array observations ) {
+		var md = [];
+		md.append( "# Trace Export" );
+		md.append( "" );
+		md.append( "**Trace ID:** `" & ( arguments.trace.id ?: "" ) & "`" );
+		md.append( "**Name:** " & ( arguments.trace.name ?: "Untitled" ) );
+		md.append( "**Status:** " & ( arguments.trace.status ?: "unknown" ) );
+		md.append( "**Started:** " & ( arguments.trace.startedAt ?: "unknown" ) );
+		md.append( "**Duration:** " & val( arguments.trace.durationMs ?: 0 ) & " ms" );
+		md.append( "**Total Tokens:** " & val( arguments.trace.totalTokens ?: 0 ) );
+		md.append( "**Cost:** $" & val( arguments.trace.cost ?: 0 ) );
+		md.append( "" );
+		md.append( "## Observations (" & arrayLen( arguments.observations ) & ")" );
+		md.append( "" );
+		for ( var o in arguments.observations ) {
+			md.append( "### " & ( o.name ?: o.type ?: "Step" ) );
+			md.append( "- **Type:** " & ( o.type ?: "event" ) );
+			md.append( "- **Status:** " & ( o.status ?: "unknown" ) );
+			md.append( "- **Duration:** " & val( o.durationMs ?: 0 ) & " ms" );
+			md.append( "- **Model:** " & ( o.model ?: "N/A" ) );
+			md.append( "- **Tokens:** " & val( o.usage.totalTokens ?: 0 ) );
+			if ( len( o.inputText ?: "" ) ) {
+				md.append( "- **Input:** " & left( o.inputText, 200 ) );
+			}
+			if ( len( o.outputText ?: "" ) ) {
+				md.append( "- **Output:** " & left( o.outputText, 200 ) );
+			}
+			md.append( "" );
+		}
+		return arrayToList( md, chr(10) );
+	}
+
+	private string function csvValue( required string val ) {
+		return '"' & replace( arguments.val, '"', '""', "all" ) & '"';
+	}
+
 	struct function upsertFeedback(
 		required string traceId,
 		required string value,
