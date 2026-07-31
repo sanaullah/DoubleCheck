@@ -1,0 +1,86 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization risk/effort intelligence", () => {
+			it( "flags roadmap phases and architecture groups with the worst review-finding severity among their units", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				service.reviewRunRepository = { findLatestForProject: ( projectPath, runKind, tenantId, projectId ) => {
+					return { getId: () => "review-run-1" };
+				} };
+				service.reviewResultRepository = { getResult: ( runId ) => {
+					return { findings: [
+						{ filePath: "legacy/crime.cfm", severity: "high" },
+						{ filePath: "legacy/crime.cfm", severity: "critical" },
+						{ filePath: "legacy/spellcheck.cfm", severity: "low" }
+					] };
+				} };
+				var plan = {
+					target: {
+						units: [
+							{ id: "u-crime", sourcePath: "legacy/crime.cfm" },
+							{ id: "u-spell", sourcePath: "legacy/spellcheck.cfm" },
+							{ id: "u-clean", sourcePath: "legacy/clean.cfm" }
+						],
+						contexts: [ { id: "ctx-crime", targetUnitIds: [ "u-crime" ] } ],
+						extracts: [ { id: "ext-spell", targetUnitIds: [ "u-spell" ] } ]
+					},
+					roadmapPhases: [
+						{ id: "phase-crime", unitIds: [ "u-crime" ] },
+						{ id: "phase-clean", unitIds: [ "u-clean" ] }
+					]
+				};
+				var result = service.enrich( plan, "D:\Temp\cfportal\opengovdashboard" );
+				var crimePhase = result.roadmapPhases.filter( ( item ) => item.id == "phase-crime" )[ 1 ];
+				var cleanPhase = result.roadmapPhases.filter( ( item ) => item.id == "phase-clean" )[ 1 ];
+				expect( crimePhase.riskLevel ).toBe( "critical" );
+				expect( crimePhase.relatedFindingCount ).toBe( 2 );
+				expect( cleanPhase.riskLevel ).toBe( "none" );
+				expect( cleanPhase.relatedFindingCount ).toBe( 0 );
+				expect( result.target.contexts[ 1 ].riskLevel ).toBe( "critical" );
+				expect( result.target.extracts[ 1 ].riskLevel ).toBe( "low" );
+			} );
+
+			it( "still computes effortSize from unit count when no review run exists for the project", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				service.reviewRunRepository = { findLatestForProject: ( projectPath, runKind, tenantId, projectId ) => javacast( "null", "" ) };
+				service.reviewResultRepository = { getResult: ( runId ) => { throw( type = "ShouldNotBeCalled", message = "no review run to look up findings for" ); } };
+				var plan = {
+					target: { units: [ { id: "u1" }, { id: "u2" } ], contexts: [], extracts: [] },
+					roadmapPhases: [ { id: "phase-1", unitIds: [ "u1", "u2" ] } ]
+				};
+				var result = service.enrich( plan, "D:\Temp\some\project" );
+				expect( result.roadmapPhases[ 1 ].riskLevel ).toBe( "none" );
+				expect( result.roadmapPhases[ 1 ].effortSize ).toBe( "S" );
+			} );
+
+			it( "skips the review lookup entirely when no projectPath is supplied", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				var lookupCalled = false;
+				service.reviewRunRepository = { findLatestForProject: ( projectPath, runKind, tenantId, projectId ) => { lookupCalled = true; return javacast( "null", "" ); } };
+				var plan = { target: { units: [], contexts: [], extracts: [] }, roadmapPhases: [] };
+				service.enrich( plan, "" );
+				expect( lookupCalled ).toBeFalse();
+			} );
+
+			it( "sizes effort by unit count thresholds S/M/L/XL", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				service.reviewRunRepository = { findLatestForProject: ( projectPath, runKind, tenantId, projectId ) => javacast( "null", "" ) };
+				var makeUnits = ( count ) => {
+					var units = [];
+					for ( var i = 1; i <= count; i++ ) units.append( { id: "u#i#" } );
+					return units;
+				};
+				var sizesFor = ( count ) => {
+					var plan = {
+						target: { units: makeUnits( count ), contexts: [], extracts: [] },
+						roadmapPhases: [ { id: "phase-1", unitIds: makeUnits( count ).map( ( item ) => item.id ) } ]
+					};
+					return service.enrich( plan, "D:\Temp\proj" ).roadmapPhases[ 1 ].effortSize;
+				};
+				expect( sizesFor( 3 ) ).toBe( "S" );
+				expect( sizesFor( 8 ) ).toBe( "M" );
+				expect( sizesFor( 15 ) ).toBe( "L" );
+				expect( sizesFor( 16 ) ).toBe( "XL" );
+			} );
+		} );
+	}
+}

@@ -18,6 +18,14 @@ class {
 	variables.defaultApplicationShards = 40;
 	variables.maxApplicationShards = 40;
 	variables.defaultShardSize = 2;
+	// Roadmap shards are sized independently of the application-shard
+	// constants above: they cover already-compacted target-unit groups (from
+	// synthesisRoadmapGroups()), not raw file shards, and the failure mode
+	// being fixed is the roadmap role trying to describe an entire ~20-group
+	// plan in one call. 24 gives real projects one phase per group while
+	// still collapsing small/no-architecture-group test plans to one shard.
+	variables.defaultRoadmapUnitBatchSize = 24;
+	variables.maxRoadmapShards = 24;
 
 	struct function propose(
 		required string runId,
@@ -176,21 +184,43 @@ class {
 				errors.append( { role: "modernization-roadmap", message: "cost-budget-exceeded" } );
 			} else {
 				logInfo( "Modernize proposal #arguments.runId#: starting roadmap role" );
-				var roadmapRequest = agentFactory.build( "modernization-roadmap", runtime, merged, budgets );
-				var roadmapOptions = duplicate( arguments.options );
-				roadmapOptions.budgets = budgets;
-				roadmapOptions.startedAt = getTickCount();
-				roadmapOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
-				// See the matching comment on architectureOptions.maxRetries above.
-				roadmapOptions.maxRetries = 1;
-				roadmapOptions.role = "modernization-roadmap";
-				var roadmap = agentGateway.run( arguments.runId, roadmapRequest, roadmapOptions );
-				totalCostUsd += isNumeric( roadmap.costUsd ?: "" ) ? val( roadmap.costUsd ) : 0;
-				if ( roadmap.ok ?: false && validFragment( "modernization-roadmap", roadmap.payload ?: {} ) ) {
-					var redactedRoadmap = redactPayload( roadmap.payload ?: {} );
-					if ( !redactedRoadmap.count() && ( roadmap.payload ?: {} ).count() ) errors.append( { role: "modernization-roadmap", message: "redaction-failed" } );
-					else merged = mergeRoadmap( merged, redactedRoadmap, samplePolicy, errors );
-				} else errors.append( { role: "modernization-roadmap", message: roadmap.error ?: ( roadmap.ok ?: false ? "malformed-role-output" : "provider-failed" ) } );
+				// The roadmap role used to be one whole-plan call, which reliably
+				// truncated on any real project (many target units / architecture
+				// groups all described in one JSON response under the same
+				// token cap as every other role). It is now sharded the same way
+				// modernization-application already is: one small, bounded call
+				// per architecture group (or per unit batch when no groups exist
+				// yet), dispatched concurrently, then reconciled back into a
+				// single ordered roadmap.
+				var roadmapShards = buildRoadmapShards( merged, budgets );
+				if ( !roadmapShards.len() ) {
+					errors.append( { role: "modernization-roadmap", message: "no-roadmap-groups", severity: "info" } );
+				} else {
+					var roadmapResult = runRoadmapShards(
+						arguments.runId,
+						roadmapShards,
+						runtime,
+						budgets,
+						startedAt,
+						maxDurationMs,
+						totalOutputLimit,
+						totalCostUsd,
+						arguments.options
+					);
+					totalCostUsd += roadmapResult.costUsd;
+					totalOutputCharacters += roadmapResult.outputCharacters;
+					splitProposalMessages( roadmapResult.errors, errors, notes );
+					if ( roadmapResult.accepted > 0 ) merged = mergeRoadmap( merged, roadmapResult, samplePolicy, errors );
+					merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
+					merged.metadata.roadmapShards = {
+						accepted: roadmapResult.accepted,
+						total: roadmapShards.len(),
+						failed: roadmapResult.failed,
+						omitted: roadmapResult.omitted,
+						outcomes: roadmapResult.outcomes
+					};
+					logInfo( "Modernize proposal #arguments.runId#: roadmap shards accepted #roadmapResult.accepted#/#roadmapShards.len()#" );
+				}
 			}
 		}
 		merged = polishPlan( merged, samplePolicy, errors );
@@ -645,6 +675,363 @@ class {
 		arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
 		for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
 		return arguments.plan;
+	}
+
+	/**
+	 * Partitions the merged plan into small roadmap-generation jobs so no
+	 * single call has to describe the whole plan (the failure mode that made
+	 * the roadmap role truncate on any real project). Prefers one shard per
+	 * architecture group (mirrors the deterministic synthesizeGroupedPhases()
+	 * grouping, just producing shard descriptors instead of finished phases);
+	 * falls back to plain unit batches when architecture didn't run/produce
+	 * groups.
+	 */
+	private array function buildRoadmapShards( required struct plan, struct budgets = {} ) {
+		var batchSize = isNumeric( arguments.budgets.roadmapUnitBatchSize ?: "" )
+			? max( 4, min( 60, int( arguments.budgets.roadmapUnitBatchSize ) ) )
+			: variables.defaultRoadmapUnitBatchSize;
+		var shardCap = isNumeric( arguments.budgets.maxRoadmapShards ?: "" )
+			? max( 1, min( variables.maxRoadmapShards, int( arguments.budgets.maxRoadmapShards ) ) )
+			: variables.maxRoadmapShards;
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		if ( !units.len() ) return [];
+
+		var groups = synthesisRoadmapGroups( arguments.plan );
+		var shardGroups = [];
+		var covered = {};
+		if ( groups.len() ) {
+			for ( var group in groups ) {
+				if ( shardGroups.len() >= shardCap ) break;
+				var groupIds = [];
+				for ( var unitId in ( group.targetUnitIds ?: [] ) ) {
+					var id = trim( toString( unitId ) );
+					if ( len( id ) && !covered.keyExists( id ) ) { groupIds.append( id ); covered[ id ] = true; }
+				}
+				if ( groupIds.len() ) shardGroups.append( { name: group.name, targetUnitIds: groupIds, kind: group.kind ?: "context" } );
+			}
+			var leftover = [];
+			for ( var unit in units ) {
+				var id = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+				if ( len( id ) && !covered.keyExists( id ) ) leftover.append( id );
+			}
+			if ( leftover.len() && shardGroups.len() < shardCap ) {
+				shardGroups.append( { name: "Continue strangler slices", targetUnitIds: leftover, kind: "leftover" } );
+			}
+		} else {
+			for ( var offset = 1; offset <= units.len(); offset += batchSize ) {
+				if ( shardGroups.len() >= shardCap ) break;
+				var batchIds = [];
+				for ( var i = offset; i <= min( units.len(), offset + batchSize - 1 ); i++ ) {
+					var unitId = trim( toString( units[ i ].id ?: units[ i ].itemId ?: "" ) );
+					if ( len( unitId ) ) batchIds.append( unitId );
+				}
+				if ( batchIds.len() ) shardGroups.append( { name: "Slice #shardGroups.len() + 1#", targetUnitIds: batchIds, kind: "unit-batch" } );
+			}
+		}
+		if ( !shardGroups.len() ) return [];
+		var shards = [];
+		for ( var index = 1; index <= shardGroups.len(); index++ ) {
+			shards.append( evidenceForRoadmapShard( arguments.plan, shardGroups[ index ], index, shardGroups.len() ) );
+		}
+		return shards;
+	}
+
+	/** Scopes plan evidence down to one roadmap shard's target-unit group, mirroring evidenceForShard()'s file-scoping for application shards. */
+	private struct function evidenceForRoadmapShard( required struct plan, required struct group, required numeric index, required numeric total ) {
+		var idSet = {};
+		for ( var id in ( arguments.group.targetUnitIds ?: [] ) ) idSet[ trim( toString( id ) ) ] = true;
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var scopedUnits = [];
+		for ( var unit in units ) if ( idSet.keyExists( trim( toString( unit.id ?: unit.itemId ?: "" ) ) ) ) scopedUnits.append( unit );
+		var links = [];
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( idSet.keyExists( trim( toString( link.targetUnitId ?: "" ) ) ) ) links.append( link );
+		}
+		var routes = [];
+		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
+			if ( idSet.keyExists( trim( toString( route.targetUnitId ?: "" ) ) ) ) routes.append( route );
+		}
+		var findings = [];
+		var findingIds = {};
+		for ( var finding in ( isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] ) ) {
+			var relatedIds = isArray( finding.relatedTargetUnitIds ?: "" ) ? finding.relatedTargetUnitIds : [];
+			var matches = false;
+			for ( var relatedId in relatedIds ) if ( idSet.keyExists( trim( toString( relatedId ) ) ) ) { matches = true; break; }
+			if ( matches ) { findings.append( finding ); findingIds[ trim( toString( finding.id ?: finding.itemId ?: "" ) ) ] = true; }
+		}
+		var transitions = [];
+		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
+			if ( findingIds.keyExists( trim( toString( transition.dbFindingId ?: "" ) ) ) ) transitions.append( transition );
+		}
+		var samples = [];
+		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
+			var relatedItemIds = isArray( sample.relatedItemIds ?: "" ) ? sample.relatedItemIds : [];
+			var relates = false;
+			for ( var relatedId in relatedItemIds ) if ( idSet.keyExists( trim( toString( relatedId ) ) ) ) { relates = true; break; }
+			if ( relates ) samples.append( sample );
+		}
+		return {
+			target: { units: scopedUnits, contexts: [], extracts: [] },
+			unitLinks: links,
+			routeContracts: routes,
+			dbFindings: findings,
+			dbTransitions: transitions,
+			samples: samples,
+			coverage: arguments.plan.coverage ?: {},
+			assumptions: [],
+			shardMeta: {
+				index: arguments.index,
+				total: arguments.total,
+				kind: arguments.group.kind ?: "unit-batch",
+				groupName: arguments.group.name ?: "Slice",
+				targetUnitIds: arguments.group.targetUnitIds ?: []
+			}
+		};
+	}
+
+	/**
+	 * Dispatches roadmap shards concurrently, same executor/backfill shape as
+	 * runApplicationShards() but tracking accumulated phase fragments instead
+	 * of merging an application-shaped payload in place. Roadmap is the last
+	 * role to run, so unlike application shards it does not reserve spend for
+	 * anything downstream.
+	 */
+	private struct function runRoadmapShards(
+		required string runId,
+		required array roadmapShards,
+		required struct runtime,
+		required struct budgets,
+		required numeric startedAt,
+		required numeric maxDurationMs,
+		required numeric totalOutputLimit,
+		required numeric spentSoFarUsd,
+		struct options = {}
+	) {
+		var outcomes = [];
+		for ( var outcomeIndex = 1; outcomeIndex <= arguments.roadmapShards.len(); outcomeIndex++ ) {
+			outcomes.append( {
+				shard: outcomeIndex,
+				shardTotal: arguments.roadmapShards.len(),
+				groupName: arguments.roadmapShards[ outcomeIndex ].shardMeta.groupName ?: "",
+				status: "not-run",
+				durationMs: 0,
+				costUsd: 0,
+				outputCharacters: 0,
+				usage: {},
+				provenanceClass: "not-observed"
+			} );
+		}
+		var concurrency = isNumeric( arguments.budgets.applicationShardConcurrency ?: "" )
+			? max( 1, min( 12, int( arguments.budgets.applicationShardConcurrency ) ) )
+			: 3;
+		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
+
+		var state = {
+			phaseRecords: [],
+			assumptions: [],
+			samples: [],
+			accepted: 0,
+			errors: [],
+			totalOutputCharacters: 0,
+			totalCostUsd: 0,
+			providerId: "",
+			modelId: "",
+			nextShardIndex: 1,
+			dispatchCount: 0,
+			pending: [],
+			outcomes: outcomes,
+			executorName: ensureShardExecutor( concurrency )
+		};
+		var shardContext = {
+			runId: arguments.runId,
+			roadmapShards: arguments.roadmapShards,
+			runtime: arguments.runtime,
+			budgets: arguments.budgets,
+			options: arguments.options,
+			startedAt: arguments.startedAt,
+			maxDurationMs: arguments.maxDurationMs,
+			totalOutputLimit: arguments.totalOutputLimit,
+			totalShards: arguments.roadmapShards.len(),
+			concurrency: concurrency,
+			maxCost: maxCost,
+			spentSoFarUsd: arguments.spentSoFarUsd
+		};
+
+		var primed = 0;
+		while ( primed < concurrency && dispatchNextRoadmapShard( state, shardContext ) ) primed = primed + 1;
+
+		while ( state.pending.len() ) {
+			var settledIndex = 0;
+			while ( !settledIndex ) {
+				for ( var scanIndex = 1; scanIndex <= state.pending.len(); scanIndex++ ) {
+					if ( state.pending[ scanIndex ].future.isDone() ) {
+						settledIndex = scanIndex;
+						break;
+					}
+				}
+				if ( !settledIndex ) sleep( 20 );
+			}
+			var settled = state.pending[ settledIndex ];
+			state.pending.deleteAt( settledIndex );
+			recordRoadmapShardResult( state, settled, awaitShardTask( settled ) );
+			dispatchNextRoadmapShard( state, shardContext );
+		}
+
+		for ( var pendingOutcome in state.outcomes ) {
+			if ( pendingOutcome.status == "not-run" ) pendingOutcome.status = "omitted";
+		}
+
+		// A plan that only ever needed one shard (the common small-plan case)
+		// keeps today's exact single-call behavior: no cross-shard id/dependency
+		// rewriting, since there is nothing to reconcile against.
+		var phases = shardContext.totalShards <= 1
+			? state.phaseRecords.map( ( record ) => record.phase )
+			: reconcileShardedRoadmapPhases( state.phaseRecords );
+
+		return {
+			roadmapPhases: phases,
+			assumptions: state.assumptions,
+			samples: state.samples,
+			accepted: state.accepted,
+			failed: state.outcomes.filter( ( item ) => item.status == "failed" ).len(),
+			omitted: state.outcomes.filter( ( item ) => item.status == "omitted" ).len(),
+			outcomes: state.outcomes,
+			errors: state.errors,
+			outputCharacters: state.totalOutputCharacters,
+			costUsd: state.totalCostUsd,
+			provider: state.providerId,
+			model: state.modelId
+		};
+	}
+
+	/** Dispatches the next queued roadmap shard, mirroring dispatchNextShard()'s budget/cancellation gates without a downstream-role cost reserve. */
+	private boolean function dispatchNextRoadmapShard( required struct state, required struct context ) {
+		if ( arguments.state.nextShardIndex > arguments.context.totalShards ) return false;
+		if ( isCancelled( arguments.context.runId, arguments.context.options ) ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "cancelled-after-partial-acceptance", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+		var elapsedMs = getTickCount() - arguments.context.startedAt;
+		var remainingMs = arguments.context.maxDurationMs - elapsedMs;
+		if ( remainingMs <= 2000 ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "budget-exceeded", shard: arguments.state.nextShardIndex, elapsedMs: elapsedMs, maxDurationMs: arguments.context.maxDurationMs } );
+			return false;
+		}
+		if ( arguments.state.totalOutputCharacters >= arguments.context.totalOutputLimit ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "total-output-budget-exceeded", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+		if ( arguments.context.maxCost > 0 && ( arguments.context.spentSoFarUsd + arguments.state.totalCostUsd ) >= arguments.context.maxCost ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "cost-budget-exceeded", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+
+		var shardIndex = arguments.state.nextShardIndex;
+		var shard = arguments.context.roadmapShards[ shardIndex ];
+		var shareCount = arguments.state.dispatchCount < arguments.context.concurrency
+			? min( arguments.context.concurrency, arguments.context.totalShards )
+			: ( arguments.context.totalShards - arguments.state.dispatchCount );
+		var costRemaining = arguments.context.maxCost > 0
+			? max( 0, arguments.context.maxCost - arguments.context.spentSoFarUsd - arguments.state.totalCostUsd )
+			: 0;
+		var perShardCost = arguments.context.maxCost > 0 ? costRemaining / max( 1, shareCount ) : 0;
+
+		var roadmapRequest = agentFactory.build( "modernization-roadmap", arguments.context.runtime, shard, arguments.context.budgets );
+		roadmapRequest.shardIndex = shardIndex;
+		var roadmapOptions = duplicate( arguments.context.options );
+		roadmapOptions.budgets = duplicate( arguments.context.budgets );
+		if ( arguments.context.maxCost > 0 ) roadmapOptions.budgets.maxCostUsd = perShardCost;
+		roadmapOptions.startedAt = getTickCount();
+		roadmapOptions.maxDurationMs = max( 5000, remainingMs );
+		roadmapOptions.maxRetries = isNumeric( arguments.context.options.maxRetries ?: "" )
+			? max( 0, min( 1, int( arguments.context.options.maxRetries ) ) )
+			: 1;
+		roadmapOptions.role = "modernization-roadmap";
+
+		arguments.state.pending.append( dispatchShardTask( arguments.context.runId, shardIndex, roadmapRequest, roadmapOptions, arguments.state.executorName ) );
+		arguments.state.nextShardIndex = shardIndex + 1;
+		arguments.state.dispatchCount = arguments.state.dispatchCount + 1;
+		return true;
+	}
+
+	/** Applies one settled roadmap shard's response to the running accounting/phase-record state. */
+	private void function recordRoadmapShardResult( required struct state, required struct settled, required struct response ) {
+		var outcome = arguments.state.outcomes[ arguments.settled.shardIndex ];
+		outcome.provider = arguments.response.provider ?: "";
+		outcome.model = arguments.response.model ?: "";
+		outcome.costUsd = isNumeric( arguments.response.costUsd ?: "" ) ? val( arguments.response.costUsd ) : 0;
+		outcome.durationMs = isNumeric( arguments.response.durationMs ?: "" ) ? int( arguments.response.durationMs ) : 0;
+		outcome.outputCharacters = isNumeric( arguments.response.outputCharacters ?: "" ) ? int( arguments.response.outputCharacters ) : 0;
+		outcome.usage = isStruct( arguments.response.usage ?: "" ) ? duplicate( arguments.response.usage ) : {};
+		if ( len( outcome.provider ) ) arguments.state.providerId = outcome.provider;
+		if ( len( outcome.model ) ) arguments.state.modelId = outcome.model;
+		arguments.state.totalCostUsd = arguments.state.totalCostUsd + outcome.costUsd;
+		if ( !( arguments.response.ok ?: false ) ) {
+			outcome.status = "failed";
+			outcome.reason = arguments.response.error ?: "provider-failed";
+			arguments.state.errors.append( { role: "modernization-roadmap", message: arguments.response.error ?: "provider-failed", shard: arguments.settled.shardIndex } );
+			return;
+		}
+		if ( !validFragment( "modernization-roadmap", arguments.response.payload ?: {} ) ) {
+			outcome.status = "failed";
+			outcome.reason = "malformed-role-output";
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "malformed-role-output", shard: arguments.settled.shardIndex } );
+			return;
+		}
+		var redacted = redactPayload( arguments.response.payload ?: {} );
+		if ( !redacted.count() && ( arguments.response.payload ?: {} ).count() ) {
+			outcome.status = "failed";
+			outcome.reason = "redaction-failed";
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "redaction-failed", shard: arguments.settled.shardIndex } );
+			return;
+		}
+		outcome.status = "accepted";
+		outcome.provenanceClass = "provider-suggested";
+		var phasesOut = isArray( redacted.roadmapPhases ?: "" ) ? redacted.roadmapPhases : ( isArray( redacted.phases ?: "" ) ? redacted.phases : [] );
+		for ( var phase in phasesOut ) if ( isStruct( phase ) ) arguments.state.phaseRecords.append( { phase: phase, shardIndex: arguments.settled.shardIndex } );
+		arguments.state.assumptions.append( boundedArray( redacted.assumptions ?: [], 40 ), true );
+		arguments.state.samples.append( boundedStructArray( redacted.samples ?: [], 20, arguments.state.errors, "roadmap.samples" ), true );
+		arguments.state.totalOutputCharacters = arguments.state.totalOutputCharacters +
+			( isNumeric( arguments.response.outputCharacters ?: "" ) ? int( arguments.response.outputCharacters ) : len( jsonSerialize( arguments.response.payload ?: {} ) ) );
+		arguments.state.accepted = arguments.state.accepted + 1;
+	}
+
+	/**
+	 * Reconciles phases from independent roadmap shard calls, only invoked
+	 * once more than one shard actually dispatched. Independent LLM calls
+	 * cannot know about each other's output, so none of the following can be
+	 * trusted across shards: ids (dedupeById() would silently drop a later
+	 * item on collision), dependencies (may reference an id from a call this
+	 * one never saw), or currentSlice (multiple shards may each claim it).
+	 * All three are normalized deterministically here instead, mirroring how
+	 * synthesizeGroupedPhases() already chains deterministic phases.
+	 */
+	private array function reconcileShardedRoadmapPhases( required array phaseRecords ) {
+		var ordered = duplicate( arguments.phaseRecords );
+		ordered.sort( ( a, b ) => a.shardIndex - b.shardIndex );
+		var seenIds = {};
+		var previousPhaseId = "";
+		var output = [];
+		var order = 0;
+		for ( var record in ordered ) {
+			order = order + 1;
+			var phase = duplicate( record.phase );
+			var rawId = trim( toString( phase.id ?: phase.itemId ?: "" ) );
+			var candidate = len( rawId ) ? rawId : ( "phase-shard-" & record.shardIndex );
+			var suffix = 2;
+			while ( seenIds.keyExists( lCase( candidate ) ) ) {
+				candidate = ( len( rawId ) ? rawId : "phase-shard-" & record.shardIndex ) & "-" & suffix;
+				suffix = suffix + 1;
+			}
+			seenIds[ lCase( candidate ) ] = true;
+			phase.id = candidate;
+			structDelete( phase, "itemId" );
+			phase.dependencies = len( previousPhaseId ) ? [ previousPhaseId ] : [];
+			phase.currentSlice = ( order == 1 );
+			previousPhaseId = candidate;
+			output.append( phase );
+		}
+		return output;
 	}
 
 	/**

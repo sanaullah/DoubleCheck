@@ -139,6 +139,12 @@
 				return "Some application shards didn't complete — routes may be missing rather than genuinely absent.";
 			}
 		}
+		if (pane === "roadmap") {
+			const shards = result.metadata?.roadmapShards || {};
+			if (!(result.roadmapPhases || []).length && (Number(shards.failed || 0) > 0 || Number(shards.omitted || 0) > 0)) {
+				return "Some roadmap shards didn't complete — phases may be missing rather than genuinely absent.";
+			}
+		}
 		return "";
 	}
 
@@ -147,6 +153,97 @@
 		if (basis === "domain-clustering") return "Grouped by shared domain — no deployment seam evidenced yet.";
 		if (basis === "explicit-seam") return "Explicit runtime/deployment seam observed.";
 		return "";
+	}
+
+	/**
+	 * Turns target.contexts/target.extracts into the {nodes,edges} shape
+	 * ArchitectureFlow.layoutFlowPositions() expects, so the Modernize
+	 * "Modular Monolith Map" reuses the same layout engine as the code-review
+	 * Architecture tab's file-dependency diagram instead of a bespoke one.
+	 * Pure/DOM-free so it's directly unit-testable.
+	 */
+	function buildModernizationArchitectureSubgraph(result = {}) {
+		const contexts = result.target?.contexts || result.contexts || [];
+		const extracts = result.target?.extracts || result.extracts || [];
+		const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module");
+		const central = contexts.filter((item) => !modules.includes(item));
+		const centralUnitCount = central.reduce((sum, item) => sum + (Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0), 0);
+
+		const nodes = [];
+		const idById = new Map();
+		const addNode = (id, path, role, item, unitCount) => {
+			const node = { id, path, role, item: item || null, unitCount: unitCount || 0 };
+			nodes.push(node);
+			idById.set(id, node);
+		};
+		addNode("core", "ColdBox Monolith", "core", null, centralUnitCount);
+		modules.forEach((item) => {
+			const id = String(item.id || item.itemId || "");
+			if (id) addNode(id, item.name || id, "module", item, Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0);
+		});
+		extracts.forEach((item) => {
+			const id = String(item.id || item.itemId || "");
+			if (id) addNode(id, item.name || id, "extract", item, Array.isArray(item.targetUnitIds) ? item.targetUnitIds.length : 0);
+		});
+
+		const edgeKeys = new Set();
+		const edges = [];
+		const addEdge = (from, to) => {
+			if (!idById.has(from) || !idById.has(to) || from === to) return;
+			const key = `${from}\0${to}`;
+			if (edgeKeys.has(key)) return;
+			edgeKeys.add(key);
+			edges.push({ from, to });
+		};
+		[...modules, ...extracts].forEach((item) => {
+			const id = String(item.id || item.itemId || "");
+			if (!id || !idById.has(id)) return;
+			addEdge("core", id);
+			(Array.isArray(item.dependsOnContextIds) ? item.dependsOnContextIds : []).forEach((dependsOnId) => {
+				addEdge(id, String(dependsOnId));
+			});
+		});
+
+		return {
+			mode: "modernization-architecture",
+			nodes,
+			edges,
+			truncated: false,
+			totalNodes: nodes.length,
+			totalEdges: edges.length
+		};
+	}
+
+	/**
+	 * Pure aggregation for the "Modernization Brief" summary card: status,
+	 * effort roll-up and risk distribution (from ModernizationRiskService's
+	 * read-time overlay), packaging split (from the architecture role), and
+	 * a one-line recommended next action. Every input is optional — a plan
+	 * from before Parts B/C shipped, or one that skipped those roles, still
+	 * produces a valid (mostly empty) summary rather than throwing.
+	 */
+	function modernizationBriefSummary(result = {}) {
+		const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
+		const contexts = result.target?.contexts || result.contexts || [];
+		const extracts = result.target?.extracts || result.extracts || [];
+		const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module");
+		const effortCounts = { S: 0, M: 0, L: 0, XL: 0 };
+		let riskyPhaseCount = 0;
+		phases.forEach((phase) => {
+			if (phase.effortSize && Object.prototype.hasOwnProperty.call(effortCounts, phase.effortSize)) effortCounts[phase.effortSize]++;
+			if (["high", "critical"].includes(String(phase.riskLevel || "").toLowerCase())) riskyPhaseCount++;
+		});
+		const currentPhase = phases.find((phase) => phase.currentSlice) || null;
+		return {
+			hasPlan: !!(phases.length || contexts.length || extracts.length || (result.target?.units || []).length),
+			phaseCount: phases.length,
+			effortCounts,
+			riskyPhaseCount,
+			packagingSplit: { centralized: Math.max(0, contexts.length - modules.length), modules: modules.length, extracts: extracts.length },
+			currentSlice: currentPhase ? { name: currentPhase.name || currentPhase.goal || currentPhase.id || "Current slice", effortSize: currentPhase.effortSize || "", riskLevel: currentPhase.riskLevel || "" } : null,
+			coverageStatus: result.coverage?.status || (result.coverage?.complete === true ? "complete" : "incomplete"),
+			validationStatus: result.validation?.status || result.validation?.overallStatus || "unknown"
+		};
 	}
 
 	return {
@@ -161,6 +258,8 @@
 		modernizationItemMeta,
 		modernizationItemKey,
 		modernizationPaneBanner,
-		modernizationEvidenceBasisNote
+		modernizationEvidenceBasisNote,
+		buildModernizationArchitectureSubgraph,
+		modernizationBriefSummary
 	};
 });

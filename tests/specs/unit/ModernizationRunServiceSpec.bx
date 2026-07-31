@@ -137,6 +137,48 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.coverage.llm.gaps.some( ( item ) => ( item.reason ?: "" ) == "cancelled" ) ).toBeTrue();
 				expect( repository.getPlan( run.getId() ) ).notToBeNull();
 			} );
+
+			it( "enriches getResult() with risk/effort data via the risk service when a run entity exists", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				repository.savePlan( "run-risk", { schemaVersion: "modernization-plan-v1", roadmapPhases: [] } );
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				var enrichCalls = [];
+				service.modernizationRiskService = {
+					enrich: ( plan, projectPath, tenantId, projectId ) => {
+						enrichCalls.append( { projectPath: projectPath, tenantId: tenantId, projectId: projectId } );
+						plan.riskEnriched = true;
+						return plan;
+					}
+				};
+				service.runRepository = {
+					find: ( runId ) => {
+						return {
+							getProjectPath: () => "D:\Temp\cfportal\opengovdashboard",
+							getTenantId: () => "tenant-1",
+							getProjectId: () => "project-1"
+						};
+					}
+				};
+				var result = service.getResult( "run-risk" );
+				expect( result.riskEnriched ?: false ).toBeTrue();
+				expect( enrichCalls ).toHaveLength( 1 );
+				expect( enrichCalls[ 1 ].projectPath ).toBe( "D:\Temp\cfportal\opengovdashboard" );
+				expect( enrichCalls[ 1 ].tenantId ).toBe( "tenant-1" );
+			} );
+
+			it( "returns the result unchanged when no run entity is found for risk enrichment", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				repository.savePlan( "run-no-entity", { schemaVersion: "modernization-plan-v1", roadmapPhases: [] } );
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				var enrichCalled = false;
+				service.modernizationRiskService = { enrich: ( plan, projectPath, tenantId, projectId ) => { enrichCalled = true; return plan; } };
+				service.runRepository = { find: ( runId ) => javacast( "null", "" ) };
+				var result = service.getResult( "run-no-entity" );
+				expect( enrichCalled ).toBeFalse();
+				expect( result.schemaVersion ).toBe( "modernization-plan-v1" );
+			} );
 		} );
 	}
 }

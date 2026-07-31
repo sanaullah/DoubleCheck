@@ -332,6 +332,42 @@ class {
 		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
 	}
 
+	/**
+	 * Latest completed run of the given kind (default "review") for a
+	 * project path, regardless of mode — used to cross-reference a
+	 * Modernize plan against DoubleCheck's own most recent review findings
+	 * for the same local repository.
+	 */
+	any function findLatestForProject(
+		required string projectPath,
+		string runKind   = "review",
+		string tenantId  = "",
+		string projectId = ""
+	) {
+		var result = queryExecute(
+			"
+				SELECT r.*
+				FROM review_runs r
+				INNER JOIN review_summaries s ON s.run_id = r.id
+				WHERE r.project_path = :projectPath
+					AND COALESCE( r.run_kind, 'review' ) = :runKind
+					AND ( :tenantId = '' OR r.tenant_id = :tenantId )
+					AND ( :projectId = '' OR r.project_id = :projectId )
+					AND r.status IN ( 'succeeded', 'partial' )
+				ORDER BY r.created_at DESC
+				LIMIT 1
+			",
+			{
+				projectPath: arguments.projectPath,
+				runKind    : arguments.runKind,
+				tenantId   : arguments.tenantId,
+				projectId  : arguments.projectId
+			},
+			{ datasource: datasource }
+		);
+		return result.recordCount ? hydrate( result, 1 ) : javacast( "null", "" );
+	}
+
 	private any function hydrate( required query record, required numeric row ) {
 		return new app.models.domain.ReviewRun(
 			{

@@ -1,0 +1,121 @@
+/**
+ * Read-time, deterministic overlay that cross-references a Modernize plan
+ * against DoubleCheck's own most recent review findings for the same local
+ * project — the two features already analyze the same repository, so a
+ * roadmap phase or packaging decision touching a file with known
+ * high/critical review findings can be flagged without any new LLM call.
+ *
+ * Never persisted: composed onto the plan result the same way
+ * FindingBaselineService/FindingReviewService already overlay review
+ * results in ReviewRunService.getResult(), so nothing here touches the
+ * plan's persisted fingerprint/coverage contract.
+ */
+@singleton
+class {
+	property name="reviewRunRepository" inject="ReviewRunRepository";
+	property name="reviewResultRepository" inject="ReviewResultRepository";
+
+	variables.severityRank = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+	variables.effortSmallMax = 3;
+	variables.effortMediumMax = 8;
+	variables.effortLargeMax = 15;
+
+	struct function enrich(
+		required struct plan,
+		required string projectPath,
+		string tenantId = "",
+		string projectId = ""
+	) {
+		var unitPathById = unitPathIndex( arguments.plan );
+		var severityByPath = {};
+		if ( len( trim( arguments.projectPath ) ) ) {
+			var reviewRun = reviewRunRepository.findLatestForProject( arguments.projectPath, "review", arguments.tenantId, arguments.projectId );
+			if ( !isNull( reviewRun ) ) {
+				var findings = reviewResultRepository.getResult( reviewRun.getId() ).findings ?: [];
+				if ( isArray( findings ) ) severityByPath = severityMap( findings );
+			}
+		}
+		if ( isArray( arguments.plan.roadmapPhases ?: "" ) ) {
+			for ( var phase in arguments.plan.roadmapPhases ) {
+				if ( isStruct( phase ) ) enrichItem( phase, phase.unitIds ?: [], unitPathById, severityByPath );
+			}
+		}
+		if ( isStruct( arguments.plan.target ?: "" ) ) {
+			for ( var collection in [ "contexts", "extracts" ] ) {
+				if ( !isArray( arguments.plan.target[ collection ] ?: "" ) ) continue;
+				for ( var item in arguments.plan.target[ collection ] ) {
+					if ( isStruct( item ) ) enrichItem( item, item.targetUnitIds ?: [], unitPathById, severityByPath );
+				}
+			}
+		}
+		return arguments.plan;
+	}
+
+	private void function enrichItem(
+		required struct item,
+		required array unitIds,
+		required struct unitPathById,
+		required struct severityByPath
+	) {
+		var worstRank = 0;
+		var worstSeverity = "none";
+		var relatedCount = 0;
+		for ( var unitId in arguments.unitIds ) {
+			var path = arguments.unitPathById[ trim( toString( unitId ) ) ] ?: "";
+			if ( !len( path ) || !arguments.severityByPath.keyExists( path ) ) continue;
+			var entry = arguments.severityByPath[ path ];
+			relatedCount += entry.count;
+			if ( entry.rank > worstRank ) {
+				worstRank = entry.rank;
+				worstSeverity = entry.severity;
+			}
+		}
+		arguments.item.riskLevel = worstSeverity;
+		arguments.item.relatedFindingCount = relatedCount;
+		arguments.item.effortSize = effortSizeFor( arguments.unitIds.len() );
+	}
+
+	/** filePath (normalized) -> {severity, rank, count}, using the worst severity observed at that path. */
+	private struct function severityMap( required array findings ) {
+		var map = {};
+		for ( var finding in arguments.findings ) {
+			if ( !isStruct( finding ) ) continue;
+			var path = normalizePath( finding.filePath ?: "" );
+			if ( !len( path ) ) continue;
+			var severity = lCase( trim( finding.severity ?: "info" ) );
+			var rank = variables.severityRank[ severity ] ?: 1;
+			if ( !map.keyExists( path ) ) map[ path ] = { severity: severity, rank: rank, count: 0 };
+			map[ path ].count = map[ path ].count + 1;
+			if ( rank > map[ path ].rank ) {
+				map[ path ].rank = rank;
+				map[ path ].severity = severity;
+			}
+		}
+		return map;
+	}
+
+	/** target unit id -> normalized legacy sourcePath, so roadmap/architecture unitIds can be looked up against review findings keyed by file path. */
+	private struct function unitPathIndex( required struct plan ) {
+		var index = {};
+		if ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ) {
+			for ( var unit in arguments.plan.target.units ) {
+				if ( !isStruct( unit ) ) continue;
+				var id = trim( unit.id ?: unit.itemId ?: "" );
+				var path = normalizePath( unit.sourcePath ?: unit.sourceFile ?: "" );
+				if ( len( id ) && len( path ) ) index[ id ] = path;
+			}
+		}
+		return index;
+	}
+
+	private string function normalizePath( required any path ) {
+		return lCase( replace( trim( toString( arguments.path ) ), "\", "/", "all" ) );
+	}
+
+	private string function effortSizeFor( required numeric unitCount ) {
+		if ( arguments.unitCount <= variables.effortSmallMax ) return "S";
+		if ( arguments.unitCount <= variables.effortMediumMax ) return "M";
+		if ( arguments.unitCount <= variables.effortLargeMax ) return "L";
+		return "XL";
+	}
+}

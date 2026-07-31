@@ -282,6 +282,54 @@ class extends="testbox.system.BaseSpec" {
 				expect( roles.findNoCase( "modernization-architecture" ) ).toBeLT( roles.findNoCase( "modernization-roadmap" ) );
 			} );
 
+			it( "carries moduleSlug, dependsOnContextIds, and migrationSteps through merge/polish unchanged", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [ { id: "pdf-h", targetPath: "app/handlers/Pdf.bx", sourcePath: "handlers/Pdf.cfc", purpose: "pdf tools" } ],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [ {
+							id: "ctx-pdf-tools",
+							name: "PDF tools",
+							packaging: "coldbox-module",
+							targetUnitIds: [ "pdf-h" ],
+							recommendation: "PDF tools share a distinct outbound HTTP call to the conversion service",
+							evidenceBasis: "explicit-seam",
+							evidenceRefs: [ { filePath: "handlers/Pdf.cfc" } ],
+							moduleSlug: "pdf-tools",
+							dependsOnContextIds: [],
+							migrationSteps: [ {
+								order: 1, action: "Move PDF generation into a handler",
+								legacyRef: { filePath: "handlers/Pdf.cfc", symbolName: "generate" },
+								targetRef: { targetPath: "app/handlers/Pdf.bx", methodName: "generate" },
+								note: "Preserve legacy query params"
+							} ]
+						} ],
+						extracts: []
+					},
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-pdf", unitIds: [ "pdf-h" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-architecture-guide",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var ctx = result.plan.target.contexts.filter( ( item ) => item.id == "ctx-pdf-tools" )[ 1 ];
+				expect( ctx.moduleSlug ).toBe( "pdf-tools" );
+				expect( ctx.migrationSteps ).toHaveLength( 1 );
+				expect( ctx.migrationSteps[ 1 ].legacyRef.filePath ).toBe( "handlers/Pdf.cfc" );
+				expect( ctx.migrationSteps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Pdf.bx" );
+				expect( ctx.itemFingerprint ).notToBeEmpty();
+			} );
+
 			it( "synthesizes a mapped roadmap when the provider roadmap is skipped for cost", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": {
@@ -380,6 +428,177 @@ class extends="testbox.system.BaseSpec" {
 				expect( strangler ).notToBeEmpty();
 				expect( strangler[ 1 ].unitIds ).toInclude( "feedback-1" );
 				expect( phases.filter( ( phase ) => phase.currentSlice ?: false ) ).toHaveLength( 1 );
+			} );
+
+			it( "shards the roadmap role across architecture groups and merges accepted phases into a non-generic road", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc", purpose: "group a" },
+							{ id: "unit-b", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc", purpose: "group b" }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-a", name: "Group A", targetUnitIds: [ "unit-a" ], packaging: "coldbox-module", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-b", name: "Group B", targetUnitIds: [ "unit-b" ], packaging: "centralized", evidenceBasis: "explicit-seam" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": [
+						{ roadmapPhases: [ { id: "phase-1", name: "Group A", unitIds: [ "unit-a" ], routeIds: [], currentSlice: false } ], assumptions: [], samples: [] },
+						{ roadmapPhases: [ { id: "phase-1", name: "Group B", unitIds: [ "unit-b" ], routeIds: [], currentSlice: false } ], assumptions: [], samples: [] }
+					]
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-roadmap-sharded",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var roadmapCalls = gateway.requestLog().filter( ( item ) => ( item.role ?: "" ) == "modernization-roadmap" );
+				expect( roadmapCalls ).toHaveLength( 2 );
+				var phaseNames = result.plan.roadmapPhases.map( ( phase ) => phase.name );
+				expect( phaseNames ).toInclude( "Group A" );
+				expect( phaseNames ).toInclude( "Group B" );
+				expect( result.plan.metadata.roadmapSource ?: "" ).notToBe( "synthesized" );
+				expect( result.plan.metadata.roadmapShards.accepted ).toBe( 2 );
+				expect( result.plan.metadata.roadmapShards.total ).toBe( 2 );
+			} );
+
+			it( "rewrites colliding phase ids and chains dependencies deterministically across independent roadmap shards, ignoring cross-shard references the provider could not have known", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc" },
+							{ id: "unit-b", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc" }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-a", name: "Group A", targetUnitIds: [ "unit-a" ], packaging: "coldbox-module", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-b", name: "Group B", targetUnitIds: [ "unit-b" ], packaging: "centralized", evidenceBasis: "explicit-seam" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": [
+						{ roadmapPhases: [ { id: "phase-1", name: "Group A", unitIds: [ "unit-a" ], routeIds: [], dependencies: [ "phase-never-seen" ], currentSlice: true } ], assumptions: [], samples: [] },
+						{ roadmapPhases: [ { id: "phase-1", name: "Group B", unitIds: [ "unit-b" ], routeIds: [], dependencies: [], currentSlice: true } ], assumptions: [], samples: [] }
+					]
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-roadmap-collision",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var phases = result.plan.roadmapPhases;
+				// Both shards proposed "phase-1"; both must survive under distinct ids.
+				expect( phases ).toHaveLength( 2 );
+				var ids = phases.map( ( phase ) => phase.id );
+				expect( ids[ 1 ] ).notToBe( ids[ 2 ] );
+				// Neither shard's own (untrustworthy) dependencies/currentSlice survive:
+				// the pipeline chains phases in shard order and keeps exactly one current slice.
+				var groupA = phases.filter( ( phase ) => phase.name == "Group A" )[ 1 ];
+				var groupB = phases.filter( ( phase ) => phase.name == "Group B" )[ 1 ];
+				expect( groupA.dependencies ).toBeEmpty();
+				expect( groupB.dependencies ).toBe( [ groupA.id ] );
+				expect( phases.filter( ( phase ) => phase.currentSlice ?: false ) ).toHaveLength( 1 );
+				expect( groupA.currentSlice ).toBeTrue();
+			} );
+
+			it( "keeps accepted roadmap phases when one shard fails and reports the shard outcome", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc" },
+							{ id: "unit-b", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc" }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-a", name: "Group A", targetUnitIds: [ "unit-a" ], packaging: "coldbox-module", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-b", name: "Group B", targetUnitIds: [ "unit-b" ], packaging: "centralized", evidenceBasis: "explicit-seam" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": [
+						{ roadmapPhases: [ { id: "phase-1", name: "Group A", unitIds: [ "unit-a" ], routeIds: [] } ], assumptions: [], samples: [] },
+						{ throw: true, message: "Provider JSON was truncated mid-object" }
+					]
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-roadmap-partial",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.partial ).toBeTrue();
+				var phaseNames = result.plan.roadmapPhases.map( ( phase ) => phase.name );
+				expect( phaseNames ).toInclude( "Group A" );
+				expect( result.plan.metadata.roadmapShards.accepted ).toBe( 1 );
+				expect( result.plan.metadata.roadmapShards.failed ).toBe( 1 );
+				expect( result.plan.metadata.roadmapShards.outcomes.filter( ( item ) => item.status == "failed" ) ).toHaveLength( 1 );
+				expect( result.errors.filter( ( item ) => findNoCase( "truncated", item.message ?: "" ) ) ).notToBeEmpty();
+			} );
+
+			it( "divides remaining budget across roadmap shards", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc" },
+							{ id: "unit-b", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc" }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-a", name: "Group A", targetUnitIds: [ "unit-a" ], packaging: "coldbox-module", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-b", name: "Group B", targetUnitIds: [ "unit-b" ], packaging: "centralized", evidenceBasis: "explicit-seam" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": [
+						{ roadmapPhases: [ { id: "phase-1", name: "Group A", unitIds: [ "unit-a" ], routeIds: [] } ], assumptions: [], samples: [] },
+						{ roadmapPhases: [ { id: "phase-2", name: "Group B", unitIds: [ "unit-b" ], routeIds: [] } ], assumptions: [], samples: [] }
+					]
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-roadmap-budget",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2, maxCostUsd: 10 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				var roadmapOptions = gateway.optionsHistory().filter( ( item ) => ( item.role ?: "" ) == "modernization-roadmap" );
+				expect( roadmapOptions ).toHaveLength( 2 );
+				expect( roadmapOptions.every( ( item ) => val( item.budgets.maxCostUsd ?: 0 ) > 0 && val( item.budgets.maxCostUsd ?: 0 ) < 10 ) ).toBeTrue();
 			} );
 
 			it( "does not reserve disabled downstream-role budget from an application-only run", () => {

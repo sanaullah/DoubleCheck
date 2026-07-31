@@ -74,6 +74,7 @@ const state = {
 		phase: "all",
 		selectedItem: null,
 		selectedPhaseId: "",
+		selectedArchitectureId: "",
 		showUnsliced: false,
 		decisions: {},
 		decisionNotes: {},
@@ -2531,8 +2532,74 @@ async function rebuildModernizationItem(item, note, statusElement) {
 	}
 }
 
+/**
+ * Small risk/effort chip pair (deterministic, from ModernizationRiskService's
+ * read-time overlay — cross-references review findings for the same
+ * project, no new LLM call). Returns "" when neither field is present so
+ * older/degraded results render exactly as before.
+ */
+function modernizationRiskEffortBadges(item = {}) {
+	const parts = [];
+	if (item.effortSize) parts.push(`<span class="modernization-effort-chip" data-size="${architectureEscapeAttr(item.effortSize)}" title="Effort size (by mapped unit count)">${architectureEscapeHtml(item.effortSize)}</span>`);
+	if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
+		parts.push(`<span class="modernization-risk-chip" data-risk="${architectureEscapeAttr(item.riskLevel)}" title="${item.relatedFindingCount || 0} related review finding(s)">${architectureEscapeHtml(item.riskLevel)} risk</span>`);
+	}
+	return parts.join("");
+}
+
+/**
+ * Resolves target.contexts/target.extracts targetUnitIds against the
+ * already-evidenced result.target.units instead of asking the LLM to
+ * restate file/method names in prose — the same file/method-level guide,
+ * sourced from data the pipeline already verified, not new provider output.
+ */
+function modernizationResolveTargetUnitLabels(targetUnitIds) {
+	if (!Array.isArray(targetUnitIds) || !targetUnitIds.length) return [];
+	const units = state.modernization.result?.target?.units || [];
+	const unitById = new Map(units.map((unit) => [String(unit.id || unit.itemId || ""), unit]));
+	return targetUnitIds.map((id) => {
+		const unit = unitById.get(String(id));
+		if (!unit) return String(id);
+		const methods = Array.isArray(unit.symbolNames) && unit.symbolNames.length ? ` (${unit.symbolNames.slice(0, 3).join(", ")})` : "";
+		return `${unit.sourcePath || "unknown source"}${methods} → ${unit.targetPath || "unassigned target"}`;
+	});
+}
+
 function renderModernizationDetailSummary(host, item = {}) {
 	if (!host) return;
+	const addMigrationSteps = (steps) => {
+		if (!Array.isArray(steps) || !steps.length) return;
+		const section = document.createElement("section");
+		const heading = document.createElement("h4");
+		heading.textContent = "Migration steps";
+		section.appendChild(heading);
+		const ol = document.createElement("ol");
+		ol.className = "modernization-migration-steps";
+		steps.forEach((step) => {
+			const li = document.createElement("li");
+			const legacyRef = step.legacyRef || {};
+			const targetRef = step.targetRef || {};
+			const from = [legacyRef.filePath, legacyRef.symbolName].filter(Boolean).join(":");
+			const to = [targetRef.targetPath, targetRef.methodName].filter(Boolean).join(":");
+			const action = document.createElement("strong");
+			action.textContent = step.action || "Step";
+			li.appendChild(action);
+			if (from || to) {
+				const path = document.createElement("code");
+				path.textContent = `${from || "?"} → ${to || "?"}`;
+				li.append(document.createTextNode(" — "), path);
+			}
+			if (step.note) {
+				const note = document.createElement("span");
+				note.className = "field-hint";
+				note.textContent = ` ${step.note}`;
+				li.appendChild(note);
+			}
+			ol.appendChild(li);
+		});
+		section.appendChild(ol);
+		host.appendChild(section);
+	};
 	const add = (title, value, className = "") => {
 		if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length)) return;
 		const section = document.createElement("section");
@@ -2579,6 +2646,10 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Goal", item.goal || item.description);
 		add("Pattern", item.pattern);
 		add("Parity intent", item.parityIntent);
+		if (item.effortSize) add("Estimated effort", item.effortSize);
+		if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
+			add("Related review findings", `${item.relatedFindingCount || 0} finding(s), worst severity: ${item.riskLevel}`);
+		}
 		add("Exit checklist", Array.isArray(item.exitCriteria) ? item.exitCriteria : (item.exitCriteria ? [item.exitCriteria] : []));
 		add("Rollback", item.rollback);
 		add("Implementer prompt", item.implementerPrompt);
@@ -2598,19 +2669,26 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Migration relation", item.relation || item.relationship || item.kind);
 		add("Transition notes", item.notes || item.description);
 		add("Confidence", item.confidence);
-	} else if (item._modernizationType === "context") {
-		add("Packaging", item.packaging === "coldbox-module" ? "ColdBox module candidate" : "Centralize (stay in the monolith)");
+	} else if (item._modernizationType === "context" || item._modernizationType === "extract") {
+		const isExtract = item._modernizationType === "extract";
+		if (!isExtract) add("Packaging", item.packaging === "coldbox-module" ? "ColdBox module candidate" : "Centralize (stay in the monolith)");
 		add("Purpose", item.purpose);
-		add("Why this grouping", item.recommendation);
+		if (isExtract) {
+			add("Why extract", item.reason);
+			add("Suggested boundary", item.suggestedBoundary);
+			add("Data boundary", item.dataBoundaryNote);
+			add("Shared datasource risk", item.sharedDatasourceRisk);
+		} else {
+			add("Why this grouping", item.recommendation);
+		}
 		add("Basis", modernizationEvidenceBasisNote(item));
-		add("Target units in this group", item.targetUnitIds);
-	} else if (item._modernizationType === "extract") {
-		add("Why extract", item.reason);
-		add("Suggested boundary", item.suggestedBoundary);
-		add("Data boundary", item.dataBoundaryNote);
-		add("Shared datasource risk", item.sharedDatasourceRisk);
-		add("Basis", modernizationEvidenceBasisNote(item));
-		add("Target units in this group", item.targetUnitIds);
+		add("Suggested module path", item.moduleSlug ? `app/modules/${item.moduleSlug}/` : "");
+		if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
+			add("Related review findings", `${item.relatedFindingCount || 0} finding(s), worst severity: ${item.riskLevel}`);
+		}
+		if (item.effortSize) add("Estimated effort", item.effortSize);
+		add("Legacy → target units in this group", modernizationResolveTargetUnitLabels(item.targetUnitIds));
+		addMigrationSteps(item.migrationSteps);
 	} else if (item._modernizationType === "db-transition") {
 		add("Operation", item.operation);
 		add("Order", item.order);
@@ -2677,6 +2755,47 @@ async function clearModernizationDecision(item, statusElement) {
 	}
 }
 
+/**
+ * "Modernization Brief" — one prominent, always-on-top summary card built
+ * purely from data Parts A-C already produce: coverage/validation status,
+ * an effort roll-up and risk distribution across roadmap phases
+ * (ModernizationRiskService), the packaging split (Modular Monolith Map),
+ * and a one-line recommended next step. Pure aggregation lives in
+ * modernizationBriefSummary() (modernization-render-helpers.js) so it's
+ * unit-testable without the DOM; this function only renders it.
+ */
+function renderModernizationBrief(result = {}, planState = "") {
+	const host = document.querySelector("#modernization-brief");
+	if (!host) return;
+	const summary = modernizationBriefSummary(result);
+	host.hidden = !summary.hasPlan;
+	if (!summary.hasPlan) {
+		host.innerHTML = "";
+		return;
+	}
+	const effortLine = Object.entries(summary.effortCounts)
+		.filter(([, count]) => count > 0)
+		.map(([size, count]) => `${count} ${size}`)
+		.join(" · ") || "not yet sized";
+	const packagingLine = `${summary.packagingSplit.centralized} centralized · ${summary.packagingSplit.modules} ColdBox module${summary.packagingSplit.modules === 1 ? "" : "s"} · ${summary.packagingSplit.extracts} microservice candidate${summary.packagingSplit.extracts === 1 ? "" : "s"}`;
+	const riskLine = summary.riskyPhaseCount > 0
+		? `${summary.riskyPhaseCount} slice${summary.riskyPhaseCount === 1 ? "" : "s"} touch${summary.riskyPhaseCount === 1 ? "es" : ""} known high/critical review findings — sequence ${summary.riskyPhaseCount === 1 ? "it" : "them"} earlier or pair with a fix.`
+		: "No slices flagged against known review findings.";
+	const nextLine = summary.currentSlice
+		? `Start with “${summary.currentSlice.name}”${summary.currentSlice.effortSize ? ` (${summary.currentSlice.effortSize})` : ""}${summary.currentSlice.riskLevel && summary.currentSlice.riskLevel !== "none" ? ` · ${summary.currentSlice.riskLevel} risk` : ""}.`
+		: "Pick a Road step below to see its next action.";
+	host.innerHTML = `
+		<div class="modernization-brief-stats">
+			<div><span>Plan status</span><strong>${architectureEscapeHtml(planState || "unknown")}</strong></div>
+			<div><span>Coverage</span><strong>${architectureEscapeHtml(summary.coverageStatus)}</strong></div>
+			<div><span>Slices</span><strong>${summary.phaseCount}</strong><small>${architectureEscapeHtml(effortLine)}</small></div>
+			<div><span>Packaging</span><small>${architectureEscapeHtml(packagingLine)}</small></div>
+		</div>
+		<p class="modernization-brief-risk" data-has-risk="${summary.riskyPhaseCount > 0}">${architectureEscapeHtml(riskLine)}</p>
+		<p class="modernization-brief-next"><strong>Recommended next:</strong> ${architectureEscapeHtml(nextLine)}</p>
+	`;
+}
+
 function renderModernizationResult(result = {}) {
 	state.modernization.result = result;
 	refreshModernizationFilterOptions(result);
@@ -2713,6 +2832,8 @@ function renderModernizationResult(result = {}) {
 		}
 		const solutionHost = document.querySelector("#modernization-solution");
 		if (solutionHost) solutionHost.hidden = true;
+		const briefHost = document.querySelector("#modernization-brief");
+		if (briefHost) { briefHost.hidden = true; briefHost.innerHTML = ""; }
 		return;
 	}
 	const coverage = result.coverage || {};
@@ -2723,6 +2844,7 @@ function renderModernizationResult(result = {}) {
 		elements.modernizationPlanState.textContent = planState;
 		elements.modernizationPlanState.dataset.state = planState;
 	}
+	renderModernizationBrief(result, planState);
 	if (elements.modernizationOverview) {
 		const inventory = result.inventory || {};
 		const inventorySummary = inventory.summary || {};
@@ -2859,10 +2981,7 @@ function renderModernizationArchitecture(result = {}) {
 	if (!host) return;
 	const contexts = result.target?.contexts || result.contexts || [];
 	const extracts = result.target?.extracts || result.extracts || [];
-	const central = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "centralized" || item.stayInMonolith === true && String(item.packaging || "").toLowerCase() !== "coldbox-module");
-	const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module" || /module/i.test(item.name || ""));
-	const centralOnly = central.filter((item) => !modules.includes(item));
-	host.hidden = !(centralOnly.length || modules.length || extracts.length);
+	host.hidden = !(contexts.length || extracts.length);
 	if (host.hidden) return;
 	const architectureCoverage = document.querySelector("#modernization-architecture-coverage");
 	if (architectureCoverage) {
@@ -2872,36 +2991,117 @@ function renderModernizationArchitecture(result = {}) {
 			? "This packaging view is a conservative default (everything centralized) — the architecture analysis step didn't complete for this run."
 			: "";
 	}
-	const fill = (selector, items, emptyText, { flagSpeculative = false } = {}) => {
-		const el = document.querySelector(selector);
-		if (!el) return;
-		el.innerHTML = "";
-		if (!items.length) {
-			el.innerHTML = `<p class="field-hint">${emptyText}</p>`;
-			return;
-		}
-		items.forEach((item) => {
-			const card = document.createElement("article");
-			card.className = "modernization-architecture-card";
-			card.innerHTML = `<strong></strong><span class="architecture-basis-badge" hidden>Worth reviewing</span><p class="modernization-item-meta"></p><p class="architecture-recommendation"></p>`;
-			card.querySelector("strong").textContent = item.name || item.id || "Item";
-			card.querySelector(".modernization-item-meta").textContent = item.purpose || item.reason || item.suggestedModulePath || "";
-			card.querySelector(".architecture-recommendation").textContent = item.recommendation || item.dataBoundaryNote || item.sharedDatasourceRisk || "";
-			// Only module/extract picks are a bolder-than-default call worth
-			// flagging — a "keep it centralized" recommendation is already the
-			// safe default, so it never needs a "worth reviewing" badge even
-			// when the model recorded evidenceBasis=domain-clustering on it.
-			if (flagSpeculative && String(item.evidenceBasis || "").toLowerCase() === "domain-clustering") {
-				const badge = card.querySelector(".architecture-basis-badge");
-				badge.hidden = false;
-				badge.title = "Grouped by shared domain — no deployment seam evidenced yet";
-			}
-			el.appendChild(card);
+	renderModernizationArchitectureMap(result);
+	const selectedId = state.modernization.selectedArchitectureId;
+	let selectedItem = null;
+	if (selectedId) {
+		const matchedContext = contexts.find((item) => String(item.id || item.itemId || "") === selectedId);
+		const matchedExtract = extracts.find((item) => String(item.id || item.itemId || "") === selectedId);
+		if (matchedContext) selectedItem = { ...matchedContext, _modernizationType: "context" };
+		else if (matchedExtract) selectedItem = { ...matchedExtract, _modernizationType: "extract" };
+	}
+	renderModernizationArchitectureDetail(selectedItem);
+}
+
+/**
+ * Renders target.contexts/target.extracts as a "Modular Monolith Map" SVG —
+ * a core monolith node plus one node per ColdBox module/microservice
+ * candidate, connected by dependsOnContextIds edges — reusing the same
+ * layoutFlowPositions() engine and .architecture-node/.architecture-edge
+ * visual language as the code-review Architecture tab's file diagram
+ * (renderArchitectureDiagram()) so it reads as native to the app.
+ */
+function renderModernizationArchitectureMap(result = {}) {
+	const mapHost = document.querySelector("#modernization-architecture-map");
+	if (!mapHost) return;
+	const flow = window.ArchitectureFlow;
+	const subgraph = buildModernizationArchitectureSubgraph(result);
+	if (!flow || subgraph.nodes.length <= 1) {
+		mapHost.innerHTML = `<p class="field-hint">No packaging decisions yet — the architecture role hasn't produced module or extract candidates for this run.</p>`;
+		return;
+	}
+	const layout = flow.layoutFlowPositions(subgraph);
+	const byId = Object.fromEntries(layout.nodes.map((n) => [n.id, n]));
+	const selectedId = state.modernization.selectedArchitectureId;
+
+	const edgeLines = layout.edges.map((e) => {
+		const a = byId[e.from];
+		const b = byId[e.to];
+		if (!a || !b) return "";
+		const x1 = a.x + a.w;
+		const y1 = a.y + a.h / 2;
+		const x2 = b.x;
+		const y2 = b.y + b.h / 2;
+		const dx = Math.max(36, (x2 - x1) * 0.45);
+		return `<path class="architecture-edge" d="M${x1} ${y1} C${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" />`;
+	}).join("");
+
+	const nodeHtml = layout.nodes.map((n) => {
+		const sel = selectedId && selectedId === n.id ? " is-selected" : "";
+		const roleClass = n.role === "core" ? " is-core" : n.role === "extract" ? " is-extract" : " is-module";
+		const speculative = n.item && String(n.item.evidenceBasis || "").toLowerCase() === "domain-clustering";
+		const subLabel = n.role === "core"
+			? `${n.unitCount} centralized unit${n.unitCount === 1 ? "" : "s"}`
+			: `${n.unitCount} unit${n.unitCount === 1 ? "" : "s"}${speculative ? " · speculative" : ""}`;
+		// Risk dot: deterministic, from ModernizationRiskService's read-time
+		// overlay (cross-referenced review findings for this project) — no
+		// new provider call, so it's safe to show even on a degraded plan.
+		const risk = n.item?.riskLevel && String(n.item.riskLevel).toLowerCase() !== "none" ? String(n.item.riskLevel).toLowerCase() : "";
+		const riskDot = risk
+			? `<circle class="architecture-node-risk" data-risk="${architectureEscapeAttr(risk)}" cx="${n.w - 10}" cy="10" r="5"><title>${architectureEscapeAttr(risk)} risk · ${n.item.relatedFindingCount || 0} related review finding(s)</title></circle>`
+			: "";
+		return `<g class="architecture-node${roleClass}${sel}" data-architecture-id="${architectureEscapeAttr(n.id)}" transform="translate(${n.x},${n.y})">
+			<title>${architectureEscapeAttr(n.path)}</title>
+			<rect class="architecture-node-card" width="${n.w}" height="${n.h}" rx="10" ry="10"></rect>
+			<rect class="architecture-node-rail" x="0" y="0" width="4" height="${n.h}" rx="2"></rect>
+			<text class="architecture-node-title" x="14" y="23">${architectureEscapeHtml(n.path)}</text>
+			<text class="architecture-node-sub" x="14" y="41">${architectureEscapeHtml(subLabel)}</text>
+			${riskDot}
+		</g>`;
+	}).join("");
+
+	mapHost.innerHTML = `<svg viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" xmlns="http://www.w3.org/2000/svg">
+		<defs>
+			<marker id="modernization-architecture-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+				<path d="M0,0 L7,3.5 L0,7 Z" fill="#5a738a"></path>
+			</marker>
+		</defs>
+		${edgeLines}
+		${nodeHtml}
+	</svg>`;
+	[...mapHost.querySelectorAll(".architecture-node")].forEach((node) => {
+		node.addEventListener("click", () => {
+			const id = node.dataset.architectureId || "";
+			state.modernization.selectedArchitectureId = state.modernization.selectedArchitectureId === id ? "" : id;
+			renderModernizationArchitecture(state.modernization.result || result);
 		});
-	};
-	fill("#modernization-arch-central", centralOnly, "No centralized shell recommendations yet.");
-	fill("#modernization-arch-modules", modules, "No ColdBox module candidates yet — keep feature slices in the monolith.", { flagSpeculative: true });
-	fill("#modernization-arch-extracts", extracts, "No side-app extract candidates. Prefer modules until outbound/schedule isolation is evidenced.", { flagSpeculative: true });
+	});
+}
+
+/**
+ * Read-only "Migration Blueprint" for the packaging decision selected on the
+ * map — reuses renderModernizationDetailSummary() (the same body renderer
+ * the full item-detail panel under "Evidence and catalogs" uses) so the
+ * context/extract field enrichment (resolved legacy/target unit list,
+ * migration steps) only has to live in one place.
+ */
+function renderModernizationArchitectureDetail(item) {
+	const host = document.querySelector("#modernization-architecture-detail");
+	if (!host) return;
+	host.innerHTML = "";
+	if (!item) {
+		host.appendChild(emptyStateElement({ icon: "detail", title: "Select a packaging decision", hint: "Click a node on the map for its migration blueprint." }));
+		return;
+	}
+	const isExtract = item._modernizationType === "extract";
+	const card = document.createElement("div");
+	card.className = "modernization-detail-card";
+	card.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div>`;
+	card.querySelector(".eyebrow").textContent = isExtract ? "microservice / side-app candidate" : (String(item.packaging || "").toLowerCase() === "coldbox-module" ? "coldbox module candidate" : "centralized (stays in the monolith)");
+	card.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
+	card.querySelector("h3").textContent = item.name || item.id || "Packaging decision";
+	renderModernizationDetailSummary(card.querySelector(".modernization-detail-summary"), item);
+	host.appendChild(card);
 }
 
 function renderModernizationSolution(result = {}) {
@@ -3002,11 +3202,12 @@ function renderModernizationSolution(result = {}) {
 			card.className = `modernization-road-card ${linked ? "is-mapped" : "is-scaffold"}`;
 			card.classList.toggle("is-selected", item.id === phase?.id);
 			card.dataset.phaseId = item.id || "";
-			card.innerHTML = `<span class="modernization-road-index">${index + 1}</span><span class="modernization-road-body"><strong></strong><span class="modernization-item-meta"></span></span><span class="status-badge"></span>`;
+			card.innerHTML = `<span class="modernization-road-index">${index + 1}</span><span class="modernization-road-body"><strong></strong><span class="modernization-item-meta"></span></span><span class="modernization-road-badges"></span><span class="status-badge"></span>`;
 			card.querySelector("strong").textContent = item.name || item.goal || item.id || `Phase ${index + 1}`;
 			card.querySelector(".modernization-item-meta").textContent = (item.name && item.goal && item.name !== item.goal)
 				? item.goal
 				: (item.parityIntent || (linked ? "Mapped slice" : "Setup / scaffold — no file map yet"));
+			card.querySelector(".modernization-road-badges").innerHTML = modernizationRiskEffortBadges(item);
 			card.querySelector(".status-badge").textContent = item.pattern || (linked ? "mapped" : "scaffold");
 			card.addEventListener("click", () => {
 				state.modernization.selectedPhaseId = item.id || "";
