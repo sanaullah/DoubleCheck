@@ -496,7 +496,12 @@
 	.wf-bar.tool { background: var(--tool); }
 	.wf-bar.span { background: var(--span); }
 	.wf-bar.event { background: var(--event); }
+	.wf-bar.error { background: var(--err) !important; }
 	.wf-dur { font-size: 0.72rem; font-family: var(--mono); color: var(--muted); text-align: right; }
+	.wf-row.error .wf-bar { background: var(--err) !important; opacity: 1; }
+	.wf-row.error .wf-label { color: var(--err); font-weight: 600; }
+	.wf-row.abandoned .wf-bar { opacity: 0.4; }
+	.wf-row.abandoned .wf-label { color: var(--muted); opacity: 0.7; }
 	.chat-block { margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; }
 	.chat-msg {
 		padding: 10px 12px;
@@ -1160,6 +1165,20 @@
 		function buildWaterfall(t) {
 			const obs = Array.isArray(t.observations) ? t.observations : [];
 			if (!obs.length) return "";
+
+			// Build parent-child map for hierarchical rendering
+			const byParent = {};
+			const roots = [];
+			obs.forEach((o) => {
+				const pid = o.parentObservationId || "";
+				if (!pid) roots.push(o);
+				else {
+					if (!byParent[pid]) byParent[pid] = [];
+					byParent[pid].push(o);
+				}
+			});
+
+			// Calculate timing
 			const starts = obs.map((o) => parseMs(o.startTime)).filter((n) => n != null);
 			const origin = parseMs(t.startedAt) ?? (starts.length ? Math.min(...starts) : Date.now());
 			let end = origin + (Number(t.durationMs) || 0);
@@ -1169,19 +1188,34 @@
 				if (e > end) end = e;
 			});
 			const span = Math.max(1, end - origin);
-			const rows = obs.map((o) => {
+
+			// Render observation bar recursively with hierarchy
+			function rowHtml(o, depth) {
 				const s = parseMs(o.startTime) ?? origin;
 				const dur = Math.max(0, Number(o.durationMs) || 0);
 				const left = Math.max(0, ((s - origin) / span) * 100);
 				const width = Math.max(0.5, (dur / span) * 100);
 				const type = esc(o.type || "event");
-				return `<div class="wf-row" data-wf-id="${esc(o.id || "")}" title="${esc(o.name || "")}">
-					<span class="wf-label">${esc(o.name || o.type || "step")}</span>
+				const isError = o.status === "error";
+				const cost = formatCost(o.usage);
+				const indent = depth * 16;
+				const tooltip = `${esc(o.name || o.type || "step")} (${durSpan(o.status, o.startTime, o.durationMs)})${cost ? ' · $' + esc(cost) : ''}`;
+				const statusClass = isError ? " error" : (o.status === "abandoned" ? " abandoned" : "");
+
+				const children = byParent[o.id] || [];
+				const childHtml = children.map((c) => rowHtml(c, depth + 1)).join("");
+
+				return `<div class="wf-row${statusClass}" data-wf-id="${esc(o.id || "")}" title="${esc(tooltip)}" data-depth="${depth}">
+					<span class="wf-label" style="padding-left:${indent}px">${esc(o.name || o.type || "step")}</span>
 					<span class="wf-track"><span class="wf-bar ${type}" style="left:${left}%;width:${Math.min(100 - left, width)}%"></span></span>
 					<span class="wf-dur">${esc(formatDuration(dur))}</span>
-				</div>`;
-			}).join("");
-			return `<div class="waterfall"><div class="section-head"><div class="waterfall-title">Waterfall</div><p class="section-purpose">When each step ran and how long it took</p></div>${rows}</div>`;
+				</div>${childHtml}`;
+			}
+
+			const list = roots.length ? roots : obs;
+			const rows = list.map((o) => rowHtml(o, 0)).join("");
+
+			return `<div class="waterfall"><div class="section-head"><div class="waterfall-title">Waterfall</div><p class="section-purpose">When each step ran and how long it took (hierarchical view)</p></div>${rows}</div>`;
 		}
 
 		function buildTree(observations, preferredOpen) {
