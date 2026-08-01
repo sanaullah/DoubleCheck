@@ -146,6 +146,7 @@ class extends="testbox.system.BaseSpec" {
 							);
 						expect( fitted.maxTokens ).toBeLTE( 2048 );
 						expect( fitted.truncated ).toBeTrue();
+						expect( fitted.systemPrompt ).toBe( "system instructions" );
 						expect( fitted.userPrompt ).toInclude( "[truncated]" );
 						var estimatedTokens = int(
 								( len( fitted.systemPrompt ) + len( fitted.userPrompt ) ) / 2
@@ -166,6 +167,36 @@ class extends="testbox.system.BaseSpec" {
 							) +
 							retryFitted.maxTokens;
 						expect( retryEstimatedTokens ).toBeLTE( 8192 );
+
+						var requiredFooter = char( 10 ) & "BEGIN_REPAIR_REQUEST" & char( 10 ) & "Repair serialization only." & char( 10 ) & "END_REPAIR_REQUEST";
+						var repairFitted = gateway.fitChatPrompt(
+								"immutable role and schema contract",
+								repeatString( "dynamic task data", 4000 ),
+								"",
+								1000,
+								.25,
+								requiredFooter
+							);
+						expect( repairFitted.systemPrompt ).toBe( "immutable role and schema contract" );
+						expect( repairFitted.userPrompt ).toInclude( "BEGIN_REPAIR_REQUEST" );
+						expect( repairFitted.userPrompt ).toInclude( "END_REPAIR_REQUEST" );
+					}
+				);
+
+				it(
+					"uses the canonical message field in chat-only contracts",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { model: "test-model" } )
+							);
+						makePublic( gateway, "chatOnlyInstructions" );
+
+						var instructions = gateway.chatOnlyInstructions( { instructions: "OUTPUT_SCHEMA: specialist-findings-v1" } );
+						expect( instructions ).toInclude( "use message, never detail" );
+						expect( instructions ).notToInclude( "title, detail" );
 					}
 				);
 
@@ -211,17 +242,21 @@ class extends="testbox.system.BaseSpec" {
 								"variables",
 								800
 							);
+						var chatStub = new tests.resources.DeterministicAIChatGateway( "{""summary"":""ok"",""findings"":[]}" );
 						gateway.$property(
 								"chatGateway",
 								"variables",
-								new tests.resources.DeterministicAIChatGateway( "{""summary"":""ok"",""findings"":[]}" )
+								chatStub
 							);
 						makePublic( gateway, "ensureChatJsonResponse" );
 						var progressEvents = [];
 
 						var response = gateway.ensureChatJsonResponse(
 								"not-json",
-								[ { role: "user", content: "Review this source." }],
+								[
+									{ role: "system", content: "ORIGINAL ROLE CONTRACT" & char( 10 ) & "OUTPUT_SCHEMA: specialist-findings-v1" },
+									{ role: "user", content: "Review this source." }
+								],
 								{ max_tokens: 2048 },
 								{},
 								{ maxTokens: 6000 },
@@ -240,6 +275,11 @@ class extends="testbox.system.BaseSpec" {
 								.observe
 								.meta
 								.requestedRetryMaxTokens ).toBe( 3072 );
+						var retryRequest = chatStub.getRequests()[ 1 ];
+						expect( retryRequest.prompt[ 1 ].content ).toInclude( "ORIGINAL ROLE CONTRACT" );
+						expect( retryRequest.prompt[ 1 ].content ).toInclude( "OUTPUT_SCHEMA: specialist-findings-v1" );
+						expect( retryRequest.prompt[ 2 ].content ).toInclude( "BEGIN_REPAIR_REQUEST" );
+						expect( retryRequest.prompt[ 2 ].content ).toInclude( "Do not add findings" );
 					}
 				);
 
@@ -448,7 +488,9 @@ class extends="testbox.system.BaseSpec" {
 						expect( result.findings ).toHaveLength( 1 );
 						expect( result.results[ 1 ].status ).toBe( "succeeded" );
 						expect( result.findings[ 1 ].source ).toBe( "specialist/security" );
-						expect( result.findings[ 1 ].provenance.promptVersion ).toBe( "specialist-prompt-v3" );
+						expect( result.findings[ 1 ].provenance.promptVersion ).toBe( "specialist-prompt-v5" );
+						expect( result.findings[ 1 ].provenance.promptId ).toBe( "specialist.security" );
+						expect( len( result.findings[ 1 ].provenance.promptHash ) ).toBe( 64 );
 						expect( result.findings[ 1 ].provenance.policyFingerprint ).toBe( "policy-fingerprint" );
 						expect( result.findings[ 1 ].provenance.analyzerVersion ).toBe( "parser-version" );
 					}

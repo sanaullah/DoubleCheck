@@ -182,10 +182,48 @@ sudo apt-get install openjdk-21-jdk
 
 ## Running tests
 
-**With CommandBox:**
+### CommandBox / ColdBox suite
+
+Run the web-backed TestBox runner from the repository root. The server must be
+running first because `box testbox run` calls the runner over HTTP; it does not
+create the ColdBox application scope itself.
+
 ```powershell
+cd C:\Box\DoubleCheck
+box install                 # first checkout only
+box server start            # uses server.json and runs in the background
 box testbox run
 ```
+
+`box.json` points TestBox at `/tests/runner.bxm`. The request then executes
+`tests/Application.bx`, which starts the virtual ColdBox app used by the
+integration specs. For a faster focused run, keep the server running and use:
+
+```powershell
+box testbox run directory=tests.specs.unit
+box testbox run bundles=tests.specs.unit.PromptSystemSpec
+```
+
+Check or stop the server with `box server status` and `box server stop`. If you
+start it with `box server start --console`, leave that terminal open and run
+TestBox from a second terminal in the same project directory.
+
+Do not use the bare BoxLang TestBox runner for the ColdBox-backed suite, for
+example:
+
+```powershell
+boxlang --bx-config runtime/boxlang.json lib/testbox/system/runners/BoxLangRunner.bx
+```
+
+That runner is intentionally serverless. It does not execute the web request
+that loads `tests/Application.bx`, so ColdBox's `BaseTestCase` cannot find the
+`application` scope and fails with `The requested key [application] was not
+located in any scope or it's undefined`. The CLI runner is appropriate for
+framework-independent specs; use the CommandBox runner above for this
+application's integration/ColdBox tests. See the [CommandBox TestBox runner
+documentation](https://commandbox.ortusbooks.com/testbox-integration/test-runner)
+and [TestBox's BoxLang CLI runner guidance](https://testbox.ortusbooks.com/getting-started/running-tests/boxlang-cli-runner)
+for the distinction.
 
 **Standalone (JDK 21 only, no CommandBox):**
 ```batch

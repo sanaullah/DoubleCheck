@@ -1,0 +1,97 @@
+/**
+ * Deterministic local evaluation harness for versioned prompt contracts.
+ * It never contacts a provider and never persists raw task/evidence material.
+ */
+@singleton
+class {
+	property name="promptRegistry" inject="PromptRegistry";
+	property name="promptCompiler" inject="PromptCompiler";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+
+	struct function lintAll() {
+		var results = [];
+		var passed = 0;
+		for ( var contractId in getRegistry().listContracts() ) {
+			try {
+				var result = getCompiler().lint( contractId );
+				results.append( result );
+				if ( result.valid ) passed++;
+			} catch ( any error ) {
+				results.append( { valid: false, promptId: contractId, errors: [ error.message ?: "lint failed" ] } );
+			}
+		}
+		return { valid: passed == results.len(), total: results.len(), passed: passed, failed: results.len() - passed, results: results };
+	}
+
+	struct function evaluate( struct fixtures = {} ) {
+		var fixtureSet = arguments.fixtures;
+		if ( !fixtureSet.count() ) fixtureSet = getRegistry().evals();
+		var cases = isArray( fixtureSet.fixtures ?: "" ) ? fixtureSet.fixtures : [];
+		var results = [];
+		var passed = 0;
+		for ( var fixture in cases ) {
+			var result = evaluateFixture( fixture );
+			results.append( result );
+			if ( result.passed ) passed++;
+		}
+		var lint = lintAll();
+		var dynamicAuthorityLeak = results.filter( ( item ) => item.id == "evidence-injection-is-data" && !item.passed ).len() == 0;
+		var unauthorizedEvidence = results.filter( ( item ) => item.id == "unauthorized-file-is-rejected" && !item.passed ).len() == 0;
+		var schemaFixtures = results.filter( ( item ) => item.id == "canonical-message-field" );
+		return {
+			version        : fixtureSet.version ?: "prompt-evals-v1",
+			passed         : passed,
+			total          : results.len(),
+			passRate       : results.len() ? passed / results.len() : 1,
+			lint           : lint,
+			metrics        : {
+				schemaFixturePassRate: schemaFixtures.len() ? schemaFixtures.filter( ( item ) => item.passed ).len() / schemaFixtures.len() : 1,
+				repairRate          : 0,
+				unauthorizedEvidenceRate: unauthorizedEvidence ? 1 : 0,
+				dynamicAuthorityLeakRate: dynamicAuthorityLeak ? 0 : 1
+			},
+			securityGates  : { unauthorizedEvidence: unauthorizedEvidence, dynamicAuthorityLeak: dynamicAuthorityLeak },
+			results        : results
+		};
+	}
+
+	private struct function evaluateFixture( required struct fixture ) {
+		var errors = [];
+		if ( len( trim( arguments.fixture.role ?: "" ) ) && !isStruct( arguments.fixture.output ?: "" ) ) {
+			try {
+				var prompt = getCompiler().compile( arguments.fixture.role, { task: arguments.fixture.task ?: {}, evidence: arguments.fixture.evidence ?: {} } );
+				var evidenceText = jsonSerialize( arguments.fixture.evidence ?: {} );
+				if ( find( evidenceText, prompt.systemPrompt ) ) errors.append( "dynamic evidence leaked into system contract" );
+			} catch ( any error ) {
+				errors.append( error.message ?: "prompt fixture compilation failed" );
+			}
+		}
+		if ( len( trim( arguments.fixture.schema ?: "" ) ) && isStruct( arguments.fixture.output ?: "" ) ) {
+			var validation = getValidator().validate( arguments.fixture.output, arguments.fixture.schema, arguments.fixture.context ?: {} );
+			if ( structKeyExists( arguments.fixture, "expectedReasonCode" ) ) {
+				if ( !validation.reasonCodes.contains( arguments.fixture.expectedReasonCode ) ) errors.append( "expected reason code was not emitted" );
+			} else if ( !validation.valid ) {
+				errors.append( "fixture output was rejected" );
+			}
+		}
+		return { id: arguments.fixture.id ?: "fixture", passed: errors.len() == 0, errors: errors };
+	}
+
+	private any function getRegistry() {
+		if ( !isNull( variables.promptRegistry ?: javacast( "null", "" ) ) ) return variables.promptRegistry;
+		variables.promptRegistry = new app.models.services.PromptRegistry();
+		return variables.promptRegistry;
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+}

@@ -1,0 +1,80 @@
+/**
+ * Builds an offline prompt-authoring request. This service never calls a
+ * provider and never changes the active runtime contract; its output is a
+ * reviewable proposal for a developer to inspect and version.
+ */
+@singleton
+class {
+	property name="promptRegistry" inject="PromptRegistry";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+
+	struct function build( required string contractId, struct fixtures = {} ) {
+		var registry = getRegistry();
+		var contract = registry.contract( arguments.contractId );
+		var outputSchema = registry.schema( contract.outputSchema );
+		var authoring = registry.authoringMetaPrompt();
+		var evalSet = arguments.fixtures;
+		if ( !evalSet.count() ) evalSet = registry.evals();
+		var fixtureText = boundedJson( evalSet, 120000 );
+		var userPrompt = "BEGIN_CONTRACT_JSON" & char( 10 ) & boundedJson( contract, 24000 ) & char( 10 ) & "END_CONTRACT_JSON" & char( 10 ) &
+			"BEGIN_OUTPUT_SCHEMA_JSON" & char( 10 ) & boundedJson( outputSchema, 60000 ) & char( 10 ) & "END_OUTPUT_SCHEMA_JSON" & char( 10 ) &
+			"BEGIN_EVAL_FIXTURES_JSON" & char( 10 ) & fixtureText & char( 10 ) & "END_EVAL_FIXTURES_JSON";
+		var systemPrompt = trim( toString( authoring.text ?: "" ) ) & char( 10 ) & "Return exactly one JSON object matching AUTHORING_RESULT_SCHEMA: prompt-authoring-result-v1.";
+		var provenance = {
+			promptId     : authoring.id ?: "prompt-authoring-meta-v1",
+			promptVersion: authoring.version ?: "v1",
+			promptHash   : stableHash( systemPrompt ),
+			contractId   : contract.id,
+			contractVersion: contract.version,
+			contractHash : stableHash( boundedJson( contract, 24000 ) ),
+			schemaId     : "prompt-authoring-result-v1",
+			schemaHash   : stableHash( boundedJson( registry.schema( "prompt-authoring-result-v1" ), 60000 ) ),
+			evalHash     : stableHash( fixtureText ),
+			mode         : "offline-draft"
+		};
+		return {
+			ok          : true,
+			offlineOnly : true,
+			promptId    : provenance.promptId,
+			promptVersion: provenance.promptVersion,
+			contractId  : contract.id,
+			contractVersion: contract.version,
+			outputSchema: "prompt-authoring-result-v1",
+			systemPrompt: systemPrompt,
+			userPrompt  : userPrompt,
+			messages    : [ { role: "system", content: systemPrompt }, { role: "user", content: userPrompt } ],
+			provenance  : provenance
+		};
+	}
+
+	struct function validateProposal( required any proposal ) {
+		return getValidator().validate( arguments.proposal, "prompt-authoring-result-v1" );
+	}
+
+	private any function getRegistry() {
+		if ( !isNull( variables.promptRegistry ?: javacast( "null", "" ) ) ) return variables.promptRegistry;
+		variables.promptRegistry = new app.models.services.PromptRegistry();
+		return variables.promptRegistry;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private string function boundedJson( required any value, required numeric limit ) {
+		var encoded = jsonSerialize( arguments.value );
+		if ( len( encoded ) <= arguments.limit ) return encoded;
+		return jsonSerialize( {
+			omitted: true,
+			reason : "offline-authoring-budget",
+			sha256 : stableHash( encoded ),
+			bytes  : len( encoded )
+		} );
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

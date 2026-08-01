@@ -44,6 +44,7 @@ class {
 		var notes = [];
 		var totalOutputCharacters = 0;
 		var totalCostUsd = 0;
+		var dbPromptProvenance = {};
 		var shardCap = isNumeric( budgets.maxApplicationShards ?: "" ) ? max( 1, min( variables.maxApplicationShards, int( budgets.maxApplicationShards ) ) ) : variables.defaultApplicationShards;
 		var totalOutputLimit = isNumeric( budgets.maxTokens ?: "" ) ? max( 2048, int( budgets.maxTokens ) * 4 * max( 3, shardCap ) ) : 24000 * max( 3, shardCap );
 		var samplePolicy = structKeyExists( arguments.input, "samplePolicy" ) && isStruct( arguments.input.samplePolicy ) ? arguments.input.samplePolicy : {};
@@ -90,6 +91,7 @@ class {
 				dbOptions.maxRetries = 0;
 				dbOptions.role = "modernization-database";
 				var dbResponse = agentGateway.run( arguments.runId, dbRequest, dbOptions );
+				dbPromptProvenance = structKeyExists( dbResponse, "promptProvenance" ) ? dbResponse.promptProvenance : {};
 				totalCostUsd += isNumeric( dbResponse.costUsd ?: "" ) ? val( dbResponse.costUsd ) : 0;
 				if ( !( dbResponse.ok ?: false ) ) {
 					errors.append( { role: "modernization-database", message: dbResponse.error ?: "provider-failed" } );
@@ -115,6 +117,7 @@ class {
 			return failure( firstMessage, errors );
 		}
 		var merged = mergeFragments( arguments.input, arguments.evidence, fragments, errors );
+		appendPromptContract( merged, "modernization-database", dbPromptProvenance );
 		merged = ensureApplicationSourceCoverage( merged, arguments.evidence, arguments.input, notes );
 		merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
 		merged.metadata.applicationShards = {
@@ -167,6 +170,7 @@ class {
 				architectureOptions.maxRetries = 1;
 				architectureOptions.role = "modernization-architecture";
 				var architecture = agentGateway.run( arguments.runId, architectureRequest, architectureOptions );
+				appendPromptContract( merged, "modernization-architecture", structKeyExists( architecture, "promptProvenance" ) ? architecture.promptProvenance : {} );
 				totalCostUsd += isNumeric( architecture.costUsd ?: "" ) ? val( architecture.costUsd ) : 0;
 				if ( architecture.ok ?: false && validFragment( "modernization-architecture", architecture.payload ?: {} ) ) {
 					var redactedArchitecture = redactPayload( architecture.payload ?: {} );
@@ -243,6 +247,10 @@ class {
 			: "";
 		merged.metadata.model = appResult.model ?: "";
 		merged.metadata.providerId = appResult.provider ?: "";
+		merged.metadata.promptContracts = isArray( merged.metadata.promptContracts ?: "" ) ? merged.metadata.promptContracts : [];
+		for ( var applicationContract in collectPromptContracts( appResult.outcomes ?: [] ) ) {
+			if ( !merged.metadata.promptContracts.some( ( existing ) => existing.key == applicationContract.key ) ) merged.metadata.promptContracts.append( applicationContract );
+		}
 		merged = annotateProvenance( merged );
 		var finalErrors = [];
 		var finalNotes = duplicate( notes );
@@ -898,6 +906,7 @@ class {
 				costUsd: 0,
 				outputCharacters: 0,
 				usage: {},
+				promptProvenance: {},
 				provenanceClass: "not-observed"
 			} );
 		}
@@ -1043,6 +1052,7 @@ class {
 		outcome.durationMs = isNumeric( arguments.response.durationMs ?: "" ) ? int( arguments.response.durationMs ) : 0;
 		outcome.outputCharacters = isNumeric( arguments.response.outputCharacters ?: "" ) ? int( arguments.response.outputCharacters ) : 0;
 		outcome.usage = isStruct( arguments.response.usage ?: "" ) ? duplicate( arguments.response.usage ) : {};
+		outcome.promptProvenance = isStruct( arguments.response.promptProvenance ?: "" ) ? duplicate( arguments.response.promptProvenance ) : {};
 		if ( len( outcome.provider ) ) arguments.state.providerId = outcome.provider;
 		if ( len( outcome.model ) ) arguments.state.modelId = outcome.model;
 		arguments.state.totalCostUsd = arguments.state.totalCostUsd + outcome.costUsd;
@@ -1534,6 +1544,7 @@ class {
 				costUsd: 0,
 				outputCharacters: 0,
 				usage: {},
+				promptProvenance: {},
 				provenanceClass: "not-observed"
 			} );
 		}
@@ -1719,6 +1730,7 @@ class {
 		outcome.durationMs = isNumeric( arguments.appResponse.durationMs ?: "" ) ? int( arguments.appResponse.durationMs ) : 0;
 		outcome.outputCharacters = isNumeric( arguments.appResponse.outputCharacters ?: "" ) ? int( arguments.appResponse.outputCharacters ) : 0;
 		outcome.usage = isStruct( arguments.appResponse.usage ?: "" ) ? duplicate( arguments.appResponse.usage ) : {};
+		outcome.promptProvenance = isStruct( arguments.appResponse.promptProvenance ?: "" ) ? duplicate( arguments.appResponse.promptProvenance ) : {};
 		if ( len( outcome.provider ) ) arguments.state.providerId = outcome.provider;
 		if ( len( outcome.model ) ) arguments.state.modelId = outcome.model;
 		arguments.state.totalCostUsd = arguments.state.totalCostUsd + ( isNumeric( arguments.appResponse.costUsd ?: "" ) ? val( arguments.appResponse.costUsd ) : 0 );
@@ -2665,6 +2677,25 @@ class {
 	private boolean function isCancelled(required string runId, required struct options) {
 		return variables.cancelledRuns.keyExists( arguments.runId ) || ( structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled() );
 	}
+	private array function collectPromptContracts( required array outcomes ) {
+		var contracts = [];
+		for ( var outcome in arguments.outcomes ) {
+			if ( !isStruct( outcome.promptProvenance ?: "" ) || !outcome.promptProvenance.count() ) continue;
+			var provenance = duplicate( outcome.promptProvenance );
+			var key = ( provenance.promptId ?: "" ) & "|" & ( provenance.promptVersion ?: provenance.contractVersion ?: "" ) & "|" & ( provenance.promptHash ?: "" );
+			if ( !contracts.some( ( item ) => item.key == key ) ) contracts.append( { key: "modernization-application|" & key, provenance: provenance, role: "modernization-application" } );
+		}
+		return contracts;
+	}
+
+	private void function appendPromptContract( required struct plan, required string role, required any provenance ) {
+		if ( !isStruct( arguments.provenance ) || !arguments.provenance.count() ) return;
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.promptContracts = isArray( arguments.plan.metadata.promptContracts ?: "" ) ? arguments.plan.metadata.promptContracts : [];
+		var item = { key: arguments.role & "|" & ( arguments.provenance.promptId ?: "" ) & "|" & ( arguments.provenance.promptHash ?: "" ), provenance: duplicate( arguments.provenance ), role: arguments.role };
+		if ( !arguments.plan.metadata.promptContracts.some( ( existing ) => existing.key == item.key ) ) arguments.plan.metadata.promptContracts.append( item );
+	}
+
 	private struct function failure(required string message, array errors = []) {
 		return { ok: false, plan: {}, partial: false, errors: arguments.errors.len() ? arguments.errors : [ { role: "provider", message: arguments.message } ] };
 	}

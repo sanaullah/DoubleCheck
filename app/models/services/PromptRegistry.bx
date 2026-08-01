@@ -1,0 +1,213 @@
+/**
+ * Local, versioned source of truth for model prompt contracts, policies,
+ * schemas, and provider capability profiles.
+ *
+ * Resources are immutable application data. Dynamic task and repository
+ * evidence never belongs in this registry.
+ */
+@singleton
+class {
+	variables.loaded = false;
+	variables.projectRoot = "";
+	variables.manifest = {};
+	variables.cache = {};
+
+	function init() {
+		ensureLoaded();
+		return this;
+	}
+
+	struct function manifest() {
+		ensureLoaded();
+		return duplicate( variables.manifest );
+	}
+
+	struct function contract( required string id ) {
+		ensureLoaded();
+		var contractId = trim( arguments.id );
+		if ( !variables.manifest.contracts.keyExists( contractId ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Unknown prompt contract: #contractId#"
+			);
+		}
+		var value = loadResource( "contract:#contractId#", variables.manifest.contracts[ contractId ] );
+		var active = activeVersion( contractId );
+		if ( len( active ) && active != ( value.version ?: "" ) ) throw( type = "PromptRegistryException", message = "Prompt contract #contractId# is not the active version" );
+		return value;
+	}
+
+	struct function lifecycle() {
+		ensureLoaded();
+		return duplicate( variables.manifest.lifecycle ?: { active: {}, previous: {} } );
+	}
+
+	string function activeVersion( required string id ) {
+		ensureLoaded();
+		var lifecycle = variables.manifest.lifecycle ?: {};
+		var active = isStruct( lifecycle.active ?: "" ) && structKeyExists( lifecycle.active, arguments.id ) ? lifecycle.active[ arguments.id ] : "";
+		return trim( toString( active ) );
+	}
+
+	string function previousVersion( required string id ) {
+		ensureLoaded();
+		var lifecycle = variables.manifest.lifecycle ?: {};
+		var previous = isStruct( lifecycle.previous ?: "" ) && structKeyExists( lifecycle.previous, arguments.id ) ? lifecycle.previous[ arguments.id ] : "";
+		return trim( toString( previous ) );
+	}
+
+	struct function schema( required string id ) {
+		ensureLoaded();
+		var schemaId = trim( arguments.id );
+		if ( !variables.manifest.schemas.keyExists( schemaId ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Unknown prompt schema: #schemaId#"
+			);
+		}
+		return loadResource( "schema:#schemaId#", variables.manifest.schemas[ schemaId ] );
+	}
+
+	struct function policy( required string id ) {
+		ensureLoaded();
+		var policyId = trim( arguments.id );
+		if ( !variables.manifest.policies.keyExists( policyId ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Unknown prompt policy: #policyId#"
+			);
+		}
+		return loadResource( "policy:#policyId#", variables.manifest.policies[ policyId ] );
+	}
+
+	struct function evals() {
+		ensureLoaded();
+		if ( !structKeyExists( variables.manifest, "evals" ) ) return { version: "none", fixtures: [] };
+		return loadResource( "evals", variables.manifest.evals );
+	}
+
+	/**
+	 * Offline authoring instructions are a resource, not a runtime authority.
+	 * Keeping this behind the registry lets review tooling use the same
+	 * versioned source without ever allowing repository text to rewrite a
+	 * production system prompt.
+	 */
+	struct function authoringMetaPrompt() {
+		ensureLoaded();
+		if ( !structKeyExists( variables.manifest, "authoringMetaPrompt" ) ) return { id: "prompt-authoring-meta-v1", version: "v1", text: "" };
+		return loadResource( "authoring-meta-prompt", variables.manifest.authoringMetaPrompt );
+	}
+
+	struct function capabilities( string provider = "" ) {
+		ensureLoaded();
+		var resource = loadResource( "capabilities", variables.manifest.capabilities );
+		var providerName = lCase( trim( arguments.provider ) );
+		var selected = duplicate( resource.default ?: {} );
+		if ( len( providerName ) && isStruct( resource.providers ?: "" ) && resource.providers.keyExists( providerName ) ) {
+			structAppend( selected, resource.providers[ providerName ], true );
+		}
+		selected.provider = providerName;
+		selected.version = resource.version ?: "v1";
+		return selected;
+	}
+
+	array function listContracts() {
+		ensureLoaded();
+		return structKeyArray( variables.manifest.contracts );
+	}
+
+	array function listSchemas() {
+		ensureLoaded();
+		return structKeyArray( variables.manifest.schemas );
+	}
+
+	void function clearCache() {
+		variables.loaded = false;
+		variables.manifest = {};
+		variables.cache = {};
+	}
+
+	private void function ensureLoaded() {
+		if ( variables.loaded ) {
+			return;
+		}
+		variables.projectRoot = projectRootPath();
+		var manifestPath = resourcePath( "manifest.json" );
+		if ( !fileExists( manifestPath ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Prompt registry manifest is missing: #manifestPath#"
+			);
+		}
+		variables.manifest = parseResource( manifestPath );
+		if ( !isStruct( variables.manifest ) || !len( trim( variables.manifest.version ?: "" ) ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Prompt registry manifest is invalid"
+			);
+		}
+		for ( var requiredKey in [ "policies", "contracts", "schemas", "capabilities" ] ) {
+			if ( !isStruct( variables.manifest[ requiredKey ] ?: "" ) && requiredKey != "capabilities" ) {
+				throw(
+					type    = "PromptRegistryException",
+					message = "Prompt registry manifest is missing #requiredKey#"
+				);
+			}
+		}
+		var lifecycle = variables.manifest.lifecycle ?: {};
+		if ( !isStruct( lifecycle ) ) throw( type = "PromptRegistryException", message = "Prompt registry lifecycle is invalid" );
+		for ( var lifecycleKey in [ "active", "previous" ] ) {
+			if ( !isStruct( lifecycle[ lifecycleKey ] ?: "" ) ) throw( type = "PromptRegistryException", message = "Prompt registry lifecycle is missing #lifecycleKey# versions" );
+		}
+		for ( var contractId in variables.manifest.contracts ) {
+			if ( structKeyExists( lifecycle.active, contractId ) && !len( trim( toString( lifecycle.active[ contractId ] ) ) ) ) throw( type = "PromptRegistryException", message = "Prompt registry has an empty active version for #contractId#" );
+		}
+		variables.loaded = true;
+	}
+
+	private struct function loadResource( required string cacheKey, required string relativePath ) {
+		if ( variables.cache.keyExists( arguments.cacheKey ) ) {
+			return duplicate( variables.cache[ arguments.cacheKey ] );
+		}
+		var path = resourcePath( arguments.relativePath );
+		if ( !fileExists( path ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Prompt resource is missing: #arguments.relativePath#"
+			);
+		}
+		var value = parseResource( path );
+		if ( !isStruct( value ) ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Prompt resource must contain a JSON object: #arguments.relativePath#"
+			);
+		}
+		variables.cache[ arguments.cacheKey ] = value;
+		return duplicate( value );
+	}
+
+	private struct function parseResource( required string path ) {
+		try {
+			return jsonDeserialize( fileRead( arguments.path ) );
+		} catch ( any error ) {
+			throw(
+				type    = "PromptRegistryException",
+				message = "Prompt resource cannot be parsed: #arguments.path#"
+			);
+		}
+	}
+
+	private string function resourcePath( required string relativePath ) {
+		if ( findNoCase( "..", arguments.relativePath ) ) throw( type = "PromptRegistryException", message = "Prompt resource path traversal is not allowed" );
+		return variables.projectRoot & "/resources/prompts/" & replace( arguments.relativePath, "\", "/", "all" );
+	}
+
+	private string function projectRootPath() {
+		var rootFile = new java:java.io.File( getCurrentTemplatePath() );
+		for ( var i = 1; i <= 4; i++ ) {
+			rootFile = rootFile.getParentFile();
+		}
+		return replace( rootFile.getAbsolutePath(), "\", "/", "all" );
+	}
+}
