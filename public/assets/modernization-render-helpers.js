@@ -109,7 +109,7 @@
 		const provenance = item.provenanceClass || "unknown provenance";
 		if (item._modernizationType === "legacy-unit") {
 			const range = item.startLine ? ` · lines ${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ""}` : "";
-			return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signals · ${item.touchedTables?.length || 0} tables · ${provenance}`;
+			return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signal types · ${item.touchedTables?.length || 0} tables · ${provenance}`;
 		}
 		if (item._modernizationType === "target-unit") return `${item.layer || item.kind || "target"} · ${item.sourcePath || item.filePath || "new proposal"} · ${validation} · ${provenance}`;
 		if (item._modernizationType === "roadmap-phase") return `${item.pattern || "migration phase"} · ${(item.dependencies || []).length} dependencies · ${validation} · ${provenance}`;
@@ -224,6 +224,103 @@
 	}
 
 	/**
+	 * What each deterministic coupling signal means for a CFML -> ColdBox
+	 * migration. Keyed by the signalId slugs ModernizationSignalService emits.
+	 * `impact` is the part a planner actually needs: what the legacy construct
+	 * has to become on the target side.
+	 */
+	const MODERNIZATION_SIGNAL_GUIDE = {
+		"scope.application-state": { label: "Shared application state", impact: "Must become WireBox singletons, ColdBox config, or CacheBox — not application scope." },
+		"scope.session-heavy": { label: "Session state coupling", impact: "Move to cbstorages/cbsecurity rather than reading session scope directly." },
+		"scope.client": { label: "Client scope coupling", impact: "Client scope has no ColdBox equivalent; re-home this state deliberately." },
+		"security.session-gate": { label: "Auth / session gate", impact: "Replace hand-rolled login checks with a cbsecurity rule or interceptor." },
+		"include.chain": { label: "Include chain", impact: "cfinclude shares variables implicitly; convert to views/helpers with explicit args." },
+		"component.dynamic": { label: "Dynamic component construction", impact: "Cannot be migrated statically — needs a human decision on the DI mapping." },
+		"dynamic.eval": { label: "evaluate() usage", impact: "Requires manual rewrite; no safe mechanical translation." },
+		"component.construction": { label: "Component construction", impact: "createObject/new becomes WireBox injection." },
+		"sql.query": { label: "Inline SQL", impact: "Move to qb or a service method; parameterize on the way." },
+		"sql.unparameterized": { label: "Unparameterized SQL", impact: "Security risk — must use queryparam/qb bindings when migrated." },
+		"sql.dynamic-identifier": { label: "Dynamic SQL identifier", impact: "Table/column built at runtime; cannot be validated statically." },
+		"sql.proc-call": { label: "Stored procedure call", impact: "Confirm the proc still exists on the target database." },
+		"sql.parameter-mismatch": { label: "SQL parameter mismatch", impact: "CFML and SQL bindings may disagree; verify before migrating." },
+		"sql.table-ref": { label: "Table reference", impact: "Ties this slice to schema work." },
+		"sql.column-ref": { label: "Column reference", impact: "Ties this slice to schema work." },
+		"sql.type-hint": { label: "CFML SQL type hint", impact: "cfsqltype hints carry over to qb bindings." },
+		"datasource.named": { label: "Named datasource", impact: "Datasource must be declared in ColdBox config." },
+		"http.outbound": { label: "Outbound HTTP call", impact: "A real deployment seam — candidate for isolation." },
+		"schedule.task": { label: "Scheduled work", impact: "Becomes a ColdBox scheduled task; a real deployment seam." },
+		"filesystem.io": { label: "Filesystem access", impact: "Check path assumptions survive the app/ + public/ split." },
+		"java.interop": { label: "Java interop", impact: "BoxLang Java interop differs from Lucee — verify each call." },
+		"app.lifecycle": { label: "Application lifecycle", impact: "Application.cfc hooks decompose across ColdBox config and interceptors." },
+		"route.evidence": { label: "Legacy route", impact: "Needs a coexist route before the legacy path can retire." },
+		"route.dynamic": { label: "Dynamic route", impact: "Route built at runtime; confirm manually." },
+		"coldbox.present": { label: "ColdBox already present", impact: "Some target structure already exists." }
+	};
+
+	function modernizationSignalGuide(signalId) {
+		const key = String(signalId || "");
+		return MODERNIZATION_SIGNAL_GUIDE[key] || { label: key, impact: "" };
+	}
+
+	function modernizationSignalLabel(signalId) {
+		return modernizationSignalGuide(signalId).label;
+	}
+
+	/**
+	 * "What makes this slice hard" — resolves a roadmap phase to its coupling
+	 * signals through phase.unitIds -> target units -> legacyUnitIds (with a
+	 * sourcePath fallback), then ranks them by hit count.
+	 *
+	 * Pure/DOM-free so it is unit-testable; every input optional because plans
+	 * predating the signal join carry no unitIds on their signals.
+	 */
+	function modernizationSliceDifficulty(result = {}, phase = {}, limit = 6) {
+		const signals = Array.isArray(result.signals) ? result.signals : [];
+		const phaseUnitIds = new Set((Array.isArray(phase.unitIds) ? phase.unitIds : []).map(String));
+		if (!signals.length || !phaseUnitIds.size) return { total: 0, groups: [] };
+
+		const legacyIds = new Set();
+		const paths = new Set();
+		(result.target?.units || []).forEach((unit) => {
+			if (!phaseUnitIds.has(String(unit.id || unit.itemId || ""))) return;
+			(Array.isArray(unit.legacyUnitIds) ? unit.legacyUnitIds : []).forEach((id) => legacyIds.add(String(id)));
+			String(unit.sourcePath || "").split(",").forEach((part) => {
+				const norm = part.trim().replace(/\\/g, "/").toLowerCase();
+				if (norm) paths.add(norm);
+			});
+		});
+		if (!legacyIds.size && !paths.size) return { total: 0, groups: [] };
+
+		const buckets = new Map();
+		let total = 0;
+		signals.forEach((signal) => {
+			if (!signal || typeof signal !== "object") return;
+			const owners = Array.isArray(signal.unitIds) ? signal.unitIds : [];
+			const ref = (Array.isArray(signal.evidenceRefs) ? signal.evidenceRefs[0] : null) || {};
+			const filePath = String(ref.filePath || "");
+			const inScope = owners.some((id) => legacyIds.has(String(id)))
+				|| (filePath && paths.has(filePath.replace(/\\/g, "/").toLowerCase()));
+			if (!inScope) return;
+			const signalId = String(signal.signalId || "");
+			if (!signalId) return;
+			total++;
+			if (!buckets.has(signalId)) {
+				const guide = modernizationSignalGuide(signalId);
+				buckets.set(signalId, { signalId, label: guide.label, impact: guide.impact, count: 0, files: [] });
+			}
+			const bucket = buckets.get(signalId);
+			bucket.count++;
+			if (filePath && bucket.files.length < 3) {
+				const label = `${filePath}:${ref.startLine || 0}`;
+				if (!bucket.files.includes(label)) bucket.files.push(label);
+			}
+		});
+
+		const groups = [...buckets.values()].sort((a, b) => (b.count - a.count) || a.signalId.localeCompare(b.signalId));
+		return { total, groups: groups.slice(0, limit) };
+	}
+
+	/**
 	 * Pure aggregation for the "Modernization Brief" summary card: status,
 	 * effort roll-up and risk distribution (from ModernizationRiskService's
 	 * read-time overlay), packaging split (from the architecture role), and
@@ -249,7 +346,12 @@
 			effortCounts,
 			riskyPhaseCount,
 			packagingSplit: { centralized: Math.max(0, contexts.length - modules.length), modules: modules.length, extracts: extracts.length },
-			currentSlice: currentPhase ? { name: currentPhase.name || currentPhase.goal || currentPhase.id || "Current slice", effortSize: currentPhase.effortSize || "", riskLevel: currentPhase.riskLevel || "" } : null,
+			currentSlice: currentPhase ? {
+				name: currentPhase.name || currentPhase.goal || currentPhase.id || "Current slice",
+				effortSize: currentPhase.effortSize || "",
+				riskLevel: currentPhase.riskLevel || "",
+				effortDrivers: Array.isArray(currentPhase.effortDrivers) ? currentPhase.effortDrivers : []
+			} : null,
 			coverageStatus: result.coverage?.status || (result.coverage?.complete === true ? "complete" : "incomplete"),
 			validationStatus: result.validation?.status || result.validation?.overallStatus || "unknown"
 		};
@@ -269,6 +371,10 @@
 		modernizationPaneBanner,
 		modernizationEvidenceBasisNote,
 		buildModernizationArchitectureSubgraph,
-		modernizationBriefSummary
+		modernizationBriefSummary,
+		MODERNIZATION_SIGNAL_GUIDE,
+		modernizationSignalGuide,
+		modernizationSignalLabel,
+		modernizationSliceDifficulty
 	};
 });

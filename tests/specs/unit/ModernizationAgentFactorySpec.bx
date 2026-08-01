@@ -142,6 +142,45 @@ class extends="testbox.system.BaseSpec" {
 				expect( prompt.messages[ 2 ].content ).toInclude( "targetRef" );
 			} );
 
+			it( "carries shard coupling signals into the roadmap prompt", () => {
+				// Regression guard for a silent no-op: compactRoadmapEvidence() is a
+				// whitelist constructor, so a `signals` key added to the shard
+				// evidence is dropped before the prompt is built unless the
+				// whitelist and orderedKeys are updated too. Every other test
+				// passes in that broken state.
+				var prompt = factory.build(
+					"modernization-roadmap",
+					{ runtime: "boxlang", profile: "modern" },
+					{
+						target: { units: [ { id: "songs-1", targetPath: "app/handlers/Songs.bx" } ] },
+						shardMeta: { index: 1, total: 3, kind: "context", groupName: "Songs", targetUnitIds: [ "songs-1" ] },
+						signals: [
+							{ signalId: "scope.application-state", group: "application-lifecycle-state", meaning: "Application scope state", count: 9, files: [ "handlers/Songs.cfc:14" ] }
+						]
+					},
+					{}
+				);
+				expect( prompt.messages[ 2 ].content ).toInclude( "scope.application-state" );
+				expect( prompt.messages[ 2 ].content ).toInclude( "Application scope state" );
+			} );
+
+			it( "never leaks raw signal evidence plumbing into the roadmap prompt", () => {
+				var prompt = factory.build(
+					"modernization-roadmap",
+					{ runtime: "boxlang", profile: "modern" },
+					{
+						target: { units: [ { id: "songs-1", targetPath: "app/handlers/Songs.bx" } ] },
+						shardMeta: { index: 1, total: 1, kind: "context", groupName: "Songs", targetUnitIds: [ "songs-1" ] },
+						signals: [ { signalId: "sql.query", group: "datasource-table-coupling", meaning: "SQL/query execution", count: 2, files: [ "handlers/Songs.cfc:20" ] } ]
+					},
+					{}
+				);
+				// Aggregates only — raw per-hit records would stringify past
+				// boundedValue()'s depth-2 limit into unreadable prompt garbage.
+				expect( prompt.messages[ 2 ].content ).notToInclude( "contentHash" );
+				expect( prompt.messages[ 2 ].content ).notToInclude( "evidenceRefs" );
+			} );
+
 			it( "builds a slice-rebuild role that keeps scope locked to one phase", () => {
 				factory.skillService = new app.models.services.ModernizationSkillService();
 				var prompt = factory.build( "modernization-slice-rebuild", { runtime: "boxlang", profile: "modern" }, { phaseId: "phase-3", note: "use Crime handler" }, {} );

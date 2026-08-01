@@ -2540,7 +2540,7 @@ async function rebuildModernizationItem(item, note, statusElement) {
  */
 function modernizationRiskEffortBadges(item = {}) {
 	const parts = [];
-	if (item.effortSize) parts.push(`<span class="modernization-effort-chip" data-size="${architectureEscapeAttr(item.effortSize)}" title="Effort size (by mapped unit count)">${architectureEscapeHtml(item.effortSize)}</span>`);
+	if (item.effortSize) parts.push(`<span class="modernization-effort-chip" data-size="${architectureEscapeAttr(item.effortSize)}" title="Effort size (mapped unit count plus weighted coupling)">${architectureEscapeHtml(item.effortSize)}</span>`);
 	if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
 		parts.push(`<span class="modernization-risk-chip" data-risk="${architectureEscapeAttr(item.riskLevel)}" title="${item.relatedFindingCount || 0} related review finding(s)">${architectureEscapeHtml(item.riskLevel)} risk</span>`);
 	}
@@ -2651,7 +2651,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 	} else if (item._modernizationType === "legacy-unit") {
 		add("Purpose", item.purpose || "Purpose was not enriched for this unit.");
 		add("Signature", item.signature || item.symbolName);
-		add("Detected modernization signals", item.signalIds);
+		add("Detected modernization signals", (item.signalIds || []).map(modernizationSignalLabel));
 		add("Tables touched", item.touchedTables);
 		add("Columns touched", item.touchedColumns);
 	} else if (item._modernizationType === "roadmap-phase") {
@@ -2659,6 +2659,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Pattern", item.pattern);
 		add("Parity intent", item.parityIntent);
 		if (item.effortSize) add("Estimated effort", item.effortSize);
+		if (Array.isArray(item.effortDrivers) && item.effortDrivers.length) add("Effort drivers", item.effortDrivers.map(modernizationSignalLabel));
 		if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
 			add("Related review findings", `${item.relatedFindingCount || 0} finding(s), worst severity: ${item.riskLevel}`);
 		}
@@ -2794,8 +2795,11 @@ function renderModernizationBrief(result = {}, planState = "") {
 	const riskLine = summary.riskyPhaseCount > 0
 		? `${summary.riskyPhaseCount} slice${summary.riskyPhaseCount === 1 ? "" : "s"} touch${summary.riskyPhaseCount === 1 ? "es" : ""} known high/critical review findings — sequence ${summary.riskyPhaseCount === 1 ? "it" : "them"} earlier or pair with a fix.`
 		: "No slices flagged against known review findings.";
+	const driverLine = summary.currentSlice?.effortDrivers?.length
+		? ` · coupling drivers: ${summary.currentSlice.effortDrivers.map(modernizationSignalLabel).join(", ")}`
+		: "";
 	const nextLine = summary.currentSlice
-		? `Start with “${summary.currentSlice.name}”${summary.currentSlice.effortSize ? ` (${summary.currentSlice.effortSize})` : ""}${summary.currentSlice.riskLevel && summary.currentSlice.riskLevel !== "none" ? ` · ${summary.currentSlice.riskLevel} risk` : ""}.`
+		? `Start with “${summary.currentSlice.name}”${summary.currentSlice.effortSize ? ` (${summary.currentSlice.effortSize})` : ""}${summary.currentSlice.riskLevel && summary.currentSlice.riskLevel !== "none" ? ` · ${summary.currentSlice.riskLevel} risk` : ""}${driverLine}.`
 		: "Pick a Road step below to see its next action.";
 	host.innerHTML = `
 		<div class="modernization-brief-stats">
@@ -3322,7 +3326,8 @@ function renderModernizationSolution(result = {}) {
 			${hollow ? `<p class="modernization-phase-empty">Treat this as planning notes only until a rerun produces mapped targets. Rebuild will not invent missing application maps.</p>` : mappedPhase ? "" : `<p class="modernization-phase-empty">This step is scaffold/setup. Accept it when the exit criteria are true, then move to a mapped Road slice to modernize concrete files.</p>`}
 			<p class="modernization-dod-goal"></p>
 			<p class="modernization-dod-parity"></p>
-			<div class="modernization-dod-grid"><section><h4>Exit criteria</h4><ul class="exit"></ul></section><section><h4>Rollback</h4><p class="rollback"></p></section></div>
+			<p class="modernization-dod-effort"></p>
+			<div class="modernization-dod-grid"><section><h4>Exit criteria</h4><ul class="exit"></ul></section><section><h4>Rollback</h4><p class="rollback"></p></section><section class="modernization-dod-hard" hidden><h4>What makes this hard</h4><ul class="modernization-dod-difficulty"></ul></section></div>
 			<section class="modernization-dod-prompt"><h4>Implementer prompt</h4><pre></pre></section>
 			<section class="modernization-dod-migration-steps" hidden><h4>Migration steps</h4><ol class="modernization-migration-steps"></ol></section>
 			<label class="modernization-rebuild-note">Rebuild note <textarea id="modernization-rebuild-note" rows="2" maxlength="1000" placeholder="Optional guidance for a redo of this slice"></textarea></label>
@@ -3336,6 +3341,9 @@ function renderModernizationSolution(result = {}) {
 		dod.querySelector(".status-badge").textContent = phase.pattern || (mappedPhase ? "mapped" : "scaffold");
 		dod.querySelector(".modernization-dod-goal").textContent = phase.goal || "";
 		dod.querySelector(".modernization-dod-parity").textContent = phase.parityIntent ? `Parity: ${phase.parityIntent}` : "";
+		dod.querySelector(".modernization-dod-effort").textContent = Array.isArray(phase.effortDrivers) && phase.effortDrivers.length
+			? `Weighted effort drivers: ${phase.effortDrivers.map(modernizationSignalLabel).join(", ")}`
+			: "";
 		const exitList = dod.querySelector("ul.exit");
 		if (!exit.length) exitList.innerHTML = `<li class="field-hint">No exit criteria listed.</li>`;
 		else exit.forEach((item) => {
@@ -3345,6 +3353,34 @@ function renderModernizationSolution(result = {}) {
 		});
 		dod.querySelector(".rollback").textContent = phase.rollback || "No rollback note.";
 		dod.querySelector("pre").textContent = phase.implementerPrompt || "No implementer prompt.";
+		// Deterministic coupling evidence for this slice — the shared state,
+		// include chains and dynamic construction that decide how hard the
+		// migration actually is, not just which files move.
+		const difficulty = modernizationSliceDifficulty(result, phase);
+		const hardSection = dod.querySelector(".modernization-dod-hard");
+		if (difficulty.groups.length && hardSection) {
+			hardSection.hidden = false;
+			const list = hardSection.querySelector("ul");
+			list.innerHTML = "";
+			difficulty.groups.forEach((group) => {
+				const li = document.createElement("li");
+				const label = document.createElement("strong");
+				label.textContent = `${group.label} · ${group.count}`;
+				li.appendChild(label);
+				if (group.impact) {
+					const impact = document.createElement("span");
+					impact.className = "difficulty-impact";
+					impact.textContent = group.impact;
+					li.appendChild(impact);
+				}
+				if (group.files.length) {
+					const where = document.createElement("code");
+					where.textContent = group.files.join(", ");
+					li.append(document.createElement("br"), where);
+				}
+				list.appendChild(li);
+			});
+		}
 		const migrationSteps = Array.isArray(phase.migrationSteps) ? phase.migrationSteps : [];
 		const migrationStepsSection = dod.querySelector(".modernization-dod-migration-steps");
 		if (migrationSteps.length && migrationStepsSection) {

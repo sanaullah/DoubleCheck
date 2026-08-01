@@ -332,6 +332,65 @@ class extends="testbox.system.BaseSpec" {
 					( item ) => ( item.category ?: "" ) == "roadmapPhases" && ( item.level ?: "" ) == "blocking" && findNoCase( "not among this phase's own units", item.message ?: "" )
 				) ).toBeTrue();
 			} );
+
+			it( "allows ColdBox convention paths in migration steps when they are not phase units", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-crime", filePath: "legacy/crime.cfm" } ] },
+					schemaEvidence: {},
+					target: { units: [ { id: "target-crime", itemFingerprint: "fp-crime", targetPath: "app/handlers/Crime.bx" } ], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [ {
+						id: "phase-crime", itemFingerprint: "fp-phase", unitIds: [ "target-crime" ], provenanceClass: "provider-suggested",
+						migrationSteps: [ {
+							order: 1, action: "Add coexist route",
+							legacyRef: { filePath: "legacy/crime.cfm", symbolName: "listCrime" },
+							targetRef: { targetPath: "app/config/Router.bx", methodName: "configure" }
+						} ]
+					} ],
+					validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && findNoCase( "not among this phase's own units", item.message ?: "" ) ) ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && findNoCase( "another roadmap phase", item.message ?: "" ) ) ).toBeFalse();
+			} );
+
+			it( "warns when a migration step points to a target unit owned by another phase", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-crime", filePath: "legacy/crime.cfm" } ] },
+					schemaEvidence: {},
+					target: {
+						units: [
+							{ id: "target-crime", itemFingerprint: "fp-crime", targetPath: "app/handlers/Crime.bx" },
+							{ id: "target-other", itemFingerprint: "fp-other", targetPath: "app/handlers/Other.bx" }
+						],
+						contexts: [], extracts: []
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [
+						{
+							id: "phase-crime", itemFingerprint: "fp-phase-crime", unitIds: [ "target-crime" ], provenanceClass: "provider-suggested",
+							migrationSteps: [ {
+								order: 1, action: "Touch the other handler",
+								legacyRef: { filePath: "legacy/crime.cfm", symbolName: "listCrime" },
+								targetRef: { targetPath: "app/handlers/Other.bx", methodName: "list" }
+							} ]
+						},
+						{ id: "phase-other", itemFingerprint: "fp-phase-other", unitIds: [ "target-other" ], provenanceClass: "deterministically-derived" }
+					],
+					validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && ( item.level ?: "" ) == "warning" && findNoCase( "another roadmap phase", item.message ?: "" ) ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && ( item.level ?: "" ) == "blocking" && findNoCase( "not among this phase's own units", item.message ?: "" ) ) ).toBeFalse();
+			} );
 		} );
 	}
 }

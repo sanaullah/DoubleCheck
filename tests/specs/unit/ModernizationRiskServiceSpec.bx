@@ -61,6 +61,60 @@ class extends="testbox.system.BaseSpec" {
 				expect( lookupCalled ).toBeFalse();
 			} );
 
+			it( "weights coupling differently for equal-sized phases and exposes the top effort drivers", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				var plan = {
+					target: {
+						units: [
+							{ id: "u-a", sourcePath: "legacy/a.cfm", legacyUnitIds: [ "legacy-a" ] },
+							{ id: "u-b", sourcePath: "legacy/b.cfm", legacyUnitIds: [ "legacy-b" ] },
+							{ id: "u-c", sourcePath: "legacy/c.cfm", legacyUnitIds: [ "legacy-c" ] },
+							{ id: "u-d", sourcePath: "legacy/d.cfm", legacyUnitIds: [ "legacy-d" ] }
+						],
+						contexts: [], extracts: []
+					},
+					signals: [
+						{ signalId: "component.construction", unitIds: [ "legacy-a" ], evidenceRefs: [ { filePath: "legacy/a.cfm" } ] },
+						{ signalId: "scope.application-state", unitIds: [ "legacy-c" ], evidenceRefs: [ { filePath: "legacy/c.cfm" } ] },
+						{ signalId: "scope.application-state", unitIds: [ "legacy-c" ], evidenceRefs: [ { filePath: "legacy/c.cfm" } ] },
+						{ signalId: "include.chain", unitIds: [ "legacy-d" ], evidenceRefs: [ { filePath: "legacy/d.cfm" } ] },
+						{ signalId: "include.chain", unitIds: [ "legacy-d" ], evidenceRefs: [ { filePath: "legacy/d.cfm" } ] },
+						{ signalId: "include.chain", unitIds: [ "legacy-d" ], evidenceRefs: [ { filePath: "legacy/d.cfm" } ] },
+						{ signalId: "include.chain", unitIds: [ "legacy-d" ], evidenceRefs: [ { filePath: "legacy/d.cfm" } ] }
+					],
+					roadmapPhases: [
+						{ id: "phase-low-coupling", unitIds: [ "u-a", "u-b" ] },
+						{ id: "phase-high-coupling", unitIds: [ "u-c", "u-d" ] }
+					]
+				};
+				var result = service.enrich( plan, "" );
+				var low = result.roadmapPhases.filter( ( item ) => item.id == "phase-low-coupling" )[ 1 ];
+				var high = result.roadmapPhases.filter( ( item ) => item.id == "phase-high-coupling" )[ 1 ];
+				expect( low.effortSize ).toBe( "S" );
+				expect( high.effortSize ).toBe( "M" );
+				expect( high.effortDrivers ).toBe( [ "include.chain", "scope.application-state" ] );
+			} );
+
+			it( "pins the coupled score bands while keeping count-only bands unchanged", () => {
+				var service = new app.models.services.ModernizationRiskService();
+				var cases = [
+					{ count: 2, signalCount: 6, expected: "S" },
+					{ count: 2, signalCount: 7, expected: "M" },
+					{ count: 2, signalCount: 18, expected: "M" },
+					{ count: 2, signalCount: 19, expected: "L" },
+					{ count: 2, signalCount: 38, expected: "L" },
+					{ count: 2, signalCount: 39, expected: "XL" }
+				];
+				for ( var testCase in cases ) {
+					var units = [];
+					for ( var index = 1; index <= testCase.count; index++ ) units.append( { id: "u#testCase.count#-#index#" } );
+					var signals = [];
+					for ( var hit = 1; hit <= testCase.signalCount; hit++ ) signals.append( { signalId: "component.construction", unitIds: [ units[ 1 ].id ], evidenceRefs: [] } );
+					var plan = { target: { units: units, contexts: [], extracts: [] }, signals: signals, roadmapPhases: [ { id: "phase-1", unitIds: units.map( ( item ) => item.id ) } ] };
+					expect( service.enrich( plan, "" ).roadmapPhases[ 1 ].effortSize ).toBe( testCase.expected );
+				}
+			} );
+
 			it( "sizes effort by unit count thresholds S/M/L/XL", () => {
 				var service = new app.models.services.ModernizationRiskService();
 				service.reviewRunRepository = { findLatestForProject: ( projectPath, runKind, tenantId, projectId ) => javacast( "null", "" ) };

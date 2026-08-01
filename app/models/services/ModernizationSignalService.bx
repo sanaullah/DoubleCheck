@@ -1,7 +1,7 @@
 /** Extracts deterministic modernization seams before any LLM call. */
 @singleton
 class {
-	variables.version = "modernization-signals-v1";
+	variables.version = "modernization-signals-v2";
 
 	struct function build(required struct inventory, struct schemaPack = {}, struct evidence = {}) {
 		var signals = [];
@@ -58,12 +58,75 @@ class {
 		if ( ( arguments.inventory.files ?: [] ).filter( ( item ) => reFindNoCase( "(^|/)application[.](?:cfc|bx)$", item.filePath ?: "" ) ).len() ) stackHints.append( "application.lifecycle" );
 		// Stable ordering prevents prompt drift and makes plan fingerprints useful.
 		signals.sort( ( a, b ) => compareNoCase( a.signalId & ":" & jsonSerialize( a.evidenceRefs ), b.signalId & ":" & jsonSerialize( b.evidenceRefs ) ) );
+		// Bind every signal to the inventory unit(s) whose line range contains it.
+		// Dependencies carry filePath+startLine but no unit id, so this range join
+		// is what turns an orphaned signal list into per-unit / per-phase evidence.
+		// Runs before the groups loop (group entries are references to these same
+		// records) and before the fingerprint, so the hash honestly covers the join.
+		var unitIndex = unitRangeIndex( arguments.inventory.units ?: [] );
+		for ( var signalIndex = 1; signalIndex <= signals.len(); signalIndex++ ) {
+			var refs = signals[ signalIndex ].evidenceRefs ?: [];
+			var ref = isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? refs[ 1 ] : {};
+			var owners = containingUnitIds( unitIndex, ref.filePath ?: "", val( ref.startLine ?: 0 ) );
+			signals[ signalIndex ].unitIds = owners;
+			signals[ signalIndex ].unitId = owners.len() ? owners[ 1 ] : "";
+		}
 		var groups = {};
 		for ( var item in signals ) {
 			if ( !groups.keyExists( item.group ) ) groups[ item.group ] = [];
 			groups[ item.group ].append( item );
 		}
 		return { version: variables.version, signals: signals, groups: groups, stackHints: stackHints, count: signals.len(), fingerprint: stableHash( variables.version & "|" & jsonSerialize( signals ) ) };
+	}
+
+	/**
+	 * filePath (lowercased) -> containing units, narrowest first.
+	 * The sort is an explicit TOTAL order (span, then startLine desc, then id)
+	 * rather than relying on comparator-sort stability: identical-span ties are
+	 * reachable (a .cfc classified as both custom-tag and component both span
+	 * 1..N), and a jittery order would make the signal fingerprint — and every
+	 * plan fingerprint derived from it — non-reproducible for identical input.
+	 */
+	private struct function unitRangeIndex( required array units ) {
+		var index = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( unit.id ?: unit.itemId ?: "" );
+			var path = lCase( trim( unit.filePath ?: "" ) );
+			if ( !len( unitId ) || !len( path ) ) continue;
+			var startLine = val( unit.startLine ?: 0 );
+			var endLine = max( startLine, val( unit.endLine ?: 0 ) );
+			if ( !index.keyExists( path ) ) index[ path ] = [];
+			index[ path ].append( { id: unitId, startLine: startLine, endLine: endLine, span: endLine - startLine } );
+		}
+		for ( var key in index ) {
+			index[ key ].sort( ( a, b ) => {
+				if ( a.span != b.span ) return a.span - b.span;
+				if ( a.startLine != b.startLine ) return b.startLine - a.startLine;
+				return compareNoCase( a.id, b.id );
+			} );
+		}
+		return index;
+	}
+
+	/**
+	 * Every unit containing this line, narrowest first. Returns all containers
+	 * (not just the innermost) because target units claim legacy units at file
+	 * level far more often than function level — keying a rollup on the
+	 * narrowest owner alone would drop roughly half the evidence at the join.
+	 */
+	private array function containingUnitIds( required struct index, required string filePath, required numeric line ) {
+		var path = lCase( trim( arguments.filePath ) );
+		if ( !len( path ) || !arguments.index.keyExists( path ) ) return [];
+		var candidates = arguments.index[ path ];
+		// Signals default startLine to 0; bind those to the file-level unit
+		// (widest span, i.e. the last entry) instead of orphaning them.
+		if ( arguments.line < 1 ) return candidates.len() ? [ candidates[ candidates.len() ].id ] : [];
+		var owners = [];
+		for ( var candidate in candidates ) {
+			if ( candidate.startLine <= arguments.line && arguments.line <= candidate.endLine ) owners.append( candidate.id );
+		}
+		return owners;
 	}
 
 	struct function derive(required struct inventory, struct schemaPack = {}, struct evidence = {}) returntype="struct" { return build( arguments.inventory, arguments.schemaPack, arguments.evidence ); }

@@ -22,7 +22,13 @@ class {
 	property name="eventService" inject="ReviewEventService";
 	property name="log" inject="logbox:logger:{this}";
 
-	variables.pipelineContractVersion = "modernization-pipeline-v2";
+	// v4: the inventory resolver now changes dependency records and signal
+	// precision in addition to the v3 range join. A v3 "evidence" checkpoint
+	// would restore a pre-join inventory wholesale (see the reuse branch below),
+	// silently restoring noisy construction signals on every rerun — so v3
+	// checkpoints must not
+	// be reusable.
+	variables.pipelineContractVersion = "modernization-pipeline-v4";
 
 	struct function execute(required any run, required struct scan, struct callbacks = {}) {
 		var runId = arguments.run.getId();
@@ -81,6 +87,10 @@ class {
 			if ( isArray( extraEvidence.routeEvidence ?: "" ) ) result.inventory.routeEvidence = ( result.inventory.routeEvidence ?: [] ).append( extraEvidence.routeEvidence, true );
 			var signals = signalService.build( inventory, schemaPack ?: {}, extraEvidence );
 			result.signals = signals.signals ?: signals;
+			// Backfill the unit-level rollup the unit schema always declared but
+			// nothing ever populated. Mutates the plan's inventory in place, the
+			// same post-checkpoint pattern the routeEvidence append above uses.
+			linkSignalsToInventory( result.inventory, result.signals );
 			emit( arguments.callbacks, 45, "modernization-signals", "Deriving modernization coupling signals" );
 			var contextCheckpoint = reusableCheckpoint( priorCheckpoints, "context", inputFingerprint, sourceFingerprint );
 			var contextCheckpointValue = !isNull( contextCheckpoint ) ? ( contextCheckpoint.payload.value ?: contextCheckpoint.payload ) : {};
@@ -323,6 +333,53 @@ class {
 
 	void function cancelRun(required string runId) {
 		proposalService.cancelRun( arguments.runId );
+	}
+
+	/**
+	 * Rolls range-joined signals up onto their inventory units, populating the
+	 * signalIds/touchedTables/touchedColumns fields the unit record has always
+	 * declared but nothing ever filled.
+	 *
+	 * Takes the inventory STRUCT deliberately: BoxLang passes a bare array
+	 * argument by value, so a `required array units` signature would mutate a
+	 * copy, change nothing, and still pass every test. Reached through the
+	 * struct it is the same object the plan later persists.
+	 *
+	 * signalIds holds distinct sorted signalId slugs (not per-hit record
+	 * hashes), matching the convention ModernizationContextPackService already
+	 * uses for partition signalIds — human-mappable, and immune to count
+	 * inflation from a signal being attributed to both a function and its
+	 * containing component.
+	 */
+	private void function linkSignalsToInventory( required struct inventory, required array signals ) {
+		var units = isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [];
+		if ( !units.len() || !arguments.signals.len() ) return;
+		var owners = {};
+		for ( var signal in arguments.signals ) {
+			if ( !isStruct( signal ) ) continue;
+			var signalId = trim( signal.signalId ?: "" );
+			if ( !len( signalId ) ) continue;
+			var refs = signal.evidenceRefs ?: [];
+			var target = trim( toString( ( isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? ( refs[ 1 ].target ?: "" ) : "" ) ) );
+			for ( var unitId in ( isArray( signal.unitIds ?: "" ) ? signal.unitIds : [] ) ) {
+				var key = trim( toString( unitId ) );
+				if ( !len( key ) ) continue;
+				if ( !owners.keyExists( key ) ) owners[ key ] = { ids: {}, tables: {}, columns: {} };
+				owners[ key ].ids[ signalId ] = true;
+				if ( len( target ) && signalId == "sql.table-ref" ) owners[ key ].tables[ target ] = true;
+				if ( len( target ) && signalId == "sql.column-ref" ) owners[ key ].columns[ target ] = true;
+			}
+		}
+		for ( var index = 1; index <= units.len(); index++ ) {
+			var unitId = trim( units[ index ].id ?: units[ index ].itemId ?: "" );
+			if ( !len( unitId ) || !owners.keyExists( unitId ) ) continue;
+			var owner = owners[ unitId ];
+			units[ index ].signalIds = owner.ids.keyArray().sort( "textnocase" );
+			var tableNames = owner.tables.keyArray().sort( "textnocase" );
+			var columnNames = owner.columns.keyArray().sort( "textnocase" );
+			units[ index ].touchedTables = tableNames.len() > 20 ? tableNames.slice( 1, 20 ) : tableNames;
+			units[ index ].touchedColumns = columnNames.len() > 40 ? columnNames.slice( 1, 40 ) : columnNames;
+		}
 	}
 
 	private struct function schemaPackFromInput(required struct input, required string projectPath) {

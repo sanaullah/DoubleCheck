@@ -15,7 +15,7 @@ class extends="testbox.system.BaseSpec" {
 					}
 				};
 				var currentCheckpoint = duplicate( oldCheckpoint );
-				currentCheckpoint.payload.provenance.pipelineContractVersion = "modernization-pipeline-v2";
+				currentCheckpoint.payload.provenance.pipelineContractVersion = "modernization-pipeline-v4";
 
 				var oldResult = service.reusableCheckpoint( [ oldCheckpoint ], "inventory", "input-fp", "source-fp" );
 				var currentResult = service.reusableCheckpoint( [ currentCheckpoint ], "inventory", "input-fp", "source-fp" );
@@ -136,6 +136,97 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.coverage.complete ).toBeFalse();
 				expect( result.coverage.llm.gaps.some( ( item ) => ( item.reason ?: "" ) == "cancelled" ) ).toBeTrue();
 				expect( repository.getPlan( run.getId() ) ).notToBeNull();
+			} );
+
+			it( "backfills signalIds and touched tables/columns onto inventory units in the PERSISTED plan", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				service.inventoryService = {
+					build: ( scan ) => {
+						return {
+							noModernizationScope: false,
+							fingerprint: "inventory-fp",
+							files: [ { filePath: "legacy/index.cfm" } ],
+							// No signalIds/touchedTables/touchedColumns keys at all —
+							// the backfill must tolerate their absence.
+							units: [
+								{ id: "legacy-index", filePath: "legacy/index.cfm", startLine: 1, endLine: 60 },
+								{ id: "legacy-untouched", filePath: "legacy/other.cfm", startLine: 1, endLine: 10 }
+							],
+							dependencies: [],
+							routeEvidence: [],
+							unresolved: []
+						};
+					}
+				};
+				service.schemaPackService = { discover: ( path ) => { return { coverage: "absent", fingerprint: "schema-fp" }; } };
+				service.evidenceDiscoveryService = { discover: ( path, options ) => { return { routeEvidence: [] }; } };
+				service.signalService = { build: ( inventory, schema, extra ) => {
+					return { signals: [
+						{ signalId: "scope.application-state", group: "application-lifecycle-state", unitIds: [ "legacy-index" ], evidenceRefs: [ { filePath: "legacy/index.cfm", startLine: 4, target: "application" } ] },
+						{ signalId: "sql.query", group: "datasource-table-coupling", unitIds: [ "legacy-index" ], evidenceRefs: [ { filePath: "legacy/index.cfm", startLine: 9, target: "sql" } ] },
+						// Duplicate slug must collapse, not inflate the rollup.
+						{ signalId: "sql.query", group: "datasource-table-coupling", unitIds: [ "legacy-index" ], evidenceRefs: [ { filePath: "legacy/index.cfm", startLine: 11, target: "sql" } ] },
+						{ signalId: "sql.table-ref", group: "datasource-table-coupling", unitIds: [ "legacy-index" ], evidenceRefs: [ { filePath: "legacy/index.cfm", startLine: 9, target: "crime" } ] },
+						{ signalId: "sql.column-ref", group: "datasource-table-coupling", unitIds: [ "legacy-index" ], evidenceRefs: [ { filePath: "legacy/index.cfm", startLine: 9, target: "state" } ] }
+					] };
+				} };
+				service.contextPackService = {
+					build: ( scan, inventory, signals, options ) => {
+						return { fingerprint: "context-fp", contexts: [], summary: { files: 1, omittedPartitions: 0 }, truncated: false };
+					}
+				};
+				service.coverageService = {
+					assess: ( scan, inventory, schema, context, llm ) => {
+						return { complete: true, status: "complete", repository: { truncation: false, modernizationLanguagesComplete: true }, llm: { complete: true, status: "complete", gaps: [] } };
+					}
+				};
+				service.proposalService = {
+					propose: ( runId, input, evidence, options ) => {
+						return {
+							ok: true, partial: false, errors: [],
+							plan: {
+								version: "modernization-plan-v1",
+								metadata: { provenanceContract: { version: "modernization-provenance-v1" } },
+								coverage: evidence.coverage,
+								assumptions: [],
+								inventory: evidence.inventory,
+								schemaEvidence: evidence.schemaEvidence,
+								signals: evidence.signals,
+								target: { units: [], contexts: [], extracts: [] },
+								unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [],
+								roadmapPhases: [], samples: [], validation: {}, decisions: []
+							}
+						};
+					},
+					cancelRun: ( runId ) => {}
+				};
+				service.validationService = { validate: ( plan, context ) => { return { ok: true, blocking: 0, warnings: 0, messages: [] }; } };
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				var run = new tests.resources.ScriptedModernizationRun(
+					"run-signal-backfill",
+					"modernize",
+					getTempDirectory(),
+					{ target: { runtime: "boxlang", layoutProfile: "modern" } },
+					{ fingerprint: "input-fp" },
+					{ maxDurationMs: 900000 }
+				);
+				service.execute( run, { files: [ { filePath: "legacy/index.cfm", content: "index" } ], repositoryRevision: "rev-1", discoveryTruncated: false } );
+
+				// Assert on the PERSISTED plan, not the in-memory result: a stale
+				// evidence checkpoint restoring a pre-join inventory would pass a
+				// result-only assertion while shipping empty signalIds to the user.
+				var persisted = repository.getPlan( run.getId() );
+				expect( persisted ).notToBeNull();
+				var persistedUnits = persisted.plan.inventory.units;
+				var indexUnit = persistedUnits.filter( ( item ) => item.id == "legacy-index" )[ 1 ];
+				expect( indexUnit.signalIds ).toBe( [ "scope.application-state", "sql.column-ref", "sql.query", "sql.table-ref" ] );
+				expect( indexUnit.touchedTables ).toBe( [ "crime" ] );
+				expect( indexUnit.touchedColumns ).toBe( [ "state" ] );
+				// A unit no signal points at keeps its empty/absent rollup.
+				var untouched = persistedUnits.filter( ( item ) => item.id == "legacy-untouched" )[ 1 ];
+				expect( untouched.signalIds ?: [] ).toBeEmpty();
 			} );
 
 			it( "enriches getResult() with risk/effort data via the risk service when a run entity exists", () => {

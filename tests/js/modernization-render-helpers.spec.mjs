@@ -230,7 +230,7 @@ assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extr
 		coverage: { status: "incomplete" },
 		validation: { status: "warning" },
 		roadmapPhases: [
-			{ id: "phase-1", name: "Crime Management", effortSize: "M", riskLevel: "critical", currentSlice: true },
+			{ id: "phase-1", name: "Crime Management", effortSize: "M", riskLevel: "critical", effortDrivers: ["scope.application-state", "sql.query"], currentSlice: true },
 			{ id: "phase-2", name: "Spellcheck", effortSize: "S", riskLevel: "none", currentSlice: false },
 			{ id: "phase-3", name: "Reporting", effortSize: "L", riskLevel: "high", currentSlice: false }
 		],
@@ -252,6 +252,7 @@ assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extr
 	assert.equal(summary.currentSlice.name, "Crime Management");
 	assert.equal(summary.currentSlice.effortSize, "M");
 	assert.equal(summary.currentSlice.riskLevel, "critical");
+	assert.deepEqual(summary.currentSlice.effortDrivers, ["scope.application-state", "sql.query"]);
 	assert.equal(summary.coverageStatus, "incomplete");
 	assert.equal(summary.validationStatus, "warning");
 }
@@ -274,5 +275,57 @@ assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extr
 	assert.equal(summary.riskyPhaseCount, 0);
 	assert.equal(summary.currentSlice, null, "no phase has currentSlice=true");
 }
+
+// modernizationSignalLabel / Guide
+assert.equal(helpers.modernizationSignalLabel("scope.application-state"), "Shared application state");
+assert.match(helpers.modernizationSignalGuide("scope.application-state").impact, /WireBox|ColdBox config/);
+// Unknown slug falls back to the slug itself, never undefined.
+assert.equal(helpers.modernizationSignalLabel("totally.unknown"), "totally.unknown");
+assert.equal(helpers.modernizationSignalGuide("totally.unknown").impact, "");
+
+// modernizationSliceDifficulty: phase -> target units -> legacyUnitIds -> signals
+{
+	const result = {
+		target: {
+			units: [
+				{ id: "tu-a", legacyUnitIds: ["legacy-a"], sourcePath: "handlers/A.cfc" },
+				{ id: "tu-b", legacyUnitIds: ["legacy-b"], sourcePath: "handlers/B.cfc" }
+			]
+		},
+		signals: [
+			{ signalId: "scope.application-state", unitIds: ["legacy-a"], evidenceRefs: [{ filePath: "handlers/A.cfc", startLine: 4 }] },
+			{ signalId: "scope.application-state", unitIds: ["legacy-a"], evidenceRefs: [{ filePath: "handlers/A.cfc", startLine: 9 }] },
+			{ signalId: "include.chain", unitIds: ["legacy-a"], evidenceRefs: [{ filePath: "handlers/A.cfc", startLine: 2 }] },
+			// belongs to another phase's unit — must not leak in
+			{ signalId: "java.interop", unitIds: ["legacy-b"], evidenceRefs: [{ filePath: "handlers/B.cfc", startLine: 3 }] }
+		]
+	};
+	const out = helpers.modernizationSliceDifficulty(result, { unitIds: ["tu-a"] });
+	assert.equal(out.total, 3, "only tu-a's signals count");
+	assert.equal(out.groups.length, 2);
+	// Ranked by hit count descending.
+	assert.equal(out.groups[0].signalId, "scope.application-state");
+	assert.equal(out.groups[0].count, 2);
+	assert.equal(out.groups[0].label, "Shared application state");
+	assert.deepEqual(out.groups[0].files, ["handlers/A.cfc:4", "handlers/A.cfc:9"]);
+	assert.equal(out.groups[1].signalId, "include.chain");
+	assert.ok(!out.groups.some((g) => g.signalId === "java.interop"), "other phase's signal excluded");
+}
+
+// modernizationSliceDifficulty: sourcePath fallback for plans whose signals
+// predate the unit range join (no unitIds stamped).
+{
+	const result = {
+		target: { units: [{ id: "tu-a", sourcePath: "handlers/A.cfc" }] },
+		signals: [{ signalId: "sql.query", evidenceRefs: [{ filePath: "handlers/A.cfc", startLine: 7 }] }]
+	};
+	const out = helpers.modernizationSliceDifficulty(result, { unitIds: ["tu-a"] });
+	assert.equal(out.total, 1);
+	assert.equal(out.groups[0].signalId, "sql.query");
+}
+
+// modernizationSliceDifficulty: empty/absent inputs degrade safely.
+assert.deepEqual(helpers.modernizationSliceDifficulty({}, {}), { total: 0, groups: [] });
+assert.deepEqual(helpers.modernizationSliceDifficulty({ signals: [] }, { unitIds: ["tu-a"] }), { total: 0, groups: [] });
 
 console.log("modernization-render-helpers.spec.mjs OK");

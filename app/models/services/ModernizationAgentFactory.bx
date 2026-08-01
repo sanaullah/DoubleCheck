@@ -114,7 +114,7 @@ class {
 					// the one place a concrete legacy-file/method-to-target guide can be
 					// requested for every phase without risking the whole-repo overload
 					// that made the unsharded architecture call time out.
-					return "ROADMAP SHARD #val( roadmapShard.index ?: 1 )# of #val( roadmapShard.total ?: 1 )# — group `#roadmapGroupLabel#`. Produce EXACTLY ONE roadmap phase covering ONLY these target unit ids: #roadmapShard.targetUnitIds.toList( ', ' )#. Do not reference any unit, route, finding, or transition id outside this list and its linked evidence. Set dependencies to an empty array and currentSlice to false; the pipeline assigns phase order and the current slice deterministically after all shards return. Return COMPLETE COMPACT JSON with keys roadmapPhases (array with exactly one phase), samples, assumptions. The phase needs goal, pattern, unitIds (matching the listed ids), routeIds, dbFindingIds, transitionIds, sampleIds, parityIntent, exitCriteria, rollback, implementerPrompt. Keep goal/parityIntent/rollback/implementerPrompt under 200 characters and exitCriteria to at most 4 short items. Also produce migrationSteps: up to 6 ordered steps, each with action, legacyRef ({filePath,symbolName} copied from this shard's own evidence, never invented), targetRef ({targetPath,methodName} matching one of this shard's own listed unit ids), and an optional note. When this shard lists more units than 6 steps can cover, pick the most representative steps rather than trying to enumerate every unit — migrationSteps is a starting guide, not an exhaustive list. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions.";
+					return "ROADMAP SHARD #val( roadmapShard.index ?: 1 )# of #val( roadmapShard.total ?: 1 )# — group `#roadmapGroupLabel#`. Produce EXACTLY ONE roadmap phase covering ONLY these target unit ids: #roadmapShard.targetUnitIds.toList( ', ' )#. Do not reference any unit, route, finding, or transition id outside this list and its linked evidence. Set dependencies to an empty array and currentSlice to false; the pipeline assigns phase order and the current slice deterministically after all shards return. Return COMPLETE COMPACT JSON with keys roadmapPhases (array with exactly one phase), samples, assumptions. The phase needs goal, pattern, unitIds (matching the listed ids), routeIds, dbFindingIds, transitionIds, sampleIds, parityIntent, exitCriteria, rollback, implementerPrompt. Keep goal/parityIntent/rollback/implementerPrompt under 200 characters and exitCriteria to at most 4 short items. Also produce migrationSteps: up to 6 ordered steps, each with action, legacyRef ({filePath,symbolName} copied from this shard's own evidence, never invented), targetRef ({targetPath,methodName} matching one of this shard's own listed unit ids), and an optional note. When this shard lists more units than 6 steps can cover, pick the most representative steps rather than trying to enumerate every unit — migrationSteps is a starting guide, not an exhaustive list. The `signals` array is this slice's deterministic coupling evidence — shared application scope, session or auth gates, include chains, dynamic component construction, SQL coupling, Java or outbound integration — each with a hit count and file:line examples. Name the two or three highest-count signals explicitly in implementerPrompt and cover them in migrationSteps: that coupling is what makes this slice hard, not moving files. Never cite a signal that is not listed. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions.";
 				}
 				return "After application and database fragments are merged, produce a concise ordered roadmap using ONLY IDs present in the merged plan. Preserve coexistence. When target.contexts or target.extracts already group units into coherent feature domains, prefer one phase per coherent group over one catch-all phase — a group's targetUnitIds is a strong hint for that phase's unitIds. Only fall back to a single combined phase when no such grouping exists. Each phase needs goal/pattern, earlier-phase dependencies, linked unit/route/finding/transition ids, parity intent, exitCriteria, rollback, implementerPrompt, and linked sample ids. Put route IDs only in routeIds and target-unit IDs only in unitIds. Mark exactly one actionable mapped phase currentSlice=true. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions. Deduplicate assumptions and omit assumptions already represented by evidence.";
 		}
@@ -187,10 +187,14 @@ class {
 				: ( arguments.role == "modernization-repair"
 					? [ "invalidItems", "validation", "inventory", "schemaEvidence", "context" ]
 					: ( arguments.role == "modernization-architecture"
-						? [ "target", "unitLinks", "routeContracts", "signals", "coverage" ]
+						// Signals ahead of routeContracts: coupling/seam evidence is
+						// what an explicit-seam vs domain-clustering call rests on,
+						// and this whole-repo call can exhaust its budget before the
+						// later keys are reached.
+						? [ "target", "unitLinks", "signals", "routeContracts", "coverage" ]
 						: ( arguments.role == "modernization-item-rebuild"
 							? [ "priorItem", "schemaEvidence" ]
-							: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "coverage", "assumptions" ] ) ) ) );
+							: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "signals", "coverage", "assumptions" ] ) ) ) );
 		var included = {};
 		for ( var key in orderedKeys ) {
 			if ( !source.keyExists( key ) ) continue;
@@ -252,6 +256,11 @@ class {
 				[ "id", "sampleKind", "targetPath", "relatedItemIds", "phaseId" ],
 				60
 			),
+			signals: compactRecords(
+				isArray( arguments.evidence.signals ?: "" ) ? arguments.evidence.signals : [],
+				[ "signalId", "group", "meaning", "count", "files" ],
+				20
+			),
 			coverage: arguments.evidence.coverage ?: {},
 			assumptions: arguments.evidence.assumptions ?: []
 		};
@@ -282,16 +291,62 @@ class {
 		};
 	}
 
-	private struct function architectureSignals( required any signals ) {
+	/**
+	 * Seam/coupling evidence for the whole-repository architecture call.
+	 * Widened beyond datasource/include coupling to the groups that actually
+	 * justify an explicit-seam packaging call — outbound integration, session
+	 * and auth gates, shared application state — which the role was previously
+	 * asked to find while being denied the evidence for it.
+	 *
+	 * Returns a bare aggregated array rather than raw records: this is the one
+	 * unsharded call, and hundreds of per-hit records would either exhaust the
+	 * character budget before later keys are reached or stringify past
+	 * boundedValue()'s depth-2 limit.
+	 */
+	private array function architectureSignals( required any signals ) {
+		return aggregateSignals(
+			arguments.signals,
+			[ "datasource-table-coupling", "include-call-coupling", "outbound-integration", "security-session", "application-lifecycle-state" ],
+			20,
+			3
+		);
+	}
+
+	/**
+	 * Collapses per-hit signal records into one record per signalId:
+	 * {signalId, group, meaning, count, files}. Bounded by construction (there
+	 * are only ~17 distinct signalIds), and immune to the "first N records"
+	 * monoculture a naive cap would produce on a signal list sorted
+	 * alphabetically by signalId.
+	 */
+	private array function aggregateSignals( required any signals, required array allowedGroups, numeric maxGroups = 20, numeric maxFiles = 3 ) {
 		var source = isStruct( arguments.signals ) && isArray( arguments.signals.signals ?: "" )
 			? arguments.signals.signals
 			: ( isArray( arguments.signals ) ? arguments.signals : [] );
-		var selected = [];
+		var buckets = {};
+		var order = [];
 		for ( var signal in source ) {
 			if ( !isStruct( signal ) ) continue;
-			if ( [ "datasource-table-coupling", "include-call-coupling" ].contains( lCase( trim( signal.group ?: "" ) ) ) ) selected.append( signal );
+			var group = lCase( trim( signal.group ?: "" ) );
+			if ( arguments.allowedGroups.len() && !arguments.allowedGroups.contains( group ) ) continue;
+			var signalId = trim( signal.signalId ?: "" );
+			if ( !len( signalId ) ) continue;
+			if ( !buckets.keyExists( signalId ) ) {
+				buckets[ signalId ] = { signalId: signalId, group: signal.group ?: "", meaning: signal.meaning ?: "", count: 0, files: [] };
+				order.append( signalId );
+			}
+			buckets[ signalId ].count = buckets[ signalId ].count + 1;
+			var refs = signal.evidenceRefs ?: [];
+			var ref = isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? refs[ 1 ] : {};
+			var filePath = trim( toString( ref.filePath ?: "" ) );
+			if ( len( filePath ) && buckets[ signalId ].files.len() < arguments.maxFiles ) {
+				var label = filePath & ":" & val( ref.startLine ?: 0 );
+				if ( !buckets[ signalId ].files.contains( label ) ) buckets[ signalId ].files.append( label );
+			}
 		}
-		return { signals: selected };
+		var output = order.map( ( item ) => buckets[ item ] );
+		output.sort( ( a, b ) => a.count != b.count ? b.count - a.count : compareNoCase( a.signalId, b.signalId ) );
+		return output.len() > arguments.maxGroups ? output.slice( 1, arguments.maxGroups ) : output;
 	}
 
 	private array function compactRecords( required array records, required array fields, numeric limit = 200 ) {

@@ -54,6 +54,40 @@ class extends="testbox.system.BaseSpec" {
 				expect( gateway.callCount() ).toBe( 4 );
 			} );
 
+			it( "drops application packaging leaks and keeps architecture-owned contexts", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [ { id: "unit-a", targetPath: "app/handlers/A.bx" } ],
+						unitLinks: [], routeContracts: [],
+						contexts: [ { id: "ctx-leaked", name: "Leaked application context" } ],
+						extracts: [ { id: "ext-leaked", name: "Leaked application extract" } ],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [ { id: "ctx-real", name: "Architecture context", targetUnitIds: [ "unit-a" ], packaging: "centralized" } ],
+						extracts: []
+					},
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-a", unitIds: [ "unit-a" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+
+				var result = service.propose(
+					"run-architecture-leak",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.target.contexts.map( ( item ) => item.id ) ).notToInclude( "ctx-leaked" );
+				expect( result.plan.target.contexts.map( ( item ) => item.id ) ).toInclude( "ctx-real" );
+				expect( result.plan.target.extracts.map( ( item ) => item.id ) ).notToInclude( "ext-leaked" );
+				expect( result.notes.some( ( item ) => ( item.message ?: "" ) == "dropped-nonempty-application-architecture-fields" && ( item.fields ?: [] ).contains( "contexts" ) && ( item.fields ?: [] ).contains( "extracts" ) ) ).toBeTrue();
+			} );
+
 			it( "rewrites legacy source paths into legal target layout paths", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "dashboard/index.cfm", proposedRole: "page", targetPath: "dashboard/index.cfm" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
@@ -355,6 +389,90 @@ class extends="testbox.system.BaseSpec" {
 				expect( phase.migrationSteps[ 1 ].legacyRef.filePath ).toBe( "handlers/Pdf.cfc" );
 				expect( phase.migrationSteps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Pdf.bx" );
 				expect( phase.itemFingerprint ).notToBeEmpty();
+			} );
+
+			it( "scopes aggregated coupling signals to each roadmap shard's own units", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{ id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc", legacyUnitIds: [ "legacy-a" ] },
+							{ id: "unit-b", targetPath: "app/handlers/B.bx", sourcePath: "handlers/B.cfc", legacyUnitIds: [ "legacy-b" ] }
+						],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": {
+						contexts: [
+							{ id: "ctx-a", name: "Group A", targetUnitIds: [ "unit-a" ], packaging: "centralized", evidenceBasis: "domain-clustering" },
+							{ id: "ctx-b", name: "Group B", targetUnitIds: [ "unit-b" ], packaging: "centralized", evidenceBasis: "domain-clustering" }
+						],
+						extracts: []
+					},
+					"modernization-roadmap": [
+						{ roadmapPhases: [ { id: "phase-a", name: "Group A", unitIds: [ "unit-a" ] } ], assumptions: [], samples: [] },
+						{ roadmapPhases: [ { id: "phase-b", name: "Group B", unitIds: [ "unit-b" ] } ], assumptions: [], samples: [] }
+					]
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				// Three hits of one signal on unit-a (must collapse to count 3 with
+				// at most 3 file examples), one unrelated signal on unit-b.
+				var signals = [
+					{ signalId: "scope.application-state", group: "application-lifecycle-state", meaning: "Application scope state", unitIds: [ "legacy-a" ], evidenceRefs: [ { filePath: "handlers/A.cfc", startLine: 4 } ] },
+					{ signalId: "scope.application-state", group: "application-lifecycle-state", meaning: "Application scope state", unitIds: [ "legacy-a" ], evidenceRefs: [ { filePath: "handlers/A.cfc", startLine: 9 } ] },
+					{ signalId: "scope.application-state", group: "application-lifecycle-state", meaning: "Application scope state", unitIds: [ "legacy-a" ], evidenceRefs: [ { filePath: "handlers/A.cfc", startLine: 12 } ] },
+					{ signalId: "include.chain", group: "include-call-coupling", meaning: "CFML include chain", unitIds: [ "legacy-b" ], evidenceRefs: [ { filePath: "handlers/B.cfc", startLine: 7 } ] }
+				];
+				var result = service.propose(
+					"run-shard-signals",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {}, signals: signals }
+				);
+				expect( result.ok ).toBeTrue();
+				var roadmapRequests = gateway.requestLog().filter( ( item ) => ( item.role ?: "" ) == "modernization-roadmap" );
+				expect( roadmapRequests ).toHaveLength( 2 );
+				var promptA = roadmapRequests[ 1 ].messages[ 2 ].content;
+				var promptB = roadmapRequests[ 2 ].messages[ 2 ].content;
+				// Each shard sees only its own coupling evidence.
+				expect( promptA ).toInclude( "scope.application-state" );
+				expect( promptA ).notToInclude( "include.chain" );
+				expect( promptB ).toInclude( "include.chain" );
+				expect( promptB ).notToInclude( "scope.application-state" );
+				// Aggregated, not per-hit: three hits of the same signal collapse into
+				// a single record, so the slug appears exactly once in the prompt.
+				var slug = "scope.application-state";
+				var slugOccurrences = ( len( promptA ) - len( replace( promptA, slug, "", "all" ) ) ) / len( slug );
+				expect( slugOccurrences ).toBe( 1 );
+				// ...carrying a hit count and bounded file examples.
+				expect( findNoCase( "count", promptA ) ).toBeGT( 0 );
+				expect( promptA ).toInclude( "handlers/A.cfc:4" );
+			} );
+
+			it( "returns no shard signals when the plan carries none, without failing the proposal", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [ { id: "unit-a", targetPath: "app/handlers/A.bx", sourcePath: "handlers/A.cfc" } ],
+						unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-a", unitIds: [ "unit-a" ] } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-no-signals",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.roadmapPhases ).notToBeEmpty();
 			} );
 
 			it( "prunes a non-current phase's sampleIds when currentSliceSamples() drops its sample, instead of leaving a dangling reference", () => {

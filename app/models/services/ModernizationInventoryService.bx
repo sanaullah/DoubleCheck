@@ -6,7 +6,7 @@
 @singleton
 class {
 	property name="identityService" inject="ModernizationIdentityService";
-	variables.version       = "cfml-inventory-conservative-v3";
+	variables.version       = "cfml-inventory-conservative-v4";
 	variables.patternCache  = {};
 
 	struct function build( required any scan ) {
@@ -18,6 +18,7 @@ class {
 		var unresolved = [];
 		var cfmlFileCount = 0;
 		var totalBytes = 0;
+		var resolutionIndex = buildResolutionIndex( files );
 		for ( var file in files ) {
 			if ( !isStruct( file ) ) continue;
 			var path = normalizePath( file.filePath ?: file.path ?: "" );
@@ -54,11 +55,12 @@ class {
 				var declaration = extractComponentDeclaration( lines );
 				var declarationEvidence = evidence( path, declaration.declarationLine, lines[ declaration.declarationLine ] ?: "", file );
 				if ( len( declaration.extends ) ) {
-					dependencies.append( dependency( "extends", declaration.extends, declarationEvidence ) );
+					dependencies.append( dependency( "extends", declaration.extends, declarationEvidence, resolveTarget( declaration.extends, resolutionIndex ) ) );
 				}
 				if ( len( declaration.implements ) ) {
 					for ( var contract in listToArray( declaration.implements, "," ) ) {
-						dependencies.append( dependency( "implements", trim( contract ), declarationEvidence ) );
+						var contractTarget = trim( contract );
+						dependencies.append( dependency( "implements", contractTarget, declarationEvidence, resolveTarget( contractTarget, resolutionIndex ) ) );
 					}
 				}
 			}
@@ -85,15 +87,46 @@ class {
 				var includeMatch = variables.javaPatternMatcher( "(?:<cfinclude\\s+template\\s*=\\s*|\\binclude\\s+)[^A-Za-z0-9_./-]*([A-Za-z0-9_./-]+)", sourceLine );
 				if ( includeMatch.find() ) {
 					var includeTarget = includeMatch.group( 1 );
-					dependencies.append( dependency( "include", includeTarget, lineEvidence ) );
+					var includeResolution = resolveTarget( includeTarget, resolutionIndex );
+					if ( isStruct( includeResolution ) ) includeResolution.resolution = includeResolution.resolution ?: "include";
+					dependencies.append( dependency( "include", includeTarget, lineEvidence, includeResolution ) );
 					if ( find( char( 35 ), includeTarget ) ) unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
 				} else if ( reFindNoCase( "<cfinclude\\b|\\binclude\\s+", sourceLine ) ) {
 					unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
 				}
-				var constructMatch = variables.javaPatternMatcher( "(?i)component[^A-Za-z0-9_./-]*([A-Za-z_][A-Za-z0-9_./-]*)", sourceLine );
-				while ( constructMatch.find() ) dependencies.append( dependency( "component-construction", constructMatch.group( 1 ), lineEvidence ) );
+				var constructText = sourceLine;
+				if ( reFindNoCase( "<(?:cfobject|cfinvoke)\\b", sourceLine ) ) constructText = joinTagLines( lines, lineNumber ).text;
+				var createObjectMatch = variables.javaPatternMatcher( "\\bcreateObject\\s*\\(\\s*[""']component[""']\\s*,\\s*[""']([^""']+)[""']", constructText );
+				while ( createObjectMatch.find() ) {
+					var createTarget = createObjectMatch.group( 1 );
+					if ( hasInterpolatedConstructionTarget( createTarget ) ) {
+						unresolved.append( unresolvedEvidence( "dynamic-component", path, lineNumber, sourceLine ) );
+					} else {
+						dependencies.append( dependency( "component-construction", createTarget, lineEvidence, resolveTarget( createTarget, resolutionIndex ) ) );
+					}
+				}
+				var tagConstructMatch = variables.javaPatternMatcher( "<(?:cfobject|cfinvoke)\\b[^>]*\\bcomponent\\s*=\\s*[""']([^""']+)[""']", constructText );
+				while ( tagConstructMatch.find() ) {
+					var tagTarget = tagConstructMatch.group( 1 );
+					if ( hasInterpolatedConstructionTarget( tagTarget ) ) {
+						unresolved.append( unresolvedEvidence( "dynamic-component", path, lineNumber, sourceLine ) );
+					} else {
+						dependencies.append( dependency( "component-construction", tagTarget, lineEvidence, resolveTarget( tagTarget, resolutionIndex ) ) );
+					}
+				}
+				var dynamicLiteralMatch = variables.javaPatternMatcher( "\\b(?:createObject|cfinvoke)\\b[^\\r\\n]*[&+]\\s*[""']([A-Za-z_][A-Za-z0-9_./-]*)[""']", constructText );
+				while ( dynamicLiteralMatch.find() ) {
+					var literalTarget = dynamicLiteralMatch.group( 1 );
+					var literalResolution = resolveTarget( literalTarget, resolutionIndex, "dynamic-literal" );
+					if ( len( literalResolution.targetFile ?: "" ) ) dependencies.append( dependency( "component-construction", literalTarget, lineEvidence, literalResolution ) );
+				}
 				var newMatch = variables.javaPatternMatcher( "(?i)new[ ]+([A-Za-z_][A-Za-z0-9_./-]*)", sourceLine );
-				while ( newMatch.find() ) dependencies.append( dependency( "component-construction", newMatch.group( 1 ), lineEvidence ) );
+				while ( newMatch.find() ) {
+					var newTarget = newMatch.group( 1 );
+					if ( isBuiltinConstruction( newTarget ) || isLikelyJavaScriptConstruction( newTarget, path, sourceLine ) ) continue;
+					var newResolution = resolveTarget( newTarget, resolutionIndex );
+					if ( shouldKeepNewConstruction( newTarget, path, resolutionIndex, newResolution ) ) dependencies.append( dependency( "component-construction", newTarget, lineEvidence, newResolution ) );
+				}
 				if ( ( reFindNoCase( "createObject|cfinvoke", sourceLine ) && reFindNoCase( "(arguments|variables|url|form)[.]", sourceLine ) ) || ( findNoCase( "<cfinvoke", sourceLine ) && find( char( 35 ), sourceLine ) ) ) {
 					unresolved.append( unresolvedEvidence( "dynamic-component", path, lineNumber, sourceLine ) );
 				}
@@ -272,8 +305,109 @@ class {
 		return { filePath: arguments.path, startLine: arguments.lineNumber, endLine: arguments.lineNumber, extractionMethod: "regex-conservative-v1", contentHash: arguments.file.contentHash ?: lCase( hash( arguments.line, "SHA-256" ) ), snippet: left( trim( arguments.line ), 240 ) };
 	}
 
-	private struct function dependency( required string kind, required string target, required struct evidence ) {
-		return { id: stableItemId( "dependency", "#arguments.kind#:#arguments.evidence.filePath#:#arguments.evidence.startLine#:#arguments.target#" ), kind: arguments.kind, target: arguments.target, filePath: arguments.evidence.filePath, startLine: arguments.evidence.startLine, endLine: arguments.evidence.endLine, evidenceRefs: [ arguments.evidence ] };
+	private struct function dependency( required string kind, required string target, required struct evidence, struct resolution = {} ) {
+		var record = { id: stableItemId( "dependency", "#arguments.kind#:#arguments.evidence.filePath#:#arguments.evidence.startLine#:#arguments.target#" ), kind: arguments.kind, target: arguments.target, filePath: arguments.evidence.filePath, startLine: arguments.evidence.startLine, endLine: arguments.evidence.endLine, evidenceRefs: [ arguments.evidence ] };
+		if ( isStruct( arguments.resolution ) && len( trim( arguments.resolution.targetFile ?: "" ) ) ) {
+			record.targetFile = arguments.resolution.targetFile;
+			record.resolution = arguments.resolution.resolution ?: "path";
+		}
+		return record;
+	}
+
+	private struct function buildResolutionIndex( required array files ) {
+		var index = { byPath: {}, byBasename: {}, byStem: {}, paths: [] };
+		for ( var file in arguments.files ) {
+			if ( !isStruct( file ) ) continue;
+			var path = normalizePath( file.filePath ?: file.path ?: "" );
+			var extension = lCase( listLast( path, "." ) );
+			if ( !len( path ) || !listFindNoCase( "cfc,cfm,cfml", extension ) ) continue;
+			if ( !index.paths.contains( path ) ) index.paths.append( path );
+			addResolutionCandidate( index.byPath, lCase( path ), path );
+			var basename = listLast( path, "/" );
+			addResolutionCandidate( index.byBasename, lCase( basename ), path );
+			var stem = reReplaceNoCase( basename, "\.(?:cfc|cfm|cfml)$", "", "one" );
+			addResolutionCandidate( index.byStem, lCase( stem ), path );
+		}
+		return index;
+	}
+
+	private void function addResolutionCandidate( required struct bucket, required string key, required string path ) {
+		if ( !len( trim( arguments.key ) ) ) return;
+		if ( !arguments.bucket.keyExists( arguments.key ) ) arguments.bucket[ arguments.key ] = [];
+		if ( !arguments.bucket[ arguments.key ].contains( arguments.path ) ) arguments.bucket[ arguments.key ].append( arguments.path );
+	}
+
+	private struct function resolveTarget( required string target, required struct index, string resolutionHint = "" ) {
+		var raw = trim( arguments.target );
+		if ( !len( raw ) ) return {};
+		var normalized = normalizePath( raw );
+		var candidate = uniqueResolutionCandidate( arguments.index.byPath[ lCase( normalized ) ] ?: [] );
+		if ( len( candidate ) ) return { targetFile: candidate, resolution: len( trim( arguments.resolutionHint ) ) ? arguments.resolutionHint : "path" };
+
+		var basename = listLast( normalized, "/" );
+		candidate = uniqueResolutionCandidate( arguments.index.byBasename[ lCase( basename ) ] ?: [] );
+		if ( len( candidate ) ) return { targetFile: candidate, resolution: len( trim( arguments.resolutionHint ) ) ? arguments.resolutionHint : "basename" };
+
+		var stem = reReplaceNoCase( basename, "\.(?:cfc|cfm|cfml)$", "", "one" );
+		if ( !find( "/", normalized ) && !find( ".", stem ) ) {
+			candidate = uniqueResolutionCandidate( arguments.index.byStem[ lCase( stem ) ] ?: [] );
+			if ( len( candidate ) ) return { targetFile: candidate, resolution: len( trim( arguments.resolutionHint ) ) ? arguments.resolutionHint : "stem" };
+		}
+
+		var dottedTarget = reReplaceNoCase( normalized, "\.(?:cfc|cfm|cfml)$", "", "one" );
+		dottedTarget = replace( dottedTarget, ".", "/", "all" );
+		var dottedCandidates = [];
+		for ( var path in arguments.index.paths ) {
+			var pathWithoutExtension = reReplaceNoCase( path, "\.(?:cfc|cfm|cfml)$", "", "one" );
+			if ( pathSuffixMatches( dottedTarget, pathWithoutExtension ) ) dottedCandidates.append( path );
+		}
+		candidate = uniqueResolutionCandidate( dottedCandidates );
+		if ( len( candidate ) ) return { targetFile: candidate, resolution: len( trim( arguments.resolutionHint ) ) ? arguments.resolutionHint : "dotted-path" };
+		return {};
+	}
+
+	private string function uniqueResolutionCandidate( required array candidates ) {
+		var distinct = {};
+		for ( var candidate in arguments.candidates ) {
+			var path = trim( toString( candidate ) );
+			if ( len( path ) ) distinct[ lCase( path ) ] = path;
+		}
+		return distinct.count() == 1 ? distinct[ distinct.keyArray()[ 1 ] ] : "";
+	}
+
+	private boolean function pathSuffixMatches( required string target, required string candidate ) {
+		var targetParts = listToArray( reReplace( lCase( replace( arguments.target, "\", "/", "all" ) ), "^/+|/+$", "", "all" ), "/" );
+		var candidateParts = listToArray( reReplace( lCase( replace( arguments.candidate, "\", "/", "all" ) ), "^/+|/+$", "", "all" ), "/" );
+		if ( !targetParts.len() || !candidateParts.len() || candidateParts.len() > targetParts.len() ) return false;
+		var offset = targetParts.len() - candidateParts.len();
+		for ( var index = 1; index <= candidateParts.len(); index++ ) if ( targetParts[ offset + index ] != candidateParts[ index ] ) return false;
+		return true;
+	}
+
+	private boolean function isBuiltinConstruction( required string target ) {
+		var value = lCase( trim( arguments.target ) );
+		return listFindNoCase( "array,struct,query,string,numeric,boolean,date,list,object,function,output,option,storedproc,http,extends,implements", value ) > 0
+			|| reFind( "^[A-Za-z]$", value ) > 0
+			|| left( value, 5 ) == "java.";
+	}
+
+	private boolean function hasInterpolatedConstructionTarget( required string target ) {
+		return find( char( 35 ), arguments.target ) > 0;
+	}
+
+	private boolean function isLikelyJavaScriptConstruction( required string target, required string sourcePath, string sourceLine = "" ) {
+		var extension = lCase( listLast( arguments.sourcePath, "." ) );
+		if ( extension != "cfm" ) return false;
+		var normalizedTarget = lCase( trim( arguments.target ) );
+		return left( normalizedTarget, 4 ) == "ext." || findNoCase( "<cfwindow", arguments.sourceLine ) > 0;
+	}
+
+	private boolean function shouldKeepNewConstruction( required string target, required string sourcePath, required struct index, required struct resolution ) {
+		if ( len( trim( arguments.resolution.targetFile ?: "" ) ) ) return true;
+		var value = trim( arguments.target );
+		if ( find( ".", value ) || arguments.index.byStem.keyExists( lCase( value ) ) ) return true;
+		var extension = lCase( listLast( arguments.sourcePath, "." ) );
+		return listFindNoCase( "cfc,cfml", extension ) > 0;
 	}
 
 	private struct function unresolvedEvidence( required string kind, required string path, required numeric lineNumber, required string line ) {

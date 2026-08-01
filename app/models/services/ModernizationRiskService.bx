@@ -19,6 +19,15 @@ class {
 	variables.effortSmallMax = 3;
 	variables.effortMediumMax = 8;
 	variables.effortLargeMax = 15;
+	// Coupling raises the score far beyond raw file count, so these thresholds
+	// are calibrated separately against the live modernization corpus. Plans
+	// with no signal evidence retain the original count-only S/M/L/XL bands.
+	variables.coupledEffortSmallMax = 8;
+	variables.coupledEffortMediumMax = 20;
+	variables.coupledEffortLargeMax = 40;
+	variables.maxEffortDrivers = 3;
+	variables.highWeightSignals = [ "scope.application-state", "component.dynamic", "dynamic.eval" ];
+	variables.mediumWeightSignals = [ "include.chain", "scope.session-heavy", "security.session-gate", "sql.unparameterized" ];
 
 	struct function enrich(
 		required struct plan,
@@ -37,14 +46,14 @@ class {
 		}
 		if ( isArray( arguments.plan.roadmapPhases ?: "" ) ) {
 			for ( var phase in arguments.plan.roadmapPhases ) {
-				if ( isStruct( phase ) ) enrichItem( phase, phase.unitIds ?: [], unitPathById, severityByPath );
+				if ( isStruct( phase ) ) enrichItem( phase, phase.unitIds ?: [], unitPathById, severityByPath, arguments.plan );
 			}
 		}
 		if ( isStruct( arguments.plan.target ?: "" ) ) {
 			for ( var collection in [ "contexts", "extracts" ] ) {
 				if ( !isArray( arguments.plan.target[ collection ] ?: "" ) ) continue;
 				for ( var item in arguments.plan.target[ collection ] ) {
-					if ( isStruct( item ) ) enrichItem( item, item.targetUnitIds ?: [], unitPathById, severityByPath );
+					if ( isStruct( item ) ) enrichItem( item, item.targetUnitIds ?: [], unitPathById, severityByPath, arguments.plan );
 				}
 			}
 		}
@@ -55,7 +64,8 @@ class {
 		required struct item,
 		required array unitIds,
 		required struct unitPathById,
-		required struct severityByPath
+		required struct severityByPath,
+		required struct plan
 	) {
 		var worstRank = 0;
 		var worstSeverity = "none";
@@ -72,7 +82,88 @@ class {
 		}
 		arguments.item.riskLevel = worstSeverity;
 		arguments.item.relatedFindingCount = relatedCount;
-		arguments.item.effortSize = effortSizeFor( arguments.unitIds.len() );
+		var effort = effortProfile( arguments.plan, arguments.unitIds, arguments.item );
+		arguments.item.effortSize = effort.size;
+		arguments.item.effortDrivers = effort.drivers;
+	}
+
+	private struct function effortProfile( required struct plan, required array unitIds, struct item = {} ) {
+		var signals = isStruct( arguments.item ) && isArray( arguments.item.signals ?: "" ) && arguments.item.signals.len()
+			? arguments.item.signals
+			: signalsForUnitIds( arguments.plan, arguments.unitIds );
+		if ( !signals.len() ) return { size: effortSizeFor( arguments.unitIds.len(), [] ), drivers: [] };
+
+		var score = arguments.unitIds.len();
+		var buckets = {};
+		for ( var signal in signals ) {
+			var signalId = isStruct( signal ) ? trim( toString( signal.signalId ?: signal.id ?: "" ) ) : trim( toString( signal ) );
+			if ( !len( signalId ) ) continue;
+			var hitCount = isStruct( signal ) && isNumeric( signal.count ?: "" ) ? max( 1, val( signal.count ) ) : 1;
+			var weight = effortWeight( signalId );
+			if ( !buckets.keyExists( signalId ) ) buckets[ signalId ] = { signalId: signalId, count: 0, weight: weight, contribution: 0 };
+			buckets[ signalId ].count += hitCount;
+			buckets[ signalId ].contribution += hitCount * weight;
+			score += hitCount * weight;
+		}
+		if ( !buckets.count() ) return { size: effortSizeFor( arguments.unitIds.len(), [] ), drivers: [] };
+
+		var ranked = buckets.keyArray().map( ( id ) => buckets[ id ] );
+		ranked.sort( ( a, b ) => a.contribution != b.contribution
+			? b.contribution - a.contribution
+			: compareNoCase( a.signalId, b.signalId ) );
+		var drivers = ranked.slice( 1, min( variables.maxEffortDrivers, ranked.len() ) ).map( ( item ) => item.signalId );
+		return { size: effortSizeFor( arguments.unitIds.len(), signals, score ), drivers: drivers };
+	}
+
+	/** Signals are bound to legacy inventory units; target units bridge that join through legacyUnitIds/sourcePath. */
+	private array function signalsForUnitIds( required struct plan, required array unitIds ) {
+		var selected = {};
+		for ( var unitId in arguments.unitIds ) {
+			var key = trim( toString( unitId ) );
+			if ( len( key ) ) selected[ key ] = true;
+		}
+		if ( !selected.count() ) return [];
+		var legacyIds = duplicate( selected );
+		var paths = {};
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		for ( var unit in ( isArray( target.units ?: "" ) ? target.units : [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var targetId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !selected.keyExists( targetId ) ) continue;
+			for ( var legacyId in ( isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [] ) ) {
+				var legacyKey = trim( toString( legacyId ) );
+				if ( len( legacyKey ) ) legacyIds[ legacyKey ] = true;
+			}
+			for ( var sourcePath in listToArray( unit.sourcePath ?: unit.sourceFile ?: "", ",", true, true ) ) {
+				var normalizedPath = normalizePath( sourcePath );
+				if ( len( normalizedPath ) ) paths[ normalizedPath ] = true;
+			}
+		}
+
+		var output = [];
+		var signals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		for ( var signal in signals ) {
+			if ( !isStruct( signal ) ) continue;
+			var inScope = false;
+			for ( var ownerId in ( isArray( signal.unitIds ?: "" ) ? signal.unitIds : [] ) ) {
+				if ( legacyIds.keyExists( trim( toString( ownerId ) ) ) ) { inScope = true; break; }
+			}
+			if ( !inScope && len( trim( toString( signal.unitId ?: "" ) ) ) ) inScope = legacyIds.keyExists( trim( toString( signal.unitId ) ) );
+			if ( !inScope ) {
+				for ( var ref in ( isArray( signal.evidenceRefs ?: "" ) ? signal.evidenceRefs : [] ) ) {
+					if ( !isStruct( ref ) ) continue;
+					if ( paths.keyExists( normalizePath( ref.filePath ?: ref.path ?: "" ) ) ) { inScope = true; break; }
+				}
+			}
+			if ( inScope ) output.append( signal );
+		}
+		return output;
+	}
+
+	private numeric function effortWeight( required string signalId ) {
+		if ( variables.highWeightSignals.contains( lCase( arguments.signalId ) ) ) return 3;
+		if ( variables.mediumWeightSignals.contains( lCase( arguments.signalId ) ) ) return 2;
+		return 1;
 	}
 
 	/** filePath (normalized) -> {severity, rank, count}, using the worst severity observed at that path. */
@@ -112,10 +203,17 @@ class {
 		return lCase( replace( trim( toString( arguments.path ) ), "\", "/", "all" ) );
 	}
 
-	private string function effortSizeFor( required numeric unitCount ) {
-		if ( arguments.unitCount <= variables.effortSmallMax ) return "S";
-		if ( arguments.unitCount <= variables.effortMediumMax ) return "M";
-		if ( arguments.unitCount <= variables.effortLargeMax ) return "L";
+	private string function effortSizeFor( required numeric unitCount, array signals = [], numeric score = 0 ) {
+		if ( !isArray( arguments.signals ) || !arguments.signals.len() ) {
+			if ( arguments.unitCount <= variables.effortSmallMax ) return "S";
+			if ( arguments.unitCount <= variables.effortMediumMax ) return "M";
+			if ( arguments.unitCount <= variables.effortLargeMax ) return "L";
+			return "XL";
+		}
+		var couplingScore = arguments.score > 0 ? arguments.score : arguments.unitCount;
+		if ( couplingScore <= variables.coupledEffortSmallMax ) return "S";
+		if ( couplingScore <= variables.coupledEffortMediumMax ) return "M";
+		if ( couplingScore <= variables.coupledEffortLargeMax ) return "L";
 		return "XL";
 	}
 }

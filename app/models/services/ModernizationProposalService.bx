@@ -468,8 +468,22 @@ class {
 		var app = fragments[ "modernization-application" ] ?: {};
 		var db = fragments[ "modernization-database" ] ?: {};
 		plan.target.units = normalizeTargetUnits( boundedStructArray( app.targetUnits ?: app.units ?: [], variables.maxItems, arguments.errors, "target.units" ), arguments.input );
-		plan.target.contexts = boundedStructArray( app.contexts ?: [], variables.maxItems, arguments.errors, "target.contexts" );
-		plan.target.extracts = boundedStructArray( app.extracts ?: [], variables.maxItems, arguments.errors, "target.extracts" );
+		var leakedArchitectureFields = [];
+		if ( isArray( app.contexts ?: "" ) && app.contexts.len() ) leakedArchitectureFields.append( "contexts" );
+		if ( isArray( app.extracts ?: "" ) && app.extracts.len() ) leakedArchitectureFields.append( "extracts" );
+		if ( leakedArchitectureFields.len() ) arguments.errors.append( {
+			role: "modernization-application",
+			message: "dropped-nonempty-application-architecture-fields",
+			severity: "info",
+			fields: leakedArchitectureFields,
+			note: "Application shards do not own packaging decisions; architecture-role values were discarded before merge."
+		} );
+		// Packaging decisions belong exclusively to the architecture role. The
+		// application role's schema asks for empty arrays, but models sometimes
+		// echo thin context/extract objects anyway; seeding them here would make
+		// mergeArchitecture() append duplicate ids later.
+		plan.target.contexts = [];
+		plan.target.extracts = [];
 		plan.unitLinks = boundedStructArray( app.unitLinks ?: [], variables.maxItems, arguments.errors, "unitLinks" );
 		plan.routeContracts = boundedStructArray( app.routeContracts ?: [], variables.maxItems, arguments.errors, "routeContracts" );
 		plan.dbFindings = boundedStructArray( db.dbFindings ?: [], variables.maxItems, arguments.errors, "dbFindings" );
@@ -736,6 +750,71 @@ class {
 		return shards;
 	}
 
+	/**
+	 * Coupling signals for one roadmap shard, aggregated per signalId.
+	 *
+	 * Resolves the shard's target units to their legacy inventory unit ids and
+	 * source paths (same resolution ModernizationSliceRebuildService uses), then
+	 * selects signals bound to those units by the range join, with a filePath
+	 * fallback for newProposal targets and plans built before the join existed.
+	 *
+	 * Aggregates rather than passing per-hit records: signals arrive sorted
+	 * alphabetically by signalId, so any "first N" truncation downstream would
+	 * yield a single-signal monoculture and the model would confidently name the
+	 * wrong hard part. One record per signalId is bounded by construction.
+	 */
+	private array function signalsForRoadmapShard(
+		required struct plan,
+		required array scopedUnits,
+		numeric maxGroups = 12,
+		numeric maxFilesPerGroup = 3
+	) {
+		var signals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		if ( !signals.len() || !arguments.scopedUnits.len() ) return [];
+		var legacyIdSet = {};
+		var pathSet = {};
+		for ( var unit in arguments.scopedUnits ) {
+			if ( !isStruct( unit ) ) continue;
+			for ( var legacyId in ( isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [] ) ) {
+				var legacyKey = trim( toString( legacyId ) );
+				if ( len( legacyKey ) ) legacyIdSet[ legacyKey ] = true;
+			}
+			for ( var sourcePath in listToArray( unit.sourcePath ?: "", ",", true, true ) ) {
+				var normalizedPath = lCase( normalizeLegacyPath( sourcePath ) );
+				if ( len( normalizedPath ) ) pathSet[ normalizedPath ] = true;
+			}
+		}
+		if ( !legacyIdSet.count() && !pathSet.count() ) return [];
+		var buckets = {};
+		var order = [];
+		for ( var signal in signals ) {
+			if ( !isStruct( signal ) ) continue;
+			var inScope = false;
+			for ( var unitId in ( isArray( signal.unitIds ?: "" ) ? signal.unitIds : [] ) ) {
+				if ( legacyIdSet.keyExists( trim( toString( unitId ) ) ) ) { inScope = true; break; }
+			}
+			var refs = signal.evidenceRefs ?: [];
+			var ref = isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? refs[ 1 ] : {};
+			var filePath = trim( toString( ref.filePath ?: "" ) );
+			if ( !inScope && len( filePath ) && pathSet.keyExists( lCase( normalizeLegacyPath( filePath ) ) ) ) inScope = true;
+			if ( !inScope ) continue;
+			var signalId = trim( signal.signalId ?: "" );
+			if ( !len( signalId ) ) continue;
+			if ( !buckets.keyExists( signalId ) ) {
+				buckets[ signalId ] = { signalId: signalId, group: signal.group ?: "", meaning: signal.meaning ?: "", count: 0, files: [] };
+				order.append( signalId );
+			}
+			buckets[ signalId ].count = buckets[ signalId ].count + 1;
+			if ( len( filePath ) && buckets[ signalId ].files.len() < arguments.maxFilesPerGroup ) {
+				var label = filePath & ":" & val( ref.startLine ?: 0 );
+				if ( !buckets[ signalId ].files.contains( label ) ) buckets[ signalId ].files.append( label );
+			}
+		}
+		var output = order.map( ( item ) => buckets[ item ] );
+		output.sort( ( a, b ) => a.count != b.count ? b.count - a.count : compareNoCase( a.signalId, b.signalId ) );
+		return output.len() > arguments.maxGroups ? output.slice( 1, arguments.maxGroups ) : output;
+	}
+
 	/** Scopes plan evidence down to one roadmap shard's target-unit group, mirroring evidenceForShard()'s file-scoping for application shards. */
 	private struct function evidenceForRoadmapShard( required struct plan, required struct group, required numeric index, required numeric total ) {
 		var idSet = {};
@@ -777,6 +856,7 @@ class {
 			dbFindings: findings,
 			dbTransitions: transitions,
 			samples: samples,
+			signals: signalsForRoadmapShard( arguments.plan, scopedUnits ),
 			coverage: arguments.plan.coverage ?: {},
 			assumptions: [],
 			shardMeta: {

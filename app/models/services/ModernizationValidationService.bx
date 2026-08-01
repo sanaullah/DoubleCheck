@@ -375,11 +375,22 @@ class {
 			var unitTargetPath = lCase( replace( trim( unit.targetPath ?: unit.pathHint ?: "" ), "\", "/", "all" ) );
 			if ( len( unitId ) && len( unitTargetPath ) ) unitTargetPaths[ unitId ] = unitTargetPath;
 		}
+		var phasePathOwners = {};
+		for ( var ownerPhase in arguments.phases ) {
+			if ( !isStruct( ownerPhase ) ) continue;
+			var ownerPhaseId = trim( ownerPhase.id ?: ownerPhase.itemId ?: "" );
+			for ( var ownerUnitId in ( isArray( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ?: "" ) ? ( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ) : [] ) ) {
+				var ownerPath = unitTargetPaths[ trim( toString( ownerUnitId ) ) ] ?: "";
+				if ( !len( ownerPath ) ) continue;
+				if ( !phasePathOwners.keyExists( ownerPath ) ) phasePathOwners[ ownerPath ] = [];
+				if ( !phasePathOwners[ ownerPath ].contains( ownerPhaseId ) ) phasePathOwners[ ownerPath ].append( ownerPhaseId );
+			}
+		}
 		for ( var phase in arguments.phases ) {
 			if ( !isStruct( phase ) ) continue;
 			var id = trim( phase.id ?: phase.itemId ?: "" );
 			var phaseUnitIds = {};
-			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) phaseUnitIds[ trim( toString( unitId ) ) ] = true;
+			for ( var unitId in ( isArray( phase.unitIds ?: phase.targetUnitIds ?: "" ) ? ( phase.unitIds ?: phase.targetUnitIds ) : [] ) ) phaseUnitIds[ trim( toString( unitId ) ) ] = true;
 
 			var steps = isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps : [];
 			for ( var step in steps ) {
@@ -396,6 +407,11 @@ class {
 					if ( len( stepTargetPath ) && ( unitTargetPaths[ phaseUnitId ] ?: "" ) == stepTargetPath ) { matchesPhaseUnit = true; break; }
 				}
 				if ( !len( stepTargetPath ) || !matchesPhaseUnit ) {
+					if ( isColdBoxConventionPath( stepTargetPath ) ) continue;
+					if ( len( stepTargetPath ) && phasePathOwners.keyExists( stepTargetPath ) && !phasePathOwners[ stepTargetPath ].contains( id ) ) {
+						addMessage( arguments.messages, "roadmapPhases", "warning", "Phase #id# migration step references a targetRef.targetPath belonging to another roadmap phase", id ); report.warnings++;
+						continue;
+					}
 					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a targetRef.targetPath not among this phase's own units", id ); report.blocking++;
 				}
 			}
@@ -405,6 +421,12 @@ class {
 			}
 		}
 		return report;
+	}
+
+	private boolean function isColdBoxConventionPath( required string path ) {
+		var normalized = lCase( replace( trim( arguments.path ), "\", "/", "all" ) );
+		return reFindNoCase( "(^|/)router\.(?:bx|cfc)$", normalized ) > 0
+			|| reFindNoCase( "(^|/)(?:coldbox|application)\.(?:bx|cfc)$", normalized ) > 0;
 	}
 
 	private struct function idSet( required any items ) {

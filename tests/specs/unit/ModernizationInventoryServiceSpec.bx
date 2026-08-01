@@ -125,12 +125,67 @@ class extends="testbox.system.BaseSpec" {
                     }
                 ] } );
                 var functions = result.units.filter( ( item ) => listFindNoCase( "function,lifecycle-hook", item.unitType ) );
-                expect( result.version ).toBe( "cfml-inventory-conservative-v3" );
+				expect( result.version ).toBe( "cfml-inventory-conservative-v4" );
                 expect( functions.map( ( item ) => item.symbolName ) ).toBe( [ "onApplicationStart", "onRequestStart" ] );
                 // Application.cfc lifecycle methods are tagged distinctly (Phase 3).
                 expect( functions.every( ( item ) => item.unitType == "lifecycle-hook" ) ).toBeTrue();
                 expect( functions.filter( ( item ) => item.symbolName == "onRequestStart" )[ 1 ].startLine ).toBe( 6 );
-            } );
+			} );
+
+			it( "keeps real component construction, resolves targets, and drops builtin/JavaScript new calls", () => {
+				var result = new app.models.services.ModernizationInventoryService().build( { files: [
+					{ filePath: "dashboard/components/crime.cfc", language: "ColdFusion", content: "component {}", contentHash: "crime" },
+					{ filePath: "webportal/Application.cfc", language: "ColdFusion", content: "component {}", contentHash: "webportal-application" },
+					{ filePath: "includes/header.cfm", language: "ColdFusion", content: "<h1>Header</h1>", contentHash: "header" },
+					{ filePath: "Base.cfc", language: "ColdFusion", content: '<cfcomponent extends="crime">' & char( 10 ) & "</cfcomponent>", contentHash: "base" },
+					{
+						filePath: "dashboard/index.cfm",
+						language: "ColdFusion",
+						content: 'new Array(); new Query(); new i(); new GStreetviewPanorama(); new Http(); new Ext.Viewport(); new crime(); new opengovdashboard.webportal.Application();' & char( 10 )
+							& 'createObject("component", "dashboard.components.crime");' & char( 10 )
+							& 'createObject("component", application.settings.cfcPath & "crime");' & char( 10 )
+							& 'createObject("component", "' & char( 35 ) & 'application.settings.cfcPath' & char( 35 ) & 'crime");' & char( 10 )
+							& '<cfobject component="crime">' & char( 10 )
+							& '<cfinvoke component="crime">' & char( 10 )
+							& '<cfinclude template="header.cfm">' & char( 10 )
+							& 'createObject("component", "missing")',
+						contentHash: "dashboard-index"
+					}
+				] } );
+
+				var constructions = result.dependencies.filter( ( item ) => item.kind == "component-construction" );
+				var targets = constructions.map( ( item ) => item.target );
+				expect( targets ).toInclude( "crime" );
+				expect( targets ).toInclude( "dashboard.components.crime" );
+				expect( targets ).toInclude( "opengovdashboard.webportal.Application" );
+				expect( targets ).toInclude( "missing" );
+				expect( targets ).notToInclude( "Array" );
+				expect( targets ).notToInclude( "Query" );
+				expect( targets ).notToInclude( "i" );
+				expect( targets ).notToInclude( "GStreetviewPanorama" );
+				expect( targets ).notToInclude( "Http" );
+				expect( targets ).notToInclude( "Ext.Viewport" );
+				expect( targets ).notToInclude( "extends" );
+
+				var dotted = constructions.filter( ( item ) => item.target == "dashboard.components.crime" )[ 1 ];
+				expect( dotted.targetFile ).toBe( "dashboard/components/crime.cfc" );
+				expect( dotted.resolution ).toBe( "dotted-path" );
+				var bare = constructions.filter( ( item ) => item.target == "crime" && structKeyExists( item, "targetFile" ) )[ 1 ];
+				expect( bare.targetFile ).toBe( "dashboard/components/crime.cfc" );
+				expect( bare.resolution ).toBe( "stem" );
+				var dottedApplication = constructions.filter( ( item ) => item.target == "opengovdashboard.webportal.Application" )[ 1 ];
+				expect( dottedApplication.targetFile ).toBe( "webportal/Application.cfc" );
+				var unresolved = constructions.filter( ( item ) => item.target == "missing" )[ 1 ];
+				expect( structKeyExists( unresolved, "targetFile" ) ).toBeFalse();
+				expect( result.unresolved.filter( ( item ) => item.kind == "dynamic-component" ).len() ).toBeGT( 0 );
+
+				var include = result.dependencies.filter( ( item ) => item.kind == "include" )[ 1 ];
+				expect( include.targetFile ).toBe( "includes/header.cfm" );
+				expect( include.resolution ).toBe( "basename" );
+				var extendsDependency = result.dependencies.filter( ( item ) => item.kind == "extends" )[ 1 ];
+				expect( extendsDependency.target ).toBe( "crime" );
+				expect( result.dependencies.filter( ( item ) => item.target == "extends" ) ).toBeEmpty();
+			} );
 
             it( "extracts the declared name from tag and script remote methods", () => {
                 var result = new app.models.services.ModernizationInventoryService().build( { files: [

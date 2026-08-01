@@ -30,6 +30,80 @@ class extends="testbox.system.BaseSpec" {
             } );
             expect( result.signals[ 1 ].confidence ).toBe( 1 );
         } );
+
+        it( "binds a signal to every containing unit, narrowest first", () => {
+            var inventory = {
+                files: [], routeEvidence: [], unresolved: [],
+                units: [
+                    { id: "unit-component", filePath: "Crime.cfc", startLine: 1, endLine: 40 },
+                    { id: "unit-function", filePath: "Crime.cfc", startLine: 10, endLine: 20 }
+                ],
+                dependencies: [ { kind: "scope.application", target: "application", filePath: "Crime.cfc", startLine: 14 } ]
+            };
+            var result = new app.models.services.ModernizationSignalService().build( inventory );
+            expect( result.signals[ 1 ].signalId ).toBe( "scope.application-state" );
+            // Narrowest (the function) first, then the containing component —
+            // target units claim either, so both must be recorded.
+            expect( result.signals[ 1 ].unitIds ).toBe( [ "unit-function", "unit-component" ] );
+            expect( result.signals[ 1 ].unitId ).toBe( "unit-function" );
+        } );
+
+        it( "binds a signal outside any function to the file-level unit", () => {
+            var inventory = {
+                files: [], routeEvidence: [], unresolved: [],
+                units: [
+                    { id: "unit-component", filePath: "Crime.cfc", startLine: 1, endLine: 40 },
+                    { id: "unit-function", filePath: "Crime.cfc", startLine: 10, endLine: 20 }
+                ],
+                dependencies: [ { kind: "scope.application", target: "application", filePath: "Crime.cfc", startLine: 35 } ]
+            };
+            var result = new app.models.services.ModernizationSignalService().build( inventory );
+            expect( result.signals[ 1 ].unitIds ).toBe( [ "unit-component" ] );
+        } );
+
+        it( "falls back to the widest unit when the evidence has no usable line number", () => {
+            var inventory = {
+                files: [], routeEvidence: [], unresolved: [],
+                units: [
+                    { id: "unit-component", filePath: "Crime.cfc", startLine: 1, endLine: 40 },
+                    { id: "unit-function", filePath: "Crime.cfc", startLine: 10, endLine: 20 }
+                ],
+                dependencies: [ { kind: "scope.application", target: "application", filePath: "Crime.cfc", startLine: 0 } ]
+            };
+            var result = new app.models.services.ModernizationSignalService().build( inventory );
+            expect( result.signals[ 1 ].unitIds ).toBe( [ "unit-component" ] );
+        } );
+
+        it( "leaves a signal unbound when its file has no inventory unit, without throwing", () => {
+            var inventory = {
+                files: [], routeEvidence: [], unresolved: [],
+                units: [ { id: "unit-other", filePath: "Other.cfc", startLine: 1, endLine: 40 } ],
+                dependencies: [ { kind: "http", target: "outbound", filePath: "Unscanned.cfm", startLine: 3 } ]
+            };
+            var result = new app.models.services.ModernizationSignalService().build( inventory );
+            expect( result.signals[ 1 ].unitIds ).toBeEmpty();
+            expect( result.signals[ 1 ].unitId ).toBe( "" );
+        } );
+
+        it( "orders equal-span containing units deterministically across builds", () => {
+            // A .cfc can be classified as both custom-tag and component, giving
+            // two units with an identical 1..N span. Without a total order the
+            // fingerprint would jitter run-to-run on identical input.
+            var inventory = {
+                files: [], routeEvidence: [], unresolved: [],
+                units: [
+                    { id: "unit-zeta", filePath: "Portal.cfc", startLine: 1, endLine: 30 },
+                    { id: "unit-alpha", filePath: "Portal.cfc", startLine: 1, endLine: 30 }
+                ],
+                dependencies: [ { kind: "include", target: "shared.cfm", filePath: "Portal.cfc", startLine: 5 } ]
+            };
+            var service = new app.models.services.ModernizationSignalService();
+            var first = service.build( inventory );
+            var second = service.build( inventory );
+            expect( first.signals[ 1 ].unitIds ).toBe( [ "unit-alpha", "unit-zeta" ] );
+            expect( first.signals[ 1 ].unitIds ).toBe( second.signals[ 1 ].unitIds );
+            expect( first.fingerprint ).toBe( second.fingerprint );
+        } );
         } );
     }
 }
