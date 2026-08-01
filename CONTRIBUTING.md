@@ -33,7 +33,7 @@ See [`readme.md`](readme.md) for the no-CommandBox standalone path
 
 1. Keep API changes under `/api/v1/*` and update `resources/apidocs/openapi.yaml`
    **and** `openapi.json` together when the contract changes.
-2. Use migrations (`resources/database/migrations/`) for schema changes.
+2. Keep application SQLite schema changes in `app/models/services/SchemaService.bx`.
    Never commit `.env`, local database files, or other generated runtime state.
 3. Follow nearby BoxLang/CFML formatting and naming rather than a broad
    unrelated rewrite.

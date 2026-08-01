@@ -84,8 +84,8 @@ fi
 cd "$(dirname "$0")"
 
 # Check JAR
-if [ ! -f ".engine/boxlang-miniserver-1.14.0.jar" ]; then
-    echo -e "${RED}ERROR: boxlang-miniserver-1.14.0.jar not found${NC}"
+if [ ! -f ".engine/boxlang-miniserver.jar" ]; then
+    echo -e "${RED}ERROR: boxlang-miniserver.jar not found${NC}"
     exit 1
 fi
 
@@ -105,7 +105,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
     # Console mode: show all output
     echo "[INFO] Starting miniserver with console output..."
     echo ""
-    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar miniserver.json
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver.jar miniserver.json
     echo ""
     echo "================================================================================"
     echo "DoubleCheck has stopped"
@@ -113,7 +113,7 @@ if [ $CONSOLE_MODE -eq 1 ]; then
 else
     # Background mode: clean output
     echo "[INFO] Starting miniserver in background..."
-    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar miniserver.json &
+    $JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver.jar miniserver.json &
     SERVER_PID=$!
 
     sleep 2

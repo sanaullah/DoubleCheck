@@ -110,8 +110,8 @@ exit /b 0
 :start_server
 cd /d "%~dp0"
 
-if not exist .engine\boxlang-miniserver-1.14.0.jar (
-    echo ERROR: boxlang-miniserver-1.14.0.jar not found
+if not exist .engine\boxlang-miniserver.jar (
+    echo ERROR: boxlang-miniserver.jar not found
     exit /b 1
 )
 
@@ -125,7 +125,7 @@ if %VERBOSE%==1 echo [INFO] Starting miniserver...
 
 REM Start miniserver and capture its exact PID (do NOT use start /B - it cannot be
 REM targeted for cleanup afterward, which is why processes were piling up before)
-for /f "tokens=*" %%p in ('powershell -NoProfile -Command "(Start-Process -FilePath '%JAVA_EXE%' -ArgumentList '-Xmx1024m','-jar','.engine\boxlang-miniserver-1.14.0.jar','miniserver.json' -WindowStyle Hidden -PassThru).Id"') do (
+for /f "tokens=*" %%p in ('powershell -NoProfile -Command "(Start-Process -FilePath '%JAVA_EXE%' -ArgumentList '-Xmx1024m','-jar','.engine\boxlang-miniserver.jar','miniserver.json' -WindowStyle Hidden -PassThru).Id"') do (
     set SERVER_PID=%%p
 )
 

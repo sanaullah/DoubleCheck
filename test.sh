@@ -60,8 +60,8 @@ fi
 cd "$(dirname "$0")"
 
 # Check JAR exists
-if [ ! -f ".engine/boxlang-miniserver-1.14.0.jar" ]; then
-    echo -e "${RED}ERROR: boxlang-miniserver-1.14.0.jar not found${NC}"
+if [ ! -f ".engine/boxlang-miniserver.jar" ]; then
+    echo -e "${RED}ERROR: boxlang-miniserver.jar not found${NC}"
     exit 1
 fi
 
@@ -73,7 +73,7 @@ echo ""
 
 # Start miniserver in background
 [ $VERBOSE -eq 1 ] && echo "[INFO] Starting miniserver..."
-$JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver-1.14.0.jar miniserver.json >/dev/null 2>&1 &
+$JAVA_CMD -Xmx1024m -jar .engine/boxlang-miniserver.jar miniserver.json >/dev/null 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to start

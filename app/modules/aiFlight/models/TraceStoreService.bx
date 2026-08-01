@@ -25,93 +25,109 @@ class {
 	void function ensureSchema() {
 		variables.dbPath = resolveDbPath();
 		ensureDatabaseFile( variables.dbPath );
-		executeUpdate(
-			"
-				CREATE TABLE IF NOT EXISTS schema_meta (
-					key TEXT PRIMARY KEY,
-					value TEXT NOT NULL
-				)
-			"
-		);
-		executeUpdate(
-			"
-				CREATE TABLE IF NOT EXISTS traces (
-					id TEXT PRIMARY KEY,
-					name TEXT NOT NULL DEFAULT '',
-					session_id TEXT,
-					user_id TEXT,
-					environment TEXT NOT NULL DEFAULT '',
-					started_at TEXT NOT NULL,
-					ended_at TEXT,
-					status TEXT NOT NULL DEFAULT 'running',
-					provider TEXT,
-					model TEXT,
-					input_preview TEXT,
-					output_preview TEXT,
-					total_tokens INTEGER NOT NULL DEFAULT 0,
-					prompt_tokens INTEGER NOT NULL DEFAULT 0,
-					completion_tokens INTEGER NOT NULL DEFAULT 0,
-					duration_ms INTEGER NOT NULL DEFAULT 0,
-					error_message TEXT,
-					metadata_json TEXT NOT NULL DEFAULT '{}'
-				)
-			"
-		);
-		executeUpdate(
-			"
-				CREATE TABLE IF NOT EXISTS observations (
-					id TEXT PRIMARY KEY,
-					trace_id TEXT NOT NULL,
-					parent_observation_id TEXT,
-					type TEXT NOT NULL,
-					name TEXT NOT NULL DEFAULT '',
-					start_time TEXT NOT NULL,
-					end_time TEXT,
-					duration_ms INTEGER NOT NULL DEFAULT 0,
-					status TEXT NOT NULL DEFAULT 'running',
-					model TEXT,
-					provider TEXT,
-					input_text TEXT,
-					output_text TEXT,
-					usage_json TEXT NOT NULL DEFAULT '{}',
-					level TEXT NOT NULL DEFAULT 'DEFAULT',
-					source_event TEXT NOT NULL DEFAULT '',
-					payload_json TEXT NOT NULL DEFAULT '{}',
-					FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
-				)
-			"
-		);
-		executeUpdate(
-			"CREATE INDEX IF NOT EXISTS idx_observations_trace ON observations(trace_id, start_time)"
-		);
-		executeUpdate(
-			"
-				CREATE TABLE IF NOT EXISTS scores (
-					id TEXT PRIMARY KEY,
-					trace_id TEXT NOT NULL,
-					observation_id TEXT,
-					name TEXT NOT NULL,
-					data_type TEXT NOT NULL,
-					value TEXT NOT NULL,
-					comment TEXT NOT NULL DEFAULT '',
-					created_at TEXT NOT NULL,
-					updated_at TEXT NOT NULL,
-					FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
-				)
-			"
-		);
-		executeUpdate( "CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_trace_name ON scores(trace_id, name)" );
-		executeUpdate( "CREATE INDEX IF NOT EXISTS idx_scores_trace ON scores(trace_id)" );
-		executeUpdate(
-			"CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at DESC)"
-		);
-		executeUpdate(
-			"
-				INSERT OR IGNORE INTO schema_meta(key, value)
-				VALUES ('version', '3')
-			"
-		);
+		var definition = schemaDefinition();
+		for ( var tableDefinition in definition.tables ) {
+			executeUpdate( tableDefinition.sql );
+		}
 		migrateSchema();
+		repairOrphanedRows();
+		for ( var indexDefinition in definition.indexes ) {
+			executeUpdate( indexDefinition.sql );
+		}
+		validateSchema( definition );
+	}
+
+	/**
+	 * The complete AI Flight schema. Keep table and index definitions together
+	 * so the module's local database has one authoritative source.
+	 */
+	private struct function schemaDefinition() {
+		return {
+			tables: [
+				{
+					name: "schema_meta",
+					sql : "
+						CREATE TABLE IF NOT EXISTS schema_meta (
+							key TEXT PRIMARY KEY,
+							value TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "traces",
+					sql : "
+						CREATE TABLE IF NOT EXISTS traces (
+							id TEXT PRIMARY KEY,
+							name TEXT NOT NULL DEFAULT '',
+							session_id TEXT,
+							user_id TEXT,
+							environment TEXT NOT NULL DEFAULT '',
+							started_at TEXT NOT NULL,
+							ended_at TEXT,
+							status TEXT NOT NULL DEFAULT 'running',
+							provider TEXT,
+							model TEXT,
+							input_preview TEXT,
+							output_preview TEXT,
+							total_tokens INTEGER NOT NULL DEFAULT 0,
+							prompt_tokens INTEGER NOT NULL DEFAULT 0,
+							completion_tokens INTEGER NOT NULL DEFAULT 0,
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							error_message TEXT,
+							metadata_json TEXT NOT NULL DEFAULT '{}'
+						)
+					"
+				},
+				{
+					name: "observations",
+					sql : "
+						CREATE TABLE IF NOT EXISTS observations (
+							id TEXT PRIMARY KEY,
+							trace_id TEXT NOT NULL,
+							parent_observation_id TEXT,
+							type TEXT NOT NULL,
+							name TEXT NOT NULL DEFAULT '',
+							start_time TEXT NOT NULL,
+							end_time TEXT,
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							status TEXT NOT NULL DEFAULT 'running',
+							model TEXT,
+							provider TEXT,
+							input_text TEXT,
+							output_text TEXT,
+							usage_json TEXT NOT NULL DEFAULT '{}',
+							level TEXT NOT NULL DEFAULT 'DEFAULT',
+							source_event TEXT NOT NULL DEFAULT '',
+							payload_json TEXT NOT NULL DEFAULT '{}',
+							FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "scores",
+					sql : "
+						CREATE TABLE IF NOT EXISTS scores (
+							id TEXT PRIMARY KEY,
+							trace_id TEXT NOT NULL,
+							observation_id TEXT,
+							name TEXT NOT NULL,
+							data_type TEXT NOT NULL,
+							value TEXT NOT NULL,
+							comment TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							updated_at TEXT NOT NULL,
+							FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
+						)
+					"
+				}
+			],
+			indexes: [
+				{ name: "idx_observations_trace", sql: "CREATE INDEX IF NOT EXISTS idx_observations_trace ON observations(trace_id, start_time)" },
+				{ name: "idx_scores_trace_name", sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_trace_name ON scores(trace_id, name)" },
+				{ name: "idx_scores_trace", sql: "CREATE INDEX IF NOT EXISTS idx_scores_trace ON scores(trace_id)" },
+				{ name: "idx_traces_started", sql: "CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at DESC)" }
+			]
+		};
 	}
 
 	struct function createTrace( required struct data ) {
@@ -1370,6 +1386,105 @@ class {
 		);
 	}
 
+	/**
+	 * Older runs could prune traces while SQLite foreign keys were disabled,
+	 * leaving observations or scores whose trace no longer exists. Remove only
+	 * those unreachable child rows before validating the store.
+	 */
+	private void function repairOrphanedRows() {
+		var orphanedObservations = executeQuery(
+			"
+				SELECT COUNT(*) AS count
+				FROM observations
+				WHERE NOT EXISTS (
+					SELECT 1 FROM traces WHERE traces.id = observations.trace_id
+				)
+			"
+		);
+		var observationCount = int( val( orphanedObservations.count[ 1 ] ?: 0 ) );
+		if ( observationCount ) {
+			executeUpdate(
+				"
+					DELETE FROM observations
+					WHERE NOT EXISTS (
+						SELECT 1 FROM traces WHERE traces.id = observations.trace_id
+					)
+				"
+			);
+		}
+
+		var orphanedScores = executeQuery(
+			"
+				SELECT COUNT(*) AS count
+				FROM scores
+				WHERE NOT EXISTS (
+					SELECT 1 FROM traces WHERE traces.id = scores.trace_id
+				)
+			"
+		);
+		var scoreCount = int( val( orphanedScores.count[ 1 ] ?: 0 ) );
+		if ( scoreCount ) {
+			executeUpdate(
+				"
+					DELETE FROM scores
+					WHERE NOT EXISTS (
+						SELECT 1 FROM traces WHERE traces.id = scores.trace_id
+					)
+				"
+			);
+		}
+
+		if ( observationCount || scoreCount ) {
+			log.warn(
+				"AiFlight removed #observationCount + scoreCount# orphaned rows (#observationCount# observations, #scoreCount# scores)"
+			);
+		}
+	}
+
+	private void function validateSchema( required struct definition ) {
+		var objects = executeQuery(
+			"
+				SELECT type, name
+				FROM sqlite_master
+				WHERE type IN ('table', 'index')
+					AND name NOT LIKE 'sqlite_%'
+			"
+		);
+		var found = {};
+		for ( var object in objects ) {
+			found[ lCase( toString( object.type ) ) & ":" & lCase( toString( object.name ) ) ] = true;
+		}
+
+		var issues = [];
+		for ( var tableDefinition in arguments.definition.tables ) {
+			if ( !structKeyExists( found, "table:" & lCase( tableDefinition.name ) ) ) {
+				issues.append( "missing table " & tableDefinition.name );
+			}
+		}
+		for ( var indexDefinition in arguments.definition.indexes ) {
+			if ( !structKeyExists( found, "index:" & lCase( indexDefinition.name ) ) ) {
+				issues.append( "missing index " & indexDefinition.name );
+			}
+		}
+
+		var integrity = executeQuery( "PRAGMA integrity_check" );
+		if ( !integrity.recordCount || compareNoCase( toString( integrity.integrity_check[ 1 ] ), "ok" ) != 0 ) {
+			issues.append( "PRAGMA integrity_check failed" );
+		}
+
+		var foreignKeys = executeQuery( "SELECT * FROM pragma_foreign_key_check" );
+		if ( foreignKeys.recordCount ) {
+			issues.append( "PRAGMA foreign_key_check found violations" );
+		}
+
+		if ( issues.len() ) {
+			throw(
+				type   = "AiFlight.SchemaUnavailable",
+				message = "The AI Flight SQLite schema is incomplete or invalid: " & arrayToList( issues, "; " )
+			);
+		}
+	}
+
 	private any function feedbackFromTraceId( required string traceId ) {
 		var q = executeQuery(
 			"
@@ -1511,15 +1626,17 @@ class {
 	}
 
 	private struct function queryOptions() {
+		var databasePath = variables.dbPath.replace(
+			"\",
+			"/",
+			"all"
+		);
+		// SQLite foreign_keys is connection-local. Put both settings in the
+		// JDBC URL so every inline pooled connection receives them.
 		return {
 			datasource: {
-				driver  : "sqlite",
-				database: variables.dbPath.replace(
-						"\",
-						"/",
-						"all"
-					),
-				custom: { foreign_keys: "true", busy_timeout: "5000" }
+				driver: "sqlite",
+				url   : "jdbc:sqlite:#databasePath#?foreign_keys=on&busy_timeout=5000"
 			}
 		};
 	}

@@ -1,7 +1,10 @@
 /**
- * Ensures SQLite is present and schema is ready before the app serves traffic.
- * Creates the DB file/folder and tables only when missing; otherwise applies
- * lightweight column upgrades.
+ * Owns the complete local SQLite schema.
+ *
+ * The schema definition, compatibility columns, indexes, trigger, validation,
+ * and rebuild helpers intentionally live in this service.  Keeping schema
+ * creation on raw SQLite statements avoids the query-builder grammar path,
+ * which does not support every SQLite operation used by this application.
  */
 
 @singleton
@@ -11,54 +14,57 @@ class {
 	property name="log" inject="logbox:logger:{this}";
 
 	/**
-	 * Public status for diagnostics / setup messaging.
+	 * Public status for diagnostics and setup messaging.
 	 */
 	struct function getDatabaseStatus() {
 		var dbPath = resolveDbPath();
 		return {
 			dbPath     : dbPath,
 			dbExists   : fileExists( dbPath ),
-			schemaReady: hasCoreSchema()
+			schemaReady: hasCompleteSchema()
 		};
 	}
 
+	/**
+	 * Create or repair the application schema without deleting application data.
+	 */
 	void function ensureSchema() {
-		var dbPath = resolveDbPath();
+		var dbPath    = resolveDbPath();
+		var definition = schemaDefinition();
+
 		ensureDatabaseFile( dbPath );
+		configureSqlite();
+		dropLegacyMigrationTables( definition );
+		applySchema( definition );
+		repairOrphanedRows( definition );
+		validateSchema( definition );
 
-		queryExecute(
-			"PRAGMA foreign_keys = ON",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"PRAGMA journal_mode = WAL",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"PRAGMA busy_timeout = 5000",
-			{},
-			{ datasource: datasource }
-		);
-
-		if ( hasCoreSchema() ) {
-			log.info( "DoubleCheck database schema present — checking upgrades" );
-			ensurePendingUpgrades();
-			log.info( "DoubleCheck SQLite schema is ready" );
-			return;
-		}
-
-		log.info( "DoubleCheck database schema missing — creating tables" );
-		createCoreSchema();
-		ensurePendingUpgrades();
 		log.info( "DoubleCheck SQLite schema is ready" );
+	}
+
+	/**
+	 * Deliberately discard all application data and rebuild the database schema.
+	 * This is not called during normal startup.
+	 */
+	void function rebuildSchema() {
+		var dbPath     = resolveDbPath();
+		var definition = schemaDefinition();
+
+		ensureDatabaseFile( dbPath );
+		configureSqlite();
+		dropSchema( definition );
+		dropLegacyMigrationTables( definition );
+		applySchema( definition );
+		repairOrphanedRows( definition );
+		validateSchema( definition );
+
+		log.warn( "DoubleCheck SQLite schema was rebuilt; local review data was removed" );
 	}
 
 	private string function resolveDbPath() {
 		var configured = getSystemSetting( "DOUBLECHECK_DB_PATH", "./.db/doublecheck.db" );
 		try {
-			return createObject( "java", "java.io.File" ).init( configured ).getCanonicalPath();
+			return new java:java.io.File( configured ).getCanonicalPath();
 		} catch (any e) {
 			return configured;
 		}
@@ -67,11 +73,7 @@ class {
 	private void function ensureDatabaseFile( required string dbPath ) {
 		var dbDirectory = getDirectoryFromPath( arguments.dbPath );
 		if ( !directoryExists( dbDirectory ) ) {
-			directoryCreate(
-				dbDirectory,
-				true,
-				true
-			);
+			directoryCreate( dbDirectory, true, true );
 			log.info( "Created database directory: #dbDirectory#" );
 		}
 		if ( !fileExists( arguments.dbPath ) ) {
@@ -80,702 +82,46 @@ class {
 		}
 	}
 
-	/**
-	 * Core tables that must exist for the app to run.
-	 */
-	private boolean function hasCoreSchema() {
-		try {
-			var tables = queryExecute(
-				"
-					SELECT name
-					FROM sqlite_master
-					WHERE type = 'table'
-					  AND name IN ( 'review_runs', 'review_events', 'review_findings' )
-				",
-				{},
-				{ datasource: datasource }
+	private void function configureSqlite() {
+		queryExecute( "PRAGMA foreign_keys = ON", {}, { datasource: datasource } );
+		queryExecute( "PRAGMA journal_mode = WAL", {}, { datasource: datasource } );
+		queryExecute( "PRAGMA synchronous = NORMAL", {}, { datasource: datasource } );
+		queryExecute( "PRAGMA busy_timeout = 5000", {}, { datasource: datasource } );
+	}
+
+	private void function applySchema( required struct definition ) {
+		for ( var tableDefinition in arguments.definition.tables ) {
+			queryExecute( tableDefinition.sql, {}, { datasource: datasource } );
+		}
+
+		// These are the additive fields used by databases created before the
+		// current baseline.  CREATE TABLE IF NOT EXISTS cannot add them.
+		for ( var columnDefinition in arguments.definition.columns ) {
+			ensureColumn(
+				columnDefinition.tableName,
+				columnDefinition.columnName,
+				columnDefinition.definition
 			);
-			return tables.recordCount >= 3;
-		} catch (any e) {
-			return false;
 		}
-	}
 
-	private void function createCoreSchema() {
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_runs (
-					id TEXT PRIMARY KEY,
-					project_path TEXT NOT NULL,
-					mode TEXT NOT NULL,
-					run_kind TEXT NOT NULL DEFAULT 'review',
-					input_json TEXT NOT NULL DEFAULT '{}',
-					base_revision TEXT,
-					head_revision TEXT,
-					status TEXT NOT NULL,
-					progress INTEGER NOT NULL DEFAULT 0,
-					current_phase TEXT NOT NULL DEFAULT '',
-					message TEXT NOT NULL DEFAULT '',
-					created_at TEXT NOT NULL,
-					started_at TEXT,
-					completed_at TEXT,
-					cancel_requested_at TEXT,
-					lease_expires_at TEXT,
-					attempt_count INTEGER NOT NULL DEFAULT 0,
-					error_reference TEXT,
-					policy_json TEXT NOT NULL DEFAULT '{}',
-					budgets_json TEXT NOT NULL DEFAULT '{}',
-					tenant_id TEXT NOT NULL DEFAULT 'default',
-					project_id TEXT NOT NULL DEFAULT 'default',
-					worker_id TEXT NOT NULL DEFAULT '',
-					lease_token TEXT NOT NULL DEFAULT '',
-					updated_at TEXT NOT NULL
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_events (
-					sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-					run_id TEXT NOT NULL,
-					event_type TEXT NOT NULL,
-					payload TEXT NOT NULL,
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_artifacts (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
-					run_id TEXT NOT NULL,
-					file_path TEXT NOT NULL,
-					language TEXT NOT NULL,
-					content_hash TEXT NOT NULL,
-					size_bytes INTEGER NOT NULL,
-					line_count INTEGER NOT NULL,
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE,
-					UNIQUE ( run_id, file_path )
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_findings (
-					id TEXT PRIMARY KEY,
-					run_id TEXT NOT NULL,
-					fingerprint TEXT NOT NULL,
-					category TEXT NOT NULL,
-					rule_id TEXT NOT NULL,
-					severity TEXT NOT NULL,
-					confidence REAL NOT NULL,
-					title TEXT NOT NULL,
-					message TEXT NOT NULL,
-					file_path TEXT NOT NULL,
-					start_line INTEGER NOT NULL,
-					end_line INTEGER NOT NULL,
-					evidence TEXT NOT NULL,
-					suggestion TEXT NOT NULL,
-					source TEXT NOT NULL,
-					solution_json TEXT,
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE,
-					UNIQUE ( run_id, fingerprint )
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_summaries (
-					run_id TEXT PRIMARY KEY,
-					summary TEXT NOT NULL,
-					languages TEXT NOT NULL,
-					files_scanned INTEGER NOT NULL,
-					bytes_scanned INTEGER NOT NULL,
-					findings_count INTEGER NOT NULL,
-					ai_enabled INTEGER NOT NULL,
-					ai_files_reviewed INTEGER NOT NULL DEFAULT 0,
-					ai_characters_sent INTEGER NOT NULL DEFAULT 0,
-					review_scope TEXT NOT NULL DEFAULT '',
-					repository_revision TEXT NOT NULL DEFAULT '',
-					base_revision TEXT NOT NULL DEFAULT '',
-					head_revision TEXT NOT NULL DEFAULT '',
-					discovery_truncated INTEGER NOT NULL DEFAULT 0,
-					skipped_json TEXT NOT NULL DEFAULT '{}',
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS finding_reviews (
-					tenant_id TEXT NOT NULL,
-					project_id TEXT NOT NULL,
-					project_path TEXT NOT NULL,
-					fingerprint TEXT NOT NULL,
-					review_state TEXT NOT NULL DEFAULT 'new',
-					note TEXT NOT NULL DEFAULT '',
-					version INTEGER NOT NULL DEFAULT 0,
-					updated_by TEXT NOT NULL DEFAULT '',
-					updated_at TEXT NOT NULL,
-					PRIMARY KEY ( tenant_id, project_id, project_path, fingerprint )
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS finding_review_events (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
-					tenant_id TEXT NOT NULL,
-					project_id TEXT NOT NULL,
-					project_path TEXT NOT NULL,
-					fingerprint TEXT NOT NULL,
-					run_id TEXT NOT NULL DEFAULT '',
-					previous_state TEXT NOT NULL DEFAULT '',
-					review_state TEXT NOT NULL,
-					note TEXT NOT NULL DEFAULT '',
-					version INTEGER NOT NULL,
-					changed_by TEXT NOT NULL DEFAULT '',
-					created_at TEXT NOT NULL
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS analysis_artifact_cache (
-					content_hash TEXT NOT NULL,
-					parser_version TEXT NOT NULL,
-					language TEXT NOT NULL,
-					symbols TEXT NOT NULL,
-					dependencies TEXT NOT NULL,
-					created_at TEXT NOT NULL,
-					PRIMARY KEY ( content_hash, parser_version )
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_symbols (
-					id TEXT NOT NULL,
-					run_id TEXT NOT NULL,
-					file_path TEXT NOT NULL,
-					content_hash TEXT NOT NULL,
-					parser_version TEXT NOT NULL,
-					kind TEXT NOT NULL,
-					name TEXT NOT NULL,
-					line INTEGER NOT NULL,
-					evidence TEXT NOT NULL,
-					PRIMARY KEY ( run_id, id ),
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_dependencies (
-					id TEXT NOT NULL,
-					run_id TEXT NOT NULL,
-					source_file TEXT NOT NULL,
-					content_hash TEXT NOT NULL,
-					parser_version TEXT NOT NULL,
-					kind TEXT NOT NULL,
-					target TEXT NOT NULL,
-					target_file TEXT NOT NULL DEFAULT '',
-					line INTEGER NOT NULL,
-					evidence TEXT NOT NULL,
-					PRIMARY KEY ( run_id, id ),
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_graph_summaries (
-					run_id TEXT PRIMARY KEY,
-					parser_version TEXT NOT NULL,
-					files_analyzed INTEGER NOT NULL,
-					parser_executions INTEGER NOT NULL,
-					cache_hits INTEGER NOT NULL,
-					symbol_count INTEGER NOT NULL,
-					dependency_count INTEGER NOT NULL,
-					impact_count INTEGER NOT NULL DEFAULT 0,
-					baseline_run_id TEXT NOT NULL DEFAULT '',
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_impacts (
-					id TEXT NOT NULL,
-					run_id TEXT NOT NULL,
-					changed_file TEXT NOT NULL,
-					changed_symbol TEXT NOT NULL,
-					impacted_file TEXT NOT NULL,
-					reason TEXT NOT NULL,
-					depth INTEGER NOT NULL,
-					via_file TEXT NOT NULL DEFAULT '',
-					PRIMARY KEY ( run_id, id ),
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_architecture_models (
-					run_id TEXT PRIMARY KEY,
-					model_version TEXT NOT NULL,
-					repository_revision TEXT NOT NULL DEFAULT '',
-					fingerprint TEXT NOT NULL,
-					model_json TEXT NOT NULL,
-					cache_key TEXT NOT NULL DEFAULT '',
-					reused INTEGER NOT NULL DEFAULT 0,
-					baseline_fingerprint TEXT NOT NULL DEFAULT '',
-					diff_json TEXT NOT NULL DEFAULT '{}',
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_plans (
-					run_id TEXT PRIMARY KEY,
-					plan_version TEXT NOT NULL,
-					model_fingerprint TEXT NOT NULL,
-					policy_fingerprint TEXT NOT NULL DEFAULT '',
-					budget_fingerprint TEXT NOT NULL DEFAULT '',
-					fingerprint TEXT NOT NULL,
-					task_count INTEGER NOT NULL,
-					plan_json TEXT NOT NULL,
-					created_at TEXT NOT NULL,
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS architecture_model_cache (
-					cache_key TEXT PRIMARY KEY,
-					project_path TEXT NOT NULL,
-					repository_revision TEXT NOT NULL,
-					model_version TEXT NOT NULL,
-					input_fingerprint TEXT NOT NULL,
-					model_json TEXT NOT NULL,
-					created_at TEXT NOT NULL
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_specialist_results (
-					run_id TEXT NOT NULL,
-					task_id TEXT NOT NULL,
-					role TEXT NOT NULL,
-					result_version TEXT NOT NULL,
-					status TEXT NOT NULL,
-					summary TEXT NOT NULL DEFAULT '',
-					finding_refs_json TEXT NOT NULL DEFAULT '[]',
-					provenance_json TEXT NOT NULL DEFAULT '{}',
-					error TEXT NOT NULL DEFAULT '',
-					duration_ms INTEGER NOT NULL DEFAULT 0,
-					created_at TEXT NOT NULL,
-					PRIMARY KEY ( run_id, task_id ),
-					FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TABLE IF NOT EXISTS review_tool_audits (
-					run_id TEXT NOT NULL,
-					task_id TEXT NOT NULL,
-					sequence INTEGER NOT NULL,
-					tool_name TEXT NOT NULL,
-					input_fingerprint TEXT NOT NULL,
-					status TEXT NOT NULL,
-					output_characters INTEGER NOT NULL DEFAULT 0,
-					duration_ms INTEGER NOT NULL DEFAULT 0,
-					created_at TEXT NOT NULL,
-					PRIMARY KEY ( run_id, task_id, sequence ),
-					FOREIGN KEY ( run_id, task_id )
-						REFERENCES review_specialist_results( run_id, task_id )
-						ON DELETE CASCADE
-				)
-			",
-			{},
-			{ datasource: datasource }
-		);
-	}
-
-	private void function ensurePendingUpgrades() {
-		ensureColumn(
-			"review_runs",
-			"lease_expires_at",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_runs",
-			"base_revision",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_runs",
-			"head_revision",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_runs",
-			"attempt_count",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_runs",
-			"error_reference",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_runs",
-			"policy_json",
-			"TEXT NOT NULL DEFAULT '{}'"
-		);
-		ensureColumn(
-			"review_runs",
-			"budgets_json",
-			"TEXT NOT NULL DEFAULT '{}'"
-		);
-		ensureColumn(
-			"review_runs",
-			"source_run_id",
-			"TEXT"
-		);
-		ensureModernizationSchema();
-		ensureColumn(
-			"review_summaries",
-			"ai_files_reviewed",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_characters_sent",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_summaries",
-			"review_scope",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_summaries",
-			"repository_revision",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_summaries",
-			"base_revision",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_summaries",
-			"head_revision",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_summaries",
-			"discovery_truncated",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_summaries",
-			"skipped_json",
-			"TEXT NOT NULL DEFAULT '{}'"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_providers_json",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_models_json",
-			"TEXT"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_prompt_tokens",
-			"INTEGER"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_completion_tokens",
-			"INTEGER"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_total_tokens",
-			"INTEGER"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_retries",
-			"INTEGER"
-		);
-		ensureColumn(
-			"review_summaries",
-			"ai_observation_count",
-			"INTEGER"
-		);
-		ensureColumn(
-			"review_dependencies",
-			"target_file",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_graph_summaries",
-			"impact_count",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_graph_summaries",
-			"baseline_run_id",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_architecture_models",
-			"cache_key",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_architecture_models",
-			"reused",
-			"INTEGER NOT NULL DEFAULT 0"
-		);
-		ensureColumn(
-			"review_architecture_models",
-			"baseline_fingerprint",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_architecture_models",
-			"diff_json",
-			"TEXT NOT NULL DEFAULT '{}'"
-		);
-		ensureColumn(
-			"review_plans",
-			"policy_fingerprint",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_plans",
-			"budget_fingerprint",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_findings",
-			"solution_json",
-			"TEXT"
-		);
-		ensureLocalSupportSchema();
-		ensureAiSettingsSchema();
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_events_run_sequence ON review_events ( run_id, sequence )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_runs_created_at ON review_runs ( created_at DESC )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_runs_source ON review_runs ( tenant_id, source_run_id )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_artifacts_run ON review_artifacts ( run_id, file_path )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_findings_run_severity ON review_findings ( run_id, severity )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_finding_reviews_project_state ON finding_reviews ( tenant_id, project_id, project_path, review_state )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_finding_review_events_identity ON finding_review_events ( tenant_id, project_id, project_path, fingerprint, version )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_symbols_run_file ON review_symbols ( run_id, file_path, line )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_dependencies_run_source ON review_dependencies ( run_id, source_file, line )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_dependencies_run_target ON review_dependencies ( run_id, target_file, source_file )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_impacts_run_changed ON review_impacts ( run_id, changed_file, depth )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_review_architecture_revision ON review_architecture_models ( repository_revision, model_version )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_architecture_cache_revision ON architecture_model_cache ( project_path, repository_revision, model_version )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"CREATE INDEX IF NOT EXISTS idx_specialist_results_run_status ON review_specialist_results ( run_id, status )",
-			{},
-			{ datasource: datasource }
-		);
-		queryExecute(
-			"
-				CREATE TRIGGER IF NOT EXISTS trg_review_runs_contract_immutable
-				BEFORE UPDATE OF policy_json, budgets_json, run_kind, input_json ON review_runs
-				BEGIN
-					SELECT RAISE(
-						ABORT,
-						'review run contract is immutable'
-					);
-				END
-			",
-			{},
-			{ datasource: datasource }
-		);
-	}
-
-	private void function ensureModernizationSchema() {
-		ensureColumn( "review_runs", "run_kind", "TEXT NOT NULL DEFAULT 'review'" );
-		ensureColumn( "review_runs", "input_json", "TEXT NOT NULL DEFAULT '{}'" );
-		var statements = [
-			"CREATE TABLE IF NOT EXISTS modernization_schema_packs ( run_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, format TEXT NOT NULL, relative_path TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', pack_version TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}', sanitized_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
-			"CREATE TABLE IF NOT EXISTS modernization_checkpoints ( run_id TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', progress INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL, PRIMARY KEY ( run_id, stage ), FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
-			"CREATE TABLE IF NOT EXISTS modernization_plans ( run_id TEXT PRIMARY KEY, plan_version TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'generated', fingerprint TEXT NOT NULL DEFAULT '', plan_json TEXT NOT NULL, validation_json TEXT NOT NULL DEFAULT '{}', coverage_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
-			"CREATE TABLE IF NOT EXISTS modernization_decisions ( run_id TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL, decision TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', item_fingerprint TEXT NOT NULL DEFAULT '', decided_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY ( run_id, item_type, item_id ), FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
-			"CREATE TABLE IF NOT EXISTS modernization_decision_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, item_type TEXT NOT NULL, item_id TEXT NOT NULL, action TEXT NOT NULL, decision_json TEXT NOT NULL DEFAULT '{}', actor TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE )",
-			"CREATE INDEX IF NOT EXISTS idx_review_runs_kind_history ON review_runs ( run_kind, created_at DESC )",
-			"CREATE INDEX IF NOT EXISTS idx_modernization_checkpoints_run ON modernization_checkpoints ( run_id, updated_at )",
-			"CREATE INDEX IF NOT EXISTS idx_modernization_decisions_lookup ON modernization_decisions ( run_id, item_type, updated_at )",
-			"CREATE INDEX IF NOT EXISTS idx_modernization_decision_events_lookup ON modernization_decision_events ( run_id, item_type, item_id, id )"
-		];
-		for ( var statement in statements ) {
-			queryExecute( statement, {}, { datasource: datasource } );
-		}
-		queryExecute( "DROP TRIGGER IF EXISTS trg_review_runs_contract_immutable", {}, { datasource: datasource } );
-		queryExecute(
-			"
-				CREATE TRIGGER IF NOT EXISTS trg_review_runs_contract_immutable
-				BEFORE UPDATE OF policy_json, budgets_json, run_kind, input_json ON review_runs
-				BEGIN
-					SELECT RAISE( ABORT, 'review run contract is immutable' );
-				END
-			",
-			{},
-			{ datasource: datasource }
-		);
-	}
-
-	private void function ensureAiSettingsSchema() {
-		var statements = [
-			"CREATE TABLE IF NOT EXISTS ai_provider_profiles ( id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL DEFAULT 'default', name TEXT NOT NULL, provider TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, timeout_seconds INTEGER NOT NULL DEFAULT 120, context_window INTEGER NOT NULL DEFAULT 8192, input_usd_per_million REAL NOT NULL DEFAULT 0, output_usd_per_million REAL NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL )",
-			"CREATE INDEX IF NOT EXISTS idx_ai_provider_profiles_active ON ai_provider_profiles ( tenant_id, is_active )",
-			"CREATE TABLE IF NOT EXISTS app_settings ( tenant_id TEXT NOT NULL DEFAULT 'default', setting_key TEXT NOT NULL, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY ( tenant_id, setting_key ) )"
-		];
-		for ( var statement in statements ) {
-			queryExecute( statement, {}, { datasource: datasource } );
-		}
-	}
-
-	private void function ensureLocalSupportSchema() {
-		// Lightweight helpers used by the local app (not multi-tenant SaaS).
-		var statements = [
-			"CREATE TABLE IF NOT EXISTS review_workers ( id TEXT PRIMARY KEY, status TEXT NOT NULL, capabilities_json TEXT NOT NULL DEFAULT '{}', last_seen_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, started_at TEXT NOT NULL )",
-			"CREATE TABLE IF NOT EXISTS evaluation_gate_runs ( id TEXT PRIMARY KEY, corpus_version TEXT NOT NULL, language TEXT NOT NULL, capability_tier TEXT NOT NULL, passed INTEGER NOT NULL, metrics_json TEXT NOT NULL, failures_json TEXT NOT NULL, created_at TEXT NOT NULL )",
-			"CREATE TABLE IF NOT EXISTS language_capabilities ( language TEXT PRIMARY KEY, capability_tier TEXT NOT NULL, corpus_version TEXT NOT NULL, gate_run_id TEXT NOT NULL, promoted_at TEXT NOT NULL, FOREIGN KEY ( gate_run_id ) REFERENCES evaluation_gate_runs( id ) )",
-			"CREATE INDEX IF NOT EXISTS idx_runs_tenant_project_created ON review_runs ( tenant_id, project_id, created_at DESC )",
-			"CREATE INDEX IF NOT EXISTS idx_runs_queue_lease ON review_runs ( status, lease_expires_at, created_at )"
-		];
-		ensureColumn(
-			"review_runs",
-			"tenant_id",
-			"TEXT NOT NULL DEFAULT 'default'"
-		);
-		ensureColumn(
-			"review_runs",
-			"project_id",
-			"TEXT NOT NULL DEFAULT 'default'"
-		);
-		ensureColumn(
-			"review_runs",
-			"worker_id",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		ensureColumn(
-			"review_runs",
-			"lease_token",
-			"TEXT NOT NULL DEFAULT ''"
-		);
-		for ( var statement in statements ) {
+		// Recreate fixed indexes so a partially repaired database receives the
+		// same index definitions as a clean database.
+		for ( var indexDefinition in arguments.definition.indexes ) {
 			queryExecute(
-				statement,
+				"DROP INDEX IF EXISTS #indexDefinition.name#",
 				{},
 				{ datasource: datasource }
 			);
+			queryExecute( indexDefinition.sql, {}, { datasource: datasource } );
+		}
+
+		for ( var triggerDefinition in arguments.definition.triggers ) {
+			queryExecute(
+				"DROP TRIGGER IF EXISTS #triggerDefinition.name#",
+				{},
+				{ datasource: datasource }
+			);
+			queryExecute( triggerDefinition.sql, {}, { datasource: datasource } );
 		}
 	}
 
@@ -785,19 +131,768 @@ class {
 		required string definition
 	) {
 		var columns = queryExecute(
-			"PRAGMA table_info( #arguments.tableName# )",
+			"PRAGMA table_info(#arguments.tableName#)",
 			{},
 			{ datasource: datasource }
 		);
-		for ( var row = 1; row <= columns.recordCount; row++ ) {
-			if ( lCase( columns.name[ row ] ) == lCase( arguments.columnName ) ) {
-				return;
+		var found = false;
+
+		for ( var column in columns ) {
+			if ( compareNoCase( toString( column.name ), arguments.columnName ) == 0 ) {
+				found = true;
+				break;
 			}
 		}
-		queryExecute(
-			"ALTER TABLE #arguments.tableName# ADD COLUMN #arguments.columnName# #arguments.definition#",
-			{},
-			{ datasource: datasource }
-		);
+
+		if ( !found ) {
+			queryExecute(
+				"ALTER TABLE #arguments.tableName# ADD COLUMN #arguments.columnName# #arguments.definition#",
+				{},
+				{ datasource: datasource }
+			);
+			log.info( "Added SQLite compatibility column #arguments.tableName#.#arguments.columnName#" );
+		}
+	}
+
+	private void function dropSchema( required struct definition ) {
+		for ( var triggerDefinition in arguments.definition.triggers ) {
+			queryExecute(
+				"DROP TRIGGER IF EXISTS #triggerDefinition.name#",
+				{},
+				{ datasource: datasource }
+			);
+		}
+
+		for ( var indexDefinition in arguments.definition.indexes ) {
+			queryExecute(
+				"DROP INDEX IF EXISTS #indexDefinition.name#",
+				{},
+				{ datasource: datasource }
+			);
+		}
+
+		// Tables are dropped in reverse dependency order.  The definitions are
+		// ordered parent-first, so this keeps foreign-key enforcement enabled.
+		for ( var index = arguments.definition.tables.len(); index >= 1; index-- ) {
+			queryExecute(
+				"DROP TABLE IF EXISTS #arguments.definition.tables[ index ].name#",
+				{},
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	private void function dropLegacyMigrationTables( required struct definition ) {
+		for ( var tableName in arguments.definition.legacyMigrationTables ) {
+			queryExecute(
+				"DROP TABLE IF EXISTS #tableName#",
+				{},
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	/**
+	 * Older local databases could delete a review run while foreign-key
+	 * enforcement was disabled, leaving child rows behind.  Those rows cannot
+	 * be displayed or repaired through the application, so remove only rows
+	 * whose parent is missing before running the final foreign-key check.
+	 */
+	private numeric function repairOrphanedRows( required struct definition ) {
+		var removed = 0;
+
+		for ( var repair in arguments.definition.orphanRepairs ) {
+			queryExecute( repair.sql, {}, { datasource: datasource } );
+			try {
+				var changes = queryExecute(
+					"SELECT changes() AS changed",
+					{},
+					{ datasource: datasource }
+				);
+				removed += val( changes.changed[ 1 ] ?: 0 );
+			} catch (any ignored) {
+				// The DELETE already completed; a row count is only diagnostic.
+			}
+		}
+
+		if ( removed ) {
+			log.warn( "Removed #removed# orphaned SQLite child rows" );
+		}
+		return removed;
+	}
+
+	private boolean function hasCompleteSchema() {
+		try {
+			return schemaIssues( schemaDefinition() ).len() == 0;
+		} catch (any e) {
+			return false;
+		}
+	}
+
+	private void function validateSchema( required struct definition ) {
+		var issues = schemaIssues( arguments.definition );
+		if ( issues.len() ) {
+			throw(
+				type   = "DoubleCheck.SchemaUnavailable",
+				message = "The SQLite schema is incomplete or invalid: " & arrayToList( issues, "; " )
+			);
+		}
+	}
+
+	private array function schemaIssues( required struct definition ) {
+		var issues = [];
+		var objects = {};
+
+		try {
+			var objectQuery = queryExecute(
+				"
+					SELECT type, name
+					FROM sqlite_master
+					WHERE type IN ( 'table', 'index', 'trigger' )
+						AND name NOT LIKE 'sqlite_%'
+				",
+				{},
+				{ datasource: datasource }
+			);
+
+			for ( var object in objectQuery ) {
+				objects[ lCase( toString( object.type ) ) & ":" & lCase( toString( object.name ) ) ] = true;
+			}
+		} catch (any e) {
+			issues.append( "unable to inspect sqlite_master" );
+			return issues;
+		}
+
+		for ( var tableDefinition in arguments.definition.tables ) {
+			if ( !structKeyExists( objects, "table:" & lCase( tableDefinition.name ) ) ) {
+				issues.append( "missing table " & tableDefinition.name );
+			}
+		}
+		for ( var indexDefinition in arguments.definition.indexes ) {
+			if ( !structKeyExists( objects, "index:" & lCase( indexDefinition.name ) ) ) {
+				issues.append( "missing index " & indexDefinition.name );
+			}
+		}
+		for ( var triggerDefinition in arguments.definition.triggers ) {
+			if ( !structKeyExists( objects, "trigger:" & lCase( triggerDefinition.name ) ) ) {
+				issues.append( "missing trigger " & triggerDefinition.name );
+			}
+		}
+
+		try {
+			var integrity = queryExecute( "PRAGMA integrity_check", {}, { datasource: datasource } );
+			if ( !integrity.recordCount || compareNoCase( toString( integrity.integrity_check[ 1 ] ), "ok" ) != 0 ) {
+				issues.append( "PRAGMA integrity_check failed" );
+			}
+		} catch (any e) {
+			issues.append( "unable to run PRAGMA integrity_check" );
+		}
+
+		try {
+			var foreignKeys = queryExecute( "PRAGMA foreign_key_check", {}, { datasource: datasource } );
+			if ( foreignKeys.recordCount ) {
+				issues.append( "PRAGMA foreign_key_check found violations" );
+			}
+		} catch (any e) {
+			issues.append( "unable to run PRAGMA foreign_key_check" );
+		}
+
+		return issues;
+	}
+
+	/**
+	 * The complete application schema.  Keep all table, compatibility-column,
+	 * index, trigger, and legacy-ledger names in this one definition.
+	 */
+	private struct function schemaDefinition() {
+		return {
+			legacyMigrationTables: [ "cfmigrations", "cbmigrations" ],
+			orphanRepairs        : [
+				{
+					sql: "DELETE FROM review_tool_audits WHERE NOT EXISTS ( SELECT 1 FROM review_specialist_results WHERE review_specialist_results.run_id = review_tool_audits.run_id AND review_specialist_results.task_id = review_tool_audits.task_id )"
+				},
+				{ sql: "DELETE FROM review_events WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_events.run_id )" },
+				{ sql: "DELETE FROM review_artifacts WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_artifacts.run_id )" },
+				{ sql: "DELETE FROM review_findings WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_findings.run_id )" },
+				{ sql: "DELETE FROM review_summaries WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_summaries.run_id )" },
+				{ sql: "DELETE FROM review_symbols WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_symbols.run_id )" },
+				{ sql: "DELETE FROM review_dependencies WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_dependencies.run_id )" },
+				{ sql: "DELETE FROM review_graph_summaries WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_graph_summaries.run_id )" },
+				{ sql: "DELETE FROM review_impacts WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_runs.id = review_impacts.run_id )" },
+				{ sql: "DELETE FROM review_architecture_models WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_architecture_models.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM review_plans WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_plans.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM review_specialist_results WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE review_specialist_results.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM modernization_schema_packs WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_schema_packs.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM modernization_checkpoints WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_checkpoints.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM modernization_plans WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_plans.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM modernization_decisions WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_decisions.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM modernization_decision_events WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_decision_events.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM language_capabilities WHERE NOT EXISTS ( SELECT 1 FROM evaluation_gate_runs WHERE evaluation_gate_runs.id = language_capabilities.gate_run_id )" }
+			],
+			tables               : [
+				{
+					name: "review_runs",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_runs (
+							id TEXT PRIMARY KEY,
+							project_path TEXT NOT NULL,
+							mode TEXT NOT NULL,
+							run_kind TEXT NOT NULL DEFAULT 'review',
+							input_json TEXT NOT NULL DEFAULT '{}',
+							base_revision TEXT,
+							head_revision TEXT,
+							status TEXT NOT NULL,
+							progress INTEGER NOT NULL DEFAULT 0,
+							current_phase TEXT NOT NULL DEFAULT '',
+							message TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							started_at TEXT,
+							completed_at TEXT,
+							cancel_requested_at TEXT,
+							lease_expires_at TEXT,
+							attempt_count INTEGER NOT NULL DEFAULT 0,
+							error_reference TEXT,
+							policy_json TEXT NOT NULL DEFAULT '{}',
+							budgets_json TEXT NOT NULL DEFAULT '{}',
+							tenant_id TEXT NOT NULL DEFAULT 'default',
+							project_id TEXT NOT NULL DEFAULT 'default',
+							worker_id TEXT NOT NULL DEFAULT '',
+							lease_token TEXT NOT NULL DEFAULT '',
+							source_run_id TEXT,
+							updated_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "review_events",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_events (
+							sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+							run_id TEXT NOT NULL,
+							event_type TEXT NOT NULL,
+							payload TEXT NOT NULL,
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_artifacts",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_artifacts (
+							id INTEGER PRIMARY KEY AUTOINCREMENT,
+							run_id TEXT NOT NULL,
+							file_path TEXT NOT NULL,
+							language TEXT NOT NULL,
+							content_hash TEXT NOT NULL,
+							size_bytes INTEGER NOT NULL,
+							line_count INTEGER NOT NULL,
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE,
+							UNIQUE ( run_id, file_path )
+						)
+					"
+				},
+				{
+					name: "review_findings",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_findings (
+							id TEXT PRIMARY KEY,
+							run_id TEXT NOT NULL,
+							fingerprint TEXT NOT NULL,
+							category TEXT NOT NULL,
+							rule_id TEXT NOT NULL,
+							severity TEXT NOT NULL,
+							confidence REAL NOT NULL,
+							title TEXT NOT NULL,
+							message TEXT NOT NULL,
+							file_path TEXT NOT NULL,
+							start_line INTEGER NOT NULL,
+							end_line INTEGER NOT NULL,
+							evidence TEXT NOT NULL,
+							suggestion TEXT NOT NULL,
+							source TEXT NOT NULL,
+							solution_json TEXT,
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE,
+							UNIQUE ( run_id, fingerprint )
+						)
+					"
+				},
+				{
+					name: "review_summaries",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_summaries (
+							run_id TEXT PRIMARY KEY,
+							summary TEXT NOT NULL,
+							languages TEXT NOT NULL,
+							files_scanned INTEGER NOT NULL,
+							bytes_scanned INTEGER NOT NULL,
+							findings_count INTEGER NOT NULL,
+							ai_enabled INTEGER NOT NULL,
+							ai_files_reviewed INTEGER NOT NULL DEFAULT 0,
+							ai_characters_sent INTEGER NOT NULL DEFAULT 0,
+							review_scope TEXT NOT NULL DEFAULT '',
+							repository_revision TEXT NOT NULL DEFAULT '',
+							base_revision TEXT NOT NULL DEFAULT '',
+							head_revision TEXT NOT NULL DEFAULT '',
+							discovery_truncated INTEGER NOT NULL DEFAULT 0,
+							skipped_json TEXT NOT NULL DEFAULT '{}',
+							ai_providers_json TEXT,
+							ai_models_json TEXT,
+							ai_prompt_tokens INTEGER,
+							ai_completion_tokens INTEGER,
+							ai_total_tokens INTEGER,
+							ai_retries INTEGER,
+							ai_observation_count INTEGER,
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "analysis_artifact_cache",
+					sql : "
+						CREATE TABLE IF NOT EXISTS analysis_artifact_cache (
+							content_hash TEXT NOT NULL,
+							parser_version TEXT NOT NULL,
+							language TEXT NOT NULL,
+							symbols TEXT NOT NULL,
+							dependencies TEXT NOT NULL,
+							created_at TEXT NOT NULL,
+							PRIMARY KEY ( content_hash, parser_version )
+						)
+					"
+				},
+				{
+					name: "review_symbols",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_symbols (
+							id TEXT NOT NULL,
+							run_id TEXT NOT NULL,
+							file_path TEXT NOT NULL,
+							content_hash TEXT NOT NULL,
+							parser_version TEXT NOT NULL,
+							kind TEXT NOT NULL,
+							name TEXT NOT NULL,
+							line INTEGER NOT NULL,
+							evidence TEXT NOT NULL,
+							PRIMARY KEY ( run_id, id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_dependencies",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_dependencies (
+							id TEXT NOT NULL,
+							run_id TEXT NOT NULL,
+							source_file TEXT NOT NULL,
+							content_hash TEXT NOT NULL,
+							parser_version TEXT NOT NULL,
+							kind TEXT NOT NULL,
+							target TEXT NOT NULL,
+							target_file TEXT NOT NULL DEFAULT '',
+							line INTEGER NOT NULL,
+							evidence TEXT NOT NULL,
+							PRIMARY KEY ( run_id, id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_graph_summaries",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_graph_summaries (
+							run_id TEXT PRIMARY KEY,
+							parser_version TEXT NOT NULL,
+							files_analyzed INTEGER NOT NULL,
+							parser_executions INTEGER NOT NULL,
+							cache_hits INTEGER NOT NULL,
+							symbol_count INTEGER NOT NULL,
+							dependency_count INTEGER NOT NULL,
+							impact_count INTEGER NOT NULL DEFAULT 0,
+							baseline_run_id TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_impacts",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_impacts (
+							id TEXT NOT NULL,
+							run_id TEXT NOT NULL,
+							changed_file TEXT NOT NULL,
+							changed_symbol TEXT NOT NULL,
+							impacted_file TEXT NOT NULL,
+							reason TEXT NOT NULL,
+							depth INTEGER NOT NULL,
+							via_file TEXT NOT NULL DEFAULT '',
+							PRIMARY KEY ( run_id, id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "architecture_model_cache",
+					sql : "
+						CREATE TABLE IF NOT EXISTS architecture_model_cache (
+							cache_key TEXT PRIMARY KEY,
+							project_path TEXT NOT NULL,
+							repository_revision TEXT NOT NULL,
+							model_version TEXT NOT NULL,
+							input_fingerprint TEXT NOT NULL,
+							model_json TEXT NOT NULL,
+							created_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "review_architecture_models",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_architecture_models (
+							run_id TEXT PRIMARY KEY,
+							model_version TEXT NOT NULL,
+							repository_revision TEXT NOT NULL DEFAULT '',
+							fingerprint TEXT NOT NULL,
+							model_json TEXT NOT NULL,
+							cache_key TEXT NOT NULL DEFAULT '',
+							reused INTEGER NOT NULL DEFAULT 0,
+							baseline_fingerprint TEXT NOT NULL DEFAULT '',
+							diff_json TEXT NOT NULL DEFAULT '{}',
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_plans",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_plans (
+							run_id TEXT PRIMARY KEY,
+							plan_version TEXT NOT NULL,
+							model_fingerprint TEXT NOT NULL,
+							fingerprint TEXT NOT NULL,
+							task_count INTEGER NOT NULL,
+							plan_json TEXT NOT NULL,
+							policy_fingerprint TEXT NOT NULL DEFAULT '',
+							budget_fingerprint TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_specialist_results",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_specialist_results (
+							run_id TEXT NOT NULL,
+							task_id TEXT NOT NULL,
+							role TEXT NOT NULL,
+							result_version TEXT NOT NULL,
+							status TEXT NOT NULL,
+							summary TEXT NOT NULL DEFAULT '',
+							finding_refs_json TEXT NOT NULL DEFAULT '[]',
+							provenance_json TEXT NOT NULL DEFAULT '{}',
+							error TEXT NOT NULL DEFAULT '',
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							created_at TEXT NOT NULL,
+							PRIMARY KEY ( run_id, task_id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_tool_audits",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_tool_audits (
+							run_id TEXT NOT NULL,
+							task_id TEXT NOT NULL,
+							sequence INTEGER NOT NULL,
+							tool_name TEXT NOT NULL,
+							input_fingerprint TEXT NOT NULL,
+							status TEXT NOT NULL,
+							output_characters INTEGER NOT NULL DEFAULT 0,
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							created_at TEXT NOT NULL,
+							PRIMARY KEY ( run_id, task_id, sequence ),
+							FOREIGN KEY ( run_id, task_id )
+								REFERENCES review_specialist_results( run_id, task_id )
+								ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "review_workers",
+					sql : "
+						CREATE TABLE IF NOT EXISTS review_workers (
+							id TEXT PRIMARY KEY,
+							status TEXT NOT NULL,
+							capabilities_json TEXT NOT NULL DEFAULT '{}',
+							last_seen_at TEXT NOT NULL,
+							lease_expires_at TEXT NOT NULL,
+							started_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "evaluation_gate_runs",
+					sql : "
+						CREATE TABLE IF NOT EXISTS evaluation_gate_runs (
+							id TEXT PRIMARY KEY,
+							corpus_version TEXT NOT NULL,
+							language TEXT NOT NULL,
+							capability_tier TEXT NOT NULL,
+							passed INTEGER NOT NULL,
+							metrics_json TEXT NOT NULL,
+							failures_json TEXT NOT NULL,
+							created_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "language_capabilities",
+					sql : "
+						CREATE TABLE IF NOT EXISTS language_capabilities (
+							language TEXT PRIMARY KEY,
+							capability_tier TEXT NOT NULL,
+							corpus_version TEXT NOT NULL,
+							gate_run_id TEXT NOT NULL,
+							promoted_at TEXT NOT NULL,
+							FOREIGN KEY ( gate_run_id ) REFERENCES evaluation_gate_runs( id )
+						)
+					"
+				},
+				{
+					name: "finding_reviews",
+					sql : "
+						CREATE TABLE IF NOT EXISTS finding_reviews (
+							tenant_id TEXT NOT NULL,
+							project_id TEXT NOT NULL,
+							project_path TEXT NOT NULL,
+							fingerprint TEXT NOT NULL,
+							review_state TEXT NOT NULL DEFAULT 'new',
+							note TEXT NOT NULL DEFAULT '',
+							version INTEGER NOT NULL DEFAULT 0,
+							updated_by TEXT NOT NULL DEFAULT '',
+							updated_at TEXT NOT NULL,
+							PRIMARY KEY ( tenant_id, project_id, project_path, fingerprint )
+						)
+					"
+				},
+				{
+					name: "finding_review_events",
+					sql : "
+						CREATE TABLE IF NOT EXISTS finding_review_events (
+							id INTEGER PRIMARY KEY AUTOINCREMENT,
+							tenant_id TEXT NOT NULL,
+							project_id TEXT NOT NULL,
+							project_path TEXT NOT NULL,
+							fingerprint TEXT NOT NULL,
+							run_id TEXT NOT NULL DEFAULT '',
+							previous_state TEXT NOT NULL DEFAULT '',
+							review_state TEXT NOT NULL,
+							note TEXT NOT NULL DEFAULT '',
+							version INTEGER NOT NULL,
+							changed_by TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "modernization_schema_packs",
+					sql : "
+						CREATE TABLE IF NOT EXISTS modernization_schema_packs (
+							run_id TEXT PRIMARY KEY,
+							source_kind TEXT NOT NULL,
+							format TEXT NOT NULL,
+							relative_path TEXT NOT NULL DEFAULT '',
+							content_hash TEXT NOT NULL DEFAULT '',
+							pack_version TEXT NOT NULL DEFAULT '',
+							metadata_json TEXT NOT NULL DEFAULT '{}',
+							sanitized_json TEXT NOT NULL DEFAULT '{}',
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "modernization_checkpoints",
+					sql : "
+						CREATE TABLE IF NOT EXISTS modernization_checkpoints (
+							run_id TEXT NOT NULL,
+							stage TEXT NOT NULL,
+							status TEXT NOT NULL DEFAULT 'pending',
+							progress INTEGER NOT NULL DEFAULT 0,
+							payload_json TEXT NOT NULL DEFAULT '{}',
+							updated_at TEXT NOT NULL,
+							PRIMARY KEY ( run_id, stage ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "modernization_plans",
+					sql : "
+						CREATE TABLE IF NOT EXISTS modernization_plans (
+							run_id TEXT PRIMARY KEY,
+							plan_version TEXT NOT NULL,
+							state TEXT NOT NULL DEFAULT 'generated',
+							fingerprint TEXT NOT NULL DEFAULT '',
+							plan_json TEXT NOT NULL,
+							validation_json TEXT NOT NULL DEFAULT '{}',
+							coverage_json TEXT NOT NULL DEFAULT '{}',
+							created_at TEXT NOT NULL,
+							updated_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "modernization_decisions",
+					sql : "
+						CREATE TABLE IF NOT EXISTS modernization_decisions (
+							run_id TEXT NOT NULL,
+							item_type TEXT NOT NULL,
+							item_id TEXT NOT NULL,
+							decision TEXT NOT NULL,
+							note TEXT NOT NULL DEFAULT '',
+							item_fingerprint TEXT NOT NULL DEFAULT '',
+							decided_by TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							updated_at TEXT NOT NULL,
+							PRIMARY KEY ( run_id, item_type, item_id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "modernization_decision_events",
+					sql : "
+						CREATE TABLE IF NOT EXISTS modernization_decision_events (
+							id INTEGER PRIMARY KEY AUTOINCREMENT,
+							run_id TEXT NOT NULL,
+							item_type TEXT NOT NULL,
+							item_id TEXT NOT NULL,
+							action TEXT NOT NULL,
+							decision_json TEXT NOT NULL DEFAULT '{}',
+							actor TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "ai_provider_profiles",
+					sql : "
+						CREATE TABLE IF NOT EXISTS ai_provider_profiles (
+							id TEXT PRIMARY KEY,
+							tenant_id TEXT NOT NULL DEFAULT 'default',
+							name TEXT NOT NULL,
+							provider TEXT NOT NULL,
+							base_url TEXT NOT NULL,
+							api_key TEXT NOT NULL DEFAULT '',
+							model TEXT NOT NULL,
+							timeout_seconds INTEGER NOT NULL DEFAULT 120,
+							context_window INTEGER NOT NULL DEFAULT 8192,
+							input_usd_per_million REAL NOT NULL DEFAULT 0,
+							output_usd_per_million REAL NOT NULL DEFAULT 0,
+							is_active INTEGER NOT NULL DEFAULT 0,
+							created_at TEXT NOT NULL,
+							updated_at TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "app_settings",
+					sql : "
+						CREATE TABLE IF NOT EXISTS app_settings (
+							tenant_id TEXT NOT NULL DEFAULT 'default',
+							setting_key TEXT NOT NULL,
+							setting_value TEXT NOT NULL,
+							updated_at TEXT NOT NULL,
+							PRIMARY KEY ( tenant_id, setting_key )
+						)
+					"
+				}
+			],
+			columns: [
+				{ tableName: "review_runs", columnName: "run_kind", definition: "TEXT NOT NULL DEFAULT 'review'" },
+				{ tableName: "review_runs", columnName: "input_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+				{ tableName: "review_runs", columnName: "tenant_id", definition: "TEXT NOT NULL DEFAULT 'default'" },
+				{ tableName: "review_runs", columnName: "project_id", definition: "TEXT NOT NULL DEFAULT 'default'" },
+				{ tableName: "review_runs", columnName: "worker_id", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_runs", columnName: "lease_token", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_runs", columnName: "source_run_id", definition: "TEXT" },
+				{ tableName: "review_findings", columnName: "solution_json", definition: "TEXT" },
+				{ tableName: "review_summaries", columnName: "ai_files_reviewed", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_summaries", columnName: "ai_characters_sent", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_summaries", columnName: "review_scope", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_summaries", columnName: "repository_revision", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_summaries", columnName: "base_revision", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_summaries", columnName: "head_revision", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_summaries", columnName: "discovery_truncated", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_summaries", columnName: "skipped_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+				{ tableName: "review_summaries", columnName: "ai_providers_json", definition: "TEXT" },
+				{ tableName: "review_summaries", columnName: "ai_models_json", definition: "TEXT" },
+				{ tableName: "review_summaries", columnName: "ai_prompt_tokens", definition: "INTEGER" },
+				{ tableName: "review_summaries", columnName: "ai_completion_tokens", definition: "INTEGER" },
+				{ tableName: "review_summaries", columnName: "ai_total_tokens", definition: "INTEGER" },
+				{ tableName: "review_summaries", columnName: "ai_retries", definition: "INTEGER" },
+				{ tableName: "review_summaries", columnName: "ai_observation_count", definition: "INTEGER" },
+				{ tableName: "review_dependencies", columnName: "target_file", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_graph_summaries", columnName: "impact_count", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_graph_summaries", columnName: "baseline_run_id", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_architecture_models", columnName: "repository_revision", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_architecture_models", columnName: "cache_key", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_architecture_models", columnName: "reused", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_architecture_models", columnName: "baseline_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_architecture_models", columnName: "diff_json", definition: "TEXT NOT NULL DEFAULT '{}'" },
+				{ tableName: "review_plans", columnName: "policy_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_plans", columnName: "budget_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" }
+			],
+			indexes: [
+				{ name: "idx_review_events_run_sequence", sql: "CREATE INDEX idx_review_events_run_sequence ON review_events ( run_id, sequence )" },
+				{ name: "idx_review_events_run_type_sequence", sql: "CREATE INDEX idx_review_events_run_type_sequence ON review_events ( run_id, event_type, sequence )" },
+				{ name: "idx_review_runs_created_at", sql: "CREATE INDEX idx_review_runs_created_at ON review_runs ( created_at DESC )" },
+				{ name: "idx_runs_tenant_project_created", sql: "CREATE INDEX idx_runs_tenant_project_created ON review_runs ( tenant_id, project_id, created_at DESC )" },
+				{ name: "idx_runs_queue_lease", sql: "CREATE INDEX idx_runs_queue_lease ON review_runs ( status, lease_expires_at, created_at )" },
+				{ name: "idx_review_runs_history_scope", sql: "CREATE INDEX idx_review_runs_history_scope ON review_runs ( tenant_id, project_id, project_path, mode, status, created_at DESC )" },
+				{ name: "idx_review_runs_source", sql: "CREATE INDEX idx_review_runs_source ON review_runs ( tenant_id, source_run_id )" },
+				{ name: "idx_review_artifacts_run", sql: "CREATE INDEX idx_review_artifacts_run ON review_artifacts ( run_id, file_path )" },
+				{ name: "idx_review_findings_run_severity", sql: "CREATE INDEX idx_review_findings_run_severity ON review_findings ( run_id, severity )" },
+				{ name: "idx_review_findings_fingerprint_run", sql: "CREATE INDEX idx_review_findings_fingerprint_run ON review_findings ( fingerprint, run_id )" },
+				{ name: "idx_review_symbols_run_file", sql: "CREATE INDEX idx_review_symbols_run_file ON review_symbols ( run_id, file_path, line )" },
+				{ name: "idx_review_dependencies_run_source", sql: "CREATE INDEX idx_review_dependencies_run_source ON review_dependencies ( run_id, source_file, line )" },
+				{ name: "idx_review_dependencies_run_target", sql: "CREATE INDEX idx_review_dependencies_run_target ON review_dependencies ( run_id, target_file, source_file )" },
+				{ name: "idx_review_impacts_run_changed", sql: "CREATE INDEX idx_review_impacts_run_changed ON review_impacts ( run_id, changed_file, depth )" },
+				{ name: "idx_review_architecture_revision", sql: "CREATE INDEX idx_review_architecture_revision ON review_architecture_models ( repository_revision, model_version )" },
+				{ name: "idx_architecture_cache_revision", sql: "CREATE INDEX idx_architecture_cache_revision ON architecture_model_cache ( project_path, repository_revision, model_version )" },
+				{ name: "idx_specialist_results_run_status", sql: "CREATE INDEX idx_specialist_results_run_status ON review_specialist_results ( run_id, status )" },
+				{ name: "idx_review_specialists_run_status_role", sql: "CREATE INDEX idx_review_specialists_run_status_role ON review_specialist_results ( run_id, status, role )" },
+				{ name: "idx_review_runs_kind_history", sql: "CREATE INDEX idx_review_runs_kind_history ON review_runs ( run_kind, created_at DESC )" },
+				{ name: "idx_modernization_checkpoints_run", sql: "CREATE INDEX idx_modernization_checkpoints_run ON modernization_checkpoints ( run_id, updated_at )" },
+				{ name: "idx_modernization_decisions_lookup", sql: "CREATE INDEX idx_modernization_decisions_lookup ON modernization_decisions ( run_id, item_type, updated_at )" },
+				{ name: "idx_modernization_decision_events_lookup", sql: "CREATE INDEX idx_modernization_decision_events_lookup ON modernization_decision_events ( run_id, item_type, item_id, id )" },
+				{ name: "idx_ai_provider_profiles_active", sql: "CREATE INDEX idx_ai_provider_profiles_active ON ai_provider_profiles ( tenant_id, is_active )" },
+				{ name: "idx_finding_reviews_project_state", sql: "CREATE INDEX idx_finding_reviews_project_state ON finding_reviews ( tenant_id, project_id, project_path, review_state )" },
+				{ name: "idx_finding_review_events_identity", sql: "CREATE INDEX idx_finding_review_events_identity ON finding_review_events ( tenant_id, project_id, project_path, fingerprint, version )" }
+			],
+			triggers: [
+				{
+					name: "trg_review_runs_contract_immutable",
+					sql : "
+						CREATE TRIGGER trg_review_runs_contract_immutable
+						BEFORE UPDATE OF policy_json, budgets_json, run_kind, input_json ON review_runs
+						BEGIN
+							SELECT RAISE( ABORT, 'review run contract is immutable' );
+						END
+					"
+				}
+			]
+		};
 	}
 }

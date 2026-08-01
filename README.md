@@ -223,6 +223,30 @@ Copy [`.env.example`](.env.example). Important keys:
 
 Local-only: no auth, tenants, or hosted production mode.
 
+### Rebuild the local database
+
+The application schema has one source file:
+`app/models/services/SchemaService.bx`. It is applied and validated
+automatically when the app starts. To discard local review history and rebuild
+the schema, stop the server first, make a backup if needed, then remove these
+three exact SQLite files from `.db`:
+
+```text
+doublecheck.db
+doublecheck.db-wal
+doublecheck.db-shm
+```
+
+Starting the app recreates the complete set of tables, indexes, and triggers.
+`SchemaService.rebuildSchema()` is also available for an intentional reset
+from application code; it is never called during normal startup.
+For older local databases, startup also removes child rows whose parent review
+run no longer exists, then verifies SQLite integrity and foreign keys.
+
+The `-wal` and `-shm` files are SQLite's write-ahead-log sidecars, not extra
+schemas. They can exist while the app is running because DoubleCheck
+uses SQLite WAL mode for its local worker queue.
+
 ### Scan and LLM budgets
 
 | Variable | Default | Role |

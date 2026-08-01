@@ -138,8 +138,8 @@ REM Ensure we're in the project root directory
 cd /d "%~dp0"
 
 REM Check if JAR exists
-if not exist .engine\boxlang-miniserver-1.14.0.jar (
-    echo ERROR: boxlang-miniserver-1.14.0.jar not found at .engine\boxlang-miniserver-1.14.0.jar
+if not exist .engine\boxlang-miniserver.jar (
+    echo ERROR: boxlang-miniserver.jar not found at .engine\boxlang-miniserver.jar
     exit /b 1
 )
 
@@ -157,14 +157,14 @@ echo.
 if %CONSOLE_MODE%==1 (
     echo [INFO] Starting miniserver with console output...
     echo.
-    %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar miniserver.json
+    %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver.jar miniserver.json
     echo.
     echo ================================================================================
     echo DoubleCheck has stopped
     echo ================================================================================
 ) else (
     REM Run miniserver in background
-    start "DoubleCheck Server" /B %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver-1.14.0.jar miniserver.json
+    start "DoubleCheck Server" /B %JAVA_EXE% -Xmx1024m -jar .engine\boxlang-miniserver.jar miniserver.json
 
     REM Wait for server to start
     timeout /t 3 /nobreak >nul
