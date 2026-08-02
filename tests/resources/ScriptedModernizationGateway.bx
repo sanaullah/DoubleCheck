@@ -9,8 +9,10 @@ class {
 	property name="roleIndexes" type="struct";
 	property name="requests" type="array";
 	property name="optionsLog" type="array";
+	property name="preflightFailureRole" type="string" default="";
+	property name="preflightRequests" type="array";
 
-	function init( struct responses = {}, boolean enabled = true ) {
+	function init( struct responses = {}, boolean enabled = true, string preflightFailureRole = "" ) {
 		variables.responses = duplicate( arguments.responses );
 		variables.enabled = arguments.enabled;
 		variables.callCounter = new AtomicInteger( 0 );
@@ -19,10 +21,25 @@ class {
 		variables.roleIndexes = {};
 		variables.requests = [];
 		variables.optionsLog = [];
+		variables.preflightFailureRole = arguments.preflightFailureRole;
+		variables.preflightRequests = [];
 		return this;
 	}
 
 	boolean function isEnabled() { return variables.enabled; }
+
+	struct function preflight( required struct request, struct options = {} ) {
+		variables.preflightRequests.append( arguments.request );
+		if ( len( variables.preflightFailureRole ) ) {
+			throw(
+				type = "PromptPackageFitException",
+				message = "scripted prompt cannot fit",
+				data = { cap: 60000, role: variables.preflightFailureRole },
+				detail = jsonSerialize( { cap: 60000, role: variables.preflightFailureRole } )
+			);
+		}
+		return { ok: true, request: arguments.request, diagnostics: {} };
+	}
 
 	struct function run( required string runId, required struct agentRequest, struct options = {} ) {
 		variables.calls = variables.callCounter.incrementAndGet();
@@ -55,4 +72,9 @@ class {
 	numeric function callCount() { return variables.callCounter.get(); }
 	array function requestLog() { return variables.requests; }
 	array function optionsHistory() { return variables.optionsLog; }
+	array function preflightLog() { return variables.preflightRequests; }
+	any function failPreflightFor( required string role ) {
+		variables.preflightFailureRole = arguments.role;
+		return this;
+	}
 }

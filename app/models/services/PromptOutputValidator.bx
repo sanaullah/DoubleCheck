@@ -34,20 +34,129 @@ class {
 		};
 	}
 
+	struct function validateStructure(
+		required any response,
+		required string schemaId
+	) {
+		var value = normalizeResponse( arguments.response );
+		var schema = promptRegistry.schema( arguments.schemaId );
+		var errors = [];
+		validateValue( value, schema, "$", errors );
+		return validationResult( value, errors, [] );
+	}
+
+	/**
+	 * Validate the complete structural contract, then quarantine top-level items
+	 * with unauthorized evidence while preserving their valid siblings.
+	 */
+	struct function sanitize(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		var structural = validateStructure( arguments.response, arguments.schemaId );
+		if ( !structural.valid || !isStruct( structural.value ) ) return structural;
+		var value = duplicate( structural.value );
+		var collections = itemCollections( value, arguments.schemaId );
+		var rejected = [];
+		for ( var collection in collections ) {
+			if ( !isArray( value[ collection ] ?: "" ) ) continue;
+			var accepted = [];
+			for ( var itemIndex = 1; itemIndex <= value[ collection ].len(); itemIndex++ ) {
+				var itemErrors = [];
+				var itemEnvelope = {};
+				itemEnvelope[ collection ] = [ value[ collection ][ itemIndex ] ];
+				validateEvidence( itemEnvelope, arguments.schemaId, arguments.context, itemErrors );
+				if ( itemErrors.len() ) {
+					rejected.append( {
+						collection: collection,
+						index: itemIndex,
+						errors: duplicate( itemErrors ),
+						reasonCodes: reasonCodesFor( itemErrors )
+					} );
+				} else {
+					accepted.append( value[ collection ][ itemIndex ] );
+				}
+			}
+			value[ collection ] = accepted;
+		}
+		var remainingErrors = [];
+		validateEvidence( value, arguments.schemaId, arguments.context, remainingErrors );
+		var result = validationResult( value, remainingErrors, rejected );
+		result.rejectedReasonCodes = reasonCodesForRejected( rejected );
+		return result;
+	}
+
+	struct function sanitizeValid(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		var result = sanitize( arguments.response, arguments.schemaId, arguments.context );
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
+		return result;
+	}
+
 	struct function assertValid(
 		required any response,
 		required string schemaId,
 		struct context = {}
 	) {
 		var result = validate( arguments.response, arguments.schemaId, arguments.context );
-		if ( !result.valid ) {
-			throw(
-				type    = "PromptOutputValidationException",
-				message = "Output failed #arguments.schemaId# validation: #result.errors.map( ( item ) => item.message ).toList( '; ' )#",
-				data    = result
-			);
-		}
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
 		return result;
+	}
+
+	struct function assertStructureValid( required any response, required string schemaId ) {
+		var result = validateStructure( arguments.response, arguments.schemaId );
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
+		return result;
+	}
+
+	private struct function validationResult( required any value, required array errors, array rejectedItems = [] ) {
+		return {
+			valid: arguments.errors.len() == 0,
+			value: arguments.value,
+			errors: arguments.errors,
+			reasonCodes: reasonCodesFor( arguments.errors ),
+			rejectedItems: arguments.rejectedItems
+		};
+	}
+
+	private array function reasonCodesFor( required array errors ) {
+		var output = [];
+		for ( var validationError in arguments.errors ) {
+			var code = validationError.code ?: "validation";
+			if ( !output.contains( code ) ) output.append( code );
+		}
+		return output;
+	}
+
+	private array function reasonCodesForRejected( required array rejectedItems ) {
+		var output = [];
+		for ( var item in arguments.rejectedItems ) {
+			for ( var code in item.reasonCodes ?: [] ) if ( !output.contains( code ) ) output.append( code );
+		}
+		return output;
+	}
+
+	private array function itemCollections( required struct value, required string schemaId ) {
+		if ( listFindNoCase( "specialist-findings-v1,bulk-review-v1", arguments.schemaId ) ) return [ "findings" ];
+		if ( arguments.schemaId == "architecture-enrichment-v1" ) return [ "statements" ];
+		if ( findNoCase( "modernization-", arguments.schemaId ) == 1 ) {
+			var output = [];
+			for ( var key in arguments.value ) if ( isArray( arguments.value[ key ] ) ) output.append( key );
+			return output;
+		}
+		return [];
+	}
+
+	private void function throwValidation( required struct result, required string schemaId ) {
+		throw(
+			type = "PromptOutputValidationException",
+			message = "Output failed #arguments.schemaId# validation: #arguments.result.errors.map( ( item ) => item.message ).toList( '; ' )#",
+			data = arguments.result
+		);
 	}
 
 	private any function normalizeResponse( required any response ) {

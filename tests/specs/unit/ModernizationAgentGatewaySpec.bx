@@ -17,6 +17,68 @@ class extends="testbox.system.BaseSpec" {
 				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
 			} );
 
+			it( "preflights and fits a live-size compiled package before provider execution", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				var compiler = new app.models.services.PromptCompiler();
+				var package = compiler.compile(
+					"modernization-application",
+					{
+						task: { runtime: "boxlang", profile: "modern", roleInstruction: "Map the authorized shard." },
+						evidence: { inventory: [ { filePath: "legacy/index.cfm", content: repeatString( "legacy source" & char( 10 ), 5000 ) } ] },
+						reference: [ { name: "coldbox", excerpt: repeatString( "skill reference" & char( 10 ), 1800 ) } ]
+					}
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+				var result = service.preflight( { messages: package.messages, promptPackage: package, provenance: package.provenance }, { role: "modernization-application" } );
+				expect( result.ok ).toBeTrue();
+				expect( result.promptProvenance.promptCharacters ).toBeLTE( 60000 );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "ignores unrelated runtime objects while preserving the compiled prompt", () => {
+				var schedulerPool = new java:java.util.concurrent.ScheduledThreadPoolExecutor( 1 );
+				try {
+					var service = new app.models.services.ModernizationAgentGateway();
+					service.secretRedactionService = new app.models.services.SecretRedactionService();
+					service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+					var result = asyncRun(
+						() => {
+							var compiler = new app.models.services.PromptCompiler();
+							var compiledPackage = compiler.compile(
+								"modernization-application",
+								{ task: { roleInstruction: "Map the authorized shard." }, evidence: {} }
+							);
+							if ( compiledPackage.messages.len() != 2 || !len( compiledPackage.systemPrompt ?: "" ) ) {
+								throw( type = "AsyncPromptTestException", message = "Compiler lost the prompt before gateway preflight" );
+							}
+							var promptRequest = { messages: compiledPackage.messages, promptPackage: compiledPackage, provenance: compiledPackage.provenance, runtimeHandle: schedulerPool };
+							if ( promptRequest.messages.len() != 2 ) throw( type = "AsyncPromptTestException", message = "Request lost messages before gateway preflight" );
+							return service.preflight( promptRequest, { role: "modernization-application" } );
+						}
+					).get();
+					expect( result.ok ).toBeTrue();
+					expect( result.request.messages[ 1 ].role ).toBe( "system" );
+					expect( result.request.messages[ 1 ].content ).notToBeEmpty();
+				} finally {
+					schedulerPool.shutdownNow();
+				}
+			} );
+
+			it( "fails one preflight without retrying an impossible immutable task", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				var compiler = new app.models.services.PromptCompiler();
+				var package = compiler.compile( "modernization-application", { task: { roleInstruction: repeatString( "immutable", 8000 ) }, evidence: {} } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+				expect( () => service.preflight( { messages: package.messages, promptPackage: package, provenance: package.provenance }, { role: "modernization-application" } ) ).toThrow( type = "PromptPackageFitException" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
 			it( "retries with a shrink instruction when provider JSON is truncated", () => {
 				var chat = new tests.resources.ScriptedModernizationChatGateway(
 					responses = [

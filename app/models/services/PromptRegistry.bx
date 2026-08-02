@@ -22,7 +22,7 @@ class {
 		return duplicate( variables.manifest );
 	}
 
-	struct function contract( required string id ) {
+	struct function contract( required string id, string version = "" ) {
 		ensureLoaded();
 		var contractId = trim( arguments.id );
 		if ( !variables.manifest.contracts.keyExists( contractId ) ) {
@@ -31,10 +31,30 @@ class {
 				message = "Unknown prompt contract: #contractId#"
 			);
 		}
-		var value = loadResource( "contract:#contractId#", variables.manifest.contracts[ contractId ] );
-		var active = activeVersion( contractId );
-		if ( len( active ) && active != ( value.version ?: "" ) ) throw( type = "PromptRegistryException", message = "Prompt contract #contractId# is not the active version" );
+		var requestedVersion = trim( arguments.version );
+		var selectedVersion = len( requestedVersion ) ? requestedVersion : activeVersion( contractId );
+		var relativePath = variables.manifest.contracts[ contractId ];
+		if (
+			len( selectedVersion ) &&
+			isStruct( variables.manifest.contractVersions ?: "" ) &&
+			isStruct( variables.manifest.contractVersions[ contractId ] ?: "" ) &&
+			structKeyExists( variables.manifest.contractVersions[ contractId ], selectedVersion )
+		) {
+			relativePath = variables.manifest.contractVersions[ contractId ][ selectedVersion ];
+		}
+		var value = loadResource( "contract:#contractId#:#selectedVersion#", relativePath );
+		if ( len( selectedVersion ) && selectedVersion != ( value.version ?: "" ) ) throw( type = "PromptRegistryException", message = "Prompt contract #contractId# version #selectedVersion# is unavailable" );
+		if ( !len( requestedVersion ) ) {
+			var active = activeVersion( contractId );
+			if ( len( active ) && active != ( value.version ?: "" ) ) throw( type = "PromptRegistryException", message = "Prompt contract #contractId# is not the active version" );
+		}
 		return value;
+	}
+
+	struct function previousContract( required string id ) {
+		var previous = previousVersion( arguments.id );
+		if ( !len( previous ) ) throw( type = "PromptRegistryException", message = "Prompt contract #arguments.id# has no previous version" );
+		return contract( arguments.id, previous );
 	}
 
 	struct function lifecycle() {
@@ -161,6 +181,12 @@ class {
 		}
 		for ( var contractId in variables.manifest.contracts ) {
 			if ( structKeyExists( lifecycle.active, contractId ) && !len( trim( toString( lifecycle.active[ contractId ] ) ) ) ) throw( type = "PromptRegistryException", message = "Prompt registry has an empty active version for #contractId#" );
+			if ( structKeyExists( lifecycle.previous, contractId ) ) {
+				var previousVersionId = trim( toString( lifecycle.previous[ contractId ] ) );
+				if ( !len( previousVersionId ) ) throw( type = "PromptRegistryException", message = "Prompt registry has an empty previous version for #contractId#" );
+				if ( previousVersionId == trim( toString( lifecycle.active[ contractId ] ?: "" ) ) ) throw( type = "PromptRegistryException", message = "Prompt registry previous version must differ from active for #contractId#" );
+				if ( !isStruct( variables.manifest.contractVersions ?: "" ) || !isStruct( variables.manifest.contractVersions[ contractId ] ?: "" ) || !structKeyExists( variables.manifest.contractVersions[ contractId ], previousVersionId ) ) throw( type = "PromptRegistryException", message = "Prompt registry previous version resource is missing for #contractId#" );
+			}
 		}
 		variables.loaded = true;
 	}

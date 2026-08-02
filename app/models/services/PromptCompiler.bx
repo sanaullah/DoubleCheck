@@ -5,6 +5,7 @@
 @singleton
 class {
 	property name="promptRegistry" inject="PromptRegistry";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
 
 	variables.policyOrder = [ "evidence-v1", "read-only-tools-v1", "privacy-v1" ];
 	variables.allowedTools = [ "read_file", "read_indexed_range", "search_indexed_code" ];
@@ -22,15 +23,19 @@ class {
 		struct options = {}
 	) {
 		ensureRegistry();
-		var contract = promptRegistry.contract( arguments.contractId );
+		var requestedVersion = trim( arguments.options.contractVersion ?: "" );
+		var contract = promptRegistry.contract( arguments.contractId, requestedVersion );
 		var schema = promptRegistry.schema( contract.outputSchema );
 		var inputSchema = promptRegistry.schema( contract.inputSchema );
 		validateContract( contract, schema, inputSchema );
+		validateInputData( arguments.data, contract.inputSchema );
 		var systemPrompt = buildSystemPrompt( contract, schema );
 		var userPrompt = buildUserPrompt( arguments.data, schema );
 		var taskData = isStruct( arguments.data.task ?: "" ) ? arguments.data.task : {};
 		var evidenceData = arguments.data.evidence ?: {};
-		var package = {
+		var hasReference = structKeyExists( arguments.data, "reference" ) && !isNull( arguments.data.reference );
+		var referenceData = hasReference ? arguments.data.reference : [];
+		var compiledPackage = {
 			promptId     : contract.id,
 			promptVersion: contract.version,
 			policyVersion: policyVersion( contract ),
@@ -46,6 +51,13 @@ class {
 			limits       : duplicate( contract.limits ?: {} ),
 			budgets      : duplicate( arguments.options.budgets ?: {} ),
 			providerMode : contract.mode ?: "chat",
+			segments     : {
+				task        : duplicate( taskData ),
+				evidence    : duplicate( evidenceData ),
+				reference   : duplicate( referenceData ),
+				hasReference: hasReference,
+				repair      : ""
+			},
 			truncation   : { applied: false, omitted: [], boundaries: [] },
 			provenance   : {
 				promptId     : contract.id,
@@ -56,38 +68,145 @@ class {
 				schemaHash   : stableHash( jsonSerialize( schema ) ),
 				taskHash     : stableHash( jsonSerialize( taskData ) ),
 				evidenceHash : stableHash( jsonSerialize( evidenceData ) ),
+				referenceHash: stableHash( jsonSerialize( referenceData ) ),
+				inputSchemaHash: stableHash( jsonSerialize( inputSchema ) ),
 				contractHash : stableHash( jsonSerialize( contract ) ),
 				provider     : trim( arguments.options.provider ?: "" ),
 				model        : trim( arguments.options.model ?: "" )
 			}
 		};
-		package.hashes = {
-			system  : package.provenance.promptHash,
-			task    : package.provenance.taskHash,
-			evidence: package.provenance.evidenceHash,
-			schema  : package.provenance.schemaHash
+		compiledPackage.hashes = {
+			system  : compiledPackage.provenance.promptHash,
+			task    : compiledPackage.provenance.taskHash,
+			evidence: compiledPackage.provenance.evidenceHash,
+			schema  : compiledPackage.provenance.schemaHash,
+			reference: compiledPackage.provenance.referenceHash
 		};
-		package.lint = lintPackage( package );
-		if ( !package.lint.valid ) throw( type = "PromptLintException", message = package.lint.errors.toList( "; " ) );
-		return package;
+		compiledPackage.provenance.segmentCharacters = segmentCharacters( compiledPackage );
+		compiledPackage.lint = lintPackage( compiledPackage );
+		if ( !compiledPackage.lint.valid ) throw( type = "PromptLintException", message = compiledPackage.lint.errors.toList( "; " ) );
+		return compiledPackage;
 	}
 
 	struct function compileRepair(
-		required struct package,
+		required struct promptPackage,
 		required string reason,
 		string userText = ""
 	) {
-		var repaired = duplicate( arguments.package );
-		var baseUser = len( trim( arguments.userText ) ) ? arguments.userText : repaired.userPrompt;
+		var repaired = duplicate( arguments.promptPackage );
 		var footer = repairRequest( arguments.reason );
-		repaired.userPrompt = baseUser & footer;
+		if ( isStruct( repaired.segments ?: "" ) ) {
+			repaired.segments.repair = footer;
+			repaired.userPrompt = buildUserPromptFromSegments( repaired.segments, repaired.schema );
+		} else {
+			var baseUser = len( trim( arguments.userText ) ) ? arguments.userText : repaired.userPrompt;
+			repaired.userPrompt = baseUser & footer;
+		}
 		repaired.messages = [
 			{ role: "system", content: repaired.systemPrompt },
 			{ role: "user", content: repaired.userPrompt }
 		];
 		repaired.provenance.repair = true;
 		repaired.provenance.repairReason = left( trim( arguments.reason ), 160 );
+		repaired.provenance.segmentCharacters = segmentCharacters( repaired );
 		return repaired;
+	}
+
+	/**
+	 * Fit dynamic prompt segments before they are serialized into the final user
+	 * message. The system contract, task, envelope markers, and repair request are
+	 * immutable. Reference material and evidence are reduced only as valid JSON
+	 * values, with evidence receiving most of the available budget.
+	 */
+	struct function fitPackage(
+		required struct promptPackage,
+		required numeric maxPromptCharacters,
+		struct options = {}
+	) {
+		var fitted = duplicate( arguments.promptPackage );
+		var cap = max( 4000, int( arguments.maxPromptCharacters ) );
+		if ( !isStruct( fitted.segments ?: "" ) ) {
+			throw(
+				type = "PromptPackageFitException",
+				message = "Compiled prompt package has no structured segments",
+				data = { cap: cap, promptId: fitted.promptId ?: "" },
+				detail = jsonSerialize( { cap: cap, promptId: fitted.promptId ?: "" } )
+			);
+		}
+		var originalSegments = duplicate( fitted.segments );
+		var emptySegments = duplicate( originalSegments );
+		emptySegments.evidence = emptyValueLike( originalSegments.evidence ?: {} );
+		emptySegments.reference = [];
+		var minimumUser = buildUserPromptFromSegments( emptySegments, fitted.schema );
+		var immutableCharacters = len( fitted.systemPrompt ?: "" ) + len( minimumUser );
+		if ( immutableCharacters > cap ) {
+			throw(
+				type = "PromptPackageFitException",
+				message = "Immutable prompt contract, task, and repair envelope exceed the provider prompt budget",
+				data = {
+					cap: cap,
+					promptId: fitted.promptId ?: "",
+					immutableCharacters: immutableCharacters,
+					segments: segmentCharacters( fitted )
+				},
+				detail = jsonSerialize( { cap: cap, promptId: fitted.promptId ?: "", immutableCharacters: immutableCharacters, segments: segmentCharacters( fitted ) } )
+			);
+		}
+
+		var available = max( 2, cap - immutableCharacters );
+		var originalReferenceCharacters = len( jsonSerialize( originalSegments.reference ?: [] ) );
+		var referenceBudget = ( originalSegments.hasReference ?: false )
+			? min( originalReferenceCharacters, min( 8000, max( 2, int( available * .2 ) ) ) )
+			: 0;
+		var evidenceBudget = max( 2, available - referenceBudget );
+		fitted.segments.evidence = fitJsonValue( originalSegments.evidence ?: {}, evidenceBudget );
+		fitted.segments.reference = ( originalSegments.hasReference ?: false )
+			? fitJsonValue( originalSegments.reference ?: [], referenceBudget )
+			: [];
+		fitted.userPrompt = buildUserPromptFromSegments( fitted.segments, fitted.schema );
+
+		var overflow = len( fitted.systemPrompt ?: "" ) + len( fitted.userPrompt ) - cap;
+		if ( overflow > 0 && referenceBudget > 2 ) {
+			referenceBudget = max( 2, referenceBudget - overflow - 32 );
+			fitted.segments.reference = fitJsonValue( originalSegments.reference ?: [], referenceBudget );
+			fitted.userPrompt = buildUserPromptFromSegments( fitted.segments, fitted.schema );
+			overflow = len( fitted.systemPrompt ?: "" ) + len( fitted.userPrompt ) - cap;
+		}
+		if ( overflow > 0 ) {
+			evidenceBudget = max( 2, evidenceBudget - overflow - 32 );
+			fitted.segments.evidence = fitJsonValue( originalSegments.evidence ?: {}, evidenceBudget );
+			fitted.userPrompt = buildUserPromptFromSegments( fitted.segments, fitted.schema );
+		}
+		var fittedCharacters = len( fitted.systemPrompt ?: "" ) + len( fitted.userPrompt );
+		if ( fittedCharacters > cap ) {
+			throw(
+				type = "PromptPackageFitException",
+				message = "Structured prompt package could not fit the provider prompt budget",
+				data = { cap: cap, promptId: fitted.promptId ?: "", fittedCharacters: fittedCharacters, segments: segmentCharacters( fitted ) },
+				detail = jsonSerialize( { cap: cap, promptId: fitted.promptId ?: "", fittedCharacters: fittedCharacters, segments: segmentCharacters( fitted ) } )
+			);
+		}
+
+		fitted.messages = [
+			{ role: "system", content: fitted.systemPrompt },
+			{ role: "user", content: fitted.userPrompt }
+		];
+		var evidenceReduced = jsonSerialize( fitted.segments.evidence ) != jsonSerialize( originalSegments.evidence );
+		var referenceReduced = jsonSerialize( fitted.segments.reference ) != jsonSerialize( originalSegments.reference );
+		var omitted = [];
+		if ( evidenceReduced ) omitted.append( "evidence-records" );
+		if ( referenceReduced ) omitted.append( "reference-records" );
+		fitted.truncation = {
+			applied: evidenceReduced || referenceReduced,
+			omitted: omitted,
+			boundaries: ( evidenceReduced || referenceReduced ) ? [ "complete-json-value", "complete-line" ] : [],
+			cap: cap
+		};
+		fitted.provenance.truncation = duplicate( fitted.truncation );
+		fitted.provenance.segmentCharacters = segmentCharacters( fitted );
+		fitted.provenance.promptCharacters = fittedCharacters;
+		fitted.provenance.promptCharacterCap = cap;
+		return fitted;
 	}
 
 	struct function capabilities( string provider = "" ) {
@@ -138,10 +257,10 @@ class {
 		};
 	}
 
-	struct function lintPackage( required struct package ) {
+	struct function lintPackage( required struct promptPackage ) {
 		var errors = [];
-		var systemText = toString( arguments.package.systemPrompt ?: "" );
-		var userText = toString( arguments.package.userPrompt ?: "" );
+		var systemText = toString( arguments.promptPackage.systemPrompt ?: "" );
+		var userText = toString( arguments.promptPackage.userPrompt ?: "" );
 		if ( !len( trim( systemText ) ) ) errors.append( "empty system contract" );
 		if ( !len( trim( userText ) ) ) errors.append( "empty user envelope" );
 		if ( findNoCase( "BEGIN_TASK_JSON", systemText ) || findNoCase( "END_TASK_JSON", systemText ) || findNoCase( "BEGIN_AUTHORIZED_EVIDENCE_JSON", systemText ) || findNoCase( "END_AUTHORIZED_EVIDENCE_JSON", systemText ) || findNoCase( "BEGIN_REFERENCE_MATERIAL_JSON", systemText ) || findNoCase( "END_REFERENCE_MATERIAL_JSON", systemText ) ) errors.append( "dynamic envelope appeared in system contract" );
@@ -186,13 +305,124 @@ class {
 		var taskData = data.task ?: {};
 		var evidenceData = data.evidence ?: {};
 		var referenceData = data.reference ?: [];
-		var output = "BEGIN_TASK_JSON" & char( 10 ) & jsonSerialize( taskData ) & char( 10 ) & "END_TASK_JSON";
-		output &= char( 10 ) & "BEGIN_AUTHORIZED_EVIDENCE_JSON" & char( 10 ) & jsonSerialize( evidenceData ) & char( 10 ) & "END_AUTHORIZED_EVIDENCE_JSON";
-		if ( !isNull( data.reference ?: javacast( "null", "" ) ) ) {
-			output &= char( 10 ) & "BEGIN_REFERENCE_MATERIAL_JSON" & char( 10 ) & jsonSerialize( referenceData ) & char( 10 ) & "END_REFERENCE_MATERIAL_JSON";
+		return buildUserPromptFromSegments(
+			{
+				task: taskData,
+				evidence: evidenceData,
+				reference: referenceData,
+				hasReference: structKeyExists( data, "reference" ) && !isNull( data.reference ),
+				repair: ""
+			},
+			arguments.schema
+		);
+	}
+
+	private string function buildUserPromptFromSegments( required struct segments, required struct schema ) {
+		var output = "BEGIN_TASK_JSON" & char( 10 ) & jsonSerialize( arguments.segments.task ?: {} ) & char( 10 ) & "END_TASK_JSON";
+		output &= char( 10 ) & "BEGIN_AUTHORIZED_EVIDENCE_JSON" & char( 10 ) & jsonSerialize( arguments.segments.evidence ?: {} ) & char( 10 ) & "END_AUTHORIZED_EVIDENCE_JSON";
+		if ( arguments.segments.hasReference ?: false ) {
+			output &= char( 10 ) & "BEGIN_REFERENCE_MATERIAL_JSON" & char( 10 ) & jsonSerialize( arguments.segments.reference ?: [] ) & char( 10 ) & "END_REFERENCE_MATERIAL_JSON";
 		}
 		output &= char( 10 ) & "Return only the fragment matching output schema #arguments.schema.$id ?: ''#.";
+		if ( len( toString( arguments.segments.repair ?: "" ) ) ) output &= arguments.segments.repair;
 		return output;
+	}
+
+	private void function validateInputData( required struct data, required string schemaId ) {
+		var validation = getValidator().validate( arguments.data, arguments.schemaId );
+		if ( !validation.valid ) {
+			throw(
+				type = "PromptInputValidationException",
+				message = "Input failed #arguments.schemaId# validation: #validation.errors.map( ( item ) => item.message ).toList( '; ' )#",
+				data = validation
+			);
+		}
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private struct function segmentCharacters( required struct promptPackage ) {
+		var segments = isStruct( arguments.promptPackage.segments ?: "" ) ? arguments.promptPackage.segments : {};
+		return {
+			system: len( arguments.promptPackage.systemPrompt ?: "" ),
+			task: len( jsonSerialize( segments.task ?: {} ) ),
+			evidence: len( jsonSerialize( segments.evidence ?: {} ) ),
+			reference: len( jsonSerialize( segments.reference ?: [] ) ),
+			repair: len( toString( segments.repair ?: "" ) ),
+			user: len( arguments.promptPackage.userPrompt ?: "" ),
+			total: len( arguments.promptPackage.systemPrompt ?: "" ) + len( arguments.promptPackage.userPrompt ?: "" )
+		};
+	}
+
+	private any function emptyValueLike( required any value ) {
+		if ( isArray( arguments.value ) ) return [];
+		if ( isStruct( arguments.value ) ) return {};
+		return "";
+	}
+
+	/** Return a semantically valid JSON value no larger than the requested budget. */
+	private any function fitJsonValue( required any value, required numeric budget, numeric depth = 0 ) {
+		var cap = max( 2, int( arguments.budget ) );
+		if ( len( jsonSerialize( arguments.value ) ) <= cap ) return duplicate( arguments.value );
+		if ( arguments.depth >= 8 ) return fitScalarValue( arguments.value, cap );
+		if ( isArray( arguments.value ) ) {
+			var output = [];
+			for ( var item in arguments.value ) {
+				var candidate = duplicate( output );
+				candidate.append( duplicate( item ) );
+				if ( len( jsonSerialize( candidate ) ) <= cap ) {
+					output = candidate;
+					continue;
+				}
+				var remaining = max( 2, cap - len( jsonSerialize( output ) ) - 1 );
+				if ( isStruct( item ) || isArray( item ) ) {
+					var reducedItem = fitJsonValue( item, remaining, arguments.depth + 1 );
+					candidate = duplicate( output );
+					candidate.append( reducedItem );
+					if ( len( jsonSerialize( candidate ) ) <= cap && len( jsonSerialize( reducedItem ) ) > 2 ) output = candidate;
+				}
+				break;
+			}
+			return output;
+		}
+		if ( isStruct( arguments.value ) ) {
+			var outputStruct = {};
+			var keys = arguments.value.keyArray().sort( "textnocase" );
+			for ( var keyIndex = 1; keyIndex <= keys.len(); keyIndex++ ) {
+				var key = keys[ keyIndex ];
+				var remainingKeys = keys.len() - keyIndex + 1;
+				var remainingBudget = max( 2, cap - len( jsonSerialize( outputStruct ) ) );
+				var valueBudget = max( 2, int( remainingBudget / max( 1, remainingKeys ) ) - len( key ) - 6 );
+				var candidateValue = len( jsonSerialize( arguments.value[ key ] ) ) <= valueBudget
+					? duplicate( arguments.value[ key ] )
+					: fitJsonValue( arguments.value[ key ], valueBudget, arguments.depth + 1 );
+				var candidateStruct = duplicate( outputStruct );
+				candidateStruct[ key ] = candidateValue;
+				if ( len( jsonSerialize( candidateStruct ) ) <= cap ) outputStruct = candidateStruct;
+			}
+			return outputStruct;
+		}
+		return fitScalarValue( arguments.value, cap );
+	}
+
+	private any function fitScalarValue( required any value, required numeric budget ) {
+		if ( !isSimpleValue( arguments.value ) ) return "";
+		if ( isNumeric( arguments.value ) || isBoolean( arguments.value ) ) return arguments.value;
+		var source = toString( arguments.value );
+		if ( len( jsonSerialize( source ) ) <= arguments.budget ) return source;
+		var target = max( 0, arguments.budget - 2 );
+		if ( target == 0 ) return "";
+		var bounded = left( source, target );
+		if ( find( char( 10 ), bounded ) ) bounded = listDeleteAt( bounded, listLen( bounded, char( 10 ) ), char( 10 ) );
+		while ( len( bounded ) && len( jsonSerialize( bounded ) ) > arguments.budget ) {
+			if ( len( bounded ) == 1 ) return "";
+			bounded = left( bounded, len( bounded ) - 1 );
+		}
+		return bounded;
 	}
 
 	private void function validateContract( required struct contract, required struct schema, required struct inputSchema ) {

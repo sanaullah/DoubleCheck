@@ -38,6 +38,12 @@ class {
 		var dynamicAuthorityLeak = results.filter( ( item ) => item.id == "evidence-injection-is-data" && !item.passed ).len() == 0;
 		var unauthorizedEvidence = results.filter( ( item ) => item.id == "unauthorized-file-is-rejected" && !item.passed ).len() == 0;
 		var schemaFixtures = results.filter( ( item ) => item.id == "canonical-message-field" );
+		var unauthorizedFixtures = results.filter( ( item ) => item.securityFixture ?: false );
+		var repairFixtures = results.filter( ( item ) => item.repairAttempted ?: false );
+		var fitFixtures = results.filter( ( item ) => item.fitAttempted ?: false );
+		var roleFixtures = results.filter( ( item ) => len( trim( item.role ?: "" ) ) > 0 );
+		var coveredFamilies = {};
+		for ( var roleFixture in roleFixtures ) coveredFamilies[ roleFamily( roleFixture.role ) ] = true;
 		return {
 			version        : fixtureSet.version ?: "prompt-evals-v1",
 			passed         : passed,
@@ -46,9 +52,12 @@ class {
 			lint           : lint,
 			metrics        : {
 				schemaFixturePassRate: schemaFixtures.len() ? schemaFixtures.filter( ( item ) => item.passed ).len() / schemaFixtures.len() : 1,
-				repairRate          : 0,
-				unauthorizedEvidenceRate: unauthorizedEvidence ? 1 : 0,
-				dynamicAuthorityLeakRate: dynamicAuthorityLeak ? 0 : 1
+				repairRate          : results.len() ? repairFixtures.len() / results.len() : 0,
+				repairSuccessRate   : repairFixtures.len() ? repairFixtures.filter( ( item ) => item.passed ).len() / repairFixtures.len() : 1,
+				unauthorizedEvidenceRate: unauthorizedFixtures.len() ? unauthorizedFixtures.filter( ( item ) => !item.passed ).len() / unauthorizedFixtures.len() : 0,
+				dynamicAuthorityLeakRate: dynamicAuthorityLeak ? 0 : 1,
+				fitPassRate: fitFixtures.len() ? fitFixtures.filter( ( item ) => item.passed ).len() / fitFixtures.len() : 1,
+				roleFamilyCoverage: coveredFamilies.count()
 			},
 			securityGates  : { unauthorizedEvidence: unauthorizedEvidence, dynamicAuthorityLeak: dynamicAuthorityLeak },
 			results        : results
@@ -57,24 +66,63 @@ class {
 
 	private struct function evaluateFixture( required struct fixture ) {
 		var errors = [];
+		var repairAttempted = arguments.fixture.repair ?: false;
+		var fitAttempted = isStruct( arguments.fixture.fit ?: "" );
+		var securityFixture = structKeyExists( arguments.fixture, "expectedReasonCode" ) && arguments.fixture.expectedReasonCode == "unauthorized-evidence";
 		if ( len( trim( arguments.fixture.role ?: "" ) ) && !isStruct( arguments.fixture.output ?: "" ) ) {
 			try {
-				var prompt = getCompiler().compile( arguments.fixture.role, { task: arguments.fixture.task ?: {}, evidence: arguments.fixture.evidence ?: {} } );
+				var evidence = arguments.fixture.evidence ?: {};
+				var reference = arguments.fixture.reference ?: [];
+				if ( fitAttempted ) {
+					evidence = { payload: repeatString( "evidence line" & char( 10 ), int( arguments.fixture.fit.evidenceLines ?: 4000 ) ) };
+					reference = [ { name: "reference", excerpt: repeatString( "reference line" & char( 10 ), int( arguments.fixture.fit.referenceLines ?: 1200 ) ) } ];
+				}
+				var prompt = getCompiler().compile( arguments.fixture.role, { task: arguments.fixture.task ?: {}, evidence: evidence, reference: reference } );
 				var evidenceText = jsonSerialize( arguments.fixture.evidence ?: {} );
 				if ( find( evidenceText, prompt.systemPrompt ) ) errors.append( "dynamic evidence leaked into system contract" );
+				if ( repairAttempted ) {
+					var repaired = getCompiler().compileRepair( prompt, "fixture validation failure" );
+					if ( repaired.systemPrompt != prompt.systemPrompt || !findNoCase( "BEGIN_REPAIR_REQUEST", repaired.userPrompt ) ) errors.append( "repair changed authority or omitted repair envelope" );
+				}
+				if ( fitAttempted ) {
+					var cap = int( arguments.fixture.fit.maxPromptCharacters ?: 60000 );
+					var fitted = getCompiler().fitPackage( prompt, cap );
+					if ( len( fitted.systemPrompt ) + len( fitted.userPrompt ) > cap ) errors.append( "compiled package exceeded fit cap" );
+					if ( !findNoCase( "BEGIN_TASK_JSON", fitted.userPrompt ) || !findNoCase( "END_AUTHORIZED_EVIDENCE_JSON", fitted.userPrompt ) ) errors.append( "fitting broke envelope boundaries" );
+				}
 			} catch ( any error ) {
 				errors.append( error.message ?: "prompt fixture compilation failed" );
 			}
 		}
 		if ( len( trim( arguments.fixture.schema ?: "" ) ) && isStruct( arguments.fixture.output ?: "" ) ) {
-			var validation = getValidator().validate( arguments.fixture.output, arguments.fixture.schema, arguments.fixture.context ?: {} );
+			var validation = arguments.fixture.preserveValidSiblings ?: false
+				? getValidator().sanitize( arguments.fixture.output, arguments.fixture.schema, arguments.fixture.context ?: {} )
+				: getValidator().validate( arguments.fixture.output, arguments.fixture.schema, arguments.fixture.context ?: {} );
 			if ( structKeyExists( arguments.fixture, "expectedReasonCode" ) ) {
 				if ( !validation.reasonCodes.contains( arguments.fixture.expectedReasonCode ) ) errors.append( "expected reason code was not emitted" );
+			} else if ( arguments.fixture.preserveValidSiblings ?: false ) {
+				var collection = arguments.fixture.collection ?: "findings";
+				if ( !validation.valid || !isArray( validation.value[ collection ] ?: "" ) || validation.value[ collection ].len() != int( arguments.fixture.expectedAccepted ?: 1 ) ) errors.append( "mixed-validity output did not preserve expected valid siblings" );
 			} else if ( !validation.valid ) {
 				errors.append( "fixture output was rejected" );
 			}
 		}
-		return { id: arguments.fixture.id ?: "fixture", passed: errors.len() == 0, errors: errors };
+		return {
+			id: arguments.fixture.id ?: "fixture",
+			role: arguments.fixture.role ?: "",
+			passed: errors.len() == 0,
+			errors: errors,
+			repairAttempted: repairAttempted,
+			fitAttempted: fitAttempted,
+			securityFixture: securityFixture
+		};
+	}
+
+	private string function roleFamily( required string role ) {
+		var value = lCase( trim( arguments.role ) );
+		if ( findNoCase( "specialist.", value ) == 1 ) return "specialist";
+		if ( findNoCase( "modernization-", value ) == 1 ) return "modernization";
+		return value;
 	}
 
 	private any function getRegistry() {

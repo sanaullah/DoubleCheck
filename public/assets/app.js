@@ -5351,8 +5351,9 @@ function updateModernizationTargetProfiles() {
 	if (!profiles.length) return;
 	const languages = [...new Set(profiles.map((profile) => profile.targetLanguage))];
 	const layouts = [...new Set(profiles.map((profile) => profile.layoutProfile))];
-	const labels = { boxlang: "BoxLang app/ + public/", modern: "ColdBox app/ + public/", flat: "Flat repository layout" };
-	const replaceOptions = (select, values, preferred) => {
+	const languageLabels = { boxlang: "BoxLang", cfml: "CFML" };
+	const layoutLabels = { modern: "ColdBox app/ + public/", flat: "Flat repository layout" };
+	const replaceOptions = (select, values, preferred, labels) => {
 		if (!select) return;
 		const prior = select.value;
 		select.innerHTML = "";
@@ -5364,8 +5365,8 @@ function updateModernizationTargetProfiles() {
 		});
 		select.value = values.includes(prior) ? prior : (values.includes(preferred) ? preferred : values[0]);
 	};
-	replaceOptions(elements.modernizationTargetLanguage, languages, languages[0]);
-	replaceOptions(elements.modernizationLayoutProfile, layouts, "modern");
+	replaceOptions(elements.modernizationTargetLanguage, languages, languages[0], languageLabels);
+	replaceOptions(elements.modernizationLayoutProfile, layouts, "modern", layoutLabels);
 }
 
 function updateModernizationProviderDisclosure() {
@@ -5416,6 +5417,10 @@ async function smokeModernizationProvider() {
 }
 
 async function submitModernization() {
+	if (elements.formMessage) {
+		elements.formMessage.textContent = "";
+		elements.formMessage.dataset.tone = "";
+	}
 	const formData = new FormData(elements.form);
 	const values = Object.fromEntries(formData.entries());
 	values.allowedRole = formData.getAll("allowedRole");

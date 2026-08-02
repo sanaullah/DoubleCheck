@@ -5,7 +5,10 @@ class extends="testbox.system.BaseSpec" {
 					var registry = new app.models.services.PromptRegistry();
 					var compiler = new app.models.services.PromptCompiler();
 					expect( registry.activeVersion( "specialist.security" ) ).toBe( "v1" );
-					expect( registry.previousVersion( "specialist.security" ) ).toBeEmpty();
+					expect( registry.previousVersion( "provider-smoke" ) ).toBe( "v0" );
+					expect( registry.previousContract( "provider-smoke" ).version ).toBe( "v0" );
+					var rollbackPackage = compiler.compile( "provider-smoke", { task: {}, evidence: {} }, { contractVersion: "v0" } );
+					expect( rollbackPackage.promptVersion ).toBe( "v0" );
 					var package = compiler.compile( "specialist.security", { task: {}, evidence: {} } );
 					expect( package.inputSchema ).toBe( "specialist-task-v1" );
 					expect( package.inputSchemaDefinition.$id ).toBe( "specialist-task-v1" );
@@ -45,6 +48,52 @@ class extends="testbox.system.BaseSpec" {
 				expect( repaired.systemPrompt ).toBe( package.systemPrompt );
 				expect( repaired.messages[ 2 ].content ).toInclude( "BEGIN_REPAIR_REQUEST" );
 				expect( repaired.provenance.repair ).toBeTrue();
+			} );
+
+			it( "rejects invocation data that violates the registered input schema", () => {
+				var compiler = new app.models.services.PromptCompiler();
+				expect( () => compiler.compile( "modernization-application", { task: {}, evidence: {}, reference: {} } ) ).toThrow( type = "PromptInputValidationException" );
+			} );
+
+			it( "fits live-size dynamic segments without cutting envelope markers", () => {
+				var compiler = new app.models.services.PromptCompiler();
+				var package = compiler.compile(
+					"modernization-application",
+					{
+						task: { runtime: "boxlang", profile: "modern", roleInstruction: "Map this shard." },
+						evidence: { inventory: [ { filePath: "legacy/index.cfm", content: repeatString( "source line" & char( 10 ), 5000 ) } ] },
+						reference: [ { name: "coldbox", excerpt: repeatString( "reference line" & char( 10 ), 2000 ) } ]
+					}
+				);
+				var fitted = compiler.fitPackage( package, 60000 );
+				expect( fitted.provenance.promptCharacters ).toBeLTE( 60000 );
+				expect( fitted.userPrompt ).toInclude( "BEGIN_TASK_JSON" );
+				expect( fitted.userPrompt ).toInclude( "END_AUTHORIZED_EVIDENCE_JSON" );
+				expect( fitted.truncation.applied ).toBeTrue();
+			} );
+
+			it( "fits a scalar into the minimum JSON budget without a zero-count slice", () => {
+				var compiler = new app.models.services.PromptCompiler();
+				makePublic( compiler, "fitScalarValue" );
+				expect( compiler.fitScalarValue( "oversized", 2 ) ).toBe( "" );
+			} );
+
+			it( "quarantines unauthorized items while retaining valid siblings", () => {
+				var validator = new app.models.services.PromptOutputValidator();
+				var result = validator.sanitizeValid(
+					{
+						summary: "mixed",
+						findings: [
+							{ category: "security", ruleId: "security/valid", severity: "high", confidence: .9, title: "Valid", message: "Supported", filePath: "app/handlers/Orders.bx", startLine: 1, endLine: 1 },
+							{ category: "security", ruleId: "security/invalid", severity: "high", confidence: .9, title: "Invalid", message: "Unsupported", filePath: "../outside.bx", startLine: 1, endLine: 1 }
+						]
+					},
+					"bulk-review-v1",
+					{ allowedFilePaths: [ "app/handlers/Orders.bx" ] }
+				);
+				expect( result.value.findings ).toHaveLength( 1 );
+				expect( result.value.findings[ 1 ].ruleId ).toBe( "security/valid" );
+				expect( result.rejectedItems ).toHaveLength( 1 );
 			} );
 
 				it( "rejects invalid schema output and unauthorized evidence", () => {

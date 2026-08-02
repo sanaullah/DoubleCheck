@@ -17,6 +17,22 @@ class {
 		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
 	}
 
+	/** Compile-provider preflight with no network or tool execution. */
+	struct function preflight( required struct request, struct options = {} ) {
+		var resolved = aiProviderResolver.resolve();
+		var fittedRequest = fitRequest( resolved, arguments.request );
+		var contractId = promptContractId( fittedRequest, arguments.options );
+		assertProviderContract( resolved, fittedRequest, contractId );
+		return {
+			ok: true,
+			request: fittedRequest,
+			provider: resolved.provider ?: "",
+			model: len( trim( arguments.options.model ?: "" ) ) ? trim( arguments.options.model ) : ( resolved.model ?: "" ),
+			promptProvenance: isStruct( fittedRequest.provenance ?: "" ) ? duplicate( fittedRequest.provenance ) : {},
+			diagnostics: isStruct( fittedRequest.provenance.segmentCharacters ?: "" ) ? duplicate( fittedRequest.provenance.segmentCharacters ) : {}
+		};
+	}
+
 	/**
 	 * Optional allowlisted skill reader for agent path. Construction/read failures
 	 * never block the preferred chat JSON path.
@@ -81,8 +97,9 @@ class {
 			}
 		}
 		var lastError = "";
+		var lastDiagnostics = {};
 		var spentUsd = 0;
-		var activeRequest = duplicate( arguments.request );
+		var activeRequest = copyRequest( arguments.request );
 		if ( !isStruct( activeRequest.provenance ?: "" ) && isStruct( activeRequest.promptPackage ?: "" ) && isStruct( activeRequest.promptPackage.provenance ?: "" ) ) activeRequest.provenance = duplicate( activeRequest.promptPackage.provenance );
 		var effectiveModel = len( trim( arguments.options.model ?: "" ) ) ? trim( arguments.options.model ) : resolved.model;
 		var contractId = promptContractId( activeRequest, arguments.options );
@@ -98,12 +115,8 @@ class {
 				return { ok: false, payload: {}, attempt: attempt, provider: resolved.provider, model: effectiveModel, durationMs: elapsedMs, error: "budget-exceeded" };
 			}
 			try {
-				var originalMessages = duplicate( activeRequest.messages ?: [] );
-				var fittedMessages = fitMessages( resolved, activeRequest.messages ?: [] );
-				if ( jsonSerialize( originalMessages ) != jsonSerialize( fittedMessages ) ) {
-					activeRequest.truncation = { applied: true, omitted: [ "earlier-context" ], boundaries: [ "complete-message" ] };
-					if ( isStruct( activeRequest.promptPackage ?: "" ) ) activeRequest.promptPackage.truncation = duplicate( activeRequest.truncation );
-				}
+				activeRequest = fitRequest( resolved, activeRequest );
+				var fittedMessages = activeRequest.messages ?: [];
 				var response = chatGateway.chat(
 					fittedMessages,
 					buildParams( resolved, activeRequest, budgets, effectiveModel, contractId ),
@@ -115,7 +128,9 @@ class {
 					throw( type = "ModernizationProviderResponseException", message = "Provider returned non-object JSON" );
 				}
 				if ( len( schemaId ) ) {
-					getValidator().assertValid( payload, schemaId, validationContext( activeRequest, arguments.options ) );
+					var acceptedPayload = getValidator().sanitizeValid( payload, schemaId, validationContext( activeRequest, arguments.options ) );
+					payload = acceptedPayload.value;
+					if ( acceptedPayload.rejectedItems.len() && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.rejectedItems = duplicate( acceptedPayload.rejectedItems );
 				}
 				var outputTokens = isNumeric( budgets.maxTokensPerTask ?: "" ) ? int( budgets.maxTokensPerTask ) : ( isNumeric( budgets.maxTokens ?: "" ) ? int( budgets.maxTokens ) : 12000 );
 				var outputLimit = max( 2048, min( 120000, outputTokens * 4 ) );
@@ -140,11 +155,25 @@ class {
 			} catch ( any error ) {
 				if ( lCase( error.type ?: "" ) == "runcancelled" ) rethrow;
 				lastError = classifyProviderError( error );
-				emitObservation( arguments.options, { stage: "provider-error", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, error: lastError } );
+				var errorObservation = {
+					stage: "provider-error",
+					runId: arguments.runId,
+					attempt: attempt + 1,
+					elapsedMs: getTickCount() - startedAt,
+					error: lastError,
+					provider: resolved.provider ?: "",
+					model: effectiveModel,
+					promptId: contractId,
+					promptProvenance: isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {}
+				};
+				lastDiagnostics = exceptionDiagnostics( error );
+				if ( lastDiagnostics.count() ) errorObservation.fit = duplicate( lastDiagnostics );
+				emitObservation( arguments.options, errorObservation );
 				try {
 					var errorMsg = "Modernize provider error runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# error=#left( lastError, 240 )#";
 					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.warn( errorMsg );
 				} catch ( any ignored ) {}
+				if ( isPromptFitError( error ) ) break;
 				if ( attempt < attemptLimit ) {
 					if ( isStruct( error.data ?: "" ) && isArray( error.data.reasonCodes ?: "" ) && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.validationReasonCodes = duplicate( error.data.reasonCodes );
 					if ( isRepairableOutputError( error ) ) {
@@ -156,7 +185,17 @@ class {
 				}
 			}
 		}
-		return { ok: false, payload: {}, attempt: attemptLimit + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, error: lastError };
+		return {
+			ok: false,
+			payload: {},
+			attempt: attemptLimit + 1,
+			provider: resolved.provider,
+			model: effectiveModel,
+			durationMs: getTickCount() - startedAt,
+			error: lastError,
+			promptProvenance: isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {},
+			diagnostics: lastDiagnostics
+		};
 	}
 
 	void function cancelRun( required string runId ) {
@@ -220,7 +259,7 @@ class {
 	}
 
 	private struct function shrinkRequestForRetry( required struct request, string reason = "", string contractId = "" ) {
-		var copy = duplicate( arguments.request );
+		var copy = copyRequest( arguments.request );
 		var shrink = "RETRY CONSTRAINT: Your previous JSON was truncated. Return a smaller COMPLETE JSON object only, keys in order targetUnits, unitLinks, routeContracts, samples, contexts, extracts. Cap targetUnits at 3, unitLinks at 3, routeContracts at 3, samples at 2. contexts=[] and extracts=[]. Each evidenceRefs array at most 2 ids. sampleCode under 8 lines. Map only the shard paths already listed; do not invent a repo-wide contexts dump.";
 		if ( len( trim( arguments.contractId ) ) && isStruct( copy.promptPackage ?: "" ) ) {
 			var repaired = getCompiler().compileRepair( copy.promptPackage, len( trim( arguments.reason ) ) ? arguments.reason : "output validation failure" );
@@ -316,7 +355,11 @@ class {
 			throw( type = "ModernizationProviderResponseException", message = "Skill agent returned non-object JSON" );
 		}
 		var skillSchemaId = promptSchemaId( arguments.request, arguments.options );
-		if ( len( skillSchemaId ) ) getValidator().assertValid( payload, skillSchemaId, validationContext( arguments.request, arguments.options ) );
+		if ( len( skillSchemaId ) ) {
+			var acceptedPayload = getValidator().sanitizeValid( payload, skillSchemaId, validationContext( arguments.request, arguments.options ) );
+			payload = acceptedPayload.value;
+			if ( acceptedPayload.rejectedItems.len() && isStruct( arguments.request.provenance ?: "" ) ) arguments.request.provenance.rejectedItems = duplicate( acceptedPayload.rejectedItems );
+		}
 		var usage = normalizeUsage( responseUsage, arguments.request, payload );
 		var costUsd = estimateCost( arguments.resolved, usage );
 		emitObservation( arguments.options, {
@@ -374,7 +417,20 @@ class {
 		}
 		var hasSystem = arguments.request.messages.some( ( message ) => lCase( trim( message.role ?: "" ) ) == "system" );
 		if ( len( trim( arguments.contractId ) ) && !( capabilities.distinctSystem ?: true ) && hasSystem ) throw( type = "ModernizationProviderCapabilityException", message = "Provider cannot preserve the immutable system contract" );
-		if ( len( trim( arguments.contractId ) ) && !hasSystem ) throw( type = "ModernizationPromptContractException", message = "Compiled modernization contract lost its system message" );
+		if ( len( trim( arguments.contractId ) ) && !hasSystem ) {
+			var diagnostics = {
+				contractId: arguments.contractId,
+				messageCount: arguments.request.messages.len(),
+				messageRoles: arguments.request.messages.map( ( item ) => toString( item.role ?: "" ) ),
+				packageSystemCharacters: isStruct( arguments.request.promptPackage ?: "" ) ? len( toString( arguments.request.promptPackage.systemPrompt ?: "" ) ) : 0
+			};
+			throw(
+				type = "ModernizationPromptContractException",
+				message = "Compiled modernization contract lost its system message",
+				data = diagnostics,
+				detail = jsonSerialize( diagnostics )
+			);
+		}
 	}
 
 	private any function getCompiler() {
@@ -387,6 +443,74 @@ class {
 		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
 		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
 		return variables.promptOutputValidator;
+	}
+
+	private struct function fitRequest( required struct resolved, required struct request ) {
+		var output = copyRequest( arguments.request );
+		if ( isStruct( output.promptPackage ?: "" ) && isStruct( output.promptPackage.segments ?: "" ) ) {
+			var capabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+			var configuredCap = isNumeric( arguments.resolved.maxPromptCharacters ?: "" )
+				? arguments.resolved.maxPromptCharacters
+				: capabilities.maxPromptCharacters;
+			var cap = isNumeric( configuredCap ?: "" ) ? max( 4000, int( configuredCap ) ) : 60000;
+			var fittedPackage = getCompiler().fitPackage( output.promptPackage, cap );
+			output.promptPackage = fittedPackage;
+			output.messages = fittedPackage.messages;
+			output.userPrompt = fittedPackage.userPrompt;
+			output.provenance = fittedPackage.provenance;
+			output.truncation = fittedPackage.truncation;
+			return output;
+		}
+		var originalMessages = duplicate( output.messages ?: [] );
+		output.messages = fitMessages( arguments.resolved, originalMessages );
+		if ( jsonSerialize( originalMessages ) != jsonSerialize( output.messages ) ) {
+			output.truncation = { applied: true, omitted: [ "earlier-context" ], boundaries: [ "complete-message" ] };
+		}
+		return output;
+	}
+
+	private boolean function isPromptFitError( required any error ) {
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		return findNoCase( "promptpackagefit", typeName ) > 0 || findNoCase( "modernizationpromptbudget", typeName ) > 0;
+	}
+
+	/**
+	 * Request structs may be assembled on a worker whose callback closure
+	 * captures BoxLang's scheduled executor. Copy the request envelope shallowly
+	 * and replace only the prompt fields we mutate; never recursively clone the
+	 * worker runtime graph.
+	 */
+	private struct function copyRequest( required struct request ) {
+		var output = {};
+		if ( structKeyExists( arguments.request, "role" ) ) output.role = arguments.request.role;
+		if ( structKeyExists( arguments.request, "promptVersion" ) ) output.promptVersion = arguments.request.promptVersion;
+		if ( structKeyExists( arguments.request, "promptId" ) ) output.promptId = arguments.request.promptId;
+		if ( structKeyExists( arguments.request, "contractVersion" ) ) output.contractVersion = arguments.request.contractVersion;
+		if ( structKeyExists( arguments.request, "outputSchemaId" ) ) output.outputSchemaId = arguments.request.outputSchemaId;
+		if ( structKeyExists( arguments.request, "messages" ) ) output.messages = arguments.request.messages;
+		if ( structKeyExists( arguments.request, "outputSchema" ) ) output.outputSchema = arguments.request.outputSchema;
+		if ( structKeyExists( arguments.request, "promptPackage" ) ) output.promptPackage = arguments.request.promptPackage;
+		if ( structKeyExists( arguments.request, "runtime" ) ) output.runtime = arguments.request.runtime;
+		if ( structKeyExists( arguments.request, "profile" ) ) output.profile = arguments.request.profile;
+		if ( structKeyExists( arguments.request, "budgets" ) ) output.budgets = arguments.request.budgets;
+		if ( structKeyExists( arguments.request, "skillPack" ) ) output.skillPack = arguments.request.skillPack;
+		if ( structKeyExists( arguments.request, "provenance" ) ) output.provenance = arguments.request.provenance;
+		if ( structKeyExists( arguments.request, "validationContext" ) ) output.validationContext = arguments.request.validationContext;
+		if ( structKeyExists( arguments.request, "allowedFilePaths" ) ) output.allowedFilePaths = arguments.request.allowedFilePaths;
+		if ( structKeyExists( arguments.request, "params" ) ) output.params = arguments.request.params;
+		if ( structKeyExists( arguments.request, "userPrompt" ) ) output.userPrompt = arguments.request.userPrompt;
+		if ( structKeyExists( arguments.request, "truncation" ) ) output.truncation = arguments.request.truncation;
+		return output;
+	}
+
+	private struct function exceptionDiagnostics( required any error ) {
+		if ( isStruct( arguments.error.data ?: "" ) ) return duplicate( arguments.error.data );
+		var detail = trim( toString( arguments.error.detail ?: "" ) );
+		if ( len( detail ) && isJSON( detail ) ) {
+			var parsed = jsonDeserialize( detail );
+			if ( isStruct( parsed ) ) return parsed;
+		}
+		return {};
 	}
 
 	private array function fitMessages( required struct resolved, required array messages ) {

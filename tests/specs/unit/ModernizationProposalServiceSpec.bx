@@ -1,6 +1,33 @@
 class extends="testbox.system.BaseSpec" {
 	function run() {
 			describe( "Modernization proposal orchestration", () => {
+			it( "preflights the complete initial batch before making any provider call", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway();
+				gateway.failPreflightFor( "modernization-application" );
+				var schedulerPool = new java:java.util.concurrent.ScheduledThreadPoolExecutor( 1 );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+
+				try {
+					var result = service.propose(
+						"run-preflight-failure",
+						{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000 } },
+						{ coverage: {}, inventory: {}, schemaEvidence: {} },
+						{ isCancelled: () => schedulerPool.isShutdown() }
+					);
+
+					expect( result.ok ).toBeFalse();
+					expect( gateway.callCount() ).toBe( 0 );
+					expect( result.errors[ 1 ].stage ).toBe( "prompt-preflight" );
+					expect( result.errors[ 1 ].diagnostics.cap ).toBe( 60000 );
+				} finally {
+					schedulerPool.shutdownNow();
+				}
+			} );
+
 			it( "preserves millisecond timestamps without int overflow", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", newProposal: true, proposalReason: "timestamp seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
@@ -14,7 +41,7 @@ class extends="testbox.system.BaseSpec" {
 				service.secretRedactionService = new app.models.services.SecretRedactionService();
 				service.identityService = new app.models.services.ModernizationIdentityService();
 				var result = service.propose( "run-timestamp", { startedAt: getTickCount(), target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
-				expect( result.ok ).toBeTrue();
+				expect( result.ok ).toBeTrue( jsonSerialize( result.errors ?: [] ) );
 				expect( gateway.callCount() ).toBe( 4 );
 			} );
 

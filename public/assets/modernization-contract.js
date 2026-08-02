@@ -8,6 +8,7 @@
 	if (root) root.DoubleCheckModernization = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
 	const DEFAULT_LIMIT = 2 * 1024 * 1024;
+	const MAX_OUTCOME_CHARACTERS = 120;
 	const profileMatrix = {
 		"boxlang-modern": {
 			runtime: "boxlang-modern",
@@ -87,10 +88,11 @@
 			? (schemaFileName.endsWith(".json") ? "structured-json-v1" : "inline-ddl")
 			: schemaSource === "repo-path" ? "sql-ddl" : "";
 		const modelOverride = String(first(values, "modelOverride", "")).trim();
+		const outcomes = list(values, "outcomes").concat(String(first(values, "outcome", "")).trim() ? [String(first(values, "outcome", "")).trim()] : []);
 		const normalizedInput = {
 			provider,
 			execution: { model: modelOverride },
-			outcomes: list(values, "outcomes").concat(String(first(values, "outcome", "")).trim() ? [String(first(values, "outcome", "")).trim()] : []),
+			outcomes,
 			source: {
 				engine: String(first(values, "sourceEngine", "unknown")).trim().toLowerCase(),
 				version: String(first(values, "sourceVersion", "")).trim(),
@@ -185,6 +187,9 @@
 		if (mode !== "full") warnings.push("Modernize is most complete with a full repository scope; this run may be inference-limited.");
 		if ((modernization.schemaPack?.sourceKind || modernization.schema?.source || "none") === "repo-path" && !(modernization.schemaPack?.relativePath || modernization.schema?.path)) {
 			errors.push("Provide a relative in-repository schema path or choose another schema source.");
+		}
+		if ((modernization.outcomes || []).some((outcome) => String(outcome).length > MAX_OUTCOME_CHARACTERS)) {
+			errors.push(`Keep each modernization outcome at ${MAX_OUTCOME_CHARACTERS} characters or fewer.`);
 		}
 		// The normalized request carries the selected provider so callers do not
 		// need to duplicate form state when checking readiness.  Capabilities can

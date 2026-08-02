@@ -53,6 +53,18 @@ class {
 		// Many small application agents in parallel waves beat one whole-repo JSON
 		// that truncates, and finish inside the wall-clock budget.
 		var appShards = buildApplicationShards( arguments.evidence, budgets );
+		var initialPreflight = preflightInitialRoles( appShards, runtime, arguments.evidence, budgets, maxTasks, arguments.options );
+		if ( !( initialPreflight.ok ?: false ) ) {
+			return failure(
+				initialPreflight.message ?: "modernization prompt preflight failed",
+				[ {
+					role: initialPreflight.role ?: "modernization",
+					message: initialPreflight.message ?: "modernization prompt preflight failed",
+					stage: "prompt-preflight",
+					diagnostics: initialPreflight.diagnostics ?: {}
+				} ]
+			);
+		}
 		var allApplicationPaths = prioritizedLegacyPaths( arguments.evidence );
 		var plannedApplicationPaths = {};
 		for ( var plannedShard in appShards ) {
@@ -84,7 +96,7 @@ class {
 				errors.append( { role: "modernization-database", message: "cost-budget-exceeded" } );
 			} else {
 				var dbRequest = agentFactory.build( "modernization-database", runtime, arguments.evidence, budgets );
-				var dbOptions = duplicate( arguments.options );
+				var dbOptions = copyGatewayOptions( arguments.options );
 				dbOptions.budgets = budgets;
 				dbOptions.startedAt = getTickCount();
 				dbOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
@@ -159,7 +171,7 @@ class {
 				logInfo( "Modernize proposal #arguments.runId#: starting architecture role" );
 				// merged already carries .signals through from mergeFragments().
 				var architectureRequest = agentFactory.build( "modernization-architecture", runtime, merged, budgets );
-				var architectureOptions = duplicate( arguments.options );
+				var architectureOptions = copyGatewayOptions( arguments.options );
 				architectureOptions.budgets = budgets;
 				architectureOptions.startedAt = getTickCount();
 				architectureOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
@@ -372,7 +384,7 @@ class {
 	/**
 	 * Carries an optional per-run model override (immutable input, set from
 	 * ModernizationPolicyService.normalize()) into the gateway options struct so
-	 * every duplicate(arguments.options) call site below inherits it without
+	 * every copied gateway-options struct below inherits it without
 	 * threading a new parameter through each role.
 	 */
 	private void function applyModelOverride( required struct input, required struct options ) {
@@ -380,6 +392,26 @@ class {
 		if ( !structKeyExists( arguments.input, "execution" ) || !isStruct( arguments.input.execution ) ) return;
 		var overrideModel = trim( arguments.input.execution.model ?: "" );
 		if ( len( overrideModel ) ) arguments.options.model = overrideModel;
+	}
+
+	/**
+	 * Copies only gateway-supported option keys. Callback closures are retained
+	 * by reference so BoxLang never attempts to recursively duplicate their
+	 * captured worker/executor state during live runs.
+	 */
+	private struct function copyGatewayOptions( struct options = {} ) {
+		var output = {};
+		var keys = [
+			"allowedEvidenceIds", "allowedFactIds", "allowedFilePaths", "budgets",
+			"isCancelled", "maxDurationMs", "maxRetries", "model", "onObservation",
+			"role", "startedAt", "useSkillAgent"
+		];
+		for ( var key in keys ) {
+			if ( !structKeyExists( arguments.options, key ) ) continue;
+			var value = arguments.options[ key ];
+			output[ key ] = isStruct( value ) || isArray( value ) ? duplicate( value ) : value;
+		}
+		return output;
 	}
 
 	/**
@@ -412,7 +444,7 @@ class {
 			schemaEvidence: arguments.evidence.schemaEvidence ?: {}
 		};
 		var repairRequest = agentFactory.build( "modernization-repair", runtime, repairEvidence, repairBudgets );
-		var repairOptions = duplicate( arguments.options );
+		var repairOptions = copyGatewayOptions( arguments.options );
 		repairOptions.budgets = repairBudgets;
 		repairOptions.role = "modernization-repair";
 		repairOptions.maxRetries = 0;
@@ -914,6 +946,31 @@ class {
 			? max( 1, min( 12, int( arguments.budgets.applicationShardConcurrency ) ) )
 			: 3;
 		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
+		var roadmapRequests = [];
+		try {
+			for ( var preflightIndex = 1; preflightIndex <= arguments.roadmapShards.len(); preflightIndex++ ) {
+				var roadmapRequest = agentFactory.build( "modernization-roadmap", arguments.runtime, arguments.roadmapShards[ preflightIndex ], arguments.budgets );
+				roadmapRequest.shardIndex = preflightIndex;
+				var preflightOptions = copyGatewayOptions( arguments.options );
+				preflightOptions.role = "modernization-roadmap";
+				preflightOptions.budgets = duplicate( arguments.budgets );
+				agentGateway.preflight( roadmapRequest, preflightOptions );
+				roadmapRequests.append( roadmapRequest );
+			}
+		} catch ( any error ) {
+			for ( var failedOutcome in outcomes ) failedOutcome.status = "omitted";
+			return {
+				roadmapPhases: [], assumptions: [], samples: [], accepted: 0, failed: 0,
+				omitted: outcomes.len(), outcomes: outcomes,
+				errors: [ {
+					role: "modernization-roadmap",
+					message: left( error.message ?: "modernization roadmap prompt preflight failed", 500 ),
+					stage: "prompt-preflight",
+					diagnostics: exceptionDiagnostics( error )
+				} ],
+				outputCharacters: 0, costUsd: 0, provider: "", model: ""
+			};
+		}
 
 		var state = {
 			phaseRecords: [],
@@ -934,6 +991,7 @@ class {
 		var shardContext = {
 			runId: arguments.runId,
 			roadmapShards: arguments.roadmapShards,
+			roadmapRequests: roadmapRequests,
 			runtime: arguments.runtime,
 			budgets: arguments.budgets,
 			options: arguments.options,
@@ -1025,8 +1083,7 @@ class {
 			: 0;
 		var perShardCost = arguments.context.maxCost > 0 ? costRemaining / max( 1, shareCount ) : 0;
 
-		var roadmapRequest = agentFactory.build( "modernization-roadmap", arguments.context.runtime, shard, arguments.context.budgets );
-		roadmapRequest.shardIndex = shardIndex;
+		var roadmapRequest = arguments.context.roadmapRequests[ shardIndex ];
 		var roadmapOptions = duplicate( arguments.context.options );
 		roadmapOptions.budgets = duplicate( arguments.context.budgets );
 		if ( arguments.context.maxCost > 0 ) roadmapOptions.budgets.maxCostUsd = perShardCost;
@@ -1515,6 +1572,66 @@ class {
 		return { targetUnits: [], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] };
 	}
 
+	private struct function preflightInitialRoles(
+		required array appShards,
+		required struct runtime,
+		required struct evidence,
+		required struct budgets,
+		required numeric maxTasks,
+		struct options = {}
+	) {
+		var activeRole = "modernization-application";
+		var activeOperation = "build-request";
+		var activeShard = 0;
+		try {
+			for ( var shardIndex = 1; shardIndex <= arguments.appShards.len(); shardIndex++ ) {
+				activeRole = "modernization-application";
+				activeShard = shardIndex;
+				activeOperation = "build-request";
+				var applicationRequest = agentFactory.build( "modernization-application", arguments.runtime, arguments.appShards[ shardIndex ], arguments.budgets );
+				activeOperation = "copy-options";
+				var requestOptions = copyGatewayOptions( arguments.options );
+				requestOptions.role = "modernization-application";
+				requestOptions.budgets = duplicate( arguments.budgets );
+				activeOperation = "fit-package";
+				agentGateway.preflight( applicationRequest, requestOptions );
+			}
+			if ( arguments.maxTasks >= 2 ) {
+				activeRole = "modernization-database";
+				activeShard = 0;
+				activeOperation = "build-request";
+				var databaseRequest = agentFactory.build( "modernization-database", arguments.runtime, arguments.evidence, arguments.budgets );
+				activeOperation = "copy-options";
+				var databaseOptions = copyGatewayOptions( arguments.options );
+				databaseOptions.role = "modernization-database";
+				databaseOptions.budgets = duplicate( arguments.budgets );
+				activeOperation = "fit-package";
+				agentGateway.preflight( databaseRequest, databaseOptions );
+			}
+			return { ok: true };
+		} catch ( any error ) {
+			var diagnostics = exceptionDiagnostics( error );
+			diagnostics.operation = activeOperation;
+			if ( activeShard > 0 ) diagnostics.shard = activeShard;
+			return {
+				ok: false,
+				role: activeRole,
+				message: left( error.message ?: "modernization prompt preflight failed", 500 ),
+				diagnostics: diagnostics
+			};
+		}
+	}
+
+	private struct function exceptionDiagnostics( required any error ) {
+		if ( isStruct( arguments.error.data ?: "" ) ) return duplicate( arguments.error.data );
+		var detail = trim( toString( arguments.error.detail ?: "" ) );
+		if ( len( detail ) && isJSON( detail ) ) {
+			var parsed = jsonDeserialize( detail );
+			if ( isStruct( parsed ) ) return parsed;
+		}
+		return {};
+	}
+
 	/**
 	 * Run application shards over a bounded worker pool sized to
 	 * applicationShardConcurrency. Shards are dispatched one at a time; the
@@ -1803,7 +1920,7 @@ class {
 	) {
 		var rid = arguments.runId;
 		var req = duplicate( arguments.request );
-		var opts = duplicate( arguments.options );
+		var opts = copyGatewayOptions( arguments.options );
 		var gw = agentGateway;
 		var future = asyncRun( () => gw.run( rid, req, opts ), arguments.executorName )
 			.orTimeout( opts.maxDurationMs, "milliseconds" );
@@ -2227,16 +2344,16 @@ class {
 		for ( var route in arguments.routes ) {
 			if ( !isStruct( route ) ) continue;
 			var copy = duplicate( route );
-			var request = isStruct( copy.request ?: "" ) ? copy.request : {};
+			var routeRequest = isStruct( copy.request ?: "" ) ? copy.request : {};
 			// Provider (and repair) output is untrusted and can return an array
 			// where a scalar string is expected (e.g. method: ["GET","POST"]);
 			// coerce defensively before trim() rather than crashing the run.
-			var path = trim( scalarString( copy.path ?: copy.legacyPath ?: request.path ?: "" ) );
+			var path = trim( scalarString( copy.path ?: copy.legacyPath ?: routeRequest.path ?: "" ) );
 			path = replace( path, "\", "/", "all" );
 			if ( len( path ) && left( path, 1 ) != "/" ) path = "/" & path;
 			copy.path = path;
 			if ( !len( trim( scalarString( copy.legacyPath ?: "" ) ) ) ) copy.legacyPath = path;
-			if ( !len( trim( scalarString( copy.method ?: "" ) ) ) ) copy.method = uCase( trim( scalarString( request.method ?: "GET" ) ) );
+			if ( !len( trim( scalarString( copy.method ?: "" ) ) ) ) copy.method = uCase( trim( scalarString( routeRequest.method ?: "GET" ) ) );
 			else copy.method = uCase( trim( scalarString( copy.method ) ) );
 			if ( !structKeyExists( copy, "rollback" ) || !len( trim( scalarString( copy.rollback ?: "" ) ) ) ) {
 				copy.rollback = trim( scalarString( copy.rollbackNote ?: copy.rollbackIntent ?: copy.rollbackPlan ?: "Revert this route to the legacy path and remove the ColdBox mapping." ) );
