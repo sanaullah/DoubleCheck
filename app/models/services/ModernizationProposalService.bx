@@ -100,7 +100,10 @@ class {
 				dbOptions.budgets = budgets;
 				dbOptions.startedAt = getTickCount();
 				dbOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
-				dbOptions.maxRetries = 0;
+				// Database evidence can be dense even for a modest schema. Allow the
+				// gateway's single shrink-and-retry recovery when a provider response
+				// is truncated; the retry remains inside the existing run budgets.
+				dbOptions.maxRetries = 1;
 				dbOptions.role = "modernization-database";
 				var dbResponse = agentGateway.run( arguments.runId, dbRequest, dbOptions );
 				dbPromptProvenance = structKeyExists( dbResponse, "promptProvenance" ) ? dbResponse.promptProvenance : {};
@@ -2172,6 +2175,10 @@ class {
 		polished = resolveInventoryReferences( polished );
 		polished.routeContracts = retainEvidencedRoutes( polished, arguments.errors );
 		polished.roadmapPhases = normalizeRoadmapReferences( polished, arguments.errors );
+		// Roadmap normalization first separates route ids that providers placed in
+		// unitIds; target alias resolution can then safely canonicalize only the
+		// remaining target-unit references.
+		polished = resolveTargetReferences( polished );
 		polished.assumptions = dedupeSimpleValues( polished.assumptions ?: [] );
 		polished.samples = normalizeSamples( polished.samples ?: [], polished.metadata.runtime ?: {} );
 		polished.samples = dedupeById( polished.samples ?: [] );
@@ -2202,6 +2209,148 @@ class {
 		for ( var item in polished.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
 		for ( var item in polished.samples ) ensureIdentity( item, "sample" );
 		return polished;
+	}
+
+	/**
+	 * Application shards invent identifiers independently. Resolve their path,
+	 * source-path, basename, and pre-normalization aliases to the retained target
+	 * unit ids before reference validation. Unknown placement/roadmap aliases are
+	 * preserved as explicit uncertainty rather than dangling ids that flood the
+	 * plan with repetitive referential-integrity blockers.
+	 */
+	private struct function resolveTargetReferences( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var units = isArray( target.units ?: "" ) ? target.units : [];
+		var lookup = buildTargetLookup( units );
+
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( !isStruct( link ) ) continue;
+			var resolvedLinkTarget = resolveTargetToken(
+				link.targetUnitId ?: link.targetId ?: "",
+				link.sourcePath ?: link.sourceFile ?: link.filePath ?: "",
+				lookup
+			);
+			if ( len( resolvedLinkTarget ) ) link.targetUnitId = resolvedLinkTarget;
+		}
+
+		var linkTargets = {};
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( !isStruct( link ) ) continue;
+			var linkId = trim( toString( link.id ?: link.itemId ?: "" ) );
+			var linkTargetId = trim( toString( link.targetUnitId ?: "" ) );
+			if ( len( linkId ) && len( linkTargetId ) ) linkTargets[ linkId ] = linkTargetId;
+		}
+
+		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
+			if ( !isStruct( route ) ) continue;
+			var resolvedRouteTarget = resolveTargetToken(
+				route.targetUnitId ?: route.targetId ?: "",
+				route.sourcePath ?: route.legacyPath ?: "",
+				lookup
+			);
+			if ( !len( resolvedRouteTarget ) ) {
+				var routeLinkId = trim( toString( route.unitLinkId ?: "" ) );
+				if ( len( routeLinkId ) && linkTargets.keyExists( routeLinkId ) ) resolvedRouteTarget = linkTargets[ routeLinkId ];
+			}
+			if ( len( resolvedRouteTarget ) ) route.targetUnitId = resolvedRouteTarget;
+		}
+
+		for ( var collectionName in [ "placements", "contexts", "extracts" ] ) {
+			for ( var grouping in ( isArray( target[ collectionName ] ?: "" ) ? target[ collectionName ] : [] ) ) {
+				if ( !isStruct( grouping ) ) continue;
+				var normalizedIds = [];
+				var unresolvedIds = [];
+				for ( var rawId in ( isArray( grouping.targetUnitIds ?: "" ) ? grouping.targetUnitIds : ( isArray( grouping.unitIds ?: "" ) ? grouping.unitIds : [] ) ) ) {
+					var resolvedGroupId = resolveTargetToken( rawId, "", lookup );
+					if ( len( resolvedGroupId ) ) {
+						if ( !arrayContainsNoCase( normalizedIds, resolvedGroupId ) ) normalizedIds.append( resolvedGroupId );
+					} else if ( len( trim( toString( rawId ) ) ) && !arrayContainsNoCase( unresolvedIds, toString( rawId ) ) ) {
+						unresolvedIds.append( toString( rawId ) );
+					}
+				}
+				grouping.targetUnitIds = normalizedIds;
+				grouping.unitIds = normalizedIds;
+				if ( unresolvedIds.len() ) {
+					grouping.unresolvedTargetUnitIds = unresolvedIds;
+					grouping.validationStatus = "needs-review";
+					grouping.uncertainty = isArray( grouping.uncertainty ?: "" ) ? grouping.uncertainty : [];
+					grouping.uncertainty.append( "Some provider target references could not be matched to retained target units." );
+				}
+			}
+		}
+
+		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
+			if ( !isStruct( phase ) ) continue;
+			var phaseIds = [];
+			var unresolvedPhaseIds = [];
+			for ( var rawPhaseId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : ( isArray( phase.targetUnitIds ?: "" ) ? phase.targetUnitIds : [] ) ) ) {
+				var resolvedPhaseId = resolveTargetToken( rawPhaseId, "", lookup );
+				if ( len( resolvedPhaseId ) ) {
+					if ( !arrayContainsNoCase( phaseIds, resolvedPhaseId ) ) phaseIds.append( resolvedPhaseId );
+				} else if ( len( trim( toString( rawPhaseId ) ) ) ) unresolvedPhaseIds.append( toString( rawPhaseId ) );
+			}
+			phase.unitIds = phaseIds;
+			if ( unresolvedPhaseIds.len() ) phase.unresolvedTargetUnitIds = dedupeSimpleValues( unresolvedPhaseIds );
+		}
+
+		arguments.plan.target = target;
+		return arguments.plan;
+	}
+
+	private struct function buildTargetLookup( required array units ) {
+		var lookup = { byId: {}, aliases: {} };
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var canonicalId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !len( canonicalId ) ) continue;
+			lookup.byId[ canonicalId ] = canonicalId;
+			registerTargetAlias( lookup, canonicalId, canonicalId );
+			for ( var aliasField in [ "targetPath", "pathHint", "sourcePath", "sourceFile", "legacyPath", "filePath" ] ) {
+				if ( len( trim( toString( unit[ aliasField ] ?: "" ) ) ) ) registerTargetAlias( lookup, unit[ aliasField ], canonicalId );
+			}
+		}
+		return lookup;
+	}
+
+	private void function registerTargetAlias( required struct lookup, required any alias, required string canonicalId ) {
+		var normalized = normalizeTargetAlias( arguments.alias );
+		if ( !len( normalized ) ) return;
+		var aliases = [ normalized ];
+		var withoutExtension = reReplaceNoCase( normalized, "\.(?:cfc|cfm|cfml|bx|bxm)$", "" );
+		if ( withoutExtension != normalized ) aliases.append( withoutExtension );
+		if ( findNoCase( "app/", normalized ) == 1 ) aliases.append( removeChars( normalized, 1, 4 ) );
+		if ( findNoCase( "app/", withoutExtension ) == 1 ) aliases.append( removeChars( withoutExtension, 1, 4 ) );
+		var basename = listLast( normalized, "/" );
+		if ( len( basename ) ) {
+			aliases.append( basename );
+			aliases.append( reReplaceNoCase( basename, "\.(?:cfc|cfm|cfml|bx|bxm)$", "" ) );
+		}
+		for ( var aliasKey in aliases ) {
+			if ( !len( aliasKey ) ) continue;
+			if ( !arguments.lookup.aliases.keyExists( aliasKey ) ) arguments.lookup.aliases[ aliasKey ] = [];
+			if ( !arrayContainsNoCase( arguments.lookup.aliases[ aliasKey ], arguments.canonicalId ) ) arguments.lookup.aliases[ aliasKey ].append( arguments.canonicalId );
+		}
+	}
+
+	private string function resolveTargetToken( required any token, required string hintPath, required struct lookup ) {
+		var raw = trim( isStruct( arguments.token ) ? toString( arguments.token.id ?: arguments.token.targetPath ?: arguments.token.path ?: "" ) : toString( arguments.token ) );
+		if ( len( raw ) && arguments.lookup.byId.keyExists( raw ) ) return arguments.lookup.byId[ raw ];
+		for ( var candidate in [ raw, arguments.hintPath ] ) {
+			var normalized = normalizeTargetAlias( candidate );
+			if ( !len( normalized ) ) continue;
+			var keys = [ normalized, reReplaceNoCase( normalized, "\.(?:cfc|cfm|cfml|bx|bxm)$", "" ) ];
+			if ( findNoCase( "app/", normalized ) == 1 ) keys.append( removeChars( normalized, 1, 4 ) );
+			for ( var key in keys ) {
+				if ( arguments.lookup.aliases.keyExists( key ) && arguments.lookup.aliases[ key ].len() == 1 ) return arguments.lookup.aliases[ key ][ 1 ];
+			}
+		}
+		return "";
+	}
+
+	private string function normalizeTargetAlias( required any value ) {
+		var normalized = lCase( replace( trim( toString( arguments.value ) ), "\", "/", "all" ) );
+		while ( find( "//", normalized ) ) normalized = replace( normalized, "//", "/", "all" );
+		return reReplace( normalized, "^\./", "" );
 	}
 
 	private array function normalizeDbTransitions( required any transitions ) {

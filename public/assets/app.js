@@ -65,6 +65,8 @@ const state = {
 	workspace: getCurrentWorkspace(),
 	modernization: {
 		result: null,
+		loading: false,
+		error: "",
 		activePane: "overview",
 		search: "",
 		itemType: "all",
@@ -2066,6 +2068,8 @@ function setRun(run) {
 	if (run?.runKind) state.workspace = run.runKind === "modernize" ? "modernize" : "review";
 	if (run?.id && run.id !== previousRunId && run.runKind === "modernize") {
 		state.modernization.result = null;
+		state.modernization.loading = !state.terminal.has(run.status);
+		state.modernization.error = "";
 		state.modernization.selectedItem = null;
 		state.modernization.selectedPhaseId = "";
 		state.modernization.decisions = {};
@@ -2852,6 +2856,44 @@ function renderModernizationResult(result = {}) {
 	if (!active) return;
 	if (document.querySelector("#results-panel")) document.querySelector("#results-panel").dataset.state = "idle";
 	const hasResult = !!result && Object.keys(result).length > 0;
+	if (state.modernization.loading && !hasResult) {
+		if (elements.modernizationPlanState) {
+			elements.modernizationPlanState.textContent = "Loading plan";
+			elements.modernizationPlanState.dataset.state = "running";
+		}
+		if (elements.modernizationOverview) {
+			elements.modernizationOverview.innerHTML = emptyStateHtml({
+				icon: "working",
+				title: "Loading the saved modernization plan",
+				hint: "Large evidence-backed plans can take a moment. Counts and packaging decisions will appear only after the complete result is available."
+			});
+		}
+		if (elements.modernizationCoverageBanner) {
+			elements.modernizationCoverageBanner.hidden = true;
+			elements.modernizationCoverageBanner.textContent = "";
+		}
+		const solutionHost = document.querySelector("#modernization-solution");
+		if (solutionHost) solutionHost.hidden = true;
+		const architectureHost = document.querySelector("#modernization-architecture");
+		if (architectureHost) architectureHost.hidden = true;
+		const briefHost = document.querySelector("#modernization-brief");
+		if (briefHost) { briefHost.hidden = true; briefHost.innerHTML = ""; }
+		return;
+	}
+	if (state.modernization.error && !hasResult) {
+		if (elements.modernizationPlanState) {
+			elements.modernizationPlanState.textContent = "Plan unavailable";
+			elements.modernizationPlanState.dataset.state = "failed";
+		}
+		if (elements.modernizationOverview) {
+			elements.modernizationOverview.innerHTML = emptyStateHtml({
+				icon: "warning",
+				title: "Could not load the saved modernization plan",
+				hint: state.modernization.error
+			});
+		}
+		return;
+	}
 	if (!state.activeRun && !hasResult) {
 		if (elements.modernizationPlanState) {
 			elements.modernizationPlanState.textContent = "No plan";
@@ -4267,13 +4309,30 @@ function renderFixedFindings(result = {}) {
 }
 
 async function loadResult(runId) {
+	const modernize = state.workspace === "modernize" || state.activeRun?.runKind === "modernize";
+	if (modernize) {
+		state.modernization.loading = true;
+		state.modernization.error = "";
+		renderModernizationResult({});
+	}
 	try {
 		const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/result`);
+		if (state.activeRun?.id && state.activeRun.id !== runId) return null;
+		if (modernize) {
+			state.modernization.loading = false;
+			state.modernization.error = "";
+		}
 		renderResult(payload.data.result);
 		return payload.data.result;
 	} catch (error) {
-		elements.summary.textContent = error.message;
-		elements.summary.dataset.tone = "danger";
+		if (modernize && (!state.activeRun?.id || state.activeRun.id === runId)) {
+			state.modernization.loading = false;
+			state.modernization.error = error.message || "The saved plan request failed.";
+			renderModernizationResult({});
+		} else if (elements.summary) {
+			elements.summary.textContent = error.message;
+			elements.summary.dataset.tone = "danger";
+		}
 		return null;
 	}
 }
@@ -4323,6 +4382,10 @@ function finishRun(run) {
 	state.finishingRunId = run.id;
 	stopStatusPoll();
 	state.closingStream = true;
+	if (run.runKind === "modernize" && !state.modernization.result) {
+		state.modernization.loading = true;
+		state.modernization.error = "";
+	}
 	setRun(run);
 	if (state.eventSource) {
 		state.eventSource.close();
@@ -4345,7 +4408,10 @@ function finishRun(run) {
 		})
 		.finally(() => {
 			loadResult(run.id).then(() => {
-				document.querySelector("#results-panel")?.scrollIntoView({
+				const resultTarget = run.runKind === "modernize"
+					? elements.modernizationResults
+					: document.querySelector("#results-panel");
+				resultTarget?.scrollIntoView({
 					behavior: "smooth",
 					block: "start"
 				});
@@ -5793,7 +5859,10 @@ elements.jumpTrace?.addEventListener("click", () => {
 });
 
 elements.jumpFindings?.addEventListener("click", () => {
-	document.querySelector("#results-panel")?.scrollIntoView({
+	const resultTarget = state.workspace === "modernize"
+		? elements.modernizationResults
+		: document.querySelector("#results-panel");
+	resultTarget?.scrollIntoView({
 		behavior: "smooth",
 		block: "start"
 	});

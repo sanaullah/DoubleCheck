@@ -43,6 +43,32 @@ class extends="testbox.system.BaseSpec" {
 				var result = service.propose( "run-timestamp", { startedAt: getTickCount(), target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
 				expect( result.ok ).toBeTrue( jsonSerialize( result.errors ?: [] ) );
 				expect( gateway.callCount() ).toBe( 4 );
+				var databaseOptions = gateway.optionsHistory().filter( ( item ) => ( item.role ?: "" ) == "modernization-database" );
+				expect( databaseOptions ).toHaveLength( 1 );
+				expect( databaseOptions[ 1 ].maxRetries ).toBe( 1 );
+			} );
+
+			it( "resolves provider path aliases to retained target unit ids before reference validation", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "resolveTargetReferences" );
+				var plan = service.resolveTargetReferences( {
+					target: {
+						units: [ { id: "canonical-bootstrap", targetPath: "app/handlers/ApplicationBootstrap.bx", sourcePath: "legacy/Application.cfm" } ],
+						placements: [ { id: "placement-bootstrap", targetUnitIds: [ "handlers/ApplicationBootstrap.cfc", "phantom-unit" ], uncertainty: [] } ],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [ { id: "link-bootstrap", sourcePath: "legacy/Application.cfm", targetUnitId: "handlers/ApplicationBootstrap.cfc" } ],
+					routeContracts: [ { id: "route-bootstrap", unitLinkId: "link-bootstrap", targetUnitId: "unmatched-route-alias" } ],
+					roadmapPhases: [ { id: "phase-bootstrap", unitIds: [ "ApplicationBootstrap", "phantom-phase-unit" ] } ]
+				} );
+
+				expect( plan.unitLinks[ 1 ].targetUnitId ).toBe( "canonical-bootstrap" );
+				expect( plan.routeContracts[ 1 ].targetUnitId ).toBe( "canonical-bootstrap" );
+				expect( plan.target.placements[ 1 ].targetUnitIds ).toBe( [ "canonical-bootstrap" ] );
+				expect( plan.target.placements[ 1 ].unresolvedTargetUnitIds ).toContain( "phantom-unit" );
+				expect( plan.roadmapPhases[ 1 ].unitIds ).toBe( [ "canonical-bootstrap" ] );
+				expect( plan.roadmapPhases[ 1 ].unresolvedTargetUnitIds ).toContain( "phantom-phase-unit" );
 			} );
 
 			it( "merges role fragments, adds stable identities and sorts deterministically", () => {

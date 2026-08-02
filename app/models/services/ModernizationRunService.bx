@@ -30,7 +30,7 @@ property name="modernizationGateService" inject="ModernizationGateService";
 	// silently restoring noisy construction signals on every rerun — so v3
 	// checkpoints must not
 	// be reusable.
-	variables.pipelineContractVersion = "modernization-pipeline-v5";
+	variables.pipelineContractVersion = "modernization-pipeline-v7";
 
 	/**
 	 * Executes the evidence-first Modernize pipeline, reusing compatible
@@ -364,7 +364,21 @@ property name="modernizationGateService" inject="ModernizationGateService";
 		result.planFingerprint = stored.fingerprint;
 		result.decisions = modernizationRepository.listDecisions( arguments.runId );
 		result.decisionEvents = modernizationRepository.listDecisionEvents( arguments.runId );
-		result.checkpoints = modernizationRepository.getCheckpoints( arguments.runId );
+		// Checkpoint payloads contain cumulative stage snapshots and can be larger
+		// than the final plan many times over. They are execution artifacts, not
+		// part of the normal plan contract. Keep only the timeline metadata on the
+		// result endpoint; trace/debug callers can use the checkpoint repository
+		// directly when they explicitly need a payload.
+		result.checkpoints = modernizationRepository.getCheckpoints( arguments.runId ).map( ( item ) => {
+			return {
+				runId     : item.runId ?: arguments.runId,
+				stage     : item.stage ?: "",
+				status    : item.status ?: "unknown",
+				progress  : val( item.progress ?: 0 ),
+				updatedAt : item.updatedAt ?: "",
+				hasPayload: isStruct( item.payload ?: "" ) && item.payload.count() > 0
+			};
+		} );
 		try {
 			var run = runRepository.find( arguments.runId );
 			if ( !isNull( run ) ) {

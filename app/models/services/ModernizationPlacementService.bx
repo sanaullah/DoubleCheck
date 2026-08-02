@@ -13,7 +13,7 @@ class {
 
 	variables.version = "modernization-placement-v1";
 	variables.planVersion = "modernization-plan-v2";
-	variables.maxPlacements = 16;
+	variables.maxPlacements = 48;
 
 	function init() {
 		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) variables.identityService = new app.models.services.ModernizationIdentityService();
@@ -264,16 +264,24 @@ class {
 		for ( var unitId in unitIds ) if ( !ownerByUnit.keyExists( unitId ) ) unassigned.append( unitId );
 		var gapFilledUnitIds = duplicate( unassigned );
 		if ( unassigned.len() ) {
+			var deterministic = deterministicGapPlacements(
+				unassigned,
+				arguments.units,
+				arguments.plan,
+				arguments.evidence,
+				max( 0, variables.maxPlacements - arguments.placements.len() - 1 )
+			);
+			arguments.placements.append( deterministic.modules, true );
 			var fallback = findMainAppPlacement( arguments.placements );
-			if ( isNull( fallback ) ) {
-				fallback = defaultPlacement( unassigned, arguments.units, arguments.plan, arguments.evidence );
+			if ( deterministic.mainAppUnitIds.len() && isNull( fallback ) ) {
+				fallback = defaultPlacement( deterministic.mainAppUnitIds, arguments.units, arguments.plan, arguments.evidence );
 				arguments.placements.append( fallback );
-			} else {
+			} else if ( deterministic.mainAppUnitIds.len() ) {
 				var mergedIds = normalizeIds( fallback.targetUnitIds ?: [] );
-				for ( var gapUnitId in unassigned ) if ( !mergedIds.contains( gapUnitId ) ) mergedIds.append( gapUnitId );
+				for ( var gapUnitId in deterministic.mainAppUnitIds ) if ( !mergedIds.contains( gapUnitId ) ) mergedIds.append( gapUnitId );
 				fallback.targetUnitIds = mergedIds;
 				fallback.unitIds = fallback.targetUnitIds;
-				fallback.gapFilledUnitIds = gapFilledUnitIds;
+				fallback.gapFilledUnitIds = normalizeIds( ( fallback.gapFilledUnitIds ?: [] ).append( deterministic.mainAppUnitIds, true ) );
 				fallback.coverageSource = "provider-plus-deterministic-gap-fill";
 				fallback.itemFingerprint = stableFingerprint( fallback );
 			}
@@ -295,6 +303,99 @@ class {
 				complete: remainingUnassigned.len() == 0 && duplicates.len() == 0
 			}
 		};
+	}
+
+	/**
+	 * Turn repeated source-directory ownership into conservative ColdBox module
+	 * candidates. This is a packaging hint, not an extraction claim: external
+	 * services remain provider/evidence gated, while shared and small groups stay
+	 * in the main application.
+	 */
+	private struct function deterministicGapPlacements(
+		required array unitIds,
+		required array units,
+		required struct plan,
+		required struct evidence,
+		required numeric moduleLimit
+	) {
+		var allowed = {};
+		for ( var unitId in arguments.unitIds ) allowed[ unitId ] = true;
+		var groups = {};
+		var mainIds = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !len( unitId ) || !allowed.keyExists( unitId ) ) continue;
+			var domainKey = sourceDomainKey( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" );
+			if ( !len( domainKey ) ) {
+				mainIds.append( unitId );
+				continue;
+			}
+			if ( !groups.keyExists( domainKey ) ) groups[ domainKey ] = { domainKey: domainKey, units: [], refs: [] };
+			groups[ domainKey ].units.append( unitId );
+			for ( var ref in normalizeEvidenceRefs( unit.evidenceRefs ?: [] ) ) {
+				if ( groups[ domainKey ].refs.len() < 6 ) groups[ domainKey ].refs.append( ref );
+			}
+		}
+
+		var candidates = groups.keyArray().map( ( key ) => groups[ key ] );
+		candidates.sort( ( a, b ) => {
+			if ( a.units.len() != b.units.len() ) return b.units.len() - a.units.len();
+			return compareNoCase( a.domainKey, b.domainKey );
+		} );
+		var modules = [];
+		for ( var candidate in candidates ) {
+			// A repeated three-unit source boundary is enough to propose a module
+			// review, but never enough to claim an independent service boundary.
+			if ( candidate.units.len() < 3 || modules.len() >= arguments.moduleLimit ) {
+				mainIds.append( candidate.units, true );
+				continue;
+			}
+			var name = humanizeDomainKey( candidate.domainKey );
+			var item = {
+				name: "#name# module candidate",
+				domainKey: candidate.domainKey,
+				purpose: "Keep this repeated feature directory cohesive behind a ColdBox module boundary.",
+				recommendation: "Create a ColdBox module candidate; validate routes, dependencies, and shared data before committing the boundary.",
+				placementType: "coldbox-module",
+				packaging: "coldbox-module",
+				targetUnitIds: duplicate( candidate.units ),
+				unitIds: duplicate( candidate.units ),
+				evidenceRefs: duplicate( candidate.refs ),
+				evidenceBasis: "domain-clustering",
+				provenanceClass: "deterministically-derived",
+				coverageSource: "deterministic-gap-fill",
+				gapFilledUnitIds: duplicate( candidate.units ),
+				stayInMonolith: false,
+				decisionRequired: true,
+				validationStatus: "needs-review",
+				uncertainty: [ "Directory cohesion is observed; runtime, route, dependency, and data ownership still require validation." ],
+				newProposal: true,
+				proposalReason: "Repeated source-directory ownership provides a reviewable module seam."
+			};
+			item.id = stablePlacementId( item, arguments.units );
+			item.itemFingerprint = stableFingerprint( item );
+			modules.append( item );
+		}
+		return { modules: modules, mainAppUnitIds: normalizeIds( mainIds ) };
+	}
+
+	private string function sourceDomainKey( required any sourcePath ) {
+		var path = lCase( replace( trim( toString( arguments.sourcePath ) ), "\", "/", "all" ) );
+		path = reReplace( path, "^\./|/+", "/", "all" );
+		path = reReplace( path, "^/", "" );
+		if ( !len( path ) || reFindNoCase( "(^|/)(application\.|config/|includes?/|layouts?/|interceptors?/|shared/|common/)", path ) ) return "";
+		var parts = listToArray( path, "/" );
+		if ( parts.len() < 2 ) return "";
+		var first = parts[ 1 ];
+		if ( [ "web", "weboffice", "legacy", "src" ].contains( first ) && parts.len() >= 3 ) return first & "/" & parts[ 2 ];
+		return first;
+	}
+
+	private string function humanizeDomainKey( required string domainKey ) {
+		var value = replace( listLast( arguments.domainKey, "/" ), "_", " ", "all" );
+		value = replace( value, "-", " ", "all" );
+		return reReplace( trim( value ), "\b([a-z])", "\u\1", "all" );
 	}
 
 	private struct function defaultPlacement( required array unitIds, required array units, required struct plan, required struct evidence ) {

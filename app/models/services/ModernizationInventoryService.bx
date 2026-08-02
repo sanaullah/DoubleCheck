@@ -6,7 +6,8 @@
 @singleton
 class {
 	property name="identityService" inject="ModernizationIdentityService";
-	variables.version       = "cfml-inventory-conservative-v4";
+	property name="maxDeepFiles" inject="coldbox:setting:modernizeInventoryMaxDeepFiles";
+	variables.version       = "cfml-inventory-conservative-v5";
 	variables.patternCache  = {};
 
 	struct function build( required any scan ) {
@@ -17,8 +18,15 @@ class {
 		var routeEvidence = [];
 		var unresolved = [];
 		var cfmlFileCount = 0;
+		var deepFileCount = 0;
+		var shallowFileCount = 0;
 		var totalBytes = 0;
 		var resolutionIndex = buildResolutionIndex( files );
+		var configuredDeepLimit = isStruct( arguments.scan ) && isNumeric( arguments.scan.maxDeepFiles ?: "" )
+			? val( arguments.scan.maxDeepFiles )
+			: val( variables.maxDeepFiles ?: 300 );
+		var deepLimit = max( 1, configuredDeepLimit );
+		var deepPaths = selectDeepPaths( files, deepLimit );
 		for ( var file in files ) {
 			if ( !isStruct( file ) ) continue;
 			var path = normalizePath( file.filePath ?: file.path ?: "" );
@@ -26,9 +34,14 @@ class {
 			var isCfml = ( file.language ?: "" ) == "ColdFusion" || listFindNoCase( "cfm,cfc", extension );
 			if ( !isCfml ) continue;
 			cfmlFileCount++;
-			var content = toString( file.content ?: "" );
-			var lines = structKeyExists( file, "lines" ) && isArray( file.lines ) ? file.lines : listToArray( normalizeText( content ), char( 10 ), true, true );
-			if ( !lines.len() ) lines = [ "" ];
+			var isDeep = deepPaths.keyExists( lCase( path ) );
+			var content = structKeyExists( file, "content" ) ? toString( file.content ) : "";
+			var lineCount = val( file.lineCount ?: 0 );
+			if ( lineCount <= 0 ) {
+				lineCount = structKeyExists( file, "lines" ) && isArray( file.lines )
+					? max( 1, file.lines.len() )
+					: max( 1, listToArray( normalizeText( content ), char( 10 ), true, true ).len() );
+			}
 			totalBytes += val( file.sizeBytes ?: len( content ) );
 			inventoryFiles.append(
 				{
@@ -36,21 +49,29 @@ class {
 					language    : "CFML",
 					contentHash : file.contentHash ?: lCase( hash( content, "SHA-256" ) ),
 					sizeBytes   : val( file.sizeBytes ?: len( content ) ),
-					lineCount   : lines.len(),
-					extractionMethod: "regex-conservative-v1"
+					lineCount   : lineCount,
+					extractionMethod: isDeep ? "regex-conservative-v1" : "source-metadata-v1",
+					detailCoverage: isDeep ? "deep" : "structural"
 				}
 			);
 			var unitKind = classifyUnit( path );
 			if ( extension == "cfm" || unitKind == "custom-tag" ) {
-				units.append( makeUnit( unitKind == "custom-tag" ? "custom-tag" : "page", path, listFirst( listLast( path, "/" ), "." ), 1, lines.len(), "regex-conservative-v1", file, [] ) );
+				units.append( makeUnit( unitKind == "custom-tag" ? "custom-tag" : "page", path, listFirst( listLast( path, "/" ), "." ), 1, lineCount, isDeep ? "regex-conservative-v1" : "source-metadata-v1", file, [], isDeep ) );
 			}
 			if ( unitKind == "application" ) {
-				units.append( makeUnit( "application", path, "Application.cfc", 1, lines.len(), "regex-conservative-v1", file, [] ) );
+				units.append( makeUnit( "application", path, "Application.cfc", 1, lineCount, isDeep ? "regex-conservative-v1" : "source-metadata-v1", file, [], isDeep ) );
 			} else if ( extension == "cfc" ) {
 				// Keep component files visible even when their methods use syntax the
 				// conservative extractor cannot parse. Method units are added below.
-				units.append( makeUnit( "component", path, listFirst( listLast( path, "/" ), "." ), 1, lines.len(), "regex-conservative-v1", file, [] ) );
+				units.append( makeUnit( "component", path, listFirst( listLast( path, "/" ), "." ), 1, lineCount, isDeep ? "regex-conservative-v1" : "source-metadata-v1", file, [], isDeep ) );
 			}
+			if ( !isDeep ) {
+				shallowFileCount++;
+				continue;
+			}
+			deepFileCount++;
+			var lines = structKeyExists( file, "lines" ) && isArray( file.lines ) ? file.lines : listToArray( normalizeText( content ), char( 10 ), true, true );
+			if ( !lines.len() ) lines = [ "" ];
 			if ( extension == "cfc" ) {
 				var declaration = extractComponentDeclaration( lines );
 				var declarationEvidence = evidence( path, declaration.declarationLine, lines[ declaration.declarationLine ] ?: "", file );
@@ -158,6 +179,8 @@ class {
 				}
 			}
 		}
+		var dependencyOccurrences = dependencies.len();
+		dependencies = compactDependencies( dependencies );
 		units.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.symbolName, b.filePath & ":" & b.startLine & ":" & b.symbolName ) );
 		dependencies.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.kind & ":" & a.target, b.filePath & ":" & b.startLine & ":" & b.kind & ":" & b.target ) );
 		unresolved.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.startLine & ":" & a.kind, b.filePath & ":" & b.startLine & ":" & b.kind ) );
@@ -174,8 +197,14 @@ class {
 			status        : noScope ? "NoModernizationScope" : "ready",
 			summary       : {
 				cfmlFiles: cfmlFileCount,
+				deepFiles: deepFileCount,
+				shallowFiles: shallowFileCount,
+				structureComplete: true,
+				detailCoverage: shallowFileCount > 0 ? "bounded" : "complete",
 				unitCount: units.len(),
 				dependencyCount: dependencies.len(),
+				dependencyOccurrences: dependencyOccurrences,
+				dependencyGroupsCollapsed: max( 0, dependencyOccurrences - dependencies.len() ),
 				unresolvedCount: unresolved.len(),
 				totalBytes: totalBytes
 			},
@@ -267,11 +296,14 @@ class {
 		required numeric endLine,
 		required string method,
 		required struct file,
-		array evidenceKinds = []
+		array evidenceKinds = [],
+		boolean inspectSource = true
 	) {
 		var signature = arguments.name;
 		var id = stableItemId( "legacy-unit", "#arguments.path#:#arguments.startLine#:#arguments.name#:#arguments.kind#" );
-		var unitLines = structKeyExists( arguments.file, "lines" ) && isArray( arguments.file.lines ) ? arguments.file.lines : listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true );
+		var unitLines = arguments.inspectSource
+			? ( structKeyExists( arguments.file, "lines" ) && isArray( arguments.file.lines ) ? arguments.file.lines : listToArray( normalizeText( arguments.file.content ?: "" ), char( 10 ), true, true ) )
+			: [];
 		var unitLine = ( unitLines.len() && arguments.startLine <= unitLines.len() ) ? unitLines[ arguments.startLine ] : "";
 		var access = "";
 		var accessMatch = variables.javaPatternMatcher( "(?i)^\\s*(public|private|protected|remote)\\b", unitLine );
@@ -312,6 +344,83 @@ class {
 			record.resolution = arguments.resolution.resolution ?: "path";
 		}
 		return record;
+	}
+
+	/**
+	 * Select a deterministic evidence-rich subset for expensive line analysis.
+	 * Every CFML file still receives a structural inventory record and base unit.
+	 */
+	private struct function selectDeepPaths( required array files, required numeric limit ) {
+		var candidates = [];
+		for ( var file in arguments.files ) {
+			if ( !isStruct( file ) ) continue;
+			var path = normalizePath( file.filePath ?: file.path ?: "" );
+			var extension = lCase( listLast( path, "." ) );
+			if ( !len( path ) || !( ( file.language ?: "" ) == "ColdFusion" || listFindNoCase( "cfm,cfc", extension ) ) ) continue;
+			var lowerPath = lCase( path );
+			var score = extension == "cfc" ? 100 : 10;
+			if ( reFindNoCase( "(^|/)application[.]cfc$", lowerPath ) ) score = 140;
+			else if ( reFindNoCase( "(^|/)(config|routes?|router|bootstrap|security|auth)(/|[.])", lowerPath ) ) score = max( score, 120 );
+			else if ( reFindNoCase( "(^|/)(index|default|home)[.]cfm$", lowerPath ) ) score = max( score, 80 );
+			candidates.append( { path: path, key: lowerPath, domain: inventoryDomain( lowerPath ), score: score } );
+		}
+		candidates.sort( ( a, b ) => a.score == b.score ? compareNoCase( a.path, b.path ) : ( a.score > b.score ? -1 : 1 ) );
+		var selected = {};
+		var selectedCount = 0;
+		// Components and framework/application seams establish the dependency spine.
+		for ( var candidate in candidates ) {
+			if ( selectedCount >= arguments.limit ) break;
+			if ( candidate.score < 100 ) continue;
+			selected[ candidate.key ] = true;
+			selectedCount++;
+		}
+		// Preserve at least one detailed page per top-level application domain.
+		var representedDomains = {};
+		for ( var candidate in candidates ) {
+			if ( selectedCount >= arguments.limit ) break;
+			if ( selected.keyExists( candidate.key ) || representedDomains.keyExists( candidate.domain ) ) continue;
+			selected[ candidate.key ] = true;
+			representedDomains[ candidate.domain ] = true;
+			selectedCount++;
+		}
+		for ( var candidate in candidates ) {
+			if ( selectedCount >= arguments.limit ) break;
+			if ( selected.keyExists( candidate.key ) ) continue;
+			selected[ candidate.key ] = true;
+			selectedCount++;
+		}
+		return selected;
+	}
+
+	/** Collapse repeated line-level dependencies into evidence-rich file groups. */
+	private array function compactDependencies( required array dependencies ) {
+		var grouped = {};
+		for ( var item in arguments.dependencies ) {
+			var key = lCase( trim( item.kind ?: "" ) & "|" & normalizePath( item.filePath ?: "" ) & "|" & trim( item.target ?: "" ) & "|" & normalizePath( item.targetFile ?: "" ) );
+			if ( !grouped.keyExists( key ) ) {
+				var first = duplicate( item );
+				first.occurrenceCount = 1;
+				first.evidenceRefs = isArray( first.evidenceRefs ?: "" ) ? first.evidenceRefs : [];
+				first.id = stableItemId( "dependency", key );
+				grouped[ key ] = first;
+				continue;
+			}
+			grouped[ key ].occurrenceCount++;
+			for ( var ref in item.evidenceRefs ?: [] ) {
+				if ( grouped[ key ].evidenceRefs.len() >= 6 ) break;
+				var refKey = "#ref.filePath ?: ''#:#ref.startLine ?: 0#:#ref.endLine ?: 0#";
+				if ( !grouped[ key ].evidenceRefs.some( ( existing ) => "#existing.filePath ?: ''#:#existing.startLine ?: 0#:#existing.endLine ?: 0#" == refKey ) ) grouped[ key ].evidenceRefs.append( ref );
+			}
+		}
+		var output = grouped.valueArray();
+		output.sort( ( a, b ) => compareNoCase( a.filePath & ":" & a.kind & ":" & a.target, b.filePath & ":" & b.kind & ":" & b.target ) );
+		return output;
+	}
+
+	private string function inventoryDomain( required string path ) {
+		var parts = listToArray( reReplace( arguments.path, "^/+|/+$", "", "all" ), "/" );
+		if ( !parts.len() ) return "root";
+		return parts.len() >= 2 ? parts[ 1 ] & "/" & parts[ 2 ] : parts[ 1 ];
 	}
 
 	private struct function buildResolutionIndex( required array files ) {

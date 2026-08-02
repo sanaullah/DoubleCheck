@@ -292,11 +292,16 @@ uses SQLite WAL mode for its local worker queue.
 | `DOUBLECHECK_SCAN_MAX_FILE_BYTES` | `524288` | Skip a single file if larger (scan gate, not LLM) |
 | `DOUBLECHECK_SCAN_MAX_BYTES` | `10485760` | Total indexed bytes |
 | `DOUBLECHECK_SCAN_MAX_FILES` | `250` | Max indexed files |
+| `DOUBLECHECK_MODERNIZE_SCAN_MAX_FILES` | `10000` | Modernization-only indexed file limit |
+| `DOUBLECHECK_MODERNIZE_SCAN_MAX_BYTES` | `67108864` | Modernization-only total indexed bytes |
+| `DOUBLECHECK_MODERNIZE_SCAN_MAX_ENTRIES` | `30000` | Modernization-only discovery entry limit |
+| `DOUBLECHECK_MODERNIZE_SCAN_MAX_JAVASCRIPT_FILES` | `500` | Bound JavaScript bodies while keeping CFML/BoxLang first |
+| `DOUBLECHECK_MODERNIZE_INVENTORY_MAX_DEEP_FILES` | `300` | Deep symbol/route/dependency extraction sample; every CFML file remains structurally indexed |
 | `AI_CONTEXT_WINDOW` | local `8192` / cloud `128000` | Model context window |
 | `DOUBLECHECK_PLAN_MAX_CONTEXT_CHARACTERS` | `30000` | Specialist context-pack budget |
 | `DOUBLECHECK_SPECIALIST_BUDGET_ENFORCEMENT_ENABLED` | `false` | Enforce per-task cost estimate, tool call limit, repeated-call dedup, and tool output cap. Off by default — these were rejecting specialist tasks/tool calls too aggressively |
 
-Raising scan limits indexes more source for deterministic rules. Specialists still receive bounded context packs; raise plan/token/`AI_CONTEXT_WINDOW` knobs separately if prompts hit context errors.
+Modernize uses its own larger scan limits so a whole legacy estate is not silently reduced to the ordinary 250-file review window. CFML/BoxLang files are prioritized; JavaScript source bodies have a separate default cap to keep large asset trees from exhausting desktop memory, and coverage reports the omitted candidates. Every indexed CFML file receives a structural inventory record and base modernization unit. Detailed symbol, route, and dependency extraction is bounded to a deterministic sample (components, framework seams, and representative application domains first), and the result labels that distinction explicitly. Raising scan limits indexes more source for deterministic rules. Specialists still receive bounded context packs; raise plan/token/`AI_CONTEXT_WINDOW` knobs separately if prompts hit context errors.
 
 ---
 

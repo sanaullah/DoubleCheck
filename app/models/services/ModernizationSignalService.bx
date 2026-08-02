@@ -1,15 +1,16 @@
 /** Extracts deterministic modernization seams before any LLM call. */
 @singleton
 class {
-	variables.version = "modernization-signals-v2";
+	variables.version = "modernization-signals-v3";
 
 	struct function build(required struct inventory, struct schemaPack = {}, struct evidence = {}) {
 		var signals = [];
-		var add = ( string id, string group, string meaning, any refs, numeric confidence = 1 ) => {
+		var add = ( string id, string group, string meaning, any refs, numeric confidence = 1, numeric occurrenceCount = 1 ) => {
 			var evidenceRefs = isArray( refs ) ? refs : [ refs ];
-			signals.append( { id: stableHash( "#id#|#jsonSerialize( evidenceRefs )#" ), signalId: id, group: group, meaning: meaning, evidenceRefs: evidenceRefs, confidence: confidence } );
+			signals.append( { id: stableHash( "#id#|#jsonSerialize( evidenceRefs )#" ), signalId: id, group: group, meaning: meaning, evidenceRefs: evidenceRefs, confidence: confidence, occurrenceCount: max( 1, occurrenceCount ) } );
 		};
 		for ( var dep in arguments.inventory.dependencies ?: [] ) {
+			var signalCountBeforeDependency = signals.len();
 			var ref = { filePath: dep.filePath ?: "", startLine: dep.startLine ?: 0, endLine: dep.endLine ?: dep.startLine ?: 0, target: dep.target ?: "" };
 			switch ( lCase( dep.kind ?: "" ) ) {
 				case "http": add( "http.outbound", "outbound-integration", "Outbound HTTP integration", ref ); break;
@@ -30,6 +31,7 @@ class {
 				case "scope.client": add( "scope.client", "security-session", "Client scope coupling", ref ); break;
 				case "security-session-gate": add( "security.session-gate", "security-session", "Session or authentication gate", ref ); break;
 			}
+			if ( signals.len() > signalCountBeforeDependency ) signals[ signals.len() ].occurrenceCount = max( 1, val( dep.occurrenceCount ?: 1 ) );
 		}
 		for ( var unresolved in arguments.inventory.unresolved ?: [] ) {
 			var ref = { filePath: unresolved.filePath ?: "", startLine: unresolved.startLine ?: 0, endLine: unresolved.endLine ?: unresolved.startLine ?: 0, evidence: unresolved.evidence ?: "" };
@@ -71,12 +73,35 @@ class {
 			signals[ signalIndex ].unitIds = owners;
 			signals[ signalIndex ].unitId = owners.len() ? owners[ 1 ] : "";
 		}
+		signals = compactSignals( signals );
 		var groups = {};
 		for ( var item in signals ) {
 			if ( !groups.keyExists( item.group ) ) groups[ item.group ] = [];
 			groups[ item.group ].append( item );
 		}
 		return { version: variables.version, signals: signals, groups: groups, stackHints: stackHints, count: signals.len(), fingerprint: stableHash( variables.version & "|" & jsonSerialize( signals ) ) };
+	}
+
+	private array function compactSignals( required array signals ) {
+		var grouped = {};
+		for ( var item in arguments.signals ) {
+			var refs = item.evidenceRefs ?: [];
+			var path = refs.len() && isStruct( refs[ 1 ] ) ? lCase( refs[ 1 ].filePath ?: "" ) : "";
+			var key = lCase( item.signalId ?: "" ) & "|" & path & "|" & ( item.unitIds ?: [] ).toList( "," );
+			if ( !grouped.keyExists( key ) ) {
+				grouped[ key ] = duplicate( item );
+				continue;
+			}
+			grouped[ key ].occurrenceCount += max( 1, val( item.occurrenceCount ?: 1 ) );
+			for ( var ref in refs ) {
+				if ( grouped[ key ].evidenceRefs.len() >= 6 ) break;
+				var refKey = "#ref.filePath ?: ''#:#ref.startLine ?: 0#:#ref.endLine ?: 0#";
+				if ( !grouped[ key ].evidenceRefs.some( ( existing ) => "#existing.filePath ?: ''#:#existing.startLine ?: 0#:#existing.endLine ?: 0#" == refKey ) ) grouped[ key ].evidenceRefs.append( ref );
+			}
+		}
+		var output = grouped.valueArray();
+		output.sort( ( a, b ) => compareNoCase( a.signalId & ":" & ( a.unitId ?: "" ) & ":" & a.id, b.signalId & ":" & ( b.unitId ?: "" ) & ":" & b.id ) );
+		return output;
 	}
 
 	/**

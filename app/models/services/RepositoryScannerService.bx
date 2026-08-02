@@ -14,6 +14,14 @@ class {
 
 	property name="maxEntries" inject="coldbox:setting:scanMaxEntries";
 
+	property name="modernizeMaxFiles" inject="coldbox:setting:modernizeScanMaxFiles";
+
+	property name="modernizeMaxBytes" inject="coldbox:setting:modernizeScanMaxBytes";
+
+	property name="modernizeMaxEntries" inject="coldbox:setting:modernizeScanMaxEntries";
+
+	property name="modernizeMaxJavaScriptFiles" inject="coldbox:setting:modernizeScanMaxJavaScriptFiles";
+
 	property name="gitRepositoryService" inject="GitRepositoryService";
 
 	property name="supportedLanguageService" inject="SupportedLanguageService";
@@ -80,11 +88,28 @@ class {
 	) {
 		var root = createObject( "java", "java.io.File" ).init( arguments.projectPath ).getCanonicalFile();
 		var supportedExtensions = supportedLanguageService.extensionMap();
+		var isModernize = arguments.options.modernize ?: false;
+		var effectiveMaxFiles = numericLimit(
+			arguments.options.maxFiles ?: ( isModernize ? ( variables.modernizeMaxFiles ?: variables.maxFiles ) : variables.maxFiles ),
+			variables.maxFiles
+		);
+		var effectiveMaxBytes = numericLimit(
+			arguments.options.maxBytes ?: ( isModernize ? ( variables.modernizeMaxBytes ?: variables.maxBytes ) : variables.maxBytes ),
+			variables.maxBytes
+		);
+		var effectiveMaxEntries = numericLimit(
+			arguments.options.maxEntries ?: ( isModernize ? ( variables.modernizeMaxEntries ?: variables.maxEntries ) : variables.maxEntries ),
+			variables.maxEntries
+		);
+		var effectiveMaxJavaScriptFiles = isModernize
+			? numericLimit( arguments.options.maxJavaScriptFiles ?: ( variables.modernizeMaxJavaScriptFiles ?: 500 ), 500 )
+			: effectiveMaxFiles;
 		var candidateResult = candidatePaths(
 			root,
 			arguments.mode,
 			arguments.baseRevision,
-			arguments.headRevision
+			arguments.headRevision,
+			effectiveMaxEntries
 		);
 		var files = [];
 		var totalBytes = 0;
@@ -97,6 +122,7 @@ class {
 			limit     : 0
 		};
 		var candidateLanguageCounts = {};
+		var indexedJavaScriptFiles = 0;
 		var prioritizedPaths = prioritizeCandidatePaths(
 			candidateResult.paths,
 			arguments.options.priorityExtensions ?: ( arguments.options.modernize ?: false ? [ "cfm", "cfc", "bx", "bxm", "bxs" ] : [] )
@@ -111,13 +137,18 @@ class {
 			}
 		}
 
+		var candidateIndex = 0;
 		for ( var candidatePath in prioritizedPaths ) {
+			candidateIndex++;
+			if ( isModernize && candidateIndex % 25 == 0 && isCustomFunction( arguments.options.checkCancellation ?: "" ) ) {
+				arguments.options.checkCancellation();
+			}
 			var extensionHint = lCase( listLast( replace( toString( candidatePath ), "\\", "/", "all" ), "." ) );
 			if ( len( extensionHint ) && supportedExtensions.keyExists( extensionHint ) ) {
 				var languageHint = supportedExtensions[ extensionHint ];
 				candidateLanguageCounts[ languageHint ] = val( candidateLanguageCounts[ languageHint ] ?: 0 ) + 1;
 			}
-			if ( files.len() >= maxFiles ) {
+			if ( files.len() >= effectiveMaxFiles ) {
 				skipped.limit++;
 				continue;
 			}
@@ -145,6 +176,10 @@ class {
 				var extension = lCase( listLast( relativePath, "." ) );
 				if ( !supportedExtensions.keyExists( extension ) ) {
 					skipped.unsupported++;
+					continue;
+				}
+				if ( isModernize && supportedExtensions[ extension ] == "JavaScript" && indexedJavaScriptFiles >= effectiveMaxJavaScriptFiles ) {
+					skipped.limit++;
 					continue;
 				}
 
@@ -175,7 +210,7 @@ class {
 					}
 					content = fileRead( candidate.getPath(), "UTF-8" );
 				}
-				if ( totalBytes + sizeBytes > maxBytes ) {
+				if ( totalBytes + sizeBytes > effectiveMaxBytes ) {
 					skipped.oversized++;
 					continue;
 				}
@@ -200,10 +235,17 @@ class {
 					language    : supportedExtensions[ extension ],
 					contentHash : lCase( hash( content, "SHA-256" ) ),
 					sizeBytes   : sizeBytes,
-					lineCount   : max( 1, lines.len() ),
-					content     : content,
-					lines       : lines
+					lineCount   : max( 1, lines.len() )
 				};
+				// A line array per file has extreme object overhead across a large
+				// estate. Modernize retains one source string and its line count; the
+				// inventory/context stages split one file at a time and release it.
+				if ( isModernize ) {
+					fileEntry.content = content;
+				} else {
+					fileEntry.content = content;
+					fileEntry.lines = lines;
+				}
 				var changedLines = changedLinesFor(
 					root,
 					relativePath,
@@ -215,6 +257,8 @@ class {
 					fileEntry.changedLines = changedLines;
 				}
 				files.append( fileEntry );
+				if ( isModernize ) lines = [];
+				if ( supportedExtensions[ extension ] == "JavaScript" ) indexedJavaScriptFiles++;
 				totalBytes += sizeBytes;
 			} catch (any error) {
 				skipped.unreadable++;
@@ -254,6 +298,7 @@ class {
 			baseRevision      : candidateResult.baseRevision ?: "",
 			headRevision      : candidateResult.headRevision ?: "",
 			repositoryRevision: candidateResult.repositoryRevision ?: "",
+			limits            : { maxFiles: effectiveMaxFiles, maxBytes: effectiveMaxBytes, maxEntries: effectiveMaxEntries, maxJavaScriptFiles: effectiveMaxJavaScriptFiles },
 			error             : candidateResult.error ?: ""
 		};
 	}
@@ -367,10 +412,12 @@ class {
 		required any root,
 		required string mode,
 		required string baseRevision,
-		required string headRevision
+		required string headRevision,
+		numeric entryLimit = 0
 	) {
+		var effectiveEntryLimit = arguments.entryLimit > 0 ? int( arguments.entryLimit ) : int( variables.maxEntries );
 		if ( lCase( arguments.mode ) == "working-tree" ) {
-			var changes = gitRepositoryService.workingTreePaths( arguments.root, maxEntries );
+			var changes = gitRepositoryService.workingTreePaths( arguments.root, effectiveEntryLimit );
 			if ( changes.available ) {
 				return {
 					paths             : changes.paths,
@@ -392,7 +439,7 @@ class {
 					root         = arguments.root,
 					baseRevision = arguments.baseRevision,
 					headRevision = arguments.headRevision,
-					maxEntries   = maxEntries
+					maxEntries   = effectiveEntryLimit
 				);
 			return {
 				paths             : revisionDiff.paths,
@@ -407,7 +454,7 @@ class {
 			};
 		}
 
-		var gitFiles = gitRepositoryService.fullPaths( arguments.root, maxEntries );
+		var gitFiles = gitRepositoryService.fullPaths( arguments.root, effectiveEntryLimit );
 		if ( gitFiles.available ) {
 			return {
 				paths             : gitFiles.paths,
@@ -417,10 +464,11 @@ class {
 				repositoryRevision: gitFiles.repositoryRevision
 			};
 		}
-		return discoverPaths( arguments.root );
+		return discoverPaths( arguments.root, effectiveEntryLimit );
 	}
 
-	private struct function discoverPaths( required any root ) {
+	private struct function discoverPaths( required any root, numeric entryLimit = 0 ) {
+		var effectiveEntryLimit = arguments.entryLimit > 0 ? int( arguments.entryLimit ) : int( variables.maxEntries );
 		var supportedExtensions = supportedLanguageService.extensionMap();
 		var directories = [ arguments.root];
 		var paths = [];
@@ -428,7 +476,7 @@ class {
 		var inspectedEntries = 0;
 		var truncated = false;
 
-		while ( directories.len() && inspectedEntries < maxEntries ) {
+		while ( directories.len() && inspectedEntries < effectiveEntryLimit ) {
 			var directory = directories[ 1 ];
 			arrayDeleteAt( directories, 1 );
 			var canonicalDirectory = directory.getCanonicalFile();
@@ -445,7 +493,7 @@ class {
 			);
 			for ( var row = 1; row <= listing.recordCount; row++ ) {
 				inspectedEntries++;
-				if ( inspectedEntries > maxEntries ) {
+				if ( inspectedEntries > effectiveEntryLimit ) {
 					truncated = true;
 					break;
 				}
@@ -484,6 +532,12 @@ class {
 			gitAvailable      : directoryExists( arguments.root.getPath() & "/.git" ),
 			discoveryTruncated: truncated
 		};
+	}
+
+	private numeric function numericLimit( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) && val( arguments.value ) > 0
+			? int( arguments.value )
+			: max( 1, int( arguments.fallback ) );
 	}
 
 	private boolean function shouldIgnore( required string relativePath ) {

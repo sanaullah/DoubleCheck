@@ -15,7 +15,7 @@ class extends="testbox.system.BaseSpec" {
 					}
 				};
 				var currentCheckpoint = duplicate( oldCheckpoint );
-				currentCheckpoint.payload.provenance.pipelineContractVersion = "modernization-pipeline-v5";
+				currentCheckpoint.payload.provenance.pipelineContractVersion = "modernization-pipeline-v7";
 
 				var oldResult = service.reusableCheckpoint( [ oldCheckpoint ], "inventory", "input-fp", "source-fp" );
 				var currentResult = service.reusableCheckpoint( [ currentCheckpoint ], "inventory", "input-fp", "source-fp" );
@@ -269,6 +269,31 @@ class extends="testbox.system.BaseSpec" {
 				var result = service.getResult( "run-no-entity" );
 				expect( enrichCalled ).toBeFalse();
 				expect( result.schemaVersion ).toBe( "modernization-plan-v1" );
+			} );
+
+			it( "returns checkpoint summaries without cumulative payload snapshots", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository( checkpoints = [ {
+					runId: "run-checkpoint-summary",
+					stage: "proposal",
+					status: "succeeded",
+					progress: 72,
+					updatedAt: "2026-08-02T00:00:00Z",
+					payload: { inventory: { units: [ { id: "large-unit", source: repeatString( "x", 10000 ) } ] } }
+				} ] );
+				repository.savePlan( "run-checkpoint-summary", { schemaVersion: "modernization-plan-v2", target: { units: [], placements: [] }, roadmapPhases: [] } );
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				service.modernizationRiskService = { enrich: ( plan, projectPath, tenantId, projectId ) => plan };
+				service.runRepository = { find: ( runId ) => javacast( "null", "" ) };
+
+				var result = service.getResult( "run-checkpoint-summary" );
+
+				expect( result.checkpoints ).toHaveLength( 1 );
+				expect( result.checkpoints[ 1 ].stage ).toBe( "proposal" );
+				expect( result.checkpoints[ 1 ].progress ).toBe( 72 );
+				expect( result.checkpoints[ 1 ].hasPayload ).toBeTrue();
+				expect( result.checkpoints[ 1 ] ).notToHaveKey( "payload" );
+				expect( len( jsonSerialize( result.checkpoints ) ) ).toBeLT( 500 );
 			} );
 		} );
 	}

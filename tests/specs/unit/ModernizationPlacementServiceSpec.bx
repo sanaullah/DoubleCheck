@@ -54,6 +54,46 @@ class extends="testbox.system.BaseSpec" {
 				expect( plan.placementCoverage.duplicateUnitIds ).toContain( "tu-a" );
 				expect( plan.placementCoverage.complete ).toBeFalse();
 			} );
+
+			it( "retains more than sixteen provider capability placements", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var units = [];
+				var placements = [];
+				for ( var index = 1; index <= 18; index++ ) {
+					units.append( { id: "tu-#index#" } );
+					placements.append( { domainKey: "domain-#index#", placementType: "coldbox-module", targetUnitIds: [ "tu-#index#" ], rationale: "Cohesive feature boundary" } );
+				}
+				var plan = service.canonicalize( { version: "modernization-plan-v2", target: { units: units, placements: placements } } );
+				expect( plan.target.placements ).toHaveLength( 18 );
+				expect( plan.placementCoverage.complete ).toBeTrue();
+			} );
+
+			it( "proposes ColdBox modules for repeated directory domains while keeping shared work in the main app", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = service.canonicalize( {
+					version: "modernization-plan-v2",
+					target: {
+						units: [
+							{ id: "calendar-page", sourcePath: "weboffice/calendar/index.cfm" },
+							{ id: "calendar-service", sourcePath: "weboffice/calendar/calendar.cfc" },
+							{ id: "calendar-view", sourcePath: "weboffice/calendar/day.cfm" },
+							{ id: "shared-config", sourcePath: "config/settings.cfm" },
+							{ id: "small-one", sourcePath: "web/tiny/one.cfm" },
+							{ id: "small-two", sourcePath: "web/tiny/two.cfm" }
+						],
+						placements: []
+					}
+				} );
+				var calendar = plan.target.placements.filter( ( item ) => ( item.domainKey ?: "" ) == "weboffice/calendar" );
+				expect( calendar ).toHaveLength( 1 );
+				expect( calendar[ 1 ].placementType ).toBe( "coldbox-module" );
+				expect( calendar[ 1 ].decisionRequired ).toBeTrue();
+				var main = plan.target.placements.filter( ( item ) => item.placementType == "main-app" );
+				expect( main ).toHaveLength( 1 );
+				expect( main[ 1 ].targetUnitIds ).toInclude( "shared-config" );
+				expect( main[ 1 ].targetUnitIds ).toInclude( "small-one" );
+				expect( plan.target.placements.filter( ( item ) => item.placementType == "external-service" ) ).toBeEmpty();
+			} );
 		} );
 	}
 }

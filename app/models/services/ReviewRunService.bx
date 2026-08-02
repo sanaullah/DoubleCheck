@@ -472,6 +472,23 @@ class {
 		if ( isTerminal( run.getStatus() ) ) {
 			return run;
 		}
+		// A queued run, or a run whose local executor disappeared during an app
+		// restart, has no in-process work left to interrupt. Finish cancellation
+		// immediately instead of leaving a permanent "running / cancellation
+		// requested" record that will resume its scan on the next startup.
+		if ( !variables.activeFutures.containsKey( arguments.id ) ) {
+			var cancelled = runRepository.updateState(
+				id = arguments.id,
+				status = "cancelled",
+				progress = 100,
+				currentPhase = "cancelled",
+				message = "Run cancelled",
+				cancelRequestedAt = timestamp(),
+				completedAt = timestamp()
+			);
+			eventService.publish( arguments.id, "run.cancelled", { run: cancelled.getMemento() } );
+			return cancelled;
+		}
 
 		var updated = runRepository.updateState(
 				id                = arguments.id,
@@ -540,8 +557,13 @@ class {
 				eventType = "phase.started"
 			);
 			var runInputForScan = run.getInput() ?: {};
+			var scanRunId = arguments.runId;
 			var scanOptions = ( lCase( run.getRunKind() ?: "review" ) == "modernize" )
-				? { modernize: true, priorityExtensions: [ "cfm", "cfc", "bx", "bxm", "bxs" ] }
+				? {
+					modernize: true,
+					priorityExtensions: [ "cfm", "cfc", "bx", "bxm", "bxs" ],
+					checkCancellation: () => checkCancellation( scanRunId )
+				}
 				: {};
 			if ( isArray( runInputForScan.selectedFiles ?: "" ) && runInputForScan.selectedFiles.len() ) {
 				scanOptions.selectedFiles = runInputForScan.selectedFiles;
