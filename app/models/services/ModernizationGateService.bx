@@ -1,0 +1,242 @@
+/**
+ * Deterministic, conservative placement gates.
+ *
+ * Static evidence may pass or fail technical conditions, but it cannot prove
+ * team ownership or operational need. Those gates therefore remain unknown
+ * until an explicit plan value or human decision supplies the missing fact.
+ */
+@singleton
+class {
+	property name="identityService" inject="ModernizationIdentityService";
+
+	variables.version = "modernization-gates-v1";
+
+	function init() {
+		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) variables.identityService = new app.models.services.ModernizationIdentityService();
+		return this;
+	}
+
+	struct function evaluatePlan( required struct plan, struct evidence = {} ) {
+		var output = duplicate( arguments.plan );
+		var target = structKeyExists( output, "target" ) && isStruct( output.target ) ? output.target : {};
+		var placements = structKeyExists( target, "placements" ) && isArray( target.placements ) ? target.placements : [];
+		var allGates = [];
+		var failed = 0;
+		var unknown = 0;
+		for ( var index = 1; index <= placements.len(); index++ ) {
+			var evaluated = evaluatePlacement( placements[ index ], output, arguments.evidence );
+			placements[ index ] = evaluated.placement;
+			allGates.append( evaluated.gates, true );
+			failed += evaluated.failed;
+			unknown += evaluated.unknown;
+		}
+		target.placements = placements;
+		output.target = target;
+		output.gateContractVersion = variables.version;
+		output.gateSummary = {
+			version: variables.version,
+			placementCount: placements.len(),
+			failed: failed,
+			unknown: unknown,
+			complete: failed == 0 && unknown == 0
+		};
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.gateContract = variables.version;
+		return output;
+	}
+
+	struct function evaluatePlacement( required struct placement, required struct plan, struct evidence = {} ) {
+		var item = duplicate( arguments.placement );
+		var gates = [];
+		var targetType = normalizeType( firstValue( item, [ "placementType", "packaging" ], "" ) );
+		var signals = signalsForPlacement( item, arguments.plan );
+		var signalIds = signals.map( ( signal ) => lCase( trim( toString( firstValue( signal, [ "signalId", "id" ], "" ) ) ) ) );
+		var targetUnitIds = normalizeIds( firstValue( item, [ "targetUnitIds", "unitIds" ], [] ) );
+
+		gates.append( gate(
+			"code-boundary",
+			targetUnitIds.len() ? "pass" : "unknown",
+			targetUnitIds.len() ? "Placement owns target units." : "No target units are assigned to this placement.",
+			targetUnitIds.len() ? evidenceRefsFor( signals, 4 ) : []
+		) );
+
+		var stateSignals = intersect( signalIds, [ "scope.application-state", "scope.session-heavy", "scope.client", "security.session-gate" ] );
+		var stateStatus = targetType == "main-app"
+			? "pass"
+			: ( stateSignals.len() ? "fail" : "unknown" );
+		gates.append( gate(
+			"state-isolation",
+			stateStatus,
+			stateStatus == "pass" ? "The main application retains shared lifecycle and session state." : ( stateSignals.len() ? "Shared application, session, client, or auth state crosses this proposed boundary." : "State isolation evidence is incomplete." ),
+			evidenceRefsFor( signals, 4, stateSignals )
+		) );
+
+		var dataSignals = intersect( signalIds, [ "datasource.named", "sql.table-ref", "sql.column-ref", "sql.query", "sql.proc-call" ] );
+		var explicitBoundary = len( trim( toString( firstValue( item, [ "dataBoundaryNote", "dataBoundary", "dataOwnership" ], "" ) ) ) ) || ( isBoolean( firstValue( item, [ "dataBoundaryConfirmed" ], false ) ) && firstValue( item, [ "dataBoundaryConfirmed" ], false ) );
+		var dataStatus = targetType == "main-app"
+			? "pass"
+			: ( targetType == "external-service" && dataSignals.len() && !explicitBoundary ? "fail" : ( explicitBoundary || targetType == "coldbox-module" ? "pass" : "unknown" ) );
+		gates.append( gate(
+			"data-ownership",
+			dataStatus,
+			dataStatus == "fail" ? "Database coupling is present without an explicit owned data boundary." : ( dataStatus == "unknown" ? "Data ownership requires explicit confirmation." : "The proposed target can retain or explicitly declare its data boundary." ),
+			evidenceRefsFor( signals, 4, dataSignals )
+		) );
+
+		var seamSignals = intersect( signalIds, [ "http.outbound", "schedule.task", "route.evidence", "coldbox.present" ] );
+		var explicitSeam = lCase( trim( toString( firstValue( item, [ "evidenceBasis" ], "" ) ) ) ) == "explicit-seam";
+		var deployabilityStatus = targetType == "external-service"
+			? ( explicitSeam && seamSignals.len() ? "pass" : ( seamSignals.len() ? "unknown" : "fail" ) )
+			: "pass";
+		gates.append( gate(
+			"deployability",
+			deployabilityStatus,
+			deployabilityStatus == "pass" ? "A runtime or deployment seam supports this target." : ( deployabilityStatus == "fail" ? "No independent deployment seam is evidenced." : "A possible seam exists, but independent deployment is not established." ),
+			evidenceRefsFor( signals, 4, seamSignals )
+		) );
+
+		var operationalNeed = firstValue( item, [ "operationalNeed", "independentDeploymentNeed" ], javacast( "null", "" ) );
+		var operationalStatus = targetType == "external-service"
+			? ( isBoolean( operationalNeed ) ? ( operationalNeed ? "pass" : "fail" ) : "unknown" )
+			: "pass";
+		gates.append( gate(
+			"operational-need",
+			operationalStatus,
+			operationalStatus == "unknown" ? "Confirm independent scaling, availability, ownership, or release cadence before extracting a service." : "Operational scope is compatible with the proposed placement.",
+			[]
+		) );
+
+		var routes = routesForPlacement( item, arguments.plan );
+		var routeStatus = targetType == "external-service"
+			? ( routes.len() ? "pass" : "unknown" )
+			: "pass";
+		gates.append( gate(
+			"route-contract",
+			routeStatus,
+			routeStatus == "pass" ? "A route or callable entry seam is available." : "A service entry contract still needs to be defined and verified.",
+			evidenceRefsForRoutes( routes )
+		) );
+
+		var failed = 0;
+		var unknown = 0;
+		for ( var itemGate in gates ) {
+			if ( itemGate.status == "fail" ) failed++;
+			if ( itemGate.status == "unknown" ) unknown++;
+		}
+		item.gates = gates;
+		item.gateStatus = failed ? "blocked" : ( unknown ? "needs-review" : "ready-for-decision" );
+		item.decisionRequired = targetType == "external-service" || unknown > 0 || failed > 0;
+		item.gateEvidence = evidenceRefsFor( signals, 8 );
+		item.itemFingerprint = identityService.itemFingerprint( "placement", fingerprintInput( item ) );
+		return { placement: item, gates: gates, failed: failed, unknown: unknown };
+	}
+
+	private struct function gate( required string id, required string status, required string explanation, required array evidenceRefs ) {
+		return {
+			id: arguments.id,
+			status: arguments.status,
+			explanation: left( trim( arguments.explanation ), 400 ),
+			evidenceRefs: duplicate( arguments.evidenceRefs ),
+			provenanceClass: "deterministically-derived"
+		};
+	}
+
+	private array function signalsForPlacement( required struct placement, required struct plan ) {
+		var target = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) ? arguments.plan.target : {};
+		var units = structKeyExists( target, "units" ) && isArray( target.units ) ? target.units : [];
+		var selectedLegacyIds = {};
+		var paths = {};
+		var targetIds = normalizeIds( firstValue( arguments.placement, [ "targetUnitIds", "unitIds" ], [] ) );
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( firstValue( unit, [ "id", "itemId" ], "" ) ) );
+			if ( !targetIds.contains( unitId ) ) continue;
+			for ( var legacyId in normalizeIds( firstValue( unit, [ "legacyUnitIds" ], [] ) ) ) selectedLegacyIds[ legacyId ] = true;
+			var sourcePath = replace( trim( toString( firstValue( unit, [ "sourcePath", "sourceFile", "filePath" ], "" ) ) ), "\", "/", "all" );
+			if ( len( sourcePath ) ) paths[ lCase( sourcePath ) ] = true;
+		}
+		var output = [];
+		for ( var signal in ( structKeyExists( arguments.plan, "signals" ) && isArray( arguments.plan.signals ) ? arguments.plan.signals : [] ) ) {
+			if ( !isStruct( signal ) ) continue;
+			var inScope = false;
+			for ( var ownerId in normalizeIds( firstValue( signal, [ "unitIds" ], [] ) ) ) if ( selectedLegacyIds.keyExists( ownerId ) || targetIds.contains( ownerId ) ) { inScope = true; break; }
+			if ( !inScope ) for ( var ref in ( isArray( firstValue( signal, [ "evidenceRefs" ], [] ) ) ? firstValue( signal, [ "evidenceRefs" ], [] ) : [] ) ) {
+				if ( !isStruct( ref ) ) continue;
+				if ( paths.keyExists( lCase( replace( trim( toString( firstValue( ref, [ "filePath", "path" ], "" ) ) ), "\", "/", "all" ) ) ) ) { inScope = true; break; }
+			}
+			if ( inScope ) output.append( signal );
+		}
+		return output;
+	}
+
+	private array function routesForPlacement( required struct placement, required struct plan ) {
+		var ids = normalizeIds( firstValue( arguments.placement, [ "targetUnitIds", "unitIds" ], [] ) );
+		var output = [];
+		for ( var route in ( structKeyExists( arguments.plan, "routeContracts" ) && isArray( arguments.plan.routeContracts ) ? arguments.plan.routeContracts : [] ) ) {
+			if ( isStruct( route ) && ids.contains( trim( toString( firstValue( route, [ "targetUnitId" ], "" ) ) ) ) ) output.append( route );
+		}
+		return output;
+	}
+
+	private array function evidenceRefsForRoutes( required array routes ) {
+		var refs = [];
+		for ( var route in arguments.routes ) {
+			for ( var ref in ( isStruct( route ) && isArray( firstValue( route, [ "evidence" ], [] ) ) ? firstValue( route, [ "evidence" ], [] ) : [] ) ) {
+				refs.append( ref );
+				if ( refs.len() >= 6 ) return refs;
+			}
+		}
+		return refs;
+	}
+
+	private array function evidenceRefsFor( required array signals, numeric limit = 4, array onlySignalIds = [] ) {
+		var refs = [];
+		var filter = arguments.onlySignalIds;
+		for ( var signal in arguments.signals ) {
+			var signalId = lCase( trim( toString( firstValue( signal, [ "signalId", "id" ], "" ) ) ) );
+			if ( filter.len() && !filter.contains( signalId ) ) continue;
+			for ( var ref in ( isArray( firstValue( signal, [ "evidenceRefs" ], [] ) ) ? firstValue( signal, [ "evidenceRefs" ], [] ) : [] ) ) {
+				refs.append( ref );
+				if ( refs.len() >= arguments.limit ) return refs;
+			}
+		}
+		return refs;
+	}
+
+	private array function intersect( required array values, required array choices ) {
+		var output = [];
+		for ( var value in arguments.values ) if ( arguments.choices.contains( value ) && !output.contains( value ) ) output.append( value );
+		return output;
+	}
+
+	private array function normalizeIds( required any value ) {
+		var output = [];
+		for ( var value in ( isArray( arguments.value ) ? arguments.value : [] ) ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) && !output.contains( normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	private string function normalizeType( required any value ) {
+		var type = lCase( trim( toString( arguments.value ) ) );
+		if ( [ "microservice", "external-service", "side-app", "extract", "service" ].contains( type ) ) return "external-service";
+		if ( [ "module", "coldbox-module", "coldbox_module" ].contains( type ) ) return "coldbox-module";
+		return "main-app";
+	}
+
+	private struct function fingerprintInput( required struct item ) {
+		var output = duplicate( arguments.item );
+		for ( var key in [ "id", "itemFingerprint", "riskLevel", "relatedFindingCount", "effortSize", "effortDrivers" ] ) if ( structKeyExists( output, key ) ) structDelete( output, key );
+		return output;
+	}
+
+	private any function firstValue( required struct item, required array keys, any fallback = "" ) {
+		for ( var key in arguments.keys ) {
+			if ( !structKeyExists( arguments.item, key ) ) continue;
+			var value = arguments.item[ key ];
+			if ( !isNull( value ) ) return value;
+		}
+		return arguments.fallback;
+	}
+}

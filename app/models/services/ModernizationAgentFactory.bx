@@ -8,7 +8,7 @@ class {
 	property name="skillService" inject="ModernizationSkillService";
 	property name="promptCompiler" inject="PromptCompiler";
 	property name="aiProviderResolver" inject="AIProviderResolverService";
-	variables.promptVersion = "modernization-prompt-v5";
+	variables.promptVersion = "modernization-prompt-v6";
 	variables.skillRoles = [
 		"modernization-application",
 		"modernization-database",
@@ -167,7 +167,7 @@ class {
 				// roadmap role instead — asking for structured multi-step guidance
 				// here, across every group, in one whole-repo call risked exactly
 				// the same overload/timeout failure the roadmap role used to hit.
-				return "Analyze the FULL aggregated target unit map, unitLinks, routeContracts, and coupling signals across the whole repository at once — not a narrow shard window. Group units that share one feature domain into a context (packaging centralized or coldbox-module); identify true side-app/microservice extract candidates separately. Prefer centralized packaging by default. Tier every non-centralized context and every extract as evidenceBasis=explicit-seam (genuine runtime/deployment seam plus data-boundary evidence: distinct datasource, outbound remote/HTTP call, scheduled or worker boundary) or evidenceBasis=domain-clustering (no seam yet, but a clear shared purpose, naming pattern, or coupling signal ties multiple units together); label domain-clustering picks as speculative in the recommendation text and never imply deployment isolation for them. Every context and extract needs targetUnitIds, evidenceRefs, evidenceBasis, and a short recommendation. Do not reuse the same templated sentence across different contexts — recommendation must name this specific group's shared purpose or coupling/deployment evidence and explain, in this group's own terms, why that boundary was chosen; do not restate the evidenceBasis disclaimer in the recommendation text, since the evidenceBasis field already carries that. For every non-centralized context and every extract, also produce moduleSlug (a short kebab-case folder name, e.g. app/modules/<moduleSlug>/). Set dependsOnContextIds when this group's evidence shows a shared datasource, shared service, or explicit call-out to another group's units; leave it empty otherwise. Leave units that do not fit a coherent group uncovered rather than forcing a context. Do not invent units, signals, or evidence not present in the supplied map.";
+				return "Analyze the FULL aggregated target unit map, unitLinks, routeContracts, and coupling signals across the whole repository at once — not a narrow shard window. Return at most 16 compact placements, each with a stable domainKey, recommended placementType (main-app, coldbox-module, or external-service), targetUnitIds, a short rationale, evidenceRefs, uncertainty, and optional questions. Group units that share one feature domain. Use this progressive ladder: cross-cutting or tightly coupled behavior belongs in main-app; a cohesive boundary that can share deployment, runtime, and data ownership belongs in a ColdBox module; an external-service candidate requires explicit deployment, data, route, and operations seams. Prefer main-app or module when any service gate is unknown. Do not emit gates, alternatives, migration steps, or long prose—the application derives those deterministically. Leave units that do not fit a coherent group uncovered; the pipeline will conservatively fill gaps. Do not invent units, signals, or evidence not present in the supplied map.";
 			case "modernization-item-rebuild":
 				var rebuildItemType = trim( arguments.evidence.itemType ?: "" );
 				var rebuildItemId = trim( arguments.evidence.itemId ?: "" );
@@ -201,6 +201,7 @@ class {
 		}
 		if ( arguments.role == "modernization-architecture" ) {
 			return {
+				placements: [ { id: "string", domainKey: "string", name: "string", placementType: "main-app|coldbox-module|external-service", targetUnitIds: [ "string" ], rationale: "short string", evidenceRefs: [ "evidence-id" ], uncertainty: [ "string" ], questions: [ "string" ] } ],
 				contexts: [ { id: "string", name: "string", purpose: "string", packaging: "centralized|coldbox-module", targetUnitIds: [ "string" ], stayInMonolith: true, recommendation: "string", evidenceBasis: "explicit-seam|domain-clustering", evidenceRefs: [ "evidence-id" ], moduleSlug: "string", dependsOnContextIds: [ "string" ] } ],
 				extracts: [ { id: "string", name: "string", reason: "string", suggestedBoundary: "string", dataBoundaryNote: "string", sharedDatasourceRisk: "string", targetUnitIds: [ "string" ], recommendation: "string", evidenceBasis: "explicit-seam|domain-clustering", evidenceRefs: [ "evidence-id" ], moduleSlug: "string", dependsOnContextIds: [ "string" ] } ]
 			};
@@ -288,6 +289,11 @@ class {
 					[ "id", "targetPath", "sourcePath", "layer", "purpose", "confidence", "validationStatus" ],
 					200
 				),
+				placements: compactRecords(
+					isArray( target.placements ?: "" ) ? target.placements : [],
+					[ "id", "name", "domainKey", "placementType", "targetUnitIds", "rationale", "decisionRequired" ],
+					30
+				),
 				contexts: compactRecords(
 					isArray( target.contexts ?: "" ) ? target.contexts : [],
 					[ "id", "name", "targetUnitIds", "stayInMonolith", "recommendation" ],
@@ -342,6 +348,11 @@ class {
 					isArray( target.units ?: "" ) ? target.units : [],
 					[ "id", "targetPath", "sourcePath", "layer", "purpose", "confidence", "validationStatus" ],
 					300
+				),
+				placements: compactRecords(
+					isArray( target.placements ?: "" ) ? target.placements : [],
+					[ "id", "name", "domainKey", "placementType", "targetUnitIds", "rationale", "evidenceRefs", "uncertainty" ],
+					30
 				)
 			},
 			unitLinks: compactRecords(

@@ -1,0 +1,30 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernize placement gates", () => {
+			it( "fails service extraction on shared state and data coupling", () => {
+				var service = new app.models.services.ModernizationGateService();
+				var plan = service.evaluatePlan( {
+					target: { units: [ { id: "tu-1", legacyUnitIds: [ "legacy-1" ], sourcePath: "dashboard/orders.cfm" } ], placements: [ { id: "placement-orders", placementType: "external-service", evidenceBasis: "explicit-seam", targetUnitIds: [ "tu-1" ] } ] },
+					signals: [
+						{ signalId: "scope.session-heavy", unitIds: [ "legacy-1" ], evidenceRefs: [ { filePath: "dashboard/orders.cfm", startLine: 10 } ] },
+						{ signalId: "sql.table-ref", unitIds: [ "legacy-1" ], evidenceRefs: [ { filePath: "dashboard/orders.cfm", startLine: 20 } ] },
+						{ signalId: "http.outbound", unitIds: [ "legacy-1" ], evidenceRefs: [ { filePath: "dashboard/orders.cfm", startLine: 30 } ] }
+					]
+				} );
+				var gates = plan.target.placements[ 1 ].gates;
+				expect( gates.some( ( gate ) => gate.id == "state-isolation" && gate.status == "fail" ) ).toBeTrue();
+				expect( gates.some( ( gate ) => gate.id == "data-ownership" && gate.status == "fail" ) ).toBeTrue();
+				expect( plan.target.placements[ 1 ].decisionRequired ).toBeTrue();
+				expect( plan.gateSummary.failed ).toBeGT( 0 );
+			} );
+
+			it( "keeps unknown operational evidence distinct from a pass", () => {
+				var service = new app.models.services.ModernizationGateService();
+				var plan = service.evaluatePlan( { target: { units: [ { id: "tu-1" } ], placements: [ { id: "placement-1", placementType: "external-service", evidenceBasis: "explicit-seam", targetUnitIds: [ "tu-1" ] } ] }, signals: [ { signalId: "http.outbound", unitIds: [ "tu-1" ], evidenceRefs: [] } ], routeContracts: [] } );
+				var gate = plan.target.placements[ 1 ].gates.filter( ( item ) => item.id == "operational-need" )[ 1 ];
+				expect( gate.status ).toBe( "unknown" );
+				expect( plan.target.placements[ 1 ].gateStatus ).toBe( "needs-review" );
+			} );
+		} );
+	}
+}

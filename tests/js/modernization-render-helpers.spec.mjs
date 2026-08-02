@@ -135,6 +135,10 @@ const items = helpers.modernizationItems(
 );
 assert.deepEqual(items.map((item) => item._modernizationType), ["context", "extract"]);
 
+const placementItems = helpers.modernizationItems({ target: { placements: [{ id: "p-1", name: "Orders", placementType: "coldbox-module" }], contexts: [{ id: "legacy-context" }] } }, "contexts");
+assert.deepEqual(placementItems.map((item) => item._modernizationType), ["placement"]);
+assert.match(helpers.modernizationItemMeta({ _modernizationType: "placement", placementType: "external-service", gateStatus: "needs-review", gates: [{ status: "unknown" }] }), /external-service · needs-review · 1 unknown gates/);
+
 // buildModernizationArchitectureSubgraph: turns target.contexts/target.extracts
 // into the {nodes,edges} shape ArchitectureFlow.layoutFlowPositions() expects.
 // Every context gets its own node regardless of packaging — a centralized

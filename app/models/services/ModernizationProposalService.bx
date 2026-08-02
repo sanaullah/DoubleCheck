@@ -501,7 +501,7 @@ class {
 			inventory    : evidence.inventory ?: { units: [], routeEvidence: [], dependencies: [], unresolved: [] },
 			schemaEvidence: evidence.schemaEvidence ?: { database: {}, objects: [], routines: [], unresolved: [] },
 			signals      : evidence.signals ?: [],
-			target       : { units: [], contexts: [], extracts: [] },
+			target       : { units: [], placements: [], contexts: [], extracts: [] },
 			unitLinks    : [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
 			validation   : {}, decisions: []
 		};
@@ -1188,11 +1188,14 @@ class {
 	 * reads target.contexts/.extracts via compactRoadmapEvidence).
 	 */
 	private struct function mergeArchitecture(required struct plan, required struct architecture, array errors = []) {
-		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [] };
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], placements: [], contexts: [], extracts: [] };
+		arguments.plan.target.placements = isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [];
 		arguments.plan.target.contexts = isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
 		arguments.plan.target.extracts = isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
+		arguments.plan.target.placements.append( boundedStructArray( arguments.architecture.placements ?: [], variables.maxItems, arguments.errors, "target.placements" ), true );
 		arguments.plan.target.contexts.append( boundedStructArray( arguments.architecture.contexts ?: [], variables.maxItems, arguments.errors, "target.contexts" ), true );
 		arguments.plan.target.extracts.append( boundedStructArray( arguments.architecture.extracts ?: [], variables.maxItems, arguments.errors, "target.extracts" ), true );
+		for ( var item in arguments.plan.target.placements ) ensureIdentity( item, "placement" );
 		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
 		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
 		return arguments.plan;
@@ -1334,6 +1337,15 @@ class {
 	private array function synthesisRoadmapGroups( required struct plan ) {
 		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
 		var groups = [];
+		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
+			if ( !isStruct( placement ) || !isArray( placement.targetUnitIds ?: "" ) || !placement.targetUnitIds.len() ) continue;
+			groups.append( {
+				name: placement.name ?: placement.domainKey ?: "Capability",
+				targetUnitIds: placement.targetUnitIds,
+				kind: ( placement.placementType ?: "main-app" ) == "external-service" ? "extract" : "context"
+			} );
+		}
+		if ( groups.len() ) return groups;
 		for ( var ctx in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
 			if ( isStruct( ctx ) && isArray( ctx.targetUnitIds ?: "" ) && ctx.targetUnitIds.len() ) {
 				groups.append( { name: ctx.name ?: "Slice", targetUnitIds: ctx.targetUnitIds, kind: "context" } );
@@ -1420,9 +1432,10 @@ class {
 	}
 
 	private boolean function architectureDecisionsMissing( required struct plan ) {
+		var placements = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [];
 		var contexts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
 		var extracts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
-		return !contexts.len() && !extracts.len();
+		return !placements.len() && !contexts.len() && !extracts.len();
 	}
 
 	/**
@@ -2766,7 +2779,7 @@ class {
 			? [ "targetUnits", "units", "unitLinks", "routeContracts", "contexts", "extracts", "samples" ]
 			: ( arguments.role == "modernization-database"
 				? [ "dbFindings", "dbTransitions", "samples" ]
-				: ( arguments.role == "modernization-architecture" ? [ "contexts", "extracts" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] ) );
+			: ( arguments.role == "modernization-architecture" ? [ "placements", "contexts", "extracts" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] ) );
 		var present = false;
 		for ( var key in keys ) {
 			if ( !structKeyExists( arguments.payload, key ) ) continue;

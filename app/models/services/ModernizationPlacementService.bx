@@ -1,0 +1,436 @@
+/**
+ * Canonical placement contract for Modernize v2.
+ *
+ * The provider may still return the v1 context/extract vocabulary. This
+ * service converts that vocabulary into one owning placement per target unit,
+ * gives each placement a stable identity, and exposes a compatibility
+ * projection for older callers. The persisted plan remains one JSON artifact;
+ * contexts/extracts are explicitly marked as a legacy projection.
+ */
+@singleton
+class {
+	property name="identityService" inject="ModernizationIdentityService";
+
+	variables.version = "modernization-placement-v1";
+	variables.planVersion = "modernization-plan-v2";
+	variables.maxPlacements = 16;
+
+	function init() {
+		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) variables.identityService = new app.models.services.ModernizationIdentityService();
+		return this;
+	}
+
+	string function planVersion() {
+		return variables.planVersion;
+	}
+
+	string function placementVersion() {
+		return variables.version;
+	}
+
+	/**
+	 * Promote a generated plan to the canonical v2 contract.
+	 */
+	struct function canonicalize( required struct plan, struct evidence = {}, boolean includeLegacyProjection = true ) {
+		var output = duplicate( arguments.plan );
+		var target = isStruct( output.target ?: "" ) ? output.target : {};
+		target.units = isArray( target.units ?: "" ) ? target.units : [];
+		var rawPlacements = isArray( target.placements ?: "" ) ? target.placements : [];
+		var hadCanonicalPlacements = rawPlacements.len() > 0;
+
+		if ( !hadCanonicalPlacements ) {
+			rawPlacements = fromLegacyGroups(
+				isArray( target.contexts ?: "" ) ? target.contexts : [],
+				isArray( target.extracts ?: "" ) ? target.extracts : []
+			);
+		}
+
+		var normalized = normalizePlacements( rawPlacements, target.units, arguments.plan, arguments.evidence );
+		var coverage = assignUnownedUnits( normalized, target.units, arguments.plan, arguments.evidence );
+		normalized = coverage.placements;
+
+		target.placements = normalized;
+		target.placementContractVersion = variables.version;
+		if ( arguments.includeLegacyProjection ) {
+			var projection = legacyProjection( normalized );
+			target.contexts = projection.contexts;
+			target.extracts = projection.extracts;
+			target.legacyProjectionSource = "target.placements";
+		}
+		output.target = target;
+		output.version = variables.planVersion;
+		output.schemaVersion = variables.planVersion;
+		output.placementContractVersion = variables.version;
+		output.placementCoverage = coverage.summary;
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.placementContract = {
+			version: variables.version,
+			planVersion: variables.planVersion,
+			source: hadCanonicalPlacements ? "provider-v2" : "v1-adapter",
+			legacyProjection: arguments.includeLegacyProjection
+		};
+		output.metadata.placementSummary = placementSummary( normalized );
+		return output;
+	}
+
+	/**
+	 * Adapt a persisted artifact for API/UI reads without changing its
+	 * historical schemaVersion, fingerprint, or stored source semantics.
+	 */
+	struct function adaptForRead( required struct plan ) {
+		var sourceVersion = trim( toString( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : ( structKeyExists( arguments.plan, "version" ) ? arguments.plan.version : "" ) ) );
+		var hasPlacements = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) && structKeyExists( arguments.plan.target, "placements" ) && isArray( arguments.plan.target.placements );
+		if ( sourceVersion == variables.planVersion || hasPlacements ) {
+			return this.canonicalize( arguments.plan, {}, true );
+		}
+		var adapted = this.canonicalize( arguments.plan, {}, true );
+		adapted = preserveLegacyIdentity( adapted, arguments.plan );
+		adapted.version = len( sourceVersion ) ? sourceVersion : "modernization-plan-v1";
+		adapted.schemaVersion = adapted.version;
+		adapted.adapted = true;
+		adapted.sourcePlanVersion = adapted.version;
+		adapted.metadata = isStruct( adapted.metadata ?: "" ) ? adapted.metadata : {};
+		adapted.metadata.placementAdapter = {
+			version: variables.version,
+			sourcePlanVersion: adapted.version,
+			immutable: true
+		};
+		return adapted;
+	}
+
+	/**
+	 * Preserve the identity fields that an old decision/event stream used. The
+	 * canonical placement is additive at the read boundary; it must not make a
+	 * historical item look like a newly generated item just because it was
+	 * projected into the v2 vocabulary.
+	 */
+	private struct function preserveLegacyIdentity( required struct adapted, required struct source ) {
+		var output = duplicate( arguments.adapted );
+		var sourceTarget = structKeyExists( arguments.source, "target" ) && isStruct( arguments.source.target ) ? arguments.source.target : {};
+		var byKey = {};
+		for ( var definition in [ { key: "contexts", type: "context" }, { key: "extracts", type: "extract" } ] ) {
+			var items = structKeyExists( sourceTarget, definition.key ) && isArray( sourceTarget[ definition.key ] ) ? sourceTarget[ definition.key ] : [];
+			for ( var item in items ) {
+				if ( !isStruct( item ) ) continue;
+				var itemId = trim( toString( structKeyExists( item, "id" ) ? item.id : ( structKeyExists( item, "itemId" ) ? item.itemId : "" ) ) );
+				if ( len( itemId ) ) byKey[ definition.type & "|" & itemId ] = item;
+			}
+		}
+		var usedIds = {};
+		if ( !structKeyExists( output, "target" ) || !isStruct( output.target ) || !structKeyExists( output.target, "placements" ) || !isArray( output.target.placements ) ) return output;
+		for ( var placement in output.target.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			var sourceType = lCase( trim( toString( placement.sourceItemType ?: "" ) ) );
+			var sourceId = trim( toString( placement.sourceItemId ?: "" ) );
+			var sourceKey = sourceType & "|" & sourceId;
+			var sourceItem = structKeyExists( byKey, sourceKey ) ? byKey[ sourceKey ] : javacast( "null", "" );
+			if ( isNull( sourceItem ) ) continue;
+			placement.adapted = true;
+			placement.legacyItemType = sourceType;
+			placement.legacyItemId = sourceId;
+			var legacyId = trim( toString( structKeyExists( sourceItem, "id" ) ? sourceItem.id : ( structKeyExists( sourceItem, "itemId" ) ? sourceItem.itemId : "" ) ) );
+			if ( len( legacyId ) && !usedIds.keyExists( legacyId ) ) {
+				placement.id = legacyId;
+				usedIds[ legacyId ] = true;
+			}
+			var legacyFingerprint = trim( toString( structKeyExists( sourceItem, "itemFingerprint" ) ? sourceItem.itemFingerprint : "" ) );
+			if ( len( legacyFingerprint ) ) {
+				placement.itemFingerprint = legacyFingerprint;
+				placement.legacyItemFingerprint = legacyFingerprint;
+			}
+		}
+		output.target = output.target;
+		return output;
+	}
+
+	array function getPlacements( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		if ( isArray( target.placements ?: "" ) ) return target.placements;
+		return fromLegacyGroups(
+			isArray( target.contexts ?: "" ) ? target.contexts : [],
+			isArray( target.extracts ?: "" ) ? target.extracts : []
+		);
+	}
+
+	/**
+	 * Re-fingerprint placements after deterministic gates have been attached.
+	 */
+	struct function refreshFingerprints( required struct plan ) {
+		var output = duplicate( arguments.plan );
+		var target = isStruct( output.target ?: "" ) ? output.target : {};
+		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
+			if ( !isStruct( placement ) ) continue;
+			var identity = duplicate( placement );
+			for ( var volatileKey in [ "id", "itemFingerprint", "legacyProjection", "riskLevel", "relatedFindingCount", "effortSize", "effortDrivers" ] ) {
+				if ( structKeyExists( identity, volatileKey ) ) structDelete( identity, volatileKey );
+			}
+			placement.itemFingerprint = identityService.itemFingerprint( "placement", identity );
+		}
+		output.target = target;
+		return output;
+	}
+
+	private array function fromLegacyGroups( required array contexts, required array extracts ) {
+		var output = [];
+		for ( var context in arguments.contexts ) {
+			if ( !isStruct( context ) ) continue;
+			var item = duplicate( context );
+			item.sourceItemType = "context";
+			item.sourceItemId = item.id ?: item.itemId ?: "";
+			item.placementType = normalizePlacementType( item.packaging ?: ( item.stayInMonolith ?: "main-app" ) );
+			output.append( item );
+		}
+		for ( var extract in arguments.extracts ) {
+			if ( !isStruct( extract ) ) continue;
+			var item = duplicate( extract );
+			item.sourceItemType = "extract";
+			item.sourceItemId = item.id ?: item.itemId ?: "";
+			item.placementType = "external-service";
+			output.append( item );
+		}
+		return output;
+	}
+
+	private array function normalizePlacements(
+		required array rawPlacements,
+		required array units,
+		required struct plan,
+		required struct evidence
+	) {
+		var output = [];
+		var seenIds = {};
+		var limit = min( variables.maxPlacements, arguments.rawPlacements.len() );
+		for ( var index = 1; index <= limit; index++ ) {
+			var raw = arguments.rawPlacements[ index ];
+			if ( !isStruct( raw ) ) continue;
+			var placement = duplicate( raw );
+			var unitIds = normalizeIds( placement.targetUnitIds ?: placement.unitIds ?: [] );
+			placement.targetUnitIds = unitIds;
+			placement.unitIds = unitIds;
+			placement.placementType = normalizePlacementType( placement.placementType ?: placement.packaging ?: ( placement.stayInMonolith ?: "main-app" ) );
+			placement.packaging = placement.packaging ?: packagingFor( placement.placementType );
+			placement.evidenceBasis = lCase( trim( placement.evidenceBasis ?: "provider-suggested" ) );
+			if ( ![ "explicit-seam", "domain-clustering", "provider-suggested", "conservative-default" ].contains( placement.evidenceBasis ) ) placement.evidenceBasis = "provider-suggested";
+			placement.evidenceRefs = normalizeEvidenceRefs( placement.evidenceRefs ?: placement.evidence ?: [] );
+			placement.name = trim( placement.name ?: placement.title ?: placement.id ?: "Capability" );
+			placement.purpose = trim( placement.purpose ?: placement.reason ?: placement.recommendation ?: "" );
+			placement.recommendation = trim( placement.recommendation ?: placement.purpose ?: "Keep the capability in the new main application until stronger boundary evidence exists." );
+			placement.stayInMonolith = placement.placementType == "main-app";
+			placement.sourceItemType = placement.sourceItemType ?: ( placement.placementType == "external-service" ? "extract" : "context" );
+			placement.sourceItemId = placement.sourceItemId ?: placement.id ?: placement.itemId ?: "";
+			placement.id = stablePlacementId( placement, units );
+			if ( seenIds.keyExists( placement.id ) ) {
+				placement.id = placement.id & "-" & index;
+			}
+			seenIds[ placement.id ] = true;
+			placement.newProposal = placement.newProposal ?: false;
+			placement.provenanceClass = placement.provenanceClass ?: ( placement.evidenceBasis == "conservative-default" ? "deterministically-derived" : "provider-suggested" );
+			placement.itemFingerprint = stableFingerprint( placement );
+			output.append( placement );
+		}
+		return output;
+	}
+
+	private struct function assignUnownedUnits(
+		required array placements,
+		required array units,
+		required struct plan,
+		required struct evidence
+	) {
+		var ownerByUnit = {};
+		var duplicates = [];
+		for ( var placement in arguments.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			var uniqueIds = [];
+			for ( var unitId in normalizeIds( placement.targetUnitIds ?: [] ) ) {
+				if ( ownerByUnit.keyExists( unitId ) ) {
+					duplicates.append( unitId );
+					continue;
+				}
+				ownerByUnit[ unitId ] = placement.id ?: "";
+				uniqueIds.append( unitId );
+			}
+			placement.targetUnitIds = uniqueIds;
+			placement.unitIds = uniqueIds;
+		}
+
+		var unitIds = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitIds.append( unitId );
+		}
+		var unassigned = [];
+		for ( var unitId in unitIds ) if ( !ownerByUnit.keyExists( unitId ) ) unassigned.append( unitId );
+		var gapFilledUnitIds = duplicate( unassigned );
+		if ( unassigned.len() ) {
+			var fallback = findMainAppPlacement( arguments.placements );
+			if ( isNull( fallback ) ) {
+				fallback = defaultPlacement( unassigned, arguments.units, arguments.plan, arguments.evidence );
+				arguments.placements.append( fallback );
+			} else {
+				var mergedIds = normalizeIds( fallback.targetUnitIds ?: [] );
+				for ( var gapUnitId in unassigned ) if ( !mergedIds.contains( gapUnitId ) ) mergedIds.append( gapUnitId );
+				fallback.targetUnitIds = mergedIds;
+				fallback.unitIds = fallback.targetUnitIds;
+				fallback.gapFilledUnitIds = gapFilledUnitIds;
+				fallback.coverageSource = "provider-plus-deterministic-gap-fill";
+				fallback.itemFingerprint = stableFingerprint( fallback );
+			}
+		}
+		var assigned = {};
+		for ( var placement in arguments.placements ) for ( var unitId in normalizeIds( placement.targetUnitIds ?: [] ) ) assigned[ unitId ] = true;
+		var remainingUnassigned = [];
+		for ( var unitId in unitIds ) if ( !assigned.keyExists( unitId ) ) remainingUnassigned.append( unitId );
+		return {
+			placements: arguments.placements,
+			summary: {
+				version: variables.version,
+				totalUnits: unitIds.len(),
+				assignedUnits: assigned.count(),
+				unassignedUnitIds: remainingUnassigned,
+				gapFilledUnitIds: gapFilledUnitIds,
+				duplicateUnitIds: uniqueStrings( duplicates ),
+				coverageSource: gapFilledUnitIds.len() ? "provider-plus-deterministic-gap-fill" : "provider",
+				complete: remainingUnassigned.len() == 0 && duplicates.len() == 0
+			}
+		};
+	}
+
+	private struct function defaultPlacement( required array unitIds, required array units, required struct plan, required struct evidence ) {
+		var refs = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !arguments.unitIds.contains( unitId ) ) continue;
+			for ( var ref in normalizeEvidenceRefs( unit.evidenceRefs ?: [] ) ) if ( refs.len() < 6 ) refs.append( ref );
+		}
+		var item = {
+			id: "placement-main-app-default",
+			name: "New main application",
+			purpose: "Conservative default for units without an evidenced extraction boundary.",
+			recommendation: "Keep this behavior in the new ColdBox main application until module or service boundaries are proven.",
+			placementType: "main-app",
+			packaging: "centralized",
+			targetUnitIds: duplicate( arguments.unitIds ),
+			unitIds: duplicate( arguments.unitIds ),
+			evidenceRefs: refs,
+			evidenceBasis: "conservative-default",
+			provenanceClass: "deterministically-derived",
+			coverageSource: "deterministic-gap-fill",
+			gapFilledUnitIds: duplicate( arguments.unitIds ),
+			stayInMonolith: true,
+			newProposal: true,
+			proposalReason: "No provider architecture group covered these target units."
+		};
+		item.id = stablePlacementId( item, arguments.units );
+		item.itemFingerprint = stableFingerprint( item );
+		return item;
+	}
+
+	private any function findMainAppPlacement( required array placements ) {
+		for ( var placement in arguments.placements ) {
+			if ( isStruct( placement ) && normalizePlacementType( placement.placementType ?: placement.packaging ?: "" ) == "main-app" ) return placement;
+		}
+		return javacast( "null", "" );
+	}
+
+	private struct function legacyProjection( required array placements ) {
+		var contexts = [];
+		var extracts = [];
+		for ( var placement in arguments.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			var projection = duplicate( placement );
+			projection.legacyProjection = true;
+			projection.packaging = packagingFor( placement.placementType ?: placement.packaging ?: "main-app" );
+			if ( normalizePlacementType( placement.placementType ?: "" ) == "external-service" ) {
+				projection.sourceItemType = "extract";
+				extracts.append( projection );
+			} else {
+				projection.sourceItemType = "context";
+				contexts.append( projection );
+			}
+		}
+		return { contexts: contexts, extracts: extracts };
+	}
+
+	private string function stablePlacementId( required struct placement, required array units ) {
+		var ids = normalizeIds( arguments.placement.targetUnitIds ?: [] );
+		ids.sort( "textnocase" );
+		var domainKey = lCase( reReplace( trim( arguments.placement.domainKey ?: "" ), "[^a-zA-Z0-9_-]", "-", "all" ) );
+		var seed = { targetUnitIds: ids, domainKey: domainKey, placementContractVersion: variables.version };
+		if ( !ids.len() ) seed.sourceId = arguments.placement.sourceItemId ?: arguments.placement.id ?: "";
+		return "placement-" & left( identityService.itemId( "placement", seed ), 24 );
+	}
+
+	private string function stableFingerprint( required struct placement ) {
+		var identity = duplicate( arguments.placement );
+		for ( var volatileKey in [ "id", "itemFingerprint", "legacyProjection", "riskLevel", "relatedFindingCount", "effortSize", "effortDrivers" ] ) {
+			if ( structKeyExists( identity, volatileKey ) ) structDelete( identity, volatileKey );
+		}
+		return identityService.itemFingerprint( "placement", identity );
+	}
+
+	private string function normalizePlacementType( required any value ) {
+		var normalized = lCase( trim( toString( arguments.value ) ) );
+		if ( [ "centralized", "main-app", "main_app", "monolith", "application" ].contains( normalized ) ) return "main-app";
+		if ( [ "coldbox-module", "coldbox_module", "module", "hmvc-module" ].contains( normalized ) ) return "coldbox-module";
+		if ( [ "external-service", "microservice", "side-app", "extract", "service" ].contains( normalized ) ) return "external-service";
+		return "main-app";
+	}
+
+	private string function packagingFor( required string placementType ) {
+		return normalizePlacementType( arguments.placementType ) == "coldbox-module" ? "coldbox-module" : ( normalizePlacementType( arguments.placementType ) == "external-service" ? "external-service" : "centralized" );
+	}
+
+	private array function normalizeIds( required any value ) {
+		var output = [];
+		var values = isArray( arguments.value ) ? arguments.value : [];
+		for ( var value in values ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) && !output.contains( normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	private array function normalizeEvidenceRefs( required any value ) {
+		var output = [];
+		var values = isArray( arguments.value ) ? arguments.value : [];
+		for ( var ref in values ) {
+			if ( isStruct( ref ) ) {
+				var item = duplicate( ref );
+				item.filePath = replace( trim( item.filePath ?: item.path ?: "" ), "\", "/", "all" );
+				if ( len( item.filePath ) || len( trim( toString( item.id ?: "" ) ) ) ) output.append( item );
+			} else if ( isSimpleValue( ref ) && len( trim( toString( ref ) ) ) ) {
+				output.append( trim( toString( ref ) ) );
+			}
+			if ( output.len() >= 6 ) break;
+		}
+		return output;
+	}
+
+	private array function uniqueStrings( required array values ) {
+		var output = [];
+		for ( var value in arguments.values ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) && !output.contains( normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	private struct function placementSummary( required array placements ) {
+		var counts = { "main-app": 0, "coldbox-module": 0, "external-service": 0 };
+		var unknownGates = 0;
+		var failedGates = 0;
+		for ( var placement in arguments.placements ) {
+			var type = normalizePlacementType( placement.placementType ?: placement.packaging ?: "" );
+			counts[ type ] = ( counts[ type ] ?: 0 ) + 1;
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				var status = lCase( trim( gate.status ?: "" ) );
+				if ( status == "unknown" ) unknownGates++;
+				if ( status == "fail" ) failedGates++;
+			}
+		}
+		return { total: arguments.placements.len(), counts: counts, unknownGates: unknownGates, failedGates: failedGates };
+	}
+}

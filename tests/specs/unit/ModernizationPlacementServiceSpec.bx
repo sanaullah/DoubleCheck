@@ -1,0 +1,59 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernize v2 placement contract", () => {
+			it( "adapts legacy contexts and extracts while assigning every target unit once", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = service.canonicalize( {
+					version: "modernization-plan-v1",
+					metadata: {},
+					target: {
+						units: [ { id: "tu-orders", sourcePath: "dashboard/orders.cfm" }, { id: "tu-users", sourcePath: "dashboard/users.cfm" }, { id: "tu-report", sourcePath: "dashboard/report.cfm" } ],
+						contexts: [ { id: "ctx-orders", name: "Orders", packaging: "coldbox-module", targetUnitIds: [ "tu-orders" ], evidenceRefs: [ { filePath: "dashboard/orders.cfm" } ] } ],
+						extracts: [ { id: "ext-report", name: "Reports", targetUnitIds: [ "tu-report" ], evidenceRefs: [ { filePath: "dashboard/report.cfm" } ] } ]
+					}
+				} );
+				expect( plan.schemaVersion ).toBe( "modernization-plan-v2" );
+				expect( plan.target.placements.len() ).toBe( 3 );
+				expect( plan.placementCoverage.complete ).toBeTrue();
+				expect( plan.placementCoverage.unassignedUnitIds ).toBeEmpty();
+				expect( plan.target.placements.filter( ( item ) => item.placementType == "external-service" ).len() ).toBe( 1 );
+				expect( plan.target.placements.filter( ( item ) => item.evidenceBasis == "conservative-default" ).len() ).toBe( 1 );
+				expect( plan.target.contexts.some( ( item ) => item.legacyProjection == true ) ).toBeTrue();
+			} );
+
+			it( "keeps placement identity stable when the provider renames a capability", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var base = { version: "modernization-plan-v2", target: { units: [ { id: "tu-a" }, { id: "tu-b" } ], placements: [ { domainKey: "orders", name: "Orders", placementType: "coldbox-module", targetUnitIds: [ "tu-b", "tu-a" ] } ] } };
+				var first = service.canonicalize( base );
+				base.target.placements[ 1 ].name = "Order Processing";
+				var second = service.canonicalize( base );
+				expect( second.target.placements[ 1 ].id ).toBe( first.target.placements[ 1 ].id );
+			} );
+
+			it( "preserves legacy ids and fingerprints when adapting a persisted v1 plan", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var adapted = service.adaptForRead( {
+					version: "modernization-plan-v1",
+					schemaVersion: "modernization-plan-v1",
+					target: {
+						units: [ { id: "tu-orders" } ],
+						contexts: [ { id: "ctx-orders", name: "Orders", targetUnitIds: [ "tu-orders" ], itemFingerprint: "legacy-context-fp" } ],
+						extracts: []
+					}
+				} );
+				expect( adapted.schemaVersion ).toBe( "modernization-plan-v1" );
+				expect( adapted.adapted ).toBeTrue();
+				expect( adapted.target.placements[ 1 ].id ).toBe( "ctx-orders" );
+				expect( adapted.target.placements[ 1 ].itemFingerprint ).toBe( "legacy-context-fp" );
+				expect( adapted.target.placements[ 1 ].legacyItemType ).toBe( "context" );
+			} );
+
+			it( "preserves duplicate ownership as a validation signal instead of silently reassigning it", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = service.canonicalize( { version: "modernization-plan-v2", target: { units: [ { id: "tu-a" } ], placements: [ { id: "one", targetUnitIds: [ "tu-a" ] }, { id: "two", targetUnitIds: [ "tu-a" ] } ] } } );
+				expect( plan.placementCoverage.duplicateUnitIds ).toContain( "tu-a" );
+				expect( plan.placementCoverage.complete ).toBeFalse();
+			} );
+		} );
+	}
+}

@@ -78,6 +78,7 @@ const state = {
 		showUnsliced: false,
 		decisions: {},
 		decisionNotes: {},
+		decisionSelections: {},
 		notice: "",
 		noticeTone: "info"
 	}
@@ -2069,6 +2070,7 @@ function setRun(run) {
 		state.modernization.selectedPhaseId = "";
 		state.modernization.decisions = {};
 		state.modernization.decisionNotes = {};
+		state.modernization.decisionSelections = {};
 		state.modernization.notice = "";
 		state.modernization.noticeTone = "info";
 		state.modernization.context = "all";
@@ -2446,7 +2448,7 @@ function renderModernizationDetail(item) {
 	}
 	const detail = document.createElement("div");
 	detail.className = "modernization-detail-card";
-	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
+	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label class="placement-selection" hidden>Selected placement<select><option value="main-app">New main application</option><option value="coldbox-module">ColdBox module</option><option value="external-service">External service candidate</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
 	detail.querySelector(".eyebrow").textContent = item._modernizationType || "proposal";
 	detail.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
 	detail.querySelector("h3").textContent = modernizationItemLabel(item);
@@ -2478,7 +2480,7 @@ function renderModernizationDetail(item) {
 		fields.append(dt, dd);
 	});
 	const key = modernizationItemKey(item);
-	const decisionTypes = ["target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample", "context", "extract"];
+	const decisionTypes = ["target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample", "context", "extract", "placement"];
 	const canDecide = decisionTypes.includes(item._modernizationType);
 	if (!canDecide) {
 		const controls = detail.querySelector(".modernization-decision-controls");
@@ -2490,11 +2492,17 @@ function renderModernizationDetail(item) {
 		return;
 	}
 	detail.querySelector("select").value = prior;
+	const placementSelection = detail.querySelector(".placement-selection");
+	if (item._modernizationType === "placement") {
+		placementSelection.hidden = false;
+		const selected = state.modernization.decisionSelections?.[key] || item.selectedOption || item.selectedPlacementType || item.placementType || "main-app";
+		placementSelection.querySelector("select").value = selected;
+	}
 	detail.querySelector("textarea").value = state.modernization.decisionNotes?.[key] || item.note || "";
 	detail.querySelector(".primary-button").addEventListener("click", async () => {
 		const decision = detail.querySelector("select").value;
 		if (decision === "undecided") return;
-		await saveModernizationDecision(item, decision, detail.querySelector("textarea").value, detail.querySelector("p"));
+		await saveModernizationDecision(item, decision, detail.querySelector("textarea").value, detail.querySelector("p"), placementSelection && !placementSelection.hidden ? placementSelection.querySelector("select").value : "");
 	});
 	detail.querySelector(".secondary-button").addEventListener("click", async () => {
 		await clearModernizationDecision(item, detail.querySelector("p"));
@@ -2683,6 +2691,14 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Migration relation", item.relation || item.relationship || item.kind);
 		add("Transition notes", item.notes || item.description);
 		add("Confidence", item.confidence);
+	} else if (item._modernizationType === "placement") {
+		const placementType = String(item.placementType || item.packaging || "main-app").toLowerCase();
+		add("Recommended placement", placementType === "external-service" ? "External-service candidate" : (placementType === "coldbox-module" ? "ColdBox module" : "New main application"));
+		add("Why this placement", item.rationale || item.recommendation || item.purpose);
+		add("Gate status", item.gateStatus || "needs-review");
+		add("Gate snapshot", (item.gates || []).map((gate) => `${gate.id || "gate"}: ${gate.status || "unknown"} — ${gate.explanation || ""}`));
+		add("Unresolved questions", item.questions || item.uncertainty);
+		add("Legacy → target units in this capability", modernizationResolveTargetUnitLabels(item.targetUnitIds));
 	} else if (item._modernizationType === "context" || item._modernizationType === "extract") {
 		const isExtract = item._modernizationType === "extract";
 		if (!isExtract) add("Packaging", item.packaging === "coldbox-module" ? "ColdBox module candidate" : "Centralize (stay in the monolith)");
@@ -2719,16 +2735,17 @@ function renderModernizationDetailSummary(host, item = {}) {
 	add("Validation issues", item._validationMessages);
 }
 
-async function saveModernizationDecision(item, decision, note, statusElement) {
+async function saveModernizationDecision(item, decision, note, statusElement, selectedOption = "") {
 	if (!state.activeRun?.id) return;
 	try {
 		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(modernizationItemRouteId(item))}/decision`, {
 			method: "PUT",
-			body: JSON.stringify({ itemType: item._modernizationType, itemFingerprint: item.itemFingerprint || "", decision, note: String(note || "").trim() })
+			body: JSON.stringify({ itemType: item._modernizationType, itemFingerprint: item.itemFingerprint || "", decision, selectedOption: String(selectedOption || ""), note: String(note || "").trim() })
 		});
 		state.modernization.decisions[modernizationItemKey(item)] = decision;
 		if (!state.modernization.decisionNotes) state.modernization.decisionNotes = {};
 		state.modernization.decisionNotes[modernizationItemKey(item)] = String(note || "").trim();
+		if (selectedOption) state.modernization.decisionSelections[modernizationItemKey(item)] = selectedOption;
 		state.modernization.notice = "";
 		if (payload?.data?.result) renderModernizationResult(payload.data.result);
 		else if (payload?.data) renderModernizationResult({ ...state.modernization.result, planState: payload.data.state?.state || state.modernization.result?.planState, decisions: payload.data.decisions || state.modernization.result?.decisions || [] });
@@ -2740,6 +2757,7 @@ async function saveModernizationDecision(item, decision, note, statusElement) {
 			state.modernization.noticeTone = "warning";
 			state.modernization.decisions = {};
 			state.modernization.decisionNotes = {};
+			state.modernization.decisionSelections = {};
 			state.modernization.selectedItem = null;
 			await loadResult(state.activeRun.id);
 		}
@@ -2752,6 +2770,7 @@ async function clearModernizationDecision(item, statusElement) {
 		const payload = await request(`/api/v1/runs/${encodeURIComponent(state.activeRun.id)}/modernization/items/${encodeURIComponent(modernizationItemRouteId(item))}/decision`, { method: "DELETE", body: JSON.stringify({ itemType: item._modernizationType, itemFingerprint: item.itemFingerprint || "" }) });
 		delete state.modernization.decisions[modernizationItemKey(item)];
 		if (state.modernization.decisionNotes) delete state.modernization.decisionNotes[modernizationItemKey(item)];
+		if (state.modernization.decisionSelections) delete state.modernization.decisionSelections[modernizationItemKey(item)];
 		state.modernization.notice = "";
 		if (payload?.data?.result) renderModernizationResult(payload.data.result);
 		else if (payload?.data) renderModernizationResult({ ...state.modernization.result, planState: payload.data.state?.state || state.modernization.result?.planState, decisions: payload.data.decisions || state.modernization.result?.decisions || [] });
@@ -2763,6 +2782,7 @@ async function clearModernizationDecision(item, statusElement) {
 			state.modernization.noticeTone = "warning";
 			state.modernization.decisions = {};
 			state.modernization.decisionNotes = {};
+			state.modernization.decisionSelections = {};
 			state.modernization.selectedItem = null;
 			await loadResult(state.activeRun.id);
 		}
@@ -2792,6 +2812,7 @@ function renderModernizationBrief(result = {}, planState = "") {
 		.map(([size, count]) => `${count} ${size}`)
 		.join(" · ") || "not yet sized";
 	const packagingLine = `${summary.packagingSplit.centralized} centralized · ${summary.packagingSplit.modules} ColdBox module${summary.packagingSplit.modules === 1 ? "" : "s"} · ${summary.packagingSplit.extracts} microservice candidate${summary.packagingSplit.extracts === 1 ? "" : "s"}`;
+	const gateLine = `${summary.gateSummary.decisionRequired} decision${summary.gateSummary.decisionRequired === 1 ? "" : "s"} required · ${summary.gateSummary.unknown} unknown gate${summary.gateSummary.unknown === 1 ? "" : "s"}${summary.gateSummary.failed ? ` · ${summary.gateSummary.failed} blocked` : ""}`;
 	const riskLine = summary.riskyPhaseCount > 0
 		? `${summary.riskyPhaseCount} slice${summary.riskyPhaseCount === 1 ? "" : "s"} touch${summary.riskyPhaseCount === 1 ? "es" : ""} known high/critical review findings — sequence ${summary.riskyPhaseCount === 1 ? "it" : "them"} earlier or pair with a fix.`
 		: "No slices flagged against known review findings.";
@@ -2806,7 +2827,7 @@ function renderModernizationBrief(result = {}, planState = "") {
 			<div><span>Plan status</span><strong>${architectureEscapeHtml(planState || "unknown")}</strong></div>
 			<div><span>Coverage</span><strong>${architectureEscapeHtml(summary.coverageStatus)}</strong></div>
 			<div><span>Slices</span><strong>${summary.phaseCount}</strong><small>${architectureEscapeHtml(effortLine)}</small></div>
-			<div><span>Packaging</span><small>${architectureEscapeHtml(packagingLine)}</small></div>
+			<div><span>Packaging</span><small>${architectureEscapeHtml(packagingLine)}</small><small>${architectureEscapeHtml(gateLine)}</small></div>
 		</div>
 		<p class="modernization-brief-risk" data-has-risk="${summary.riskyPhaseCount > 0}">${architectureEscapeHtml(riskLine)}</p>
 		<p class="modernization-brief-next"><strong>Recommended next:</strong> ${architectureEscapeHtml(nextLine)}</p>
@@ -2820,6 +2841,7 @@ function renderModernizationResult(result = {}) {
 		result.decisions.forEach((decision) => {
 			const key = decision.itemFingerprint || decision.itemId || decision.id;
 			if (key && decision.decision) state.modernization.decisions[key] = decision.decision;
+			if (key && decision.selectedOption) state.modernization.decisionSelections[key] = decision.selectedOption;
 		});
 	}
 	const active = state.workspace === "modernize" || state.activeRun?.runKind === "modernize";
@@ -2870,7 +2892,11 @@ function renderModernizationResult(result = {}) {
 		const target = result.target || {};
 		const targetRuntime = result.metadata?.runtime?.runtime || result.metadata?.runtime || "not specified";
 		const targetProfile = result.metadata?.targetProfile || target.layoutProfile || "not specified";
-		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Architecture decisions</span><strong>${(target.contexts || []).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Coverage status</dt><dd>${coverage.status || (coverage.complete === true ? "complete" : "incomplete")}</dd><dt>Provider coverage</dt><dd>${llm.status || "not-observed"} · ${llm.completed || 0} completed · ${llm.failed || 0} failed · ${llm.omitted || llm.omittedPartitions || 0} omitted</dd><dt>Source context prepared</dt><dd>${llm.partitions || llm.planned || 0} partitions · ${llm.files || 0} files · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
+		const placements = Array.isArray(target.placements) ? target.placements : [];
+		const placementCounts = { "main-app": 0, "coldbox-module": 0, "external-service": 0 };
+		placements.forEach((item) => { const type = String(item.placementType || "main-app").toLowerCase(); if (placementCounts[type] !== undefined) placementCounts[type]++; });
+		const gateSummary = result.gateSummary || {};
+		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Capabilities</span><strong>${placements.length || (target.contexts || []).length}</strong></div><div><span>Service candidates</span><strong>${placementCounts["external-service"]}</strong></div><div><span>Decisions required</span><strong>${placements.filter((item) => item.decisionRequired).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Placement posture</dt><dd>${placementCounts["main-app"]} main app · ${placementCounts["coldbox-module"]} modules · ${placementCounts["external-service"]} service candidates</dd><dt>Gate snapshot</dt><dd>${gateSummary.unknown || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "unknown").length, 0)} unknown · ${gateSummary.failed || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "fail").length, 0)} failed</dd><dt>Coverage status</dt><dd>${coverage.status || (coverage.complete === true ? "complete" : "incomplete")}</dd><dt>Provider coverage</dt><dd>${llm.status || "not-observed"} · ${llm.completed || 0} completed · ${llm.failed || 0} failed · ${llm.omitted || llm.omittedPartitions || 0} omitted</dd><dt>Source context prepared</dt><dd>${llm.partitions || llm.planned || 0} partitions · ${llm.files || 0} files · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
 		const queuedSummary = runStatus === "queued" ? "Modernize is queued; the plan will appear after the shared repository scan." : runStatus === "running" ? "Modernize is building an evidence-backed plan. Proposal items will appear as stages complete." : runStatus === "failed" ? (state.activeRun?.message || "Modernize could not generate a plan.") : runStatus === "cancelled" ? "Modernize was cancelled before a complete plan was generated." : runStatus === "partial" ? "A partial Modernize plan was retained with review gates." : "Modernization proposal is ready for review.";
 		elements.modernizationOverview.querySelector(".result-summary").textContent = result.summary || queuedSummary;
 		const notice = elements.modernizationOverview.querySelector(".modernization-notice");
@@ -2892,7 +2918,7 @@ function renderModernizationResult(result = {}) {
 			const llm = coverage.llm || {};
 			const repo = coverage.repository || {};
 			const targetCount = result.target?.units?.length || 0;
-			const targetContextCount = result.target?.contexts?.length || 0;
+			const targetContextCount = result.target?.placements?.length || result.target?.contexts?.length || 0;
 			const sourceCount = coverage.filesScanned || repo.indexed || 0;
 			const cfmlFiles = coverage.cfmlFiles || coverage.cfmlInventory?.files || 0;
 			const appError = genErrors.find((item) => String(item.role || "") === "modernization-application");
@@ -2996,9 +3022,12 @@ function selectedRoadPhase(result = {}) {
 function renderModernizationArchitecture(result = {}) {
 	const host = document.querySelector("#modernization-architecture");
 	if (!host) return;
-	const contexts = result.target?.contexts || result.contexts || [];
-	const extracts = result.target?.extracts || result.extracts || [];
-	host.hidden = !(contexts.length || extracts.length);
+	const placements = Array.isArray(result.target?.placements) && result.target.placements.length
+		? result.target.placements
+		: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
+	const contexts = placements.filter((item) => !["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+	const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+	host.hidden = !placements.length;
 	if (host.hidden) return;
 	const architectureCoverage = document.querySelector("#modernization-architecture-coverage");
 	if (architectureCoverage) {
@@ -3014,8 +3043,8 @@ function renderModernizationArchitecture(result = {}) {
 	if (selectedId) {
 		const matchedContext = contexts.find((item) => String(item.id || item.itemId || "") === selectedId);
 		const matchedExtract = extracts.find((item) => String(item.id || item.itemId || "") === selectedId);
-		if (matchedContext) selectedItem = { ...matchedContext, _modernizationType: "context" };
-		else if (matchedExtract) selectedItem = { ...matchedExtract, _modernizationType: "extract" };
+		if (matchedContext) selectedItem = { ...matchedContext, _modernizationType: "placement" };
+		else if (matchedExtract) selectedItem = { ...matchedExtract, _modernizationType: "placement" };
 	}
 	renderModernizationArchitectureDetail(selectedItem);
 }
@@ -3067,7 +3096,7 @@ function renderModernizationArchitectureMap(result = {}) {
 		const riskDot = risk
 			? `<circle class="architecture-node-risk" data-risk="${architectureEscapeAttr(risk)}" cx="${n.w - 10}" cy="10" r="5"><title>${architectureEscapeAttr(risk)} risk · ${n.item.relatedFindingCount || 0} related review finding(s)</title></circle>`
 			: "";
-		return `<g class="architecture-node${roleClass}${sel}" data-architecture-id="${architectureEscapeAttr(n.id)}" transform="translate(${n.x},${n.y})">
+		return `<g class="architecture-node${roleClass}${sel}" data-architecture-id="${architectureEscapeAttr(n.id)}" tabindex="0" role="button" aria-label="${architectureEscapeAttr(n.path)}" transform="translate(${n.x},${n.y})">
 			<title>${architectureEscapeAttr(n.path)}</title>
 			<rect class="architecture-node-card" width="${n.w}" height="${n.h}" rx="10" ry="10"></rect>
 			<rect class="architecture-node-rail" x="0" y="0" width="4" height="${n.h}" rx="2"></rect>
@@ -3087,11 +3116,13 @@ function renderModernizationArchitectureMap(result = {}) {
 		${nodeHtml}
 	</svg>`;
 	[...mapHost.querySelectorAll(".architecture-node")].forEach((node) => {
-		node.addEventListener("click", () => {
+		const selectNode = () => {
 			const id = node.dataset.architectureId || "";
 			state.modernization.selectedArchitectureId = state.modernization.selectedArchitectureId === id ? "" : id;
 			renderModernizationArchitecture(state.modernization.result || result);
-		});
+		};
+		node.addEventListener("click", selectNode);
+		node.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectNode(); } });
 	});
 }
 
@@ -3110,11 +3141,12 @@ function renderModernizationArchitectureDetail(item) {
 		host.appendChild(emptyStateElement({ icon: "detail", title: "Select a packaging decision", hint: "Click a node on the map for its migration blueprint." }));
 		return;
 	}
-	const isExtract = item._modernizationType === "extract";
+	const placementType = String(item.placementType || item.packaging || "").toLowerCase();
+	const isExtract = item._modernizationType === "extract" || ["external-service", "microservice", "side-app", "extract"].includes(placementType);
 	const card = document.createElement("div");
 	card.className = "modernization-detail-card";
 	card.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div>`;
-	card.querySelector(".eyebrow").textContent = isExtract ? "microservice / side-app candidate" : (String(item.packaging || "").toLowerCase() === "coldbox-module" ? "coldbox module candidate" : "centralized (stays in the monolith)");
+	card.querySelector(".eyebrow").textContent = isExtract ? "microservice / side-app candidate" : (["coldbox-module", "module"].includes(placementType) ? "coldbox module candidate" : "main application (stays in the monolith)");
 	card.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
 	card.querySelector("h3").textContent = item.name || item.id || "Packaging decision";
 	renderModernizationDetailSummary(card.querySelector(".modernization-detail-summary"), item);
@@ -3124,7 +3156,7 @@ function renderModernizationArchitectureDetail(item) {
 function renderModernizationSolution(result = {}) {
 	const host = document.querySelector("#modernization-solution");
 	if (!host) return;
-	const hasPlan = !!(result.roadmapPhases?.length || result.target?.units?.length || result.inventory?.units?.length);
+	const hasPlan = !!(result.roadmapPhases?.length || result.target?.placements?.length || result.target?.units?.length || result.inventory?.units?.length);
 	host.hidden = !hasPlan;
 	if (!hasPlan) return;
 	const hollow = modernizationPlanIsHollow(result);

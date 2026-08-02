@@ -28,8 +28,10 @@ class {
 		var inventoryIds = inventoryUnitIdSet( validationInventory );
 		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
 
-		if ( ( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : "" ) != "modernization-plan-v1" ) {
-			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1" ); blocking++;
+		var planVersion = lCase( trim( arguments.plan.schemaVersion ?: arguments.plan.version ?: "" ) );
+		var isV2 = planVersion == "modernization-plan-v2" || isArray( target.placements ?: "" );
+		if ( ![ "modernization-plan-v1", "modernization-plan-v2" ].contains( planVersion ) ) {
+			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1 or modernization-plan-v2" ); blocking++;
 		}
 		for ( var field in [ "version", "metadata", "coverage", "assumptions", "inventory", "schemaEvidence", "signals", "target", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples", "validation", "decisions" ] ) {
 			if ( !structKeyExists( arguments.plan, field ) ) { addMessage( messages, "contract", "blocking", "Missing top-level field: #field#" ); blocking++; }
@@ -37,7 +39,9 @@ class {
 
 		var seen = {};
 		var seenTargetPaths = {};
-		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ];
+		var collections = isV2
+			? [ "target.units", "target.placements", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ]
+			: [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ];
 		for ( var collection in collections ) {
 			var parts = collection.listToArray( "." );
 			var owner = parts.len() == 2 ? ( structKeyExists( arguments.plan, parts[ 1 ] ) && isStruct( arguments.plan[ parts[ 1 ] ] ) ? arguments.plan[ parts[ 1 ] ] : {} ) : arguments.plan;
@@ -49,7 +53,7 @@ class {
 				if ( !len( id ) ) { addMessage( messages, collection, "blocking", "Item is missing a stable id", id ); blocking++; }
 				else if ( seen.keyExists( id ) ) { addMessage( messages, collection, "blocking", "Duplicate id: #id#", id ); blocking++; }
 				else seen[ id ] = true;
-				var decisionCollection = [ "target.units", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection );
+				var decisionCollection = [ "target.units", "target.placements", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection );
 				if ( !len( trim( item.itemFingerprint ?: "" ) ) ) {
 					addMessage( messages, collection, decisionCollection ? "blocking" : "warning", "Item #id# has no itemFingerprint", id );
 					if ( decisionCollection ) blocking++; else warnings++;
@@ -64,6 +68,21 @@ class {
 				// relative-path gate against a route's URL.
 				var itemPath = trim( item.targetPath ?: item.pathHint ?: ( collection == "routeContracts" ? "" : ( item.path ?: item.filePath ?: "" ) ) );
 					if ( collection != "routeContracts" && len( itemPath ) && !safeRelativePath( itemPath ) ) { addMessage( messages, collection, "blocking", "Item #id# contains an unsafe path", id ); blocking++; }
+				if ( collection == "target.placements" ) {
+					var placementType = lCase( trim( item.placementType ?: item.packaging ?: "" ) );
+					if ( ![ "main-app", "coldbox-module", "external-service", "centralized" ].contains( placementType ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an unsupported placementType", id ); blocking++; }
+					if ( !isArray( item.targetUnitIds ?: item.unitIds ?: "" ) || !( item.targetUnitIds ?: item.unitIds ?: [] ).len() ) { addMessage( messages, collection, "blocking", "Placement #id# must own at least one target unit", id ); blocking++; }
+					if ( !isArray( item.evidenceRefs ?: "" ) || !item.evidenceRefs.len() ) { addMessage( messages, collection, "warning", "Placement #id# has no evidence references", id ); warnings++; }
+					if ( isArray( item.gates ?: "" ) ) {
+						for ( var gate in item.gates ) {
+							var gateId = trim( toString( gate.id ?: "architecture" ) );
+							var gateStatus = lCase( trim( gate.status ?: "" ) );
+							if ( ![ "pass", "fail", "unknown" ].contains( gateStatus ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an invalid gate status", id ); blocking++; }
+							else if ( gateStatus == "fail" ) { addMessage( messages, collection, "blocking", "Placement #id# has a failed #gateId# gate", id ); blocking++; }
+							else if ( gateStatus == "unknown" ) { addMessage( messages, collection, "warning", "Placement #id# has an unknown #gateId# gate", id ); warnings++; }
+						}
+					}
+				}
 				if ( collection == "target.units" ) {
 					if ( !len( itemPath ) ) { addMessage( messages, collection, "blocking", "Target unit #id# is missing targetPath", id ); blocking++; }
 					else if ( !legalTargetPath( itemPath, runtime, profile ) ) { addMessage( messages, collection, "blocking", "Target unit #id# has an illegal runtime/layout extension", id ); blocking++; }
@@ -101,8 +120,19 @@ class {
 			if ( !len( trim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
 				if ( !variables.allowedEvidenceBasis.contains( lCase( trim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
 		}
-		var packagingGuideReport = validateArchitecturePackagingFields( target, messages );
+		var packagingGuideReport = isV2 ? { blocking: 0 } : validateArchitecturePackagingFields( target, messages );
 		blocking += packagingGuideReport.blocking;
+		if ( isV2 ) {
+			var placementReport = validatePlacements( target, target.units ?: [], messages );
+			blocking += placementReport.blocking;
+			warnings += placementReport.warnings;
+			var placementCoverage = isStruct( arguments.plan.placementCoverage ?: "" ) ? arguments.plan.placementCoverage : {};
+			var duplicateCoverageIds = isArray( placementCoverage.duplicateUnitIds ?: "" ) ? placementCoverage.duplicateUnitIds : [];
+			if ( duplicateCoverageIds.len() ) {
+				addMessage( messages, "target.placements", "blocking", "Placement coverage detected duplicate ownership for target units: #duplicateCoverageIds.toList( ', ' )#", "placement-coverage" );
+				blocking++;
+			}
+		}
 		var roadmapPhasesForGuide = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
 		var migrationGuideReport = validateRoadmapMigrationGuide( roadmapPhasesForGuide, target, inventoryPaths, messages );
 		blocking += migrationGuideReport.blocking;
@@ -313,6 +343,47 @@ class {
 		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
 			var sampleId = sample.id ?: sample.itemId ?: "";
 			checkReferenceArray( sample.relatedItemIds ?: [], knownIds, "samples", sampleId, "relatedItemIds", report, arguments.messages );
+		}
+		return report;
+	}
+
+	/**
+	 * V2 ownership invariant: every target unit has exactly one placement
+	 * owner. Unassigned units are blocking because the cockpit must never hide
+	 * a modernization decision behind an incomplete map.
+	 */
+	private struct function validatePlacements( required struct target, required array units, required array messages ) {
+		var report = { blocking: 0, warnings: 0 };
+		var unitIds = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitIds[ unitId ] = true;
+		}
+		var ownerByUnit = {};
+		for ( var placement in ( isArray( arguments.target.placements ?: "" ) ? arguments.target.placements : [] ) ) {
+			if ( !isStruct( placement ) ) continue;
+			var placementId = trim( toString( placement.id ?: placement.itemId ?: "" ) );
+			var ids = isArray( placement.targetUnitIds ?: placement.unitIds ?: "" ) ? ( placement.targetUnitIds ?: placement.unitIds ) : [];
+			for ( var rawUnitId in ids ) {
+				var unitId = trim( toString( rawUnitId ) );
+				if ( !len( unitId ) ) continue;
+				if ( !unitIds.keyExists( unitId ) ) {
+					addMessage( arguments.messages, "target.placements", "blocking", "Placement #placementId# references an unknown target unit", placementId );
+					report.blocking++;
+					continue;
+				}
+				if ( ownerByUnit.keyExists( unitId ) ) {
+					addMessage( arguments.messages, "target.placements", "blocking", "Target unit #unitId# is owned by more than one placement", placementId );
+					report.blocking++;
+				} else ownerByUnit[ unitId ] = placementId;
+			}
+		}
+		for ( var unitId in unitIds ) {
+			if ( !ownerByUnit.keyExists( unitId ) ) {
+				addMessage( arguments.messages, "target.placements", "blocking", "Target unit #unitId# has no placement owner", unitId );
+				report.blocking++;
+			}
 		}
 		return report;
 	}
@@ -558,7 +629,7 @@ class {
 	}
 
 	private string function evidenceLevel( required array messages ) {
-		for ( var item in arguments.messages ) if ( [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples" ].contains( item.category ) && item.level == "blocking" ) return "evidence-unchecked";
+		for ( var item in arguments.messages ) if ( [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples" ].contains( item.category ) && item.level == "blocking" ) return "evidence-unchecked";
 		return "evidence-grounded";
 	}
 	private string function syntaxLevel( required struct plan ) { return "syntax-unchecked"; }

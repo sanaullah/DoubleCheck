@@ -27,7 +27,10 @@
 			routes: [result.routeContracts || [], "route-contract"],
 			database: [(result.dbFindings || []).map((item) => ({ ...item, itemType: item.itemType || "db-finding" })).concat((result.dbTransitions || database.findings || []).map((item) => ({ ...item, itemType: item.itemType || "db-transition" }))), "db-finding"],
 			links: [result.unitLinks || [], "unit-link"],
-			contexts: [(target.contexts || result.contexts || []).map((item) => ({ ...item, itemType: item.itemType || "context" })).concat((target.extracts || result.extracts || []).map((item) => ({ ...item, itemType: item.itemType || "extract" }))), "context"],
+			contexts: [(target.placements || []).map((item) => ({ ...item, itemType: item.itemType || "placement" })).concat(
+				(target.placements || []).length ? [] : (target.contexts || result.contexts || []).map((item) => ({ ...item, itemType: item.itemType || "context" })).concat((target.extracts || result.extracts || []).map((item) => ({ ...item, itemType: item.itemType || "extract" })))
+			), "placement"],
+			placements: [(target.placements || []).map((item) => ({ ...item, itemType: item.itemType || "placement" })), "placement"],
 			roadmap: [result.roadmapPhases || [], "roadmap-phase"],
 			validation: [result.validation?.items || result.validation?.messages || [], "validation"]
 		};
@@ -55,6 +58,7 @@
 		if (item._modernizationType === "route-contract") return `${item.method || "GET"} ${item.legacyPath || item.path || "legacy route"} → ${item.targetRoute || item.targetEvent || "target"}`;
 		if (item._modernizationType === "db-finding") return item.objectRef || item.proposedChange || item.problem || item.id || "Database finding";
 		if (item._modernizationType === "db-transition") return item.migrationPath || item.operation || item.id || "Database transition";
+		if (item._modernizationType === "placement") return (item.name || item.title || item.id || "Capability") + " · " + (item.placementType || item.packaging || "main-app");
 		if (item._modernizationType === "sample") return item.targetPath || item.path || item.sampleKind || item.id || "Sample";
 		if (item._modernizationType === "validation" || item.itemType === "validation") {
 			return item.title || item.message || item.detail || item.targetPath || item.path || item.itemId || item.id || "Validation note";
@@ -107,6 +111,7 @@
 	function modernizationItemMeta(item) {
 		const validation = modernizationValidationStatus(item);
 		const provenance = item.provenanceClass || "unknown provenance";
+		if (item._modernizationType === "placement") return (item.placementType || item.packaging || "main-app") + " · " + (item.gateStatus || "needs-review") + " · " + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "unknown").length + " unknown gates · " + provenance;
 		if (item._modernizationType === "legacy-unit") {
 			const range = item.startLine ? ` · lines ${item.startLine}${item.endLine && item.endLine !== item.startLine ? `–${item.endLine}` : ""}` : "";
 			return `${item.layer || item.unitType || "legacy"}${range} · ${item.signalIds?.length || 0} signal types · ${item.touchedTables?.length || 0} tables · ${provenance}`;
@@ -163,10 +168,12 @@
 	 * Pure/DOM-free so it's directly unit-testable.
 	 */
 	function buildModernizationArchitectureSubgraph(result = {}) {
-		const contexts = result.target?.contexts || result.contexts || [];
-		const extracts = result.target?.extracts || result.extracts || [];
-		const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module");
-		const central = contexts.filter((item) => !modules.includes(item));
+		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
+			? result.target.placements
+			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
+		const modules = placements.filter((item) => ["coldbox-module", "module"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+		const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+		const central = placements.filter((item) => !modules.includes(item) && !extracts.includes(item));
 
 		const nodes = [];
 		const idById = new Map();
@@ -330,9 +337,11 @@
 	 */
 	function modernizationBriefSummary(result = {}) {
 		const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
-		const contexts = result.target?.contexts || result.contexts || [];
-		const extracts = result.target?.extracts || result.extracts || [];
-		const modules = contexts.filter((item) => String(item.packaging || "").toLowerCase() === "coldbox-module");
+		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
+			? result.target.placements
+			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
+		const modules = placements.filter((item) => ["coldbox-module", "module"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+		const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
 		const effortCounts = { S: 0, M: 0, L: 0, XL: 0 };
 		let riskyPhaseCount = 0;
 		phases.forEach((phase) => {
@@ -341,11 +350,16 @@
 		});
 		const currentPhase = phases.find((phase) => phase.currentSlice) || null;
 		return {
-			hasPlan: !!(phases.length || contexts.length || extracts.length || (result.target?.units || []).length),
+			hasPlan: !!(phases.length || placements.length || (result.target?.units || []).length),
 			phaseCount: phases.length,
 			effortCounts,
 			riskyPhaseCount,
-			packagingSplit: { centralized: Math.max(0, contexts.length - modules.length), modules: modules.length, extracts: extracts.length },
+			packagingSplit: { centralized: Math.max(0, placements.length - modules.length - extracts.length), modules: modules.length, extracts: extracts.length },
+			gateSummary: {
+				failed: placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "fail").length, 0),
+				unknown: placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "unknown").length, 0),
+				decisionRequired: placements.filter((item) => item.decisionRequired).length
+			},
 			currentSlice: currentPhase ? {
 				name: currentPhase.name || currentPhase.goal || currentPhase.id || "Current slice",
 				effortSize: currentPhase.effortSize || "",

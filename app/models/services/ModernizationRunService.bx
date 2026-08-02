@@ -14,9 +14,11 @@ class {
 	property name="contextPackService" inject="ModernizationContextPackService";
 	property name="proposalService" inject="ModernizationProposalService";
 	property name="validationService" inject="ModernizationValidationService";
-	property name="modernizationRepository" inject="ModernizationRepository";
-	property name="modernizationDecisionService" inject="ModernizationDecisionService";
-	property name="modernizationRiskService" inject="ModernizationRiskService";
+property name="modernizationRepository" inject="ModernizationRepository";
+property name="modernizationDecisionService" inject="ModernizationDecisionService";
+property name="modernizationRiskService" inject="ModernizationRiskService";
+property name="modernizationPlacementService" inject="ModernizationPlacementService";
+property name="modernizationGateService" inject="ModernizationGateService";
 	property name="runRepository" inject="ReviewRunRepository";
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="eventService" inject="ReviewEventService";
@@ -28,7 +30,7 @@ class {
 	// silently restoring noisy construction signals on every rerun — so v3
 	// checkpoints must not
 	// be reusable.
-	variables.pipelineContractVersion = "modernization-pipeline-v4";
+	variables.pipelineContractVersion = "modernization-pipeline-v5";
 
 	/**
 	 * Executes the evidence-first Modernize pipeline, reusing compatible
@@ -188,7 +190,16 @@ class {
 				return terminal( result, "failed", "Modernization proposal was not generated", "failed" );
 			}
 			var plan = proposal.plan ?: {};
-			plan.schemaVersion = "modernization-plan-v1";
+			var placementService = placementServiceInstance();
+			var gateService = gateServiceInstance();
+			// Promote the provider's legacy context/extract vocabulary to the
+			// canonical v2 placement artifact before the first validation/save.
+			// The adapter is deterministic, bounded, and keeps a marked legacy
+			// projection so existing consumers can coexist during rollout.
+			plan = placementService.canonicalize( plan, evidence, true );
+			plan = gateService.evaluatePlan( plan, evidence );
+			plan = placementService.refreshFingerprints( plan );
+			plan.schemaVersion = placementService.planVersion();
 			plan.metadata = plan.metadata ?: {};
 			plan.metadata.runId = runId;
 			plan.metadata.privacy = input.privacy ?: {};
@@ -243,7 +254,10 @@ class {
 						break;
 					}
 					plan = repair.plan ?: plan;
-					plan.schemaVersion = "modernization-plan-v1";
+					plan = placementService.canonicalize( plan, evidence, true );
+					plan = gateService.evaluatePlan( plan, evidence );
+					plan = placementService.refreshFingerprints( plan );
+					plan.schemaVersion = placementService.planVersion();
 					plan.metadata = plan.metadata ?: {};
 					plan.metadata.runId = runId;
 					plan.coverage = coverage;
@@ -337,6 +351,7 @@ class {
 		var stored = modernizationRepository.getPlan( arguments.runId );
 		if ( isNull( stored ) ) return { schemaVersion: "modernization-plan-v1", validation: {}, coverage: {}, decisions: [], decisionEvents: [] };
 		var result = duplicate( stored.plan ?: {} );
+		result = placementServiceInstance().adaptForRead( result );
 		result.schemaVersion = result.schemaVersion ?: stored.planVersion;
 		result.validation = stored.validation ?: result.validation ?: {};
 		result.coverage = stored.coverage ?: result.coverage ?: {};
@@ -458,6 +473,7 @@ class {
 			if ( isNull( current ) || trim( current.itemFingerprint ?: "" ) != trim( prior.itemFingerprint ?: "" ) ) continue;
 			var saved = modernizationRepository.upsertDecision( arguments.run.getId(), {
 				itemType: prior.itemType, itemId: prior.itemId, decision: prior.decision,
+				selectedOption: prior.selectedOption ?: prior.selected_option ?: "",
 				note: prior.note ?: "", itemFingerprint: prior.itemFingerprint ?: "", decidedBy: prior.decidedBy ?: "carried-forward"
 			} );
 			modernizationRepository.appendDecisionEvent( arguments.run.getId(), {
@@ -468,12 +484,27 @@ class {
 		modernizationDecisionService.refreshState( arguments.run.getId() );
 	}
 	private any function findPlanItem( required struct plan, required string itemType, required string itemId ) {
-		var map = { "target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts", "db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples" };
+		var map = { "target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts", "db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples", "placement": "target.placements" };
 		if ( !map.keyExists( arguments.itemType ) ) return javacast( "null", "" );
 		var path = map[ arguments.itemType ];
-		var values = arguments.itemType == "target-unit" ? ( arguments.plan.target.units ?: [] ) : ( isArray( arguments.plan[ path ] ?: "" ) ? arguments.plan[ path ] : [] );
+		var parts = path.listToArray( "." );
+		var owner = parts.len() == 2 ? ( isStruct( arguments.plan[ parts[ 1 ] ] ?: "" ) ? arguments.plan[ parts[ 1 ] ] : {} ) : arguments.plan;
+		var key = parts[ parts.len() ];
+		var values = isArray( owner[ key ] ?: "" ) ? owner[ key ] : [];
 		for ( var item in values ) if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
 		return javacast( "null", "" );
+	}
+	private any function placementServiceInstance() {
+		if ( !isNull( variables.modernizationPlacementService ?: javacast( "null", "" ) ) ) return variables.modernizationPlacementService;
+		variables.modernizationPlacementService = new app.models.services.ModernizationPlacementService();
+		if ( isNull( variables.modernizationPlacementService.identityService ?: javacast( "null", "" ) ) ) variables.modernizationPlacementService.identityService = new app.models.services.ModernizationIdentityService();
+		return variables.modernizationPlacementService;
+	}
+	private any function gateServiceInstance() {
+		if ( !isNull( variables.modernizationGateService ?: javacast( "null", "" ) ) ) return variables.modernizationGateService;
+		variables.modernizationGateService = new app.models.services.ModernizationGateService();
+		if ( isNull( variables.modernizationGateService.identityService ?: javacast( "null", "" ) ) ) variables.modernizationGateService.identityService = new app.models.services.ModernizationIdentityService();
+		return variables.modernizationGateService;
 	}
 	private void function emit(required struct callbacks, required numeric progress, required string phase, required string message) {
 		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) arguments.callbacks.renewLease();

@@ -63,7 +63,8 @@ class {
 		var payload = sanitizeExportValue( duplicate( arguments.result ), "", "" );
 		sortExportCollections( payload );
 		var metadata = isStruct( payload.metadata ?: "" ) ? payload.metadata : {};
-		payload.schemaVersion = payload.schemaVersion ?: "modernization-plan-v1";
+		payload.schemaVersion = payload.schemaVersion ?: ( isArray( payload.target?.placements ?: "" ) ? "modernization-plan-v2" : "modernization-plan-v1" );
+		payload.placementContractVersion = payload.placementContractVersion ?: ( isArray( payload.target?.placements ?: "" ) ? "modernization-placement-v1" : "" );
 		payload.run = {
 			id          : arguments.run.id ?: "",
 			projectPath : arguments.run.projectPath ?: "",
@@ -96,6 +97,7 @@ class {
 		var legacyUnits = inventory.units ?: [];
 		var legacyUnitRows = legacyUnitDisplayRows( legacyUnits, inventory.dependencies ?: [] );
 		var targetUnits = target.units ?: [];
+		var placements = target.placements ?: arguments.result.placements ?: [];
 		var routes = arguments.result.routeContracts ?: [];
 		var dbFindings = arguments.result.dbFindings ?: [];
 		var transitions = arguments.result.dbTransitions ?: [];
@@ -135,6 +137,8 @@ class {
 		lines.append( coverageLine( "Provider shards completed", coverageLlm.completed ?: 0 ) );
 		lines.append( coverageLine( "Provider shards failed", coverageLlm.failed ?: 0 ) );
 		lines.append( coverageLine( "Provider shards omitted", coverageLlm.omitted ?: coverageLlm.omittedPartitions ?: 0 ) );
+		var gateSummary = arguments.result.gateSummary ?: {};
+		lines.append( coverageLine( "Placement gates", ( gateSummary.failed ?: 0 ) & " failed · " & ( gateSummary.unknown ?: 0 ) & " unknown" ) );
 		if ( isArray( coverageLlm.gaps ?: "" ) ) {
 			for ( var gap in coverageLlm.gaps ) {
 				if ( !isStruct( gap ) ) continue;
@@ -153,6 +157,7 @@ class {
 		lines.append( "" );
 
 		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
+		appendPlacementRegister( lines, placements );
 
 		var commonLabels = { validationStatus: "Validation", provenanceClass: "Evidence basis", evidenceRefs: "Evidence", evidence: "Evidence" };
 		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnitRows, [ "id", "path", "kind", "name", "extends", "implements", "access", "returnType", "evidenceRefs" ], commonLabels );
@@ -263,6 +268,38 @@ class {
 			results.append( gapRow );
 		}
 
+		var placements = isStruct( plan.target ?: "" ) && isArray( plan.target.placements ?: "" ) ? plan.target.placements : [];
+		for ( var placement in placements ) {
+			if ( !isStruct( placement ) ) continue;
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				if ( !isStruct( gate ) || ![ "fail", "unknown" ].contains( lCase( trim( gate.status ?: "" ) ) ) ) continue;
+				var gateStatus = lCase( trim( gate.status ?: "unknown" ) );
+				var gateId = trim( toString( gate.id ?: "architecture" ) );
+				var gateRule = "doublecheck/modernization/" & ( gateStatus == "fail" ? "placement-gate-failed" : "placement-gate-unknown" );
+				rules[ gateRule ] = {
+					id: gateRule,
+					shortDescription: { text: "Modernization placement gate" }
+				};
+				var placementId = trim( toString( placement.id ?: placement.itemId ?: "" ) );
+				var gateText = "Placement #placementId# — #gateId# gate is #gateStatus#";
+				if ( len( trim( gate.explanation ?: "" ) ) ) gateText &= ": " & gate.explanation;
+				results.append( {
+					ruleId: gateRule,
+					level: gateStatus == "fail" ? "error" : "warning",
+					message: { text: gateText },
+					properties: {
+						placementId: placementId,
+						gateId: gateId,
+						gateStatus: gateStatus,
+						planState: plan.planState ?: plan.state ?: "needs-review"
+					},
+					fingerprints: {
+						"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|placement-gate|" & placementId & "|" & gateId & "|" & gateStatus, "SHA-256" ) )
+					}
+				} );
+			}
+		}
+
 		var ruleList = [];
 		var ruleIds = structKeyArray( rules );
 		ruleIds.sort( "textnocase" );
@@ -305,7 +342,7 @@ class {
 
 	private struct function findPlanItem( required struct plan, required string itemId ) {
 		if ( !len( arguments.itemId ) ) return {};
-		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
+		for ( var path in [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
 			var parts = path.listToArray( "." );
 			var owner = parts.len() == 2 ? ( arguments.plan[ parts[ 1 ] ] ?: {} ) : arguments.plan;
 			var key = parts[ parts.len() ];
@@ -385,6 +422,36 @@ class {
 			if ( len( trim( extract.sharedDatasourceRisk ?: "" ) ) ) arguments.lines.append( "  - Shared DB risk: " & escapeMarkdown( extract.sharedDatasourceRisk ) );
 			if ( len( trim( extract.dataBoundaryNote ?: "" ) ) ) arguments.lines.append( "  - Data boundary: " & escapeMarkdown( extract.dataBoundaryNote ) );
 		}
+		arguments.lines.append( "" );
+	}
+
+	private void function appendPlacementRegister( required array lines, required array placements ) {
+		arguments.lines.append( mdHeading( 2, "Architecture placement register" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.placements.len() ) {
+			arguments.lines.append( "- No canonical placement decisions were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		arguments.lines.append( "Every target unit should have exactly one owner. Service extraction remains gated by deployability, data ownership, state isolation, and operational evidence." );
+		arguments.lines.append( "" );
+		appendRows(
+			arguments.lines,
+			"",
+			arguments.placements,
+			[ "id", "name", "placementType", "targetUnitIds", "gateStatus", "decisionRequired", "evidenceBasis", "recommendation", "evidenceRefs" ],
+			{
+				id: "Placement",
+				name: "Capability",
+				placementType: "Recommended target",
+				targetUnitIds: "Target units",
+				gateStatus: "Gate status",
+				decisionRequired: "Decision required",
+				evidenceBasis: "Evidence basis",
+				recommendation: "Recommendation",
+				evidenceRefs: "Evidence"
+			}
+		);
 		arguments.lines.append( "" );
 	}
 
@@ -618,7 +685,7 @@ class {
 	}
 
 	private void function sortExportCollections( required struct payload ) {
-		for ( var path in [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
+		for ( var path in [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
 			var parts = path.listToArray( "." );
 			var owner = parts.len() == 2 ? ( arguments.payload[ parts[ 1 ] ] ?: {} ) : arguments.payload;
 			var key = parts[ parts.len() ];

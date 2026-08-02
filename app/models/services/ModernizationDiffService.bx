@@ -14,6 +14,7 @@ class {
 	struct function compare( required struct currentPlan, any baselinePlan = javacast( "null", "" ) ) {
 		var currentLegacyUnits = isArray( arguments.currentPlan.inventory.units ?: "" ) ? arguments.currentPlan.inventory.units : [];
 		var currentTargetUnits = isArray( arguments.currentPlan.target.units ?: "" ) ? arguments.currentPlan.target.units : [];
+		var currentPlacements = isArray( arguments.currentPlan.target.placements ?: "" ) ? arguments.currentPlan.target.placements : [];
 		var currentDecisions = isArray( arguments.currentPlan.decisions ?: "" ) ? arguments.currentPlan.decisions : [];
 		var currentFingerprint = arguments.currentPlan.planFingerprint ?: "";
 		var currentCoverage = coverageSnapshot( arguments.currentPlan.coverage ?: {} );
@@ -25,6 +26,7 @@ class {
 				currentFingerprint : currentFingerprint,
 				legacyUnits        : allAdded( currentLegacyUnits ),
 				targetUnits        : allAdded( currentTargetUnits ),
+				placements         : allAdded( currentPlacements ),
 				decisions          : allAdded( currentDecisions, "itemId" ),
 				coverage           : {
 					current : currentCoverage,
@@ -37,6 +39,7 @@ class {
 
 		var baselineLegacyUnits = isArray( arguments.baselinePlan.inventory.units ?: "" ) ? arguments.baselinePlan.inventory.units : [];
 		var baselineTargetUnits = isArray( arguments.baselinePlan.target.units ?: "" ) ? arguments.baselinePlan.target.units : [];
+		var baselinePlacements = isArray( arguments.baselinePlan.target.placements ?: "" ) ? arguments.baselinePlan.target.placements : [];
 		var baselineDecisions = isArray( arguments.baselinePlan.decisions ?: "" ) ? arguments.baselinePlan.decisions : [];
 		var baselineFingerprint = arguments.baselinePlan.planFingerprint ?: "";
 		var baselineCoverage = coverageSnapshot( arguments.baselinePlan.coverage ?: {} );
@@ -47,6 +50,7 @@ class {
 			currentFingerprint : currentFingerprint,
 			legacyUnits        : diffById( currentLegacyUnits, baselineLegacyUnits ),
 			targetUnits        : diffById( currentTargetUnits, baselineTargetUnits ),
+			placements         : diffPlacements( currentPlacements, baselinePlacements ),
 			decisions          : diffById( currentDecisions, baselineDecisions, "itemId" ),
 			coverage           : {
 				current : currentCoverage,
@@ -55,6 +59,46 @@ class {
 			},
 			summary: { hasBaseline: true }
 		};
+	}
+
+	private struct function diffPlacements( required array currentItems, required array baselineItems ) {
+		var result = diffById( arguments.currentItems, arguments.baselineItems );
+		var currentByMembers = placementMemberIndex( arguments.currentItems );
+		var baselineByMembers = placementMemberIndex( arguments.baselineItems );
+		var lineage = [];
+		for ( var key in currentByMembers ) {
+			if ( baselineByMembers.keyExists( key ) ) continue;
+			var current = currentByMembers[ key ];
+			var best = "";
+			for ( var priorKey in baselineByMembers ) {
+				if ( overlapRatio( key, priorKey ) >= .5 ) { best = baselineByMembers[ priorKey ].id ?: ""; break; }
+			}
+			if ( len( best ) ) lineage.append( { currentId: current.id ?: "", sourcePlacementIds: [ best ], changeType: "split-or-repacked" } );
+		}
+		result.lineage = lineage;
+		return result;
+	}
+
+	private struct function placementMemberIndex( required array items ) {
+		var output = {};
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var ids = isArray( item.targetUnitIds ?: item.unitIds ?: "" ) ? ( item.targetUnitIds ?: item.unitIds ) : [];
+			ids = ids.map( ( id ) => trim( toString( id ) ) );
+			ids.sort( "textnocase" );
+			var key = ids.toList( "|" );
+			if ( len( key ) ) output[ key ] = { id: item.id ?: item.itemId ?: "", item: item };
+		}
+		return output;
+	}
+
+	private numeric function overlapRatio( required string leftKey, required string rightKey ) {
+		var leftIds = arguments.leftKey.listToArray( "|" );
+		var rightIds = arguments.rightKey.listToArray( "|" );
+		if ( !leftIds.len() || !rightIds.len() ) return 0;
+		var overlap = 0;
+		for ( var id in leftIds ) if ( rightIds.contains( id ) ) overlap++;
+		return overlap / max( leftIds.len(), rightIds.len() );
 	}
 
 	/** Set-difference by idField; added/removed carry a display-friendly summary, unchanged is id-only. */

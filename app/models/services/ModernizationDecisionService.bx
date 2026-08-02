@@ -5,7 +5,7 @@ class {
 	property name="identityService" inject="ModernizationIdentityService";
 	property name="securityContextService" inject="SecurityContextService";
 	property name="secretRedactionService" inject="SecretRedactionService";
-	variables.allowedTypes = [ "target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample", "context", "extract" ];
+	variables.allowedTypes = [ "target-unit", "unit-link", "route-contract", "db-finding", "db-transition", "roadmap-phase", "sample", "context", "extract", "placement" ];
 
 	function init() {
 		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
@@ -54,8 +54,12 @@ class {
 		var fingerprint = trim( arguments.input.itemFingerprint ?: "" );
 		var planFingerprint = trim( arguments.input.planFingerprint ?: arguments.input.artifactFingerprint ?: "" );
 		var note = trim( arguments.input.note ?: "" );
+		var selectedOption = lCase( trim( arguments.input.selectedPlacementType ?: arguments.input.selectedOption ?: "" ) );
 		if ( !variables.allowedTypes.contains( itemType ) ) throw( type = "ValidationException", message = "itemType is not supported" );
 		if ( ![ "accepted", "rejected" ].contains( decision ) ) throw( type = "ValidationException", message = "decision must be accepted or rejected" );
+		if ( len( selectedOption ) && ( itemType != "placement" || ![ "main-app", "coldbox-module", "external-service" ].contains( selectedOption ) ) ) throw( type = "ValidationException", message = "selectedOption is only valid for placement decisions" );
+		if ( decision == "accepted" && itemType == "placement" && !len( selectedOption ) ) selectedOption = "";
+		if ( decision == "rejected" ) selectedOption = "";
 		if ( len( note ) > 2000 ) throw( type = "ValidationException", message = "note exceeds 2000 characters" );
 		note = secretRedactionService.redactText( note );
 		var planRecord = modernizationRepository.getPlan( arguments.run.getId() );
@@ -67,7 +71,7 @@ class {
 		if ( !len( actualFingerprint ) || !len( fingerprint ) || actualFingerprint != fingerprint ) throw( type = "ModernizationDecisionConflict", message = "The modernization proposal changed; refresh before deciding" );
 		var saved = modernizationRepository.upsertDecision(
 			arguments.run.getId(),
-			{ itemType: itemType, itemId: arguments.itemId, decision: decision, note: note, itemFingerprint: fingerprint, decidedBy: arguments.context.actor ?: "local-user" }
+			{ itemType: itemType, itemId: arguments.itemId, decision: decision, selectedOption: selectedOption, note: note, itemFingerprint: fingerprint, decidedBy: arguments.context.actor ?: "local-user" }
 		);
 		modernizationRepository.appendDecisionEvent( arguments.run.getId(), { itemType: itemType, itemId: arguments.itemId, action: decision, decision: saved, actor: arguments.context.actor ?: "local-user" } );
 		if ( itemType == "roadmap-phase" ) {
@@ -103,13 +107,13 @@ class {
 		var state = ( val( validation.blocking ?: 0 ) > 0 ) ? "needs-review" : "generated";
 		var requiredItems = {};
 		var accepted = 0; var rejected = 0;
-		for ( var collection in [ "target.units", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases" ] ) {
+		for ( var collection in [ "target.units", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "target.placements" ] ) {
 			var collectionParts = collection.listToArray( "." );
 			var collectionOwner = collectionParts.len() == 2 ? ( arguments.planRecord.plan[ collectionParts[ 1 ] ] ?: {} ) : arguments.planRecord.plan;
 			var collectionKey = collectionParts[ collectionParts.len() ];
 			for ( var item in ( isStruct( collectionOwner ) && isArray( collectionOwner[ collectionKey ] ?: "" ) ? collectionOwner[ collectionKey ] : [] ) ) {
 				var itemId = item.id ?: item.itemId ?: "";
-				var isRequired = collection == "dbTransitions" || collection == "routeContracts" || collection == "roadmapPhases" || ( item.validationLevel ?: "" ) == "blocking" || ( item.severity ?: "" ) == "critical" || ( item.requiredDecision ?: false ) == true || ( item.currentSlice ?: false ) == true;
+				var isRequired = collection == "dbTransitions" || collection == "routeContracts" || collection == "roadmapPhases" || collection == "target.placements" && ( item.decisionRequired ?: false ) || ( item.validationLevel ?: "" ) == "blocking" || ( item.severity ?: "" ) == "critical" || ( item.requiredDecision ?: false ) == true || ( item.currentSlice ?: false ) == true;
 				// Persistence/API item types use singular kebab-case names while the
 				// plan contract uses camelCase collection keys. Keep the mapping
 				// explicit so required-item counts line up with submitted decisions.
@@ -120,6 +124,8 @@ class {
 					"dbTransitions": "db-transition",
 					"routeContracts": "route-contract",
 					"roadmapPhases": "roadmap-phase"
+					,
+					"target.placements": "placement"
 				}[ collection ] ?: "";
 				if ( isRequired && len( itemId ) ) requiredItems[ decisionType & ":" & itemId ] = trim( item.itemFingerprint ?: "" );
 			}
@@ -152,7 +158,7 @@ class {
 		var map = {
 			"target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts",
 			"db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases",
-			"sample": "samples", "context": "target.contexts", "extract": "target.extracts"
+			"sample": "samples", "context": "target.contexts", "extract": "target.extracts", "placement": "target.placements"
 		};
 		var path = map[ arguments.itemType ];
 		// Dotted paths (target-unit/context/extract) live nested under plan.target;
@@ -194,7 +200,7 @@ class {
 				if ( isNull( linked ) ) continue;
 				var fp = trim( linked.itemFingerprint ?: "" );
 				if ( !len( fp ) ) continue;
-				var saved = modernizationRepository.upsertDecision(
+			var saved = modernizationRepository.upsertDecision(
 					arguments.runId,
 					{
 						itemType        : link.type,
