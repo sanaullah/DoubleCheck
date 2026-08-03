@@ -10,7 +10,7 @@ class {
 	property name="maxCharacters" inject="coldbox:setting:modernizeMaxContextCharacters";
 	property name="maxLinesPerFile" inject="coldbox:setting:modernizeMaxContextLinesPerFile";
 	property name="maxCharactersPerPartition" inject="coldbox:setting:modernizeMaxContextCharactersPerPartition";
-	variables.defaults = { maxPartitions: 100, maxCharacters: 240000, maxLinesPerFile: 160, maxCharactersPerPartition: 18000 };
+	variables.defaults = { maxPartitions: 140, maxCharacters: 320000, maxLinesPerFile: 160, maxCharactersPerPartition: 16000 };
 	variables.version = "modernization-context-partitions-v1";
 
 	function init() {
@@ -66,8 +66,8 @@ class {
 			if ( !pathGroups.keyExists( path ) ) pathGroups[ path ] = [];
 			pathGroups[ path ].append( unit );
 		}
-		var paths = structKeyArray( pathGroups );
-		paths.sort( "textnocase" );
+		var boostPaths = collectBoostPaths( arguments.options );
+		var paths = prioritizePaths( structKeyArray( pathGroups ), boostPaths );
 		var partitions = [];
 		var usedCharacters = 0;
 		var omittedPaths = [];
@@ -106,13 +106,79 @@ class {
 			files: paths.len(),
 			omittedPartitions: omittedPaths.len(),
 			omittedPaths: omittedPaths,
+			priorityBoostPaths: boostPaths,
 			truncated: omittedPaths.len() > 0 || coverageTruncated( arguments.coverage ),
-			lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 )
+			lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 ),
+			coverageNote: omittedPaths.len()
+				? "Omitted #omittedPaths.len()# lower-priority paths after packing foundation/scope-first partitions."
+				: "All eligible source paths fit the context budget."
 		};
 		return { version: variables.version, partitions: partitions, contexts: partitions, files: partitions, summary: summary, truncated: summary.truncated, characters: usedCharacters, fingerprint: stableHash( variables.version & "|" & partitions.map( ( item ) => item.fingerprint ).toList( "|" ) ) };
 	}
 
 	struct function partition(required struct inventory, struct signals = {}, struct schemaPack = {}, struct coverage = {}, any sourceFiles = [], struct options = {}) returntype="struct" { return build( arguments.inventory, arguments.signals, arguments.schemaPack, arguments.coverage, arguments.sourceFiles, arguments.options ); }
+
+	private array function collectBoostPaths( required struct options ) {
+		var boost = [];
+		var appendBoost = ( value ) => {
+			if ( isArray( value ) ) {
+				for ( var item in value ) appendBoost( item );
+				return;
+			}
+			var normalized = normalizePath( toString( value ?: "" ) );
+			if ( len( normalized ) && !arrayContainsNoCase( boost, normalized ) ) boost.append( normalized );
+		};
+		appendBoost( arguments.options.priorityPaths ?: [] );
+		appendBoost( arguments.options.boostPaths ?: [] );
+		appendBoost( arguments.options.scopePaths ?: [] );
+		if ( isStruct( arguments.options.input ?: "" ) ) {
+			appendBoost( arguments.options.input.scopePaths ?: [] );
+			appendBoost( arguments.options.input.priorityPaths ?: [] );
+		}
+		if ( isStruct( arguments.options.extraEvidence ?: "" ) ) {
+			appendBoost( arguments.options.extraEvidence.priorityPaths ?: [] );
+		}
+		return boost;
+	}
+
+	private array function prioritizePaths( required array paths, array boostPaths = [] ) {
+		var scored = [];
+		for ( var path in arguments.paths ) {
+			scored.append( { path: path, score: pathPriorityScore( path, arguments.boostPaths ) } );
+		}
+		scored.sort( ( a, b ) => {
+			if ( a.score != b.score ) return b.score - a.score;
+			return compareNoCase( a.path, b.path );
+		} );
+		return scored.map( ( item ) => item.path );
+	}
+
+	private numeric function pathPriorityScore( required string path, array boostPaths = [] ) {
+		var lower = lCase( arguments.path );
+		var score = 0;
+		if ( reFindNoCase( "(^|/|\\)application\.(cfc|bx)$", lower ) ) score += 100;
+		if ( reFindNoCase( "coldbox\.(cfc|bx)$", lower ) ) score += 90;
+		if ( findNoCase( "router.", lower ) || findNoCase( "/routes", lower ) ) score += 80;
+		if ( findNoCase( "/config/", lower ) || findNoCase( "\config\", lower ) ) score += 70;
+		if ( findNoCase( "application.", lower ) ) score += 40;
+		if ( findNoCase( "index.", lower ) ) score += 20;
+		if ( findNoCase( "/model", lower ) || findNoCase( "/service", lower ) || findNoCase( "/handler", lower ) || findNoCase( "/controller", lower ) ) score += 15;
+		if ( findNoCase( "playlist", lower ) || findNoCase( "userhome", lower ) || findNoCase( "search", lower ) || findNoCase( "login", lower ) ) score += 12;
+		for ( var boost in arguments.boostPaths ) {
+			var needle = lCase( reReplace( normalizePath( boost ), "/+$", "" ) );
+			if ( !len( needle ) ) continue;
+			if ( lower == needle || left( lower, len( needle ) + 1 ) == needle & "/" || find( "/" & needle & "/", "/" & lower & "/" ) ) {
+				score += 200;
+				break;
+			}
+		}
+		return score;
+	}
+
+	private boolean function arrayContainsNoCase( required array values, required string needle ) {
+		for ( var value in arguments.values ) if ( compareNoCase( toString( value ), arguments.needle ) == 0 ) return true;
+		return false;
+	}
 
 	private struct function buildPartition(
 		required string path,

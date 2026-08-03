@@ -38,6 +38,8 @@ ReviewRunService.executeRun() [runKind = modernize]
        -> ModernizationSignalService
        -> ModernizationContextPackService
        -> ModernizationProposalService [optional AI]
+       -> ModernizationPlacementService.canonicalize()
+       -> ModernizationGateService.evaluatePlan()
        -> ModernizationValidationService
        -> ModernizationRepository
 ```
@@ -111,7 +113,7 @@ deterministic rules behind those public methods.
 
 | File | Responsibility | Public API |
 | --- | --- | --- |
-| [ReviewRunService.bx](services/ReviewRunService.bx) | Coordinates run creation, queueing, leases, phase execution, cancellation, result assembly, reruns, and follow-ups. | `create`, `rerunScoped`, `followUpScoped`, `recoverPendingRuns`, `get`, `getScoped`, `getResult`, `getResultScoped`, `list`, `listScoped`, `cancel`, `cancelScoped`, `isTerminal` |
+| [ReviewRunService.bx](services/ReviewRunService.bx) | Coordinates run creation, queueing, leases, phase execution, cancellation, result assembly, reruns, follow-ups, and Modernize continuation. | `create`, `rerunScoped`, `followUpScoped`, `continueModernizeScoped`, `recoverPendingRuns`, `get`, `getScoped`, `getResult`, `getResultScoped`, `list`, `listScoped`, `cancel`, `cancelScoped`, `isTerminal` |
 | [RepositoryScannerService.bx](services/RepositoryScannerService.bx) | Discovers bounded source files for working-tree, revision-diff, or full scans and reads file metadata/content. | `scan`, `listSourceFiles`, `prioritizeCandidatePaths` |
 | [GitRepositoryService.bx](services/GitRepositoryService.bx) | Provides read-only Git inspection, file lists, blobs, and changed line ranges. | `inspect`, `workingTreePaths`, `fullPaths`, `revisionPaths`, `readBlob`, `changedLineRanges` |
 | [ReviewPolicyService.bx](services/ReviewPolicyService.bx) | Validates the create payload, allowlisted roles, budgets, and stable policy fingerprint. | `normalize` |
@@ -151,6 +153,11 @@ deterministic rules behind those public methods.
 | [AIProviderResolverService.bx](services/AIProviderResolverService.bx) | Resolves the active or requested profile fresh from SQLite, falling back to environment settings. | `resolve` |
 | [AIReviewService.bx](services/AIReviewService.bx) | Provides the bounded bulk-review fallback when specialist agents are not enabled. | `isEnabled`, `review`, `smokeTest` |
 | [CrewPlannerService.bx](services/CrewPlannerService.bx) | Optionally proposes a small set of catalog roles and change-specific briefs. | `isEnabled`, `propose`, `validateAndClamp` |
+| [PromptRegistry.bx](services/PromptRegistry.bx) | Local versioned source of truth for prompt contracts, policies, schemas, and provider capability profiles. | `manifest`, `contract`, `previousContract`, `lifecycle`, `activeVersion`, `previousVersion`, `schema`, `policy`, `evals`, `authoringMetaPrompt`, `capabilities`, `listContracts`, `listSchemas`, `clearCache` |
+| [PromptCompiler.bx](services/PromptCompiler.bx) | Compiles registry contracts into provider-neutral prompt packages; dynamic task/evidence stays user-side. | `compile`, `compileRepair`, `fitPackage`, `capabilities`, `structuredOutput`, `lint`, `lintPackage` |
+| [PromptOutputValidator.bx](services/PromptOutputValidator.bx) | Provider-independent structural and evidence validation for prompt-contract JSON outputs. | `validate`, `validateStructure`, `sanitize`, `sanitizeValid`, `assertValid`, `assertStructureValid` |
+| [PromptAuthoringService.bx](services/PromptAuthoringService.bx) | Builds offline prompt-authoring requests; never calls a provider or changes the active runtime contract. | `build`, `validateProposal` |
+| [PromptEvaluationService.bx](services/PromptEvaluationService.bx) | Deterministic local evaluation harness for versioned prompt contracts; never contacts a provider. | `lintAll`, `evaluate` |
 | [SpecialistAgentFactory.bx](services/SpecialistAgentFactory.bx) | Builds versioned allowlisted role definitions, instructions, and output contracts. | `definition`, `input` |
 | [SpecialistAgentGateway.bx](services/SpecialistAgentGateway.bx) | Executes one specialist through agent tools or embedded-context chat with retries and circuit breaking. | `isEnabled`, `run`, `runAsyncRetry`, `unwrapAsyncError`, `getProviderKey`, `circuitStatus`, `resetCircuit`, `contextPackCharacterBudget` |
 | [SpecialistReviewService.bx](services/SpecialistReviewService.bx) | Runs planned specialist tasks within concurrency/budget bounds and validates their findings. | `isEnabled`, `review`, `cancelRun` |
@@ -168,12 +175,14 @@ deterministic rules behind those public methods.
 | [ModernizationDiffService.bx](services/ModernizationDiffService.bx) | Compares Modernize plans, tracks added/removed items, carries decisions, and reports coverage movement. | `compare` |
 | [ModernizationEvidenceDiscoveryService.bx](services/ModernizationEvidenceDiscoveryService.bx) | Finds a small allowlisted set of configuration and migration evidence for Modernize only. | `discover`, `build` |
 | [ModernizationExportService.bx](services/ModernizationExportService.bx) | Renders persisted Modernize artifacts as JSON, Markdown, or validation-oriented SARIF. | `export`, `supportedFormats`, `toJson`, `toMarkdown`, `toSarif` |
+| [ModernizationGateService.bx](services/ModernizationGateService.bx) | Applies deterministic, conservative placement gates; ownership/ops need remain unknown until plan or human input supplies them. | `evaluatePlan`, `evaluatePlacement` |
 | [ModernizationIdentityService.bx](services/ModernizationIdentityService.bx) | Creates deterministic opaque IDs and fingerprints without putting source text in identifiers. | `itemId`, `itemFingerprint` |
 | [ModernizationInventoryService.bx](services/ModernizationInventoryService.bx) | Builds conservative evidence-linked CFML inventory records; it is not a full AST. | `build`, `inventory`, `analyze` |
+| [ModernizationPlacementService.bx](services/ModernizationPlacementService.bx) | Canonicalizes Modernize v2 placements, adapts persisted plans for read, and projects legacy contexts/extracts. | `planVersion`, `placementVersion`, `canonicalize`, `adaptForRead`, `getPlacements`, `refreshFingerprints` |
 | [ModernizationPolicyService.bx](services/ModernizationPolicyService.bx) | Validates immutable Modernize input, applies limits, and gates provider-dependent work. | `normalize`, `preflight`, `isProviderEnabled`, `ensureProviderEnabled` |
 | [ModernizationProposalService.bx](services/ModernizationProposalService.bx) | Runs bounded application/database/architecture/roadmap roles, shards large inputs, and merges validated fragments. | `propose`, `cancelRun`, `repair` |
 | [ModernizationRiskService.bx](services/ModernizationRiskService.bx) | Adds a read-time deterministic risk overlay from existing Review findings. | `enrich` |
-| [ModernizationRunService.bx](services/ModernizationRunService.bx) | Owns the Modernize evidence/proposal artifact lifecycle after shared run scanning. | `execute`, `getResult`, `cancelRun` |
+| [ModernizationRunService.bx](services/ModernizationRunService.bx) | Owns the Modernize evidence/proposal artifact lifecycle after shared run scanning. | `execute`, `getResult`, `cancelRun`, `checkpointStatusForPayload` |
 | [ModernizationSchemaPackService.bx](services/ModernizationSchemaPackService.bx) | Ingests, sanitizes, parses, and discovers schema evidence without executing SQL or retaining row DML. | `ingest`, `sanitize`, `parse`, `discover` |
 | [ModernizationSignalService.bx](services/ModernizationSignalService.bx) | Derives deterministic modernization seams before any optional AI call. | `build`, `derive`, `detect` |
 | [ModernizationSkillService.bx](services/ModernizationSkillService.bx) | Reads only allowlisted installed skill packs, never skill files from the analyzed project. | `listPack`, `readSkill`, `isAllowlisted`, `resolveSkillsRoot` |
@@ -201,7 +210,9 @@ deterministic rules behind those public methods.
 | Architecture graph or parser behavior | `ArchitectureIndexService` | `BoxLangParserService`, `CfmlParserService`, `AnalysisGraphRepository` |
 | Deterministic findings | `FindingService` | `FindingSolutionService`, `RulePlaybookCatalog` |
 | Specialist prompts or tools | `SpecialistAgentFactory` | `SpecialistAgentGateway`, `ControlledRepositoryToolService`, `AIChatGateway` |
+| Prompt contracts, schemas, or offline eval | `PromptRegistry` | `PromptCompiler`, `PromptOutputValidator`, `PromptEvaluationService`, `PromptAuthoringService` |
 | Modernize inventory or proposal | `ModernizationRunService` | `ModernizationInventoryService`, `ModernizationProposalService`, `ModernizationValidationService` |
+| Modernize placements or gates | `ModernizationPlacementService` | `ModernizationGateService`, `ModernizationRunService`, `ModernizationValidationService` |
 | Modernize schema evidence | `ModernizationSchemaPackService` | `ModernizationRepository`, `ModernizationValidationService` |
 | SQLite schema or cleanup | `SchemaService` | `runtime/boxlang.json`, repository SQL, SQLite status checks |
 | Path safety or secret handling | `SecurityContextService` | `SecretRedactionService`, `ControlledRepositoryToolService` |

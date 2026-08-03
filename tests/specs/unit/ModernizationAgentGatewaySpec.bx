@@ -368,6 +368,27 @@ class extends="testbox.system.BaseSpec" {
 				expect( chat.lastOptions.timeout ).toBeLTE( 90 );
 				expect( chat.lastOptions.baseURL ).toBe( "https://openrouter.ai/api/v1" );
 			} );
+
+			it( "salvages truncated database JSON into a complete object instead of failing", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = '{ "dbFindings": [ { "id": "f1", "objectRef": "songs", "category": "coverage", "severity": "info", "problem": "needs plan", "proposedChange": "expand", "evidenceRefs": [], "confidence": 0.5, "validationStatus": "needs-review" }, { "id": "f2", "objectRef": "playlists", "problem": "incomplete';
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 0;
+				service.retryBackoffMs = 0;
+				var result = service.run(
+					"run-db-salvage",
+					{ messages: [ { role: "system", content: "Return JSON" }, { role: "user", content: "db" } ] },
+					{ role: "modernization-database", maxRetries: 0 }
+				);
+				expect( result.ok ).toBeTrue( jsonSerialize( result ) );
+				expect( result.salvaged ).toBeTrue();
+				expect( result.payload.dbFindings.len() ).toBeGTE( 1 );
+				expect( result.payload.dbFindings[ 1 ].id ).toBe( "f1" );
+				expect( result.promptProvenance.truncatedJsonSalvaged ).toBeTrue();
+			} );
 		} );
 	}
 }

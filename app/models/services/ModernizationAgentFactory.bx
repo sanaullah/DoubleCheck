@@ -152,7 +152,7 @@ class {
 				}
 				return "Produce implementer-ready target units in a strangler plan, not a folder summary. Map behavior into coherent ColdBox handler/service/view/config concerns and avoid one handler per page filename. Return COMPLETE compact JSON with keys in this exact order: targetUnits, unitLinks, routeContracts, samples, contexts, extracts. contexts and extracts MUST be empty arrays; architecture extraction is a separate evidence decision. Every target needs a legal ColdBox targetPath, layer, evidenced symbols/signatures, purpose, sourcePath, legacyUnitIds, source-range evidenceRefs, confidence, and validationStatus. Routes require actual navigation or remote-entry evidence, targetUnitId, unitLinkId, and UNKNOWN values where method/auth/response/side effects are not established. Scaffold-only targets need newProposal=true and proposalReason.";
 			case "modernization-database":
-				return "Produce actionable dbFindings for observed schema objects and app readers/writers. Return COMPLETE COMPACT JSON with no more than 40 dbFindings, 60 dbTransitions, and 2 samples. Inspect schemaEvidence before deciding whether DDL is present; sourceKind=auto-discovered and populated tables/columns are real DDL evidence. Consolidate repeated reader/writer issues by object rather than repeating one finding per file. Keep problem, proposedChange, and rollback under 180 characters; keep sampleMigration to an up/down skeleton under 16 lines; keep every ID/evidence array under 8 items. Each finding needs category, severity, objectRef, problem, proposedChange, evidenceRefs, confidence, expandContract stage, related legacy/target ids, and validationStatus. Each transition needs operation, order, migrationPath, bounded sampleMigration with up/down skeleton, rollback, objects touched, and irreversible flag. When schema is absent, emit one explicit inference-limit finding and do not invent tables, columns, indexes, or procedures.";
+				return "Produce actionable dbFindings for observed schema objects and app readers/writers. Return COMPLETE COMPACT JSON with no more than 20 dbFindings, 24 dbTransitions, and 2 samples. Inspect schemaEvidence before deciding whether DDL is present; sourceKind=auto-discovered and populated tables/columns are real DDL evidence. Consolidate repeated reader/writer issues by object rather than repeating one finding per file. Keep problem, proposedChange, and rollback under 160 characters; keep sampleMigration to an up/down skeleton under 12 lines; keep every ID/evidence array under 6 items. Each finding needs category, severity, objectRef, problem, proposedChange, evidenceRefs, confidence, expandContract stage, related legacy/target ids, and validationStatus. Each transition needs operation, order, migrationPath, bounded sampleMigration with up/down skeleton, rollback, objects touched, and irreversible flag. When schema is absent, emit one explicit inference-limit finding and do not invent tables, columns, indexes, or procedures. Prefer finishing a smaller complete JSON over truncating a larger one.";
 			case "modernization-repair":
 				return "Replace only the listed invalid item fingerprints. Return replacements with the same itemFingerprint and no new items. Do not rewrite valid items, invent evidence, or broaden the repair scope.";
 			case "modernization-slice-rebuild":
@@ -253,15 +253,17 @@ class {
 		var characterLimit = arguments.role == "modernization-application"
 			? 48000
 			: ( arguments.role == "modernization-database"
-				? 30000
+				? 36000
 				: ( [ "modernization-architecture", "modernization-roadmap" ].contains( arguments.role ) ? 40000 : 24000 ) );
 		var source = arguments.role == "modernization-roadmap"
 			? compactRoadmapEvidence( arguments.evidence )
-			: ( arguments.role == "modernization-architecture" ? compactArchitectureEvidence( arguments.evidence ) : arguments.evidence );
+			: ( arguments.role == "modernization-architecture"
+				? compactArchitectureEvidence( arguments.evidence )
+				: ( arguments.role == "modernization-database" ? compactDatabaseEvidence( arguments.evidence ) : arguments.evidence ) );
 		var orderedKeys = arguments.role == "modernization-application"
 			? [ "shardMeta", "inventory", "context", "signals", "schemaEvidence", "coverage" ]
 			: ( arguments.role == "modernization-database"
-				? [ "schemaEvidence", "signals", "inventory", "coverage" ]
+				? [ "schemaEvidence", "signals", "coverage" ]
 				: ( arguments.role == "modernization-repair"
 					? [ "invalidItems", "validation", "inventory", "schemaEvidence", "context" ]
 					: ( arguments.role == "modernization-architecture"
@@ -496,6 +498,45 @@ class {
 			if ( [ "datasource-table-coupling", "application-lifecycle-state" ].contains( lCase( trim( signal.group ?: "" ) ) ) ) selected.append( signal );
 		}
 		return { signals: selected };
+	}
+
+	/**
+	 * Keep database prompts focused on observed schema objects. Dropping raw
+	 * inventory/source excerpts reduces output truncation on dense MySQL packs.
+	 */
+	private struct function compactDatabaseEvidence( required struct evidence ) {
+		var schema = isStruct( arguments.evidence.schemaEvidence ?: "" ) ? arguments.evidence.schemaEvidence : {};
+		var tables = [];
+		for ( var table in ( isArray( schema.tables ?: "" ) ? schema.tables : ( isArray( schema.objects ?: "" ) ? schema.objects : [] ) ) ) {
+			if ( !isStruct( table ) ) continue;
+			var name = trim( toString( table.name ?: table.objectRef ?: "" ) );
+			if ( !len( name ) ) continue;
+			var columns = isArray( table.columns ?: "" ) ? table.columns : [];
+			var columnNames = [];
+			for ( var column in columns ) {
+				var columnName = isStruct( column ) ? trim( toString( column.name ?: "" ) ) : trim( toString( column ) );
+				if ( len( columnName ) ) columnNames.append( columnName );
+				if ( columnNames.len() >= 12 ) break;
+			}
+			tables.append( {
+				name: name,
+				columnCount: columns.len() ? columns.len() : val( table.columnCount ?: 0 ),
+				columns: columnNames
+			} );
+			if ( tables.len() >= 32 ) break;
+		}
+		return {
+			schemaEvidence: {
+				coverage: schema.coverage ?: "",
+				sourceKind: schema.sourceKind ?: "",
+				vendor: schema.vendor ?: ( isStruct( schema.database ?: "" ) ? ( schema.database.vendor ?: "" ) : "" ),
+				tableCount: tables.len() ? tables.len() : val( schema.tableCount ?: 0 ),
+				unresolvedCount: val( schema.unresolvedCount ?: 0 ),
+				tables: tables
+			},
+			signals: arguments.evidence.signals ?: [],
+			coverage: arguments.evidence.coverage ?: {}
+		};
 	}
 
 	private any function boundedValue( required any value, numeric depth = 0, numeric characterLimit = 12000 ) {

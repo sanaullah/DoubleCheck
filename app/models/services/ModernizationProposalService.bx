@@ -108,21 +108,38 @@ class {
 			} else if ( isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd >= val( budgets.maxCostUsd ) ) {
 				errors.append( { role: "modernization-database", message: "cost-budget-exceeded" } );
 			} else {
-				var dbRequest = agentFactory.build( "modernization-database", runtime, arguments.evidence, budgets );
+				var dbBudgets = duplicate( budgets );
+				// Dense schema packs truncate at the default 8k/task ceiling.
+				dbBudgets.maxTokensPerTask = min( 16000, max( 12000, int( budgets.maxTokensPerTask ?: 8000 ) ) );
+				if ( isNumeric( budgets.maxTokens ?: "" ) ) {
+					dbBudgets.maxTokens = max( int( budgets.maxTokens ), dbBudgets.maxTokensPerTask );
+				}
+				var dbRequest = agentFactory.build( "modernization-database", runtime, arguments.evidence, dbBudgets );
 				var dbOptions = copyGatewayOptions( arguments.options );
-				dbOptions.budgets = budgets;
+				dbOptions.budgets = dbBudgets;
 				dbOptions.startedAt = getTickCount();
 				dbOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
-				// Database evidence can be dense even for a modest schema. Allow the
-				// gateway's single shrink-and-retry recovery when a provider response
-				// is truncated; the retry remains inside the existing run budgets.
-				dbOptions.maxRetries = 1;
+				// Two retries: first shrinks the ask, second may still salvage
+				// truncated JSON inside the gateway before we synthesize.
+				dbOptions.maxRetries = 2;
 				dbOptions.role = "modernization-database";
 				var dbResponse = agentGateway.run( arguments.runId, dbRequest, dbOptions );
 				dbPromptProvenance = structKeyExists( dbResponse, "promptProvenance" ) ? dbResponse.promptProvenance : {};
 				totalCostUsd += isNumeric( dbResponse.costUsd ?: "" ) ? val( dbResponse.costUsd ) : 0;
 				if ( !( dbResponse.ok ?: false ) ) {
-					errors.append( providerRoleError( "modernization-database", dbResponse ) );
+					var synthDb = synthesizeDatabaseFragment( arguments.evidence.schemaEvidence ?: {} );
+					if ( ( isArray( synthDb.dbFindings ?: "" ) && synthDb.dbFindings.len() ) || ( isArray( synthDb.dbTransitions ?: "" ) && synthDb.dbTransitions.len() ) ) {
+						fragments[ "modernization-database" ] = synthDb;
+						errors.append( {
+							role: "modernization-database",
+							message: "synthesized-database-from-schema",
+							severity: "info",
+							errorType: dbResponse.errorType ?: inferErrorType( dbResponse.error ?: "" ),
+							providerError: left( toString( dbResponse.error ?: "" ), 240 )
+						} );
+					} else {
+						errors.append( providerRoleError( "modernization-database", dbResponse ) );
+					}
 				} else if ( !validFragment( "modernization-database", dbResponse.payload ?: {} ) ) {
 					errors.append( { role: "modernization-database", message: "malformed-role-output" } );
 				} else {
@@ -131,6 +148,9 @@ class {
 					else {
 						fragments[ "modernization-database" ] = redactedDb;
 						totalOutputCharacters += isNumeric( dbResponse.outputCharacters ?: "" ) ? int( dbResponse.outputCharacters ) : len( jsonSerialize( dbResponse.payload ?: {} ) );
+						if ( dbResponse.salvaged ?: false || ( isStruct( dbPromptProvenance ) && ( dbPromptProvenance.truncatedJsonSalvaged ?: false ) ) ) {
+							errors.append( { role: "modernization-database", message: "salvaged-truncated-database-json", severity: "info" } );
+						}
 					}
 				}
 			}
@@ -597,10 +617,14 @@ class {
 		for ( var item in plan.target.units ) ensureIdentity( item, "target-unit" );
 		for ( var item in plan.unitLinks ) ensureIdentity( item, "unit-link" );
 		for ( var item in plan.routeContracts ) ensureIdentity( item, "route-contract" );
-			for ( var item in plan.dbFindings ) ensureIdentity( item, "db-finding" );
-			for ( var item in plan.dbTransitions ) ensureIdentity( item, "db-transition" );
-			for ( var item in plan.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
-			for ( var item in plan.samples ) ensureIdentity( item, "sample" );
+		for ( var item in plan.dbFindings ) ensureIdentity( item, "db-finding" );
+		for ( var item in plan.dbTransitions ) ensureIdentity( item, "db-transition" );
+		for ( var item in plan.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
+		for ( var item in plan.samples ) ensureIdentity( item, "sample" );
+		if ( isArray( db.dbFindings ?: "" ) && db.dbFindings.len() ) {
+			var dbProvenance = lCase( trim( db.dbFindings[ 1 ].provenanceClass ?: "" ) );
+			plan.metadata.databaseSource = dbProvenance == "deterministically-derived" ? "synthesized" : "provider";
+		}
 		return plan;
 	}
 
@@ -2724,8 +2748,10 @@ class {
 		// unitIds; target alias resolution can then safely canonicalize only the
 		// remaining target-unit references.
 		polished = resolveTargetReferences( polished );
+		polished = dropUnresolvedUnitLinks( polished, arguments.errors );
 		polished.assumptions = dedupeSimpleValues( polished.assumptions ?: [] );
 		polished.samples = normalizeSamples( polished.samples ?: [], polished.metadata.runtime ?: {} );
+		polished.samples = liftUnitSampleCode( polished.samples ?: [], polished.target.units ?: [] );
 		polished.samples = dedupeById( polished.samples ?: [] );
 		polished.roadmapPhases = orderRoadmapPhases( polished.roadmapPhases ?: [] );
 		polished.roadmapPhases = ensureCurrentSlice( polished.roadmapPhases ?: [] );
@@ -2734,7 +2760,7 @@ class {
 		var sampleLimit = isNumeric( arguments.samplePolicy.maxFiles ?: "" ) ? max( 1, int( arguments.samplePolicy.maxFiles ) ) : 40;
 		polished.samples = boundedStructArray( polished.samples ?: [], sampleLimit, arguments.errors, "samples" );
 		if ( ( arguments.samplePolicy.currentPhasesOnly ?: true ) && isArray( polished.roadmapPhases ?: "" ) ) {
-			polished.samples = currentSliceSamples( polished.samples ?: [], polished.roadmapPhases );
+			polished.samples = currentSliceSamples( polished.samples ?: [], polished.roadmapPhases, polished.target.units ?: [] );
 			// currentSliceSamples() intentionally drops every non-current-slice
 			// sample to keep the exported samples list bounded, but
 			// normalizeRoadmapReferences() already validated phase.sampleIds
@@ -2745,6 +2771,7 @@ class {
 			for ( var survivingSample in polished.samples ) survivingSampleIds[ trim( survivingSample.id ?: survivingSample.itemId ?: "" ) ] = true;
 			for ( var polishedPhase in polished.roadmapPhases ) polishedPhase.sampleIds = validIds( polishedPhase.sampleIds ?: [], survivingSampleIds );
 		}
+		polished.samples = ensureActionableSamples( polished, arguments.samplePolicy, arguments.errors );
 		for ( var item in polished.routeContracts ) ensureIdentity( item, "route-contract" );
 		for ( var item in polished.unitLinks ?: [] ) ensureIdentity( item, "unit-link" );
 		for ( var item in polished.target.units ?: [] ) ensureIdentity( item, "target-unit" );
@@ -2840,6 +2867,40 @@ class {
 		}
 
 		arguments.plan.target = target;
+		return arguments.plan;
+	}
+
+	/**
+	 * Drop unitLinks whose targetUnitId still does not resolve after alias
+	 * repair. Dangling hashes / invented ids (targetUnit-2, models/Foo.cfc)
+	 * otherwise flood validation with unknownTargetUnitId blockers.
+	 */
+	private struct function dropUnresolvedUnitLinks( required struct plan, array errors = [] ) {
+		var targetIds = {};
+		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) targetIds[ unitId ] = true;
+		}
+		var kept = [];
+		var dropped = 0;
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( !isStruct( link ) ) continue;
+			var targetId = trim( toString( link.targetUnitId ?: "" ) );
+			if ( len( targetId ) && targetIds.keyExists( targetId ) ) {
+				kept.append( link );
+			} else {
+				dropped++;
+			}
+		}
+		if ( dropped ) {
+			arguments.errors.append( {
+				role: "modernization-application",
+				message: "dropped-unresolved-unit-links",
+				severity: "info",
+				count: dropped
+			} );
+		}
+		arguments.plan.unitLinks = kept;
 		return arguments.plan;
 	}
 
@@ -3554,22 +3615,209 @@ class {
 		return list;
 	}
 
-	private array function currentSliceSamples( required array samples, required array phases ) {
+	private array function currentSliceSamples( required array samples, required array phases, array units = [] ) {
 		var currentPhaseIds = {};
 		var allowedSampleIds = {};
+		var currentUnitIds = {};
 		for ( var phase in arguments.phases ) {
 			if ( !isStruct( phase ) || !( phase.currentSlice ?: false ) ) continue;
 			currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
 			for ( var sampleId in ( isArray( phase.sampleIds ?: "" ) ? phase.sampleIds : [] ) ) allowedSampleIds[ trim( sampleId ) ] = true;
+			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : ( isArray( phase.targetUnitIds ?: "" ) ? phase.targetUnitIds : [] ) ) ) {
+				currentUnitIds[ trim( toString( unitId ) ) ] = true;
+			}
 		}
 		var output = [];
 		for ( var sample in arguments.samples ) {
 			if ( !isStruct( sample ) ) continue;
 			var phaseId = sample.phaseId ?: sample.roadmapPhaseId ?: "";
 			var sampleId = trim( sample.id ?: sample.itemId ?: "" );
-			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) || ( len( sampleId ) && allowedSampleIds.keyExists( sampleId ) ) ) output.append( sample );
+			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) || ( len( sampleId ) && allowedSampleIds.keyExists( sampleId ) ) ) {
+				output.append( sample );
+				continue;
+			}
+			// Keep provider samples that already relate to current-slice units
+			// even when phases omitted sampleIds (common on roadmap shards).
+			var related = isArray( sample.relatedItemIds ?: "" ) ? sample.relatedItemIds : [];
+			var relatedToCurrent = false;
+			for ( var relatedId in related ) {
+				if ( currentUnitIds.keyExists( trim( toString( relatedId ) ) ) ) {
+					relatedToCurrent = true;
+					break;
+				}
+			}
+			if ( relatedToCurrent ) output.append( sample );
 		}
 		return output;
+	}
+
+	/**
+	 * Promote inline targetUnit.sampleCode into the samples collection when
+	 * providers returned code on units but left samples empty.
+	 */
+	private array function liftUnitSampleCode( required array samples, required array units ) {
+		var output = isArray( arguments.samples ) ? duplicate( arguments.samples ) : [];
+		var seenPaths = {};
+		for ( var existing in output ) {
+			var path = lCase( replace( trim( toString( existing.targetPath ?: existing.path ?: "" ) ), "\", "/", "all" ) );
+			if ( len( path ) ) seenPaths[ path ] = true;
+		}
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var code = trim( toString( unit.sampleCode ?: "" ) );
+			if ( !len( code ) ) continue;
+			var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+			if ( !len( targetPath ) || seenPaths.keyExists( lCase( targetPath ) ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			output.append( {
+				id: "lifted-sample-#left( hash( targetPath & "|" & unitId, 'SHA-256' ), 12 )#",
+				sampleKind: "app",
+				targetPath: targetPath,
+				language: reFindNoCase( "\.(bx|bxm)$", targetPath ) ? "boxlang" : "cfml",
+				code: left( code, 4000 ),
+				relatedItemIds: len( unitId ) ? [ unitId ] : [],
+				irreversible: false,
+				provenanceClass: "provider-suggested"
+			} );
+			seenPaths[ lCase( targetPath ) ] = true;
+			if ( output.len() >= 40 ) break;
+		}
+		return output;
+	}
+
+	/**
+	 * When current-slice phases have units but samples were pruned or never
+	 * returned, emit bounded deterministic skeletons labeled honestly.
+	 */
+	private array function ensureActionableSamples( required struct plan, struct samplePolicy = {}, array errors = [] ) {
+		var samples = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [];
+		if ( samples.len() ) return samples;
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var unitsById = {};
+		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitsById[ unitId ] = unit;
+		}
+		var maxSamples = isNumeric( arguments.samplePolicy.maxFiles ?: "" ) ? max( 1, min( 8, int( arguments.samplePolicy.maxFiles ) ) ) : 6;
+		var generated = [];
+		for ( var phase in phases ) {
+			if ( !isStruct( phase ) || !( phase.currentSlice ?: false ) ) continue;
+			var phaseId = trim( toString( phase.id ?: phase.itemId ?: "" ) );
+			for ( var rawUnitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) {
+				if ( generated.len() >= maxSamples ) break;
+				var id = trim( toString( rawUnitId ) );
+				if ( !len( id ) || !unitsById.keyExists( id ) ) continue;
+				var unit = unitsById[ id ];
+				var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+				if ( !len( targetPath ) ) continue;
+				var layer = lCase( trim( toString( unit.layer ?: unit.kind ?: "handler" ) ) );
+				var isView = [ "view", "layout" ].contains( layer ) || findNoCase( "/views/", "/" & targetPath );
+				var language = reFindNoCase( "\.(bx|bxm)$", targetPath ) ? "boxlang" : "cfml";
+				var nl = char( 10 );
+				var skeleton = language == "boxlang"
+					? ( isView ? "<bx:output>#nl#  <!--- Deterministic sample skeleton for #targetPath# — not observed source. --->#nl#</bx:output>" : "class {#nl#  // Deterministic sample skeleton for #targetPath# — not observed source.#nl#}" )
+					: ( isView ? "<cfoutput>#nl#  <!--- Deterministic sample skeleton for #targetPath# — not observed source. --->#nl#</cfoutput>" : "component {#nl#  // Deterministic sample skeleton for #targetPath# — not observed source.#nl#}" );
+				var sampleId = "synth-sample-#left( hash( phaseId & "|" & id, 'SHA-256' ), 12 )#";
+				generated.append( {
+					id: sampleId,
+					sampleKind: isView ? "view" : "app",
+					targetPath: targetPath,
+					language: language,
+					code: skeleton,
+					relatedItemIds: [ id ],
+					irreversible: false,
+					phaseId: phaseId,
+					currentSlice: true,
+					provenanceClass: "deterministically-derived"
+				} );
+			}
+			if ( generated.len() ) {
+				phase.sampleIds = generated.map( ( item ) => item.id );
+			}
+		}
+		if ( generated.len() ) {
+			arguments.errors.append( {
+				role: "modernization",
+				message: "synthesized-current-slice-samples",
+				severity: "info",
+				count: generated.len()
+			} );
+			arguments.plan.samples = generated;
+			return generated;
+		}
+		return samples;
+	}
+
+	/**
+	 * Deterministic database fragment from observed schemaEvidence when the
+	 * provider truncates or fails. Labeled provenanceClass so UI/validation
+	 * never pretends these were model-authored.
+	 */
+	private struct function synthesizeDatabaseFragment( required any schemaEvidence ) {
+		var schema = isStruct( arguments.schemaEvidence ) ? arguments.schemaEvidence : {};
+		var tables = [];
+		if ( isArray( schema.tables ?: "" ) ) tables = schema.tables;
+		else if ( isArray( schema.objects ?: "" ) ) tables = schema.objects;
+		else if ( isStruct( schema.database ?: "" ) && isArray( schema.database.tables ?: "" ) ) tables = schema.database.tables;
+		if ( !tables.len() && ( schema.coverage ?: "absent" ) == "absent" ) {
+			return { dbFindings: [], dbTransitions: [], samples: [] };
+		}
+		var findings = [];
+		var transitions = [];
+		var order = 1;
+		for ( var table in tables ) {
+			if ( findings.len() >= 20 ) break;
+			var name = isStruct( table ) ? trim( toString( table.name ?: table.objectRef ?: "" ) ) : trim( toString( table ) );
+			if ( !len( name ) ) continue;
+			var slug = reReplace( lCase( name ), "[^a-z0-9]+", "_", "all" );
+			var findingId = "synth-db-finding-#slug#";
+			findings.append( {
+				id: findingId,
+				category: "coverage",
+				severity: "info",
+				objectRef: name,
+				problem: "Observed table `#name#` needs an expand/contract migration plan during strangler modernization.",
+				proposedChange: "Inventory readers/writers and stage an expand-contract migration for `#name#`.",
+				expandContract: "expand",
+				relatedLegacyUnitIds: [],
+				relatedTargetUnitIds: [],
+				evidenceRefs: [],
+				confidence: 0.45,
+				validationStatus: "needs-review",
+				provenanceClass: "deterministically-derived"
+			} );
+			transitions.append( {
+				id: "synth-db-transition-#slug#",
+				dbFindingId: findingId,
+				operation: "expand",
+				order: order++,
+				migrationPath: "resources/database/migrations/YYYY_MM_DD_HHMMSS_expand_#slug#.bx",
+				objectsTouched: [ name ],
+				sampleMigration: "component {" & char( 10 ) & "  function up( schema, query ) {" & char( 10 ) & "    // expand `" & name & "` — generated from observed DDL, not executed" & char( 10 ) & "  }" & char( 10 ) & "  function down( schema, query ) {" & char( 10 ) & "    // review before contracting `" & name & "`" & char( 10 ) & "  }" & char( 10 ) & "}",
+				rollback: "Review expand before any contract step for `#name#`.",
+				irreversible: false,
+				evidenceRefs: [],
+				provenanceClass: "deterministically-derived"
+			} );
+		}
+		if ( !findings.len() && ( schema.coverage ?: "" ) != "absent" ) {
+			findings.append( {
+				id: "synth-db-finding-schema-present",
+				category: "coverage",
+				severity: "info",
+				objectRef: "schema",
+				problem: "Schema evidence was observed but table names could not be enumerated for a provider fragment.",
+				proposedChange: "Retry the database stage with a smaller schema pack or raise max tokens.",
+				expandContract: "defer",
+				relatedLegacyUnitIds: [],
+				relatedTargetUnitIds: [],
+				evidenceRefs: [],
+				confidence: 0.3,
+				validationStatus: "needs-review",
+				provenanceClass: "deterministically-derived"
+			} );
+		}
+		return { dbFindings: findings, dbTransitions: transitions, samples: [] };
 	}
 
 	private array function boundedArray(required any value, required numeric limit) {
@@ -3749,6 +3997,7 @@ class {
 			lastSuccessfulCheckpoint: arguments.runId & ":proposal",
 			architectureSource: architectureSource,
 			roadmapSource: roadmapSource,
+			databaseSource: arguments.plan.metadata.databaseSource ?: ( arguments.fragments.keyExists( "modernization-database" ) ? "provider" : "" ),
 			limitReached: limitReached,
 			actionability: actionabilityIncomplete ? "incomplete" : "present",
 			partialResults: {

@@ -129,10 +129,22 @@ class {
 				if ( !isStruct( payload ) ) {
 					throw( type = "ModernizationProviderResponseException", message = "Provider returned non-object JSON" );
 				}
+				var salvagedFromTruncation = structKeyExists( payload, "_salvagedFromTruncation" ) && payload._salvagedFromTruncation;
+				if ( salvagedFromTruncation ) structDelete( payload, "_salvagedFromTruncation" );
 				if ( len( schemaId ) ) {
-					var acceptedPayload = getValidator().sanitizeValid( payload, schemaId, validationContext( activeRequest, arguments.options ) );
-					payload = acceptedPayload.value;
-					if ( acceptedPayload.rejectedItems.len() && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.rejectedItems = duplicate( acceptedPayload.rejectedItems );
+					try {
+						var acceptedPayload = getValidator().sanitizeValid( payload, schemaId, validationContext( activeRequest, arguments.options ) );
+						payload = acceptedPayload.value;
+						if ( acceptedPayload.rejectedItems.len() && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.rejectedItems = duplicate( acceptedPayload.rejectedItems );
+					} catch ( any schemaError ) {
+						// Salvaged truncated JSON is often schema-noisy; soft-accept when
+						// the role's primary arrays survived with at least one item.
+						if ( salvagedFromTruncation && salvageHasRoleSubstance( payload, schemaId, arguments.options.role ?: "" ) ) {
+							if ( isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.schemaSoftAccepted = true;
+						} else {
+							rethrow;
+						}
+					}
 				}
 				var outputTokens = isNumeric( budgets.maxTokensPerTask ?: "" ) ? int( budgets.maxTokensPerTask ) : ( isNumeric( budgets.maxTokens ?: "" ) ? int( budgets.maxTokens ) : 12000 );
 				var outputLimit = max( 2048, min( 120000, outputTokens * 4 ) );
@@ -146,14 +158,15 @@ class {
 					emitObservation( arguments.options, { stage: "budget-exceeded", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, costUsd: spentUsd, maxCostUsd: val( budgets.maxCostUsd ) } );
 					return { ok: false, payload: {}, attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usage, error: "cost-budget-exceeded" };
 				}
-				emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usage } );
+				emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usage, salvaged: salvagedFromTruncation } );
 				try {
-					var completeMsg = "Modernize provider complete runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# chars=#len( jsonSerialize( payload ) )# costUsd=#spentUsd#";
+					var completeMsg = "Modernize provider complete runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# chars=#len( jsonSerialize( payload ) )# costUsd=#spentUsd# salvaged=#salvagedFromTruncation#";
 					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( completeMsg );
 				} catch ( any ignored ) {}
 				var finalProvenance = isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {};
 				if ( isStruct( activeRequest.truncation ?: "" ) && ( activeRequest.truncation.applied ?: false ) ) finalProvenance.truncation = duplicate( activeRequest.truncation );
-				return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usage, promptProvenance: finalProvenance };
+				if ( salvagedFromTruncation ) finalProvenance.truncatedJsonSalvaged = true;
+				return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usage, promptProvenance: finalProvenance, salvaged: salvagedFromTruncation };
 			} catch ( any error ) {
 				if ( lCase( error.type ?: "" ) == "runcancelled" ) rethrow;
 				var classified = classifyProviderError( error );
@@ -384,7 +397,19 @@ class {
 
 	private struct function shrinkRequestForRetry( required struct request, string reason = "", string contractId = "" ) {
 		var copy = copyRequest( arguments.request );
+		var role = trim( arguments.contractId );
 		var shrink = "RETRY CONSTRAINT: Your previous JSON was truncated. Return a smaller COMPLETE JSON object only, keys in order targetUnits, unitLinks, routeContracts, samples, contexts, extracts. Cap targetUnits at 3, unitLinks at 3, routeContracts at 3, samples at 2. contexts=[] and extracts=[]. Each evidenceRefs array at most 2 ids. sampleCode under 8 lines. Map only the shard paths already listed; do not invent a repo-wide contexts dump.";
+		var retryTokens = 8000;
+		if ( role == "modernization-database" ) {
+			shrink = "RETRY CONSTRAINT: Previous database JSON was truncated. Return one COMPLETE compact JSON object with keys dbFindings, dbTransitions, samples only. Cap dbFindings at 12, dbTransitions at 16, samples at 1. Prefer high-severity observed tables first. Keep problem/proposedChange/rollback under 120 characters and sampleMigration under 10 lines. Do not invent tables absent from schemaEvidence.";
+			retryTokens = 12000;
+		} else if ( role == "modernization-architecture" ) {
+			shrink = "RETRY CONSTRAINT: Previous architecture JSON was truncated. Return COMPLETE compact JSON with at most 24 placements. Each placement at most 24 targetUnitIds and 12 evidenceRefs. Leave contexts=[] and extracts=[]. Prefer main-app packaging when unsure.";
+			retryTokens = 10000;
+		} else if ( role == "modernization-roadmap" ) {
+			shrink = "RETRY CONSTRAINT: Previous roadmap JSON was truncated. Return COMPLETE compact JSON with exactly one roadmapPhases entry, at most 4 migrationSteps, at most 2 samples, and assumptions=[]. Keep prose fields under 160 characters.";
+			retryTokens = 10000;
+		}
 		if ( len( trim( arguments.contractId ) ) && isStruct( copy.promptPackage ?: "" ) ) {
 			var repaired = getCompiler().compileRepair( copy.promptPackage, len( trim( arguments.reason ) ) ? arguments.reason : "output validation failure" );
 			if ( isStruct( arguments.request.provenance ?: "" ) && isArray( arguments.request.provenance.validationReasonCodes ?: "" ) ) repaired.provenance.validationReasonCodes = duplicate( arguments.request.provenance.validationReasonCodes );
@@ -403,8 +428,8 @@ class {
 			}
 		}
 		if ( !isStruct( copy.params ?: "" ) ) copy.params = {};
-		copy.params.max_tokens = 8000;
-		copy.truncation = { applied: true, omitted: [ "evidence-for-repair" ], boundaries: [ "complete-envelope" ], retry: true };
+		copy.params.max_tokens = retryTokens;
+		copy.truncation = { applied: true, omitted: [ "evidence-for-repair" ], boundaries: [ "complete-envelope" ], retry: true, role: role };
 		return copy;
 	}
 
@@ -722,18 +747,130 @@ class {
 			if ( isTimeoutBody( text ) || ( findNoCase( "request timeout", text ) && findNoCase( "parse", parseError.message ?: "" ) ) ) {
 				throw( type = "ModernizationProviderTimeoutException", message = "Request Timeout" );
 			}
-			var safe = left( reReplace( secretRedactionService.redactText( text ), "\s+", " ", "all" ), 180 );
-			if ( findNoCase( "unexpected end", parseError.message ?: "" ) || findNoCase( "unterminated", parseError.message ?: "" ) || left( trim( text ), 1 ) == "{" ) {
+			var looksTruncated = findNoCase( "unexpected end", parseError.message ?: "" )
+				|| findNoCase( "unterminated", parseError.message ?: "" )
+				|| left( trim( text ), 1 ) == "{";
+			if ( looksTruncated ) {
+				var salvaged = salvageTruncatedJsonText( text );
+				if ( isStruct( salvaged ) && salvaged.count() ) {
+					salvaged._salvagedFromTruncation = true;
+					return salvaged;
+				}
+				var safe = left( reReplace( secretRedactionService.redactText( text ), "\s+", " ", "all" ), 180 );
 				throw(
 					type = "ModernizationProviderResponseException",
 					message = "Provider JSON was truncated or incomplete. Excerpt: #safe#"
 				);
 			}
+			var safeNonJson = left( reReplace( secretRedactionService.redactText( text ), "\s+", " ", "all" ), 180 );
 			throw(
 				type = "ModernizationProviderResponseException",
-				message = "Provider returned non-JSON content. Excerpt: #safe#"
+				message = "Provider returned non-JSON content. Excerpt: #safeNonJson#"
 			);
 		}
+	}
+
+	/**
+	 * Recover a usable object from mid-stream truncation by closing open
+	 * containers after the last complete value. Distinguishes true truncation
+	 * salvage from transport timeouts (handled before parse).
+	 */
+	private any function salvageTruncatedJsonText( required string text ) {
+		var body = trim( arguments.text );
+		if ( !len( body ) || left( body, 1 ) != "{" ) return javacast( "null", "" );
+		var start = max( 1, int( len( body ) * 0.35 ) );
+		for ( var pos = len( body ); pos >= start; pos-- ) {
+			var ch = mid( body, pos, 1 );
+			if ( ch != "}" && ch != "]" ) continue;
+			var candidate = closeJsonContainers( left( body, pos ) );
+			if ( !len( candidate ) ) continue;
+			try {
+				var parsed = jsonDeserialize( candidate );
+				if ( isStruct( parsed ) && parsed.count() ) return parsed;
+			} catch ( any ignored ) {}
+		}
+		return javacast( "null", "" );
+	}
+
+	private string function closeJsonContainers( required string text ) {
+		var stack = [];
+		var inString = false;
+		var escaped = false;
+		var lastStringOpen = 0;
+		for ( var i = 1; i <= len( arguments.text ); i++ ) {
+			var ch = mid( arguments.text, i, 1 );
+			if ( inString ) {
+				if ( escaped ) {
+					escaped = false;
+					continue;
+				}
+				if ( ch == "\" ) {
+					escaped = true;
+					continue;
+				}
+				if ( ch == '"' ) inString = false;
+				continue;
+			}
+			if ( ch == '"' ) {
+				inString = true;
+				lastStringOpen = i;
+				continue;
+			}
+			if ( ch == "{" || ch == "[" ) stack.append( ch );
+			else if ( ( ch == "}" || ch == "]" ) && stack.len() ) stack.deleteAt( stack.len() );
+		}
+		var base = arguments.text;
+		if ( inString && lastStringOpen > 0 ) {
+			base = left( arguments.text, lastStringOpen - 1 );
+			base = reReplace( base, ",\s*$", "" );
+			stack = [];
+			inString = false;
+			escaped = false;
+			for ( var j = 1; j <= len( base ); j++ ) {
+				var scan = mid( base, j, 1 );
+				if ( inString ) {
+					if ( escaped ) {
+						escaped = false;
+						continue;
+					}
+					if ( scan == "\" ) {
+						escaped = true;
+						continue;
+					}
+					if ( scan == '"' ) inString = false;
+					continue;
+				}
+				if ( scan == '"' ) {
+					inString = true;
+					continue;
+				}
+				if ( scan == "{" || scan == "[" ) stack.append( scan );
+				else if ( ( scan == "}" || scan == "]" ) && stack.len() ) stack.deleteAt( stack.len() );
+			}
+			if ( inString ) return "";
+		}
+		base = reReplace( base, ",\s*$", "" );
+		var suffix = "";
+		for ( var k = stack.len(); k >= 1; k-- ) {
+			suffix &= stack[ k ] == "{" ? "}" : "]";
+		}
+		return base & suffix;
+	}
+
+	private boolean function salvageHasRoleSubstance( required struct payload, required string schemaId, required string role ) {
+		var activeRole = len( trim( arguments.role ) ) ? arguments.role : arguments.schemaId;
+		if ( findNoCase( "database", activeRole ) ) {
+			return ( isArray( arguments.payload.dbFindings ?: "" ) && arguments.payload.dbFindings.len() )
+				|| ( isArray( arguments.payload.dbTransitions ?: "" ) && arguments.payload.dbTransitions.len() );
+		}
+		if ( findNoCase( "architecture", activeRole ) ) {
+			return isArray( arguments.payload.placements ?: "" ) && arguments.payload.placements.len();
+		}
+		if ( findNoCase( "roadmap", activeRole ) ) {
+			return isArray( arguments.payload.roadmapPhases ?: "" ) && arguments.payload.roadmapPhases.len();
+		}
+		return ( isArray( arguments.payload.targetUnits ?: "" ) && arguments.payload.targetUnits.len() )
+			|| ( isArray( arguments.payload.unitLinks ?: "" ) && arguments.payload.unitLinks.len() );
 	}
 
 	private struct function extractUsage( required any response ) {

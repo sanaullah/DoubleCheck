@@ -45,7 +45,8 @@ class extends="testbox.system.BaseSpec" {
 				expect( gateway.callCount() ).toBe( 4 );
 				var databaseOptions = gateway.optionsHistory().filter( ( item ) => ( item.role ?: "" ) == "modernization-database" );
 				expect( databaseOptions ).toHaveLength( 1 );
-				expect( databaseOptions[ 1 ].maxRetries ).toBe( 1 );
+				expect( databaseOptions[ 1 ].maxRetries ).toBe( 2 );
+				expect( val( databaseOptions[ 1 ].budgets.maxTokensPerTask ?: 0 ) ).toBeGTE( 12000 );
 			} );
 
 			it( "resolves provider path aliases to retained target unit ids before reference validation", () => {
@@ -261,7 +262,7 @@ class extends="testbox.system.BaseSpec" {
 			it( "attaches a generationSummary for partial proposal failures", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", sourcePath: "legacy/seed.cfm", newProposal: true, proposalReason: "seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
-					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-database": { throw: true, message: "Provider JSON was truncated mid-object", errorType: "truncated_json" },
 					"modernization-architecture": { contexts: [], extracts: [] },
 					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
 				} );
@@ -278,7 +279,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.ok ).toBeTrue();
 				expect( result.plan.generationSummary ).toBeStruct();
 				expect( result.plan.generationSummary.status ).toBe( "partial_failure" );
-				expect( result.plan.generationSummary.actionability ).toBe( "incomplete" );
+				expect( result.plan.generationSummary.incompleteStages ).toInclude( "database" );
 				expect( isArray( result.plan.generationSummary.completedStages ) ).toBeTrue();
 				expect( result.plan.generationSummary.checkpointId ).toBe( "run-summary:proposal" );
 			} );
@@ -1643,6 +1644,118 @@ class extends="testbox.system.BaseSpec" {
 				expect( llmPhase.rollbackStrategy ).toBe( "Disable module route" );
 				expect( llmPhase.testingStrategy ).toBe( "Module boot smoke" );
 				expect( llmPhase.estimatedComplexity ).toBe( "medium" );
+			} );
+
+			it( "drops unitLinks whose targetUnitId cannot be resolved after alias repair", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				makePublic( service, "polishPlan" );
+				var polished = service.polishPlan( {
+					metadata: { runtime: { runtime: "boxlang" } },
+					target: {
+						units: [ { id: "canonical-song", targetPath: "app/models/services/SongService.bx", sourcePath: "models/SongService.cfc" } ],
+						placements: [],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [
+						{ id: "link-ok", sourcePath: "models/SongService.cfc", targetUnitId: "canonical-song" },
+						{ id: "link-path", sourcePath: "models/SongService.cfc", targetUnitId: "models/SongService.cfc" },
+						{ id: "link-phantom", sourcePath: "models/Other.cfc", targetUnitId: "targetUnit-2" },
+						{ id: "link-hash", sourcePath: "models/Missing.cfc", targetUnitId: "946d79410175ad26f08439e32f6d785a72d75e43ac6e0356674561f7a1df6780" }
+					],
+					routeContracts: [],
+					dbFindings: [],
+					dbTransitions: [],
+					roadmapPhases: [ { id: "phase-1", unitIds: [ "canonical-song" ], currentSlice: true } ],
+					samples: [],
+					assumptions: []
+				}, {}, [] );
+				expect( polished.unitLinks.len() ).toBe( 2 );
+				expect( polished.unitLinks.map( ( item ) => item.id ) ).toBe( [ "link-ok", "link-path" ] );
+				expect( polished.unitLinks[ 2 ].targetUnitId ).toBe( "canonical-song" );
+			} );
+
+			it( "keeps current-slice samples by relatedItemIds and synthesizes when empty", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				makePublic( service, "polishPlan" );
+				var withRelated = service.polishPlan( {
+					metadata: { runtime: { runtime: "boxlang" }, samplePolicy: { currentPhasesOnly: true } },
+					target: {
+						units: [
+							{ id: "u1", targetPath: "app/handlers/Playlist.bx", sourcePath: "views/playlist/index.cfm", layer: "handler" },
+							{ id: "u2", targetPath: "app/handlers/Other.bx", sourcePath: "views/other/index.cfm", layer: "handler" }
+						],
+						placements: [],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [],
+					routeContracts: [],
+					dbFindings: [],
+					dbTransitions: [],
+					roadmapPhases: [
+						{ id: "phase-current", unitIds: [ "u1" ], currentSlice: true, sampleIds: [] },
+						{ id: "phase-later", unitIds: [ "u2" ], currentSlice: false, sampleIds: [] }
+					],
+					samples: [
+						{ id: "sample-related", sampleKind: "app", targetPath: "app/handlers/Playlist.bx", language: "boxlang", code: "class {}", relatedItemIds: [ "u1" ], irreversible: false },
+						{ id: "sample-other", sampleKind: "app", targetPath: "app/handlers/Other.bx", language: "boxlang", code: "class {}", relatedItemIds: [ "u2" ], irreversible: false }
+					],
+					assumptions: []
+				}, { currentPhasesOnly: true, maxFiles: 10 }, [] );
+				expect( withRelated.samples.map( ( item ) => item.id ) ).toBe( [ "sample-related" ] );
+
+				var synthesized = service.polishPlan( {
+					metadata: { runtime: { runtime: "boxlang" } },
+					target: {
+						units: [ { id: "u1", targetPath: "app/handlers/Playlist.bx", sourcePath: "views/playlist/index.cfm", layer: "handler" } ],
+						placements: [],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [],
+					routeContracts: [],
+					dbFindings: [],
+					dbTransitions: [],
+					roadmapPhases: [ { id: "phase-current", unitIds: [ "u1" ], currentSlice: true, sampleIds: [] } ],
+					samples: [],
+					assumptions: []
+				}, { currentPhasesOnly: true, maxFiles: 10 }, [] );
+				expect( synthesized.samples ).notToBeEmpty();
+				expect( synthesized.samples[ 1 ].provenanceClass ).toBe( "deterministically-derived" );
+				expect( synthesized.samples[ 1 ].code ).toInclude( "not observed source" );
+				expect( synthesized.roadmapPhases[ 1 ].sampleIds ).notToBeEmpty();
+			} );
+
+			it( "synthesizes database findings from observed schema when the provider fails", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", sourcePath: "legacy/seed.cfm", newProposal: true, proposalReason: "seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { throw: true, message: "Provider JSON was truncated mid-object", errorType: "truncated_json" },
+					"modernization-architecture": { placements: [ { id: "pl-1", domainKey: "seed", placementType: "main-app", targetUnitIds: [ "seed-unit" ] } ], contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1", unitIds: [ "seed-unit" ], currentSlice: true } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-db-synth",
+					{ startedAt: getTickCount(), target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 4, maxDurationMs: 900000, maxIterations: 2 } },
+					{
+						coverage: {},
+						inventory: { files: [ { filePath: "legacy/seed.cfm" } ], units: [ { id: "inv-1", filePath: "legacy/seed.cfm" } ] },
+						schemaEvidence: { coverage: "partial-ddl", sourceKind: "auto-discovered", tables: [ { name: "songs" }, { name: "playlists" } ] }
+					}
+				);
+				expect( result.ok ).toBeTrue( jsonSerialize( result.errors ?: [] ) );
+				expect( result.plan.dbFindings.len() ).toBeGTE( 2 );
+				expect( result.plan.dbTransitions.len() ).toBeGTE( 2 );
+				expect( result.plan.dbFindings[ 1 ].provenanceClass ).toBe( "deterministically-derived" );
+				expect( result.plan.metadata.databaseSource ).toBe( "synthesized" );
+				expect( ( result.notes ?: [] ).some( ( item ) => ( item.message ?: "" ) == "synthesized-database-from-schema" ) ).toBeTrue();
 			} );
 
 			it( "repairs only the invalid fingerprint-listed item", () => {
