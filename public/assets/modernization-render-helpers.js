@@ -95,6 +95,7 @@
 		const targets = result.target?.units || [];
 		const routes = result.routeContracts || [];
 		const placements = result.target?.placements || [];
+		const samples = Array.isArray(result.samples) ? result.samples : [];
 		const llmMapped = targets.filter((unit) => {
 			const provenance = String(unit?.provenanceClass || "").toLowerCase();
 			const id = String(unit?.id || "");
@@ -105,20 +106,37 @@
 		const fallbackNote = modernizationGenerationNotes(result).find((item) => String(item.message || "") === "inventory-coverage-fallback");
 		const fallbackCount = Number(fallbackNote?.count || 0);
 		const fallbackDominates = fallbackCount > 0 && fallbackCount >= Math.max(1, llmMapped.length);
+		const fallbackRatio = fallbackCount / Math.max(1, targets.length);
 		const mappedPhases = phases.filter((phase) => phaseHasCodeLinks(phase));
 		const packagingIsDefaultOnly =
 			placements.length === 0 ||
 			(placements.length <= 1 &&
 				/modular monolith \(default\)/i.test(String(placements[0]?.name || placements[0]?.domainKey || "")));
-		const roadmapSynthesized = String(result.metadata?.roadmapSource || "").toLowerCase() === "synthesized";
-		// Synthesized roads are hollow only when packaging stayed the generic
-		// default and maps are mostly coverage stubs — directory-clustered
-		// synthesized placements with phase unit links are still usable.
+		const roadmapSynthesized = String(result.metadata?.roadmapSource || result.generationSummary?.roadmapSource || "").toLowerCase() === "synthesized";
+		const architectureSynthesized = String(result.metadata?.architectureSource || result.generationSummary?.architectureSource || "").toLowerCase() === "synthesized";
+		const migrationStepCount = phases.reduce((count, phase) => count + (Array.isArray(phase?.migrationSteps) ? phase.migrationSteps.length : 0), 0);
+		const incompleteStages = Array.isArray(result.generationSummary?.incompleteStages)
+			? result.generationSummary.incompleteStages.map(String)
+			: [];
+		const dbIncomplete =
+			incompleteStages.includes("database") ||
+			modernizationGenerationErrors(result).some((item) => String(item.role || "") === "modernization-database");
+		const failedGaps = modernizationGenerationNotes(result).some((item) => String(item.message || "") === "failed-shard-gaps-retained");
+
+		// Synthesized road with zero actionability is hollow regardless of LLM unit count.
+		if (roadmapSynthesized && migrationStepCount === 0 && samples.length === 0) return true;
+		if (architectureSynthesized && roadmapSynthesized && migrationStepCount === 0 && samples.length === 0) return true;
+		if (fallbackCount >= 10 && fallbackRatio >= 0.25 && (roadmapSynthesized || dbIncomplete || failedGaps)) return true;
+		// Synthesized roads are hollow when packaging stayed the generic
+		// default and maps are mostly coverage stubs.
 		if (roadmapSynthesized && packagingIsDefaultOnly && fallbackDominates && llmMapped.length < 20) return true;
 		if (fallbackDominates && packagingIsDefaultOnly && llmMapped.length < 20) return true;
-		if (llmMapped.length || routes.length) return false;
+		if (llmMapped.length || routes.length) {
+			if (failedGaps && migrationStepCount === 0 && samples.length === 0 && (roadmapSynthesized || dbIncomplete)) return true;
+			return false;
+		}
 		if (targets.length && !llmMapped.length && !routes.length) {
-			if (mappedPhases.length && placements.length > 1) return false;
+			if (mappedPhases.length && placements.length > 1 && migrationStepCount > 0) return false;
 			if (!mappedPhases.length) return true;
 			if (packagingIsDefaultOnly) return true;
 		}
@@ -139,7 +157,11 @@
 			retryable: !!raw.retryable,
 			completedStages: Array.isArray(raw.completedStages) ? raw.completedStages.map(String) : [],
 			incompleteStages: Array.isArray(raw.incompleteStages) ? raw.incompleteStages.map(String) : [],
-			checkpointId: String(raw.checkpointId || "").trim()
+			checkpointId: String(raw.checkpointId || "").trim(),
+			limitReached: String(raw.limitReached || "").trim(),
+			actionability: String(raw.actionability || "").trim(),
+			recommendedContinuation: String(raw.recommendedContinuation || "").trim(),
+			partialResults: raw.partialResults && typeof raw.partialResults === "object" ? raw.partialResults : {}
 		};
 	}
 

@@ -523,6 +523,80 @@ class extends="testbox.system.BaseSpec" {
 				expect( isArray( report.messages ) ).toBeTrue();
 				expect( structKeyExists( report, "validationLevel" ) ).toBeTrue();
 			} );
+
+			it( "blocks empty actionability when roadmap was synthesized", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, architectureSource: "synthesized", roadmapSource: "synthesized" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaEvidence: {},
+					target: {
+						units: [ { id: "target-1", itemFingerprint: "fp-1", targetPath: "app/handlers/A.bx", provenanceClass: "provider-suggested" } ],
+						placements: [ {
+							id: "placement-1", itemFingerprint: "fp-p", placementType: "main-app",
+							targetUnitIds: [ "target-1" ], evidenceRefs: [ { filePath: "legacy/a.cfm" } ],
+							provenanceClass: "deterministically-derived",
+							gates: [ { id: "architecture", status: "pass" } ]
+						} ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "fp-phase", unitIds: [ "target-1" ],
+						provenanceClass: "deterministically-derived",
+						exitCriteria: "done", rollback: "revert", parityIntent: "match"
+					} ],
+					validation: {}, decisions: [],
+					generationErrors: [ { role: "modernization-architecture", message: "budget-exceeded" }, { role: "modernization-roadmap", message: "budget-exceeded" } ],
+					generationSummary: { status: "partial_failure", incompleteStages: [ "architecture", "roadmap" ], roadmapSource: "synthesized" }
+				}, { inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] } } );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "actionability" && ( item.level ?: "" ) == "blocking" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "architecture" && findNoCase( "synthesized after provider", item.message ?: "" ) ) ).toBeTrue();
+			} );
+
+			it( "blocks empty database stage when schema evidence is present", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, roadmapSource: "provider" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaEvidence: { coverage: "partial-ddl", objects: [ { name: "songs" } ] },
+					target: {
+						units: [ { id: "target-1", itemFingerprint: "fp-1", targetPath: "app/handlers/A.bx", provenanceClass: "provider-suggested" } ],
+						placements: [ {
+							id: "placement-1", itemFingerprint: "fp-p", placementType: "main-app",
+							targetUnitIds: [ "target-1" ], evidenceRefs: [ { filePath: "legacy/a.cfm" } ],
+							provenanceClass: "provider-suggested",
+							gates: [ { id: "architecture", status: "pass" } ]
+						} ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [ {
+						id: "sample-1", itemFingerprint: "fp-s", sampleKind: "handler", targetPath: "app/handlers/A.bx",
+						relatedItemIds: [ "target-1" ], irreversible: false, language: "boxlang", body: "class {}"
+					} ],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "fp-phase", unitIds: [ "target-1" ],
+						provenanceClass: "provider-suggested",
+						migrationSteps: [ {
+							order: 1, action: "map",
+							legacyRef: { filePath: "legacy/a.cfm" },
+							targetRef: { targetPath: "app/handlers/A.bx" }
+						} ],
+						exitCriteria: "done", rollback: "revert", parityIntent: "match"
+					} ],
+					validation: {}, decisions: [],
+					generationErrors: [ { role: "modernization-database", message: "empty_provider_response", errorType: "empty_provider_response" } ],
+					generationSummary: { status: "partial_failure", incompleteStages: [ "database" ] }
+				}, {
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaPack: { coverage: "partial-ddl", objects: [ { name: "songs" } ] }
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "database" && findNoCase( "schema evidence", item.message ?: "" ) ) ).toBeTrue();
+			} );
 		} );
 	}
 }

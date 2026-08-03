@@ -240,6 +240,24 @@ class extends="testbox.system.BaseSpec" {
 				expect( covered ).toBeGTE( 2000 );
 			} );
 
+			it( "caps planned application shards so later stages keep wall-clock", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "buildApplicationShards" );
+				makePublic( service, "laterStageReserveMs" );
+				var units = [];
+				for ( var i = 1; i <= 300; i++ ) {
+					units.append( { id: "u-#i#", filePath: "model/Service#i#.cfc" } );
+				}
+				var reserveMs = service.laterStageReserveMs( 3600000, 4 );
+				expect( reserveMs ).toBeGTE( 300000 );
+				var shards = service.buildApplicationShards(
+					{ inventory: { units: units }, coverage: {}, schemaEvidence: {} },
+					{ applicationShardSize: 2, maxApplicationShards: 200, maxDurationMs: 3600000, maxTasks: 4, applicationShardConcurrency: 3 }
+				);
+				expect( shards.len() ).toBeLTE( 90 );
+				expect( shards.len() ).toBeGTE( 3 );
+			} );
+
 			it( "attaches a generationSummary for partial proposal failures", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", sourcePath: "legacy/seed.cfm", newProposal: true, proposalReason: "seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
@@ -259,7 +277,8 @@ class extends="testbox.system.BaseSpec" {
 				);
 				expect( result.ok ).toBeTrue();
 				expect( result.plan.generationSummary ).toBeStruct();
-				expect( result.plan.generationSummary.status ).toBe( "succeeded" );
+				expect( result.plan.generationSummary.status ).toBe( "partial_failure" );
+				expect( result.plan.generationSummary.actionability ).toBe( "incomplete" );
 				expect( isArray( result.plan.generationSummary.completedStages ) ).toBeTrue();
 				expect( result.plan.generationSummary.checkpointId ).toBe( "run-summary:proposal" );
 			} );
@@ -1335,8 +1354,17 @@ class extends="testbox.system.BaseSpec" {
 				var coveredPaths = {};
 				for ( var target in result.plan.target.units ) if ( len( target.sourcePath ?: "" ) ) coveredPaths[ lCase( target.sourcePath ) ] = true;
 				for ( var link in result.plan.unitLinks ) if ( len( link.sourcePath ?: "" ) ) coveredPaths[ lCase( link.sourcePath ) ] = true;
-				for ( var inventoryUnit in evidence.inventory.units ) expect( coveredPaths ).toHaveKey( lCase( inventoryUnit.filePath ) );
-				expect( ( result.notes ?: [] ).filter( ( item ) => item.message == "inventory-coverage-fallback" ) ).notToBeEmpty();
+				var failedPaths = {};
+				for ( var outcome in result.plan.metadata.applicationShards.outcomes ) {
+					if ( ( outcome.status ?: "" ) != "failed" ) continue;
+					for ( var failedPath in ( outcome.paths ?: [] ) ) failedPaths[ lCase( failedPath ) ] = true;
+				}
+				expect( failedPaths.count() ).toBeGTE( 1 );
+				for ( var failedPathKey in failedPaths ) {
+					expect( coveredPaths ).notToHaveKey( failedPathKey );
+				}
+				expect( ( result.notes ?: [] ).filter( ( item ) => item.message == "failed-shard-gaps-retained" ) ).notToBeEmpty();
+				expect( result.plan.generationSummary.recommendedContinuation ).toInclude( "/modernization/continue" );
 				var appOptions = gateway.optionsHistory().filter( ( item ) => ( item.role ?: "" ) == "modernization-application" );
 				expect( appOptions ).toHaveLength( 3 );
 				expect( appOptions.every( ( item ) => val( item.budgets.maxCostUsd ?: 0 ) <= 1.34 ) ).toBeTrue();
@@ -1373,7 +1401,7 @@ class extends="testbox.system.BaseSpec" {
 				};
 				var result = service.propose(
 					"run-cancel-between-shards",
-					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, applicationShardSize: 2, applicationShardConcurrency: 1 } },
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 7200000, applicationShardSize: 2, maxApplicationShards: 40, applicationShardConcurrency: 1 } },
 					evidence,
 					{ isCancelled: () => gateway.callCount() >= 1 }
 				);

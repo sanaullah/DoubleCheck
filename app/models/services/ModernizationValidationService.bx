@@ -212,6 +212,10 @@ class {
 		var sampleContractReport = validateSampleContract( arguments.plan, messages );
 		warnings += sampleContractReport.warnings;
 
+		var actionabilityReport = validateActionability( arguments.plan, arguments.context, messages );
+		blocking += actionabilityReport.blocking;
+		warnings += actionabilityReport.warnings;
+
 		var level = blocking ? "blocking" : ( warnings ? "warning" : "structural" );
 		return {
 			ok: blocking == 0, blocking: blocking, warnings: warnings, blockingCount: blocking, warningCount: warnings,
@@ -507,6 +511,88 @@ class {
 			}
 		}
 		return report;
+	}
+
+	/**
+	 * Elevate hollow-but-structural plans: synthesized critical stages, empty
+	 * actionability, failed database with schema present, or coverage stubs that
+	 * dominate after shard failures must not soft-pass as usable solutions.
+	 */
+	private struct function validateActionability( required struct plan, required struct context, required array messages ) {
+		var report = { blocking: 0, warnings: 0 };
+		var metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		var summary = isStruct( arguments.plan.generationSummary ?: "" ) ? arguments.plan.generationSummary : {};
+		var incompleteStages = isArray( summary.incompleteStages ?: "" ) ? summary.incompleteStages : [];
+		var generationErrors = isArray( arguments.plan.generationErrors ?: "" ) ? arguments.plan.generationErrors : [];
+		var generationNotes = isArray( arguments.plan.generationNotes ?: "" ) ? arguments.plan.generationNotes : [];
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var samples = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [];
+		var dbFindings = isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [];
+		var dbTransitions = isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [];
+		var migrationStepCount = 0;
+		for ( var phase in phases ) {
+			migrationStepCount += isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps.len() : 0;
+		}
+		var roadmapSynthesized = lCase( safeTrim( metadata.roadmapSource ?: summary.roadmapSource ?: "" ) ) == "synthesized";
+		var architectureSynthesized = lCase( safeTrim( metadata.architectureSource ?: summary.architectureSource ?: "" ) ) == "synthesized";
+		var databaseIncomplete = incompleteStages.contains( "database" )
+			|| generationErrors.some( ( item ) => ( item.role ?: "" ) == "modernization-database" && !isInformationalValidationMessage( item ) );
+		var schemaPresent = schemaEvidencePresent( arguments.plan, arguments.context );
+		var fallbackCount = 0;
+		var failedGapCount = 0;
+		for ( var note in generationNotes ) {
+			if ( ( note.message ?: "" ) == "inventory-coverage-fallback" ) fallbackCount = val( note.count ?: 0 );
+			if ( ( note.message ?: "" ) == "failed-shard-gaps-retained" ) failedGapCount = val( note.count ?: 0 );
+		}
+		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var stubDominates = fallbackCount > 0 && targetUnits.len() > 0 && fallbackCount >= ceiling( targetUnits.len() * 0.25 );
+		var shardReport = isStruct( metadata.applicationShards ?: "" ) ? metadata.applicationShards : {};
+		var criticalShardFailures = val( shardReport.failed ?: 0 ) > 0 || failedGapCount > 0;
+
+		if ( phases.len() > 0 && samples.len() == 0 && migrationStepCount == 0 && ( roadmapSynthesized || ( databaseIncomplete && schemaPresent ) ) ) {
+			addMessage( arguments.messages, "actionability", "blocking", "Plan has no samples or migration steps while roadmap was synthesized or database remained incomplete with schema evidence" );
+			report.blocking++;
+		}
+		if ( architectureSynthesized && generationErrors.some( ( item ) => ( item.role ?: "" ) == "modernization-architecture" && !isInformationalValidationMessage( item ) ) ) {
+			addMessage( arguments.messages, "architecture", "blocking", "Architecture packaging was synthesized after provider or budget failure" );
+			report.blocking++;
+		} else if ( architectureSynthesized && roadmapSynthesized && samples.len() == 0 && migrationStepCount == 0 ) {
+			addMessage( arguments.messages, "actionability", "warning", "Architecture and roadmap were both synthesized without actionable samples or migration steps" );
+			report.warnings++;
+		}
+		if ( schemaPresent && databaseIncomplete && !dbFindings.len() && !dbTransitions.len() ) {
+			addMessage( arguments.messages, "database", "blocking", "Database stage failed or was empty despite observed schema evidence" );
+			report.blocking++;
+		}
+		if ( stubDominates && criticalShardFailures ) {
+			addMessage( arguments.messages, "coverage", "blocking", "Coverage-fallback stubs dominate after failed application shards; continue or retry before treating maps as complete" );
+			report.blocking++;
+		} else if ( failedGapCount > 0 ) {
+			addMessage( arguments.messages, "coverage", "warning", "Failed application shard paths remain as incomplete gaps for continue/resume" );
+			report.warnings++;
+		}
+		return report;
+	}
+
+	private boolean function schemaEvidencePresent( required struct plan, required struct context ) {
+		var schema = structKeyExists( arguments.context, "schemaPack" ) && isStruct( arguments.context.schemaPack )
+			? arguments.context.schemaPack
+			: ( isStruct( arguments.plan.schemaEvidence ?: "" ) ? arguments.plan.schemaEvidence : {} );
+		if ( !isStruct( schema ) || !schema.count() ) return false;
+		if ( ( schema.coverage ?: "absent" ) == "absent" ) return false;
+		if ( isArray( schema.objects ?: "" ) && schema.objects.len() ) return true;
+		if ( isArray( schema.tables ?: "" ) && schema.tables.len() ) return true;
+		if ( isStruct( schema.database ?: "" ) && isArray( schema.database.tables ?: "" ) && schema.database.tables.len() ) return true;
+		if ( isNumeric( schema.tableCount ?: "" ) && val( schema.tableCount ) > 0 ) return true;
+		return ( schema.coverage ?: "" ) == "partial-ddl" || ( schema.coverage ?: "" ) == "complete";
+	}
+
+	private boolean function isInformationalValidationMessage( required any item ) {
+		if ( !isStruct( arguments.item ) ) return false;
+		var severity = lCase( safeTrim( arguments.item.severity ?: "" ) );
+		if ( severity == "info" || severity == "note" ) return true;
+		var message = lCase( safeTrim( arguments.item.message ?: "" ) );
+		return left( message, 12 ) == "synthesized-" || message == "cost-reserved-for-roadmap";
 	}
 
 	private boolean function isColdBoxConventionPath( required any path ) {

@@ -12,16 +12,20 @@ class {
 	property name="log" inject="logbox:logger:{this}";
 	variables.cancelledRuns = {};
 	variables.maxItems = 200;
-	// Shard count ceiling doubled alongside the shard-size default (4 -> 2) so
-	// total file coverage capacity (shards * shardSize) does not regress: 40*2
-	// covers as many files as the old 20*4 ceiling did.
-	variables.defaultApplicationShards = 80;
+	// Prefer fewer, larger shards so database/architecture/roadmap keep wall-clock.
+	// Callers can still request smaller shards via budgets.applicationShardSize.
+	variables.defaultApplicationShards = 40;
 	// Absolute shard ceiling for both scoped and unscoped runs. Callers can
 	// request less; large inventories expand up to this so maps are not capped
 	// at the historical 40-shard wall that left thousands of paths unmapped.
 	variables.maxApplicationShards = 200;
 	variables.maxScopedApplicationShards = 200;
-	variables.defaultShardSize = 2;
+	variables.defaultShardSize = 6;
+	// Conservative per-shard wall-clock used when capping planned shards so later
+	// stages (database → architecture → roadmap) are not starved.
+	variables.estimatedShardWallMs = 90000;
+	variables.minLaterStageReserveMs = 300000;
+	variables.maxLaterStageReserveMs = 900000;
 	// Unscoped estates this large get directory-inferred packaging seams when
 	// the architecture role is missing — otherwise the road collapses to one
 	// generic modular-monolith phase.
@@ -142,7 +146,11 @@ class {
 		}
 		var merged = mergeFragments( arguments.input, arguments.evidence, fragments, errors );
 		appendPromptContract( merged, "modernization-database", dbPromptProvenance );
-		merged = ensureApplicationSourceCoverage( merged, arguments.evidence, arguments.input, notes );
+		// Failed/omitted shard paths stay as retryable gaps — do not invent
+		// retain-legacy stubs that look like successful maps (RC3).
+		appResult.omittedPaths = isArray( appResult.omittedPaths ?: "" ) ? appResult.omittedPaths : [];
+		if ( shardCapOmissions.len() ) appResult.omittedPaths.append( shardCapOmissions, true );
+		merged = ensureApplicationSourceCoverage( merged, arguments.evidence, arguments.input, notes, appResult );
 		merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
 		merged.metadata.applicationShards = {
 			accepted: appAccepted,
@@ -300,7 +308,8 @@ class {
 		required struct plan,
 		required struct evidence,
 		required struct input,
-		array notes = []
+		array notes = [],
+		struct appResult = {}
 	) {
 		var inventory = isStruct( arguments.evidence.inventory ?: "" ) ? arguments.evidence.inventory : {};
 		var files = isArray( inventory.files ?: "" ) ? inventory.files : [];
@@ -317,6 +326,7 @@ class {
 		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [] };
 		arguments.plan.target.units = isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
 		arguments.plan.unitLinks = isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [];
+		var gapPaths = failedOrOmittedShardPaths( arguments.appResult );
 		var covered = {};
 		for ( var target in arguments.plan.target.units ) {
 			var path = normalizeEvidencePath( target.sourcePath ?: target.sourceFile ?: target.legacyPath ?: "" );
@@ -327,10 +337,16 @@ class {
 			if ( len( path ) ) covered[ path ] = true;
 		}
 		var addedPaths = [];
+		var retainedGapPaths = [];
 		for ( var file in files ) {
 			if ( !isStruct( file ) ) continue;
 			var sourcePath = normalizeEvidencePath( file.filePath ?: file.path ?: "" );
 			if ( !len( sourcePath ) || covered.keyExists( sourcePath ) || !isLikelyApplicationSource( sourcePath ) ) continue;
+			// Empty/timeout/budget-omitted shards remain failed gaps for continue/resume.
+			if ( gapPaths.keyExists( lCase( sourcePath ) ) ) {
+				retainedGapPaths.append( sourcePath );
+				continue;
+			}
 			var unitsForPath = inventoryUnits.filter( ( item ) => isStruct( item ) && normalizeEvidencePath( item.filePath ?: "" ) == sourcePath );
 			var representative = unitsForPath.len() ? unitsForPath[ 1 ] : {};
 			var layer = fallbackLayerForSource( sourcePath, representative );
@@ -385,7 +401,33 @@ class {
 				paths: addedPaths
 			} );
 		}
+		if ( retainedGapPaths.len() ) {
+			arguments.notes.append( {
+				role: "modernization-application",
+				message: "failed-shard-gaps-retained",
+				severity: "info",
+				count: retainedGapPaths.len(),
+				paths: retainedGapPaths
+			} );
+		}
 		return arguments.plan;
+	}
+
+	/** Paths belonging to failed or omitted application shards — retryable gaps, not stubs. */
+	private struct function failedOrOmittedShardPaths( required struct appResult ) {
+		var gapPaths = {};
+		for ( var outcome in ( isArray( arguments.appResult.outcomes ?: "" ) ? arguments.appResult.outcomes : [] ) ) {
+			if ( ![ "failed", "omitted" ].contains( outcome.status ?: "" ) ) continue;
+			for ( var path in ( isArray( outcome.paths ?: "" ) ? outcome.paths : [] ) ) {
+				var normalized = lCase( normalizeEvidencePath( path ) );
+				if ( len( normalized ) ) gapPaths[ normalized ] = true;
+			}
+		}
+		for ( var omittedPath in ( isArray( arguments.appResult.omittedPaths ?: "" ) ? arguments.appResult.omittedPaths : [] ) ) {
+			var normalizedOmitted = lCase( normalizeEvidencePath( omittedPath ) );
+			if ( len( normalizedOmitted ) ) gapPaths[ normalizedOmitted ] = true;
+		}
+		return gapPaths;
 	}
 
 	private string function fallbackLayerForSource( required string sourcePath, required struct unit ) {
@@ -2090,13 +2132,8 @@ class {
 			: 3;
 		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
 		var maxTasks = isNumeric( arguments.budgets.maxTasks ?: "" ) ? max( 1, int( arguments.budgets.maxTasks ) ) : 3;
-		// Keep provider spend for database + architecture + roadmap so maps are
-		// not stranded without packaging decisions or a road.
-		var reserveCost = 0;
-		if ( maxTasks >= 2 ) {
-			if ( maxCost >= 10 ) reserveCost = max( 3, min( maxCost * 0.25, 10 ) );
-			else if ( maxCost > 0 ) reserveCost = maxCost * 0.2;
-		}
+		// Keep meaningful provider spend for database + architecture + roadmap.
+		var reserveCost = laterStageReserveCost( maxCost, maxTasks );
 
 		var state = {
 			appMerged: emptyApplicationFragment(),
@@ -2128,7 +2165,8 @@ class {
 			concurrency: concurrency,
 			maxCost: maxCost,
 			maxTasks: maxTasks,
-			reserveCost: reserveCost
+			reserveCost: reserveCost,
+			reserveMs: laterStageReserveMs( arguments.maxDurationMs, maxTasks )
 		};
 
 		var primed = 0;
@@ -2193,14 +2231,15 @@ class {
 			}
 			var elapsedMs = getTickCount() - arguments.context.startedAt;
 			var remainingMs = arguments.context.maxDurationMs - elapsedMs;
-			// Keep a slice of the wall clock for database + architecture + roadmap
-			// after maps: a tight reserve while still filling the initial
-			// concurrency window, a bigger one once we start backfilling freed
-			// slots (widened from 120s to 180s now that a third sequential role
-			// runs after the shards).
-			var reserveMs = arguments.context.maxTasks >= 2 ? ( arguments.state.dispatchCount < arguments.context.concurrency ? 2000 : 180000 ) : 0;
+			// Keep a meaningful slice of wall clock for database → architecture →
+			// roadmap. A tight reserve while still filling the initial concurrency
+			// window; once backfilling, stop application shards early enough that
+			// later stages can run for real instead of synthesizing.
+			var reserveMs = arguments.context.maxTasks >= 2
+				? ( arguments.state.dispatchCount < arguments.context.concurrency ? 2000 : val( arguments.context.reserveMs ?: variables.minLaterStageReserveMs ) )
+				: 0;
 			if ( remainingMs <= reserveMs ) {
-				arguments.state.errors.append( { role: "modernization-application", message: "budget-exceeded", shard: arguments.state.nextShardIndex, elapsedMs: elapsedMs, maxDurationMs: arguments.context.maxDurationMs } );
+				arguments.state.errors.append( { role: "modernization-application", message: "budget-exceeded", shard: arguments.state.nextShardIndex, elapsedMs: elapsedMs, maxDurationMs: arguments.context.maxDurationMs, reservedMs: reserveMs } );
 				arguments.state.stopReason = "budget-exceeded";
 				return false;
 			}
@@ -2392,19 +2431,29 @@ class {
 
 	/**
 	 * Partition inventory into foundation-first file batches so each agent sees
-	 * a small, completeable mapping job instead of the whole tree.
+	 * a small, completeable mapping job instead of the whole tree. Prefers fewer,
+	 * larger shards under wall-clock pressure so later stages retain budget.
 	 */
 	private array function buildApplicationShards( required struct evidence, struct budgets = {} ) {
 		var shardSize = isNumeric( arguments.budgets.applicationShardSize ?: "" ) ? max( 2, min( 20, int( arguments.budgets.applicationShardSize ) ) ) : variables.defaultShardSize;
 		var paths = prioritizedLegacyPaths( arguments.evidence );
 		var shardCap = applicationShardCap( arguments.evidence, arguments.budgets, paths.len(), shardSize );
-		// Full-estate runs: raise files-per-shard (up to 12) so the 200-shard
-		// ceiling covers far more of the inventory instead of omitting thousands.
+		// Full-estate runs: raise files-per-shard (up to 12) so the ceiling covers
+		// more inventory with fewer LLM calls.
 		var scopePaths = isArray( arguments.evidence.scopePaths ?: "" )
 			? arguments.evidence.scopePaths
 			: ( isStruct( arguments.evidence.input ?: "" ) && isArray( arguments.evidence.input.scopePaths ?: "" ) ? arguments.evidence.input.scopePaths : [] );
 		if ( !scopePaths.len() && paths.len() > shardCap * shardSize ) {
 			shardSize = min( 12, max( shardSize, ceiling( paths.len() / max( 1, shardCap ) ) ) );
+		}
+		// Cap planned shards by affordable wall-clock after later-stage reserve so
+		// application mapping cannot consume the entire duration budget.
+		var affordableCap = affordableApplicationShardCap( arguments.budgets );
+		if ( affordableCap > 0 && shardCap > affordableCap ) {
+			shardCap = affordableCap;
+			if ( paths.len() > shardCap * shardSize ) {
+				shardSize = min( 12, max( shardSize, ceiling( paths.len() / max( 1, shardCap ) ) ) );
+			}
 		}
 		if ( !paths.len() ) {
 			var single = duplicate( arguments.evidence );
@@ -2425,6 +2474,44 @@ class {
 			shards.append( evidenceForShard( arguments.evidence, chunks[ chunkIndex ], chunkIndex, chunks.len() ) );
 		}
 		return shards;
+	}
+
+	/**
+	 * How many application shards can finish before the later-stage wall-clock
+	 * reserve must be held. Returns 0 when duration is unbounded / unknown so
+	 * callers keep the inventory-driven cap.
+	 */
+	private numeric function affordableApplicationShardCap( required struct budgets ) {
+		var maxDurationMs = isNumeric( arguments.budgets.maxDurationMs ?: "" ) ? int( arguments.budgets.maxDurationMs ) : 0;
+		if ( maxDurationMs <= 0 ) return 0;
+		var maxTasks = isNumeric( arguments.budgets.maxTasks ?: "" ) ? max( 1, int( arguments.budgets.maxTasks ) ) : 3;
+		var concurrency = isNumeric( arguments.budgets.applicationShardConcurrency ?: "" )
+			? max( 1, min( 12, int( arguments.budgets.applicationShardConcurrency ) ) )
+			: 3;
+		var reserveMs = laterStageReserveMs( maxDurationMs, maxTasks );
+		var availableMs = max( 60000, maxDurationMs - reserveMs );
+		var waves = max( 1, int( availableMs / max( 1, variables.estimatedShardWallMs ) ) );
+		return max( concurrency, waves * concurrency );
+	}
+
+	/** Wall-clock reserved for database (+ architecture + roadmap when enabled). */
+	private numeric function laterStageReserveMs( required numeric maxDurationMs, required numeric maxTasks ) {
+		if ( arguments.maxTasks < 2 ) return 0;
+		var laterStages = arguments.maxTasks >= 3 ? 3 : 1;
+		var desired = variables.minLaterStageReserveMs * laterStages;
+		var proportional = int( arguments.maxDurationMs * ( arguments.maxTasks >= 3 ? 0.30 : 0.15 ) );
+		return max( variables.minLaterStageReserveMs, min( variables.maxLaterStageReserveMs, max( desired, proportional ) ) );
+	}
+
+	/** Cost reserved for database (+ architecture + roadmap when enabled). */
+	private numeric function laterStageReserveCost( required numeric maxCost, required numeric maxTasks ) {
+		if ( arguments.maxTasks < 2 || arguments.maxCost <= 0 ) return 0;
+		if ( arguments.maxTasks >= 3 ) {
+			if ( arguments.maxCost >= 10 ) return max( 8, min( arguments.maxCost * 0.35, 25 ) );
+			return arguments.maxCost * 0.35;
+		}
+		if ( arguments.maxCost >= 10 ) return max( 3, min( arguments.maxCost * 0.25, 10 ) );
+		return arguments.maxCost * 0.2;
 	}
 
 	/**
@@ -3587,28 +3674,28 @@ class {
 		var hasArchitecture = ( isArray( arguments.plan.target.placements ?: "" ) && arguments.plan.target.placements.len() )
 			|| ( isArray( arguments.plan.target.contexts ?: "" ) && arguments.plan.target.contexts.len() )
 			|| ( isArray( arguments.plan.target.extracts ?: "" ) && arguments.plan.target.extracts.len() );
-		if ( hasArchitecture ) completed.append( "architecture" );
+		// Synthesized packaging after budget/provider failure is incomplete truth,
+		// not a completed architecture stage.
+		if ( hasArchitecture && architectureSource != "synthesized" ) completed.append( "architecture" );
+		else if ( hasArchitecture && architectureSource == "synthesized" && !hasRoleError( arguments.errors, "modernization-architecture" ) ) completed.append( "architecture" );
 		else incomplete.append( "architecture" );
 		var roadmapSource = arguments.plan.metadata.roadmapSource ?: "";
 		var hasRoadmap = isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len();
 		var roadmapAccepted = isStruct( arguments.plan.metadata.roadmapShards ?: "" )
 			? val( arguments.plan.metadata.roadmapShards.accepted ?: 0 )
 			: 0;
-		// Partial roadmap shard timeouts still leave usable phases — do not mark
-		// the whole roadmap stage incomplete when phases are retained.
-		if ( hasRoadmap && ( roadmapAccepted > 0 || roadmapSource == "synthesized" || !hasRoleError( arguments.errors, "modernization-roadmap" ) ) ) {
+		if ( hasRoadmap && roadmapAccepted > 0 && roadmapSource != "synthesized" ) {
 			completed.append( "roadmap" );
-		} else if ( hasRoadmap ) {
+		} else if ( hasRoadmap && roadmapSource != "synthesized" && !hasRoleError( arguments.errors, "modernization-roadmap" ) ) {
+			completed.append( "roadmap" );
+		} else if ( hasRoadmap && roadmapSource == "synthesized" && !hasRoleError( arguments.errors, "modernization-roadmap" ) ) {
 			completed.append( "roadmap" );
 		} else {
 			incomplete.append( "roadmap" );
 		}
 		var primary = arguments.errors.len() ? arguments.errors[ 1 ] : {};
 		var status = arguments.errors.len() ? "partial_failure" : "succeeded";
-		// Path-synthesized packaging still completes the architecture stage; keep
-		// provider timeouts visible on the summary without marking packaging absent.
 		if ( architectureSource == "synthesized" && hasArchitecture && ( primary.role ?: "" ) == "modernization-architecture" ) {
-			// Prefer a non-architecture error as the headline when packaging exists.
 			for ( var item in arguments.errors ) {
 				if ( ( item.role ?: "" ) != "modernization-architecture" && !isInformationalProposalMessage( item ) ) {
 					primary = item;
@@ -3618,6 +3705,18 @@ class {
 		}
 		var errorType = primary.errorType ?: inferErrorType( primary.message ?: "" );
 		var omittedPathCount = isArray( arguments.appResult.omittedPaths ?: "" ) ? arguments.appResult.omittedPaths.len() : val( arguments.appResult.omitted ?: 0 );
+		var failedShardCount = val( arguments.appResult.failed ?: 0 );
+		var fallbackStubCount = 0;
+		for ( var note in ( isArray( arguments.plan.generationNotes ?: "" ) ? arguments.plan.generationNotes : [] ) ) {
+			if ( ( note.message ?: "" ) == "inventory-coverage-fallback" ) fallbackStubCount = val( note.count ?: 0 );
+		}
+		var migrationStepCount = 0;
+		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
+			migrationStepCount += isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps.len() : 0;
+		}
+		var sampleCount = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples.len() : 0;
+		var actionabilityIncomplete = ( sampleCount == 0 && migrationStepCount == 0 && ( roadmapSource == "synthesized" || incomplete.contains( "database" ) ) );
+		if ( actionabilityIncomplete && status == "succeeded" ) status = "partial_failure";
 		var limitReached = "";
 		if ( errorType == "request_timeout" || findNoCase( "budget-exceeded", primary.message ?: "" ) || errorType == "budget_exceeded" ) {
 			limitReached = errorType.len() ? errorType : "budget_exceeded";
@@ -3627,29 +3726,38 @@ class {
 			limitReached = errorType;
 		}
 		var recommendedContinuation = "Review partial plan gates before accepting.";
-		if ( omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
-			recommendedContinuation = "Continue omitted coverage via POST /api/v1/runs/#arguments.runId#/modernization/continue";
+		if ( failedShardCount > 0 || omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
+			recommendedContinuation = "Continue omitted or failed coverage via POST /api/v1/runs/#arguments.runId#/modernization/continue";
 		} else if ( incomplete.contains( "architecture" ) || architectureSource == "synthesized" ) {
 			recommendedContinuation = "Retry architecture packaging or rebuild placements after coverage is complete.";
+		} else if ( incomplete.contains( "database" ) ) {
+			recommendedContinuation = "Retry the database stage; schema evidence was present but no provider findings were retained.";
 		} else if ( errorType == "request_timeout" ) {
 			recommendedContinuation = "Retry with a narrower scopePaths wave or higher AI_TIMEOUT; partial shards are retained.";
+		} else if ( actionabilityIncomplete ) {
+			recommendedContinuation = "Plan is structurally present but not actionable — retry roadmap/database stages or continue failed shards.";
 		}
 		return {
 			status: status,
 			stage: incomplete.len() ? incomplete[ 1 ] : "proposal_generation",
 			errorType: errorType,
-			message: primary.message ?: "",
+			message: primary.message ?: ( actionabilityIncomplete ? "actionability-incomplete" : "" ),
 			retryable: structKeyExists( primary, "retryable" ) ? !!primary.retryable : ( status == "partial_failure" ),
 			completedStages: completed,
 			incompleteStages: incomplete,
 			checkpointId: arguments.runId & ":proposal",
 			lastSuccessfulCheckpoint: arguments.runId & ":proposal",
 			architectureSource: architectureSource,
+			roadmapSource: roadmapSource,
 			limitReached: limitReached,
+			actionability: actionabilityIncomplete ? "incomplete" : "present",
 			partialResults: {
 				acceptedShards: val( arguments.appResult.accepted ?: 0 ),
-				failedShards: val( arguments.appResult.failed ?: 0 ),
+				failedShards: failedShardCount,
 				omittedPaths: omittedPathCount,
+				fallbackStubCount: fallbackStubCount,
+				migrationSteps: migrationStepCount,
+				samples: sampleCount,
 				phases: isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases.len() : 0,
 				units: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units.len() : 0,
 				placements: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements.len() : 0

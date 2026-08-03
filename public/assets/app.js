@@ -3019,7 +3019,7 @@ function renderModernizationResult(result = {}) {
 				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Partial modernization</strong><p>${architectureEscapeHtml(genSummary.errorType || genSummary.stage || "proposal_generation")}${genSummary.message ? `: ${architectureEscapeHtml(genSummary.message)}` : ""}.${genSummary.incompleteStages.length ? ` Incomplete: ${architectureEscapeHtml(genSummary.incompleteStages.join(", "))}.` : ""}${genSummary.limitReached ? ` Limit: ${architectureEscapeHtml(genSummary.limitReached)}.` : ""}${genSummary.retryable ? " Retryable from the last proposal checkpoint." : ""}</p>${genSummary.recommendedContinuation ? `<p class="confidence-action">${architectureEscapeHtml(genSummary.recommendedContinuation)}</p>` : ""}${genSummary.checkpointId ? `<p class="confidence-action">Checkpoint: ${architectureEscapeHtml(genSummary.checkpointId)}</p>` : ""}</div>`
 				: "";
 			const failureLead = hollow
-				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Application proposal incomplete</strong><p>${appError ? `The application role failed (${appError.message || "provider-failed"}), so this plan has road text without file maps, routes, or samples.` : "This plan has roadmap phases but no target units or route contracts bound to legacy files."}</p><p class="confidence-action">Next: start a new Modernize run (or Rebuild once a mapped slice exists). Indexed inventory (${cfmlFiles || sourceCount} CFML/source files) is still browsable below.</p></div>`
+				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Modernization plan incomplete</strong><p>${appError ? `The application role failed (${appError.message || "provider-failed"}), so this plan has road text without reliable file maps, routes, or samples.` : (result.metadata?.roadmapSource === "synthesized" || result.generationSummary?.actionability === "incomplete") ? "Critical stages were synthesized or empty — this plan is not an actionable Solution guide yet (missing migration steps/samples, and/or database/architecture incomplete)." : "This plan has roadmap phases but no target units or route contracts bound to legacy files."}</p><p class="confidence-action">${(typeof genSummary.recommendedContinuation === "string" && genSummary.recommendedContinuation.includes("/modernization/continue")) ? architectureEscapeHtml(genSummary.recommendedContinuation) : `Next: continue omitted/failed coverage or start a new Modernize run. Indexed inventory (${cfmlFiles || sourceCount} CFML/source files) is still browsable below.`}</p></div>`
 				: (genErrors.length
 					? `<div class="modernization-generation-alert"><strong>Partial generation</strong><p>${hasMaps ? `${targetCount} target units retained` : "No maps yet"}${shardMeta.accepted ? ` · application shards ${shardMeta.accepted}/${shardMeta.total || shardMeta.accepted}` : ""}. ${genErrors.slice(0, 3).map((item) => `${item.role || "role"}${item.shard ? ` #${item.shard}` : ""}: ${item.message || "failed"}`).join(" · ")}</p></div>`
 					: (genNotes.length
@@ -3071,9 +3071,10 @@ function renderModernizationResult(result = {}) {
 			}
 			const continueHost = elements.modernizationCoverageBanner.querySelector(".modernization-continue-actions");
 			const omittedCount = Number(shardMeta.omitted || (shardMeta.omittedPaths || []).length || genSummary.partialResults?.omittedPaths || 0);
+			const failedCount = Number(shardMeta.failed || genSummary.partialResults?.failedShards || 0);
 			const continueRecommended = typeof genSummary.recommendedContinuation === "string"
 				&& genSummary.recommendedContinuation.includes("/modernization/continue");
-			if (continueHost && (omittedCount > 0 || continueRecommended) && state.activeRun?.id) {
+			if (continueHost && (omittedCount > 0 || failedCount > 0 || continueRecommended) && state.activeRun?.id) {
 				continueHost.hidden = false;
 				const continueBtn = continueHost.querySelector("[data-modernization-continue]");
 				if (continueBtn && !continueBtn.dataset.bound) {

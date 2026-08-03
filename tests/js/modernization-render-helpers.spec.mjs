@@ -100,8 +100,8 @@ assert.equal(
 		],
 		generationNotes: [{ message: "inventory-coverage-fallback", count: 30 }]
 	}),
-	false,
-	"directory-clustered synthesized packaging with mapped phases is usable"
+	true,
+	"directory-clustered synthesized packaging without migration steps is hollow"
 );
 assert.equal(
 	helpers.modernizationPlanIsHollow({
@@ -130,6 +130,45 @@ assert.equal(
 	}),
 	false,
 	"LLM-mapped majority is not hollow"
+);
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		metadata: { roadmapSource: "synthesized", architectureSource: "synthesized" },
+		target: {
+			units: Array.from({ length: 108 }, (_, i) => ({
+				id: `tu-${i}`,
+				provenanceClass: "provider-suggested"
+			})),
+			placements: [
+				{ id: "p1", name: "ColdBox module candidate: model", placementType: "coldbox-module" },
+				{ id: "p2", name: "ColdBox module candidate: services", placementType: "coldbox-module" }
+			]
+		},
+		roadmapPhases: Array.from({ length: 6 }, (_, i) => ({
+			id: `phase-${i}`,
+			unitIds: [`tu-${i}`],
+			migrationSteps: []
+		})),
+		samples: [],
+		generationNotes: [{ message: "inventory-coverage-fallback", count: 56 }],
+		generationSummary: { incompleteStages: ["database", "architecture", "roadmap"], actionability: "incomplete" }
+	}),
+	true,
+	"CFTunes-shaped synthesized road with empty migration steps is hollow despite many LLM units"
+);
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		metadata: { roadmapSource: "provider" },
+		target: { units: [{ id: "tu-1", provenanceClass: "provider-suggested" }] },
+		samples: [{ id: "s1" }],
+		roadmapPhases: [{
+			id: "phase-1",
+			unitIds: ["tu-1"],
+			migrationSteps: [{ order: 1, action: "map" }]
+		}]
+	}),
+	false,
+	"provider roadmap with samples and migration steps is not hollow"
 );
 
 // modernizationGenerationSummary
