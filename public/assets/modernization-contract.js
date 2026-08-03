@@ -65,6 +65,24 @@
 		})));
 	}
 
+	function normalizeScopePaths(value) {
+		const parts = [];
+		const seen = new Set();
+		const pushChunk = (raw) => {
+			String(raw || "").split(/[\r\n,]+/).forEach((piece) => {
+				let path = String(piece || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+				if (!path) return;
+				const key = path.toLowerCase();
+				if (seen.has(key)) return;
+				seen.add(key);
+				parts.push(path);
+			});
+		};
+		if (Array.isArray(value)) value.forEach(pushChunk);
+		else pushChunk(value);
+		return parts;
+	}
+
 	function normalizeModernizationRequest(formValues, capabilities = {}) {
 		const values = asObject(formValues);
 		const targetRuntime = String(first(values, "targetRuntime", "lucee-modern")).trim().toLowerCase();
@@ -81,6 +99,7 @@
 		const schemaPath = first(values, "schemaPath", "");
 		const provider = String(first(values, "provider", capabilities.defaultProvider || "")).trim().toLowerCase();
 		const ack = first(values, "remoteProviderAcknowledged", false);
+		const scopePaths = normalizeScopePaths(values.scopePaths ?? values.prioritizedLegacyPaths ?? []);
 
 		const runtime = targetRuntime.endsWith("-modern") ? targetRuntime.slice(0, -7) : targetRuntime;
 		const schemaSource = String(first(values, "schemaSource", "none")).trim().toLowerCase() || "none";
@@ -93,6 +112,7 @@
 			provider,
 			execution: { model: modelOverride },
 			outcomes,
+			scopePaths,
 			source: {
 				engine: String(first(values, "sourceEngine", "unknown")).trim().toLowerCase(),
 				version: String(first(values, "sourceVersion", "")).trim(),
@@ -141,14 +161,14 @@
 				reviewGoal: String(first(values, "reviewGoal", "")).trim()
 			},
 			budgets: {
-				maxTasks: number(values, "maxTasks", 3),
-				maxTokens: Math.max(number(values, "maxTokens", 24000), 24000),
-				maxTokensPerTask: Math.max(number(values, "maxTokensPerTask", 8000), 8000),
-				maxDurationMs: Math.max(number(values, "maxDurationMs", 900000), 900000),
+				maxTasks: number(values, "maxTasks", 4),
+				maxTokens: Math.max(number(values, "maxTokens", 48000), 24000),
+				maxTokensPerTask: Math.max(number(values, "maxTokensPerTask", 16000), 8000),
+				maxDurationMs: Math.max(number(values, "maxDurationMs", 3600000), 900000),
 				maxIterationsPerTask: number(values, "maxIterationsPerTask", 8),
 				maxToolOutputCharacters: number(values, "maxToolOutputCharacters", 48000),
-				maxCostUsd: Math.max(number(values, "maxCostUsd", 40), 40),
-				maxApplicationShards: number(values, "maxApplicationShards", 40),
+				maxCostUsd: Math.max(number(values, "maxCostUsd", 120), 40),
+				maxApplicationShards: number(values, "maxApplicationShards", 200),
 				applicationShardSize: number(values, "applicationShardSize", 2),
 				applicationShardConcurrency: number(values, "applicationShardConcurrency", 3)
 			}
@@ -185,6 +205,12 @@
 			errors.push("Choose a supported target language and layout profile for the selected runtime.");
 		}
 		if (mode !== "full") warnings.push("Modernize is most complete with a full repository scope; this run may be inference-limited.");
+		const scopePaths = Array.isArray(modernization.scopePaths) ? modernization.scopePaths : [];
+		if (scopePaths.length) {
+			warnings.push(`Directory scope active (${scopePaths.length} path${scopePaths.length === 1 ? "" : "s"}); scan and maps prioritize those prefixes.`);
+		} else if (mode === "full") {
+			warnings.push("No directory scopePaths set — full repositories only AI-map within the shard budget (default up to 200×shard size). Prefer scope paths for a complete domain roadmap.");
+		}
 		if ((modernization.schemaPack?.sourceKind || modernization.schema?.source || "none") === "repo-path" && !(modernization.schemaPack?.relativePath || modernization.schema?.path)) {
 			errors.push("Provide a relative in-repository schema path or choose another schema source.");
 		}

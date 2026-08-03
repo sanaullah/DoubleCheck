@@ -1953,6 +1953,8 @@ function renderRunConfig(run) {
 		const database = input.database || {};
 		const execution = input.execution || {};
 		const schemaPack = input.schemaPack || {};
+		const scopePaths = Array.isArray(input.scopePaths) ? input.scopePaths.filter(Boolean) : [];
+		if (scopePaths.length) addRunConfigRow(grid, "Directory scope", scopePaths.join(", "));
 		addRunConfigRow(grid, "Source engine", source.engine);
 		addRunConfigRow(grid, "Source version", source.version);
 		addRunConfigRow(grid, "Java version", source.javaVersion);
@@ -2036,7 +2038,10 @@ function updateCommandMetrics(run = state.activeRun) {
 		elements.commandLanguages.textContent = (metrics.languages || []).join(", ") || "—";
 	}
 	if (elements.commandScope) {
-		elements.commandScope.textContent = scopeLabel(run?.mode);
+		const scoped = Array.isArray(run?.input?.scopePaths) ? run.input.scopePaths.filter(Boolean) : [];
+		elements.commandScope.textContent = scoped.length
+			? `${scopeLabel(run?.mode)} · ${scoped.length} path${scoped.length === 1 ? "" : "s"}`
+			: scopeLabel(run?.mode);
 	}
 	if (elements.commandFindings) {
 		elements.commandFindings.textContent = Number.isFinite(Number(metrics.findings))
@@ -2951,9 +2956,12 @@ function renderModernizationResult(result = {}) {
 	if (elements.modernizationCoverageBanner) {
 		const genErrors = modernizationGenerationErrors(result);
 		const hollow = modernizationPlanIsHollow(result);
+		const genSummary = typeof modernizationGenerationSummary === "function"
+			? modernizationGenerationSummary(result)
+			: { status: "" };
 		const genNotesPreview = modernizationGenerationNotes(result);
 		const bannerText = Array.isArray(coverage.banners) ? coverage.banners.join(" ") : "";
-		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.complete === false ? "Coverage is incomplete; review the explicit gaps before accepting this plan." : "") || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "") || (genErrors.length || genNotesPreview.length ? "generation-errors" : "");
+		const note = coverage.note || coverage.remoteProviderDisclosure || result.remoteProviderDisclosure || bannerText || (coverage.complete === false ? "Coverage is incomplete; review the explicit gaps before accepting this plan." : "") || (coverage.schema?.coverage === "absent" ? "Database coverage is inference-limited because no schema pack was provided." : "") || (genErrors.length || genNotesPreview.length || genSummary.status === "partial_failure" ? "generation-errors" : "");
 		elements.modernizationCoverageBanner.hidden = !note;
 		if (note) {
 			const schema = coverage.schema || {};
@@ -2967,6 +2975,9 @@ function renderModernizationResult(result = {}) {
 			const genNotes = modernizationGenerationNotes(result);
 			const hasMaps = targetCount > 0 || (result.routeContracts || []).length > 0;
 			const shardMeta = result.metadata?.applicationShards || {};
+			const summaryLead = genSummary.status === "partial_failure"
+				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Partial modernization</strong><p>${architectureEscapeHtml(genSummary.errorType || genSummary.stage || "proposal_generation")}${genSummary.message ? `: ${architectureEscapeHtml(genSummary.message)}` : ""}.${genSummary.incompleteStages.length ? ` Incomplete: ${architectureEscapeHtml(genSummary.incompleteStages.join(", "))}.` : ""}${genSummary.retryable ? " Retryable from the last proposal checkpoint." : ""}</p>${genSummary.checkpointId ? `<p class="confidence-action">Checkpoint: ${architectureEscapeHtml(genSummary.checkpointId)}</p>` : ""}</div>`
+				: "";
 			const failureLead = hollow
 				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Application proposal incomplete</strong><p>${appError ? `The application role failed (${appError.message || "provider-failed"}), so this plan has road text without file maps, routes, or samples.` : "This plan has roadmap phases but no target units or route contracts bound to legacy files."}</p><p class="confidence-action">Next: start a new Modernize run (or Rebuild once a mapped slice exists). Indexed inventory (${cfmlFiles || sourceCount} CFML/source files) is still browsable below.</p></div>`
 				: (genErrors.length
@@ -2974,7 +2985,7 @@ function renderModernizationResult(result = {}) {
 					: (genNotes.length
 						? `<div class="modernization-generation-alert" data-tone="info"><strong>Generation notes</strong><p>${hasMaps ? `${targetCount} target units · ` : ""}${shardMeta.accepted ? `shards ${shardMeta.accepted}/${shardMeta.total || shardMeta.accepted} · ` : ""}${genNotes.slice(0, 3).map((item) => item.message || "note").join(" · ")}</p></div>`
 						: ""));
-			elements.modernizationCoverageBanner.innerHTML = `${failureLead}<details class="modernization-confidence-details"${hollow ? "" : ""}><summary><span class="eyebrow">Plan confidence</span> · working limits of this run (optional)</summary><div class="modernization-confidence-heading"><strong>Modernize works within what this run indexed</strong><span class="status-badge" data-state="warning">Scoped</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div></details>`;
+			elements.modernizationCoverageBanner.innerHTML = `${summaryLead}${failureLead}<details class="modernization-confidence-details"${hollow ? "" : ""}><summary><span class="eyebrow">Plan confidence</span> · working limits of this run (optional)</summary><div class="modernization-confidence-heading"><strong>Modernize works within what this run indexed</strong><span class="status-badge" data-state="warning">Scoped</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div></details>`;
 			const cards = elements.modernizationCoverageBanner.querySelectorAll(".modernization-confidence-grid > section");
 			const jsIndexed = repo.supportedLanguages?.JavaScript || 0;
 			const jsCandidates = repo.candidateLanguages?.JavaScript || 0;
@@ -3092,30 +3103,47 @@ function renderModernizationArchitecture(result = {}) {
 }
 
 /**
- * Renders target.contexts/target.extracts as a "Modular Monolith Map" SVG —
- * a core monolith node plus one node per ColdBox module/microservice
- * candidate, connected by dependsOnContextIds edges — reusing the same
- * layoutFlowPositions() engine and .architecture-node/.architecture-edge
- * visual language as the code-review Architecture tab's file diagram
- * (renderArchitectureDiagram()) so it reads as native to the app.
+ * Renders target placements as a vertical Modular Monolith Map — separate
+ * lanes for main-app, ColdBox modules, and side-app/microservice candidates.
  */
 function renderModernizationArchitectureMap(result = {}) {
 	const mapHost = document.querySelector("#modernization-architecture-map");
 	if (!mapHost) return;
-	const flow = window.ArchitectureFlow;
 	const subgraph = buildModernizationArchitectureSubgraph(result);
-	if (!flow || subgraph.nodes.length <= 1) {
-		mapHost.innerHTML = `<p class="field-hint">No packaging decisions yet — the architecture role hasn't produced module or extract candidates for this run.</p>`;
+	if (subgraph.nodes.length <= 1) {
+		mapHost.innerHTML = `<p class="field-hint">No packaging decisions yet — the architecture role hasn't produced main-app, module, or side-app candidates for this run.</p>`;
 		return;
 	}
-	const layout = flow.layoutFlowPositions(subgraph);
+	const layoutFn = typeof layoutModernizationArchitectureVertical === "function"
+		? layoutModernizationArchitectureVertical
+		: null;
+	const layout = layoutFn
+		? layoutFn(subgraph)
+		: (window.ArchitectureFlow ? window.ArchitectureFlow.layoutFlowPositions(subgraph) : null);
+	if (!layout) {
+		mapHost.innerHTML = `<p class="field-hint">Architecture map layout is unavailable in this build.</p>`;
+		return;
+	}
 	const byId = Object.fromEntries(layout.nodes.map((n) => [n.id, n]));
 	const selectedId = state.modernization.selectedArchitectureId;
+
+	const laneLabels = (layout.lanes || []).map((lane) =>
+		`<text class="architecture-lane-label" x="20" y="${lane.y + 12}">${architectureEscapeHtml(lane.title)} · ${lane.count}</text>`
+	).join("");
 
 	const edgeLines = layout.edges.map((e) => {
 		const a = byId[e.from];
 		const b = byId[e.to];
 		if (!a || !b) return "";
+		const vertical = Math.abs(b.y - a.y) >= Math.abs(b.x - a.x);
+		if (vertical) {
+			const x1 = a.x + a.w / 2;
+			const y1 = a.y + a.h;
+			const x2 = b.x + b.w / 2;
+			const y2 = b.y;
+			const dy = Math.max(18, (y2 - y1) * 0.4);
+			return `<path class="architecture-edge" d="M${x1} ${y1} C${x1} ${y1 + dy}, ${x2} ${y2 - dy}, ${x2} ${y2}" />`;
+		}
 		const x1 = a.x + a.w;
 		const y1 = a.y + a.h / 2;
 		const x2 = b.x;
@@ -3128,12 +3156,16 @@ function renderModernizationArchitectureMap(result = {}) {
 		const sel = selectedId && selectedId === n.id ? " is-selected" : "";
 		const roleClass = n.role === "core" ? " is-core" : n.role === "extract" ? " is-extract" : n.role === "centralized" ? " is-centralized" : " is-module";
 		const speculative = n.item && String(n.item.evidenceBasis || "").toLowerCase() === "domain-clustering";
+		const packagingLabel = n.role === "core"
+			? "core"
+			: n.role === "extract"
+				? "side-app / microservice"
+				: n.role === "module"
+					? "coldbox module"
+					: "main application";
 		const subLabel = n.role === "core"
 			? (n.unitCount > 0 ? `${n.unitCount} ungrouped unit${n.unitCount === 1 ? "" : "s"}` : "shared app bootstrap")
-			: `${n.unitCount} unit${n.unitCount === 1 ? "" : "s"}${speculative ? " · speculative" : ""}`;
-		// Risk dot: deterministic, from ModernizationRiskService's read-time
-		// overlay (cross-referenced review findings for this project) — no
-		// new provider call, so it's safe to show even on a degraded plan.
+			: `${packagingLabel} · ${n.unitCount} unit${n.unitCount === 1 ? "" : "s"}${speculative ? " · speculative" : ""}`;
 		const risk = n.item?.riskLevel && String(n.item.riskLevel).toLowerCase() !== "none" ? String(n.item.riskLevel).toLowerCase() : "";
 		const riskDot = risk
 			? `<circle class="architecture-node-risk" data-risk="${architectureEscapeAttr(risk)}" cx="${n.w - 10}" cy="10" r="5"><title>${architectureEscapeAttr(risk)} risk · ${n.item.relatedFindingCount || 0} related review finding(s)</title></circle>`
@@ -3148,12 +3180,13 @@ function renderModernizationArchitectureMap(result = {}) {
 		</g>`;
 	}).join("");
 
-	mapHost.innerHTML = `<svg viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" xmlns="http://www.w3.org/2000/svg">
+	mapHost.innerHTML = `<svg class="modernization-architecture-svg is-vertical" viewBox="0 0 ${layout.width} ${layout.height}" width="${layout.width}" height="${layout.height}" xmlns="http://www.w3.org/2000/svg">
 		<defs>
 			<marker id="modernization-architecture-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
 				<path d="M0,0 L7,3.5 L0,7 Z" fill="#5a738a"></path>
 			</marker>
 		</defs>
+		${laneLabels}
 		${edgeLines}
 		${nodeHtml}
 	</svg>`;
@@ -3552,7 +3585,7 @@ function renderModernizationTransitionGuide(result = {}) {
 	if (hollow) {
 		host.innerHTML = `<div class="modernization-guide-heading"><div><p class="eyebrow">How to use this plan</p><h3>Rerun until file maps appear</h3></div><span class="status-badge">${runtime} · ${profile}</span></div>
 			${attentionLine}
-			<p class="modernization-guide-next"><strong>Blocked:</strong> the application proposal failed or produced no targets, so the Road is narrative-only. Confidence cards (repo limits / schema / AI partitions) are secondary.</p>
+			<p class="modernization-guide-next"><strong>Blocked:</strong> this plan is narrative-only (generic packaging and/or coverage stubs without enough AI-mapped targets). Set Directory scope to the folders you care about, raise duration/cost if the form allows, and rerun — Rebuild will not invent missing application maps.</p>
 			<div class="modernization-guide-grid">
 				<section><h4>1. What you still have</h4>${list([
 					`${(result.inventory?.units || []).length} legacy units from the indexed tree are browsable in Legacy you have.`,

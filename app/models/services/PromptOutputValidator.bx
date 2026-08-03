@@ -54,7 +54,11 @@ class {
 		required string schemaId,
 		struct context = {}
 	) {
-		var structural = validateStructure( arguments.response, arguments.schemaId );
+		var prepared = arguments.response;
+		if ( arguments.schemaId == "modernization-architecture-v2" && isStruct( prepared ) ) {
+			prepared = compactArchitectureResponse( prepared );
+		}
+		var structural = validateStructure( prepared, arguments.schemaId );
 		if ( !structural.valid || !isStruct( structural.value ) ) return structural;
 		var value = duplicate( structural.value );
 		var collections = itemCollections( value, arguments.schemaId );
@@ -276,6 +280,85 @@ class {
 		}
 		if ( !isStruct( resolved ) ) throw( type = "PromptSchemaReferenceException", message = "Schema reference does not resolve to an object" );
 		return resolved;
+	}
+
+	/**
+	 * Oversized architecture placements fail schema maxItems (40) and used to
+	 * discard the entire packaging recommendation. Split them into same-type
+	 * parts so ColdBox module / main-app decisions survive validation without
+	 * dropping targetUnitIds.
+	 */
+	private struct function compactArchitectureResponse( required struct response ) {
+		var value = duplicate( arguments.response );
+		if ( !isArray( value.placements ?: "" ) || !value.placements.len() ) return value;
+		var maxIds = 40;
+		var maxPlacements = 48;
+		var compacted = [];
+		for ( var placement in value.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			var ids = normalizeStringList( placement.targetUnitIds ?: [] );
+			var refs = normalizeStringList( placement.evidenceRefs ?: [] );
+			if ( ids.len() <= maxIds && refs.len() <= maxIds ) {
+				placement.targetUnitIds = ids;
+				placement.evidenceRefs = refs;
+				compacted.append( placement );
+				continue;
+			}
+			var chunkCount = 1;
+			if ( ids.len() || refs.len() ) {
+				chunkCount = max(
+					ids.len() ? ceiling( ids.len() / maxIds ) : 1,
+					refs.len() ? ceiling( refs.len() / maxIds ) : 1
+				);
+			} else {
+				compacted.append( placement );
+				continue;
+			}
+			for ( var chunkIndex = 1; chunkIndex <= chunkCount; chunkIndex++ ) {
+				var idOffset = ( ( chunkIndex - 1 ) * maxIds ) + 1;
+				var refOffset = ( ( chunkIndex - 1 ) * maxIds ) + 1;
+				var chunkIds = ( ids.len() && idOffset <= ids.len() )
+					? ids.slice( idOffset, min( maxIds, ids.len() - idOffset + 1 ) )
+					: [];
+				var chunkRefs = ( refs.len() && refOffset <= refs.len() )
+					? refs.slice( refOffset, min( maxIds, refs.len() - refOffset + 1 ) )
+					: [];
+				if ( !chunkIds.len() && !chunkRefs.len() ) continue;
+				var chunk = duplicate( placement );
+				chunk.targetUnitIds = chunkIds;
+				chunk.evidenceRefs = chunkRefs;
+				if ( chunkCount > 1 ) {
+					var baseId = trim( toString( placement.id ?: placement.domainKey ?: "placement" ) );
+					var baseName = trim( toString( placement.name ?: placement.domainKey ?: baseId ) );
+					chunk.id = baseId & "-part" & chunkIndex;
+					chunk.name = baseName & " (part " & chunkIndex & ")";
+				}
+				compacted.append( chunk );
+			}
+		}
+		if ( compacted.len() > maxPlacements ) compacted = compacted.slice( 1, maxPlacements );
+		value.placements = compacted;
+		return value;
+	}
+
+	private array function normalizeStringList( required any values ) {
+		var output = [];
+		var seen = {};
+		if ( !isArray( arguments.values ) ) {
+			if ( isSimpleValue( arguments.values ) && len( trim( toString( arguments.values ) ) ) ) {
+				var single = trim( toString( arguments.values ) );
+				return [ single ];
+			}
+			return output;
+		}
+		for ( var item in arguments.values ) {
+			if ( !isSimpleValue( item ) ) continue;
+			var text = trim( toString( item ) );
+			if ( !len( text ) || seen.keyExists( lCase( text ) ) ) continue;
+			seen[ lCase( text ) ] = true;
+			output.append( text );
+		}
+		return output;
 	}
 
 	private string function normalizePath( required any value ) {

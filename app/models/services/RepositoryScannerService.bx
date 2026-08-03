@@ -125,7 +125,8 @@ class {
 		var indexedJavaScriptFiles = 0;
 		var prioritizedPaths = prioritizeCandidatePaths(
 			candidateResult.paths,
-			arguments.options.priorityExtensions ?: ( arguments.options.modernize ?: false ? [ "cfm", "cfc", "bx", "bxm", "bxs" ] : [] )
+			arguments.options.priorityExtensions ?: ( arguments.options.modernize ?: false ? [ "cfm", "cfc", "bx", "bxm", "bxs" ] : [] ),
+			arguments.options.priorityPathPrefixes ?: []
 		);
 		// The /review file picker can narrow a scan to a chosen subset; an
 		// empty/omitted list means "scan everything" (existing behavior).
@@ -134,6 +135,13 @@ class {
 		if ( hasFileSelection ) {
 			for ( var selectedPath in arguments.options.selectedFiles ) {
 				selectedFileSet[ normalizePath( toString( selectedPath ) ) ] = true;
+			}
+		}
+		var pathPrefixes = [];
+		if ( isArray( arguments.options.pathPrefixes ?: "" ) ) {
+			for ( var prefix in arguments.options.pathPrefixes ) {
+				var normalizedPrefix = reReplace( replace( trim( toString( prefix ) ), "\", "/", "all" ), "/+$", "" );
+				if ( len( normalizedPrefix ) ) pathPrefixes.append( normalizedPrefix );
 			}
 		}
 
@@ -169,6 +177,10 @@ class {
 					continue;
 				}
 				if ( hasFileSelection && !selectedFileSet.keyExists( relativePath ) ) {
+					skipped.ignored++;
+					continue;
+				}
+				if ( pathPrefixes.len() && !pathMatchesPrefixes( relativePath, pathPrefixes ) ) {
 					skipped.ignored++;
 					continue;
 				}
@@ -364,19 +376,43 @@ class {
 	/**
 	 * Prefer CFML/BoxLang paths ahead of JS when a scan budget will truncate,
 	 * so Modernize does not burn the file cap on assets before legacy pages.
+	 * Optional priorityPathPrefixes further boost directory-scoped focus areas
+	 * (e.g. weboffice/_scheduledScripts) ahead of the rest of the estate.
 	 */
-	array function prioritizeCandidatePaths( required array paths, array priorityExtensions = [] ) {
-		if ( !arguments.priorityExtensions.len() || arguments.paths.len() < 2 ) return arguments.paths;
+	array function prioritizeCandidatePaths( required array paths, array priorityExtensions = [], array priorityPathPrefixes = [] ) {
+		if ( ( !arguments.priorityExtensions.len() && !arguments.priorityPathPrefixes.len() ) || arguments.paths.len() < 2 ) return arguments.paths;
 		var preferred = {};
 		for ( var extension in arguments.priorityExtensions ) preferred[ lCase( trim( extension ) ) ] = true;
+		var prefixes = [];
+		for ( var prefix in arguments.priorityPathPrefixes ) {
+			var normalizedPrefix = reReplace( replace( trim( toString( prefix ) ), "\", "/", "all" ), "/+$", "" );
+			if ( len( normalizedPrefix ) ) prefixes.append( normalizedPrefix );
+		}
+		var scopedPrimary = [];
 		var primary = [];
 		var secondary = [];
 		for ( var path in arguments.paths ) {
 			var extension = lCase( listLast( replace( toString( path ), "\\", "/", "all" ), "." ) );
-			if ( preferred.keyExists( extension ) ) primary.append( path );
+			var extensionPreferred = preferred.count() ? preferred.keyExists( extension ) : true;
+			var prefixPreferred = prefixes.len() ? pathMatchesPrefixes( path, prefixes ) : false;
+			if ( prefixPreferred && extensionPreferred ) scopedPrimary.append( path );
+			else if ( extensionPreferred ) primary.append( path );
 			else secondary.append( path );
 		}
-		return primary.append( secondary, true );
+		return scopedPrimary.append( primary, true ).append( secondary, true );
+	}
+
+	boolean function pathMatchesPrefixes( required string relativePath, required array prefixes ) {
+		var path = lCase( replace( trim( arguments.relativePath ), "\", "/", "all" ) );
+		if ( !len( path ) ) return false;
+		var haystack = "/" & reReplace( path, "^(\./)+", "" ) & "/";
+		for ( var prefix in arguments.prefixes ) {
+			var needle = lCase( reReplace( replace( trim( toString( prefix ) ), "\", "/", "all" ), "/+$", "" ) );
+			if ( !len( needle ) ) continue;
+			if ( findNoCase( "/" & needle & "/", haystack ) ) return true;
+			if ( path == needle || left( path, len( needle ) + 1 ) == needle & "/" ) return true;
+		}
+		return false;
 	}
 
 	/**

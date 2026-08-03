@@ -146,6 +146,28 @@ class extends="testbox.system.BaseSpec" {
 				expect( chat.callCount() ).toBe( 2 );
 			} );
 
+			it( "classifies a plain Request Timeout body as request_timeout, not truncated JSON", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "Request Timeout" );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var observations = [];
+				var result = service.run(
+					"run-timeout",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 3, maxTokensPerTask: 12000 }, onObservation: ( item ) => observations.append( item ) }
+				);
+				expect( result.ok ).toBeFalse();
+				expect( result.errorType ).toBe( "request_timeout" );
+				expect( result.retryable ).toBeTrue();
+				expect( findNoCase( "truncated", result.error ?: "" ) ).toBe( 0 );
+				expect( findNoCase( "timed out", result.error ?: "" ) ).toBeGT( 0 );
+				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeFalse();
+			} );
+
 			it( "cancels before provider execution", () => {
 				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { ok: true } );
 				var service = new app.models.services.ModernizationAgentGateway();

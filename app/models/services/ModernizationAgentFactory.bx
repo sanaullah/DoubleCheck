@@ -167,7 +167,7 @@ class {
 				// roadmap role instead — asking for structured multi-step guidance
 				// here, across every group, in one whole-repo call risked exactly
 				// the same overload/timeout failure the roadmap role used to hit.
-				return "Analyze the FULL aggregated target unit map, unitLinks, routeContracts, and coupling signals across the whole repository at once — not a narrow shard window. Return at most 48 compact placements, each with a stable domainKey, recommended placementType (main-app, coldbox-module, or external-service), targetUnitIds, a short rationale, evidenceRefs, uncertainty, and optional questions. Group units that share one feature domain. Use this progressive ladder: cross-cutting or tightly coupled behavior belongs in main-app; a cohesive boundary that can share deployment, runtime, and data ownership belongs in a ColdBox module; an external-service candidate requires explicit deployment, data, route, and operations seams. Prefer main-app or module when any service gate is unknown. Do not emit gates, alternatives, migration steps, or long prose—the application derives those deterministically. Leave units that do not fit a coherent group uncovered; the pipeline will conservatively fill gaps. Do not invent units, signals, or evidence not present in the supplied map.";
+				return "Analyze the FULL aggregated target unit map, unitLinks, routeContracts, and coupling signals across the whole repository at once — not a narrow shard window. Return at most 48 compact placements, each with a stable domainKey, recommended placementType (main-app, coldbox-module, or external-service), at most 40 targetUnitIds, at most 40 evidenceRefs, a short rationale, uncertainty, and optional questions. If a domain has more than 40 units, emit multiple placements that share the same domainKey/placementType instead of one oversized array. Group units that share one feature domain. Progressive packaging ladder (follow strictly): (1) DEFAULT is main-app — shared bootstrap, config, workers/scheduled scripts, temp/common/js/static folders, and loosely related views stay in the monolith. (2) coldbox-module ONLY for a cohesive in-process feature boundary that can share deployment/runtime/data (e.g. a real modules/ package or a tightly cohesive feature like BLC category) — do NOT label every top-level folder as a module. (3) external-service ONLY for a separate small application / side-app / microservice candidate with an explicit deployable seam (its own Application.cfc/cfm tree, separate hosting root, independent ops boundary) — never promote scheduled jobs, temp, or shared includes to microservices. Prefer main-app whenever unsure. Do not emit gates, alternatives, migration steps, or long prose—the application derives those deterministically. Leave units that do not fit a coherent group uncovered; the pipeline will conservatively fill gaps. Do not invent units, signals, or evidence not present in the supplied map.";
 			case "modernization-item-rebuild":
 				var rebuildItemType = trim( arguments.evidence.itemType ?: "" );
 				var rebuildItemId = trim( arguments.evidence.itemId ?: "" );
@@ -177,12 +177,21 @@ class {
 				var roadmapShard = isStruct( arguments.evidence.shardMeta ?: "" ) ? arguments.evidence.shardMeta : {};
 				if ( roadmapShard.count() && isArray( roadmapShard.targetUnitIds ?: "" ) && roadmapShard.targetUnitIds.len() ) {
 					var roadmapGroupLabel = trim( roadmapShard.groupName ?: "Slice" );
+					var shardIds = roadmapShard.targetUnitIds;
+					var listedIds = shardIds.len() > 24 ? shardIds.slice( 1, 24 ) : shardIds;
+					var idListText = listedIds.toList( ", " );
+					var moreIdsNote = shardIds.len() > 24
+						? " (plus #( shardIds.len() - 24 )# more ids in shard evidence — cover the listed ids with representative migrationSteps; do not enumerate every remaining id in prose)"
+						: "";
 					// migrationSteps lives here (not on the architecture role) because
 					// this call is already sharded to a small, bounded group of units —
 					// the one place a concrete legacy-file/method-to-target guide can be
 					// requested for every phase without risking the whole-repo overload
 					// that made the unsharded architecture call time out.
-					return "ROADMAP SHARD #val( roadmapShard.index ?: 1 )# of #val( roadmapShard.total ?: 1 )# — group `#roadmapGroupLabel#`. Produce EXACTLY ONE roadmap phase covering ONLY these target unit ids: #roadmapShard.targetUnitIds.toList( ', ' )#. Do not reference any unit, route, finding, or transition id outside this list and its linked evidence. Set dependencies to an empty array and currentSlice to false; the pipeline assigns phase order and the current slice deterministically after all shards return. Return COMPLETE COMPACT JSON with keys roadmapPhases (array with exactly one phase), samples, assumptions. The phase needs goal, pattern, unitIds (matching the listed ids), routeIds, dbFindingIds, transitionIds, sampleIds, parityIntent, exitCriteria, rollback, implementerPrompt. Keep goal/parityIntent/rollback/implementerPrompt under 200 characters and exitCriteria to at most 4 short items. Also produce migrationSteps: up to 6 ordered steps, each with action, legacyRef ({filePath,symbolName} copied from this shard's own evidence, never invented), targetRef ({targetPath,methodName} matching one of this shard's own listed unit ids), and an optional note. When this shard lists more units than 6 steps can cover, pick the most representative steps rather than trying to enumerate every unit — migrationSteps is a starting guide, not an exhaustive list. The `signals` array is this slice's deterministic coupling evidence — shared application scope, session or auth gates, include chains, dynamic component construction, SQL coupling, Java or outbound integration — each with a hit count and file:line examples. Name the two or three highest-count signals explicitly in implementerPrompt and cover them in migrationSteps: that coupling is what makes this slice hard, not moving files. Never cite a signal that is not listed. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions.";
+					// Never dump thousands of leftover unit ids into the immutable task
+					// segment: PromptCompiler treats roleInstruction as uncapped and a
+					// megashard list exceeds AI_MAX_PROMPT_CHARACTERS before evidence fits.
+					return "ROADMAP SHARD #val( roadmapShard.index ?: 1 )# of #val( roadmapShard.total ?: 1 )# — group `#roadmapGroupLabel#`. Produce EXACTLY ONE roadmap phase covering ONLY these target unit ids: #idListText##moreIdsNote#. Do not reference any unit, route, finding, or transition id outside this list and its linked evidence. Set dependencies to an empty array and currentSlice to false; the pipeline assigns phase order and the current slice deterministically after all shards return. Return COMPLETE COMPACT JSON with keys roadmapPhases (array with exactly one phase), samples, assumptions. The phase needs goal, pattern, unitIds (matching the listed ids), routeIds, dbFindingIds, transitionIds, sampleIds, parityIntent, exitCriteria, rollback, implementerPrompt. Keep goal/parityIntent/rollback/implementerPrompt under 200 characters and exitCriteria to at most 4 short items. Also produce migrationSteps: up to 6 ordered steps, each with action, legacyRef ({filePath,symbolName} copied from this shard's own evidence, never invented), targetRef ({targetPath,methodName} matching one of this shard's own listed unit ids), and an optional note. When this shard lists more units than 6 steps can cover, pick the most representative steps rather than trying to enumerate every unit — migrationSteps is a starting guide, not an exhaustive list. The `signals` array is this slice's deterministic coupling evidence — shared application scope, session or auth gates, include chains, dynamic component construction, SQL coupling, Java or outbound integration — each with a hit count and file:line examples. Name the two or three highest-count signals explicitly in implementerPrompt and cover them in migrationSteps: that coupling is what makes this slice hard, not moving files. Never cite a signal that is not listed. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions.";
 				}
 				return "After application and database fragments are merged, produce a concise ordered roadmap using ONLY IDs present in the merged plan. Preserve coexistence. When target.contexts or target.extracts already group units into coherent feature domains, prefer one phase per coherent group over one catch-all phase — a group's targetUnitIds is a strong hint for that phase's unitIds. Only fall back to a single combined phase when no such grouping exists. Each phase needs goal/pattern, earlier-phase dependencies, linked unit/route/finding/transition ids, parity intent, exitCriteria, rollback, implementerPrompt, and linked sample ids. Put route IDs only in routeIds and target-unit IDs only in unitIds. Mark exactly one actionable mapped phase currentSlice=true. Cover only evidenced work; do not manufacture module, side-app, schema-transition, auth, or retirement decisions. Deduplicate assumptions and omit assumptions already represented by evidence.";
 		}
@@ -342,12 +351,13 @@ class {
 
 	private struct function compactArchitectureEvidence( required struct evidence ) {
 		var target = isStruct( arguments.evidence.target ?: "" ) ? arguments.evidence.target : {};
+		var units = preferModelMappedUnits( isArray( target.units ?: "" ) ? target.units : [] );
 		return {
 			target: {
 				units: compactRecords(
-					isArray( target.units ?: "" ) ? target.units : [],
+					units,
 					[ "id", "targetPath", "sourcePath", "layer", "purpose", "confidence", "validationStatus" ],
-					300
+					80
 				),
 				placements: compactRecords(
 					isArray( target.placements ?: "" ) ? target.placements : [],
@@ -356,18 +366,54 @@ class {
 				)
 			},
 			unitLinks: compactRecords(
-				isArray( arguments.evidence.unitLinks ?: "" ) ? arguments.evidence.unitLinks : [],
+				preferModelMappedLinks( isArray( arguments.evidence.unitLinks ?: "" ) ? arguments.evidence.unitLinks : [], units ),
 				[ "id", "targetUnitId", "legacyUnitId", "sourcePath", "relation", "validationStatus" ],
-				300
+				80
 			),
 			routeContracts: compactRecords(
 				isArray( arguments.evidence.routeContracts ?: "" ) ? arguments.evidence.routeContracts : [],
 				[ "id", "path", "legacyPath", "method", "targetUnitId", "unitLinkId", "validationStatus" ],
-				300
+				40
 			),
 			signals: architectureSignals( arguments.evidence.signals ?: [] ),
 			coverage: arguments.evidence.coverage ?: {}
 		};
+	}
+
+	/** Prefer LLM-mapped units so architecture does not drown in coverage-fallback stubs. */
+	private array function preferModelMappedUnits( required array units ) {
+		var preferred = [];
+		var fallback = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			if ( isCoverageFallbackUnit( unit ) ) fallback.append( unit );
+			else preferred.append( unit );
+		}
+		return preferred.len() ? preferred.append( fallback, true ) : fallback;
+	}
+
+	private array function preferModelMappedLinks( required array links, required array preferredUnits ) {
+		var preferredIds = {};
+		for ( var unit in arguments.preferredUnits ) {
+			if ( isStruct( unit ) && !isCoverageFallbackUnit( unit ) ) {
+				var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+				if ( len( unitId ) ) preferredIds[ unitId ] = true;
+			}
+		}
+		if ( !preferredIds.count() ) return arguments.links;
+		var preferred = [];
+		var other = [];
+		for ( var link in arguments.links ) {
+			if ( !isStruct( link ) ) continue;
+			if ( preferredIds.keyExists( trim( toString( link.targetUnitId ?: "" ) ) ) ) preferred.append( link );
+			else other.append( link );
+		}
+		return preferred.len() ? preferred.append( other, true ) : other;
+	}
+
+	private boolean function isCoverageFallbackUnit( required struct unit ) {
+		if ( lCase( trim( arguments.unit.provenanceClass ?: "" ) ) == "deterministically-derived" ) return true;
+		return findNoCase( "coverage-", trim( toString( arguments.unit.id ?: "" ) ) ) == 1;
 	}
 
 	/**

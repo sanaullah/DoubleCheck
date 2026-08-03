@@ -89,7 +89,14 @@ class {
 			execution: {
 				provider: lCase( trim( resolved.provider ?: "" ) ),
 				model: len( modelOverride ) ? modelOverride : trim( resolved.model ?: "" )
-			}
+			},
+			scopePaths: normalizeScopePaths(
+				structKeyExists( arguments.input, "scopePaths" )
+					? arguments.input.scopePaths
+					: ( structKeyExists( arguments.input, "prioritizedLegacyPaths" ) ? arguments.input.prioritizedLegacyPaths : [] )
+			),
+			evidencePaths: normalizeScopePaths( structKeyExists( arguments.input, "evidencePaths" ) ? arguments.input.evidencePaths : [] ),
+			migrationPaths: normalizeScopePaths( structKeyExists( arguments.input, "migrationPaths" ) ? arguments.input.migrationPaths : [] )
 		};
 		normalized.fingerprint = lCase( hash( serializeCanonical( normalized ), "SHA-256" ) );
 		return {
@@ -163,6 +170,38 @@ class {
 			var value = boundedText( item, "outcomes[]", 120 );
 			if ( !output.contains( value ) ) output.append( value );
 			if ( output.len() > maxOutcomes ) validationError( "outcomes exceeds the configured maximum" );
+		}
+		return output;
+	}
+
+	/**
+	 * Relative directory/file prefixes used to prioritize or limit Modernize
+	 * scans and application shards. Empty means whole-repo behavior.
+	 */
+	private array function normalizeScopePaths( required any requested ) {
+		var values = [];
+		if ( isArray( arguments.requested ) ) values = arguments.requested;
+		else if ( isSimpleValue( arguments.requested ) && len( trim( toString( arguments.requested ) ) ) ) {
+			values = listToArray( replace( toString( arguments.requested ), chr( 13 ), "", "all" ), chr( 10 ), true, true );
+			if ( values.len() == 1 && find( ",", values[ 1 ] ) ) values = listToArray( values[ 1 ], ",", true, true );
+		} else if ( !isNull( arguments.requested ?: javacast( "null", "" ) ) && !isSimpleValue( arguments.requested ) && !isArray( arguments.requested ) ) {
+			validationError( "scopePaths must be an array of relative paths" );
+		}
+		var output = [];
+		var seen = {};
+		for ( var item in values ) {
+			if ( !isSimpleValue( item ) ) validationError( "scopePaths must contain text values" );
+			var path = replace( trim( toString( item ) ), "\", "/", "all" );
+			while ( find( "//", path ) ) path = replace( path, "//", "/", "all" );
+			path = reReplace( path, "^(\./)+", "" );
+			path = reReplace( path, "/+$", "" );
+			if ( !len( path ) || left( path, 1 ) == "/" || find( ":", path ) || find( "..", path ) ) continue;
+			path = boundedText( path, "scopePaths[]", 240 );
+			var key = lCase( path );
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			output.append( path );
+			if ( output.len() >= 40 ) break;
 		}
 		return output;
 	}

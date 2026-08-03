@@ -97,6 +97,8 @@ class {
 			}
 		}
 		var lastError = "";
+		var lastErrorType = "provider_error";
+		var lastRetryable = true;
 		var lastDiagnostics = {};
 		var spentUsd = 0;
 		var activeRequest = copyRequest( arguments.request );
@@ -154,13 +156,18 @@ class {
 				return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usage, promptProvenance: finalProvenance };
 			} catch ( any error ) {
 				if ( lCase( error.type ?: "" ) == "runcancelled" ) rethrow;
-				lastError = classifyProviderError( error );
+				var classified = classifyProviderError( error );
+				lastError = classified.message;
+				lastErrorType = classified.errorType;
+				lastRetryable = classified.retryable;
 				var errorObservation = {
 					stage: "provider-error",
 					runId: arguments.runId,
 					attempt: attempt + 1,
 					elapsedMs: getTickCount() - startedAt,
 					error: lastError,
+					errorType: lastErrorType,
+					retryable: lastRetryable,
 					provider: resolved.provider ?: "",
 					model: effectiveModel,
 					promptId: contractId,
@@ -170,10 +177,14 @@ class {
 				if ( lastDiagnostics.count() ) errorObservation.fit = duplicate( lastDiagnostics );
 				emitObservation( arguments.options, errorObservation );
 				try {
-					var errorMsg = "Modernize provider error runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# error=#left( lastError, 240 )#";
+					var errorMsg = "Modernize provider error runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# errorType=#lastErrorType# error=#left( lastError, 240 )#";
 					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.warn( errorMsg );
 				} catch ( any ignored ) {}
 				if ( isPromptFitError( error ) ) break;
+				// Transport timeouts are transient but shrink-and-retry cannot help:
+				// the same oversized request will time out again. Fail with a typed
+				// request_timeout instead of mislabeling the body as truncated JSON.
+				if ( lastErrorType == "request_timeout" ) break;
 				if ( attempt < attemptLimit ) {
 					if ( isStruct( error.data ?: "" ) && isArray( error.data.reasonCodes ?: "" ) && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.validationReasonCodes = duplicate( error.data.reasonCodes );
 					if ( isRepairableOutputError( error ) ) {
@@ -193,6 +204,8 @@ class {
 			model: effectiveModel,
 			durationMs: getTickCount() - startedAt,
 			error: lastError,
+			errorType: lastErrorType,
+			retryable: lastRetryable,
 			promptProvenance: isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {},
 			diagnostics: lastDiagnostics
 		};
@@ -236,15 +249,47 @@ class {
 		return result;
 	}
 
-	private string function classifyProviderError( required any error ) {
+	private struct function classifyProviderError( required any error ) {
 		var raw = secretRedactionService.redactText( arguments.error.message ?: "Provider request failed" );
-		if ( isTruncatedJsonError( arguments.error ) ) {
-			return "Provider JSON was truncated mid-object (raise max tokens or keep the first slice small). " & left( raw, 240 );
+		if ( isTransportTimeoutError( arguments.error ) ) {
+			return {
+				errorType: "request_timeout",
+				retryable: true,
+				message: "The proposal agent exceeded its execution limit (provider request timed out). " & left( raw, 200 )
+			};
 		}
-		return left( raw, 500 );
+		if ( isTruncatedJsonError( arguments.error ) ) {
+			return {
+				errorType: "truncated_json",
+				retryable: true,
+				message: "Provider JSON was truncated mid-object (raise max tokens or keep the first slice small). " & left( raw, 240 )
+			};
+		}
+		return {
+			errorType: "provider_error",
+			retryable: true,
+			message: left( raw, 500 )
+		};
+	}
+
+	/**
+	 * Plain-text gateway/proxy timeout bodies (e.g. "Request Timeout") are often
+	 * fed into JSON deserialization because returnFormat=json. That produces
+	 * "Failed to parse JSON Request Timeout" — a transport failure, not truncation.
+	 */
+	private boolean function isTransportTimeoutError( required any error ) {
+		var message = trim( toString( arguments.error.message ?: "" ) );
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		if ( findNoCase( "timeout", typeName ) || findNoCase( "deadlineexceeded", typeName ) ) return true;
+		if ( reFindNoCase( "^\s*request\s+timeout\s*$", message ) ) return true;
+		if ( findNoCase( "gateway timeout", message ) || findNoCase( "gateway time-out", message ) ) return true;
+		if ( findNoCase( "failed to parse json", message ) && findNoCase( "request timeout", message ) ) return true;
+		if ( findNoCase( "parse json", message ) && reFindNoCase( "request\s+timeout", message ) ) return true;
+		return false;
 	}
 
 	private boolean function isTruncatedJsonError( required any error ) {
+		if ( isTransportTimeoutError( arguments.error ) ) return false;
 		var message = lCase( toString( arguments.error.message ?: "" ) );
 		var typeName = lCase( toString( arguments.error.type ?: "" ) );
 		if ( findNoCase( "parse json", message ) || findNoCase( "jsondeserialize", typeName ) || findNoCase( "json", typeName ) ) return true;
@@ -254,6 +299,7 @@ class {
 	}
 
 	private boolean function isRepairableOutputError( required any error ) {
+		if ( isTransportTimeoutError( arguments.error ) ) return false;
 		var typeName = lCase( toString( arguments.error.type ?: "" ) );
 		return isTruncatedJsonError( arguments.error ) || findNoCase( "promptoutputvalidation", typeName ) > 0 || findNoCase( "providerresponse", typeName ) > 0;
 	}
@@ -566,6 +612,11 @@ class {
 		}
 		var text = trim( toString( arguments.response ) );
 		if ( !len( text ) ) return {};
+		// Detect gateway/proxy plain-text timeouts before JSON parsing so callers
+		// see request_timeout instead of a misleading parse failure.
+		if ( reFindNoCase( "^\s*request\s+timeout\s*$", text ) || findNoCase( "gateway timeout", text ) || findNoCase( "504 gateway time-out", text ) ) {
+			throw( type = "ModernizationProviderTimeoutException", message = "Request Timeout" );
+		}
 		// Strip the optional Markdown fence without relying on a backslash-heavy
 		// regex (BoxLang preserves doubled escapes in string literals).
 		text = replaceNoCase( text, "```json", "", "all" );

@@ -94,10 +94,53 @@
 		const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
 		const targets = result.target?.units || [];
 		const routes = result.routeContracts || [];
-		if (targets.length || routes.length) return false;
-		const mapped = phases.some((phase) => phaseHasCodeLinks(phase));
+		const placements = result.target?.placements || [];
+		const llmMapped = targets.filter((unit) => {
+			const provenance = String(unit?.provenanceClass || "").toLowerCase();
+			const id = String(unit?.id || "");
+			if (provenance === "deterministically-derived") return false;
+			if (id.startsWith("coverage-")) return false;
+			return true;
+		});
+		const fallbackNote = modernizationGenerationNotes(result).find((item) => String(item.message || "") === "inventory-coverage-fallback");
+		const fallbackCount = Number(fallbackNote?.count || 0);
+		const fallbackDominates = fallbackCount > 0 && fallbackCount >= Math.max(1, llmMapped.length);
+		const mappedPhases = phases.filter((phase) => phaseHasCodeLinks(phase));
+		const packagingIsDefaultOnly =
+			placements.length === 0 ||
+			(placements.length <= 1 &&
+				/modular monolith \(default\)/i.test(String(placements[0]?.name || placements[0]?.domainKey || "")));
+		const roadmapSynthesized = String(result.metadata?.roadmapSource || "").toLowerCase() === "synthesized";
+		// Synthesized roads are hollow only when packaging stayed the generic
+		// default and maps are mostly coverage stubs — directory-clustered
+		// synthesized placements with phase unit links are still usable.
+		if (roadmapSynthesized && packagingIsDefaultOnly && fallbackDominates && llmMapped.length < 20) return true;
+		if (fallbackDominates && packagingIsDefaultOnly && llmMapped.length < 20) return true;
+		if (llmMapped.length || routes.length) return false;
+		if (targets.length && !llmMapped.length && !routes.length) {
+			if (mappedPhases.length && placements.length > 1) return false;
+			if (!mappedPhases.length) return true;
+			if (packagingIsDefaultOnly) return true;
+		}
 		const appFailed = modernizationGenerationErrors(result).some((item) => String(item.role || "") === "modernization-application");
-		return appFailed || (phases.length > 0 && !mapped);
+		return appFailed || (phases.length > 0 && !mappedPhases.length);
+	}
+
+	function modernizationGenerationSummary(result = {}) {
+		const raw = result && typeof result.generationSummary === "object" && result.generationSummary
+			? result.generationSummary
+			: {};
+		const status = String(raw.status || "").trim();
+		return {
+			status,
+			stage: String(raw.stage || "").trim(),
+			errorType: String(raw.errorType || "").trim(),
+			message: String(raw.message || "").trim(),
+			retryable: !!raw.retryable,
+			completedStages: Array.isArray(raw.completedStages) ? raw.completedStages.map(String) : [],
+			incompleteStages: Array.isArray(raw.incompleteStages) ? raw.incompleteStages.map(String) : [],
+			checkpointId: String(raw.checkpointId || "").trim()
+		};
 	}
 
 	function modernizationValidationStatus(item) {
@@ -226,7 +269,69 @@
 			edges,
 			truncated: false,
 			totalNodes: nodes.length,
-			totalEdges: edges.length
+			totalEdges: edges.length,
+			lanes: {
+				centralized: central.length,
+				modules: modules.length,
+				extracts: extracts.length
+			}
+		};
+	}
+
+	/**
+	 * Vertical packaging lanes for the Modular Monolith Map: core → main-app →
+	 * ColdBox modules → side-app/microservice candidates. Keeps each packaging
+	 * type visually separate instead of a left-to-right dependency soup.
+	 */
+	function layoutModernizationArchitectureVertical(subgraph = {}, opts = {}) {
+		const nodeWidth = Number(opts.nodeWidth) > 0 ? Number(opts.nodeWidth) : 240;
+		const nodeHeight = Number(opts.nodeHeight) > 0 ? Number(opts.nodeHeight) : 56;
+		const gapY = Number(opts.gapY) > 0 ? Number(opts.gapY) : 10;
+		const gapLane = Number(opts.gapLane) > 0 ? Number(opts.gapLane) : 26;
+		const pad = Number(opts.pad) > 0 ? Number(opts.pad) : 20;
+		const laneHeaderH = 20;
+		const nodes = Array.isArray(subgraph.nodes) ? subgraph.nodes : [];
+		const edges = Array.isArray(subgraph.edges) ? subgraph.edges : [];
+		const byRole = {
+			core: nodes.filter((n) => n.role === "core"),
+			centralized: nodes.filter((n) => n.role === "centralized"),
+			module: nodes.filter((n) => n.role === "module"),
+			extract: nodes.filter((n) => n.role === "extract")
+		};
+		const sortNodes = (list) => list.slice().sort((a, b) => String(a.path || a.id).localeCompare(String(b.path || b.id)));
+		const lanes = [
+			{ id: "core", title: "Shared ColdBox core", roleClass: "is-core", nodes: sortNodes(byRole.core) },
+			{ id: "main-app", title: "Main application (monolith)", roleClass: "is-centralized", nodes: sortNodes(byRole.centralized) },
+			{ id: "modules", title: "ColdBox module candidates", roleClass: "is-module", nodes: sortNodes(byRole.module) },
+			{ id: "services", title: "Side-app / microservice candidates", roleClass: "is-extract", nodes: sortNodes(byRole.extract) }
+		].filter((lane) => lane.nodes.length);
+
+		let y = pad;
+		const positioned = [];
+		const laneMeta = [];
+		lanes.forEach((lane) => {
+			laneMeta.push({ id: lane.id, title: lane.title, roleClass: lane.roleClass, y, count: lane.nodes.length });
+			y += laneHeaderH;
+			lane.nodes.forEach((n) => {
+				positioned.push({
+					...n,
+					x: pad,
+					y,
+					w: nodeWidth,
+					h: nodeHeight,
+					lane: lane.id
+				});
+				y += nodeHeight + gapY;
+			});
+			y += gapLane;
+		});
+
+		return {
+			width: pad * 2 + nodeWidth,
+			height: Math.max(pad * 2 + nodeHeight, y),
+			nodes: positioned,
+			edges: edges.map((e) => ({ ...e })),
+			lanes: laneMeta
 		};
 	}
 
@@ -379,12 +484,14 @@
 		modernizationGenerationNotes,
 		modernizationMessageIsNote,
 		modernizationPlanIsHollow,
+		modernizationGenerationSummary,
 		modernizationValidationStatus,
 		modernizationItemMeta,
 		modernizationItemKey,
 		modernizationPaneBanner,
 		modernizationEvidenceBasisNote,
 		buildModernizationArchitectureSubgraph,
+		layoutModernizationArchitectureVertical,
 		modernizationBriefSummary,
 		MODERNIZATION_SIGNAL_GUIDE,
 		modernizationSignalGuide,

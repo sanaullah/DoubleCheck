@@ -30,7 +30,7 @@ property name="modernizationGateService" inject="ModernizationGateService";
 	// silently restoring noisy construction signals on every rerun — so v3
 	// checkpoints must not
 	// be reusable.
-	variables.pipelineContractVersion = "modernization-pipeline-v7";
+	variables.pipelineContractVersion = "modernization-pipeline-v8";
 
 	/**
 	 * Executes the evidence-first Modernize pipeline, reusing compatible
@@ -114,15 +114,23 @@ property name="modernizationGateService" inject="ModernizationGateService";
 					: coverageService.assess( arguments.scan, inventory, schemaPack ?: {}, context, {} );
 				result.coverage = coverage;
 				checkCancellation( arguments.callbacks );
+			var scopedPaths = isArray( input.scopePaths ?: "" ) ? duplicate( input.scopePaths ) : [];
 			var evidence = {
 				inventory: inventory,
 				schemaEvidence: schemaPack ?: {},
 				signals: result.signals,
 				coverage: coverage,
 				context: context,
-				extraEvidence: extraEvidence
+				extraEvidence: extraEvidence,
+				scopePaths: scopedPaths,
+				input: { scopePaths: duplicate( scopedPaths ) }
 			};
-			if ( isStruct( evidenceCheckpointValue ) && evidenceCheckpointValue.count() && isStruct( evidenceCheckpointValue.inventory ?: "" ) ) evidence = evidenceCheckpointValue;
+			if ( isStruct( evidenceCheckpointValue ) && evidenceCheckpointValue.count() && isStruct( evidenceCheckpointValue.inventory ?: "" ) ) {
+				evidence = evidenceCheckpointValue;
+				evidence.scopePaths = scopedPaths;
+				if ( !isStruct( evidence.input ?: "" ) ) evidence.input = {};
+				evidence.input.scopePaths = duplicate( scopedPaths );
+			}
 			checkpoint( runId, "evidence", evidence, 48, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
 
 			checkCancellation( arguments.callbacks );
@@ -139,18 +147,55 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			proposalInput.startedAt = pipelineStartedAt;
 			var proposalCheckpoint = reusableCheckpoint( priorCheckpoints, "proposal", inputFingerprint, sourceFingerprint );
 			var proposalCheckpointValue = !isNull( proposalCheckpoint ) ? ( proposalCheckpoint.payload.value ?: proposalCheckpoint.payload ) : {};
+			var shardProgressCheckpoint = findCheckpoint( priorCheckpoints, "proposal-shards", inputFingerprint, sourceFingerprint );
+			var proposalOptions = {
+				isCancelled: () => isCancelled( pipelineCallbacks ),
+				onObservation: ( observation ) => {
+					if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
+				},
+				onShardComplete: ( progress ) => {
+					try {
+						checkpoint(
+							runId,
+							"proposal-shards",
+							{
+								ok: true,
+								partial: true,
+								fragment: progress.fragment ?: {},
+								outcomes: progress.outcomes ?: [],
+								accepted: progress.accepted ?: 0,
+								failed: progress.failed ?: 0,
+								omitted: progress.omitted ?: 0,
+								outputCharacters: progress.outputCharacters ?: 0,
+								costUsd: progress.costUsd ?: 0
+							},
+							60,
+							{ inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint }
+						);
+					} catch ( any ignored ) {}
+				}
+			};
+			if ( !isNull( shardProgressCheckpoint ) ) {
+				var shardProgressValue = shardProgressCheckpoint.payload.value ?: shardProgressCheckpoint.payload;
+				if ( isStruct( shardProgressValue ) && ( shardProgressValue.accepted ?: 0 ) > 0 ) {
+					proposalOptions.resumeFrom = {
+						fragment: shardProgressValue.fragment ?: {},
+						outcomes: shardProgressValue.outcomes ?: [],
+						accepted: shardProgressValue.accepted ?: 0,
+						failed: shardProgressValue.failed ?: 0,
+						omitted: shardProgressValue.omitted ?: 0,
+						outputCharacters: shardProgressValue.outputCharacters ?: 0,
+						costUsd: shardProgressValue.costUsd ?: 0
+					};
+				}
+			}
 			var proposal = isStruct( proposalCheckpointValue ) && structKeyExists( proposalCheckpointValue, "plan" )
 				? proposalCheckpointValue
 				: proposalService.propose(
 					runId,
 					proposalInput,
 					evidence,
-					{
-						isCancelled: () => isCancelled( pipelineCallbacks ),
-						onObservation: ( observation ) => {
-							if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
-						}
-					}
+					proposalOptions
 				);
 			checkpoint( runId, "proposal", proposal, 76, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
 			if ( !( proposal.ok ?: false ) ) {
@@ -387,7 +432,25 @@ property name="modernizationGateService" inject="ModernizationGateService";
 		} catch ( any ignored ) {
 			// Risk/effort badges are additive; never fail result assembly.
 		}
+		result = enrichGenerationSummary( result, arguments.runId );
 		return result;
+	}
+
+	private struct function enrichGenerationSummary( required struct result, required string runId ) {
+		var summary = isStruct( arguments.result.generationSummary ?: "" ) ? duplicate( arguments.result.generationSummary ) : {};
+		var errors = isArray( arguments.result.generationErrors ?: "" ) ? arguments.result.generationErrors : [];
+		if ( !( summary.status ?: "" ).len() ) {
+			summary.status = errors.len() ? "partial_failure" : "succeeded";
+			summary.stage = summary.stage ?: ( errors.len() ? "proposal_generation" : "proposal_generation" );
+			summary.errorType = summary.errorType ?: ( errors.len() ? ( errors[ 1 ].errorType ?: "" ) : "" );
+			summary.message = summary.message ?: ( errors.len() ? ( errors[ 1 ].message ?: "" ) : "" );
+			summary.retryable = structKeyExists( summary, "retryable" ) ? !!summary.retryable : errors.len() > 0;
+			summary.completedStages = isArray( summary.completedStages ?: "" ) ? summary.completedStages : [];
+			summary.incompleteStages = isArray( summary.incompleteStages ?: "" ) ? summary.incompleteStages : [];
+		}
+		if ( !( summary.checkpointId ?: "" ).len() ) summary.checkpointId = arguments.runId & ":proposal";
+		arguments.result.generationSummary = summary;
+		return arguments.result;
 	}
 
 	void function cancelRun(required string runId) {
@@ -455,13 +518,35 @@ property name="modernizationGateService" inject="ModernizationGateService";
 		return arguments.current;
 	}
 	private void function checkpoint(required string runId, required string stage, required any payload, required numeric progress, struct provenance = {}) {
-			var status = isStruct( arguments.payload ) && structKeyExists( arguments.payload, "ok" ) && !arguments.payload.ok ? "failed" : "succeeded";
+			var status = checkpointStatusForPayload( arguments.payload );
 			arguments.provenance.pipelineContractVersion = variables.pipelineContractVersion;
 			modernizationRepository.saveCheckpoint( arguments.runId, arguments.stage, { status: status, progress: arguments.progress, payload: { value: arguments.payload, provenance: arguments.provenance } } );
 		}
+
+	string function checkpointStatusForPayload( required any payload ) {
+		if ( isStruct( arguments.payload ) && structKeyExists( arguments.payload, "ok" ) && !arguments.payload.ok ) return "failed";
+		if ( isStruct( arguments.payload ) && ( arguments.payload.partial ?: false ) ) return "partial";
+		return "succeeded";
+	}
+
 	private any function reusableCheckpoint(required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint) {
 		for ( var item in arguments.checkpoints ) {
 			if ( ( item.stage ?: "" ) != arguments.stage || ( item.status ?: "" ) != "succeeded" ) continue;
+			var payload = item.payload ?: {};
+			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
+			if (
+				( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint
+				&& ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint
+				&& ( provenance.pipelineContractVersion ?: "" ) == variables.pipelineContractVersion
+			) return item;
+		}
+		return javacast( "null", "" );
+	}
+
+	private any function findCheckpoint( required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint ) {
+		for ( var item in arguments.checkpoints ) {
+			if ( ( item.stage ?: "" ) != arguments.stage ) continue;
+			if ( ![ "succeeded", "partial" ].contains( item.status ?: "" ) ) continue;
 			var payload = item.payload ?: {};
 			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
 			if (

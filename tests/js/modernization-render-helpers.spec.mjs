@@ -65,6 +65,93 @@ assert.equal(
 	false,
 	"at least one mapped phase is not hollow even with no top-level units/routes"
 );
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		metadata: { roadmapSource: "synthesized" },
+		target: {
+			units: [
+				{ id: "coverage-1", provenanceClass: "deterministically-derived" },
+				{ id: "coverage-2", provenanceClass: "deterministically-derived" }
+			],
+			placements: [{ id: "ctx-1", name: "ColdBox modular monolith (default)", placementType: "main-app" }]
+		},
+		roadmapPhases: [{ id: "phase-1", unitIds: ["coverage-1"] }],
+		generationNotes: [{ message: "inventory-coverage-fallback", count: 2 }]
+	}),
+	true,
+	"synthesized default-monolith road with coverage-stub majority is hollow"
+);
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		metadata: { roadmapSource: "synthesized" },
+		target: {
+			units: Array.from({ length: 30 }, (_, i) => ({
+				id: `coverage-${i}`,
+				provenanceClass: "deterministically-derived"
+			})),
+			placements: [
+				{ id: "ctx-mod", name: "ColdBox module candidate: bridgeway", placementType: "coldbox-module", targetUnitIds: ["coverage-1"] },
+				{ id: "ctx-jobs", name: "Scheduled / background workers", placementType: "main-app", targetUnitIds: ["coverage-2"] }
+			]
+		},
+		roadmapPhases: [
+			{ id: "phase-1", unitIds: ["coverage-1"] },
+			{ id: "phase-2", unitIds: ["coverage-2"] }
+		],
+		generationNotes: [{ message: "inventory-coverage-fallback", count: 30 }]
+	}),
+	false,
+	"directory-clustered synthesized packaging with mapped phases is usable"
+);
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		target: {
+			units: [
+				{ id: "coverage-1", provenanceClass: "deterministically-derived" },
+				{ id: "coverage-2", provenanceClass: "deterministically-derived" },
+				{ id: "tu-llm", provenanceClass: "model-generated" }
+			]
+		},
+		generationNotes: [{ message: "inventory-coverage-fallback", count: 2 }]
+	}),
+	true,
+	"coverage-fallback majority over LLM-mapped units counts as hollow"
+);
+assert.equal(
+	helpers.modernizationPlanIsHollow({
+		target: {
+			units: [
+				{ id: "tu-1", provenanceClass: "model-generated" },
+				{ id: "tu-2", provenanceClass: "model-generated" },
+				{ id: "coverage-1", provenanceClass: "deterministically-derived" }
+			]
+		},
+		generationNotes: [{ message: "inventory-coverage-fallback", count: 1 }]
+	}),
+	false,
+	"LLM-mapped majority is not hollow"
+);
+
+// modernizationGenerationSummary
+{
+	const summary = helpers.modernizationGenerationSummary({
+		generationSummary: {
+			status: "partial_failure",
+			stage: "proposal_generation",
+			errorType: "request_timeout",
+			retryable: true,
+			completedStages: ["inventory", "schema", "context", "evidence", "application-shards"],
+			incompleteStages: ["architecture", "roadmap"],
+			checkpointId: "run-1:proposal"
+		}
+	});
+	assert.equal(summary.status, "partial_failure");
+	assert.equal(summary.errorType, "request_timeout");
+	assert.equal(summary.retryable, true);
+	assert.deepEqual(summary.incompleteStages, ["architecture", "roadmap"]);
+	assert.equal(summary.checkpointId, "run-1:proposal");
+}
+assert.equal(helpers.modernizationGenerationSummary({}).status, "");
 
 // modernizationPaneBanner
 assert.equal(
@@ -225,6 +312,32 @@ assert.match(helpers.modernizationItemMeta({ _modernizationType: "placement", pl
 	const subgraph = helpers.buildModernizationArchitectureSubgraph({ target: { contexts: [], extracts: [] } });
 	assert.equal(subgraph.nodes.length, 1);
 	assert.equal(subgraph.edges.length, 0);
+}
+
+// layoutModernizationArchitectureVertical: separate lanes for main-app /
+// modules / microservices stacked top-to-bottom.
+{
+	const subgraph = helpers.buildModernizationArchitectureSubgraph({
+		target: {
+			units: [{ id: "u1" }, { id: "u2" }, { id: "u3" }],
+			placements: [
+				{ id: "p-main", name: "Bootstrap", placementType: "main-app", targetUnitIds: ["u1"] },
+				{ id: "p-mod", name: "BLC module", placementType: "coldbox-module", targetUnitIds: ["u2"] },
+				{ id: "p-svc", name: "Orders side app", placementType: "external-service", targetUnitIds: ["u3"] }
+			]
+		}
+	});
+	const layout = helpers.layoutModernizationArchitectureVertical(subgraph);
+	assert.ok(layout.lanes.length >= 3, "core + at least one packaging lane");
+	assert.ok(layout.lanes.some((lane) => lane.id === "main-app"));
+	assert.ok(layout.lanes.some((lane) => lane.id === "modules"));
+	assert.ok(layout.lanes.some((lane) => lane.id === "services"));
+	const main = layout.nodes.find((n) => n.id === "p-main");
+	const mod = layout.nodes.find((n) => n.id === "p-mod");
+	const svc = layout.nodes.find((n) => n.id === "p-svc");
+	assert.ok(main.y < mod.y, "main-app lane above modules");
+	assert.ok(mod.y < svc.y, "modules lane above microservices");
+	assert.equal(main.x, mod.x, "vertical layout shares one column");
 }
 
 // modernizationBriefSummary: aggregates status/effort/risk/packaging/next-action

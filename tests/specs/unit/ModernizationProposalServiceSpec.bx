@@ -71,6 +71,247 @@ class extends="testbox.system.BaseSpec" {
 				expect( plan.roadmapPhases[ 1 ].unresolvedTargetUnitIds ).toContain( "phantom-phase-unit" );
 			} );
 
+			it( "batches leftover roadmap unit ids instead of one megashard that blows the prompt budget", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "buildRoadmapShards" );
+				var units = [];
+				for ( var i = 1; i <= 80; i++ ) {
+					units.append( { id: "u-#i#", targetPath: "app/handlers/U#i#.bx", sourcePath: "legacy/u#i#.cfm" } );
+				}
+				var shards = service.buildRoadmapShards(
+					{
+						target: {
+							units: units,
+							contexts: [ { id: "ctx-1", name: "First group", targetUnitIds: [ "u-1", "u-2" ] } ],
+							extracts: []
+						}
+					},
+					{ roadmapUnitBatchSize: 10, maxRoadmapShards: 8 }
+				);
+				expect( shards.len() ).toBeGTE( 3 );
+				for ( var shard in shards ) {
+					expect( ( shard.shardMeta.targetUnitIds ?: [] ).len() ).toBeLTE( 24 );
+				}
+				var leftoverShards = shards.filter( ( item ) => ( item.shardMeta.kind ?: "" ) == "leftover" );
+				expect( leftoverShards.len() ).toBeGTE( 2 );
+			} );
+
+			it( "boosts user scopePaths ahead of other legacy paths when building application shards", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "prioritizedLegacyPaths" );
+				var paths = service.prioritizedLegacyPaths( {
+					scopePaths: [ "weboffice/_scheduledScripts" ],
+					inventory: {
+						files: [
+							{ filePath: "weboffice/index.cfm" },
+							{ filePath: "weboffice/_scheduledScripts/archiveNotes.cfm" },
+							{ filePath: "weboffice/bridgeway_BLCcategory2/_listing.cfm" },
+							{ filePath: "weboffice/_scheduledScripts/Bridgeway/autoEnrollCourses.cfm" }
+						]
+					}
+				} );
+				expect( paths[ 1 ] ).toInclude( "_scheduledScripts" );
+				expect( paths[ 2 ] ).toInclude( "_scheduledScripts" );
+			} );
+
+			it( "covers every scoped inventory path with application shards instead of omitting leftovers", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "buildApplicationShards" );
+				var files = [];
+				for ( var index = 1; index <= 124; index++ ) {
+					files.append( { filePath: "weboffice/_scheduledScripts/job#index#.cfm" } );
+				}
+				var shards = service.buildApplicationShards(
+					{
+						scopePaths: [ "weboffice/_scheduledScripts" ],
+						inventory: { files: files, units: [] }
+					},
+					{ applicationShardSize: 2, maxApplicationShards: 40 }
+				);
+				expect( shards.len() ).toBe( 62 );
+				var covered = {};
+				for ( var shard in shards ) {
+					for ( var path in ( shard.shardMeta.paths ?: [] ) ) covered[ path ] = true;
+				}
+				expect( covered.count() ).toBe( 124 );
+			} );
+
+			it( "synthesizes ColdBox module and worker placements from scopePaths when architecture fails", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "synthesizeArchitectureDecisions" );
+				var built = service.synthesizeArchitectureDecisions(
+					{
+						target: {
+							units: [
+								{ id: "sched-1", sourcePath: "weboffice/_scheduledScripts/archiveNotes.cfm" },
+								{ id: "sched-2", sourcePath: "weboffice/_scheduledScripts/Bridgeway/autoEnrollCourses.cfm" },
+								{ id: "blc-1", sourcePath: "weboffice/bridgeway_BLCcategory2/_listing.cfm" },
+								{ id: "blc-2", sourcePath: "weboffice/bridgeway_BLCcategory2/_entry.cfm" }
+							]
+						}
+					},
+					{ scopePaths: [ "weboffice/_scheduledScripts", "weboffice/bridgeway_BLCcategory2" ] }
+				);
+				expect( built.placements.len() ).toBeGTE( 2 );
+				var types = built.placements.map( ( item ) => item.placementType ?: "" );
+				expect( types.toList() ).toInclude( "coldbox-module" );
+				expect( types.toList() ).toInclude( "main-app" );
+				var module = built.placements.filter( ( item ) => ( item.placementType ?: "" ) == "coldbox-module" )[ 1 ];
+				expect( module.targetUnitIds ).toInclude( "blc-1" );
+				expect( module.targetUnitIds ).toInclude( "blc-2" );
+			} );
+
+			it( "infers feature-folder placements for large unscoped estates when architecture fails", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "synthesizeArchitectureDecisions" );
+				var units = [];
+				for ( var i = 1; i <= 12; i++ ) {
+					units.append( { id: "sched-#i#", sourcePath: "weboffice/_scheduledScripts/job#i#.cfm" } );
+					units.append( { id: "blc-#i#", sourcePath: "weboffice/bridgeway_BLCcategory2/page#i#.cfm" } );
+					units.append( { id: "other-#i#", sourcePath: "weboffice/misc/util#i#.cfm" } );
+				}
+				var built = service.synthesizeArchitectureDecisions( { target: { units: units } }, {} );
+				expect( built.placements.len() ).toBeGTE( 2 );
+				var types = built.placements.map( ( item ) => item.placementType ?: "" );
+				expect( types.toList() ).toInclude( "coldbox-module" );
+				var names = built.placements.map( ( item ) => item.name ?: "" ).toList();
+				expect( names ).toInclude( "ColdBox module candidate: bridgeway_BLCcategory2" );
+				expect( names ).toInclude( "Scheduled / background workers: _scheduledScripts" );
+			} );
+
+			it( "demotes folder-spam modules and promotes hosting Application trees to side-apps", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "normalizeArchitecturePlacementTypes" );
+				var plan = service.normalizeArchitecturePlacementTypes( {
+					target: {
+						units: [
+							{ id: "temp-1", sourcePath: "weboffice/temp/scratch.cfm" },
+							{ id: "sched-1", sourcePath: "weboffice/_scheduledScripts/job.cfm" },
+							{ id: "blc-1", sourcePath: "weboffice/bridgeway_BLCcategory2/_listing.cfm" },
+							{ id: "orders-1", sourcePath: "web/1/00000hosting/bridgewayOrders/Application.cfc" },
+							{ id: "orders-2", sourcePath: "web/1/00000hosting/bridgewayOrders/pages/cart.cfm" }
+						],
+						placements: [
+							{ id: "p-temp", name: "Temp module candidate", placementType: "coldbox-module", targetUnitIds: [ "temp-1" ] },
+							{ id: "p-sched", name: "Scheduledscripts module candidate", placementType: "coldbox-module", targetUnitIds: [ "sched-1" ] },
+							{ id: "p-blc", name: "ColdBox module candidate: bridgeway_BLCcategory2", placementType: "coldbox-module", targetUnitIds: [ "blc-1" ] },
+							{ id: "p-orders", name: "Bridgeway Orders Application Bootstrap", placementType: "main-app", targetUnitIds: [ "orders-1", "orders-2" ] }
+						],
+						contexts: [],
+						extracts: []
+					}
+				} );
+				var byId = {};
+				for ( var placement in plan.target.placements ) byId[ placement.id ] = placement;
+				expect( byId[ "p-temp" ].placementType ).toBe( "main-app" );
+				expect( byId[ "p-sched" ].placementType ).toBe( "main-app" );
+				expect( byId[ "p-blc" ].placementType ).toBe( "coldbox-module" );
+				expect( byId[ "p-orders" ].placementType ).toBe( "external-service" );
+			} );
+
+			it( "expands unscoped application shards toward the hard ceiling instead of stopping at 40", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "buildApplicationShards" );
+				var units = [];
+				for ( var i = 1; i <= 124; i++ ) {
+					units.append( { id: "u-#i#", filePath: "model/Service#i#.cfc" } );
+				}
+				var shards = service.buildApplicationShards(
+					{ inventory: { units: units }, coverage: {}, schemaEvidence: {} },
+					{ applicationShardSize: 2, maxApplicationShards: 40 }
+				);
+				expect( shards.len() ).toBe( 62 );
+			} );
+
+			it( "raises unscoped shard size so the ceiling covers more of a large estate", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "buildApplicationShards" );
+				var units = [];
+				for ( var i = 1; i <= 2000; i++ ) {
+					units.append( { id: "u-#i#", filePath: "model/Service#i#.cfc" } );
+				}
+				var shards = service.buildApplicationShards(
+					{ inventory: { units: units }, coverage: {}, schemaEvidence: {} },
+					{ applicationShardSize: 2, maxApplicationShards: 200 }
+				);
+				expect( shards.len() ).toBe( 200 );
+				var covered = 0;
+				for ( var shard in shards ) covered += ( shard.shardMeta.paths ?: [] ).len();
+				expect( covered ).toBeGTE( 2000 );
+			} );
+
+			it( "attaches a generationSummary for partial proposal failures", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", sourcePath: "legacy/seed.cfm", newProposal: true, proposalReason: "seed" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-summary",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: { files: [ { filePath: "legacy/seed.cfm" } ], units: [] }, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.generationSummary ).toBeStruct();
+				expect( result.plan.generationSummary.status ).toBe( "succeeded" );
+				expect( isArray( result.plan.generationSummary.completedStages ) ).toBeTrue();
+				expect( result.plan.generationSummary.checkpointId ).toBe( "run-summary:proposal" );
+			} );
+
+			it( "resumes accepted application shards from a proposal-shards checkpoint", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": { targetUnits: [ { id: "fresh-unit", targetPath: "app/handlers/Fresh.bx", sourcePath: "legacy/fresh.cfm", newProposal: true, proposalReason: "fresh" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [ { id: "phase-1" } ], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var progressCalls = [];
+				var result = service.propose(
+					"run-resume",
+					{
+						target: { runtime: "boxlang", layoutProfile: "modern" },
+						budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2, applicationShardSize: 1, maxApplicationShards: 4 }
+					},
+					{
+						coverage: {},
+						inventory: {
+							files: [
+								{ filePath: "legacy/seed.cfm" },
+								{ filePath: "legacy/fresh.cfm" }
+							],
+							units: []
+						},
+						schemaEvidence: {}
+					},
+					{
+						resumeFrom: {
+							accepted: 1,
+							fragment: { targetUnits: [ { id: "seed-unit", targetPath: "app/handlers/Seed.bx", sourcePath: "legacy/seed.cfm" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] },
+							outcomes: [ { status: "accepted", paths: [ "legacy/seed.cfm" ] } ]
+						},
+						onShardComplete: ( progress ) => {
+							progressCalls.append( progress.accepted ?: 0 );
+						}
+					}
+				);
+				expect( result.ok ).toBeTrue();
+				expect( gateway.callCount() ).toBeLTE( 4 );
+				var unitIds = ( result.plan.target.units ?: [] ).map( ( item ) => item.id ?: "" );
+				expect( unitIds.toList() ).toInclude( "seed-unit" );
+				expect( progressCalls.len() ).toBeGTE( 1 );
+			} );
+
 			it( "merges role fragments, adds stable identities and sorts deterministically", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
 					"modernization-application": { targetUnits: [ { id: "z-unit", targetPath: "app/z.bx" }, { id: "a-unit", targetPath: "app/a.bx" } ], unitLinks: [], routeContracts: [], contexts: [ { id: "ctx-1", evidenceRefs: [ { filePath: "index.cfm" } ] } ], extracts: [], samples: [] },

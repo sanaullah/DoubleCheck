@@ -71,4 +71,16 @@ const invalidReady = contract.modernizationReadiness(invalidProfile, { providerR
 assert.equal(invalidReady.ready, false);
 assert.match(invalidReady.errors.join(" "), /target language and layout/i);
 
+const scopeRequest = contract.normalizeModernizationRequest({
+	projectPath: "C:/projects/legacy-shop",
+	targetRuntime: "lucee-modern",
+	provider: "ollama",
+	scopePaths: "weboffice/_scheduledScripts\nweboffice/bridgeway_BLCcategory2/\n\nweboffice/_scheduledScripts"
+});
+assert.deepEqual(scopeRequest.input.scopePaths, [
+	"weboffice/_scheduledScripts",
+	"weboffice/bridgeway_BLCcategory2"
+]);
+assert.deepEqual(scopeRequest.modernization.scopePaths, scopeRequest.input.scopePaths);
+
 console.log("modernization-contract.spec.mjs: ok");
