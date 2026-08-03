@@ -8,12 +8,20 @@ BoxLang, ColdFusion, and JavaScript. Keep changes focused on that product.
 Read only what the task needs:
 
 1. `readme.md` for product scope, setup, and supported languages.
-2. The relevant code and tests.
-3. `.docs/PRODUCT.md` and `.docs/codebase-flow.md` when present and useful.
+2. `resources/docs/application-features.md` for purpose and shipped features
+   (Review vs Modernize, AI contract, out of scope).
+3. `resources/docs/technical-flow.md` for the committed technical map (review /
+   modernize pipelines, HTTP surface, bootstrap).
+4. The relevant code and tests (`app/models/README.md` when changing model-layer
+   ownership or public APIs).
+5. `.docs/PRODUCT.md` and `.docs/codebase-flow.md` when present and useful.
 
 `.docs/` is gitignored local context and may not exist on another checkout. Do
-not make the application or committed documentation depend on it. Do not invent
-product claims when the README and code do not support them.
+not make the application or committed documentation depend on it. When `.docs/`
+duplicates or lags the committed docs, prefer
+`resources/docs/application-features.md`, `resources/docs/technical-flow.md`,
+and the code. Do not invent product claims when the README and code do not
+support them.
 
 Framework reference material and implementation skills live under `.agents/`.
 Load a specific guideline or skill only when the task requires it; do not treat
@@ -50,12 +58,13 @@ in scope.
 - `app/config/` — ColdBox configuration and routes
 - `public/` — web root and desktop UI
 - `resources/apidocs/` — OpenAPI source
-- `resources/database/` — SQLite migrations
+- `resources/docs/` — committed product and technical docs
 - `tests/` — TestBox suites
 
 The database path comes from `DOUBLECHECK_DB_PATH` and defaults to
 `./.db/doublecheck.db`. `Setup.bx` creates `.env` only when it is missing.
-`SchemaService` creates the database and schema on first start when needed.
+`SchemaService` owns the complete SQLite schema and creates or repairs it on
+start when needed. There is no `resources/database/migrations/` path.
 
 Keep application code outside the public web root. Preserve the modern
 `app/`/`public/` separation and the mappings and aliases in `server.json`.
@@ -74,8 +83,10 @@ Keep application code outside the public web root. Preserve the modern
 - Use dependency injection rather than manually resolving services.
 - Keep API changes under `/api/v1/*` and update OpenAPI material when the
   contract changes.
-- Use migrations for schema changes. Do not commit local database files,
-  secrets, generated runtime state, or `.env`.
+- Change the local SQLite schema in `SchemaService` (single source of truth).
+  Do not reintroduce CommandBox/cfmigrations under `resources/database/`.
+  Do not commit local database files, secrets, generated runtime state, or
+  `.env`.
 - Preserve basic non-LLM behavior when adding or changing AI-assisted features.
 - Follow nearby BoxLang/CFML formatting and naming rather than applying a broad
   unrelated rewrite.

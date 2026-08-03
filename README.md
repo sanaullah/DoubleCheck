@@ -326,11 +326,13 @@ normal (non-fast) review from the workspace UI for full specialist depth.
 ```text
 app/                      ColdBox application
 public/                   Web root + desktop UI
-resources/database/       Migrations
-resources/docs/images/    README screenshots
-.db/                      SQLite (gitignored)
+resources/docs/           Features, technical map + README screenshots
+resources/apidocs/        OpenAPI source
+.db/                      SQLite (gitignored; schema via SchemaService)
 tests/                    TestBox
 ```
+
+Agent/developer docs: [`resources/docs/application-features.md`](resources/docs/application-features.md) (purpose + features), [`resources/docs/technical-flow.md`](resources/docs/technical-flow.md) (wiring).
 
 ---
 

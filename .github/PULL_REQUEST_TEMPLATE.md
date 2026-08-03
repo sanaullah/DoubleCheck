@@ -9,7 +9,7 @@
 - [ ] No new SaaS/hosted/multi-tenant/login-wall surface area
 - [ ] API changes (if any) stay under `/api/v1/*` and update both
       `resources/apidocs/openapi.yaml` and `openapi.json`
-- [ ] Schema changes (if any) use a migration under `resources/database/migrations/`
+- [ ] Schema changes (if any) update `SchemaService` (no `resources/database/migrations/`)
 
 ## Testing
 
