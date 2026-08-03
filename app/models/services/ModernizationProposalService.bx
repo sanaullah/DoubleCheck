@@ -394,7 +394,7 @@ class {
 		if ( find( "/handlers/", "/" & path ) ) return "handler";
 		if ( find( "/models/", "/" & path ) || find( "/components/", "/" & path ) ) return "service";
 		if ( find( "/views/", "/" & path ) || find( "/layouts/", "/" & path ) || listLast( path, "." ) == "cfm" || listLast( path, "." ) == "bxm" ) return "view";
-		var observed = lCase( trim( arguments.unit.layer ?: arguments.unit.unitType ?: "" ) );
+		var observed = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.unitType ?: "" ) ) );
 		return observed == "page" ? "view" : "service";
 	}
 
@@ -567,28 +567,35 @@ class {
 	 * or persistence so the UI never presents source files as target structure. */
 	private array function normalizeTargetUnits( required array units, required struct input ) {
 		var target = isStruct( arguments.input.target ?: "" ) ? arguments.input.target : {};
-		var runtime = lCase( trim( target.runtime ?: arguments.input.targetRuntime ?: "boxlang" ) );
-		var profile = lCase( trim( target.layoutProfile ?: arguments.input.targetProfile ?: "modern" ) );
+		var runtime = lCase( trim( scalarString( target.runtime ?: arguments.input.targetRuntime ?: "boxlang" ) ) );
+		var profile = lCase( trim( scalarString( target.layoutProfile ?: arguments.input.targetProfile ?: "modern" ) ) );
 		var output = [];
 		for ( var unit in arguments.units ) {
 			if ( !isStruct( unit ) ) continue;
 			var copy = duplicate( unit );
-			var sourcePath = trim( copy.sourcePath ?: copy.sourceFile ?: copy.legacyPath ?: copy.filePath ?: "" );
+			// Shard merges sometimes leave path-like fields as arrays (multi-file
+			// units). Coerce before trim() — a raw Array crashes packaging.
+			var sourcePath = trim( scalarString( copy.sourcePath ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.sourceFile ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.legacyPath ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.filePath ?: "" ) );
 			if ( !len( sourcePath ) ) {
-				var idHint = trim( copy.id ?: "" );
+				var idHint = trim( scalarString( copy.id ?: "" ) );
 				if ( find( "/", idHint ) || reFindNoCase( "\.(cfm|cfc|bx|bxm|js)$", idHint ) ) sourcePath = idHint;
 			}
 			sourcePath = replace( sourcePath, "\", "/", "all" );
-			if ( reFindNoCase( "\(new\)|new proposal|new-proposal", sourcePath ) || reFindNoCase( "\(new\)", trim( copy.sourcePath ?: "" ) ) ) {
+			var rawSourceMarker = trim( scalarString( copy.sourcePath ?: "" ) );
+			if ( reFindNoCase( "\(new\)|new proposal|new-proposal", sourcePath ) || reFindNoCase( "\(new\)", rawSourceMarker ) ) {
 				sourcePath = reReplaceNoCase( sourcePath, "\s*\(new\)\s*", "", "all" );
 				copy.newProposal = true;
-				if ( !len( trim( copy.proposalReason ?: "" ) ) ) copy.proposalReason = "Provider marked this target as a new scaffold without a legacy source file";
+				if ( !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) copy.proposalReason = "Provider marked this target as a new scaffold without a legacy source file";
 			}
 			if ( len( sourcePath ) ) copy.sourcePath = sourcePath;
-			var candidate = trim( copy.targetPath ?: copy.pathHint ?: "" );
+			var candidate = trim( scalarString( copy.targetPath ?: "" ) );
+			if ( !len( candidate ) ) candidate = trim( scalarString( copy.pathHint ?: "" ) );
 			var sourceIsApplication = reFindNoCase( "(^|/)Application[.](?:cfc|bx)$", sourcePath ) > 0;
 			if ( sourceIsApplication ) {
-				var applicationLayer = lCase( trim( copy.layer ?: copy.kind ?: copy.proposedRole ?: "config" ) );
+				var applicationLayer = lCase( trim( scalarString( copy.layer ?: copy.kind ?: copy.proposedRole ?: "config" ) ) );
 				var parentName = !find( "/", sourcePath )
 					? "Root"
 					: listGetAt( sourcePath, max( 1, listLen( sourcePath, "/" ) - 1 ), "/" );
@@ -613,8 +620,9 @@ class {
 			if ( !legalModernTargetPath( candidate, runtime, profile ) || !targetPathMatchesLayer( candidate, copy ) ) copy.targetPath = deriveTargetPath( copy, sourcePath, runtime, profile );
 			else copy.targetPath = candidate;
 			copy.targetPath = normalizeLayerExtension( copy.targetPath, copy, runtime );
-			if ( len( trim( copy.evidenceRef ?: "" ) ) && !structKeyExists( copy, "evidenceRefs" ) && copy.evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
-			if ( !len( trim( copy.sourcePath ?: "" ) ) && !( copy.newProposal ?: false ) && !( copy.explicitProposal ?: false ) && !len( trim( copy.proposalReason ?: "" ) ) ) {
+			var evidenceRef = trim( scalarString( copy.evidenceRef ?: "" ) );
+			if ( len( evidenceRef ) && !structKeyExists( copy, "evidenceRefs" ) && evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
+			if ( !len( trim( scalarString( copy.sourcePath ?: "" ) ) ) && !( copy.newProposal ?: false ) && !( copy.explicitProposal ?: false ) && !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) {
 				copy.newProposal = true;
 				copy.proposalReason = "Provider proposed a scaffold target without a legacy source path";
 			}
@@ -626,7 +634,7 @@ class {
 
 	private string function normalizeLayerExtension( required string path, required struct unit, required string runtime ) {
 		if ( !len( trim( arguments.path ) ) ) return arguments.path;
-		var layer = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) );
+		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) ) );
 		var isView = [ "view", "layout" ].contains( layer ) || findNoCase( "/views/", "/" & arguments.path ) || findNoCase( "/layouts/", "/" & arguments.path );
 		var extension = arguments.runtime == "boxlang"
 			? ( isView ? ".bxm" : ".bx" )
@@ -644,7 +652,7 @@ class {
 	private array function ensureUniqueTargetPaths( required array units, required string runtime, required string profile ) {
 		var groups = {};
 		for ( var unit in arguments.units ) {
-			var key = lCase( replace( trim( unit.targetPath ?: "" ), "\", "/", "all" ) );
+			var key = lCase( replace( trim( scalarString( unit.targetPath ?: "" ) ), "\", "/", "all" ) );
 			if ( !groups.keyExists( key ) ) groups[ key ] = [];
 			groups[ key ].append( unit );
 		}
@@ -674,10 +682,10 @@ class {
 	}
 
 	private string function contextualCollisionPath( required struct unit, required string runtime, required string profile ) {
-		var sourcePath = replace( trim( arguments.unit.sourcePath ?: "" ), "\", "/", "all" );
+		var sourcePath = replace( trim( scalarString( arguments.unit.sourcePath ?: "" ) ), "\", "/", "all" );
 		var sourceName = len( sourcePath ) ? listLast( sourcePath, "/" ) : "ModernizedUnit";
 		var stem = reReplaceNoCase( sourceName, "\.(?:cfc|cfm|cfml|bx|bxm|js)$", "" );
-		var layer = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) );
+		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) ) );
 		if ( lCase( stem ) == "index" ) {
 			stem = find( "/", sourcePath )
 				? listGetAt( sourcePath, max( 1, listLen( sourcePath, "/" ) - 1 ), "/" )
@@ -686,7 +694,7 @@ class {
 		stem = reReplace( stem, "[^A-Za-z0-9]", "", "all" );
 		if ( !len( stem ) ) stem = "ModernizedUnit";
 		if ( reFindNoCase( "\.(?:cfm|bxm)$", sourceName ) && [ "service", "model" ].contains( layer ) ) stem &= "PageService";
-		var current = replace( trim( arguments.unit.targetPath ?: "" ), "\", "/", "all" );
+		var current = replace( trim( scalarString( arguments.unit.targetPath ?: "" ) ), "\", "/", "all" );
 		var directory = reFind( "/", current ) ? reReplace( current, "[^/]+$", "" ) : "";
 		var extension = arguments.runtime == "boxlang"
 			? ( [ "view", "layout" ].contains( layer ) ? ".bxm" : ".bx" )
@@ -711,7 +719,7 @@ class {
 
 	private boolean function targetPathMatchesLayer( required string path, required struct unit ) {
 		var normalized = lCase( replace( arguments.path, "\", "/", "all" ) );
-		var layer = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: "" ) );
+		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: "" ) ) );
 		if ( !len( layer ) ) return true;
 		if ( layer == "service" || layer == "model" ) return find( "/models/", "/" & normalized ) > 0;
 		if ( layer == "handler" || layer == "page" ) return find( "/handlers/", "/" & normalized ) > 0;
@@ -733,7 +741,7 @@ class {
 		}
 		stem = reReplace( stem, "[^A-Za-z0-9_-]", "-", "all" );
 		if ( !len( trim( stem ) ) ) stem = "ModernizedUnit";
-		var role = lCase( trim( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: arguments.unit.category ?: "" ) );
+		var role = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: arguments.unit.category ?: "" ) ) );
 		var root = arguments.profile == "flat" ? "" : "app/";
 		if ( findNoCase( "application", role ) || findNoCase( "bootstrap", role ) ) return "Application" & extension;
 		if ( role == "config" ) return root & "config/" & stem & extension;
@@ -750,6 +758,8 @@ class {
 		arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
 		arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
 		for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.roadmapSource = "provider";
 		return arguments.plan;
 	}
 
@@ -1248,6 +1258,8 @@ class {
 		for ( var item in arguments.plan.target.placements ) ensureIdentity( item, "placement" );
 		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
 		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.architectureSource = "provider";
 		return normalizeArchitecturePlacementTypes( arguments.plan );
 	}
 
@@ -1275,7 +1287,7 @@ class {
 		var feature = [];
 		for ( var unit in units ) {
 			if ( !isStruct( unit ) ) continue;
-			var path = lCase( trim( unit.targetPath ?: unit.sourcePath ?: unit.id ?: "" ) );
+			var path = lCase( trim( scalarString( unit.targetPath ?: unit.sourcePath ?: unit.id ?: "" ) ) );
 			if ( reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes", path ) ) foundation.append( unit );
 			else feature.append( unit );
 		}
@@ -1286,6 +1298,12 @@ class {
 				name: "Foundation and config",
 				goal: "Stand up modern Application/config/router coexistence before feature slices.",
 				pattern: "foundation",
+				classification: "refactor-monolith",
+				wave: 0,
+				estimatedComplexity: "medium",
+				risks: [ "Shared bootstrap changes can break every coexist route." ],
+				rollbackStrategy: "Keep legacy Application/config as default entry until coexist routes prove stable.",
+				testingStrategy: "Boot smoke, router coexist checks, and config parity against legacy entrypoints.",
 				dependencies: [],
 				unitIds: foundation.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) ),
 				routeIds: [],
@@ -1392,6 +1410,7 @@ class {
 			groups.append( {
 				name: placement.name ?: placement.domainKey ?: "Capability",
 				targetUnitIds: placement.targetUnitIds,
+				placementType: placement.placementType ?: "main-app",
 				kind: ( placement.placementType ?: "main-app" ) == "external-service" ? "extract" : "context"
 			} );
 		}
@@ -1407,6 +1426,17 @@ class {
 			}
 		}
 		return groups;
+	}
+
+	/** Map placement taxonomy onto roadmap classification vocabulary. */
+	private string function synthesizeRoadmapClassification( required string placementType ) {
+		var normalized = lCase( trim( arguments.placementType ) );
+		if ( normalized == "coldbox-module" ) return "coldbox-module";
+		if ( normalized == "background-worker" ) return "background-worker";
+		if ( normalized == "scheduled-service" ) return "scheduled-service";
+		if ( normalized == "external-service" ) return "external-service";
+		if ( normalized == "worker" ) return "background-worker";
+		return "refactor-monolith";
 	}
 
 	/** One roadmap phase per context/extract/placement group (capped near the
@@ -1432,6 +1462,7 @@ class {
 			var idSet = {};
 			for ( var id in groupIds ) idSet[ id ] = true;
 			var isExtract = ( group.kind ?: "" ) == "extract";
+			var classification = synthesizeRoadmapClassification( group.placementType ?: ( isExtract ? "external-service" : "main-app" ) );
 			phases.append( {
 				id: "phase-slice-" & index,
 				name: group.name,
@@ -1439,6 +1470,15 @@ class {
 					? "Extract #group.name# behind a coexist boundary, verified before any deployment split."
 					: "Migrate the #group.name# slice behind ColdBox, one strangler step at a time.",
 				pattern: isExtract ? "side-app-extract" : "vertical-slice",
+				classification: classification,
+				wave: index,
+				estimatedComplexity: groupIds.len() > 40 ? "high" : ( groupIds.len() > 15 ? "medium" : "low" ),
+				risks: [
+					"Coexistence cutover may regress routes shared with unmigrated legacy callers.",
+					"Schema or credential coupling may block an early extract."
+				],
+				rollbackStrategy: "Route traffic back to legacy paths for this slice.",
+				testingStrategy: "Parity checks for the listed target units, coexist route smoke, and rollback drill before advancing the wave.",
 				dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
 				unitIds: groupIds,
 				routeIds: routesForUnitIds( arguments.routes, idSet ),
@@ -1475,6 +1515,12 @@ class {
 					name: leftoverIndex == 1 ? "Continue strangler slices" : "Continue strangler slices (#leftoverIndex#)",
 					goal: "Migrate remaining mapped targets not covered by an identified slice.",
 					pattern: "coexist-route",
+					classification: "refactor-monolith",
+					wave: index + leftoverIndex,
+					estimatedComplexity: batch.len() > 24 ? "high" : "medium",
+					risks: [ "Ungrouped leftovers may mix unrelated domains in one wave." ],
+					rollbackStrategy: "Leave later slices on legacy until accepted.",
+					testingStrategy: "Rebuild one leftover batch at a time and verify coexist routing before advancing.",
 					dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
 					unitIds: batch,
 					routeIds: [],
@@ -1545,7 +1591,7 @@ class {
 		var contexts = [];
 		var placements = [];
 		for ( var cluster in clusters ) {
-			var packaging = cluster.placementType == "coldbox-module" ? "coldbox-module" : "centralized";
+			var packaging = cluster.placementType == "coldbox-module" ? "coldbox-module" : ( [ "background-worker", "scheduled-service" ].contains( cluster.placementType ) ? "worker" : "centralized" );
 			contexts.append( {
 				id: cluster.id,
 				name: cluster.name,
@@ -1554,7 +1600,7 @@ class {
 				placementType: cluster.placementType,
 				domainKey: cluster.domainKey,
 				recommendation: cluster.rationale,
-				stayInMonolith: cluster.placementType != "external-service",
+				stayInMonolith: ![ "external-service" ].contains( cluster.placementType ),
 				targetUnitIds: duplicate( cluster.targetUnitIds ),
 				evidenceRefs: evidenceRefsForUnitIds( cluster.targetUnitIds, evidenceByUnit ),
 				newProposal: true,
@@ -1582,8 +1628,9 @@ class {
 
 	/**
 	 * Path-aware packaging fallback used when the architecture role fails.
-	 * Scoped directories become distinct placements (e.g. bridgeway → coldbox-module,
-	 * scheduled scripts → main-app workers) so the roadmap still gets seams.
+	 * Scoped directories become distinct placements (nested feature folders →
+	 * coldbox-module candidates; scheduled/job folders → background-worker)
+	 * so the roadmap still gets seams without estate-specific folder names.
 	 */
 	private array function clusterUnitsForArchitecture( required array units, required array scopePaths ) {
 		var clusters = [];
@@ -1649,16 +1696,18 @@ class {
 				name = "Side application candidate: " & listLast( scopeNeedle, "/" );
 				purpose = "Separate hosting/Application tree — candidate small app or microservice boundary.";
 				rationale = "Distinct hosting root under #scopeNeedle# looks like a separate deployable, not an in-process ColdBox module.";
-			} else if ( findNoCase( "bridgeway_blccategory", scopeNeedle ) || findNoCase( "/modules/", "/" & scopeNeedle & "/" ) ) {
+			} else if ( findNoCase( "_scheduled", scopeNeedle ) || findNoCase( "scheduled", scopeNeedle ) || findNoCase( "/jobs/", "/" & scopeNeedle & "/" ) || findNoCase( "/workers/", "/" & scopeNeedle & "/" ) ) {
+				placementType = "background-worker";
+				name = "Scheduled / background workers: " & listLast( scopeNeedle, "/" );
+				purpose = "Background and scheduled scripts become workers/tasks in a jobs host or main-app scheduler.";
+				rationale = "Scheduled-script folders are background-worker candidates, not ColdBox UI modules or microservices.";
+			} else if ( findNoCase( "/modules/", "/" & scopeNeedle & "/" ) || findNoCase( "modules/", scopeNeedle ) || listLen( scopeNeedle, "/" ) >= 2 ) {
+				// Nested scoped feature directories are module candidates; bare
+				// top-level roots stay main-app unless modules/ is explicit.
 				placementType = "coldbox-module";
 				name = "ColdBox module candidate: " & listLast( scopeNeedle, "/" );
 				purpose = "Cohesive feature folder suitable for a ColdBox module boundary.";
 				rationale = "Directory cohesion under #scopeNeedle# supports coldbox-module packaging.";
-			} else if ( findNoCase( "_scheduled", scopeNeedle ) || findNoCase( "scheduled", scopeNeedle ) || findNoCase( "/jobs/", "/" & scopeNeedle & "/" ) || findNoCase( "/workers/", "/" & scopeNeedle & "/" ) ) {
-				placementType = "main-app";
-				name = "Scheduled / background workers: " & listLast( scopeNeedle, "/" );
-				purpose = "Background and scheduled scripts stay in the main deployable as workers/tasks.";
-				rationale = "Scheduled-script folders are worker candidates inside the main ColdBox app, not modules or microservices.";
 			}
 			appendCluster(
 				"ctx-scope-" & scopeIndex,
@@ -1694,7 +1743,7 @@ class {
 	/**
 	 * Rank feature folders by unit count for unscoped large estates. Caps the
 	 * set so roadmap sharding stays bounded while still surfacing ColdBox-module
-	 * and scheduled-worker candidates (e.g. weboffice/bridgeway_*, _scheduled*).
+	 * and scheduled-worker candidates (modules/*, _scheduled*, /jobs/, /workers/).
 	 */
 	private array function inferArchitectureScopesFromUnits( required array units ) {
 		var counts = {};
@@ -1716,7 +1765,7 @@ class {
 		var selected = [];
 		for ( var item in ranked ) {
 			if ( selected.len() >= variables.maxInferredArchitectureScopes ) break;
-			var forceKeep = reFindNoCase( "bridgeway_blccategory|/modules/|_scheduled|scheduled|/jobs/|/workers/", item.folder );
+			var forceKeep = reFindNoCase( "/modules/|(^|/)modules/|_scheduled|scheduled|/jobs/|/workers/", item.folder );
 			if ( item.count >= 3 || forceKeep ) selected.append( item.folder );
 		}
 		return selected;
@@ -1725,8 +1774,6 @@ class {
 	private string function featureFolderFromPath( required string path ) {
 		var lower = lCase( arguments.path );
 		if ( !len( lower ) ) return "";
-		var webofficeMatch = reMatchNoCase( "weboffice/[^/]+", lower );
-		if ( isArray( webofficeMatch ) && webofficeMatch.len() ) return webofficeMatch[ 1 ];
 		var modulesMatch = reMatchNoCase( "modules/[^/]+", lower );
 		if ( isArray( modulesMatch ) && modulesMatch.len() ) return modulesMatch[ 1 ];
 		var hostingAt = reFindNoCase( "\d*hosting/", lower );
@@ -1736,6 +1783,11 @@ class {
 			if ( hostingParts.len() >= 2 ) return hostingParts[ 1 ] & "/" & hostingParts[ 2 ];
 		}
 		var parts = listToArray( lower, "/" );
+		// Common CF/legacy roots keep an extra path segment so feature folders
+		// (root/feature/...) cluster separately from the root itself.
+		if ( parts.len() >= 3 && [ "web", "weboffice", "legacy", "src", "app", "cf", "cfm" ].contains( parts[ 1 ] ) ) {
+			return parts[ 1 ] & "/" & parts[ 2 ];
+		}
 		if ( parts.len() >= 2 ) return parts[ 1 ] & "/" & parts[ 2 ];
 		return parts.len() ? parts[ 1 ] : "";
 	}
@@ -1769,10 +1821,13 @@ class {
 					isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds.len() : 0
 				);
 				placement.placementType = nextType;
-				placement.packaging = nextType == "coldbox-module" ? "coldbox-module" : ( nextType == "external-service" ? "external-service" : "centralized" );
+				placement.packaging = nextType == "coldbox-module" ? "coldbox-module" : ( nextType == "external-service" ? "external-service" : ( [ "background-worker", "scheduled-service" ].contains( nextType ) ? "worker" : "centralized" ) );
 				placement.stayInMonolith = nextType != "external-service";
 				if ( nextType == "main-app" && reFindNoCase( "module candidate", placement.name ?: "" ) ) {
 					placement.name = "Main app: " & trim( reReplaceNoCase( placement.name, "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
+				}
+				if ( nextType == "background-worker" && !reFindNoCase( "worker|scheduled|job", placement.name ?: "" ) ) {
+					placement.name = "Background workers: " & trim( reReplaceNoCase( placement.name ?: "jobs", "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
 				}
 				if ( nextType == "external-service" && !reFindNoCase( "side application|microservice|external", placement.name ?: "" ) ) {
 					placement.name = "Side application candidate: " & trim( reReplaceNoCase( placement.name ?: "capability", "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
@@ -1785,12 +1840,12 @@ class {
 				var ctxType = classifyPackagingType(
 					ctx.name ?: "",
 					ctx.domainKey ?: "",
-					( ctx.packaging ?: "" ) == "coldbox-module" ? "coldbox-module" : ( ( ctx.placementType ?: "" ) == "external-service" ? "external-service" : "main-app" ),
+					( ctx.packaging ?: "" ) == "coldbox-module" ? "coldbox-module" : ( ( ctx.placementType ?: "" ) == "external-service" ? "external-service" : ( [ "background-worker", "scheduled-service" ].contains( ctx.placementType ?: "" ) ? ctx.placementType : "main-app" ) ),
 					[],
 					isArray( ctx.targetUnitIds ?: "" ) ? ctx.targetUnitIds.len() : 0
 				);
 				ctx.placementType = ctxType;
-				ctx.packaging = ctxType == "coldbox-module" ? "coldbox-module" : "centralized";
+				ctx.packaging = ctxType == "coldbox-module" ? "coldbox-module" : ( [ "background-worker", "scheduled-service" ].contains( ctxType ) ? "worker" : "centralized" );
 				ctx.stayInMonolith = ctxType != "external-service";
 			}
 		}
@@ -1808,13 +1863,17 @@ class {
 		var blob = lCase( trim( arguments.name ) & " " & trim( arguments.domainKey ) & " " & pathBlob );
 		var current = lCase( trim( arguments.currentType ) );
 		if ( !len( current ) ) current = "main-app";
-		// Shared / worker / static folders are never modules or microservices.
-		if ( reFindNoCase( "_scheduled|scheduledscripts|/jobs/|/workers/|\btemp\b|copyfiles|commonfiles|comingsoon|\bjs\b|/js/|webmanagementwelcome|message.?template", blob ) ) {
+		// Shared / worker / static folders are never UI modules or microservices.
+		if ( reFindNoCase( "_scheduled|scheduledscripts|/jobs/|/workers/", blob ) ) {
+			// Integration-heavy job folders (payments, mail APIs, webhooks, CRM
+			// / inventory connectors) may later become a separate jobs host.
+			return reFindNoCase( "payment|autopay|billing|invoice|webhook|oauth|smtp|mail.?api|/integrations?/|inventory|crm", blob ) ? "scheduled-service" : "background-worker";
+		}
+		if ( reFindNoCase( "\btemp\b|copyfiles|commonfiles|comingsoon|\bjs\b|/js/|webmanagementwelcome|message.?template", blob ) ) {
 			return "main-app";
 		}
 		var hasApplicationEntrypoint = arguments.sourcePaths.some( ( path ) => reFindNoCase( "(^|/|\\)application\.(cfc|cfm|bx)$", path ) );
-		// zLegacy uses folders like web/1/00000hosting/bridgewayOrders — treat
-		// *hosting*/AppName trees with their own Application.* as side-apps.
+		// *hosting*/AppName trees with their own Application.* look like side-apps.
 		var hostingRoot = reFindNoCase( "(^|/|\\)\d*hosting/[a-z0-9_-]+", blob ) || reFindNoCase( "(^|/|\\)hosting/[a-z0-9_-]+", blob );
 		if ( hostingRoot && ( hasApplicationEntrypoint || reFindNoCase( "application bootstrap|side application|orders application|hosting/", blob ) ) ) {
 			return "external-service";
@@ -1822,15 +1881,20 @@ class {
 		if ( current == "external-service" && ( hasApplicationEntrypoint || hostingRoot || reFindNoCase( "microservice|side.?app|external.?service|separate deploy", blob ) ) ) {
 			return "external-service";
 		}
-		// Strict module allowlist — cohesive in-process features only.
-		if ( reFindNoCase( "bridgeway_blccategory|/modules/|blcquiz|blcassignment|enrollment", blob ) ) {
+		if ( [ "background-worker", "scheduled-service" ].contains( current ) ) return current;
+		if ( reFindNoCase( "/modules/|moduleconfig\.(cfc|cfm|bx)", blob ) ) {
 			return "coldbox-module";
 		}
 		if ( current == "coldbox-module" ) {
 			if ( arguments.unitCount > 120 && !reFindNoCase( "/modules/", blob ) ) return "main-app";
-			if ( reFindNoCase( "module candidate", arguments.name ) && !reFindNoCase( "bridgeway_blc|/modules/|enrollment|blcquiz|blcassignment", blob ) ) {
-				return "main-app";
-			}
+			// Keep nested feature directories; demote bare "module candidate" labels
+			// that lack path evidence of a real feature or modules/ package.
+			var nestedFeature = arguments.sourcePaths.some( ( path ) => {
+				var normalized = reReplace( replace( trim( toString( path ) ), "\", "/", "all" ), "^(\./)+", "" );
+				return listLen( normalized, "/" ) >= 2;
+			} );
+			if ( nestedFeature ) return "coldbox-module";
+			if ( reFindNoCase( "module candidate", arguments.name ) ) return "main-app";
 			return "coldbox-module";
 		}
 		return "main-app";
@@ -2451,7 +2515,7 @@ class {
 	}
 
 	private string function normalizeLegacyPath( required any path ) {
-		return replace( replace( trim( toString( arguments.path ) ), "\", "/", "all" ), "//", "/", "all" );
+		return replace( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ), "//", "/", "all" );
 	}
 
 	private struct function evidenceForShard( required struct evidence, required array paths, required numeric index, required numeric total ) {
@@ -2568,6 +2632,7 @@ class {
 		polished = resolveInventoryReferences( polished );
 		polished.routeContracts = retainEvidencedRoutes( polished, arguments.errors );
 		polished.roadmapPhases = normalizeRoadmapReferences( polished, arguments.errors );
+		polished.roadmapPhases = ensureRoadmapActionFields( polished.roadmapPhases ?: [], polished );
 		// Roadmap normalization first separates route ids that providers placed in
 		// unitIds; target alias resolution can then safely canonicalize only the
 		// remaining target-unit references.
@@ -2578,6 +2643,7 @@ class {
 		polished.roadmapPhases = orderRoadmapPhases( polished.roadmapPhases ?: [] );
 		polished.roadmapPhases = ensureCurrentSlice( polished.roadmapPhases ?: [] );
 		polished.roadmapPhases = ensurePhaseNames( polished.roadmapPhases ?: [] );
+		polished.roadmapPhases = ensureRoadmapActionFields( polished.roadmapPhases ?: [], polished );
 		var sampleLimit = isNumeric( arguments.samplePolicy.maxFiles ?: "" ) ? max( 1, int( arguments.samplePolicy.maxFiles ) ) : 40;
 		polished.samples = boundedStructArray( polished.samples ?: [], sampleLimit, arguments.errors, "samples" );
 		if ( ( arguments.samplePolicy.currentPhasesOnly ?: true ) && isArray( polished.roadmapPhases ?: "" ) ) {
@@ -2748,11 +2814,40 @@ class {
 
 	private array function normalizeDbTransitions( required any transitions ) {
 		var output = isArray( arguments.transitions ) ? arguments.transitions : [];
+		var allowedOps = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
+		var opAliases = {
+			"expand-contract": "expand",
+			"expand_contract": "expand",
+			"migrate": "switch",
+			"migration": "switch",
+			"alter": "expand",
+			"add": "expand",
+			"create": "expand",
+			"drop": "contract",
+			"remove": "contract",
+			"delete": "contract",
+			"back-fill": "backfill",
+			"cutover": "switch",
+			"forwardonly": "forward-only",
+			"forward only": "forward-only"
+		};
 		for ( var transition in output ) {
 			if ( !isStruct( transition ) ) continue;
 			transition.evidenceRefs = normalizeProviderList( transition.evidenceRefs ?: transition.evidence ?: [] );
 			transition.objectsTouched = normalizeProviderList( transition.objectsTouched ?: transition.objects ?: [] );
-			var path = replace( trim( transition.migrationPath ?: transition.filePath ?: "" ), "\", "/", "all" );
+			var operation = lCase( trim( toString( transition.operation ?: transition.phase ?: "" ) ) );
+			if ( len( operation ) && !allowedOps.contains( operation ) ) {
+				operation = opAliases[ operation ] ?: operation;
+			}
+			if ( len( operation ) && allowedOps.contains( operation ) ) {
+				transition.operation = operation;
+			} else if ( !len( operation ) ) {
+				// Incomplete provider drafts often omit operation; default to expand
+				// so validation can soft-warn instead of hard-block the whole plan.
+				transition.operation = "expand";
+				transition.operationInferred = true;
+			}
+			var path = replace( trim( scalarString( transition.migrationPath ?: transition.filePath ?: "" ) ), "\", "/", "all" );
 			if ( !len( path ) ) continue;
 			var fileName = listLast( path, "/" );
 			var nameWithoutExtension = listFirst( fileName, "." );
@@ -2918,6 +3013,73 @@ class {
 		return output;
 	}
 
+	/**
+	 * Soft-fill actionable roadmap fields for both provider and synthesized
+	 * phases so Solution UI never renders blank classification/wave/risks.
+	 * Empty strings and empty arrays are normalized; existing values are kept.
+	 */
+	private array function ensureRoadmapActionFields( required array phases, required struct plan ) {
+		var allowedClassification = [
+			"remain-monolith", "refactor-monolith", "coldbox-module", "background-worker",
+			"scheduled-service", "microservice", "external-service", "shared-library", "retire", "investigate"
+		];
+		var placementByUnit = {};
+		for ( var placement in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [] ) ) {
+			if ( !isStruct( placement ) ) continue;
+			var placementType = lCase( trim( placement.placementType ?: placement.packaging ?: "" ) );
+			for ( var unitId in ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds : [] ) ) {
+				var key = trim( toString( unitId ) );
+				if ( len( key ) && !placementByUnit.keyExists( key ) ) placementByUnit[ key ] = placementType;
+			}
+		}
+		var output = [];
+		var waveIndex = 0;
+		for ( var phase in arguments.phases ) {
+			if ( !isStruct( phase ) ) continue;
+			var copy = duplicate( phase );
+			waveIndex++;
+			var classification = lCase( trim( toString( copy.classification ?: "" ) ) );
+			if ( !allowedClassification.contains( classification ) ) {
+				var inferred = "refactor-monolith";
+				for ( var phaseUnitId in ( isArray( copy.unitIds ?: "" ) ? copy.unitIds : [] ) ) {
+					var mapped = placementByUnit[ trim( toString( phaseUnitId ) ) ] ?: "";
+					if ( len( mapped ) ) {
+						inferred = synthesizeRoadmapClassification( mapped );
+						break;
+					}
+				}
+				copy.classification = inferred;
+			}
+			if ( !isNumeric( copy.wave ?: "" ) || val( copy.wave ) < 1 ) {
+				copy.wave = waveIndex;
+			} else {
+				copy.wave = max( 1, min( 20, int( copy.wave ) ) );
+			}
+			var complexity = lCase( trim( toString( copy.estimatedComplexity ?: "" ) ) );
+			if ( ![ "low", "medium", "high", "unknown" ].contains( complexity ) ) {
+				var unitCount = isArray( copy.unitIds ?: "" ) ? copy.unitIds.len() : 0;
+				copy.estimatedComplexity = unitCount > 40 ? "high" : ( unitCount > 15 ? "medium" : ( unitCount > 0 ? "low" : "unknown" ) );
+			}
+			if ( !isArray( copy.risks ?: "" ) || !copy.risks.len() ) {
+				copy.risks = [ "Parity and coexist routing may regress if this wave advances without exitCriteria checks." ];
+			} else {
+				copy.risks = copy.risks.filter( ( item ) => isSimpleValue( item ) && len( trim( toString( item ) ) ) )
+					.map( ( item ) => trim( toString( item ) ) );
+				if ( !copy.risks.len() ) copy.risks = [ "Parity and coexist routing may regress if this wave advances without exitCriteria checks." ];
+			}
+			if ( !len( trim( toString( copy.rollbackStrategy ?: "" ) ) ) ) {
+				copy.rollbackStrategy = len( trim( toString( copy.rollback ?: "" ) ) )
+					? trim( toString( copy.rollback ) )
+					: "Route traffic back to legacy paths for this slice until exitCriteria pass.";
+			}
+			if ( !len( trim( toString( copy.testingStrategy ?: "" ) ) ) ) {
+				copy.testingStrategy = "Parity checks for linked target units, coexist route smoke, and a rollback drill before advancing.";
+			}
+			output.append( copy );
+		}
+		return output;
+	}
+
 	private array function normalizeRouteContracts( required array routes ) {
 		var output = [];
 		for ( var route in arguments.routes ) {
@@ -3020,8 +3182,8 @@ class {
 			if ( !isStruct( sample ) ) continue;
 			var copy = duplicate( sample );
 			if ( !structKeyExists( copy, "code" ) ) copy.code = copy.sampleCode ?: copy.body ?: "";
-			var kind = lCase( trim( copy.sampleKind ?: copy.kind ?: "" ) );
-			var path = replace( trim( copy.targetPath ?: copy.path ?: "" ), "\", "/", "all" );
+			var kind = lCase( trim( scalarString( copy.sampleKind ?: copy.kind ?: "" ) ) );
+			var path = replace( trim( scalarString( copy.targetPath ?: copy.path ?: "" ) ), "\", "/", "all" );
 			if ( runtimeName == "boxlang" && kind != "migration" && len( path ) ) {
 				var isView = findNoCase( "/views/", "/" & path ) || findNoCase( "/layouts/", "/" & path );
 				path = reReplaceNoCase( path, "\.(?:cfc|cfm|cfml|bx|bxm)$", isView ? ".bxm" : ".bx" );
@@ -3230,14 +3392,14 @@ class {
 	}
 
 	private numeric function inventoryUnitScore( required struct unit ) {
-		var kind = lCase( trim( arguments.unit.unitType ?: arguments.unit.layer ?: "" ) );
+		var kind = lCase( trim( scalarString( arguments.unit.unitType ?: arguments.unit.layer ?: "" ) ) );
 		if ( kind == "page" || kind == "application" ) return 3;
 		if ( kind == "component" || kind == "custom-tag" ) return 2;
 		return 1;
 	}
 
-	private string function normalizeEvidencePath( required string path ) {
-		return lCase( replace( trim( arguments.path ), "\", "/", "all" ) );
+	private string function normalizeEvidencePath( required any path ) {
+		return lCase( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ) );
 	}
 
 	private array function orderRoadmapPhases( required array phases ) {
@@ -3367,8 +3529,13 @@ class {
 	}
 
 	private void function ensureIdentity(required struct item, required string kind) {
-		if ( !len( trim( arguments.item.id ?: arguments.item.itemId ?: "" ) ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
-		if ( !len( trim( arguments.item.itemFingerprint ?: "" ) ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+		var id = trim( scalarString( arguments.item.id ?: "" ) );
+		if ( !len( id ) ) id = trim( scalarString( arguments.item.itemId ?: "" ) );
+		if ( !len( id ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
+		else arguments.item.id = id;
+		var fingerprint = trim( scalarString( arguments.item.itemFingerprint ?: "" ) );
+		if ( !len( fingerprint ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+		else arguments.item.itemFingerprint = fingerprint;
 	}
 	private boolean function isCancelled(required string runId, required struct options) {
 		return variables.cancelledRuns.keyExists( arguments.runId ) || ( structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled() );
@@ -3449,16 +3616,45 @@ class {
 				}
 			}
 		}
+		var errorType = primary.errorType ?: inferErrorType( primary.message ?: "" );
+		var omittedPathCount = isArray( arguments.appResult.omittedPaths ?: "" ) ? arguments.appResult.omittedPaths.len() : val( arguments.appResult.omitted ?: 0 );
+		var limitReached = "";
+		if ( errorType == "request_timeout" || findNoCase( "budget-exceeded", primary.message ?: "" ) || errorType == "budget_exceeded" ) {
+			limitReached = errorType.len() ? errorType : "budget_exceeded";
+		} else if ( omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
+			limitReached = "shard_cap_or_budget";
+		} else if ( status == "partial_failure" && len( errorType ) ) {
+			limitReached = errorType;
+		}
+		var recommendedContinuation = "Review partial plan gates before accepting.";
+		if ( omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
+			recommendedContinuation = "Continue omitted coverage via POST /api/v1/runs/#arguments.runId#/modernization/continue";
+		} else if ( incomplete.contains( "architecture" ) || architectureSource == "synthesized" ) {
+			recommendedContinuation = "Retry architecture packaging or rebuild placements after coverage is complete.";
+		} else if ( errorType == "request_timeout" ) {
+			recommendedContinuation = "Retry with a narrower scopePaths wave or higher AI_TIMEOUT; partial shards are retained.";
+		}
 		return {
 			status: status,
 			stage: incomplete.len() ? incomplete[ 1 ] : "proposal_generation",
-			errorType: primary.errorType ?: inferErrorType( primary.message ?: "" ),
+			errorType: errorType,
 			message: primary.message ?: "",
 			retryable: structKeyExists( primary, "retryable" ) ? !!primary.retryable : ( status == "partial_failure" ),
 			completedStages: completed,
 			incompleteStages: incomplete,
 			checkpointId: arguments.runId & ":proposal",
-			architectureSource: architectureSource
+			lastSuccessfulCheckpoint: arguments.runId & ":proposal",
+			architectureSource: architectureSource,
+			limitReached: limitReached,
+			partialResults: {
+				acceptedShards: val( arguments.appResult.accepted ?: 0 ),
+				failedShards: val( arguments.appResult.failed ?: 0 ),
+				omittedPaths: omittedPathCount,
+				phases: isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases.len() : 0,
+				units: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units.len() : 0,
+				placements: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements.len() : 0
+			},
+			recommendedContinuation: recommendedContinuation
 		};
 	}
 

@@ -18,17 +18,21 @@ class {
 		var metadata = structKeyExists( arguments.plan, "metadata" ) && isStruct( arguments.plan.metadata ) ? arguments.plan.metadata : {};
 		var coverageData = structKeyExists( arguments.plan, "coverage" ) && isStruct( arguments.plan.coverage ) ? arguments.plan.coverage : {};
 		var inventoryData = structKeyExists( arguments.plan, "inventory" ) && isStruct( arguments.plan.inventory ) ? arguments.plan.inventory : {};
-		var runtime = structKeyExists( metadata, "runtime" ) && isStruct( metadata.runtime ) ? trim( metadata.runtime.runtime ?: "" ) : ( structKeyExists( metadata, "runtime" ) ? trim( metadata.runtime ?: "" ) : "" );
-		var requiresProvenance = isStruct( metadata.provenanceContract ?: "" ) && len( trim( metadata.provenanceContract.version ?: "" ) ) > 0;
-		if ( !len( runtime ) ) runtime = trim( target.runtime ?: "" );
+		var runtime = structKeyExists( metadata, "runtime" ) && isStruct( metadata.runtime ) ? safeTrim( metadata.runtime.runtime ?: "" ) : ( structKeyExists( metadata, "runtime" ) ? safeTrim( metadata.runtime ?: "" ) : "" );
+		var requiresProvenance = isStruct( metadata.provenanceContract ?: "" ) && len( safeTrim( metadata.provenanceContract.version ?: "" ) ) > 0;
+		if ( !len( runtime ) ) runtime = safeTrim( target.runtime ?: "" );
 		runtime = lCase( runtime );
-		var profile = lCase( trim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
+		var profile = lCase( safeTrim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
 		var validationInventory = structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData;
 		var inventoryPaths = inventoryPathSet( validationInventory );
 		var inventoryIds = inventoryUnitIdSet( validationInventory );
 		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
+		// Partial/synthesized plans still need review, but missing evidence and
+		// incomplete dbTransitions should not drown the gate summary in blockers.
+		var softEvidence = isSoftEvidencePlan( arguments.plan, arguments.context );
+		var evidenceLevelName = softEvidence ? "warning" : "blocking";
 
-		var planVersion = lCase( trim( arguments.plan.schemaVersion ?: arguments.plan.version ?: "" ) );
+		var planVersion = lCase( safeTrim( arguments.plan.schemaVersion ?: arguments.plan.version ?: "" ) );
 		var isV2 = planVersion == "modernization-plan-v2" || isArray( target.placements ?: "" );
 		if ( ![ "modernization-plan-v1", "modernization-plan-v2" ].contains( planVersion ) ) {
 			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1 or modernization-plan-v2" ); blocking++;
@@ -49,16 +53,16 @@ class {
 			var items = isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [];
 			for ( var item in items ) {
 				if ( !isStruct( item ) ) { addMessage( messages, collection, "blocking", "Item must be an object" ); blocking++; continue; }
-				var id = trim( item.id ?: item.itemId ?: "" );
+				var id = safeTrim( item.id ?: item.itemId ?: "" );
 				if ( !len( id ) ) { addMessage( messages, collection, "blocking", "Item is missing a stable id", id ); blocking++; }
 				else if ( seen.keyExists( id ) ) { addMessage( messages, collection, "blocking", "Duplicate id: #id#", id ); blocking++; }
 				else seen[ id ] = true;
 				var decisionCollection = [ "target.units", "target.placements", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection );
-				if ( !len( trim( item.itemFingerprint ?: "" ) ) ) {
+				if ( !len( safeTrim( item.itemFingerprint ?: "" ) ) ) {
 					addMessage( messages, collection, decisionCollection ? "blocking" : "warning", "Item #id# has no itemFingerprint", id );
 					if ( decisionCollection ) blocking++; else warnings++;
 				}
-				var provenanceClass = lCase( trim( item.provenanceClass ?: "" ) );
+				var provenanceClass = lCase( safeTrim( item.provenanceClass ?: "" ) );
 				if ( requiresProvenance && !variables.allowedProvenanceClasses.contains( provenanceClass ) ) {
 					addMessage( messages, collection, "blocking", "Item #id# is missing a valid provenanceClass", id );
 					blocking++;
@@ -66,17 +70,17 @@ class {
 				// Route contracts use an absolute URL path, while the generic
 				// collections use project-relative file paths. Do not run the
 				// relative-path gate against a route's URL.
-				var itemPath = trim( item.targetPath ?: item.pathHint ?: ( collection == "routeContracts" ? "" : ( item.path ?: item.filePath ?: "" ) ) );
+				var itemPath = safeTrim( item.targetPath ?: item.pathHint ?: ( collection == "routeContracts" ? "" : ( item.path ?: item.filePath ?: "" ) ) );
 					if ( collection != "routeContracts" && len( itemPath ) && !safeRelativePath( itemPath ) ) { addMessage( messages, collection, "blocking", "Item #id# contains an unsafe path", id ); blocking++; }
 				if ( collection == "target.placements" ) {
-					var placementType = lCase( trim( item.placementType ?: item.packaging ?: "" ) );
-					if ( ![ "main-app", "coldbox-module", "external-service", "centralized" ].contains( placementType ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an unsupported placementType", id ); blocking++; }
+					var placementType = lCase( safeTrim( item.placementType ?: item.packaging ?: "" ) );
+					if ( ![ "main-app", "coldbox-module", "external-service", "background-worker", "scheduled-service", "centralized", "worker" ].contains( placementType ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an unsupported placementType", id ); blocking++; }
 					if ( !isArray( item.targetUnitIds ?: item.unitIds ?: "" ) || !( item.targetUnitIds ?: item.unitIds ?: [] ).len() ) { addMessage( messages, collection, "blocking", "Placement #id# must own at least one target unit", id ); blocking++; }
 					if ( !isArray( item.evidenceRefs ?: "" ) || !item.evidenceRefs.len() ) { addMessage( messages, collection, "warning", "Placement #id# has no evidence references", id ); warnings++; }
 					if ( isArray( item.gates ?: "" ) ) {
 						for ( var gate in item.gates ) {
-							var gateId = trim( toString( gate.id ?: "architecture" ) );
-							var gateStatus = lCase( trim( gate.status ?: "" ) );
+							var gateId = safeTrim( gate.id ?: "architecture" );
+							var gateStatus = lCase( safeTrim( gate.status ?: "" ) );
 							if ( ![ "pass", "fail", "unknown" ].contains( gateStatus ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an invalid gate status", id ); blocking++; }
 							else if ( gateStatus == "fail" ) { addMessage( messages, collection, "blocking", "Placement #id# has a failed #gateId# gate", id ); blocking++; }
 							else if ( gateStatus == "unknown" ) { addMessage( messages, collection, "warning", "Placement #id# has an unknown #gateId# gate", id ); warnings++; }
@@ -92,13 +96,16 @@ class {
 						else seenTargetPaths[ normalizedTargetPath ] = id;
 					}
 					var sourceBacked = targetHasInventoryBacking( item, inventoryPaths, inventoryIds, planUnitLinks );
-					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( trim( item.proposalReason ?: "" ) ) ) ) {
+					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( safeTrim( item.proposalReason ?: "" ) ) ) ) {
 						addMessage( messages, collection, "blocking", "Target unit #id# is not inventory-backed and is missing a new-proposal reason", id ); blocking++;
 					}
 				}
 				if ( [ "unitLinks", "routeContracts", "dbFindings", "dbTransitions" ].contains( collection ) ) {
 					var refs = item.evidenceRefs ?: item.evidence ?: [];
-					if ( !isArray( refs ) || !refs.len() ) { addMessage( messages, collection, "blocking", "Item #id# has no evidence references", id ); blocking++; }
+					if ( !isArray( refs ) || !refs.len() ) {
+						addMessage( messages, collection, evidenceLevelName, "Item #id# has no evidence references", id );
+						if ( softEvidence ) warnings++; else blocking++;
+					}
 				}
 			}
 		}
@@ -107,18 +114,21 @@ class {
 		warnings += referenceReport.warnings;
 		var contextIds = {};
 		for ( var contextItem in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
-			var contextId = contextItem.id ?: contextItem.itemId ?: "";
+			var contextId = safeTrim( contextItem.id ?: contextItem.itemId ?: "" );
 			if ( len( contextId ) ) contextIds[ contextId ] = true;
-			if ( !isArray( contextItem.evidenceRefs ?: contextItem.evidence ?: "" ) || !( contextItem.evidenceRefs ?: contextItem.evidence ?: [] ).len() ) { addMessage( messages, "target.contexts", "blocking", "Context #contextId# must declare evidence references", contextId ); blocking++; }
+			if ( !isArray( contextItem.evidenceRefs ?: contextItem.evidence ?: "" ) || !( contextItem.evidenceRefs ?: contextItem.evidence ?: [] ).len() ) {
+				addMessage( messages, "target.contexts", evidenceLevelName, "Context #contextId# must declare evidence references", contextId );
+				if ( softEvidence ) warnings++; else blocking++;
+			}
 			if ( structKeyExists( contextItem, "dataBoundary" ) && findNoCase( "secret", jsonSerialize( contextItem.dataBoundary ) ) ) { addMessage( messages, "target.contexts", "blocking", "Context #contextId# contains a secret data boundary", contextId ); blocking++; }
-				if ( lCase( trim( contextItem.packaging ?: "" ) ) == "coldbox-module" && !variables.allowedEvidenceBasis.contains( lCase( trim( contextItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.contexts", "warning", "Context #contextId# proposes a coldbox-module without a recognized evidenceBasis", contextId ); warnings++; }
+				if ( lCase( safeTrim( contextItem.packaging ?: "" ) ) == "coldbox-module" && !variables.allowedEvidenceBasis.contains( lCase( safeTrim( contextItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.contexts", "warning", "Context #contextId# proposes a coldbox-module without a recognized evidenceBasis", contextId ); warnings++; }
 		}
 		for ( var extractItem in ( isArray( target.extracts ?: "" ) ? target.extracts : [] ) ) {
-			var extractId = extractItem.id ?: extractItem.itemId ?: "";
-			var contextRef = extractItem.contextId ?: extractItem.context ?: "";
+			var extractId = safeTrim( extractItem.id ?: extractItem.itemId ?: "" );
+			var contextRef = safeTrim( extractItem.contextId ?: extractItem.context ?: "" );
 			if ( len( contextRef ) && !contextIds.keyExists( contextRef ) ) { addMessage( messages, "target.extracts", "blocking", "Extract #extractId# references an unknown context", extractId ); blocking++; }
-			if ( !len( trim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
-				if ( !variables.allowedEvidenceBasis.contains( lCase( trim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
+			if ( !len( safeTrim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
+				if ( !variables.allowedEvidenceBasis.contains( lCase( safeTrim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
 		}
 		var packagingGuideReport = isV2 ? { blocking: 0 } : validateArchitecturePackagingFields( target, messages );
 		blocking += packagingGuideReport.blocking;
@@ -139,34 +149,34 @@ class {
 		warnings += migrationGuideReport.warnings;
 
 		for ( var link in planUnitLinks ) {
-			var sourcePath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
-			var linkId = link.id ?: link.itemId ?: "unknown";
+			var sourcePath = lCase( replace( safeTrim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
+			var linkId = safeTrim( link.id ?: link.itemId ?: "unknown" );
 			if ( len( sourcePath ) && !inventoryPaths.keyExists( sourcePath ) && !( link.newProposal ?: false ) ) { addMessage( messages, "unitLinks", "blocking", "Unit link #linkId# is not backed by inventory evidence", linkId ); blocking++; }
 		}
 
 		var planRoutes = structKeyExists( arguments.plan, "routeContracts" ) && isArray( arguments.plan.routeContracts ) ? arguments.plan.routeContracts : [];
 		for ( var route in planRoutes ) {
-			var routeId = route.id ?: route.itemId ?: "";
-			if ( !variables.allowedMethods.contains( uCase( trim( route.method ?: "" ) ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route method is invalid", routeId ); blocking++; }
-			else if ( uCase( trim( route.method ?: "" ) ) == "UNKNOWN" ) { addMessage( messages, "routeContracts", "warning", "Route method remains unknown and requires source verification", routeId ); warnings++; }
+			var routeId = safeTrim( route.id ?: route.itemId ?: "" );
+			if ( !variables.allowedMethods.contains( uCase( safeTrim( route.method ?: "" ) ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route method is invalid", routeId ); blocking++; }
+			else if ( uCase( safeTrim( route.method ?: "" ) ) == "UNKNOWN" ) { addMessage( messages, "routeContracts", "warning", "Route method remains unknown and requires source verification", routeId ); warnings++; }
 			if ( !safeRoutePath( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route path must be a safe absolute application path", routeId ); blocking++; }
-			if ( !len( trim( route.targetUnitId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a targetUnitId", routeId ); blocking++; }
-			if ( !len( trim( route.unitLinkId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a unitLinkId", routeId ); blocking++; }
+			if ( !len( safeTrim( route.targetUnitId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a targetUnitId", routeId ); blocking++; }
+			if ( !len( safeTrim( route.unitLinkId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a unitLinkId", routeId ); blocking++; }
 			for ( var requiredKey in [ "request", "response", "auth", "sideEffects", "rollback", "evidence" ] ) if ( !structKeyExists( route, requiredKey ) ) { addMessage( messages, "routeContracts", "blocking", "Route is missing #requiredKey#", routeId ); blocking++; }
-			if ( structKeyExists( route, "samplePath" ) && trim( route.samplePath ?: "" ) != trim( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route samplePath does not match its path", routeId ); blocking++; }
+			if ( structKeyExists( route, "samplePath" ) && safeTrim( route.samplePath ?: "" ) != safeTrim( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route samplePath does not match its path", routeId ); blocking++; }
 			if ( !isArray( route.evidence ?: "" ) || !route.evidence.len() ) { addMessage( messages, "routeContracts", "blocking", "Route has no evidence references", routeId ); blocking++; }
 		}
 
 		var planSamples = structKeyExists( arguments.plan, "samples" ) && isArray( arguments.plan.samples ) ? arguments.plan.samples : [];
 		for ( var sample in planSamples ) {
 			var serializedSample = jsonSerialize( sample );
-			var sampleId = sample.id ?: sample.itemId ?: "";
-			if ( !len( trim( sample.sampleKind ?: "" ) ) || !len( trim( sample.targetPath ?: sample.path ?: "" ) ) ) { addMessage( messages, "samples", "blocking", "Sample needs sampleKind and targetPath", sampleId ); blocking++; }
+			var sampleId = safeTrim( sample.id ?: sample.itemId ?: "" );
+			if ( !len( safeTrim( sample.sampleKind ?: "" ) ) || !len( safeTrim( sample.targetPath ?: sample.path ?: "" ) ) ) { addMessage( messages, "samples", "blocking", "Sample needs sampleKind and targetPath", sampleId ); blocking++; }
 			if ( !safeRelativePath( sample.targetPath ?: sample.path ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample path is unsafe", sampleId ); blocking++; }
 			if ( !isArray( sample.relatedItemIds ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare relatedItemIds", sampleId ); blocking++; }
 			if ( !structKeyExists( sample, "irreversible" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare irreversible safety", sampleId ); blocking++; }
-			var sampleLanguage = lCase( trim( sample.language ?: "" ) );
-			var sampleExtension = lCase( listLast( sample.targetPath ?: sample.path ?: "", "." ) );
+			var sampleLanguage = lCase( safeTrim( sample.language ?: "" ) );
+			var sampleExtension = lCase( listLast( scalarString( sample.targetPath ?: sample.path ?: "" ), "." ) );
 			if ( sampleLanguage == "boxlang" && ![ "bx", "bxm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "BoxLang sample path must end in .bx or .bxm", sampleId ); blocking++; }
 			if ( sampleLanguage == "cfml" && ![ "cfc", "cfm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "CFML sample path must end in .cfc or .cfm", sampleId ); blocking++; }
 			if ( sampleLanguage == "sql" && sampleExtension != "sql" ) { addMessage( messages, "samples", "blocking", "SQL sample path must end in .sql", sampleId ); blocking++; }
@@ -181,7 +191,7 @@ class {
 		var databaseReport = validateDatabaseClaims( arguments.plan.dbFindings ?: [], schemaData, messages );
 		blocking += databaseReport.blocking;
 		warnings += databaseReport.warnings;
-		var transitionReport = validateTransitions( planTransitions, messages );
+		var transitionReport = validateTransitions( planTransitions, messages, softEvidence );
 		blocking += transitionReport.blocking;
 		warnings += transitionReport.warnings;
 		var phases = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
@@ -224,16 +234,16 @@ class {
 		if ( !structCount( currentPhase ) && phases.len() ) currentPhase = phases[ 1 ];
 		var sliceUnitIds = {};
 		for ( var unitId in ( isArray( currentPhase.unitIds ?: "" ) ? currentPhase.unitIds : [] ) ) {
-			sliceUnitIds[ trim( unitId ) ] = true;
+			sliceUnitIds[ safeTrim( unitId ) ] = true;
 		}
 		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
 		for ( var unit in targetUnits ) {
-			var id = trim( unit.id ?: unit.itemId ?: "" );
+			var id = safeTrim( unit.id ?: unit.itemId ?: "" );
 			if ( structCount( sliceUnitIds ) && !sliceUnitIds.keyExists( id ) ) continue;
-			var layer = lCase( trim( unit.layer ?: unit.kind ?: "" ) );
+			var layer = lCase( safeTrim( unit.layer ?: unit.kind ?: "" ) );
 			if ( ![ "handler", "service" ].contains( layer ) ) continue;
 			var sample = toString( unit.sampleCode ?: "" );
-			if ( !len( trim( sample ) ) ) continue;
+			if ( !len( safeTrim( sample ) ) ) continue;
 			var hasClass = reFindNoCase( "\b(class|component)\b", sample ) > 0;
 			var hasDi = reFindNoCase( "\bproperty\b", sample ) > 0 || findNoCase( "inject", sample ) > 0 || findNoCase( "no DI", sample ) > 0 || findNoCase( "no di", sample ) > 0;
 			if ( !hasClass || !hasDi ) {
@@ -244,37 +254,38 @@ class {
 		return report;
 	}
 
-	private void function addMessage( required array messages, required string category, required string level, required string text, string itemId = "" ) {
+	private void function addMessage( required array messages, required string category, required string level, required string text, any itemId = "" ) {
 		var item = { category: arguments.category, level: arguments.level, message: arguments.text, validationLevel: arguments.level };
-		if ( len( trim( arguments.itemId ) ) ) item.itemId = arguments.itemId;
+		var normalizedId = safeTrim( arguments.itemId );
+		if ( len( normalizedId ) ) item.itemId = normalizedId;
 		arguments.messages.append( item );
 	}
 
 	private struct function validateDatabaseClaims( required any findings, required struct schema, required array messages ) {
 		var report = { blocking: 0, warnings: 0 };
 		if ( !isArray( arguments.findings ) ) return report;
-		var coverage = lCase( trim( arguments.schema.coverage ?: "absent" ) );
+		var coverage = lCase( safeTrim( arguments.schema.coverage ?: "absent" ) );
 		var schemaObjects = {};
 		for ( var table in arguments.schema.tables ?: [] ) {
-			var tableName = lCase( trim( table.name ?: "" ) );
+			var tableName = lCase( safeTrim( table.name ?: "" ) );
 			if ( len( tableName ) ) schemaObjects[ tableName ] = true;
 		}
 		for ( var column in arguments.schema.columns ?: [] ) {
-			var columnName = lCase( trim( column.name ?: "" ) );
-			var columnTable = lCase( trim( column.table ?: "" ) );
+			var columnName = lCase( safeTrim( column.name ?: "" ) );
+			var columnTable = lCase( safeTrim( column.table ?: "" ) );
 			if ( len( columnTable ) && len( columnName ) ) schemaObjects[ columnTable & "." & columnName ] = true;
 		}
 		for ( var collection in [ "constraints", "indexes", "routines" ] ) {
 			for ( var schemaItem in arguments.schema[ collection ] ?: [] ) {
-				var schemaName = lCase( trim( schemaItem.name ?: "" ) );
+				var schemaName = lCase( safeTrim( schemaItem.name ?: "" ) );
 				if ( len( schemaName ) ) schemaObjects[ schemaName ] = true;
 			}
 		}
 		for ( var finding in arguments.findings ) {
 			if ( !isStruct( finding ) ) continue;
-			var findingId = finding.id ?: finding.itemId ?: "";
-			var category = lCase( trim( finding.category ?: "" ) );
-			var objectRef = lCase( trim( finding.objectRef ?: "" ) );
+			var findingId = safeTrim( finding.id ?: finding.itemId ?: "" );
+			var category = lCase( safeTrim( finding.category ?: "" ) );
+			var objectRef = lCase( safeTrim( finding.objectRef ?: "" ) );
 			var inferenceLimit = [ "coverage", "inference-limit", "inference_limit" ].contains( category )
 				|| [ "", "unknown", "none", "not-observed", "not_observed" ].contains( objectRef );
 			if ( coverage == "absent" ) {
@@ -308,9 +319,9 @@ class {
 		var report = { blocking: 0, warnings: 0 };
 		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
 		var targetIds = {};
-		for ( var unit in targetUnits ) targetIds[ unit.id ?: unit.itemId ?: "" ] = true;
+		for ( var unit in targetUnits ) targetIds[ safeTrim( unit.id ?: unit.itemId ?: "" ) ] = true;
 		var inventoryIds = {};
-		for ( var unit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) inventoryIds[ unit.id ?: unit.itemId ?: "" ] = true;
+		for ( var unit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) inventoryIds[ safeTrim( unit.id ?: unit.itemId ?: "" ) ] = true;
 		var routeIds = idSet( arguments.plan.routeContracts ?: [] );
 		var linkIds = idSet( arguments.plan.unitLinks ?: [] );
 		var findingIds = idSet( arguments.plan.dbFindings ?: [] );
@@ -318,22 +329,22 @@ class {
 		var phaseIds = idSet( arguments.plan.roadmapPhases ?: [] );
 		var sampleIds = idSet( arguments.plan.samples ?: [] );
 		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
-			var linkId = link.id ?: link.itemId ?: "";
+			var linkId = safeTrim( link.id ?: link.itemId ?: "" );
 			checkReference( link.legacyUnitId ?: link.sourceUnitId ?: "", inventoryIds, "unitLinks", linkId, "legacyUnitId", report, arguments.messages );
 			checkReference( link.targetUnitId ?: "", targetIds, "unitLinks", linkId, "targetUnitId", report, arguments.messages );
 		}
 		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
-			var routeId = route.id ?: route.itemId ?: "";
+			var routeId = safeTrim( route.id ?: route.itemId ?: "" );
 			checkReference( route.unitLinkId ?: "", linkIds, "routeContracts", routeId, "unitLinkId", report, arguments.messages );
 			checkReference( route.targetUnitId ?: "", targetIds, "routeContracts", routeId, "targetUnitId", report, arguments.messages );
 		}
 		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
-			var transitionId = transition.id ?: transition.itemId ?: "";
+			var transitionId = safeTrim( transition.id ?: transition.itemId ?: "" );
 			checkReference( transition.dbFindingId ?: transition.findingId ?: "", findingIds, "dbTransitions", transitionId, "dbFindingId", report, arguments.messages );
 			checkReference( transition.roadmapPhaseId ?: transition.phaseId ?: "", phaseIds, "dbTransitions", transitionId, "roadmapPhaseId", report, arguments.messages );
 		}
 		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
-			var phaseId = phase.id ?: phase.itemId ?: "";
+			var phaseId = safeTrim( phase.id ?: phase.itemId ?: "" );
 			checkReferenceArray( phase.unitIds ?: phase.targetUnitIds ?: [], targetIds, "roadmapPhases", phaseId, "unitIds", report, arguments.messages );
 			checkReferenceArray( phase.routeIds ?: [], routeIds, "roadmapPhases", phaseId, "routeIds", report, arguments.messages );
 			checkReferenceArray( phase.dbFindingIds ?: [], findingIds, "roadmapPhases", phaseId, "dbFindingIds", report, arguments.messages );
@@ -341,7 +352,7 @@ class {
 			checkReferenceArray( phase.sampleIds ?: [], sampleIds, "roadmapPhases", phaseId, "sampleIds", report, arguments.messages );
 		}
 		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
-			var sampleId = sample.id ?: sample.itemId ?: "";
+			var sampleId = safeTrim( sample.id ?: sample.itemId ?: "" );
 			checkReferenceArray( sample.relatedItemIds ?: [], knownIds, "samples", sampleId, "relatedItemIds", report, arguments.messages );
 		}
 		return report;
@@ -357,16 +368,16 @@ class {
 		var unitIds = {};
 		for ( var unit in arguments.units ) {
 			if ( !isStruct( unit ) ) continue;
-			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			var unitId = safeTrim( unit.id ?: unit.itemId ?: "" );
 			if ( len( unitId ) ) unitIds[ unitId ] = true;
 		}
 		var ownerByUnit = {};
 		for ( var placement in ( isArray( arguments.target.placements ?: "" ) ? arguments.target.placements : [] ) ) {
 			if ( !isStruct( placement ) ) continue;
-			var placementId = trim( toString( placement.id ?: placement.itemId ?: "" ) );
+			var placementId = safeTrim( placement.id ?: placement.itemId ?: "" );
 			var ids = isArray( placement.targetUnitIds ?: placement.unitIds ?: "" ) ? ( placement.targetUnitIds ?: placement.unitIds ) : [];
 			for ( var rawUnitId in ids ) {
-				var unitId = trim( toString( rawUnitId ) );
+				var unitId = safeTrim( rawUnitId );
 				if ( !len( unitId ) ) continue;
 				if ( !unitIds.keyExists( unitId ) ) {
 					addMessage( arguments.messages, "target.placements", "blocking", "Placement #placementId# references an unknown target unit", placementId );
@@ -408,18 +419,18 @@ class {
 		}
 		var groupIds = {};
 		for ( var group in groups ) {
-			var groupItemId = trim( group.item.id ?: group.item.itemId ?: "" );
+			var groupItemId = safeTrim( group.item.id ?: group.item.itemId ?: "" );
 			if ( len( groupItemId ) ) groupIds[ groupItemId ] = true;
 		}
 		for ( var group in groups ) {
 			var item = group.item;
-			var id = trim( item.id ?: item.itemId ?: "" );
-			var moduleSlug = trim( item.moduleSlug ?: "" );
+			var id = safeTrim( item.id ?: item.itemId ?: "" );
+			var moduleSlug = safeTrim( item.moduleSlug ?: "" );
 			if ( len( moduleSlug ) && !safeRelativePath( moduleSlug ) ) {
 				addMessage( arguments.messages, group.collection, "blocking", "Item #id# has an unsafe moduleSlug", id ); report.blocking++;
 			}
 			for ( var dependsOnId in ( isArray( item.dependsOnContextIds ?: "" ) ? item.dependsOnContextIds : [] ) ) {
-				if ( !groupIds.keyExists( trim( toString( dependsOnId ) ) ) ) {
+				if ( !groupIds.keyExists( safeTrim( dependsOnId ) ) ) {
 					addMessage( arguments.messages, group.collection, "blocking", "Item #id# has a dangling dependsOnContextIds reference", id ); report.blocking++;
 				}
 			}
@@ -446,16 +457,16 @@ class {
 		var report = { blocking: 0, warnings: 0 };
 		var unitTargetPaths = {};
 		for ( var unit in ( isArray( arguments.target.units ?: "" ) ? arguments.target.units : [] ) ) {
-			var unitId = trim( unit.id ?: unit.itemId ?: "" );
-			var unitTargetPath = lCase( replace( trim( unit.targetPath ?: unit.pathHint ?: "" ), "\", "/", "all" ) );
+			var unitId = safeTrim( unit.id ?: unit.itemId ?: "" );
+			var unitTargetPath = lCase( replace( safeTrim( unit.targetPath ?: unit.pathHint ?: "" ), "\", "/", "all" ) );
 			if ( len( unitId ) && len( unitTargetPath ) ) unitTargetPaths[ unitId ] = unitTargetPath;
 		}
 		var phasePathOwners = {};
 		for ( var ownerPhase in arguments.phases ) {
 			if ( !isStruct( ownerPhase ) ) continue;
-			var ownerPhaseId = trim( ownerPhase.id ?: ownerPhase.itemId ?: "" );
+			var ownerPhaseId = safeTrim( ownerPhase.id ?: ownerPhase.itemId ?: "" );
 			for ( var ownerUnitId in ( isArray( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ?: "" ) ? ( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ) : [] ) ) {
-				var ownerPath = unitTargetPaths[ trim( toString( ownerUnitId ) ) ] ?: "";
+				var ownerPath = unitTargetPaths[ safeTrim( ownerUnitId ) ] ?: "";
 				if ( !len( ownerPath ) ) continue;
 				if ( !phasePathOwners.keyExists( ownerPath ) ) phasePathOwners[ ownerPath ] = [];
 				if ( !phasePathOwners[ ownerPath ].contains( ownerPhaseId ) ) phasePathOwners[ ownerPath ].append( ownerPhaseId );
@@ -463,20 +474,20 @@ class {
 		}
 		for ( var phase in arguments.phases ) {
 			if ( !isStruct( phase ) ) continue;
-			var id = trim( phase.id ?: phase.itemId ?: "" );
+			var id = safeTrim( phase.id ?: phase.itemId ?: "" );
 			var phaseUnitIds = {};
-			for ( var unitId in ( isArray( phase.unitIds ?: phase.targetUnitIds ?: "" ) ? ( phase.unitIds ?: phase.targetUnitIds ) : [] ) ) phaseUnitIds[ trim( toString( unitId ) ) ] = true;
+			for ( var unitId in ( isArray( phase.unitIds ?: phase.targetUnitIds ?: "" ) ? ( phase.unitIds ?: phase.targetUnitIds ) : [] ) ) phaseUnitIds[ safeTrim( unitId ) ] = true;
 
 			var steps = isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps : [];
 			for ( var step in steps ) {
 				if ( !isStruct( step ) ) continue;
 				var legacyRef = isStruct( step.legacyRef ?: "" ) ? step.legacyRef : {};
-				var legacyPath = lCase( replace( trim( legacyRef.filePath ?: "" ), "\", "/", "all" ) );
+				var legacyPath = lCase( replace( safeTrim( legacyRef.filePath ?: "" ), "\", "/", "all" ) );
 				if ( !len( legacyPath ) || !arguments.inventoryPaths.keyExists( legacyPath ) ) {
 					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a legacyRef.filePath not in inventory evidence", id ); report.blocking++;
 				}
 				var targetRef = isStruct( step.targetRef ?: "" ) ? step.targetRef : {};
-				var stepTargetPath = lCase( replace( trim( targetRef.targetPath ?: "" ), "\", "/", "all" ) );
+				var stepTargetPath = lCase( replace( safeTrim( targetRef.targetPath ?: "" ), "\", "/", "all" ) );
 				var matchesPhaseUnit = false;
 				for ( var phaseUnitId in phaseUnitIds ) {
 					if ( len( stepTargetPath ) && ( unitTargetPaths[ phaseUnitId ] ?: "" ) == stepTargetPath ) { matchesPhaseUnit = true; break; }
@@ -491,15 +502,15 @@ class {
 				}
 			}
 
-			if ( !steps.len() && lCase( trim( phase.provenanceClass ?: "" ) ) == "provider-suggested" ) {
+			if ( !steps.len() && lCase( safeTrim( phase.provenanceClass ?: "" ) ) == "provider-suggested" ) {
 				addMessage( arguments.messages, "roadmapPhases", "warning", "Phase #id# has no migration guide", id ); report.warnings++;
 			}
 		}
 		return report;
 	}
 
-	private boolean function isColdBoxConventionPath( required string path ) {
-		var normalized = lCase( replace( trim( arguments.path ), "\", "/", "all" ) );
+	private boolean function isColdBoxConventionPath( required any path ) {
+		var normalized = lCase( replace( safeTrim( arguments.path ), "\", "/", "all" ) );
 		return reFindNoCase( "(^|/)router\.(?:bx|cfc)$", normalized ) > 0
 			|| reFindNoCase( "(^|/)(?:coldbox|application)\.(?:bx|cfc)$", normalized ) > 0;
 	}
@@ -507,20 +518,21 @@ class {
 	private struct function idSet( required any items ) {
 		var output = {};
 		for ( var item in ( isArray( arguments.items ) ? arguments.items : [] ) ) {
-			var id = trim( item.id ?: item.itemId ?: "" );
+			var id = safeTrim( item.id ?: item.itemId ?: "" );
 			if ( len( id ) ) output[ id ] = true;
 		}
 		return output;
 	}
 
-	private void function checkReference( required any value, required struct allowed, required string category, required string itemId, required string field, required struct report, required array messages ) {
-		var reference = trim( toString( arguments.value ?: "" ) );
+	private void function checkReference( required any value, required struct allowed, required string category, required any itemId, required string field, required struct report, required array messages ) {
+		var reference = safeTrim( arguments.value ?: "" );
+		var normalizedItemId = safeTrim( arguments.itemId );
 		if ( !len( reference ) || arguments.allowed.keyExists( reference ) ) return;
-		addMessage( arguments.messages, arguments.category, "blocking", "Item #arguments.itemId# references unknown #arguments.field# #reference#", arguments.itemId );
+		addMessage( arguments.messages, arguments.category, "blocking", "Item #normalizedItemId# references unknown #arguments.field# #reference#", normalizedItemId );
 		arguments.report.blocking++;
 	}
 
-	private void function checkReferenceArray( required any values, required struct allowed, required string category, required string itemId, required string field, required struct report, required array messages ) {
+	private void function checkReferenceArray( required any values, required struct allowed, required string category, required any itemId, required string field, required struct report, required array messages ) {
 		if ( !isArray( arguments.values ) ) return;
 		for ( var value in arguments.values ) checkReference( value, arguments.allowed, arguments.category, arguments.itemId, arguments.field, arguments.report, arguments.messages );
 	}
@@ -529,11 +541,11 @@ class {
 		var output = {};
 		if ( !isStruct( arguments.inventory ) ) return output;
 		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
-			var path = lCase( replace( trim( unit.filePath ?: unit.path ?: "" ), "\", "/", "all" ) );
+			var path = lCase( replace( safeTrim( unit.filePath ?: unit.path ?: "" ), "\", "/", "all" ) );
 			if ( len( path ) ) output[ path ] = true;
 		}
 		for ( var file in ( isArray( arguments.inventory.files ?: "" ) ? arguments.inventory.files : [] ) ) {
-			var filePath = lCase( replace( trim( file.filePath ?: file.path ?: "" ), "\", "/", "all" ) );
+			var filePath = lCase( replace( safeTrim( file.filePath ?: file.path ?: "" ), "\", "/", "all" ) );
 			if ( len( filePath ) ) output[ filePath ] = true;
 		}
 		return output;
@@ -543,7 +555,7 @@ class {
 		var output = {};
 		if ( !isStruct( arguments.inventory ) ) return output;
 		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
-			var id = trim( unit.id ?: unit.itemId ?: "" );
+			var id = safeTrim( unit.id ?: unit.itemId ?: "" );
 			if ( len( id ) ) output[ id ] = true;
 		}
 		return output;
@@ -555,59 +567,64 @@ class {
 		required struct inventoryIds,
 		required array unitLinks
 	) {
-		var targetId = trim( arguments.item.id ?: arguments.item.itemId ?: "" );
-		var sourceValue = replace( toString( arguments.item.sourcePath ?: arguments.item.sourceFile ?: arguments.item.legacyPath ?: "" ), "\", "/", "all" );
+		var targetId = safeTrim( arguments.item.id ?: arguments.item.itemId ?: "" );
+		var sourceValue = replace( scalarString( arguments.item.sourcePath ?: arguments.item.sourceFile ?: arguments.item.legacyPath ?: "" ), "\", "/", "all" );
 		for ( var sourcePath in listToArray( sourceValue, ",", true, true ) ) {
-			var normalizedSource = lCase( trim( sourcePath ) );
+			var normalizedSource = lCase( safeTrim( sourcePath ) );
 			if ( len( normalizedSource ) && arguments.inventoryPaths.keyExists( normalizedSource ) ) return true;
 		}
 		var legacyIds = isArray( arguments.item.legacyUnitIds ?: "" ) ? duplicate( arguments.item.legacyUnitIds ) : [];
-		if ( len( trim( arguments.item.legacyUnitId ?: "" ) ) ) legacyIds.append( arguments.item.legacyUnitId );
+		if ( len( safeTrim( arguments.item.legacyUnitId ?: "" ) ) ) legacyIds.append( arguments.item.legacyUnitId );
 		for ( var legacyId in legacyIds ) {
-			if ( arguments.inventoryIds.keyExists( trim( toString( legacyId ) ) ) ) return true;
+			if ( arguments.inventoryIds.keyExists( safeTrim( legacyId ) ) ) return true;
 		}
 		for ( var link in arguments.unitLinks ) {
-			if ( trim( link.targetUnitId ?: "" ) != targetId ) continue;
-			var linkedLegacyId = trim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
+			if ( safeTrim( link.targetUnitId ?: "" ) != targetId ) continue;
+			var linkedLegacyId = safeTrim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
 			if ( len( linkedLegacyId ) && arguments.inventoryIds.keyExists( linkedLegacyId ) ) return true;
-			var linkedPath = lCase( replace( trim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
+			var linkedPath = lCase( replace( safeTrim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
 			if ( len( linkedPath ) && arguments.inventoryPaths.keyExists( linkedPath ) ) return true;
 		}
 		var refs = arguments.item.evidenceRefs ?: arguments.item.evidence ?: [];
 		if ( isArray( refs ) ) {
 			for ( var ref in refs ) {
 				if ( !isStruct( ref ) ) continue;
-				var refPath = lCase( replace( trim( ref.filePath ?: ref.path ?: "" ), "\", "/", "all" ) );
+				var refPath = lCase( replace( safeTrim( ref.filePath ?: ref.path ?: "" ), "\", "/", "all" ) );
 				if ( len( refPath ) && arguments.inventoryPaths.keyExists( refPath ) ) return true;
 			}
 		}
 		return false;
 	}
 
-	private boolean function safeRelativePath( required string path ) {
-		var normalized = replace( trim( arguments.path ), "\", "/", "all" );
+	private boolean function safeRelativePath( required any path ) {
+		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
 		if ( !len( normalized ) || find( "..", normalized ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", normalized ) ) return false;
 		return true;
 	}
-	private boolean function safeRoutePath( required string path ) {
-		var normalized = replace( trim( arguments.path ), "\", "/", "all" );
+	private boolean function safeRoutePath( required any path ) {
+		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
 		return reFind( "^/", normalized ) && !find( "..", normalized ) && !reFind( "^//", normalized );
 	}
 
-	private boolean function legalTargetPath( required string path, required string runtime, required string profile ) {
+	private boolean function legalTargetPath( required any path, required string runtime, required string profile ) {
 		if ( !safeRelativePath( arguments.path ) ) return false;
-		var extension = lCase( listLast( arguments.path, "." ) );
+		var extension = lCase( listLast( scalarString( arguments.path ), "." ) );
 		if ( arguments.runtime == "boxlang" ) return [ "bx", "bxm" ].contains( extension ) && [ "boxlang", "modern" ].contains( arguments.profile ?: "modern" );
 		if ( arguments.runtime == "lucee" ) return [ "cfc", "cfm" ].contains( extension ) && [ "modern", "flat" ].contains( arguments.profile ?: "modern" );
 		return true;
 	}
 
-	private struct function validateTransitions( required any transitions, required array messages ) {
+	private struct function validateTransitions( required any transitions, required array messages, boolean softEvidence = false ) {
 		var output = { blocking: 0, warnings: 0 };
 		var previous = 0;
+		var softLevel = arguments.softEvidence ? "warning" : "blocking";
 		for ( var transition in ( isArray( arguments.transitions ) ? arguments.transitions : [] ) ) {
-			var operation = lCase( trim( transition.operation ?: transition.phase ?: "" ) );
-			if ( !variables.allowedTransitionOperations.contains( operation ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition has an invalid operation" ); output.blocking++; }
+			var operation = lCase( safeTrim( transition.operation ?: transition.phase ?: "" ) );
+			if ( !variables.allowedTransitionOperations.contains( operation ) ) {
+				// Unknown/empty ops on partial drafts are review items, not hard blockers.
+				addMessage( arguments.messages, "dbTransitions", softLevel, "Database transition has an invalid operation" );
+				if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+			}
 			var order = isNumeric( transition.order ?: "" ) ? int( transition.order ) : 0;
 			if ( order && order < previous ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition order must be monotonic" ); output.blocking++; }
 			if ( order ) previous = order;
@@ -620,12 +637,40 @@ class {
 				var transitionId = transition.id ?: transition.itemId ?: "";
 				if ( len( migrationText ) && reFindNoCase( "(?:password|passwd|api[_-]?key|authorization|private[_-]?key)\\s*[:=]", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration contains a possible secret", transitionId ); output.blocking++; }
 				if ( len( migrationPath ) && !safeRelativePath( migrationPath ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must remain inside the project", transitionId ); output.blocking++; }
-				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\.bx$", replace( migrationPath, "\", "/", "all" ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must use a cfmigrations timestamp", transitionId ); output.blocking++; }
-				if ( len( migrationText ) && !reFindNoCase( "function\s+up\s*\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing up(schema, query)", transitionId ); output.blocking++; }
-				if ( len( migrationText ) && !reFindNoCase( "function\s+down\s*\(", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration is missing down(schema, query)", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\.bx$", replace( migrationPath, "\", "/", "all" ) ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration path must use a cfmigrations timestamp", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
+				if ( len( migrationText ) && !reFindNoCase( "function\s+up\s*\(", migrationText ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration is missing up(schema, query)", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
+				if ( len( migrationText ) && !reFindNoCase( "function\s+down\s*\(", migrationText ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration is missing down(schema, query)", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
 			}
 		}
 		return output;
+	}
+
+	/**
+	 * Partial coverage / synthesized packaging should stay needs-review without
+	 * drowning the gate summary in evidence blockers. Real structural failures
+	 * (unsafe paths, secrets, query.execute) remain blocking.
+	 */
+	private boolean function isSoftEvidencePlan( required struct plan, required struct context ) {
+		if ( arguments.context.softEvidence ?: false ) return true;
+		var metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		if ( ( metadata.architectureSource ?: "" ) == "synthesized" ) return true;
+		if ( ( metadata.roadmapSource ?: "" ) == "synthesized" ) return true;
+		if ( metadata.coverageAccumulated ?: false ) return true;
+		var summary = isStruct( arguments.plan.generationSummary ?: "" ) ? arguments.plan.generationSummary : {};
+		if ( ( summary.status ?: "" ) == "partial_failure" ) return true;
+		var coverage = isStruct( arguments.plan.coverage ?: "" ) ? arguments.plan.coverage : {};
+		if ( ( coverage.complete ?: true ) == false ) return true;
+		if ( isStruct( coverage.llm ?: "" ) && ( coverage.llm.complete ?: true ) == false ) return true;
+		return false;
 	}
 
 	private string function evidenceLevel( required array messages ) {
@@ -634,4 +679,25 @@ class {
 	}
 	private string function syntaxLevel( required struct plan ) { return "syntax-unchecked"; }
 	private string function dialectLevel( required struct plan ) { return structKeyExists( arguments.plan, "dbTransitions" ) && isArray( arguments.plan.dbTransitions ) && arguments.plan.dbTransitions.len() ? "dialect-checked" : "dialect-unchecked"; }
+
+	/**
+	 * Coerce provider/shard-merged values to a single string before trim.
+	 * Arrays (common after shard merge) yield the first non-empty simple item.
+	 */
+	private string function scalarString( required any value ) {
+		if ( isNull( arguments.value ) ) return "";
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) {
+				if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			}
+			return "";
+		}
+		return "";
+	}
+
+	private string function safeTrim( required any value ) {
+		return trim( scalarString( arguments.value ) );
+	}
+
 }

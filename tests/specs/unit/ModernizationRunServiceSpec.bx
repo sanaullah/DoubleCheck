@@ -160,6 +160,104 @@ class extends="testbox.system.BaseSpec" {
 				expect( repository.getPlan( run.getId() ) ).notToBeNull();
 			} );
 
+			it( "retains a built proposal when validation throws instead of wiping the plan", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				service.inventoryService = {
+					build: ( scan ) => {
+						return {
+							noModernizationScope: false,
+							fingerprint: "inventory-fp",
+							files: [ { filePath: "legacy/index.cfm" } ],
+							units: [ { id: "legacy-index", filePath: "legacy/index.cfm" } ],
+							dependencies: [],
+							routeEvidence: [],
+							unresolved: []
+						};
+					}
+				};
+				service.schemaPackService = { discover: ( path ) => { return { coverage: "absent", fingerprint: "schema-fp" }; } };
+				service.evidenceDiscoveryService = { discover: ( path, options ) => { return { routeEvidence: [] }; } };
+				service.signalService = { build: ( inventory, schema, extra ) => { return { signals: [] }; } };
+				service.contextPackService = {
+					build: ( scan, inventory, signals, options ) => {
+						return { fingerprint: "context-fp", contexts: [], summary: { files: 1, omittedPartitions: 0 }, truncated: false };
+					}
+				};
+				service.coverageService = {
+					assess: ( scan, inventory, schema, context, llm ) => {
+						return { complete: true, status: "complete", repository: { truncation: false, modernizationLanguagesComplete: true }, llm: { complete: true, status: "complete", gaps: [] } };
+					}
+				};
+				service.proposalService = {
+					propose: ( runId, input, evidence, options ) => {
+						return {
+							ok: true,
+							partial: false,
+							errors: [],
+							plan: {
+								version: "modernization-plan-v1",
+								schemaVersion: "modernization-plan-v1",
+								metadata: { provenanceContract: { version: "modernization-provenance-v1" } },
+								coverage: evidence.coverage,
+								assumptions: [],
+								inventory: evidence.inventory,
+								schemaEvidence: evidence.schemaEvidence,
+								signals: [],
+								target: {
+									units: [ {
+										id: "accepted-target",
+										itemFingerprint: "accepted-fp",
+										targetPath: "app/handlers/Index.bx",
+										provenanceClass: "provider-suggested",
+										newProposal: true,
+										proposalReason: "scaffold"
+									} ],
+									contexts: [],
+									extracts: []
+								},
+								unitLinks: [],
+								dbFindings: [],
+								dbTransitions: [],
+								routeContracts: [],
+								roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp", unitIds: [ "accepted-target" ] } ],
+								samples: [],
+								validation: {},
+								decisions: []
+							}
+						};
+					},
+					cancelRun: ( runId ) => {}
+				};
+				service.validationService = {
+					validate: ( plan, context ) => {
+						throw( type: "Expression", message: "The input [Ljava.lang.Object;@deadbeef which is class [Ljava.lang.Object; cannot be converted to a string for trim()" );
+					}
+				};
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				var run = new tests.resources.ScriptedModernizationRun(
+					"run-validation-trim-fail",
+					"modernize",
+					getTempDirectory(),
+					{ target: { runtime: "boxlang", layoutProfile: "modern" } },
+					{ fingerprint: "input-fp" },
+					{ maxDurationMs: 900000 }
+				);
+				var result = service.execute(
+					run,
+					{ files: [ { filePath: "legacy/index.cfm", content: "index" } ], repositoryRevision: "rev-1", discoveryTruncated: false }
+				);
+				expect( result.status ).toBe( "failed" );
+				var persisted = repository.getPlan( run.getId() );
+				expect( persisted ).notToBeNull();
+				expect( ( persisted.plan.target.units ?: [] ).len() ).toBeGT( 0 );
+				expect( persisted.plan.target.units[ 1 ].id ).toBe( "accepted-target" );
+				expect( ( persisted.plan.roadmapPhases ?: [] ).len() ).toBeGT( 0 );
+				expect( persisted.plan.state ).toBe( "needs-review" );
+				expect( ( persisted.validation.ok ?: true ) ).toBeFalse();
+			} );
+
 			it( "backfills signalIds and touched tables/columns onto inventory units in the PERSISTED plan", () => {
 				var repository = new tests.resources.ScriptedModernizationRepository();
 				var service = new app.models.services.ModernizationRunService();
@@ -316,6 +414,57 @@ class extends="testbox.system.BaseSpec" {
 				expect( result.checkpoints[ 1 ].hasPayload ).toBeTrue();
 				expect( result.checkpoints[ 1 ] ).notToHaveKey( "payload" );
 				expect( len( jsonSerialize( result.checkpoints ) ) ).toBeLT( 500 );
+			} );
+
+			it( "accumulates prior continue coverage units via mergeSourceModernizeCoverage", () => {
+				var repository = new tests.resources.ScriptedModernizationRepository();
+				repository.savePlan( "source-run", {
+					target: {
+						units: [
+							{ id: "tu-prior-1", targetPath: "app/handlers/PriorOne.bx" },
+							{ id: "tu-prior-2", targetPath: "app/handlers/PriorTwo.bx" }
+						],
+						placements: [ { id: "pl-prior", placementType: "main-app", targetUnitIds: [ "tu-prior-1", "tu-prior-2" ] } ],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [ { id: "link-prior", targetUnitId: "tu-prior-1" } ],
+					routeContracts: [],
+					dbFindings: [ { id: "db-prior" } ],
+					dbTransitions: [],
+					samples: [],
+					roadmapPhases: [ { id: "phase-prior", unitIds: [ "tu-prior-1" ] } ]
+				} );
+				var service = new app.models.services.ModernizationRunService();
+				service.modernizationRepository = repository;
+				makePublic( service, "mergeSourceModernizeCoverage" );
+				var run = new tests.resources.ScriptedModernizationRun( "continue-run", "modernize", getTempDirectory(), {}, {}, {}, "source-run" );
+				var merged = service.mergeSourceModernizeCoverage( run, {
+					target: {
+						units: [
+							{ id: "tu-new", targetPath: "app/handlers/New.bx" },
+							{ id: "tu-prior-1", targetPath: "app/handlers/PriorOneUpdated.bx" }
+						],
+						placements: [ { id: "pl-new", placementType: "coldbox-module", targetUnitIds: [ "tu-new" ] } ],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [],
+					routeContracts: [],
+					dbFindings: [],
+					dbTransitions: [],
+					samples: [],
+					roadmapPhases: [ { id: "phase-new", unitIds: [ "tu-new" ] } ],
+					metadata: {}
+				} );
+				expect( merged.metadata.coverageAccumulated ).toBeTrue();
+				expect( merged.metadata.continuedFromRunId ).toBe( "source-run" );
+				expect( merged.target.units.len() ).toBe( 3 );
+				expect( merged.target.units.filter( ( item ) => item.id == "tu-prior-1" )[ 1 ].targetPath ).toBe( "app/handlers/PriorOneUpdated.bx" );
+				expect( merged.target.units.some( ( item ) => item.id == "tu-prior-2" ) ).toBeTrue();
+				expect( merged.target.units.some( ( item ) => item.id == "tu-new" ) ).toBeTrue();
+				expect( merged.dbFindings.some( ( item ) => item.id == "db-prior" ) ).toBeTrue();
+				expect( merged.roadmapPhases.len() ).toBe( 2 );
 			} );
 		} );
 	}

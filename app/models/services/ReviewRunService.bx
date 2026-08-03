@@ -164,6 +164,14 @@ class {
 							: ( structKeyExists( arguments.input, "budgets" ) && isStruct( arguments.input.budgets ) ? arguments.input.budgets : {} )
 					)
 			};
+			// Continuation waves pass concrete omitted file paths via selectedFiles
+			// (scopePaths stay directory prefixes and are capped much lower).
+			var selectedForModernize = normalizeSelectedFiles(
+				structKeyExists( arguments.input, "selectedFiles" )
+					? arguments.input.selectedFiles
+					: ( structKeyExists( modernizationInput, "selectedFiles" ) ? modernizationInput.selectedFiles : [] )
+			);
+			if ( selectedForModernize.count() ) structAppend( runInput, selectedForModernize, true );
 		} else {
 			runContract = reviewPolicyService.normalize( arguments.input );
 			runInput = normalizeSelectedFiles( arguments.input.selectedFiles ?: [] );
@@ -290,7 +298,7 @@ class {
 			return javacast( "null", "" );
 		}
 		if ( lCase( source.getRunKind() ?: "review" ) == "modernize" ) {
-			throw( type = "ValidationException", message = "Specialist follow-up is only available for Review runs" );
+			throw( type = "ValidationException", message = "Specialist follow-up is only available for Review runs. Use POST /api/v1/runs/:id/modernization/continue for omitted modernization coverage." );
 		}
 		var coverage = getResult( source.getId() ).coverage;
 		if ( !( coverage.followUp.available ?: false ) || !( coverage.followUp.roles ?: [] ).len() ) {
@@ -330,6 +338,109 @@ class {
 				}
 			);
 		return followUp;
+	}
+
+	/**
+	 * Continue a partial modernize run by analyzing omitted/failed shard paths
+	 * as a new wave. Accumulates coverage via sourceRunId decision carry-forward
+	 * and path-scoped proposal generation.
+	 */
+	any function continueModernizeScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped( arguments.id, arguments.context, arguments.projectId );
+		if ( isNull( source ) ) return javacast( "null", "" );
+		if ( lCase( source.getRunKind() ?: "review" ) != "modernize" ) {
+			throw( type = "ValidationException", message = "Modernization continue is only available for modernize runs" );
+		}
+		if ( ![ "partial", "succeeded", "failed" ].contains( lCase( source.getStatus() ?: "" ) ) ) {
+			throw( type = "ValidationException", message = "Modernization continue requires a finished run" );
+		}
+		var result = getResult( source.getId() );
+		var omittedPaths = collectModernizeContinuationPaths( result );
+		if ( !omittedPaths.len() ) {
+			throw( type = "ValidationException", message = "This modernization run has no omitted or failed shard paths to continue" );
+		}
+		var waveCap = 400;
+		if ( omittedPaths.len() > waveCap ) omittedPaths = omittedPaths.slice( 1, waveCap );
+		var priorInput = isStruct( source.getInput() ?: "" ) ? duplicate( source.getInput() ) : {};
+		// Keep directory prefixes only. Omitted FILE paths go through selectedFiles
+		// so ModernizationPolicyService's 40-entry scopePaths cap cannot truncate the wave.
+		var directoryScopes = [];
+		for ( var scopePath in ( isArray( priorInput.scopePaths ?: "" ) ? priorInput.scopePaths : [] ) ) {
+			var normalizedScope = replace( trim( toString( scopePath ) ), "\", "/", "all" );
+			if ( !len( normalizedScope ) ) continue;
+			if ( reFindNoCase( "\.(cfm|cfc|cfml|bx|bxm|bxs|js)$", normalizedScope ) ) continue;
+			directoryScopes.append( normalizedScope );
+		}
+		priorInput.scopePaths = directoryScopes;
+		structDelete( priorInput, "selectedFiles" );
+		priorInput.outcomes = isArray( priorInput.outcomes ?: "" ) ? priorInput.outcomes : [];
+		if ( !priorInput.outcomes.contains( "continue omitted modernization coverage" ) ) {
+			priorInput.outcomes.append( "continue omitted modernization coverage" );
+		}
+		var budgets = duplicate( source.getBudgets() ?: {} );
+		if ( !isNumeric( budgets.maxDurationMs ?: "" ) || val( budgets.maxDurationMs ) < 7200000 ) {
+			budgets.maxDurationMs = 7200000;
+		}
+		// Prefer enough shards to cover this wave (2 files/shard default).
+		budgets.maxApplicationShards = max( val( budgets.maxApplicationShards ?: 80 ), min( 200, ceiling( omittedPaths.len() / 2 ) ) );
+		var continuation = create(
+			{
+				runKind     : "modernize",
+				projectId   : source.getProjectId(),
+				projectPath : source.getProjectPath(),
+				mode        : source.getMode(),
+				baseRevision: source.getBaseRevision(),
+				headRevision: source.getHeadRevision(),
+				sourceRunId : source.getId(),
+				budgets     : budgets,
+				selectedFiles: omittedPaths,
+				modernization: priorInput
+			},
+			arguments.context
+		);
+		eventService.publish(
+			continuation.getId(),
+			"run.modernize-continue",
+			{
+				sourceRunId : source.getId(),
+				omittedPaths: omittedPaths.len(),
+				waveCap     : waveCap
+			}
+		);
+		return continuation;
+	}
+
+	private array function collectModernizeContinuationPaths( required struct result ) {
+		var seen = {};
+		var paths = [];
+		var appendPath = ( value ) => {
+			var candidate = trim( replace( toString( arguments.value ), "\", "/", "all" ) );
+			if ( !len( candidate ) || seen.keyExists( lCase( candidate ) ) ) return;
+			seen[ lCase( candidate ) ] = true;
+			paths.append( candidate );
+		};
+		var shards = isStruct( arguments.result.metadata ?: "" ) && isStruct( arguments.result.metadata.applicationShards ?: "" )
+			? arguments.result.metadata.applicationShards
+			: {};
+		for ( var omitted in ( isArray( shards.omittedPaths ?: "" ) ? shards.omittedPaths : [] ) ) {
+			appendPath( omitted );
+		}
+		for ( var outcome in ( isArray( shards.outcomes ?: "" ) ? shards.outcomes : [] ) ) {
+			if ( !isStruct( outcome ) ) continue;
+			var status = lCase( trim( outcome.status ?: "" ) );
+			if ( ![ "omitted", "failed" ].contains( status ) ) continue;
+			if ( isArray( outcome.paths ?: "" ) ) {
+				for ( var path in outcome.paths ) appendPath( path );
+			}
+			if ( len( trim( outcome.path ?: "" ) ) ) appendPath( outcome.path );
+		}
+		var llmOmitted = isStruct( arguments.result.coverage ?: "" ) && isStruct( arguments.result.coverage.llm ?: "" )
+			? arguments.result.coverage.llm.omittedPaths
+			: [];
+		if ( isArray( llmOmitted ) ) {
+			for ( var path in llmOmitted ) appendPath( path );
+		}
+		return paths;
 	}
 
 	void function recoverPendingRuns() {
@@ -1189,7 +1300,7 @@ class {
 			var maxTokens = isNumeric( budgetInput.maxTokens ) ? max( 256, min( 48000, int( budgetInput.maxTokens ) ) ) : 24000;
 			var maxTokensPerTask = isNumeric( budgetInput.maxTokensPerTask ) ? max( 256, min( 16000, int( budgetInput.maxTokensPerTask ) ) ) : 8000;
 			maxTokens = max( maxTokens, maxTokensPerTask );
-			var maxDuration = isNumeric( budgetInput.maxDurationMs ) ? max( 1000, min( 3600000, int( budgetInput.maxDurationMs ) ) ) : 3600000;
+			var maxDuration = isNumeric( budgetInput.maxDurationMs ) ? max( 1000, min( 7200000, int( budgetInput.maxDurationMs ) ) ) : 7200000;
 			var maxIterations = isNumeric( budgetInput.maxIterations ) || isNumeric( budgetInput.maxIterationsPerTask ) ? max( 1, min( 16, int( isNumeric( budgetInput.maxIterations ) ? budgetInput.maxIterations : budgetInput.maxIterationsPerTask ) ) ) : 2;
 			var maxTasks = isNumeric( budgetInput.maxTasks ) ? max( 1, min( 6, int( budgetInput.maxTasks ) ) ) : 4;
 			var maxToolOutput = isNumeric( budgetInput.maxToolOutputCharacters ) ? max( 1000, min( 100000, int( budgetInput.maxToolOutputCharacters ) ) ) : 48000;

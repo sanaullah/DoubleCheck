@@ -391,6 +391,138 @@ class extends="testbox.system.BaseSpec" {
 				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && ( item.level ?: "" ) == "warning" && findNoCase( "another roadmap phase", item.message ?: "" ) ) ).toBeTrue();
 				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && ( item.level ?: "" ) == "blocking" && findNoCase( "not among this phase's own units", item.message ?: "" ) ) ).toBeFalse();
 			} );
+
+			it( "downgrades incomplete dbTransition evidence to warning on synthesized partial plans", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, architectureSource: "synthesized", roadmapSource: "synthesized" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [],
+					dbFindings: [ { id: "finding-1", itemFingerprint: "finding-fp" } ],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp", dbFindingId: "finding-1",
+						operation: "drop-table", order: 1
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: [],
+					generationSummary: { status: "partial_failure" }
+				} );
+				expect( report.ok ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "invalid operation", item.message ?: "" ) && ( item.level ?: "" ) == "warning" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "no evidence references", item.message ?: "" ) && ( item.level ?: "" ) == "warning" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "invalid operation", item.message ?: "" ) && ( item.level ?: "" ) == "blocking" ) ).toBeFalse();
+			} );
+
+			it( "still blocks query.execute secrets on soft-evidence plans", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { architectureSource: "synthesized" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp",
+						operation: "expand", order: 1, evidenceRefs: [ "schema.sql##L1" ],
+						sampleMigration: "component { function up( schema, query ) { query.execute( ""ALTER TABLE test ADD x INT"" ); } function down( schema, query ) {} }"
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => findNoCase( "must not execute query text", item.message ?: "" ) && ( item.level ?: "" ) == "blocking" ) ).toBeTrue();
+			} );
+
+			it( "does not throw when path/id/evidence fields are arrays after shard merge", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1",
+					schemaVersion: [ "modernization-plan-v2", "modernization-plan-v2" ],
+					metadata: {
+						runtime: { runtime: [ "boxlang", "boxlang" ] },
+						targetProfile: [ "modern" ],
+						architectureSource: "synthesized",
+						provenanceContract: { version: [ "modernization-provenance-v1" ] }
+					},
+					coverage: { complete: false },
+					assumptions: [],
+					signals: [],
+					inventory: { units: [ { id: [ "legacy-health" ], filePath: [ "legacy/health.cfm" ] } ] },
+					schemaEvidence: {},
+					target: {
+						units: [ {
+							id: [ "target-health", "target-health" ],
+							itemId: [ "target-health" ],
+							itemFingerprint: [ "target-fp" ],
+							targetPath: [ "app/handlers/Health.bx", "app/handlers/Health.bx" ],
+							pathHint: [ "app/handlers/Health.bx" ],
+							sourcePath: [ "legacy/health.cfm" ],
+							provenanceClass: [ "provider-suggested" ],
+							proposalReason: [ "scaffold" ],
+							newProposal: true,
+							evidenceRefs: [ { filePath: [ "legacy/health.cfm" ] } ]
+						} ],
+						placements: [ {
+							id: [ "placement-main" ],
+							itemFingerprint: [ "placement-fp" ],
+							placementType: [ "main-app" ],
+							targetUnitIds: [ "target-health" ],
+							evidenceRefs: [ { filePath: "legacy/health.cfm" } ],
+							provenanceClass: [ "deterministically-derived" ],
+							gates: [ { id: [ "architecture" ], status: [ "pass" ] } ]
+						} ]
+					},
+					unitLinks: [ {
+						id: [ "link-health" ],
+						itemFingerprint: [ "link-fp" ],
+						legacyUnitId: [ "legacy-health" ],
+						targetUnitId: [ "target-health" ],
+						sourcePath: [ "legacy/health.cfm" ],
+						provenanceClass: [ "provider-suggested" ],
+						evidenceRefs: [ { filePath: [ "legacy/health.cfm" ] } ]
+					} ],
+					dbFindings: [],
+					dbTransitions: [],
+					routeContracts: [ {
+						id: [ "route-1" ],
+						itemFingerprint: [ "route-fp" ],
+						method: [ "GET" ],
+						path: [ "/health" ],
+						targetUnitId: [ "target-health" ],
+						unitLinkId: [ "link-health" ],
+						request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {},
+						provenanceClass: [ "provider-suggested" ],
+						evidence: [ { filePath: [ "legacy/health.cfm" ] } ]
+					} ],
+					roadmapPhases: [ {
+						id: [ "phase-1" ],
+						itemFingerprint: [ "phase-fp" ],
+						unitIds: [ "target-health" ],
+						routeIds: [ "route-1" ],
+						provenanceClass: [ "provider-suggested" ],
+						classification: [ "migrate" ],
+						wave: [ 1 ],
+						exitCriteria: "done",
+						rollback: "revert",
+						parityIntent: "match"
+					} ],
+					samples: [],
+					validation: {},
+					decisions: []
+				};
+				var report = "";
+				try {
+					report = service.validate( plan, { inventory: plan.inventory } );
+				} catch ( any error ) {
+					fail( "validate threw on array-valued fields: #error.message#" );
+				}
+				expect( isStruct( report ) ).toBeTrue();
+				expect( structKeyExists( report, "ok" ) ).toBeTrue();
+				expect( structKeyExists( report, "blocking" ) ).toBeTrue();
+				expect( structKeyExists( report, "messages" ) ).toBeTrue();
+				expect( isArray( report.messages ) ).toBeTrue();
+				expect( structKeyExists( report, "validationLevel" ) ).toBeTrue();
+			} );
 		} );
 	}
 }

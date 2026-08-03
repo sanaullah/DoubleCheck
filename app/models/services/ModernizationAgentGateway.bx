@@ -174,7 +174,9 @@ class {
 					promptProvenance: isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {}
 				};
 				lastDiagnostics = exceptionDiagnostics( error );
+				if ( len( trim( classified.diagnosticExcerpt ?: "" ) ) ) lastDiagnostics.excerpt = classified.diagnosticExcerpt;
 				if ( lastDiagnostics.count() ) errorObservation.fit = duplicate( lastDiagnostics );
+				if ( len( trim( classified.diagnosticExcerpt ?: "" ) ) ) errorObservation.diagnosticExcerpt = classified.diagnosticExcerpt;
 				emitObservation( arguments.options, errorObservation );
 				try {
 					var errorMsg = "Modernize provider error runId=#arguments.runId# role=#( arguments.options.role ?: '' )# attempt=#( attempt + 1 )# errorType=#lastErrorType# error=#left( lastError, 240 )#";
@@ -185,6 +187,22 @@ class {
 				// the same oversized request will time out again. Fail with a typed
 				// request_timeout instead of mislabeling the body as truncated JSON.
 				if ( lastErrorType == "request_timeout" ) break;
+				if ( lastErrorType == "empty_provider_response" ) break;
+				// Architecture packaging often fails schema maxItems even when the
+				// payload is salvageable after compaction — accept compacted value.
+				if ( canSalvageArchitectureValidation( error, schemaId ) ) {
+					var salvaged = salvageArchitecturePayload( error, schemaId, activeRequest, arguments.options );
+					if ( isStruct( salvaged ) ) {
+						payload = salvaged;
+						var usageSalvage = normalizeUsage( {}, activeRequest, payload );
+						var costSalvage = estimateCost( resolved, usageSalvage );
+						spentUsd += costSalvage;
+						emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usageSalvage, salvaged: true } );
+						var salvageProvenance = isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {};
+						salvageProvenance.architectureSalvaged = true;
+						return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usageSalvage, promptProvenance: salvageProvenance };
+					}
+				}
 				if ( attempt < attemptLimit ) {
 					if ( isStruct( error.data ?: "" ) && isArray( error.data.reasonCodes ?: "" ) && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.validationReasonCodes = duplicate( error.data.reasonCodes );
 					if ( isRepairableOutputError( error ) ) {
@@ -250,26 +268,49 @@ class {
 	}
 
 	private struct function classifyProviderError( required any error ) {
-		var raw = secretRedactionService.redactText( arguments.error.message ?: "Provider request failed" );
+		var rawMessage = toString( arguments.error.message ?: "Provider request failed" );
+		var raw = secretRedactionService.redactText( len( trim( rawMessage ) ) ? rawMessage : "Provider request failed" );
+		var excerpt = left( reReplace( toString( raw ?: "" ), "\s+", " ", "all" ), 200 );
+		if ( isEmptyProviderContentError( arguments.error ) ) {
+			return {
+				errorType: "empty_provider_response",
+				retryable: true,
+				message: "Provider returned empty or null content.",
+				diagnosticExcerpt: excerpt
+			};
+		}
 		if ( isTransportTimeoutError( arguments.error ) ) {
 			return {
 				errorType: "request_timeout",
 				retryable: true,
-				message: "The proposal agent exceeded its execution limit (provider request timed out). " & left( raw, 200 )
+				message: "Provider request timed out before a complete JSON response arrived.",
+				diagnosticExcerpt: excerpt
 			};
 		}
 		if ( isTruncatedJsonError( arguments.error ) ) {
 			return {
 				errorType: "truncated_json",
 				retryable: true,
-				message: "Provider JSON was truncated mid-object (raise max tokens or keep the first slice small). " & left( raw, 240 )
+				message: "Provider JSON was truncated mid-object (raise max tokens or keep the first slice small).",
+				diagnosticExcerpt: excerpt
 			};
 		}
 		return {
 			errorType: "provider_error",
 			retryable: true,
-			message: left( raw, 500 )
+			message: left( toString( raw ?: "Provider request failed" ), 500 ),
+			diagnosticExcerpt: excerpt
 		};
+	}
+
+	private boolean function isEmptyProviderContentError( required any error ) {
+		var message = toString( arguments.error.message ?: "" );
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		if ( findNoCase( "empty or null content", message ) ) return true;
+		if ( findNoCase( "ModernizationProviderResponseException", typeName ) && findNoCase( "empty", message ) ) return true;
+		// bx-ai extractFromCodeBlock NPE when provider body is null.
+		if ( findNoCase( "trim()", message ) && findNoCase( "null", message ) ) return true;
+		return false;
 	}
 
 	/**
@@ -280,11 +321,24 @@ class {
 	private boolean function isTransportTimeoutError( required any error ) {
 		var message = trim( toString( arguments.error.message ?: "" ) );
 		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		if ( findNoCase( "ModernizationProviderTimeoutException", typeName ) ) return true;
 		if ( findNoCase( "timeout", typeName ) || findNoCase( "deadlineexceeded", typeName ) ) return true;
-		if ( reFindNoCase( "^\s*request\s+timeout\s*$", message ) ) return true;
-		if ( findNoCase( "gateway timeout", message ) || findNoCase( "gateway time-out", message ) ) return true;
+		if ( isTimeoutBody( message ) ) return true;
+		// BoxFuture/aiChat often surfaces java.util.concurrent.TimeoutException without "Request Timeout" text.
+		if ( findNoCase( "TimeoutException", message ) || findNoCase( "timed out", message ) ) return true;
 		if ( findNoCase( "failed to parse json", message ) && findNoCase( "request timeout", message ) ) return true;
 		if ( findNoCase( "parse json", message ) && reFindNoCase( "request\s+timeout", message ) ) return true;
+		if ( findNoCase( "deserializing", message ) && findNoCase( "request timeout", message ) ) return true;
+		return false;
+	}
+
+	private boolean function isTimeoutBody( required any text ) {
+		var body = trim( toString( arguments.text ?: "" ) );
+		if ( !len( body ) ) return false;
+		if ( reFindNoCase( "^\s*request\s+timeout\s*$", body ) ) return true;
+		if ( findNoCase( "gateway timeout", body ) || findNoCase( "gateway time-out", body ) ) return true;
+		if ( findNoCase( "504 gateway", body ) || findNoCase( "504 Gateway", body ) ) return true;
+		if ( findNoCase( "<html", body ) && ( findNoCase( "timeout", body ) || findNoCase( "504", body ) ) ) return true;
 		return false;
 	}
 
@@ -298,8 +352,32 @@ class {
 		return false;
 	}
 
+	private boolean function canSalvageArchitectureValidation( required any error, required string schemaId ) {
+		if ( arguments.schemaId != "modernization-architecture-v2" ) return false;
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		if ( findNoCase( "promptoutputvalidation", typeName ) == 0 ) return false;
+		return isStruct( arguments.error.data ?: "" );
+	}
+
+	private any function salvageArchitecturePayload( required any error, required string schemaId, required struct request, required struct options ) {
+		try {
+			var raw = isStruct( arguments.error.data.value ?: "" ) ? arguments.error.data.value : {};
+			if ( !isStruct( raw ) || !raw.count() ) return javacast( "null", "" );
+			var accepted = getValidator().sanitize( raw, arguments.schemaId, validationContext( arguments.request, arguments.options ) );
+			if ( ( accepted.valid ?: false ) && isStruct( accepted.value ?: "" ) ) return accepted.value;
+			// Soft-accept compacted placements when only residual maxItems/length noise remains.
+			if ( isStruct( accepted.value ?: "" ) && isArray( accepted.value.placements ?: "" ) && accepted.value.placements.len() ) {
+				var reasonCodes = isArray( accepted.reasonCodes ?: "" ) ? accepted.reasonCodes : [];
+				var onlySizeNoise = reasonCodes.len() && reasonCodes.every( ( code ) => [ "max-items", "max-length", "maxLength" ].contains( lCase( toString( code ) ) ) );
+				if ( onlySizeNoise || reasonCodes.len() == 0 ) return accepted.value;
+			}
+		} catch ( any ignored ) {}
+		return javacast( "null", "" );
+	}
+
 	private boolean function isRepairableOutputError( required any error ) {
 		if ( isTransportTimeoutError( arguments.error ) ) return false;
+		if ( isEmptyProviderContentError( arguments.error ) ) return false;
 		var typeName = lCase( toString( arguments.error.type ?: "" ) );
 		return isTruncatedJsonError( arguments.error ) || findNoCase( "promptoutputvalidation", typeName ) > 0 || findNoCase( "providerresponse", typeName ) > 0;
 	}
@@ -607,14 +685,30 @@ class {
 			throw( type = "ModernizationProviderResponseException", message = "Provider returned an empty response" );
 		}
 		if ( isStruct( arguments.response ) ) {
+			if ( structKeyExists( arguments.response, "statusCode" ) && isNumeric( arguments.response.statusCode ) ) {
+				var statusCode = int( arguments.response.statusCode );
+				if ( statusCode == 408 || statusCode == 504 || statusCode == 524 ) {
+					throw( type = "ModernizationProviderTimeoutException", message = "Request Timeout" );
+				}
+				if ( statusCode >= 400 ) {
+					var errBody = "";
+					if ( structKeyExists( arguments.response, "content" ) ) errBody = left( trim( toString( arguments.response.content ) ), 200 );
+					throw(
+						type = "ModernizationProviderResponseException",
+						message = "Provider HTTP #statusCode#" & ( len( errBody ) ? ( ": " & errBody ) : "" )
+					);
+				}
+			}
 			if ( structKeyExists( arguments.response, "content" ) && isSimpleValue( arguments.response.content ) ) return normalizeResponse( arguments.response.content );
 			return arguments.response;
 		}
 		var text = trim( toString( arguments.response ) );
-		if ( !len( text ) ) return {};
-		// Detect gateway/proxy plain-text timeouts before JSON parsing so callers
-		// see request_timeout instead of a misleading parse failure.
-		if ( reFindNoCase( "^\s*request\s+timeout\s*$", text ) || findNoCase( "gateway timeout", text ) || findNoCase( "504 gateway time-out", text ) ) {
+		if ( !len( text ) ) {
+			throw( type = "ModernizationProviderResponseException", message = "Provider returned an empty response" );
+		}
+		// Detect gateway/proxy plain-text or HTML timeouts before JSON parsing so
+		// callers see request_timeout instead of a misleading parse failure.
+		if ( isTimeoutBody( text ) ) {
 			throw( type = "ModernizationProviderTimeoutException", message = "Request Timeout" );
 		}
 		// Strip the optional Markdown fence without relying on a backslash-heavy
@@ -622,7 +716,24 @@ class {
 		text = replaceNoCase( text, "```json", "", "all" );
 		text = replace( text, "```", "", "all" );
 		text = trim( text );
-		return jsonDeserialize( text );
+		try {
+			return jsonDeserialize( text );
+		} catch ( any parseError ) {
+			if ( isTimeoutBody( text ) || ( findNoCase( "request timeout", text ) && findNoCase( "parse", parseError.message ?: "" ) ) ) {
+				throw( type = "ModernizationProviderTimeoutException", message = "Request Timeout" );
+			}
+			var safe = left( reReplace( secretRedactionService.redactText( text ), "\s+", " ", "all" ), 180 );
+			if ( findNoCase( "unexpected end", parseError.message ?: "" ) || findNoCase( "unterminated", parseError.message ?: "" ) || left( trim( text ), 1 ) == "{" ) {
+				throw(
+					type = "ModernizationProviderResponseException",
+					message = "Provider JSON was truncated or incomplete. Excerpt: #safe#"
+				);
+			}
+			throw(
+				type = "ModernizationProviderResponseException",
+				message = "Provider returned non-JSON content. Excerpt: #safe#"
+			);
+		}
 	}
 
 	private struct function extractUsage( required any response ) {

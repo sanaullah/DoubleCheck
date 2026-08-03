@@ -50,6 +50,10 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
 			validation: {}, decisions: [], errors: [], checkpoints: []
 		};
+		// Declared outside try so a post-proposal failure can retain the built plan
+		// instead of wiping it with an empty shell on persist-on-fail.
+		var plan = {};
+		var proposal = {};
 		try {
 			checkCancellation( arguments.callbacks );
 			emit( arguments.callbacks, 25, "modernization-inventory", "Cataloging CFML units and legacy evidence" );
@@ -189,7 +193,7 @@ property name="modernizationGateService" inject="ModernizationGateService";
 					};
 				}
 			}
-			var proposal = isStruct( proposalCheckpointValue ) && structKeyExists( proposalCheckpointValue, "plan" )
+			proposal = isStruct( proposalCheckpointValue ) && structKeyExists( proposalCheckpointValue, "plan" )
 				? proposalCheckpointValue
 				: proposalService.propose(
 					runId,
@@ -234,7 +238,8 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				);
 				return terminal( result, "failed", "Modernization proposal was not generated", "failed" );
 			}
-			var plan = proposal.plan ?: {};
+			plan = proposal.plan ?: {};
+			plan = mergeSourceModernizeCoverage( arguments.run, plan );
 			var placementService = placementServiceInstance();
 			var gateService = gateServiceInstance();
 			// Promote the provider's legacy context/extract vocabulary to the
@@ -377,16 +382,20 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				);
 			} catch ( any ignored ) {}
 			result.errors.append( { stage: "modernization", message: failureMessage } );
-			// Preserve the concrete failure in the durable plan artifact. Without
-			// this, the worker can only report the generic status and the UI cannot
-			// distinguish an indexing/parser failure from a provider failure.
+			// Prefer retaining a successfully built proposal (in-memory, already
+			// persisted, or proposal checkpoint) when a later stage throws. An empty
+			// shell wipe discards hours of shard work and forces a full re-run.
 			try {
+				var failureValidation = { blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors };
+				var retainedPlan = retainPlanAfterFailure( runId, plan, proposal, result, failureMessage );
 				modernizationRepository.savePlan(
 					runId,
-					{ version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: { runId: runId }, coverage: result.coverage ?: {}, inventory: result.inventory ?: {}, schemaEvidence: result.schemaEvidence ?: {}, signals: result.signals ?: [], target: result.target ?: { units: [] }, unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [], validation: { blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors }, decisions: [], errors: result.errors },
-					{ blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors },
-					result.coverage ?: {}
+					retainedPlan,
+					isStruct( retainedPlan.validation ?: "" ) ? retainedPlan.validation : failureValidation,
+					retainedPlan.coverage ?: result.coverage ?: {}
 				);
+				if ( isStruct( retainedPlan.target ?: "" ) ) result = flattenPlan( retainedPlan, result );
+				result.validation = retainedPlan.validation ?: failureValidation;
 			} catch ( any ignored ) {}
 			return terminal( result, "failed", "Modernization run failed: " & failureMessage, "needs-review" );
 		}
@@ -517,6 +526,106 @@ property name="modernizationGateService" inject="ModernizationGateService";
 		for ( var key in arguments.plan.keyArray() ) arguments.current[ key ] = arguments.plan[ key ];
 		return arguments.current;
 	}
+
+	/**
+	 * Prefer an in-memory post-proposal plan, then a durable save, then the
+	 * proposal checkpoint. Only fall back to an empty shell when nothing usable
+	 * was produced — validation/gate exceptions must not wipe shard work.
+	 */
+	private struct function retainPlanAfterFailure(
+		required string runId,
+		required any plan,
+		required any proposal,
+		required struct result,
+		required string failureMessage
+	) {
+		var failureValidation = {
+			blocking: 1,
+			warnings: 0,
+			ok: false,
+			validationLevel: "blocking",
+			messages: arguments.result.errors ?: [ { stage: "modernization", message: arguments.failureMessage } ]
+		};
+		var candidate = {};
+		if ( planHasRetainedContent( arguments.plan ) ) {
+			candidate = duplicate( arguments.plan );
+		} else {
+			try {
+				var existing = modernizationRepository.getPlan( arguments.runId );
+				if ( !isNull( existing ) && planHasRetainedContent( existing.plan ?: {} ) ) {
+					candidate = duplicate( existing.plan );
+					if ( !isStruct( candidate.validation ?: "" ) && isStruct( existing.validation ?: "" ) ) {
+						candidate.validation = duplicate( existing.validation );
+					}
+				}
+			} catch ( any ignored ) {}
+		}
+		if ( !planHasRetainedContent( candidate ) && isStruct( arguments.proposal ?: "" ) && planHasRetainedContent( arguments.proposal.plan ?: {} ) ) {
+			candidate = duplicate( arguments.proposal.plan );
+		}
+		if ( !planHasRetainedContent( candidate ) ) {
+			try {
+				var checkpoints = modernizationRepository.getCheckpoints( arguments.runId );
+				for ( var checkpointItem in checkpoints ) {
+					if ( ( checkpointItem.stage ?: "" ) != "proposal" ) continue;
+					var payload = checkpointItem.payload ?: {};
+					var value = structKeyExists( payload, "value" ) ? payload.value : payload;
+					if ( isStruct( value ) && planHasRetainedContent( value.plan ?: {} ) ) {
+						candidate = duplicate( value.plan );
+						break;
+					}
+				}
+			} catch ( any ignored ) {}
+		}
+		if ( !planHasRetainedContent( candidate ) ) {
+			return {
+				version: "modernization-plan-v1",
+				schemaVersion: "modernization-plan-v1",
+				state: "needs-review",
+				metadata: { runId: arguments.runId },
+				coverage: arguments.result.coverage ?: {},
+				inventory: arguments.result.inventory ?: {},
+				schemaEvidence: arguments.result.schemaEvidence ?: {},
+				signals: arguments.result.signals ?: [],
+				target: arguments.result.target ?: { units: [] },
+				unitLinks: [],
+				dbFindings: [],
+				dbTransitions: [],
+				routeContracts: [],
+				roadmapPhases: [],
+				samples: [],
+				validation: failureValidation,
+				decisions: [],
+				errors: arguments.result.errors ?: []
+			};
+		}
+		candidate.state = "needs-review";
+		candidate.metadata = isStruct( candidate.metadata ?: "" ) ? candidate.metadata : {};
+		candidate.metadata.runId = arguments.runId;
+		candidate.coverage = isStruct( candidate.coverage ?: "" ) ? candidate.coverage : ( arguments.result.coverage ?: {} );
+		candidate.validation = failureValidation;
+		candidate.generationErrors = isArray( candidate.generationErrors ?: "" ) ? candidate.generationErrors : [];
+		candidate.generationErrors.append( {
+			stage: "modernization-validation",
+			message: arguments.failureMessage,
+			provenanceClass: "not-observed"
+		} );
+		candidate.errors = isArray( candidate.errors ?: "" ) ? candidate.errors : [];
+		candidate.errors.append( arguments.result.errors ?: [], true );
+		return candidate;
+	}
+
+	private boolean function planHasRetainedContent( required any plan ) {
+		if ( !isStruct( arguments.plan ) ) return false;
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		if ( isArray( target.units ?: "" ) && target.units.len() ) return true;
+		if ( isArray( target.placements ?: "" ) && target.placements.len() ) return true;
+		if ( isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len() ) return true;
+		if ( isArray( arguments.plan.unitLinks ?: "" ) && arguments.plan.unitLinks.len() ) return true;
+		if ( isArray( arguments.plan.routeContracts ?: "" ) && arguments.plan.routeContracts.len() ) return true;
+		return false;
+	}
+
 	private void function checkpoint(required string runId, required string stage, required any payload, required numeric progress, struct provenance = {}) {
 			var status = checkpointStatusForPayload( arguments.payload );
 			arguments.provenance.pipelineContractVersion = variables.pipelineContractVersion;
@@ -581,6 +690,57 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			} );
 		}
 		modernizationDecisionService.refreshState( arguments.run.getId() );
+	}
+
+	/**
+	 * When continuing omitted coverage, keep prior accepted units/placements/
+	 * routes so the estate plan accumulates across waves instead of replacing.
+	 */
+	private struct function mergeSourceModernizeCoverage( required any run, required struct plan ) {
+		var sourceRunId = trim( arguments.run.getSourceRunId() ?: "" );
+		if ( !len( sourceRunId ) ) return arguments.plan;
+		var sourceRecord = modernizationRepository.getPlan( sourceRunId );
+		if ( isNull( sourceRecord ) || !isStruct( sourceRecord ) ) return arguments.plan;
+		var sourcePlan = isStruct( sourceRecord.plan ?: "" ) ? sourceRecord.plan : ( isStruct( sourceRecord ) ? sourceRecord : {} );
+		if ( !isStruct( sourcePlan.target ?: "" ) ) return arguments.plan;
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], placements: [], contexts: [], extracts: [] };
+		arguments.plan.target.units = mergeById( isArray( sourcePlan.target.units ?: "" ) ? sourcePlan.target.units : [], isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] );
+		arguments.plan.target.placements = mergeById( isArray( sourcePlan.target.placements ?: "" ) ? sourcePlan.target.placements : [], isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [] );
+		arguments.plan.target.contexts = mergeById( isArray( sourcePlan.target.contexts ?: "" ) ? sourcePlan.target.contexts : [], isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [] );
+		arguments.plan.target.extracts = mergeById( isArray( sourcePlan.target.extracts ?: "" ) ? sourcePlan.target.extracts : [], isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [] );
+		arguments.plan.unitLinks = mergeById( isArray( sourcePlan.unitLinks ?: "" ) ? sourcePlan.unitLinks : [], isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] );
+		arguments.plan.routeContracts = mergeById( isArray( sourcePlan.routeContracts ?: "" ) ? sourcePlan.routeContracts : [], isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] );
+		arguments.plan.dbFindings = mergeById( isArray( sourcePlan.dbFindings ?: "" ) ? sourcePlan.dbFindings : [], isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] );
+		arguments.plan.dbTransitions = mergeById( isArray( sourcePlan.dbTransitions ?: "" ) ? sourcePlan.dbTransitions : [], isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] );
+		arguments.plan.samples = mergeById( isArray( sourcePlan.samples ?: "" ) ? sourcePlan.samples : [], isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] );
+		arguments.plan.roadmapPhases = mergeById( isArray( sourcePlan.roadmapPhases ?: "" ) ? sourcePlan.roadmapPhases : [], isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.continuedFromRunId = sourceRunId;
+		arguments.plan.metadata.coverageAccumulated = true;
+		var priorUnits = isArray( sourcePlan.target.units ?: "" ) ? sourcePlan.target.units.len() : 0;
+		var nextUnits = isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units.len() : 0;
+		arguments.plan.metadata.accumulatedUnitCount = nextUnits;
+		arguments.plan.metadata.priorUnitCount = priorUnits;
+		return arguments.plan;
+	}
+
+	private array function mergeById( required array prior, required array next ) {
+		var output = [];
+		var seen = {};
+		var appendItem = ( item ) => {
+			if ( !isStruct( arguments.item ) ) return;
+			var key = trim( arguments.item.id ?: arguments.item.itemId ?: "" );
+			if ( !len( key ) ) {
+				output.append( arguments.item );
+				return;
+			}
+			if ( seen.keyExists( lCase( key ) ) ) return;
+			seen[ lCase( key ) ] = true;
+			output.append( arguments.item );
+		};
+		for ( var item in arguments.next ) appendItem( item );
+		for ( var item in arguments.prior ) appendItem( item );
+		return output;
 	}
 	private any function findPlanItem( required struct plan, required string itemType, required string itemId ) {
 		var map = { "target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts", "db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples", "placement": "target.placements" };

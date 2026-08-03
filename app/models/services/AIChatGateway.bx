@@ -13,10 +13,43 @@ class {
 	}
 
 	any function chat( required any prompt, required struct params, required struct options ) {
-		return aiChat(
-			arguments.prompt,
-			arguments.params,
-			arguments.options
-		);
+		try {
+			var response = aiChat(
+				arguments.prompt,
+				arguments.params,
+				arguments.options
+			);
+			return normalizeProviderResponse( response );
+		} catch ( any error ) {
+			// bx-ai BaseService.extractFromCodeBlock calls content.trim() and NPEs when
+			// the provider returns a null/missing body. Map that to a typed empty response.
+			if ( isNullContentTrimError( error ) ) {
+				throw(
+					type = "ModernizationProviderResponseException",
+					message = "Provider returned empty or null content"
+				);
+			}
+			rethrow;
+		}
+	}
+
+	/**
+	 * Guard null/empty provider envelopes before callers deserialize or trim.
+	 */
+	private any function normalizeProviderResponse( required any response ) {
+		if ( isNull( arguments.response ?: javacast( "null", "" ) ) ) {
+			throw( type = "ModernizationProviderResponseException", message = "Provider returned empty or null content" );
+		}
+		if ( isStruct( arguments.response ) && structKeyExists( arguments.response, "content" ) ) {
+			if ( isNull( arguments.response.content ?: javacast( "null", "" ) ) ) {
+				throw( type = "ModernizationProviderResponseException", message = "Provider returned empty or null content" );
+			}
+		}
+		return arguments.response;
+	}
+
+	private boolean function isNullContentTrimError( required any error ) {
+		var message = toString( arguments.error.message ?: "" );
+		return findNoCase( "trim()", message ) > 0 && findNoCase( "null", message ) > 0;
 	}
 }

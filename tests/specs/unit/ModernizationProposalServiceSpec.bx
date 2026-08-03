@@ -155,7 +155,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( built.placements.len() ).toBeGTE( 2 );
 				var types = built.placements.map( ( item ) => item.placementType ?: "" );
 				expect( types.toList() ).toInclude( "coldbox-module" );
-				expect( types.toList() ).toInclude( "main-app" );
+				expect( types.toList() ).toInclude( "background-worker" );
 				var module = built.placements.filter( ( item ) => ( item.placementType ?: "" ) == "coldbox-module" )[ 1 ];
 				expect( module.targetUnitIds ).toInclude( "blc-1" );
 				expect( module.targetUnitIds ).toInclude( "blc-2" );
@@ -204,7 +204,7 @@ class extends="testbox.system.BaseSpec" {
 				var byId = {};
 				for ( var placement in plan.target.placements ) byId[ placement.id ] = placement;
 				expect( byId[ "p-temp" ].placementType ).toBe( "main-app" );
-				expect( byId[ "p-sched" ].placementType ).toBe( "main-app" );
+				expect( byId[ "p-sched" ].placementType ).toBe( "background-worker" );
 				expect( byId[ "p-blc" ].placementType ).toBe( "coldbox-module" );
 				expect( byId[ "p-orders" ].placementType ).toBe( "external-service" );
 			} );
@@ -397,6 +397,151 @@ class extends="testbox.system.BaseSpec" {
 				var result = service.propose( "run-layout", { target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 10000, maxIterations: 2 } }, { coverage: {}, inventory: {}, schemaEvidence: {} } );
 				expect( result.plan.target.units[ 1 ].sourcePath ).toBe( "dashboard/index.cfm" );
 				expect( result.plan.target.units[ 1 ].targetPath ).toBe( "app/handlers/index.bx" );
+			} );
+
+			it( "coerces array-valued sourcePath during packaging instead of crashing trim", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": {
+						targetUnits: [
+							{
+								id: "scheduled-handler",
+								targetPath: "app/handlers/Scheduled.bx",
+								sourcePath: [
+									"jobs/getInventory.cfm",
+									"jobs/getOrderInfo.cfm"
+								],
+								layer: "handler",
+								purpose: "scheduled jobs"
+							},
+							{
+								id: "bridge-svc",
+								targetPath: "app/models/services/BridgeService.bx",
+								sourcePath: "bridge/Service.cfc",
+								layer: "service"
+							}
+						],
+						unitLinks: [],
+						routeContracts: [],
+						contexts: [],
+						extracts: [],
+						samples: []
+					},
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var result = service.propose(
+					"run-trim-array",
+					{ target: { runtime: "boxlang", layoutProfile: "modern" }, budgets: { maxTasks: 3, maxDurationMs: 900000, maxIterations: 2 } },
+					{ coverage: {}, inventory: {}, schemaEvidence: {} }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.target.units.len() ).toBeGTE( 2 );
+				var scheduled = result.plan.target.units.filter( ( item ) => ( item.id ?: "" ) == "scheduled-handler" );
+				expect( scheduled ).notToBeEmpty();
+				expect( scheduled[ 1 ].sourcePath ).toBe( "jobs/getInventory.cfm" );
+				expect( isSimpleValue( scheduled[ 1 ].sourcePath ) ).toBeTrue();
+				expect( len( trim( result.plan.metadata.architectureSource ?: "" ) ) ).toBeGTE( 1 );
+				expect(
+					( isArray( result.plan.target.placements ?: "" ) && result.plan.target.placements.len() )
+					|| ( isArray( result.plan.target.contexts ?: "" ) && result.plan.target.contexts.len() )
+				).toBeTrue();
+				expect( isArray( result.plan.roadmapPhases ?: "" ) && result.plan.roadmapPhases.len() ).toBeTrue();
+			} );
+
+			it( "continues packaging when some shards fail with empty provider content", () => {
+				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {
+					"modernization-application": [
+						{
+							targetUnits: [
+								{
+									id: "accepted-array-path",
+									targetPath: "app/handlers/Accepted.bx",
+									sourcePath: [ "accepted/one.cfm", "accepted/two.cfm" ],
+									layer: "handler"
+								}
+							],
+							unitLinks: [],
+							routeContracts: [],
+							contexts: [],
+							extracts: [],
+							samples: []
+						},
+						{ throw: true, message: "Provider returned empty or null content" },
+						{
+							targetUnits: [
+								{
+									id: "accepted-scalar",
+									targetPath: "app/models/services/AcceptedService.bx",
+									sourcePath: "model/AcceptedService.cfc",
+									layer: "service"
+								}
+							],
+							unitLinks: [],
+							routeContracts: [],
+							contexts: [],
+							extracts: [],
+							samples: []
+						}
+					],
+					"modernization-database": { dbFindings: [], dbTransitions: [], samples: [] },
+					"modernization-architecture": { contexts: [], extracts: [] },
+					"modernization-roadmap": { roadmapPhases: [], assumptions: [], samples: [] }
+				} );
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentFactory = new app.models.services.ModernizationAgentFactory();
+				service.agentGateway = gateway;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				var evidence = {
+					inventory: {
+						units: [
+							{ id: "u1", filePath: "accepted/one.cfm" },
+							{ id: "u2", filePath: "accepted/two.cfm" },
+							{ id: "u3", filePath: "failed/a.cfm" },
+							{ id: "u4", filePath: "failed/b.cfm" },
+							{ id: "u5", filePath: "model/AcceptedService.cfc" },
+							{ id: "u6", filePath: "model/Other.cfc" }
+						],
+						routeEvidence: [],
+						dependencies: [],
+						unresolved: []
+					},
+					coverage: {},
+					schemaEvidence: {}
+				};
+				var result = service.propose(
+					"run-mixed-empty-shards",
+					{
+						target: { runtime: "boxlang", layoutProfile: "modern" },
+						budgets: {
+							maxTasks: 3,
+							maxDurationMs: 900000,
+							maxIterations: 2,
+							maxApplicationShards: 3,
+							applicationShardSize: 2,
+							applicationShardConcurrency: 3
+						}
+					},
+					evidence
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.plan.metadata.applicationShards.accepted ).toBe( 2 );
+				expect( result.plan.metadata.applicationShards.failed ).toBe( 1 );
+				expect( result.errors.filter( ( item ) => findNoCase( "empty", item.message ?: "" ) ).len() ).toBeGTE( 1 );
+				expect( result.plan.target.units.filter( ( item ) => ( item.id ?: "" ) == "accepted-array-path" ) ).notToBeEmpty();
+				expect( result.plan.target.units.filter( ( item ) => ( item.id ?: "" ) == "accepted-scalar" ) ).notToBeEmpty();
+				expect( len( trim( result.plan.metadata.architectureSource ?: "" ) ) ).toBeGTE( 1 );
+				expect( len( trim( result.plan.metadata.roadmapSource ?: "" ) ) ).toBeGTE( 1 );
+				expect(
+					( isArray( result.plan.target.placements ?: "" ) && result.plan.target.placements.len() )
+					|| ( isArray( result.plan.target.contexts ?: "" ) && result.plan.target.contexts.len() )
+				).toBeTrue();
 			} );
 
 			it( "normalizes ColdBox application paths, roadmap collections, and BoxLang samples", () => {
@@ -1425,6 +1570,51 @@ class extends="testbox.system.BaseSpec" {
 				expect( plan.roadmapPhases.filter( ( item ) => item.currentSlice ?: false ) ).notToBeEmpty();
 				expect( plan.samples ).notToBeEmpty();
 				expect( plan.samples[ 1 ].id ).toBe( "SP-001" );
+			} );
+
+			it( "backfills roadmap classification wave risks and strategies for synth and LLM phases", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				service.identityService = new app.models.services.ModernizationIdentityService();
+				makePublic( service, "polishPlan" );
+				var polished = service.polishPlan( {
+					metadata: { runtime: { runtime: "boxlang" }, architectureSource: "synthesized", roadmapSource: "synthesized" },
+					target: {
+						units: [
+							{ id: "tu-job", targetPath: "app/handlers/Jobs.bx", sourcePath: "legacy/_scheduledScripts/job.cfm" },
+							{ id: "tu-mod", targetPath: "app/modules/feature/ModuleConfig.bx", sourcePath: "legacy/modules/feature/ModuleConfig.cfc" }
+						],
+						placements: [
+							{ id: "pl-job", placementType: "scheduled-service", targetUnitIds: [ "tu-job" ] },
+							{ id: "pl-mod", placementType: "coldbox-module", targetUnitIds: [ "tu-mod" ] }
+						],
+						contexts: [],
+						extracts: []
+					},
+					unitLinks: [],
+					routeContracts: [],
+					dbFindings: [],
+					dbTransitions: [],
+					roadmapPhases: [
+						{ id: "phase-empty", unitIds: [ "tu-job" ], classification: "", wave: "", risks: [], rollbackStrategy: "", testingStrategy: "", estimatedComplexity: "" },
+						{ id: "phase-llm", unitIds: [ "tu-mod" ], classification: "coldbox-module", wave: 2, risks: [ "Module ownership drift" ], rollbackStrategy: "Disable module route", testingStrategy: "Module boot smoke", estimatedComplexity: "medium" }
+					],
+					samples: [],
+					assumptions: []
+				} );
+				var emptyPhase = polished.roadmapPhases.filter( ( item ) => item.id == "phase-empty" )[ 1 ];
+				var llmPhase = polished.roadmapPhases.filter( ( item ) => item.id == "phase-llm" )[ 1 ];
+				expect( emptyPhase.classification ).toBe( "scheduled-service" );
+				expect( val( emptyPhase.wave ) ).toBeGTE( 1 );
+				expect( emptyPhase.risks ).notToBeEmpty();
+				expect( len( trim( emptyPhase.rollbackStrategy ?: "" ) ) ).toBeGT( 0 );
+				expect( len( trim( emptyPhase.testingStrategy ?: "" ) ) ).toBeGT( 0 );
+				expect( emptyPhase.estimatedComplexity ).toBe( "low" );
+				expect( llmPhase.classification ).toBe( "coldbox-module" );
+				expect( llmPhase.wave ).toBe( 2 );
+				expect( llmPhase.risks[ 1 ] ).toBe( "Module ownership drift" );
+				expect( llmPhase.rollbackStrategy ).toBe( "Disable module route" );
+				expect( llmPhase.testingStrategy ).toBe( "Module boot smoke" );
+				expect( llmPhase.estimatedComplexity ).toBe( "medium" );
 			} );
 
 			it( "repairs only the invalid fingerprint-listed item", () => {

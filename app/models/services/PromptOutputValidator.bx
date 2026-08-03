@@ -286,11 +286,15 @@ class {
 	 * Oversized architecture placements fail schema maxItems (40) and used to
 	 * discard the entire packaging recommendation. Split them into same-type
 	 * parts so ColdBox module / main-app decisions survive validation without
-	 * dropping targetUnitIds.
+	 * dropping targetUnitIds. Also hard-cap residual oversized arrays and the
+	 * placements list so salvageable LLM output is not rejected wholesale.
 	 */
 	private struct function compactArchitectureResponse( required struct response ) {
 		var value = duplicate( arguments.response );
-		if ( !isArray( value.placements ?: "" ) || !value.placements.len() ) return value;
+		if ( !isArray( value.placements ?: "" ) || !value.placements.len() ) {
+			value = compactArchitectureCollections( value );
+			return value;
+		}
 		var maxIds = 40;
 		var maxPlacements = 48;
 		var compacted = [];
@@ -330,15 +334,35 @@ class {
 				if ( chunkCount > 1 ) {
 					var baseId = trim( toString( placement.id ?: placement.domainKey ?: "placement" ) );
 					var baseName = trim( toString( placement.name ?: placement.domainKey ?: baseId ) );
+					if ( !len( baseId ) ) baseId = "placement";
+					if ( !len( baseName ) ) baseName = baseId;
 					chunk.id = baseId & "-part" & chunkIndex;
 					chunk.name = baseName & " (part " & chunkIndex & ")";
 				}
 				compacted.append( chunk );
 			}
 		}
+		// Final hard-cap: never leave an oversized array that can fail schema maxItems.
+		for ( var capped in compacted ) {
+			if ( !isStruct( capped ) ) continue;
+			capped.targetUnitIds = normalizeStringList( capped.targetUnitIds ?: [] );
+			capped.evidenceRefs = normalizeStringList( capped.evidenceRefs ?: [] );
+			if ( capped.targetUnitIds.len() > maxIds ) capped.targetUnitIds = capped.targetUnitIds.slice( 1, maxIds );
+			if ( capped.evidenceRefs.len() > maxIds ) capped.evidenceRefs = capped.evidenceRefs.slice( 1, maxIds );
+		}
 		if ( compacted.len() > maxPlacements ) compacted = compacted.slice( 1, maxPlacements );
 		value.placements = compacted;
-		return value;
+		return compactArchitectureCollections( value );
+	}
+
+	private struct function compactArchitectureCollections( required struct value ) {
+		if ( isArray( arguments.value.contexts ?: "" ) && arguments.value.contexts.len() > 30 ) {
+			arguments.value.contexts = arguments.value.contexts.slice( 1, 30 );
+		}
+		if ( isArray( arguments.value.extracts ?: "" ) && arguments.value.extracts.len() > 30 ) {
+			arguments.value.extracts = arguments.value.extracts.slice( 1, 30 );
+		}
+		return arguments.value;
 	}
 
 	private array function normalizeStringList( required any values ) {

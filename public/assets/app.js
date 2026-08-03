@@ -2341,6 +2341,33 @@ function orderedRoadmapPhases(phases = []) {
 	return ordered;
 }
 
+async function continueModernizeCoverage(runId, button) {
+	if (!runId) return;
+	const label = button?.textContent || "Continue omitted coverage";
+	if (button) {
+		button.disabled = true;
+		button.textContent = "Starting continuation…";
+	}
+	try {
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/modernization/continue`, { method: "POST" });
+		const next = payload?.data;
+		if (!next?.id) throw new Error("Continuation run was not created.");
+		await watchRun(next);
+	} catch (error) {
+		if (button) {
+			button.disabled = false;
+			button.textContent = label;
+		}
+		if (elements.modernizationCoverageBanner) {
+			const note = document.createElement("p");
+			note.className = "form-message";
+			note.setAttribute("role", "alert");
+			note.textContent = error.message || "Could not continue omitted modernization coverage.";
+			elements.modernizationCoverageBanner.prepend(note);
+		}
+	}
+}
+
 function modernizationItemContext(item) {
 	const value = item.contextId || item.context || item.contextName;
 	return typeof value === "object" ? (value.id || value.name || "unassigned") : (value || "unassigned");
@@ -2457,7 +2484,7 @@ function renderModernizationDetail(item) {
 	}
 	const detail = document.createElement("div");
 	detail.className = "modernization-detail-card";
-	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label class="placement-selection" hidden>Selected placement<select><option value="main-app">New main application</option><option value="coldbox-module">ColdBox module</option><option value="external-service">External service candidate</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
+	detail.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div><section class="modernization-evidence-section"><h4>Immutable snapshot evidence</h4><div class="modernization-evidence-links"></div></section><dl class="modernization-detail-fields"></dl><div class="modernization-decision-controls"><label>Decision<select><option value="undecided">Undecided</option><option value="accepted">Accept</option><option value="rejected">Reject</option></select></label><label class="placement-selection" hidden>Selected placement<select><option value="main-app">New main application</option><option value="coldbox-module">ColdBox module</option><option value="background-worker">Background worker</option><option value="scheduled-service">Scheduled service / jobs host</option><option value="external-service">External service candidate</option></select></label><label>Note<textarea rows="3" maxlength="2000" placeholder="Why this decision? (optional)"></textarea></label><button type="button" class="primary-button">Save decision</button><button type="button" class="secondary-button">Clear decision</button><p role="status"></p></div>`;
 	detail.querySelector(".eyebrow").textContent = item._modernizationType || "proposal";
 	detail.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
 	detail.querySelector("h3").textContent = modernizationItemLabel(item);
@@ -2672,6 +2699,9 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Tables touched", item.touchedTables);
 		add("Columns touched", item.touchedColumns);
 	} else if (item._modernizationType === "roadmap-phase") {
+		add("Classification", item.classification);
+		add("Migration wave", item.wave);
+		add("Estimated complexity", item.estimatedComplexity);
 		add("Goal", item.goal || item.description);
 		add("Pattern", item.pattern);
 		add("Parity intent", item.parityIntent);
@@ -2680,8 +2710,10 @@ function renderModernizationDetailSummary(host, item = {}) {
 		if (item.riskLevel && String(item.riskLevel).toLowerCase() !== "none") {
 			add("Related review findings", `${item.relatedFindingCount || 0} finding(s), worst severity: ${item.riskLevel}`);
 		}
+		add("Risks", item.risks);
+		add("Testing strategy", item.testingStrategy);
 		add("Exit checklist", Array.isArray(item.exitCriteria) ? item.exitCriteria : (item.exitCriteria ? [item.exitCriteria] : []));
-		add("Rollback", item.rollback);
+		add("Rollback", item.rollbackStrategy || item.rollback);
 		add("Implementer prompt", item.implementerPrompt);
 		addMigrationSteps(item.migrationSteps);
 	} else if (item._modernizationType === "db-finding") {
@@ -2702,7 +2734,15 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Confidence", item.confidence);
 	} else if (item._modernizationType === "placement") {
 		const placementType = String(item.placementType || item.packaging || "main-app").toLowerCase();
-		add("Recommended placement", placementType === "external-service" ? "External-service candidate" : (placementType === "coldbox-module" ? "ColdBox module" : "New main application"));
+		add("Recommended placement", placementType === "external-service"
+			? "External-service candidate"
+			: (placementType === "coldbox-module"
+				? "ColdBox module"
+				: (placementType === "background-worker"
+					? "Background worker"
+					: (placementType === "scheduled-service"
+						? "Scheduled service / jobs host"
+						: "New main application"))));
 		add("Why this placement", item.rationale || item.recommendation || item.purpose);
 		add("Gate status", item.gateStatus || "needs-review");
 		add("Gate snapshot", (item.gates || []).map((gate) => `${gate.id || "gate"}: ${gate.status || "unknown"} — ${gate.explanation || ""}`));
@@ -2940,10 +2980,10 @@ function renderModernizationResult(result = {}) {
 		const targetRuntime = result.metadata?.runtime?.runtime || result.metadata?.runtime || "not specified";
 		const targetProfile = result.metadata?.targetProfile || target.layoutProfile || "not specified";
 		const placements = Array.isArray(target.placements) ? target.placements : [];
-		const placementCounts = { "main-app": 0, "coldbox-module": 0, "external-service": 0 };
+		const placementCounts = { "main-app": 0, "coldbox-module": 0, "external-service": 0, "background-worker": 0, "scheduled-service": 0 };
 		placements.forEach((item) => { const type = String(item.placementType || "main-app").toLowerCase(); if (placementCounts[type] !== undefined) placementCounts[type]++; });
 		const gateSummary = result.gateSummary || {};
-		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Capabilities</span><strong>${placements.length || (target.contexts || []).length}</strong></div><div><span>Service candidates</span><strong>${placementCounts["external-service"]}</strong></div><div><span>Decisions required</span><strong>${placements.filter((item) => item.decisionRequired).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Placement posture</dt><dd>${placementCounts["main-app"]} main app · ${placementCounts["coldbox-module"]} modules · ${placementCounts["external-service"]} service candidates</dd><dt>Gate snapshot</dt><dd>${gateSummary.unknown || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "unknown").length, 0)} unknown · ${gateSummary.failed || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "fail").length, 0)} failed</dd><dt>Coverage status</dt><dd>${coverage.status || (coverage.complete === true ? "complete" : "incomplete")}</dd><dt>Provider coverage</dt><dd>${llm.status || "not-observed"} · ${llm.completed || 0} completed · ${llm.failed || 0} failed · ${llm.omitted || llm.omittedPartitions || 0} omitted</dd><dt>Source context prepared</dt><dd>${llm.partitions || llm.planned || 0} partitions · ${llm.files || 0} files · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
+		elements.modernizationOverview.innerHTML = `${state.modernization.notice ? '<p class="form-message modernization-notice" role="alert"></p>' : ""}<p class="result-summary"></p><div class="modernization-overview-metrics"><div><span>Files indexed</span><strong>${coverage.filesScanned || 0}</strong></div><div><span>Legacy units</span><strong>${inventorySummary.unitCount || (inventory.units || []).length}</strong></div><div><span>Target units</span><strong>${(target.units || []).length}</strong></div><div><span>Capabilities</span><strong>${placements.length || (target.contexts || []).length}</strong></div><div><span>Modules</span><strong>${placementCounts["coldbox-module"]}</strong></div><div><span>Workers</span><strong>${placementCounts["background-worker"] + placementCounts["scheduled-service"]}</strong></div><div><span>Service candidates</span><strong>${placementCounts["external-service"]}</strong></div><div><span>Decisions required</span><strong>${placements.filter((item) => item.decisionRequired).length}</strong></div><div><span>Schema objects</span><strong>${Object.values(schema.objects || {}).reduce((sum, value) => sum + Number(value || 0), 0)}</strong></div><div><span>Validation</span><strong>${validation.status || validation.overallStatus || "unknown"}</strong></div></div><div class="modernization-overview-details"><dl><dt>Target runtime</dt><dd>${targetRuntime}</dd><dt>Layout profile</dt><dd>${targetProfile}</dd><dt>Placement posture</dt><dd>${placementCounts["main-app"]} main app · ${placementCounts["coldbox-module"]} modules · ${placementCounts["background-worker"] + placementCounts["scheduled-service"]} workers · ${placementCounts["external-service"]} service candidates</dd><dt>Gate snapshot</dt><dd>${gateSummary.unknown || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "unknown").length, 0)} unknown · ${gateSummary.failed || placements.reduce((count, item) => count + (item.gates || []).filter((gate) => String(gate.status || "").toLowerCase() === "fail").length, 0)} failed</dd><dt>Coverage status</dt><dd>${coverage.status || (coverage.complete === true ? "complete" : "incomplete")}</dd><dt>Provider coverage</dt><dd>${llm.status || "not-observed"} · ${llm.completed || 0} completed · ${llm.failed || 0} failed · ${llm.omitted || llm.omittedPartitions || 0} omitted</dd><dt>Source context prepared</dt><dd>${llm.partitions || llm.planned || 0} partitions · ${llm.files || 0} files · ${llm.contextCharacters || 0} characters</dd><dt>Unresolved evidence</dt><dd>${inventorySummary.unresolvedCount || inventory.unresolved?.length || 0}</dd></dl></div><div class="modernization-transition-guide" id="modernization-transition-guide"></div>`;
 		const queuedSummary = runStatus === "queued" ? "Modernize is queued; the plan will appear after the shared repository scan." : runStatus === "running" ? "Modernize is building an evidence-backed plan. Proposal items will appear as stages complete." : runStatus === "failed" ? (state.activeRun?.message || "Modernize could not generate a plan.") : runStatus === "cancelled" ? "Modernize was cancelled before a complete plan was generated." : runStatus === "partial" ? "A partial Modernize plan was retained with review gates." : "Modernization proposal is ready for review.";
 		elements.modernizationOverview.querySelector(".result-summary").textContent = result.summary || queuedSummary;
 		const notice = elements.modernizationOverview.querySelector(".modernization-notice");
@@ -2976,7 +3016,7 @@ function renderModernizationResult(result = {}) {
 			const hasMaps = targetCount > 0 || (result.routeContracts || []).length > 0;
 			const shardMeta = result.metadata?.applicationShards || {};
 			const summaryLead = genSummary.status === "partial_failure"
-				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Partial modernization</strong><p>${architectureEscapeHtml(genSummary.errorType || genSummary.stage || "proposal_generation")}${genSummary.message ? `: ${architectureEscapeHtml(genSummary.message)}` : ""}.${genSummary.incompleteStages.length ? ` Incomplete: ${architectureEscapeHtml(genSummary.incompleteStages.join(", "))}.` : ""}${genSummary.retryable ? " Retryable from the last proposal checkpoint." : ""}</p>${genSummary.checkpointId ? `<p class="confidence-action">Checkpoint: ${architectureEscapeHtml(genSummary.checkpointId)}</p>` : ""}</div>`
+				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Partial modernization</strong><p>${architectureEscapeHtml(genSummary.errorType || genSummary.stage || "proposal_generation")}${genSummary.message ? `: ${architectureEscapeHtml(genSummary.message)}` : ""}.${genSummary.incompleteStages.length ? ` Incomplete: ${architectureEscapeHtml(genSummary.incompleteStages.join(", "))}.` : ""}${genSummary.limitReached ? ` Limit: ${architectureEscapeHtml(genSummary.limitReached)}.` : ""}${genSummary.retryable ? " Retryable from the last proposal checkpoint." : ""}</p>${genSummary.recommendedContinuation ? `<p class="confidence-action">${architectureEscapeHtml(genSummary.recommendedContinuation)}</p>` : ""}${genSummary.checkpointId ? `<p class="confidence-action">Checkpoint: ${architectureEscapeHtml(genSummary.checkpointId)}</p>` : ""}</div>`
 				: "";
 			const failureLead = hollow
 				? `<div class="modernization-generation-alert" data-tone="warning"><strong>Application proposal incomplete</strong><p>${appError ? `The application role failed (${appError.message || "provider-failed"}), so this plan has road text without file maps, routes, or samples.` : "This plan has roadmap phases but no target units or route contracts bound to legacy files."}</p><p class="confidence-action">Next: start a new Modernize run (or Rebuild once a mapped slice exists). Indexed inventory (${cfmlFiles || sourceCount} CFML/source files) is still browsable below.</p></div>`
@@ -2985,7 +3025,10 @@ function renderModernizationResult(result = {}) {
 					: (genNotes.length
 						? `<div class="modernization-generation-alert" data-tone="info"><strong>Generation notes</strong><p>${hasMaps ? `${targetCount} target units · ` : ""}${shardMeta.accepted ? `shards ${shardMeta.accepted}/${shardMeta.total || shardMeta.accepted} · ` : ""}${genNotes.slice(0, 3).map((item) => item.message || "note").join(" · ")}</p></div>`
 						: ""));
-			elements.modernizationCoverageBanner.innerHTML = `${summaryLead}${failureLead}<details class="modernization-confidence-details"${hollow ? "" : ""}><summary><span class="eyebrow">Plan confidence</span> · working limits of this run (optional)</summary><div class="modernization-confidence-heading"><strong>Modernize works within what this run indexed</strong><span class="status-badge" data-state="warning">Scoped</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div></details>`;
+			// Multi-wave continue is the supported path for full-estate completeness;
+			// keep the CTA host available whenever omitted/failed shard paths remain.
+			const continueActions = `<p class="modernization-continue-actions" hidden><button type="button" class="secondary-button" data-modernization-continue>Continue omitted coverage</button></p>`;
+			elements.modernizationCoverageBanner.innerHTML = `${summaryLead}${failureLead}${continueActions}<details class="modernization-confidence-details"${hollow ? "" : ""}><summary><span class="eyebrow">Plan confidence</span> · working limits of this run (optional)</summary><div class="modernization-confidence-heading"><strong>Modernize works within what this run indexed</strong><span class="status-badge" data-state="warning">Scoped</span></div><div class="modernization-confidence-grid"><section><h4>Repository scope</h4><p class="confidence-fact repository-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>Database evidence</h4><p class="confidence-fact schema-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section><section><h4>AI context</h4><p class="confidence-fact context-detail"></p><p class="confidence-impact"></p><p class="confidence-action"></p></section></div></details>`;
 			const cards = elements.modernizationCoverageBanner.querySelectorAll(".modernization-confidence-grid > section");
 			const jsIndexed = repo.supportedLanguages?.JavaScript || 0;
 			const jsCandidates = repo.candidateLanguages?.JavaScript || 0;
@@ -3025,6 +3068,18 @@ function renderModernizationResult(result = {}) {
 				elements.modernizationCoverageBanner.querySelector(".modernization-confidence-heading strong").textContent = "CFML scope is ready — other limits are optional";
 				elements.modernizationCoverageBanner.querySelector(".status-badge").textContent = "Ready";
 				elements.modernizationCoverageBanner.querySelector(".status-badge").dataset.state = "ok";
+			}
+			const continueHost = elements.modernizationCoverageBanner.querySelector(".modernization-continue-actions");
+			const omittedCount = Number(shardMeta.omitted || (shardMeta.omittedPaths || []).length || genSummary.partialResults?.omittedPaths || 0);
+			const continueRecommended = typeof genSummary.recommendedContinuation === "string"
+				&& genSummary.recommendedContinuation.includes("/modernization/continue");
+			if (continueHost && (omittedCount > 0 || continueRecommended) && state.activeRun?.id) {
+				continueHost.hidden = false;
+				const continueBtn = continueHost.querySelector("[data-modernization-continue]");
+				if (continueBtn && !continueBtn.dataset.bound) {
+					continueBtn.dataset.bound = "1";
+					continueBtn.addEventListener("click", () => continueModernizeCoverage(state.activeRun.id, continueBtn));
+				}
 			}
 		}
 	}
@@ -3221,7 +3276,15 @@ function renderModernizationArchitectureDetail(item) {
 	const card = document.createElement("div");
 	card.className = "modernization-detail-card";
 	card.innerHTML = `<div class="modernization-detail-heading"><span class="eyebrow"></span><span class="status-badge"></span></div><h3></h3><div class="modernization-detail-summary"></div>`;
-	card.querySelector(".eyebrow").textContent = isExtract ? "microservice / side-app candidate" : (["coldbox-module", "module"].includes(placementType) ? "coldbox module candidate" : "main application (stays in the monolith)");
+	card.querySelector(".eyebrow").textContent = isExtract
+		? "microservice / side-app candidate"
+		: (["coldbox-module", "module"].includes(placementType)
+			? "coldbox module candidate"
+			: (placementType === "background-worker"
+				? "background worker candidate"
+				: (placementType === "scheduled-service"
+					? "scheduled service / jobs host"
+					: "main application (stays in the monolith)")));
 	card.querySelector(".status-badge").textContent = modernizationValidationStatus(item);
 	card.querySelector("h3").textContent = item.name || item.id || "Packaging decision";
 	renderModernizationDetailSummary(card.querySelector(".modernization-detail-summary"), item);
@@ -3445,12 +3508,17 @@ function renderModernizationSolution(result = {}) {
 			</div>
 			<p class="form-message" id="modernization-slice-action-status" role="status"></p>`;
 		dod.querySelector("h3").textContent = phase.name || phase.id;
-		dod.querySelector(".status-badge").textContent = phase.pattern || (mappedPhase ? "mapped" : "scaffold");
+		dod.querySelector(".status-badge").textContent = phase.classification || phase.pattern || (mappedPhase ? "mapped" : "scaffold");
 		dod.querySelector(".modernization-dod-goal").textContent = phase.goal || "";
-		dod.querySelector(".modernization-dod-parity").textContent = phase.parityIntent ? `Parity: ${phase.parityIntent}` : "";
+		dod.querySelector(".modernization-dod-parity").textContent = [
+			phase.classification ? `Classification: ${phase.classification}` : "",
+			phase.wave ? `Wave ${phase.wave}` : "",
+			phase.estimatedComplexity ? `Complexity: ${phase.estimatedComplexity}` : "",
+			phase.parityIntent ? `Parity: ${phase.parityIntent}` : ""
+		].filter(Boolean).join(" · ");
 		dod.querySelector(".modernization-dod-effort").textContent = Array.isArray(phase.effortDrivers) && phase.effortDrivers.length
 			? `Weighted effort drivers: ${phase.effortDrivers.map(modernizationSignalLabel).join(", ")}`
-			: "";
+			: (Array.isArray(phase.risks) && phase.risks.length ? `Risks: ${phase.risks.join("; ")}` : "");
 		const exitList = dod.querySelector("ul.exit");
 		if (!exit.length) exitList.innerHTML = `<li class="field-hint">No exit criteria listed.</li>`;
 		else exit.forEach((item) => {
@@ -3458,7 +3526,7 @@ function renderModernizationSolution(result = {}) {
 			li.textContent = item;
 			exitList.appendChild(li);
 		});
-		dod.querySelector(".rollback").textContent = phase.rollback || "No rollback note.";
+		dod.querySelector(".rollback").textContent = phase.rollbackStrategy || phase.rollback || "No rollback note.";
 		dod.querySelector("pre").textContent = phase.implementerPrompt || "No implementer prompt.";
 		// Deterministic coupling evidence for this slice — the shared state,
 		// include chains and dynamic construction that decide how hard the
