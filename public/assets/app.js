@@ -2316,6 +2316,26 @@ function phaseScaffoldEmptyHtml(kind = "files") {
 	return `<p class="modernization-phase-empty"><strong>Scaffold / setup step</strong> — no ${noun} are mapped to this phase yet. Use the Definition of Done below for setup work, or pick a mapped slice on the Road (look for coexist / vertical-slice badges) to see what moves.</p>`;
 }
 
+/**
+ * Coerces a plan collection to an array.
+ *
+ * Persisted plans can carry a collection as text ("[\n  phase-a\n]") rather than
+ * a JSON array. Those values are truthy, so the usual `value || []` guard passes
+ * them straight through to .forEach/.map and the whole workspace fails to
+ * render. Parsing the token form keeps an older plan usable instead of blank.
+ */
+function asArray(value) {
+	if (Array.isArray(value)) return value;
+	if (value === null || value === undefined) return [];
+	if (typeof value !== "string") return [];
+	const text = value.trim().replace(/^\[|\]$/g, "");
+	if (!text.trim()) return [];
+	return text
+		.split(/[,\r\n]+/)
+		.map((item) => item.trim().replace(/^"|"$/g, "").trim())
+		.filter(Boolean);
+}
+
 function orderedRoadmapPhases(phases = []) {
 	const list = Array.isArray(phases) ? phases.slice() : [];
 	if (list.length < 2) return list;
@@ -2329,7 +2349,10 @@ function orderedRoadmapPhases(phases = []) {
 		if (visiting.has(key)) return;
 		visiting.add(key);
 		const phase = byId.get(key);
-		(phase.dependencies || []).forEach((dep) => visit(dep));
+		// A non-empty string is truthy, so `|| []` does not protect this: a phase
+		// whose dependencies arrived as text used to throw here and blank the
+		// whole workspace with "Could not load the saved modernization plan".
+		asArray(phase.dependencies).forEach((dep) => visit(dep));
 		visiting.delete(key);
 		seen.add(key);
 		ordered.push(phase);
@@ -2883,6 +2906,29 @@ function renderModernizationBrief(result = {}, planState = "") {
 	`;
 }
 
+/**
+ * Puts the plan's real counts on the catalogs disclosure.
+ *
+ * The catalogs were labelled "optional — use after you pick a road slice" and
+ * collapsed, so the richest part of the plan read as a footnote and went unread.
+ * Showing what is actually inside turns the summary into a reason to open it.
+ */
+function renderModernizationCatalogCounts(result = {}) {
+	const host = document.querySelector("#modernization-catalog-counts");
+	if (!host) return;
+	const target = result.target || {};
+	const parts = [
+		[asArray(target.units).length, "targets"],
+		[asArray(result.unitLinks).length, "legacy links"],
+		[asArray(result.routeContracts).length, "routes"],
+		[asArray(result.dbFindings).length + asArray(result.dbTransitions).length, "database items"]
+	].filter(([count]) => count > 0);
+	host.textContent = parts.length
+		? parts.map(([count, label]) => `${count} ${label}`).join(" · ")
+		: "";
+	host.hidden = !parts.length;
+}
+
 function renderModernizationResult(result = {}) {
 	state.modernization.result = result;
 	refreshModernizationFilterOptions(result);
@@ -2900,6 +2946,7 @@ function renderModernizationResult(result = {}) {
 	}
 	if (!active) return;
 	if (document.querySelector("#results-panel")) document.querySelector("#results-panel").dataset.state = "idle";
+	renderModernizationCatalogCounts(result);
 	const hasResult = !!result && Object.keys(result).length > 0;
 	if (state.modernization.loading && !hasResult) {
 		if (elements.modernizationPlanState) {
@@ -3325,10 +3372,10 @@ function renderModernizationSolution(result = {}) {
 		stackEl.hidden = !road.sourceStackNote;
 		stackEl.textContent = road.sourceStackNote || "";
 	}
-	const unitIds = new Set((phase?.unitIds || []).map(String));
-	const routeIds = new Set((phase?.routeIds || []).map(String));
-	const findingIds = new Set((phase?.dbFindingIds || []).map(String));
-	const transitionIds = new Set((phase?.transitionIds || []).map(String));
+	const unitIds = new Set(asArray(phase?.unitIds).map(String));
+	const routeIds = new Set(asArray(phase?.routeIds).map(String));
+	const findingIds = new Set(asArray(phase?.dbFindingIds).map(String));
+	const transitionIds = new Set(asArray(phase?.transitionIds).map(String));
 	const onRoadLegacy = new Set();
 	if (mappedPhase) {
 		(result.target?.units || []).forEach((unit) => {

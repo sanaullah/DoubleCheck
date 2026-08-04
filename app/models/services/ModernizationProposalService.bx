@@ -83,11 +83,36 @@ class {
 		for ( var plannedShard in appShards ) {
 			for ( var plannedPath in plannedShard.shardMeta.paths ?: [] ) plannedApplicationPaths[ lCase( plannedPath ) ] = true;
 		}
+		// Paths in the inventory that no shard will cover. Two distinct causes,
+		// reported separately so a reader can tell "we ran out of shards" from
+		// "we had no source text to read".
+		var groundedApplicationPaths = groundedPathSet( arguments.evidence );
 		var shardCapOmissions = [];
+		var ungroundedOmissions = [];
 		for ( var applicationPath in allApplicationPaths ) {
-			if ( !plannedApplicationPaths.keyExists( lCase( applicationPath ) ) ) shardCapOmissions.append( applicationPath );
+			if ( plannedApplicationPaths.keyExists( lCase( applicationPath ) ) ) continue;
+			if ( groundedApplicationPaths.count() && !groundedApplicationPaths.keyExists( lCase( normalizeLegacyPath( applicationPath ) ) ) ) {
+				ungroundedOmissions.append( applicationPath );
+			} else {
+				shardCapOmissions.append( applicationPath );
+			}
 		}
-		logInfo( "Modernize proposal #arguments.runId#: #appShards.len()# application shard(s), concurrency=#( budgets.applicationShardConcurrency ?: 3 )#, maxDurationMs=#maxDurationMs#, maxCostUsd=#( budgets.maxCostUsd ?: '' )#" );
+		if ( ungroundedOmissions.len() ) {
+			notes.append( {
+				role: "modernization-application",
+				message: "omitted-ungrounded-paths",
+				severity: "info",
+				reason: "no-context-partition",
+				count: ungroundedOmissions.len(),
+				paths: ungroundedOmissions
+			} );
+			logInfo( "Modernize proposal #arguments.runId#: #ungroundedOmissions.len()# path(s) had no context partition and were not mapped" );
+		}
+		// Captured before the run: a truncated shard can append smaller retry
+		// shards to appShards, and those are retries of already-planned paths
+		// rather than additional planned coverage.
+		var plannedShardTotal = appShards.len();
+		logInfo( "Modernize proposal #arguments.runId#: #plannedShardTotal# application shard(s), concurrency=#( budgets.applicationShardConcurrency ?: 3 )#, maxDurationMs=#maxDurationMs#, maxCostUsd=#( budgets.maxCostUsd ?: '' )#" );
 		var appResult = runApplicationShards( arguments.runId, appShards, runtime, budgets, startedAt, maxDurationMs, totalOutputLimit, arguments.options );
 		var appMerged = appResult.fragment;
 		var appAccepted = appResult.accepted;
@@ -95,7 +120,7 @@ class {
 		totalCostUsd = appResult.costUsd;
 		splitProposalMessages( appResult.errors, errors, notes );
 		if ( appAccepted > 0 ) fragments[ "modernization-application" ] = appMerged;
-		logInfo( "Modernize proposal #arguments.runId#: application shards accepted #appAccepted#/#appShards.len()#, costUsd=#totalCostUsd#, outputChars=#totalOutputCharacters#" );
+		logInfo( "Modernize proposal #arguments.runId#: application shards accepted #appAccepted#/#plannedShardTotal#, costUsd=#totalCostUsd#, outputChars=#totalOutputCharacters#" );
 
 		// Database role remains a single call when the task budget allows it.
 		if ( maxTasks >= 2 && isCancelled( arguments.runId, arguments.options ) ) {
@@ -170,15 +195,24 @@ class {
 		// retain-legacy stubs that look like successful maps (RC3).
 		appResult.omittedPaths = isArray( appResult.omittedPaths ?: "" ) ? appResult.omittedPaths : [];
 		if ( shardCapOmissions.len() ) appResult.omittedPaths.append( shardCapOmissions, true );
+		if ( ungroundedOmissions.len() ) appResult.omittedPaths.append( ungroundedOmissions, true );
 		merged = ensureApplicationSourceCoverage( merged, arguments.evidence, arguments.input, notes, appResult );
 		merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
+		// Every omission a reader could care about lands in one place. Previously
+		// only shard-cap omissions were counted here, so a run that dropped 52
+		// paths at the context stage still reported `omitted: 0`.
+		var allOmittedPaths = duplicate( shardCapOmissions );
+		if ( ungroundedOmissions.len() ) allOmittedPaths.append( ungroundedOmissions, true );
 		merged.metadata.applicationShards = {
 			accepted: appAccepted,
-			total: appShards.len(),
+			total: plannedShardTotal,
+			resplit: appResult.resplitShards ?: 0,
 			failed: appResult.failed ?: 0,
-			omitted: ( appResult.omitted ?: 0 ) + shardCapOmissions.len(),
+			omitted: ( appResult.omitted ?: 0 ) + allOmittedPaths.len(),
 			outcomes: appResult.outcomes ?: [],
-			omittedPaths: shardCapOmissions
+			omittedPaths: allOmittedPaths,
+			omittedShardCap: shardCapOmissions.len(),
+			omittedUngrounded: ungroundedOmissions.len()
 		};
 		merged.coverage = applyGenerationCoverage( merged.coverage ?: {}, merged.metadata.applicationShards );
 		// Architecture and roadmap without application substance would invent
@@ -880,22 +914,33 @@ class {
 				var id = trim( toString( unit.id ?: unit.itemId ?: "" ) );
 				if ( len( id ) && !covered.keyExists( id ) ) leftover.append( id );
 			}
-			// Cap each leftover batch so roleInstruction / evidence stay inside the
-			// provider prompt budget. A single leftover megashard of thousands of
-			// coverage-fallback ids is what blew immutableCharacters past 60k.
+			// Architecture placements are still being gap-filled by directory after
+			// propose() returns, so at this point a large share of units can be
+			// unclaimed even though the finished plan groups them cleanly. Batching
+			// those sequentially produced "Continue strangler slices (3)" phases
+			// holding half the plan. Group them by the same feature-directory signal
+			// the later gap-fill uses so the phase names carry domain meaning.
+			// Cap each batch so roleInstruction / evidence stay inside the provider
+			// prompt budget: one leftover megashard is what blew immutableCharacters
+			// past 60k previously.
 			var leftoverBatch = min( batchSize, 24 );
-			for ( var leftoverOffset = 1; leftoverOffset <= leftover.len() && shardGroups.len() < shardCap; leftoverOffset += leftoverBatch ) {
-				var leftoverIds = [];
-				for ( var leftoverIndex = leftoverOffset; leftoverIndex <= min( leftover.len(), leftoverOffset + leftoverBatch - 1 ); leftoverIndex++ ) {
-					leftoverIds.append( leftover[ leftoverIndex ] );
-				}
-				if ( leftoverIds.len() ) {
+			for ( var leftoverGroup in leftoverRoadmapGroups( units, leftover ) ) {
+				var groupLeftoverIds = leftoverGroup.targetUnitIds;
+				for ( var leftoverOffset = 1; leftoverOffset <= groupLeftoverIds.len() && shardGroups.len() < shardCap; leftoverOffset += leftoverBatch ) {
+					var leftoverIds = [];
+					for ( var leftoverIndex = leftoverOffset; leftoverIndex <= min( groupLeftoverIds.len(), leftoverOffset + leftoverBatch - 1 ); leftoverIndex++ ) {
+						leftoverIds.append( groupLeftoverIds[ leftoverIndex ] );
+					}
+					if ( !leftoverIds.len() ) continue;
 					shardGroups.append( {
-						name: leftoverOffset == 1 ? "Continue strangler slices" : "Continue strangler slices (#int( ( leftoverOffset - 1 ) / leftoverBatch ) + 1#)",
+						name: leftoverOffset == 1
+							? leftoverGroup.name
+							: "#leftoverGroup.name# (#int( ( leftoverOffset - 1 ) / leftoverBatch ) + 1#)",
 						targetUnitIds: leftoverIds,
 						kind: "leftover"
 					} );
 				}
+				if ( shardGroups.len() >= shardCap ) break;
 			}
 		} else {
 			for ( var offset = 1; offset <= units.len(); offset += batchSize ) {
@@ -982,6 +1027,39 @@ class {
 	}
 
 	/** Scopes plan evidence down to one roadmap shard's target-unit group, mirroring evidenceForShard()'s file-scoping for application shards. */
+	/**
+	 * Searchable blob of the legacy/target paths a set of units covers, used to
+	 * tie a schema object to the slice that reads or writes it.
+	 */
+	private string function pathHaystackForUnits( required array units ) {
+		var words = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			words.append( lCase( toString( unit.sourcePath ?: "" ) ) );
+			words.append( lCase( toString( unit.targetPath ?: "" ) ) );
+		}
+		return reReplace( words.toList( " " ), "[^a-z0-9]+", " ", "all" );
+	}
+
+	/** Whole-token match of a schema object name inside a path haystack. */
+	private boolean function objectMatchesHaystack( required any objectName, required string haystack ) {
+		if ( !isSimpleValue( arguments.objectName ) ) return false;
+		var needle = lCase( reReplace( toString( arguments.objectName ), "[^A-Za-z0-9]+", "", "all" ) );
+		// Two-character object names match far too much to be evidence.
+		if ( len( needle ) < 3 ) return false;
+		return reFindNoCase( "(^|[^a-z0-9])" & needle & "([^a-z0-9]|$)", arguments.haystack ) > 0;
+	}
+
+	/** Every schema object a db finding or transition names. */
+	private array function objectNamesForDbItem( required struct item ) {
+		var objects = [];
+		if ( len( trim( toString( arguments.item.objectRef ?: "" ) ) ) ) objects.append( toString( arguments.item.objectRef ) );
+		for ( var touched in ( isArray( arguments.item.objectsTouched ?: "" ) ? arguments.item.objectsTouched : [] ) ) {
+			if ( isSimpleValue( touched ) && len( trim( toString( touched ) ) ) ) objects.append( toString( touched ) );
+		}
+		return objects;
+	}
+
 	private struct function evidenceForRoadmapShard( required struct plan, required struct group, required numeric index, required numeric total ) {
 		var idSet = {};
 		for ( var id in ( arguments.group.targetUnitIds ?: [] ) ) idSet[ trim( toString( id ) ) ] = true;
@@ -996,17 +1074,42 @@ class {
 		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
 			if ( idSet.keyExists( trim( toString( route.targetUnitId ?: "" ) ) ) ) routes.append( route );
 		}
+		// The roadmap role is asked to cite dbFindingIds/transitionIds, so it has to
+		// be shown them. Relation ids alone selected nothing: providers name the
+		// field relatedTargetIds as often as relatedTargetUnitIds and frequently
+		// leave both empty, so every shard used to receive an empty ledger and
+		// every phase came back with no database work attached.
+		var shardHaystack = pathHaystackForUnits( scopedUnits );
 		var findings = [];
 		var findingIds = {};
 		for ( var finding in ( isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] ) ) {
-			var relatedIds = isArray( finding.relatedTargetUnitIds ?: "" ) ? finding.relatedTargetUnitIds : [];
+			if ( !isStruct( finding ) ) continue;
+			var relatedIds = [];
+			for ( var relatedField in [ "relatedTargetUnitIds", "relatedTargetIds", "relatedLegacyIds" ] ) {
+				if ( isArray( finding[ relatedField ] ?: "" ) ) relatedIds.append( finding[ relatedField ], true );
+			}
 			var matches = false;
 			for ( var relatedId in relatedIds ) if ( idSet.keyExists( trim( toString( relatedId ) ) ) ) { matches = true; break; }
+			if ( !matches ) {
+				for ( var objectName in objectNamesForDbItem( finding ) ) {
+					if ( objectMatchesHaystack( objectName, shardHaystack ) ) { matches = true; break; }
+				}
+			}
 			if ( matches ) { findings.append( finding ); findingIds[ trim( toString( finding.id ?: finding.itemId ?: "" ) ) ] = true; }
 		}
 		var transitions = [];
 		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
-			if ( findingIds.keyExists( trim( toString( transition.dbFindingId ?: "" ) ) ) ) transitions.append( transition );
+			if ( !isStruct( transition ) ) continue;
+			var linked = findingIds.keyExists( trim( toString( transition.dbFindingId ?: "" ) ) );
+			if ( !linked && isArray( transition.dbFindingIds ?: "" ) ) {
+				for ( var relatedFindingId in transition.dbFindingIds ) if ( findingIds.keyExists( trim( toString( relatedFindingId ) ) ) ) { linked = true; break; }
+			}
+			if ( !linked ) {
+				for ( var objectName in objectNamesForDbItem( transition ) ) {
+					if ( objectMatchesHaystack( objectName, shardHaystack ) ) { linked = true; break; }
+				}
+			}
+			if ( linked ) transitions.append( transition );
 		}
 		var samples = [];
 		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
@@ -1468,6 +1571,90 @@ class {
 
 	/** Real (non-degenerate) context/extract groupings, each with the units they
 	 * cover. Empty when the architecture role hasn't produced anything yet. */
+	/**
+	 * Groups roadmap leftovers by feature directory so each shard names a real
+	 * domain instead of "Continue strangler slices (3)".
+	 *
+	 * Uses the unit's legacy sourcePath (falling back to targetPath) because that
+	 * is the same signal the deterministic architecture gap-fill uses when it
+	 * later invents module candidates; grouping the same way keeps roadmap phase
+	 * names aligned with the placements the finished plan ends up with.
+	 *
+	 * Groups are ordered largest-first (ties broken by name) so shard order is
+	 * deterministic across runs.
+	 */
+	private array function leftoverRoadmapGroups( required array units, required array leftoverIds ) {
+		if ( !arguments.leftoverIds.len() ) return [];
+		var unitsById = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitsById[ unitId ] = unit;
+		}
+		var buckets = {};
+		var order = [];
+		for ( var leftoverId in arguments.leftoverIds ) {
+			var id = trim( toString( leftoverId ) );
+			if ( !len( id ) ) continue;
+			var unitRecord = unitsById[ id ] ?: {};
+			var key = featureDomainKey( isStruct( unitRecord ) ? unitRecord : {} );
+			if ( !buckets.keyExists( key ) ) {
+				buckets[ key ] = [];
+				order.append( key );
+			}
+			buckets[ key ].append( id );
+		}
+		var groups = [];
+		for ( var key in order ) {
+			groups.append( {
+				name: featureDomainLabel( key ),
+				targetUnitIds: buckets[ key ],
+				kind: "leftover"
+			} );
+		}
+		groups.sort( ( a, b ) => {
+			if ( a.targetUnitIds.len() != b.targetUnitIds.len() ) return b.targetUnitIds.len() - a.targetUnitIds.len();
+			return compareNoCase( a.name, b.name );
+		} );
+		return groups;
+	}
+
+	/** Feature-directory key for one target unit; "" when nothing usable exists. */
+	private string function featureDomainKey( required struct unit ) {
+		var path = normalizeLegacyPath( arguments.unit.sourcePath ?: "" );
+		if ( !len( trim( path ) ) ) path = normalizeLegacyPath( arguments.unit.targetPath ?: "" );
+		var segments = [];
+		for ( var segment in listToArray( path, "/" ) ) {
+			var cleaned = trim( segment );
+			if ( len( cleaned ) ) segments.append( cleaned );
+		}
+		// Last segment is the file itself, not a domain.
+		if ( segments.len() ) segments.deleteAt( segments.len() );
+		if ( !segments.len() ) return "";
+		// A container folder says nothing about the feature; reach one level in.
+		var containers = [ "app", "src", "cfc", "com", "lib", "libs", "includes", "include", "core", "shared", "common", "handlers", "views", "models", "services", "layouts" ];
+		var first = lCase( segments[ 1 ] );
+		if ( containers.contains( first ) && segments.len() >= 2 ) return lCase( segments[ 1 ] & "/" & segments[ 2 ] );
+		return first;
+	}
+
+	/** Human label for a feature-directory key. */
+	private string function featureDomainLabel( required string key ) {
+		if ( !len( trim( arguments.key ) ) ) return "Remaining application slices";
+		var words = [];
+		for ( var segment in listToArray( arguments.key, "/" ) ) {
+			// Split camelCase and separator-delimited folder names into words.
+			var spaced = reReplace( segment, "([a-z0-9])([A-Z])", "\1 \2", "all" );
+			spaced = reReplace( spaced, "[_\-\.]+", " ", "all" );
+			for ( var word in listToArray( spaced, " " ) ) {
+				var cleaned = trim( word );
+				if ( len( cleaned ) ) words.append( uCase( left( cleaned, 1 ) ) & lCase( right( cleaned, len( cleaned ) - 1 ) ) );
+			}
+		}
+		if ( !words.len() ) return "Remaining application slices";
+		return words.toList( " " );
+	}
+
 	private array function synthesisRoadmapGroups( required struct plan ) {
 		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
 		var groups = [];
@@ -2209,7 +2396,7 @@ class {
 			}
 			var settled = state.pending[ settledIndex ];
 			state.pending.deleteAt( settledIndex );
-			recordShardResult( state, settled, awaitShardTask( settled ) );
+			recordShardResult( state, settled, awaitShardTask( settled ), shardContext );
 			emitShardProgress( arguments.options, state );
 			// Backfill the slot the just-settled shard freed, so a fast shard
 			// immediately picks up new work instead of waiting on its
@@ -2217,18 +2404,25 @@ class {
 			dispatchNextShard( state, shardContext );
 		}
 
+		var reportedOutcomes = [];
 		for ( var pendingOutcome in state.outcomes ) {
 			if ( pendingOutcome.status == "not-run" ) {
+				// A re-split child that never got dispatched adds nothing beyond its
+				// parent's recorded failure — the same paths are already reported
+				// there, so counting it again would double-report the gap.
+				if ( structKeyExists( pendingOutcome, "splitFromShard" ) ) continue;
 				pendingOutcome.status = "omitted";
 				pendingOutcome.reason = len( state.stopReason ) ? state.stopReason : "not-run";
 			}
+			reportedOutcomes.append( pendingOutcome );
 		}
 		return {
 			fragment: state.appMerged,
 			accepted: state.appAccepted,
-			failed: state.outcomes.filter( ( item ) => item.status == "failed" ).len(),
-			omitted: state.outcomes.filter( ( item ) => item.status == "omitted" ).len(),
-			outcomes: state.outcomes,
+			failed: reportedOutcomes.filter( ( item ) => item.status == "failed" ).len(),
+			omitted: reportedOutcomes.filter( ( item ) => item.status == "omitted" ).len(),
+			outcomes: reportedOutcomes,
+			resplitShards: state.outcomes.filter( ( item ) => structKeyExists( item, "splitFromShard" ) ).len(),
 			errors: state.errors,
 			outputCharacters: state.totalOutputCharacters,
 			costUsd: state.totalCostUsd,
@@ -2334,8 +2528,53 @@ class {
 		return false;
 	}
 
+	/**
+	 * Re-queues a truncated shard as two smaller shards.
+	 *
+	 * A shard whose JSON was cut mid-object asked for more output than the model
+	 * would emit in one response; retrying the same ask at the same size just
+	 * truncates again. Halving the path list halves the output. One generation
+	 * of splitting only, so a persistently failing shard cannot fan out.
+	 * Returns true when the shard was re-queued.
+	 */
+	private boolean function resplitTruncatedShard( required struct state, required struct context, required numeric shardIndex ) {
+		if ( arguments.shardIndex > arguments.context.appShards.len() ) return false;
+		var shard = arguments.context.appShards[ arguments.shardIndex ];
+		var paths = isArray( shard.shardMeta.paths ?: "" ) ? shard.shardMeta.paths : [];
+		if ( paths.len() < 2 ) return false;
+		if ( val( shard.shardMeta.splitGeneration ?: 0 ) >= 1 ) return false;
+		if ( arguments.context.totalShards + 2 > variables.maxApplicationShards ) return false;
+
+		var midpoint = int( paths.len() / 2 );
+		var halves = [ paths.slice( 1, midpoint ), paths.slice( midpoint + 1, paths.len() - midpoint ) ];
+		for ( var half in halves ) {
+			if ( !half.len() ) continue;
+			var childIndex = arguments.context.appShards.len() + 1;
+			var child = evidenceForShard( shard, half, childIndex, childIndex );
+			child.shardMeta.splitGeneration = val( shard.shardMeta.splitGeneration ?: 0 ) + 1;
+			child.shardMeta.splitFromShard = arguments.shardIndex;
+			arguments.context.appShards.append( child );
+			arguments.state.outcomes.append( {
+				shard: childIndex,
+				shardTotal: childIndex,
+				paths: duplicate( half ),
+				status: "not-run",
+				durationMs: 0,
+				costUsd: 0,
+				outputCharacters: 0,
+				usage: {},
+				promptProvenance: {},
+				provenanceClass: "not-observed",
+				splitFromShard: arguments.shardIndex
+			} );
+			arguments.context.totalShards = arguments.context.appShards.len();
+		}
+		logInfo( "Modernize application shard #arguments.shardIndex# truncated; re-queued as smaller shards (#paths.len()# paths split)" );
+		return true;
+	}
+
 	/** Applies a settled shard's response to the running merge/accounting state. */
-	private void function recordShardResult( required struct state, required struct settled, required struct appResponse ) {
+	private void function recordShardResult( required struct state, required struct settled, required struct appResponse, struct context = {} ) {
 		var outcome = arguments.state.outcomes[ arguments.settled.shardIndex ];
 		outcome.provider = arguments.appResponse.provider ?: "";
 		outcome.model = arguments.appResponse.model ?: "";
@@ -2350,8 +2589,23 @@ class {
 		if ( !( arguments.appResponse.ok ?: false ) ) {
 			outcome.status = "failed";
 			outcome.reason = arguments.appResponse.error ?: "provider-failed";
+			// The failure is always reported: re-queued work may still never run if
+			// the wall-clock or cost reserve blocks dispatch, and silently swapping
+			// a hard failure for an optimistic note would hide that.
 			arguments.state.errors.append( providerRoleError( "modernization-application", arguments.appResponse, arguments.settled.shardIndex ) );
 			logInfo( "Modernize application shard #arguments.settled.shardIndex# failed: #( arguments.appResponse.error ?: 'provider-failed' )#" );
+			// A truncated response means the ask was too large, not that the paths
+			// are unmappable. Re-queue them in smaller pieces as well.
+			var failureType = arguments.appResponse.errorType ?: inferErrorType( arguments.appResponse.error ?: "" );
+			if ( failureType == "truncated_json" && arguments.context.count() && resplitTruncatedShard( arguments.state, arguments.context, arguments.settled.shardIndex ) ) {
+				outcome.resplit = true;
+				arguments.state.errors.append( {
+					role: "modernization-application",
+					message: "resplit-truncated-shard",
+					severity: "info",
+					shard: arguments.settled.shardIndex
+				} );
+			}
 			return;
 		}
 		if ( !validFragment( "modernization-application", arguments.appResponse.payload ?: {} ) ) {
@@ -2461,6 +2715,14 @@ class {
 	private array function buildApplicationShards( required struct evidence, struct budgets = {} ) {
 		var shardSize = isNumeric( arguments.budgets.applicationShardSize ?: "" ) ? max( 2, min( 20, int( arguments.budgets.applicationShardSize ) ) ) : variables.defaultShardSize;
 		var paths = prioritizedLegacyPaths( arguments.evidence );
+		// Only map what the model can actually read. Ungrounded paths fall out
+		// here and surface as omitted coverage in propose(), which is honest and
+		// retryable via the continue endpoint — far better than a confident
+		// mapping invented from a filename.
+		var grounded = groundedPathSet( arguments.evidence );
+		if ( grounded.count() ) {
+			paths = paths.filter( ( item ) => grounded.keyExists( lCase( normalizeLegacyPath( item ) ) ) );
+		}
 		var shardCap = applicationShardCap( arguments.evidence, arguments.budgets, paths.len(), shardSize );
 		// Full-estate runs: raise files-per-shard (up to 12) so the ceiling covers
 		// more inventory with fewer LLM calls.
@@ -2557,6 +2819,35 @@ class {
 		if ( arguments.pathCount <= 0 ) return requested;
 		var needed = max( 1, ceiling( arguments.pathCount / max( 1, arguments.shardSize ) ) );
 		return min( hardCeiling, max( requested, needed ) );
+	}
+
+	/**
+	 * Paths whose source text actually reached a context partition.
+	 *
+	 * The context pack is budget-bounded, so it can hold fewer paths than the
+	 * inventory lists. Sharding straight off the inventory used to hand the
+	 * application role a path with no source text behind it; the role answered
+	 * from the filename and inventory metadata, producing confident but
+	 * ungrounded target units. Callers use this to shard only what can be read.
+	 *
+	 * Returns an empty struct when no partitions exist at all (context pack not
+	 * in play, e.g. unit tests) so callers fall back to every inventory path.
+	 */
+	private struct function groundedPathSet( required struct evidence ) {
+		var grounded = {};
+		var context = isStruct( arguments.evidence.context ?: "" ) ? arguments.evidence.context : {};
+		var partitions = isArray( context.partitions ?: "" )
+			? context.partitions
+			: ( isArray( context.contexts ?: "" ) ? context.contexts : [] );
+		for ( var partition in partitions ) {
+			if ( !isStruct( partition ) ) continue;
+			// A partition with refs but no rendered text still carries no source
+			// the role can read, so it does not count as grounding.
+			if ( !len( trim( toString( partition.text ?: "" ) ) ) ) continue;
+			var path = normalizeLegacyPath( partition.filePath ?: partition.path ?: "" );
+			if ( len( path ) ) grounded[ lCase( path ) ] = true;
+		}
+		return grounded;
 	}
 
 	private array function prioritizedLegacyPaths( required struct evidence ) {
@@ -2733,22 +3024,438 @@ class {
 	}
 
 	/**
+	 * Collapses one-handler-per-legacy-page into ColdBox handlers with actions.
+	 *
+	 * The application role is explicitly told to group related pages into
+	 * coherent handler slices, and it cannot comply: each shard sees ~6 files, so
+	 * pages that belong on the same handler are usually in different shards. A
+	 * live run produced 84 handler files for 84 legacy pages, which is the
+	 * monolith transliterated rather than a ColdBox application.
+	 *
+	 * Grouping is by legacy feature directory — the same seam used for placements
+	 * and roadmap phases — so `admin/fileMove.cfm` and `admin/dashboard.cfm`
+	 * become the `fileMove` and `dashboard` actions of `handlers/Admin.bx`.
+	 *
+	 * Units are annotated, never merged: ids stay stable so links, routes, phases
+	 * and prior decisions keep resolving, and the page-to-action mapping stays
+	 * visible instead of disappearing into a collapsed unit.
+	 */
+	private struct function groupHandlerUnitsIntoActions( required struct plan, array errors = [] ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var units = isArray( target.units ?: "" ) ? target.units : [];
+		if ( !units.len() ) return arguments.plan;
+
+		var groups = {};
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			if ( lCase( trim( toString( unit.layer ?: "" ) ) ) != "handler" ) continue;
+			var sourcePath = normalizeLegacyPath( unit.sourcePath ?: "" );
+			if ( !find( "/", sourcePath ) ) continue;
+			var domain = lCase( listFirst( sourcePath, "/" ) );
+			if ( !len( domain ) ) continue;
+			if ( !groups.keyExists( domain ) ) groups[ domain ] = [];
+			groups[ domain ].append( unit );
+		}
+
+		var grouped = 0;
+		var handlers = 0;
+		// Roadmap migration steps cite target paths directly, so every rewrite has
+		// to be replayed onto them. Skipping this turned a correct regrouping into
+		// 74 blocking "cites a targetPath not among this phase's own units".
+		var pathRemap = {};
+		for ( var domain in groups ) {
+			var members = groups[ domain ];
+			// A single page is already its own handler; renaming it gains nothing
+			// and would churn fingerprints for no structural benefit.
+			if ( members.len() < 2 ) continue;
+			var handlerName = handlerNameForDomain( domain );
+			var seenActions = {};
+			for ( var member in members ) {
+				var previousPath = replace( trim( toString( member.targetPath ?: "" ) ), "\", "/", "all" );
+				var action = actionNameFromTargetPath( previousPath, member.sourcePath ?: "" );
+				if ( !len( action ) ) continue;
+				// Two legacy pages can reduce to the same action name; keep both
+				// addressable rather than silently dropping one.
+				var uniqueAction = action;
+				var suffix = 2;
+				while ( seenActions.keyExists( lCase( uniqueAction ) ) ) {
+					uniqueAction = action & suffix;
+					suffix++;
+				}
+				seenActions[ lCase( uniqueAction ) ] = true;
+				member.targetPath = "app/handlers/" & handlerName & ".bx";
+				member.action = uniqueAction;
+				member.handlerGrouping = {
+					handler            : handlerName,
+					domain             : domain,
+					previousTargetPath : previousPath,
+					basis              : "legacy-feature-directory"
+				};
+				if ( len( previousPath ) ) {
+					pathRemap[ lCase( previousPath ) ] = { targetPath: member.targetPath, methodName: uniqueAction };
+				}
+				grouped++;
+			}
+			if ( seenActions.count() ) handlers++;
+		}
+		remapMigrationStepTargets( arguments.plan, pathRemap );
+		if ( grouped ) {
+			arguments.errors.append( {
+				role: "modernization-application",
+				message: "grouped-handler-units-into-actions",
+				severity: "info",
+				units: grouped,
+				handlers: handlers
+			} );
+		}
+		target.units = units;
+		arguments.plan.target = target;
+		return arguments.plan;
+	}
+
+	/**
+	 * Normalizes migration-step references, then drops the ones nothing backs.
+	 *
+	 * Providers emit `legacyRef.filePath` as "/login/login.cfm" while the
+	 * inventory holds "login/login.cfm", so a perfectly good reference fails the
+	 * inventory gate on a leading slash alone. Normalizing first recovers those.
+	 *
+	 * What remains after normalization is genuinely unbacked — a live run cited
+	 * `handlers/login.cfc`, a CFML path in a BoxLang plan matching no unit — and
+	 * blocks the whole plan. Dropping an unbacked step is the same treatment
+	 * unbacked routes already get: the proposer proposes, deterministic gates
+	 * verify, and what cannot be evidenced does not ship as guidance.
+	 */
+	private struct function pruneUnbackedMigrationSteps( required struct plan, array errors = [] ) {
+		if ( !isArray( arguments.plan.roadmapPhases ?: "" ) ) return arguments.plan;
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var knownTargetPaths = {};
+		for ( var unit in ( isArray( target.units ?: "" ) ? target.units : [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitPath = lCase( normalizeLegacyPath( unit.targetPath ?: "" ) );
+			if ( len( unitPath ) ) knownTargetPaths[ unitPath ] = true;
+		}
+		var inventoryPaths = {};
+		var inventory = isStruct( arguments.plan.inventory ?: "" ) ? arguments.plan.inventory : {};
+		for ( var file in ( isArray( inventory.files ?: "" ) ? inventory.files : [] ) ) {
+			var filePath = lCase( normalizeLegacyPath( isStruct( file ) ? ( file.filePath ?: "" ) : toString( file ) ) );
+			if ( len( filePath ) ) inventoryPaths[ filePath ] = true;
+		}
+		if ( !knownTargetPaths.count() && !inventoryPaths.count() ) return arguments.plan;
+
+		// Providers name a target as "handlers/Library.cfc" — no app/ prefix and the
+		// source runtime's extension — which matches no unit literally but clearly
+		// means the Library handler. Indexing units by bare file name lets those
+		// resolve instead of being discarded as invented.
+		var unitsByBaseName = {};
+		for ( var indexedUnit in ( isArray( target.units ?: "" ) ? target.units : [] ) ) {
+			if ( !isStruct( indexedUnit ) ) continue;
+			var indexedPath = normalizeLegacyPath( indexedUnit.targetPath ?: "" );
+			if ( !len( indexedPath ) ) continue;
+			var baseName = lCase( listFirst( listLast( indexedPath, "/" ), "." ) );
+			if ( !len( baseName ) ) continue;
+			if ( !unitsByBaseName.keyExists( baseName ) ) unitsByBaseName[ baseName ] = [];
+			if ( !arrayContainsNoCase( unitsByBaseName[ baseName ], indexedPath ) ) unitsByBaseName[ baseName ].append( indexedPath );
+		}
+
+		var normalized = 0;
+		var dropped = 0;
+		var deduped = 0;
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) || !isArray( phase.migrationSteps ?: "" ) ) continue;
+			var kept = [];
+			var seenSteps = {};
+			for ( var step in phase.migrationSteps ) {
+				if ( !isStruct( step ) ) continue;
+				var legacyRef = isStruct( step.legacyRef ?: "" ) ? step.legacyRef : {};
+				var legacyPath = normalizeLegacyPath( legacyRef.filePath ?: "" );
+				// "/login/login.cfm" and "login/login.cfm" are the same file.
+				var trimmedLegacy = reReplace( legacyPath, "^/+", "", "one" );
+				if ( len( trimmedLegacy ) && compare( trimmedLegacy, legacyPath ) != 0 && inventoryPaths.keyExists( lCase( trimmedLegacy ) ) ) {
+					step.legacyRef.filePath = trimmedLegacy;
+					legacyPath = trimmedLegacy;
+					normalized++;
+				}
+				var legacyBacked = !len( legacyPath ) || !inventoryPaths.count() || inventoryPaths.keyExists( lCase( legacyPath ) );
+				var targetRef = isStruct( step.targetRef ?: "" ) ? step.targetRef : {};
+				var stepTarget = reReplace( normalizeLegacyPath( targetRef.targetPath ?: "" ), "^/+", "", "one" );
+				var targetBacked = !len( stepTarget ) || !knownTargetPaths.count() || knownTargetPaths.keyExists( lCase( stepTarget ) );
+				if ( len( stepTarget ) && !targetBacked ) {
+					// Resolve by file name, preferring a unit this phase already owns
+					// so a shared name cannot pull the step into another phase.
+					var wantedBase = lCase( listFirst( listLast( stepTarget, "/" ), "." ) );
+					var candidates = unitsByBaseName[ wantedBase ] ?: [];
+					var phaseOwned = [];
+					for ( var phaseUnitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) {
+						var phaseUnitPath = "";
+						for ( var lookupUnit in ( isArray( target.units ?: "" ) ? target.units : [] ) ) {
+							if ( trim( toString( lookupUnit.id ?: lookupUnit.itemId ?: "" ) ) == trim( toString( phaseUnitId ) ) ) {
+								phaseUnitPath = normalizeLegacyPath( lookupUnit.targetPath ?: "" );
+								break;
+							}
+						}
+						if ( len( phaseUnitPath ) && arrayContainsNoCase( candidates, phaseUnitPath ) && !arrayContainsNoCase( phaseOwned, phaseUnitPath ) ) {
+							phaseOwned.append( phaseUnitPath );
+						}
+					}
+					var resolvedPath = phaseOwned.len() == 1 ? phaseOwned[ 1 ] : ( candidates.len() == 1 ? candidates[ 1 ] : "" );
+					if ( len( resolvedPath ) ) {
+						step.targetRef.targetPath = resolvedPath;
+						step.targetRef.targetPathProvenance = "resolved-by-file-name";
+						targetBacked = true;
+						normalized++;
+					}
+				}
+				if ( !legacyBacked || !targetBacked ) {
+					dropped++;
+					continue;
+				}
+				// One live phase carried 1469 steps of which 47 were distinct — a
+				// single step repeated 319 times. Identical steps are noise.
+				var stepKey = lCase( trim( toString( step.action ?: "" ) ) ) & "|" &
+					lCase( trim( toString( ( step.legacyRef ?: {} ).filePath ?: "" ) ) ) & "|" &
+					lCase( trim( toString( ( step.legacyRef ?: {} ).symbolName ?: "" ) ) ) & "|" &
+					lCase( trim( toString( ( step.targetRef ?: {} ).targetPath ?: "" ) ) ) & "|" &
+					lCase( trim( toString( ( step.targetRef ?: {} ).methodName ?: "" ) ) );
+				if ( seenSteps.keyExists( stepKey ) ) {
+					deduped++;
+					continue;
+				}
+				seenSteps[ stepKey ] = true;
+				kept.append( step );
+			}
+			phase.migrationSteps = kept;
+		}
+		if ( normalized || dropped || deduped ) {
+			arguments.errors.append( {
+				role: "modernization-roadmap",
+				message: "pruned-unbacked-migration-steps",
+				severity: "info",
+				normalized: normalized,
+				dropped: dropped,
+				deduplicated: deduped
+			} );
+		}
+		return arguments.plan;
+	}
+
+	/**
+	 * Replays target-path rewrites onto roadmap migration steps.
+	 *
+	 * A step's `targetRef.targetPath` is compared against the current target
+	 * paths of its phase's units, so any rewrite that does not update the steps
+	 * leaves them citing files that no longer exist. Where the rewrite also
+	 * produced a handler action, the step's methodName is filled in with it —
+	 * "handlers/Admin.bx :: fileMove" is what the implementer actually needs.
+	 */
+	private void function remapMigrationStepTargets( required struct plan, required struct pathRemap ) {
+		if ( !arguments.pathRemap.count() ) return;
+		if ( !isArray( arguments.plan.roadmapPhases ?: "" ) ) return;
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) || !isArray( phase.migrationSteps ?: "" ) ) continue;
+			for ( var step in phase.migrationSteps ) {
+				if ( !isStruct( step ) || !isStruct( step.targetRef ?: "" ) ) continue;
+				var stepPath = lCase( replace( trim( toString( step.targetRef.targetPath ?: "" ) ), "\", "/", "all" ) );
+				if ( !len( stepPath ) || !arguments.pathRemap.keyExists( stepPath ) ) continue;
+				var mapped = arguments.pathRemap[ stepPath ];
+				step.targetRef.targetPath = mapped.targetPath;
+				if ( len( trim( toString( mapped.methodName ?: "" ) ) ) ) step.targetRef.methodName = mapped.methodName;
+			}
+		}
+	}
+
+	/** PascalCase ColdBox handler name for a legacy feature directory. */
+	private string function handlerNameForDomain( required string domain ) {
+		var cleaned = reReplace( arguments.domain, "[^A-Za-z0-9]+", " ", "all" );
+		var words = [];
+		for ( var word in listToArray( cleaned, " " ) ) {
+			var token = trim( word );
+			if ( len( token ) ) words.append( uCase( left( token, 1 ) ) & right( token, len( token ) - 1 ) );
+		}
+		return words.len() ? words.toList( "" ) : "Main";
+	}
+
+	/** Action name for a page, taken from its proposed handler file name. */
+	private string function actionNameFromTargetPath( required string targetPath, required string sourcePath ) {
+		var base = listLast( arguments.targetPath, "/" );
+		base = listFirst( base, "." );
+		if ( !len( trim( base ) ) ) {
+			base = listFirst( listLast( normalizeLegacyPath( arguments.sourcePath ), "/" ), "." );
+		}
+		base = reReplace( trim( base ), "[^A-Za-z0-9]+", "", "all" );
+		if ( !len( base ) ) return "";
+		return lCase( left( base, 1 ) ) & right( base, len( base ) - 1 );
+	}
+
+	/**
+	 * Restores method-level detail the deterministic inventory already extracted.
+	 *
+	 * An application shard sees a bounded window of a file, so for a large CFC it
+	 * routinely answers with a single placeholder symbol
+	 * (`{name: "UNKNOWN", signature: "UNKNOWN"}`) and a purpose that says the
+	 * details were not extracted. On a live run `cfc/services/SongServices.cfc`
+	 * carried 23 parsed methods in the inventory and reached the plan as one
+	 * UNKNOWN symbol with a single legacyUnitId — so a reader could not tell
+	 * which behaviour moves where, or whether anything was dropped.
+	 *
+	 * The inventory is source-observed and already holds the names, signatures,
+	 * and line ranges, so this fills the gap deterministically rather than
+	 * spending another provider call on it. Provider-supplied real symbols are
+	 * never overwritten.
+	 */
+	private struct function backfillUnitSymbolsFromInventory( required struct plan, array errors = [] ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var units = isArray( target.units ?: "" ) ? target.units : [];
+		var inventoryUnits = isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" )
+			? arguments.plan.inventory.units
+			: [];
+		if ( !units.len() || !inventoryUnits.len() ) return arguments.plan;
+
+		var byPath = {};
+		for ( var legacy in inventoryUnits ) {
+			if ( !isStruct( legacy ) ) continue;
+			var legacyPath = lCase( normalizeLegacyPath( legacy.filePath ?: "" ) );
+			if ( !len( legacyPath ) ) continue;
+			if ( !byPath.keyExists( legacyPath ) ) byPath[ legacyPath ] = [];
+			byPath[ legacyPath ].append( legacy );
+		}
+
+		var maxSymbols = 40;
+		var enriched = 0;
+		var recoveredSymbols = 0;
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var sourcePath = lCase( normalizeLegacyPath( unit.sourcePath ?: "" ) );
+			if ( !len( sourcePath ) || !byPath.keyExists( sourcePath ) ) continue;
+			var legacyRecords = byPath[ sourcePath ];
+			if ( !legacyRecords.len() ) continue;
+
+			// Only fill a gap: a shard that genuinely named methods keeps its answer.
+			var existing = isArray( unit.symbols ?: "" ) ? unit.symbols : [];
+			var hasRealSymbols = false;
+			for ( var symbol in existing ) {
+				var symbolName = trim( toString( isStruct( symbol ) ? ( symbol.name ?: symbol.method ?: "" ) : symbol ) );
+				if ( len( symbolName ) && uCase( symbolName ) != "UNKNOWN" ) { hasRealSymbols = true; break; }
+			}
+			if ( hasRealSymbols ) continue;
+
+			var rebuilt = [];
+			var legacyIds = [];
+			for ( var legacyRecord in legacyRecords ) {
+				var name = trim( toString( legacyRecord.symbolName ?: "" ) );
+				if ( len( name ) && rebuilt.len() < maxSymbols ) {
+					rebuilt.append( {
+						name     : name,
+						signature: trim( toString( legacyRecord.signature ?: name ) ),
+						startLine: val( legacyRecord.startLine ?: 0 ),
+						endLine  : val( legacyRecord.endLine ?: 0 ),
+						source   : "inventory"
+					} );
+				}
+				var legacyId = trim( toString( legacyRecord.id ?: "" ) );
+				if ( len( legacyId ) && legacyIds.len() < maxSymbols && !arrayContainsNoCase( legacyIds, legacyId ) ) legacyIds.append( legacyId );
+			}
+			if ( !rebuilt.len() ) continue;
+			unit.symbols = rebuilt;
+			unit.symbolsProvenance = "inventory-backfilled";
+			// The count is what tells a reader whether the window truncated.
+			unit.legacySymbolCount = legacyRecords.len();
+			if ( legacyRecords.len() > rebuilt.len() ) unit.symbolsTruncated = true;
+			var priorLegacyIds = isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [];
+			if ( legacyIds.len() > priorLegacyIds.len() ) unit.legacyUnitIds = legacyIds;
+			enriched++;
+			recoveredSymbols += rebuilt.len();
+		}
+		if ( enriched ) {
+			arguments.errors.append( {
+				role: "modernization-application",
+				message: "backfilled-unit-symbols-from-inventory",
+				severity: "info",
+				units: enriched,
+				symbols: recoveredSymbols
+			} );
+		}
+		target.units = units;
+		arguments.plan.target = target;
+		return arguments.plan;
+	}
+
+	/**
+	 * Collapses `confidence` onto one type across every plan collection.
+	 *
+	 * Providers mix an enum (high/medium/low) and a 0..1 score in the same field
+	 * — one run carried 105 "high" alongside 13 "0.7" — so any sort, filter, or
+	 * threshold on confidence was unreliable. The enum wins because the UI and
+	 * validators read it; the original number is preserved as confidenceScore.
+	 */
+	private struct function normalizePlanConfidence( required struct plan ) {
+		var collections = [
+			isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [],
+			isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [],
+			isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [],
+			isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [],
+			isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : []
+		];
+		for ( var collection in collections ) {
+			for ( var item in collection ) {
+				if ( !isStruct( item ) || !structKeyExists( item, "confidence" ) ) continue;
+				var raw = item.confidence;
+				if ( !isSimpleValue( raw ) ) {
+					structDelete( item, "confidence" );
+					continue;
+				}
+				var text = trim( toString( raw ) );
+				if ( !len( text ) ) {
+					structDelete( item, "confidence" );
+					continue;
+				}
+				if ( isNumeric( text ) ) {
+					var score = val( text );
+					// Providers sometimes answer on a 0-100 scale.
+					if ( score > 1 ) score = score / 100;
+					item.confidenceScore = score;
+					item.confidence = score >= 0.8 ? "high" : ( score >= 0.5 ? "medium" : "low" );
+					continue;
+				}
+				var normalized = lCase( text );
+				if ( [ "high", "medium", "low" ].contains( normalized ) ) item.confidence = normalized;
+				else if ( [ "very-high", "veryhigh", "certain", "confident" ].contains( normalized ) ) item.confidence = "high";
+				else if ( [ "moderate", "med", "unsure" ].contains( normalized ) ) item.confidence = "medium";
+				else if ( [ "very-low", "verylow", "speculative", "guess" ].contains( normalized ) ) item.confidence = "low";
+				else item.confidence = "medium";
+			}
+		}
+		return arguments.plan;
+	}
+
+	/**
 	 * Deterministic cleanup so common provider aliases validate and the Solution
 	 * UI gets a mapped current slice instead of an empty narrative road.
 	 */
 	private struct function polishPlan( required struct plan, struct samplePolicy = {}, array errors = [] ) {
 		var polished = arguments.plan;
+		polished = backfillUnitSymbolsFromInventory( polished, arguments.errors );
+		polished = groupHandlerUnitsIntoActions( polished, arguments.errors );
 		polished.dbTransitions = normalizeDbTransitions( polished.dbTransitions ?: [] );
 		polished.routeContracts = normalizeRouteContracts( polished.routeContracts ?: [] );
 		polished = resolveInventoryReferences( polished );
-		polished.routeContracts = retainEvidencedRoutes( polished, arguments.errors );
-		polished.roadmapPhases = normalizeRoadmapReferences( polished, arguments.errors );
-		polished.roadmapPhases = ensureRoadmapActionFields( polished.roadmapPhases ?: [], polished );
 		// Roadmap normalization first separates route ids that providers placed in
 		// unitIds; target alias resolution can then safely canonicalize only the
 		// remaining target-unit references.
+		polished.roadmapPhases = normalizeRoadmapReferences( polished, arguments.errors );
+		polished.roadmapPhases = ensureRoadmapActionFields( polished.roadmapPhases ?: [], polished );
 		polished = resolveTargetReferences( polished );
+		polished = ensureUniqueTargetUnitIds( polished, arguments.errors );
+		polished = ensureUniqueCollectionIds( polished, arguments.errors );
 		polished = dropUnresolvedUnitLinks( polished, arguments.errors );
+		// Routes are retained only after unit ids are canonicalized and links are
+		// repaired. Retaining first made every route minted in one shard that
+		// referenced another shard's unit look unbacked, and 39 of 40 were dropped.
+		polished.routeContracts = retainEvidencedRoutes( polished, arguments.errors );
+		// Re-validate phase references against the final route set.
+		polished.roadmapPhases = normalizeRoadmapReferences( polished, arguments.errors );
+		polished = normalizePlanConfidence( polished );
+		polished = pruneUnbackedMigrationSteps( polished, arguments.errors );
 		polished.assumptions = dedupeSimpleValues( polished.assumptions ?: [] );
 		polished.samples = normalizeSamples( polished.samples ?: [], polished.metadata.runtime ?: {} );
 		polished.samples = liftUnitSampleCode( polished.samples ?: [], polished.target.units ?: [] );
@@ -2875,22 +3582,185 @@ class {
 	 * repair. Dangling hashes / invented ids (targetUnit-2, models/Foo.cfc)
 	 * otherwise flood validation with unknownTargetUnitId blockers.
 	 */
+	/**
+	 * Guarantees every target unit carries a distinct id.
+	 *
+	 * Ids are minted from item content, so two shards proposing the same target
+	 * for the same legacy file mint the same id. Target-path de-collision then
+	 * renames one of them (home.bx -> home2.bx) without re-minting, leaving two
+	 * units sharing an id. That single collision cascaded into five blocking
+	 * violations on a live run: the duplicate id itself, a placement owning "the"
+	 * unit twice, and three migration steps that looked out-of-phase because the
+	 * phase resolved the shared id to only one of the two units.
+	 *
+	 * The first occurrence keeps the id so existing links, routes, and decisions
+	 * stay valid; later duplicates are re-minted from their own (now distinct)
+	 * content.
+	 */
+	private struct function ensureUniqueTargetUnitIds( required struct plan, array errors = [] ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var units = isArray( target.units ?: "" ) ? target.units : [];
+		if ( units.len() < 2 ) return arguments.plan;
+		var seen = {};
+		var reminted = 0;
+		for ( var unit in units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) && !seen.keyExists( unitId ) ) {
+				seen[ unitId ] = true;
+				continue;
+			}
+			// Re-mint from the unit's own content, which now differs from its twin.
+			var candidate = identityService.itemId( "target-unit", unit );
+			if ( !len( candidate ) || seen.keyExists( candidate ) ) {
+				// Content is still identical; fall back to a deterministic
+				// discriminator so the id cannot collide again.
+				candidate = identityService.itemId( "target-unit", {
+					previousId: unitId,
+					targetPath: toString( unit.targetPath ?: "" ),
+					sourcePath: toString( unit.sourcePath ?: "" ),
+					ordinal: seen.count() + 1
+				} );
+			}
+			unit.id = candidate;
+			unit.idProvenance = "reminted-duplicate";
+			// The fingerprint covered the old id, so it has to be rebuilt too.
+			structDelete( unit, "itemFingerprint" );
+			unit.itemFingerprint = identityService.itemFingerprint( "target-unit", unit );
+			seen[ candidate ] = true;
+			reminted++;
+		}
+		if ( reminted ) {
+			arguments.errors.append( {
+				role: "modernization-application",
+				message: "reminted-duplicate-target-unit-ids",
+				severity: "info",
+				count: reminted
+			} );
+		}
+		target.units = units;
+		arguments.plan.target = target;
+		return arguments.plan;
+	}
+
+	/**
+	 * Applies the same duplicate-id repair to the plan's other collections.
+	 *
+	 * `ensureUniqueTargetUnitIds` only covered target units, but ids are minted
+	 * from item content everywhere, so any collection can collide the same way —
+	 * a live run produced two dbTransitions sharing an id. Every duplicate id is
+	 * a blocking violation regardless of which array it sits in.
+	 */
+	private struct function ensureUniqueCollectionIds( required struct plan, array errors = [] ) {
+		var collections = [
+			{ key: "dbFindings", kind: "db-finding" },
+			{ key: "dbTransitions", kind: "db-transition" },
+			{ key: "routeContracts", kind: "route-contract" },
+			{ key: "samples", kind: "sample" },
+			{ key: "roadmapPhases", kind: "roadmap-phase" }
+		];
+		var reminted = 0;
+		for ( var collection in collections ) {
+			var items = isArray( arguments.plan[ collection.key ] ?: "" ) ? arguments.plan[ collection.key ] : [];
+			if ( items.len() < 2 ) continue;
+			var seen = {};
+			var ordinal = 0;
+			for ( var item in items ) {
+				if ( !isStruct( item ) ) continue;
+				ordinal++;
+				var itemId = trim( toString( item.id ?: item.itemId ?: "" ) );
+				if ( len( itemId ) && !seen.keyExists( itemId ) ) {
+					seen[ itemId ] = true;
+					continue;
+				}
+				var candidate = identityService.itemId( collection.kind, item );
+				if ( !len( candidate ) || seen.keyExists( candidate ) ) {
+					candidate = identityService.itemId( collection.kind, { previousId: itemId, ordinal: ordinal, collection: collection.key } );
+				}
+				item.id = candidate;
+				item.idProvenance = "reminted-duplicate";
+				structDelete( item, "itemFingerprint" );
+				item.itemFingerprint = identityService.itemFingerprint( collection.kind, item );
+				seen[ candidate ] = true;
+				reminted++;
+			}
+		}
+		if ( reminted ) {
+			arguments.errors.append( {
+				role: "modernization",
+				message: "reminted-duplicate-item-ids",
+				severity: "info",
+				count: reminted
+			} );
+		}
+		return arguments.plan;
+	}
+
 	private struct function dropUnresolvedUnitLinks( required struct plan, array errors = [] ) {
 		var targetIds = {};
-		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		// Sharding breaks referential integrity: a link minted in shard 3 can name
+		// a unit that only exists in shard 7's output. The pair of paths on both
+		// sides is stable across shards, so repair through those before dropping.
+		var unitsBySourceTarget = {};
+		var unitsBySource = {};
+		var unitsByTarget = {};
+		var noteCandidate = ( bucket, key, unitId ) => {
+			if ( !len( key ) ) return;
+			if ( !bucket.keyExists( key ) ) bucket[ key ] = [];
+			if ( !arrayContainsNoCase( bucket[ key ], unitId ) ) bucket[ key ].append( unitId );
+		};
+		for ( var unit in units ) {
 			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
-			if ( len( unitId ) ) targetIds[ unitId ] = true;
+			if ( !len( unitId ) ) continue;
+			targetIds[ unitId ] = true;
+			var unitSource = lCase( normalizeLegacyPath( unit.sourcePath ?: "" ) );
+			var unitTarget = lCase( normalizeLegacyPath( unit.targetPath ?: "" ) );
+			noteCandidate( unitsBySourceTarget, unitSource & "|" & unitTarget, unitId );
+			noteCandidate( unitsBySource, unitSource, unitId );
+			noteCandidate( unitsByTarget, unitTarget, unitId );
 		}
 		var kept = [];
 		var dropped = 0;
+		var repaired = 0;
 		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
 			if ( !isStruct( link ) ) continue;
 			var targetId = trim( toString( link.targetUnitId ?: "" ) );
 			if ( len( targetId ) && targetIds.keyExists( targetId ) ) {
 				kept.append( link );
+				continue;
+			}
+			var linkSource = lCase( normalizeLegacyPath( link.sourcePath ?: "" ) );
+			var linkTarget = lCase( normalizeLegacyPath( link.targetPath ?: "" ) );
+			var resolved = "";
+			for ( var candidate in [
+				unitsBySourceTarget[ linkSource & "|" & linkTarget ] ?: [],
+				unitsByTarget[ linkTarget ] ?: [],
+				unitsBySource[ linkSource ] ?: []
+			] ) {
+				// Only adopt an unambiguous match; a path shared by several units
+				// tells us nothing about which one this link meant.
+				if ( candidate.len() == 1 ) {
+					resolved = candidate[ 1 ];
+					break;
+				}
+			}
+			if ( len( resolved ) ) {
+				link.targetUnitId = resolved;
+				link.targetUnitIdProvenance = "repaired-by-path";
+				kept.append( link );
+				repaired++;
 			} else {
 				dropped++;
 			}
+		}
+		if ( repaired ) {
+			arguments.errors.append( {
+				role: "modernization-application",
+				message: "repaired-cross-shard-unit-links",
+				severity: "info",
+				count: repaired
+			} );
 		}
 		if ( dropped ) {
 			arguments.errors.append( {
@@ -2960,6 +3830,80 @@ class {
 		return reReplace( normalized, "^\./", "" );
 	}
 
+	/**
+	 * Guarantees a transition carries a cfmigrations-shaped migration body.
+	 *
+	 * Providers reliably return `sampleMigration: { up: "...", down: "..." }` —
+	 * the statement bodies without the component wrapper the validator requires,
+	 * so every transition failed the "missing up(schema, query)" gate. Wrapping
+	 * the model's own statements keeps the evidence and satisfies the contract;
+	 * a body the provider already wrapped is left untouched.
+	 */
+	private void function ensureMigrationSkeleton( required struct transition ) {
+		var existing = arguments.transition.migrationCode ?: "";
+		if ( isSimpleValue( existing ) && reFindNoCase( "function\s+up\s*\(", toString( existing ) ) ) return;
+		var sample = arguments.transition.sampleMigration ?: "";
+		if ( isSimpleValue( sample ) && reFindNoCase( "function\s+up\s*\(", toString( sample ) ) ) {
+			arguments.transition.migrationCode = toString( sample );
+			return;
+		}
+		var upBody = "";
+		var downBody = "";
+		if ( isStruct( sample ) ) {
+			upBody = trim( toString( sample.up ?: sample.forward ?: "" ) );
+			downBody = trim( toString( sample.down ?: sample.rollback ?: sample.reverse ?: "" ) );
+		} else if ( isSimpleValue( sample ) ) {
+			upBody = trim( toString( sample ) );
+		}
+		if ( !len( downBody ) ) downBody = trim( toString( arguments.transition.rollback ?: "" ) );
+		if ( !len( upBody ) && !len( downBody ) ) return;
+		var objectLabel = "";
+		if ( isArray( arguments.transition.objectsTouched ?: "" ) && arguments.transition.objectsTouched.len() ) {
+			objectLabel = toString( arguments.transition.objectsTouched[ 1 ] );
+		}
+		var indent = ( body, fallback ) => {
+			var text = len( trim( arguments.body ) ) ? trim( arguments.body ) : arguments.fallback;
+			var lines = [];
+			for ( var line in listToArray( replace( text, char( 13 ), "", "all" ), char( 10 ), true, false ) ) {
+				lines.append( "        " & line );
+			}
+			return lines.toList( char( 10 ) );
+		};
+		arguments.transition.migrationCode = "component {" & char( 10 ) &
+			"    function up( schema, query ) {" & char( 10 ) &
+			indent( upBody, "// review expand step for `" & objectLabel & "` before running" ) & char( 10 ) &
+			"    }" & char( 10 ) &
+			"    function down( schema, query ) {" & char( 10 ) &
+			indent( downBody, "// review rollback for `" & objectLabel & "` before running" ) & char( 10 ) &
+			"    }" & char( 10 ) & "}";
+		arguments.transition.migrationCodeProvenance = "wrapped-provider-statements";
+	}
+
+	/**
+	 * Guarantees a cfmigrations-shaped migration path.
+	 *
+	 * `migrationPath` is unreliable provider output — observed as a bare
+	 * directory and, in another run, as the literal operation name ("expand") —
+	 * and the validator requires a `YYYY_MM_DD_HHMMSS` filename. The synthesized
+	 * name is derived from the transition's own order and object so it stays
+	 * stable across runs; a wall-clock stamp would churn item fingerprints.
+	 */
+	private void function ensureMigrationPath( required struct transition, required numeric position ) {
+		var current = replace( trim( toString( arguments.transition.migrationPath ?: "" ) ), "\", "/", "all" );
+		if ( len( current ) && reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\.bx$", current ) ) return;
+		var order = isNumeric( arguments.transition.order ?: "" ) ? int( arguments.transition.order ) : arguments.position;
+		var operation = reReplace( lCase( toString( arguments.transition.operation ?: "change" ) ), "[^a-z0-9]+", "_", "all" );
+		var objectName = "";
+		if ( isArray( arguments.transition.objectsTouched ?: "" ) && arguments.transition.objectsTouched.len() ) {
+			objectName = reReplace( lCase( toString( arguments.transition.objectsTouched[ 1 ] ) ), "[^a-z0-9]+", "_", "all" );
+		}
+		var slug = trim( operation & ( len( objectName ) ? "_" & objectName : "" ) );
+		if ( !len( slug ) ) slug = "migration";
+		arguments.transition.migrationPath = "resources/database/migrations/2025_01_01_" &
+			right( "00000" & max( 0, order ), 6 ) & "_" & slug & ".bx";
+		arguments.transition.migrationPathProvenance = "derived-from-order-and-object";
+	}
+
 	private array function normalizeDbTransitions( required any transitions ) {
 		var output = isArray( arguments.transitions ) ? arguments.transitions : [];
 		var allowedOps = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
@@ -2974,6 +3918,23 @@ class {
 			"drop": "contract",
 			"remove": "contract",
 			"delete": "contract",
+			// Providers reach for their own vocabulary. One live run returned
+			// "verify" 23 times and "capture" once, and every transition then
+			// tripped the invalid-operation gate.
+			"verify": "switch",
+			"validate": "switch",
+			"check": "switch",
+			"capture": "expand",
+			"introduce": "expand",
+			"extend": "expand",
+			"populate": "backfill",
+			"seed": "backfill",
+			"copy": "backfill",
+			"migrate-data": "backfill",
+			"cutover-traffic": "switch",
+			"retire": "contract",
+			"cleanup": "contract",
+			"clean-up": "contract",
 			"back-fill": "backfill",
 			"cutover": "switch",
 			"forwardonly": "forward-only",
@@ -2983,15 +3944,20 @@ class {
 			if ( !isStruct( transition ) ) continue;
 			transition.evidenceRefs = normalizeProviderList( transition.evidenceRefs ?: transition.evidence ?: [] );
 			transition.objectsTouched = normalizeProviderList( transition.objectsTouched ?: transition.objects ?: [] );
+			ensureMigrationSkeleton( transition );
 			var operation = lCase( trim( toString( transition.operation ?: transition.phase ?: "" ) ) );
 			if ( len( operation ) && !allowedOps.contains( operation ) ) {
 				operation = opAliases[ operation ] ?: operation;
 			}
 			if ( len( operation ) && allowedOps.contains( operation ) ) {
 				transition.operation = operation;
-			} else if ( !len( operation ) ) {
-				// Incomplete provider drafts often omit operation; default to expand
-				// so validation can soft-warn instead of hard-block the whole plan.
+			} else {
+				// Empty drafts and unrecognized provider vocabulary land here alike.
+				// Passing an unknown verb through unchanged only moved the failure to
+				// the validator, which flagged every transition as invalid. Expand is
+				// the non-destructive default; the flag keeps the inference visible
+				// and records what the provider actually said.
+				if ( len( operation ) ) transition.operationProvided = operation;
 				transition.operation = "expand";
 				transition.operationInferred = true;
 			}
@@ -3014,7 +3980,36 @@ class {
 				mid( timestampDigits, 9, 6 ) & "_" &
 				slug & ".bx";
 		}
-		return output;
+		// Expand/backfill/switch/contract only means anything in sequence, and the
+		// gate requires `order` to be monotonic. Providers return repeated or
+		// out-of-sequence numbers, so renumber densely while preserving the
+		// relative order they asked for — the ordering is the provider's
+		// intent; only the numbering is unreliable.
+		var ordered = [];
+		for ( var orderedItem in output ) if ( isStruct( orderedItem ) ) ordered.append( orderedItem );
+		var originalIndex = {};
+		for ( var indexPosition = 1; indexPosition <= ordered.len(); indexPosition++ ) {
+			originalIndex[ indexPosition ] = ordered[ indexPosition ];
+		}
+		ordered.sort( ( a, b ) => {
+			var left = isNumeric( a.order ?: "" ) ? val( a.order ) : 999999;
+			var right = isNumeric( b.order ?: "" ) ? val( b.order ) : 999999;
+			return left == right ? 0 : ( left < right ? -1 : 1 );
+		} );
+		for ( var sequence = 1; sequence <= ordered.len(); sequence++ ) {
+			ordered[ sequence ].order = sequence;
+		}
+
+		// Last-resort pass: the loop above repairs a recoverable path, but skips a
+		// transition whose path is absent or carries no timestamp digits at all
+		// (observed as a bare directory, and as the literal operation name).
+		// Synthesize one so the cfmigrations gate is satisfiable.
+		var transitionPosition = 0;
+		for ( var pending in ordered ) {
+			transitionPosition++;
+			ensureMigrationPath( pending, transitionPosition );
+		}
+		return ordered;
 	}
 
 	/**
@@ -3047,13 +4042,48 @@ class {
 		return output;
 	}
 
+	/**
+	 * Turns a legacy source path into a route path the validator accepts.
+	 *
+	 * `safeRoutePath()` requires a leading "/", no ".." anywhere, and no "//".
+	 * Legacy CFML navigation is full of relative hops ("../login/login.cfm"), so
+	 * a derived path has to be resolved rather than just slash-prefixed —
+	 * otherwise deriving the path trades a dropped route for a blocking
+	 * validation error. Returns "" when nothing safe can be produced.
+	 */
+	private string function safeRoutePathFrom( required string sourcePath ) {
+		var normalized = replace( trim( arguments.sourcePath ), "\", "/", "all" );
+		if ( !len( normalized ) ) return "";
+		var resolved = [];
+		for ( var segment in listToArray( normalized, "/" ) ) {
+			var cleaned = trim( segment );
+			if ( !len( cleaned ) || cleaned == "." ) continue;
+			if ( cleaned == ".." ) {
+				// Pop the parent this hop escapes; a hop above the root is simply
+				// dropped, which keeps the remaining path inside the application.
+				if ( resolved.len() ) resolved.deleteAt( resolved.len() );
+				continue;
+			}
+			resolved.append( cleaned );
+		}
+		if ( !resolved.len() ) return "";
+		var candidate = "/" & resolved.toList( "/" );
+		// Defensive: never hand back something the gate would reject.
+		if ( find( "..", candidate ) || reFind( "^//", candidate ) ) return "";
+		return candidate;
+	}
+
 	private array function retainEvidencedRoutes( required struct plan, array errors = [] ) {
 		var targetIds = {};
+		var targetsById = {};
 		var linksById = {};
 		var linksByTarget = {};
 		for ( var target in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
 			var targetId = trim( target.id ?: target.itemId ?: "" );
-			if ( len( targetId ) ) targetIds[ targetId ] = true;
+			if ( len( targetId ) ) {
+				targetIds[ targetId ] = true;
+				targetsById[ targetId ] = target;
+			}
 		}
 		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
 			var linkId = trim( link.id ?: link.itemId ?: "" );
@@ -3103,13 +4133,33 @@ class {
 			var evidencePresent = structKeyExists( copy, "evidence" );
 			var hasEvidence = isArray( copy.evidence ?: "" ) && copy.evidence.len() > 0;
 			var validReferences = len( targetId ) && targetIds.keyExists( targetId ) && len( linkId ) && linksById.keyExists( linkId );
-			if ( !len( trim( copy.path ?: "" ) ) || !validReferences ) {
+			// Providers routinely omit `path` while still returning a resolvable
+			// link/target. The legacy source path behind that link is real
+			// evidence, so derive the route path from it rather than discarding
+			// an otherwise well-formed route.
+			if ( !len( trim( scalarString( copy.path ?: "" ) ) ) ) {
+				var derivedPath = "";
+				if ( len( linkId ) && linksById.keyExists( linkId ) ) {
+					derivedPath = trim( scalarString( linksById[ linkId ].sourcePath ?: "" ) );
+				}
+				if ( !len( derivedPath ) && len( targetId ) && targetsById.keyExists( targetId ) ) {
+					derivedPath = trim( scalarString( targetsById[ targetId ].sourcePath ?: "" ) );
+				}
+				derivedPath = safeRoutePathFrom( derivedPath );
+				if ( len( derivedPath ) ) {
+					copy.path = derivedPath;
+					if ( !len( trim( scalarString( copy.legacyPath ?: "" ) ) ) ) copy.legacyPath = derivedPath;
+					if ( isStruct( copy.request ?: "" ) && !len( trim( scalarString( copy.request.path ?: "" ) ) ) ) copy.request.path = derivedPath;
+					copy.pathProvenance = "derived-from-linked-source";
+				}
+			}
+			if ( !len( trim( scalarString( copy.path ?: "" ) ) ) || !validReferences ) {
 				arguments.errors.append( {
 					role: "modernization-application",
 					message: "omitted-unbacked-route",
 					severity: "info",
 					routeId: routeId,
-					reason: !len( trim( copy.path ?: "" ) ) ? "missing-path" : "missing-target-or-link"
+					reason: !len( trim( scalarString( copy.path ?: "" ) ) ) ? "missing-path" : "missing-target-or-link"
 				} );
 				continue;
 			}
@@ -3268,11 +4318,15 @@ class {
 
 	private array function normalizeRoadmapReferences( required struct plan, array errors = [] ) {
 		var unitIds = {};
+		var unitsById = {};
 		var routeIds = {};
 		var findingIds = {};
 		var transitionIds = {};
 		var sampleIds = {};
-		for ( var item in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) unitIds[ trim( item.id ?: item.itemId ?: "" ) ] = true;
+		for ( var item in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			unitIds[ trim( item.id ?: item.itemId ?: "" ) ] = true;
+			unitsById[ trim( item.id ?: item.itemId ?: "" ) ] = item;
+		}
 		for ( var item in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) routeIds[ trim( item.id ?: item.itemId ?: "" ) ] = true;
 		for ( var item in ( isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] ) ) findingIds[ trim( item.id ?: item.itemId ?: "" ) ] = true;
 		for ( var item in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) transitionIds[ trim( item.id ?: item.itemId ?: "" ) ] = true;
@@ -3296,7 +4350,95 @@ class {
 			copy.sampleIds = validIds( copy.sampleIds ?: [], sampleIds );
 			output.append( copy );
 		}
-		return output;
+		return linkDatabaseWorkToPhases( arguments.plan, output, unitsById, arguments.errors );
+	}
+
+	/**
+	 * Attaches database findings/transitions to the roadmap phase that touches
+	 * the same data.
+	 *
+	 * The roadmap role is sharded over target-unit groups and does not receive
+	 * the database ledger, so its phases came back with empty dbFindingIds and
+	 * transitionIds and the whole database plan sat orphaned beside the roadmap.
+	 * Matching a schema object name against the legacy paths in a phase is
+	 * deterministic and evidence-backed; anything still unmatched is attached to
+	 * the first phase so no database work is silently unscheduled.
+	 */
+	private array function linkDatabaseWorkToPhases(
+		required struct plan,
+		required array phases,
+		required struct unitsById,
+		array errors = []
+	) {
+		if ( !arguments.phases.len() ) return arguments.phases;
+		var findings = isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [];
+		var transitions = isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [];
+		if ( !findings.len() && !transitions.len() ) return arguments.phases;
+
+		var haystacks = [];
+		for ( var phase in arguments.phases ) {
+			var phaseUnits = [];
+			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) {
+				var unit = arguments.unitsById[ trim( toString( unitId ) ) ] ?: {};
+				if ( isStruct( unit ) && unit.count() ) phaseUnits.append( unit );
+			}
+			var label = reReplace( lCase( trim( toString( phase.name ?: "" ) ) & " " & trim( toString( phase.goal ?: "" ) ) ), "[^a-z0-9]+", " ", "all" );
+			haystacks.append( label & " " & pathHaystackForUnits( phaseUnits ) );
+		}
+
+		var linkedFindings = 0;
+		var linkedTransitions = 0;
+		var attachOrphan = 0;
+		var buckets = [
+			{ items: findings, field: "dbFindingIds" },
+			{ items: transitions, field: "transitionIds" }
+		];
+		for ( var bucket in buckets ) {
+			for ( var item in bucket.items ) {
+				if ( !isStruct( item ) ) continue;
+				var itemId = trim( toString( item.id ?: item.itemId ?: "" ) );
+				if ( !len( itemId ) ) continue;
+				// Already scheduled by the provider — leave it alone.
+				var alreadyScheduled = false;
+				for ( var existing in arguments.phases ) {
+					if ( arrayContainsNoCase( isArray( existing[ bucket.field ] ?: "" ) ? existing[ bucket.field ] : [], itemId ) ) {
+						alreadyScheduled = true;
+						break;
+					}
+				}
+				if ( alreadyScheduled ) continue;
+				var matchedIndex = 0;
+				for ( var objectName in objectNamesForDbItem( item ) ) {
+					for ( var haystackIndex = 1; haystackIndex <= haystacks.len(); haystackIndex++ ) {
+						if ( objectMatchesHaystack( objectName, haystacks[ haystackIndex ] ) ) {
+							matchedIndex = haystackIndex;
+							break;
+						}
+					}
+					if ( matchedIndex ) break;
+				}
+				if ( !matchedIndex ) {
+					matchedIndex = 1;
+					attachOrphan++;
+				}
+				if ( !isArray( arguments.phases[ matchedIndex ][ bucket.field ] ?: "" ) ) arguments.phases[ matchedIndex ][ bucket.field ] = [];
+				arguments.phases[ matchedIndex ][ bucket.field ].append( itemId );
+				if ( bucket.field == "transitionIds" ) linkedTransitions++;
+				else linkedFindings++;
+			}
+		}
+
+		if ( linkedFindings || linkedTransitions ) {
+			arguments.errors.append( {
+				role: "modernization-roadmap",
+				message: "linked-database-work-to-phases",
+				severity: "info",
+				findings: linkedFindings,
+				transitions: linkedTransitions,
+				unmatchedAttachedToFirstPhase: attachOrphan
+			} );
+		}
+		return arguments.phases;
 	}
 
 	private array function validIds( required any values, required struct lookup ) {

@@ -10,7 +10,11 @@ class {
 	property name="maxCharacters" inject="coldbox:setting:modernizeMaxContextCharacters";
 	property name="maxLinesPerFile" inject="coldbox:setting:modernizeMaxContextLinesPerFile";
 	property name="maxCharactersPerPartition" inject="coldbox:setting:modernizeMaxContextCharactersPerPartition";
-	variables.defaults = { maxPartitions: 140, maxCharacters: 320000, maxLinesPerFile: 160, maxCharactersPerPartition: 16000 };
+	// maxPartitions is a pathological-input guard, NOT the working limiter:
+	// maxCharacters is what bounds prompt cost. A count cap below the repository
+	// file count drops source text while budget is still unspent, and those
+	// files then get mapped from inventory metadata alone.
+	variables.defaults = { maxPartitions: 400, maxCharacters: 320000, maxLinesPerFile: 160, maxCharactersPerPartition: 16000 };
 	variables.version = "modernization-context-partitions-v1";
 
 	function init() {
@@ -71,9 +75,14 @@ class {
 		var partitions = [];
 		var usedCharacters = 0;
 		var omittedPaths = [];
+		var omittedReasons = {};
+		var noteOmission = ( path, reason ) => {
+			omittedPaths.append( path );
+			omittedReasons[ path ] = reason;
+		};
 		for ( var pathIndex = 1; pathIndex <= paths.len(); pathIndex++ ) {
 			var path = paths[ pathIndex ];
-			if ( partitions.len() >= maxPartitions ) { omittedPaths.append( path ); continue; }
+			if ( partitions.len() >= maxPartitions ) { noteOmission( path, "partition-count-cap" ); continue; }
 			var file = indexed[ path ] ?: { filePath: path, contentHash: "", lines: [] };
 			// Share the global character budget across the paths that remain.
 			// Sequentially spending the full per-partition cap caused the first
@@ -92,11 +101,11 @@ class {
 				min( maxPartitionChars, fairPartitionCharacters ),
 				maxCharacters - usedCharacters
 			);
-			if ( !len( partition.text ) && !partition.artifactRefs.len() ) { omittedPaths.append( path ); continue; }
+			if ( !len( partition.text ) && !partition.artifactRefs.len() ) { noteOmission( path, "no-readable-source" ); continue; }
 			partitions.append( partition );
 			usedCharacters += len( partition.text );
 			if ( usedCharacters >= maxCharacters ) {
-				for ( var omittedIndex = pathIndex + 1; omittedIndex <= paths.len(); omittedIndex++ ) omittedPaths.append( paths[ omittedIndex ] );
+				for ( var omittedIndex = pathIndex + 1; omittedIndex <= paths.len(); omittedIndex++ ) noteOmission( paths[ omittedIndex ], "character-budget" );
 				break;
 			}
 		}
@@ -106,6 +115,7 @@ class {
 			files: paths.len(),
 			omittedPartitions: omittedPaths.len(),
 			omittedPaths: omittedPaths,
+			omittedReasons: omittedReasons,
 			priorityBoostPaths: boostPaths,
 			truncated: omittedPaths.len() > 0 || coverageTruncated( arguments.coverage ),
 			lineCount: partitions.reduce( ( total, item ) => total + val( item.lineCount ?: 0 ), 0 ),

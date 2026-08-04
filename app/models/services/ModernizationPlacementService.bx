@@ -33,6 +33,7 @@ class {
 	 */
 	struct function canonicalize( required struct plan, struct evidence = {}, boolean includeLegacyProjection = true ) {
 		var output = duplicate( arguments.plan );
+		output = repairStringifiedPhaseCollections( output );
 		var target = isStruct( output.target ?: "" ) ? output.target : {};
 		target.units = isArray( target.units ?: "" ) ? target.units : [];
 		var rawPlacements = isArray( target.placements ?: "" ) ? target.placements : [];
@@ -49,7 +50,17 @@ class {
 		var coverage = assignUnownedUnits( normalized, target.units, arguments.plan, arguments.evidence );
 		normalized = coverage.placements;
 
+		// A placement owning nothing is a lane with no cargo: it blocks validation
+		// and tells a reader nothing. Providers emit these when a named grouping
+		// loses all its units to alias resolution or de-duplication.
+		var owned = [];
+		for ( var candidatePlacement in normalized ) {
+			if ( !isStruct( candidatePlacement ) ) continue;
+			if ( isArray( candidatePlacement.targetUnitIds ?: "" ) && candidatePlacement.targetUnitIds.len() ) owned.append( candidatePlacement );
+		}
+		normalized = owned;
 		target.placements = normalized;
+		applyModulePackagingPaths( normalized, target.units, output );
 		target.placementContractVersion = variables.version;
 		if ( arguments.includeLegacyProjection ) {
 			var projection = legacyProjection( normalized );
@@ -77,6 +88,63 @@ class {
 	 * Adapt a persisted artifact for API/UI reads without changing its
 	 * historical schemaVersion, fingerprint, or stored source semantics.
 	 */
+	/**
+	 * Restores roadmap phase collections that reached the plan as text.
+	 *
+	 * A phase field can arrive stringified — `"[\n    phase-media-player\n]"` is
+	 * BoxLang's array toString(), not JSON — and a stored plan in that shape
+	 * breaks the workspace outright: the UI's `(phase.dependencies || [])` guard
+	 * is useless because a non-empty string is truthy, so `.forEach` throws and
+	 * nothing renders.
+	 *
+	 * This runs inside canonicalize() so generation, post-repair, and read all
+	 * get it, which means plans already persisted in the broken shape load again
+	 * without a rebuild. Arrays of objects (migrationSteps) cannot be recovered
+	 * from that notation, so they are emptied rather than guessed at, and the
+	 * loss is recorded on the phase.
+	 */
+	private struct function repairStringifiedPhaseCollections( required struct plan ) {
+		if ( !isArray( arguments.plan.roadmapPhases ?: "" ) ) return arguments.plan;
+		var tokenFields = [ "dependencies", "unitIds", "routeIds", "dbFindingIds", "transitionIds", "sampleIds", "componentIds", "exitCriteria", "risks", "assumptions" ];
+		var objectFields = [ "migrationSteps" ];
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) ) continue;
+			var repaired = [];
+			for ( var field in tokenFields ) {
+				if ( !structKeyExists( phase, field ) || isArray( phase[ field ] ) ) continue;
+				phase[ field ] = tokensFromStringifiedArray( phase[ field ] );
+				repaired.append( field );
+			}
+			for ( var objectField in objectFields ) {
+				if ( !structKeyExists( phase, objectField ) || isArray( phase[ objectField ] ) ) continue;
+				phase[ objectField ] = [];
+				repaired.append( objectField );
+			}
+			if ( repaired.len() ) phase.repairedCollections = repaired;
+		}
+		return arguments.plan;
+	}
+
+	/** Splits BoxLang/provider array-ish text back into bounded tokens. */
+	private array function tokensFromStringifiedArray( required any value ) {
+		if ( isArray( arguments.value ) ) return duplicate( arguments.value );
+		if ( !isSimpleValue( arguments.value ) ) return [];
+		var text = trim( toString( arguments.value ) );
+		if ( !len( text ) ) return [];
+		text = reReplace( text, "^[[:space:]]*\[|\][[:space:]]*$", "", "all" );
+		text = replace( text, '"', "", "all" );
+		text = reReplace( text, "[,\r\n]+", ",", "all" );
+		var output = [];
+		for ( var item in listToArray( text, "," ) ) {
+			var normalized = trim( item );
+			if ( !len( normalized ) ) continue;
+			var duplicated = false;
+			for ( var existing in output ) if ( compareNoCase( toString( existing ), normalized ) == 0 ) { duplicated = true; break; }
+			if ( !duplicated ) output.append( normalized );
+		}
+		return output;
+	}
+
 	struct function adaptForRead( required struct plan ) {
 		var sourceVersion = trim( toString( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : ( structKeyExists( arguments.plan, "version" ) ? arguments.plan.version : "" ) ) );
 		var hasPlacements = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) && structKeyExists( arguments.plan.target, "placements" ) && isArray( arguments.plan.target.placements );
@@ -351,10 +419,11 @@ class {
 				mainIds.append( candidate.units, true );
 				continue;
 			}
-			var name = humanizeDomainKey( candidate.domainKey );
+			var name = moduleDisplayName( candidate.domainKey, candidate.units, arguments.units );
 			var item = {
-				name: "#name# module candidate",
+				name: name,
 				domainKey: candidate.domainKey,
+				moduleSlug: moduleSlugFor( candidate.domainKey ),
 				purpose: "Keep this repeated feature directory cohesive behind a ColdBox module boundary.",
 				recommendation: "Create a ColdBox module candidate; validate routes, dependencies, and shared data before committing the boundary.",
 				placementType: "coldbox-module",
@@ -392,10 +461,102 @@ class {
 		return first;
 	}
 
+	/**
+	 * Moves units of a ColdBox-module placement under `modules/<slug>/`.
+	 *
+	 * Declaring a placement `coldbox-module` while its units still target
+	 * `app/handlers/...` is not a ColdBox module — it is the monolith with a
+	 * label. A live run had 49 units in that contradictory state, so the plan
+	 * told an implementer to build a module and then handed them main-app paths.
+	 *
+	 * Only the leading `app/` segment is rewritten; the layer folders underneath
+	 * (handlers, views, models/services) are ColdBox module conventions too, so
+	 * they carry over unchanged. Units already under `modules/` are left alone.
+	 */
+	private void function applyModulePackagingPaths( required array placements, required array units, struct plan = {} ) {
+		var pathRemap = {};
+		var unitsById = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitsById[ unitId ] = unit;
+		}
+		for ( var placement in arguments.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			if ( lCase( trim( toString( placement.placementType ?: "" ) ) ) != "coldbox-module" ) continue;
+			var slug = trim( toString( placement.moduleSlug ?: "" ) );
+			if ( !len( slug ) ) slug = moduleSlugFor( toString( placement.domainKey ?: placement.name ?: "" ) );
+			if ( !len( slug ) ) continue;
+			placement.moduleSlug = slug;
+			placement.moduleRoot = "modules/" & slug;
+			for ( var unitId in ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds : [] ) ) {
+				var unit = unitsById[ trim( toString( unitId ) ) ] ?: {};
+				if ( !isStruct( unit ) || !unit.count() ) continue;
+				var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+				if ( !len( targetPath ) || left( lCase( targetPath ), 8 ) == "modules/" ) continue;
+				var remainder = reReplaceNoCase( targetPath, "^app/", "", "one" );
+				if ( !len( remainder ) || remainder == targetPath && left( lCase( targetPath ), 4 ) == "app/" ) continue;
+				unit.targetPath = "modules/" & slug & "/" & remainder;
+				unit.modulePackaging = { slug: slug, previousTargetPath: targetPath };
+				pathRemap[ lCase( targetPath ) ] = unit.targetPath;
+			}
+		}
+		// Roadmap steps cite target paths directly; a rewrite that skips them
+		// leaves every affected step pointing at a file that no longer exists.
+		if ( !pathRemap.count() || !isArray( arguments.plan.roadmapPhases ?: "" ) ) return;
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) || !isArray( phase.migrationSteps ?: "" ) ) continue;
+			for ( var step in phase.migrationSteps ) {
+				if ( !isStruct( step ) || !isStruct( step.targetRef ?: "" ) ) continue;
+				var stepPath = lCase( replace( trim( toString( step.targetRef.targetPath ?: "" ) ), "\", "/", "all" ) );
+				if ( len( stepPath ) && pathRemap.keyExists( stepPath ) ) step.targetRef.targetPath = pathRemap[ stepPath ];
+			}
+		}
+	}
+
 	private string function humanizeDomainKey( required string domainKey ) {
 		var value = replace( listLast( arguments.domainKey, "/" ), "_", " ", "all" );
 		value = replace( value, "-", " ", "all" );
-		return reReplace( trim( value ), "\b([a-z])", "\u\1", "all" );
+		// Legacy folders are overwhelmingly camelCase ("userHome", "myPlaylist").
+		// Without this split the label reads "Userhome", which matches neither the
+		// folder on disk nor how anyone refers to the feature.
+		value = reReplace( value, "([a-z0-9])([A-Z])", "\1 \2", "all" );
+		value = reReplace( trim( value ), "[[:space:]]+", " ", "all" );
+		return reReplace( value, "\b([a-z])", "\u\1", "all" );
+	}
+
+	/** ColdBox module slug for a legacy domain directory. */
+	private string function moduleSlugFor( required string domainKey ) {
+		var leaf = listLast( arguments.domainKey, "/" );
+		return lCase( reReplace( leaf, "[^A-Za-z0-9]+", "", "all" ) );
+	}
+
+	/**
+	 * Names a module candidate after what its units do, not after the folder.
+	 *
+	 * "Userhome module candidate" tells a reviewer nothing the directory listing
+	 * did not, and reads badly beside the provider-authored lanes ("Artist
+	 * exploration and PDF/PPT generation"). The layers actually present in the
+	 * group are observable, so the label can say whether the seam is pages,
+	 * services, or both while still naming the legacy domain it came from.
+	 */
+	private string function moduleDisplayName( required string domainKey, required array unitIds, required array allUnits ) {
+		var domain = humanizeDomainKey( arguments.domainKey );
+		var owned = {};
+		for ( var unitId in arguments.unitIds ) owned[ trim( toString( unitId ) ) ] = true;
+		var layers = {};
+		for ( var unit in arguments.allUnits ) {
+			if ( !isStruct( unit ) ) continue;
+			if ( !owned.keyExists( trim( toString( unit.id ?: unit.itemId ?: "" ) ) ) ) continue;
+			var layer = lCase( trim( toString( unit.layer ?: "" ) ) );
+			if ( len( layer ) ) layers[ layer ] = true;
+		}
+		var hasScreens = layers.keyExists( "view" ) || layers.keyExists( "handler" ) || layers.keyExists( "layout" );
+		var hasDomainLogic = layers.keyExists( "service" ) || layers.keyExists( "model" );
+		if ( hasScreens && hasDomainLogic ) return "#domain# pages and services";
+		if ( hasDomainLogic ) return "#domain# services and models";
+		if ( hasScreens ) return "#domain# pages";
+		return "#domain# feature area";
 	}
 
 	private struct function defaultPlacement( required array unitIds, required array units, required struct plan, required struct evidence ) {
