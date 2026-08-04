@@ -27,6 +27,8 @@ Framework reference material and implementation skills live under `.agents/`.
 Load a specific guideline or skill only when the task requires it; do not treat
 the generated catalogs as project requirements.
 
+When reporting information to me, be extremely concise and sacrifice grammar for sake of concision.
+
 ## Hard Product Boundaries
 
 - Local-only application; SQLite and analysis run on the user's machine.
