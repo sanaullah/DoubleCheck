@@ -308,6 +308,7 @@
 	function layoutModernizationArchitectureVertical(subgraph = {}, opts = {}) {
 		const nodeWidth = Number(opts.nodeWidth) > 0 ? Number(opts.nodeWidth) : 240;
 		const nodeHeight = Number(opts.nodeHeight) > 0 ? Number(opts.nodeHeight) : 56;
+		const gapX = Number(opts.gapX) > 0 ? Number(opts.gapX) : 16;
 		const gapY = Number(opts.gapY) > 0 ? Number(opts.gapY) : 10;
 		const gapLane = Number(opts.gapLane) > 0 ? Number(opts.gapLane) : 26;
 		const pad = Number(opts.pad) > 0 ? Number(opts.pad) : 20;
@@ -328,29 +329,58 @@
 			{ id: "services", title: "Side-app / microservice candidates", roleClass: "is-extract", nodes: sortNodes(byRole.extract) }
 		].filter((lane) => lane.nodes.length);
 
+		// One node per row made the map a 280px-wide, 1400px-tall ribbon that had to
+		// be scrolled past to reach anything — 19 packaging decisions in a single
+		// column. Nodes now wrap into a grid inside their lane, so a lane reads as
+		// a group and the whole map fits a desktop viewport.
+		const widest = lanes.reduce((max, lane) => Math.max(max, lane.nodes.length), 0);
+		let columns = Number(opts.columns) > 0 ? Math.floor(opts.columns) : 0;
+		if (!columns) {
+			const available = Number(opts.availableWidth) > 0 ? Number(opts.availableWidth) : 0;
+			columns = available > 0
+				? Math.floor((available - pad * 2 + gapX) / (nodeWidth + gapX))
+				: 3;
+		}
+		// Never more columns than there are nodes to fill them, so a small plan
+		// does not render as one sparse row with dead space.
+		columns = Math.max(1, Math.min(columns, 4, widest || 1));
+
+		// Spend the leftover pane width on the cards rather than leaving a margin:
+		// these labels are placement names like "Core application bootstrap and
+		// shared infrastructure", and a wider card is the difference between
+		// reading one and guessing at it.
+		let cardWidth = nodeWidth;
+		const availableForCards = Number(opts.availableWidth) > 0 ? Number(opts.availableWidth) : 0;
+		if (availableForCards > 0) {
+			const fitted = Math.floor((availableForCards - pad * 2 - gapX * (columns - 1)) / columns);
+			if (fitted > cardWidth) cardWidth = Math.min(fitted, 360);
+		}
+
 		let y = pad;
 		const positioned = [];
 		const laneMeta = [];
 		lanes.forEach((lane) => {
 			laneMeta.push({ id: lane.id, title: lane.title, roleClass: lane.roleClass, y, count: lane.nodes.length });
 			y += laneHeaderH;
-			lane.nodes.forEach((n) => {
+			lane.nodes.forEach((n, index) => {
 				positioned.push({
 					...n,
-					x: pad,
-					y,
-					w: nodeWidth,
+					x: pad + (index % columns) * (cardWidth + gapX),
+					y: y + Math.floor(index / columns) * (nodeHeight + gapY),
+					w: cardWidth,
 					h: nodeHeight,
 					lane: lane.id
 				});
-				y += nodeHeight + gapY;
 			});
-			y += gapLane;
+			const rows = Math.ceil(lane.nodes.length / columns) || 1;
+			y += rows * (nodeHeight + gapY) + gapLane;
 		});
 
 		return {
-			width: pad * 2 + nodeWidth,
+			width: pad * 2 + columns * cardWidth + (columns - 1) * gapX,
 			height: Math.max(pad * 2 + nodeHeight, y),
+			columns,
+			cardWidth,
 			nodes: positioned,
 			edges: edges.map((e) => ({ ...e })),
 			lanes: laneMeta

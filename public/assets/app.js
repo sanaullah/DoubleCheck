@@ -3220,8 +3220,11 @@ function renderModernizationArchitectureMap(result = {}) {
 	const layoutFn = typeof layoutModernizationArchitectureVertical === "function"
 		? layoutModernizationArchitectureVertical
 		: null;
+	// Let the lane grid use the width the pane actually has rather than assuming
+	// a fixed column count.
+	const availableWidth = mapHost.clientWidth || mapHost.parentElement?.clientWidth || 0;
 	const layout = layoutFn
-		? layoutFn(subgraph)
+		? layoutFn(subgraph, { availableWidth })
 		: (window.ArchitectureFlow ? window.ArchitectureFlow.layoutFlowPositions(subgraph) : null);
 	if (!layout) {
 		mapHost.innerHTML = `<p class="field-hint">Architecture map layout is unavailable in this build.</p>`;
