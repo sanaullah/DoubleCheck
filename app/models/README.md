@@ -99,6 +99,7 @@ deterministic rules behind those public methods.
 | --- | --- | --- |
 | [AgentResult.bx](domain/AgentResult.bx) | Memento for one specialist task result, including status, findings, tool audit, provenance, and timing. | `init`, `getMemento` |
 | [ArchitectureModel.bx](domain/ArchitectureModel.bx) | Memento for deterministic architecture facts plus optional enrichment and fingerprints. | `init`, `getMemento` |
+| [Cluster.bx](domain/Cluster.bx) | One derived cluster: candidate boundary, its units and files, and the evidence for or against separating it. Computation-free. | `init`, `getMemento`, `contains`, `isSeparable`, `boundaryEvidence`, `couplingCount`, `size` |
 | [CouplingGraph.bx](domain/CouplingGraph.bx) | Derived coupling structure for Modernize: file nodes, typed and provenance-weighted edges, fan-in/out, cycles, shared-state overlay, co-access matrix. Large but computation-free; `ModernizationCouplingGraphService` owns the computation. | `init`, `getMemento`, `fanIn`, `fanOut`, `hasEdge`, `edgesCrossing`, `truncated`, `cycleMembersFor`, `coAccessPeers` |
 | [ModernizationPlan.bx](domain/ModernizationPlan.bx) | Versioned validated Modernize artifact containing inventory, schema evidence, signals, target units, links, and roadmap data. | `init`, `getMemento` |
 | [WaveOrder.bx](domain/WaveOrder.bx) | Migration order derived from the cluster dependency DAG. Wave is longest-path depth; cluster-level cycles are carried rather than hidden. Computation-free. | `init`, `getMemento`, `wave`, `blocks`, `clustersInWave`, `criticalPath`, `inCycle` |

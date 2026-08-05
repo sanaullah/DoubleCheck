@@ -67,9 +67,9 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | --- | --- | --- | --- | --- |
 | 0 | Clear the ground | `done` (uncommitted) | `box server restart && box testbox run` green; `node --test tests/js/*.spec.mjs` green **and in `box.json:49`**; `/`, `/modernize`, `/aiflight/` load | **Gate green: 492·0·0·1**, `box run-script test` reaches its node stage (3/3), all four routes 200. Required fixing the §2.17 wiring race first |
 | 1 | Coupling graph | `wip` | unit specs for cohesion, fan-in/out, cycles, co-access on Step 2a fixtures; identical input → byte-identical graph | `ModernizationCouplingGraphService` + 16 specs green (508·0·0·1). **Remaining:** corpus-fixture validation (needs 2a), plus persistence and architecture findings, both deferred to Step 2 — see the note in Step 1 |
-| 2 | Promote synthesis | `wip` | deterministic corpus tier green on all four scenarios | **Items 1, 3, 4, 6, 7 done** (545·0·0·1). Clustering is weighted modularity; wave order derived; graph + derived structure run in the live pipeline and reach the persisted plan (verified by real run). `separable-domain` now yields `external-service`. **Remaining: items 2 and 5** |
+| 2 | Promote synthesis | `done` (uncommitted) | deterministic corpus tier green on all four scenarios | **All seven items done** (550·0·0·1). Synthesis moved; clustering is weighted modularity; wave order derived; target-path has one owner; shards key to clusters; `execute()` wired and verified by a live run; checkpoints + ladder re-plotted (contract v9) |
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
-| 12 | Domain types | `wip` | exactly one file computes each invariant; one type answers each | `CouplingGraph` + `WaveOrder` done, README convention amended, `ArchitectureFitnessSpec` added. **Remaining: `Cluster` and `Placement` ownership** — both now unblocked |
+| 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
 | 3a | Re-point client + tests | `todo` | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | |
 | 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
@@ -661,6 +661,39 @@ single small fixture — §2.3's warning applied to extraction as well as
 clustering. Expect more of this when the LLM and judge tiers land: **treat a
 corpus failure as a finding about the product first, and about the fixture
 second.**
+
+## 2.18a SQLite pragmas: `custom` is appended to the URL, not ignored
+
+The suite intermittently failed with `SQLITE_BUSY` at ColdBox shutdown — the
+test harness tears the app down on every request while the background worker is
+still writing, and a writer with no busy timeout fails instantly rather than
+waiting.
+
+**The first fix was wrong and is recorded because the wrong version is
+instructive.** It looked as though `busy_timeout` in the datasource's `custom`
+block was never reaching the driver, so it was added to the URL query string
+instead. BoxLang in fact appends `custom` to the URL using `;` separators, so the
+result was:
+
+```
+jdbc:sqlite:...?foreign_keys=on&busy_timeout=10000;synchronous=NORMAL;journal_mode=WAL
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ parsed as one integer
+```
+
+`NumberFormatException: For input string: "10000;synchronous"` → Hikari fails to
+initialise the pool. Three consecutive green runs hid it, because the failure
+only surfaced when a *new* datasource was created in a fresh context.
+
+**Correct fix:** leave the URL alone and raise `busy_timeout` from 5000 to 15000
+in `custom`. Verified across repeated back-to-back runs: zero `SQLITE_BUSY`, zero
+pool errors.
+
+Two things worth carrying forward:
+
+- **Never put pragmas in that URL.** A comment now says so at the line itself.
+- **Three green runs is not proof.** This defect passed three consecutive full
+  suites before showing itself. When a fix targets a race, re-run until a run
+  *fails*, or until the count is high enough that silence means something.
 
 ## 2.19 The LLM baseline: the current path extracts nothing at all
 
@@ -1294,11 +1327,51 @@ call away from returning a single cluster.
 
 | Item | State |
 | --- | --- |
-| 2 — target-path move to `PlacementService` | **todo**, independent of the rest |
+| 1 — move synthesis verbatim | **done** |
+| 2 — target-path move to `PlacementService` | **done** — 197 lines, one owner |
+| 3 — coupling-driven clustering | **done** — weighted modularity |
 | 4 — topological wave order | **done** — `deriveWaveOrder()` + `WaveOrder` type |
-| 5 — re-key shards to clusters | **todo** — clusters are computed before the context pack, so the input is ready |
-| 6 — rewire `execute()` | **done** — graph and derived structure run in the live pipeline |
-| 7 — checkpoints and progress ladder | **done** — `graph` and `derived` checkpoints, ladder re-plotted |
+| 5 — re-key shards to clusters | **done** — `chunkPathsByCluster()` |
+| 6 — rewire `execute()` | **done** — verified by a live run |
+| 7 — checkpoints and progress ladder | **done** — `graph` + `derived`, ladder re-plotted, contract v9 |
+
+**Step 2 is complete.**
+
+### Item 2 — target-path derivation has one owner
+
+The 197 lines §2.5 identified moved to `ModernizationPlacementService`, which is
+now the sole owner of what a unit's target path is. That closes the dual-
+ownership bug directly: the proposal used to derive a path and `canonicalize()`
+independently rewrote it, so two files decided one invariant and could disagree.
+
+`ProposalService` 4,583 → 4,386 and delegates three entry points
+(`normalizeTargetUnits`, `deriveTargetPath`, `fallbackLayerForSource`).
+`ArchitectureFitnessSpec` now grep-asserts that exactly one file declares
+`deriveTargetPath`, so the split cannot silently reopen.
+
+The sibling-call audit from §2.5a was run again first and found only two
+dependencies (`scalarString`, `ensureIdentity`), both copied as before.
+
+`PlacementService` is 957 lines, over the limit, and listed as a **self-resolving**
+exception: Step 3b deletes ~397 lines of legacy projection from it (§2.6),
+landing it near 560.
+
+### Item 5 — shards follow cluster boundaries
+
+`chunkPathsByCluster()` groups the prioritized path list by derived cluster
+before slicing, largest cluster first, with unclaimed paths as a residual group.
+A shard is one prompt; cutting a flat list every N entries hands the model half
+of one domain and a third of another, and asks it to infer a grouping that
+already exists.
+
+Two constraints held deliberately:
+
+- **Cluster size never overrides the shard size cap.** A high-cohesion domain is
+  a *larger* ask than a path batch, which is exactly why `resplitTruncatedShard`
+  has to survive the inversion (§2.4). A spec covers a 9-file cluster at shard
+  size 3 producing three shards.
+- **No clusters means unchanged behaviour**, so a run without derived structure
+  shards exactly as before.
 
 ### Items 4, 6 and 7 — what landed
 

@@ -308,20 +308,22 @@
 	"datasources": {
 		"doublecheck":{
 			"driver":"sqlite",
-			// busy_timeout and journal_mode must be in the URL, not only in
-			// "custom" below: the sqlite-jdbc driver applies query-string
-			// pragmas per connection, and the custom block was not reaching it.
-			// Without a busy timeout a second writer fails instantly with
-			// SQLITE_BUSY instead of waiting, which is what made the test
-			// harness and the background worker collide on shutdown.
-			// app/modules/aiFlight/models/TraceStoreService.bx already did this.
-			"url":"jdbc:sqlite:${DOUBLECHECK_DB_PATH:./.db/doublecheck.db}?foreign_keys=on&busy_timeout=10000&journal_mode=WAL",
+			// Do NOT add pragmas to this query string. BoxLang appends the
+			// "custom" block below to the URL using ';' separators, so a '&'
+			// pragma here collides with the first appended one and the driver
+			// parses e.g. "10000;synchronous" as an integer -- Hikari then fails
+			// to initialise the pool entirely. Tune pragmas in "custom" instead.
+			"url":"jdbc:sqlite:${DOUBLECHECK_DB_PATH:./.db/doublecheck.db}?foreign_keys=on",
 			"connectionLimit":"12",
 			"connectionTimeout":"5",
 			"custom":{
 				"journal_mode":"WAL",
 				"synchronous":"NORMAL",
-				"busy_timeout":"5000",
+				// Raised from 5000. The test harness shuts ColdBox down on every
+				// request while the background worker is still writing, and 5s
+				// was not enough headroom for that overlap -- writers failed with
+				// SQLITE_BUSY instead of waiting.
+				"busy_timeout":"15000",
 				"foreign_keys":"true"
 			}
 		}
