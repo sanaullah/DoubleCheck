@@ -2894,7 +2894,22 @@ function renderModernizationBrief(result = {}, planState = "") {
 	const nextLine = summary.currentSlice
 		? `Start with “${summary.currentSlice.name}”${summary.currentSlice.effortSize ? ` (${summary.currentSlice.effortSize})` : ""}${summary.currentSlice.riskLevel && summary.currentSlice.riskLevel !== "none" ? ` · ${summary.currentSlice.riskLevel} risk` : ""}${driverLine}.`
 		: "Pick a Road step below to see its next action.";
+	// Step 10: when the brief role ran, its verdict leads and the numbers move
+	// below it. Only claims whose citations resolved server-side get this far, so
+	// anything rendered here is grounded in a file this run actually inventoried.
+	const stated = modernizationBriefVerdict(result);
+	const verdictBlock = stated.hasVerdict
+		? `<div class="modernization-brief-verdict">
+				<p>${architectureEscapeHtml(stated.verdict)}</p>
+				${stated.claims.length ? `<ul>${stated.claims.map((claim) =>
+					`<li>${architectureEscapeHtml(claim.claim)} <code>${architectureEscapeHtml(claim.refs.join(", "))}</code></li>`
+				).join("")}</ul>` : ""}
+				${stated.droppedClaims > 0 ? `<p class="modernization-brief-dropped">${stated.droppedClaims} further claim${stated.droppedClaims === 1 ? "" : "s"} dropped: citations did not resolve.</p>` : ""}
+			</div>`
+		: "";
+
 	host.innerHTML = `
+		${verdictBlock}
 		<div class="modernization-brief-stats">
 			<div><span>Plan status</span><strong>${architectureEscapeHtml(planState || "unknown")}</strong></div>
 			<div><span>Coverage</span><strong>${architectureEscapeHtml(summary.coverageStatus)}</strong></div>

@@ -12,6 +12,55 @@ class extends="testbox.system.BaseSpec" {
 			} );
 
 
+			it( "lets narration rename a derived capability without moving it", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = { target: { placements: [ {
+					id: "ctx-derived-a1", name: "Orders", purpose: "Derived from coupling evidence.",
+					placementType: "main-app", targetUnitIds: [ "tu-a" ], evidenceBasis: "coupling-derived"
+				} ] } };
+
+				var out = service.applyNarrations( plan, [ {
+					clusterId: "ctx-derived-a1",
+					name: "Order Pricing",
+					purpose: "Prices an order and holds inventory.",
+					// A narration that tries to relocate the capability must not win:
+					// placement came from coupling evidence, not from prose.
+					placementType: "external-service",
+					targetUnitIds: [ "tu-zzz" ],
+					evidenceBasis: "provider-claimed",
+					migrationSteps: [ { order: 1, action: "Lift pricing into a service" } ]
+				} ] );
+
+				var placement = out.target.placements[ 1 ];
+				expect( placement.name ).toBe( "Order Pricing" );
+				expect( placement.purpose ).toBe( "Prices an order and holds inventory." );
+				expect( placement.migrationSteps ).toHaveLength( 1 );
+				expect( placement.narrationSource ).toBe( "provider" );
+				expect( placement.placementType ).toBe( "main-app" );
+				expect( placement.targetUnitIds ).toBe( [ "tu-a" ] );
+				expect( placement.evidenceBasis ).toBe( "coupling-derived" );
+				expect( out.metadata.narratedPlacements ).toBe( 1 );
+			} );
+
+			it( "drops a narration for a capability that does not exist", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = { target: { placements: [ { id: "ctx-derived-a1", name: "Orders" } ] } };
+
+				var out = service.applyNarrations( plan, [ { clusterId: "ctx-invented", name: "Invented Capability" } ] );
+
+				expect( out.target.placements ).toHaveLength( 1 );
+				expect( out.target.placements[ 1 ].name ).toBe( "Orders" );
+				expect( out.metadata.narratedPlacements ).toBe( 0 );
+			} );
+
+			it( "leaves the plan untouched when no narrations came back", () => {
+				var service = new app.models.services.ModernizationPlacementService();
+				var plan = { target: { placements: [ { id: "ctx-derived-a1", name: "Orders" } ] } };
+
+				// The no-key path: derived structure stands on its own.
+				expect( service.applyNarrations( plan, [] ).target.placements[ 1 ].name ).toBe( "Orders" );
+			} );
+
 			it( "preserves duplicate ownership as a validation signal instead of silently reassigning it", () => {
 				var service = new app.models.services.ModernizationPlacementService();
 				var plan = service.canonicalize( { version: "modernization-plan-v2", target: { units: [ { id: "tu-a" } ], placements: [ { id: "one", targetUnitIds: [ "tu-a" ] }, { id: "two", targetUnitIds: [ "tu-a" ] } ] } } );

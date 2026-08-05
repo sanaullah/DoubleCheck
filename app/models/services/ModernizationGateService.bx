@@ -10,6 +10,9 @@ class threadsafe {
 	property name="identityService" inject="ModernizationIdentityService";
 
 	variables.version = "modernization-gates-v1";
+	// Below this, the judge is hedging rather than agreeing, and a hedge on a
+	// boundary decision is worth a human's attention.
+	variables.judgeConfidenceFloor = 0.6;
 
 	function init() {
 		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) variables.identityService = new app.models.services.ModernizationIdentityService();
@@ -60,10 +63,45 @@ class threadsafe {
 			targetUnitIds.len() ? evidenceRefsFor( signals, 4 ) : []
 		) );
 
+		// Derived boundary evidence, when the placement came from the coupling
+		// graph. Its absence is why these gates used to answer "unknown": with
+		// only per-file signals there was no way to tell shared-with-the-outside
+		// from shared-inside-this-boundary.
+		var boundary = isStruct( item.boundaryEvidence ?: "" ) ? item.boundaryEvidence : {};
+		var hasBoundary = boundary.count() > 0;
+		var sharedTables = isArray( boundary.sharedTablesOutside ?: "" ) ? boundary.sharedTablesOutside : [];
+		var sharedScopes = isArray( boundary.sharedScopesOutside ?: "" ) ? boundary.sharedScopesOutside : [];
+		var crossingEdges = val( boundary.crossingEdges ?: 0 );
+		var externalIntegration = isArray( boundary.externalIntegration ?: "" ) ? boundary.externalIntegration : [];
+		var inCycle = boundary.inCycleWithOutside ?: false;
+		var wholeSystem = boundary.spansWholeSystem ?: false;
+
 		var stateSignals = intersect( signalIds, [ "scope.application-state", "scope.session-heavy", "scope.client", "security.session-gate" ] );
 		// ColdBox modules share process/session with the monolith by design —
 		// shared-state signals are expected, not a hard fail (fail only for
 		// external-service / microservice extraction candidates).
+		if ( hasBoundary ) {
+			// Source-derivable: the shared-state overlay says exactly which
+			// scopes are written both inside and outside this boundary.
+			var stateDecided = !sharedScopes.len();
+			gates.append( decidedGate(
+				"state-isolation",
+				stateDecided ? "pass" : "fail",
+				stateDecided
+					? "No application, session or client scope is written both inside and outside this boundary."
+					: "Shared mutable scope crosses this boundary: " & sharedScopes.toList( ", " ) & ".",
+				evidenceRefsFor( signals, 4, stateSignals ),
+				stateDecided ? "extract" : "stay",
+				stateDecided
+					? "State is not shared across the boundary, so moving this out does not split a scope that two sides write."
+					: "Extracting this would split state that both sides write, which no amount of routing fixes.",
+				"high",
+				"coupling-graph shared-state overlay",
+				stateDecided
+					? "A new write to application or session scope from a file outside this boundary."
+					: "Removing the shared scope, or moving every writer of " & sharedScopes.toList( ", " ) & " inside this boundary."
+			) );
+		} else {
 		var stateStatus = ( targetType == "main-app" || targetType == "coldbox-module" )
 			? "pass"
 			: ( stateSignals.len() ? "fail" : "unknown" );
@@ -77,9 +115,34 @@ class threadsafe {
 				: ( stateSignals.len() ? "Shared application, session, client, or auth state crosses this proposed service boundary." : "State isolation evidence is incomplete." ),
 			evidenceRefsFor( signals, 4, stateSignals )
 		) );
+		}
 
 		var dataSignals = intersect( signalIds, [ "datasource.named", "sql.table-ref", "sql.column-ref", "sql.query", "sql.proc-call" ] );
 		var explicitBoundary = len( trim( toString( firstValue( item, [ "dataBoundaryNote", "dataBoundary", "dataOwnership" ], "" ) ) ) ) || ( isBoolean( firstValue( item, [ "dataBoundaryConfirmed" ], false ) ) && firstValue( item, [ "dataBoundaryConfirmed" ], false ) );
+		if ( hasBoundary ) {
+			// Source-derivable: the co-access matrix names the tables read or
+			// written both inside and outside this boundary. Four shared tables
+			// is a different conversation from none, and the reader gets to see
+			// which ones.
+			var dataDecided = !sharedTables.len();
+			gates.append( decidedGate(
+				"data-ownership",
+				dataDecided ? "pass" : "fail",
+				dataDecided
+					? "No table is touched both inside and outside this boundary."
+					: "Shared tables cross this boundary: " & sharedTables.toList( ", " ) & ".",
+				evidenceRefsFor( signals, 4, dataSignals ),
+				dataDecided ? "extract" : "stay",
+				dataDecided
+					? "This boundary owns the data it touches, so it can take its tables with it."
+					: "These tables are written on both sides. Extracting without splitting them first creates two writers of one table.",
+				"high",
+				"coupling-graph table co-access matrix",
+				dataDecided
+					? "A new query from outside this boundary against a table it owns."
+					: "Splitting " & sharedTables.toList( ", " ) & ", or moving every reader and writer inside this boundary."
+			) );
+		} else {
 		var dataStatus = targetType == "main-app"
 			? "pass"
 			: ( targetType == "external-service" && dataSignals.len() && !explicitBoundary ? "fail" : ( explicitBoundary || targetType == "coldbox-module" ? "pass" : "unknown" ) );
@@ -89,9 +152,37 @@ class threadsafe {
 			dataStatus == "fail" ? "Database coupling is present without an explicit owned data boundary." : ( dataStatus == "unknown" ? "Data ownership requires explicit confirmation." : "The proposed target can retain or explicitly declare its data boundary." ),
 			evidenceRefsFor( signals, 4, dataSignals )
 		) );
+		}
 
 		var seamSignals = intersect( signalIds, [ "http.outbound", "schedule.task", "route.evidence", "coldbox.present" ] );
 		var explicitSeam = lCase( trim( toString( firstValue( item, [ "evidenceBasis" ], "" ) ) ) ) == "explicit-seam";
+		if ( hasBoundary ) {
+			// Source-derivable: crossing edges and cycle membership say whether
+			// anything has to be cut to lift this out.
+			var deployDecided = crossingEdges == 0 && !inCycle && !wholeSystem;
+			var deployReason = wholeSystem
+				? "Everything in scope resolves to one cluster, so there is no boundary to deploy across."
+				: ( inCycle
+					? "This boundary is part of a dependency cycle that leaves it; a cycle cannot be cut."
+					: crossingEdges & " call(s) cross this boundary and would become network hops." );
+			gates.append( decidedGate(
+				"deployability",
+				deployDecided ? "pass" : "fail",
+				deployDecided ? "Nothing structural crosses this boundary." : deployReason,
+				evidenceRefsFor( signals, 4, seamSignals ),
+				deployDecided ? "extract" : ( inCycle || wholeSystem ? "do-not-extract" : "stay" ),
+				deployDecided
+					? ( externalIntegration.len()
+						? "Nothing crosses the boundary and it already owns an outbound integration, so it behaves as a service already."
+						: "Nothing crosses the boundary, so it can be lifted out as a unit." )
+					: deployReason,
+				deployDecided ? "high" : ( inCycle ? "high" : "medium" ),
+				"coupling-graph structural edges" & ( inCycle ? " and cycle detection" : "" ),
+				deployDecided
+					? "A new call from outside this boundary into it, or from it outward."
+					: ( inCycle ? "Breaking the cycle first — that is the prerequisite work, not this extraction." : "Removing or inverting the " & crossingEdges & " crossing call(s)." )
+			) );
+		} else {
 		var deployabilityStatus = targetType == "external-service"
 			? ( explicitSeam && seamSignals.len() ? "pass" : ( seamSignals.len() ? "unknown" : "fail" ) )
 			: "pass";
@@ -101,17 +192,39 @@ class threadsafe {
 			deployabilityStatus == "pass" ? "A runtime or deployment seam supports this target." : ( deployabilityStatus == "fail" ? "No independent deployment seam is evidenced." : "A possible seam exists, but independent deployment is not established." ),
 			evidenceRefsFor( signals, 4, seamSignals )
 		) );
+		}
 
 		var operationalNeed = firstValue( item, [ "operationalNeed", "independentDeploymentNeed" ], javacast( "null", "" ) );
 		var operationalStatus = targetType == "external-service"
 			? ( isBoolean( operationalNeed ) ? ( operationalNeed ? "pass" : "fail" ) : "unknown" )
 			: "pass";
+		// operational-need is deliberately NOT source-derivable and must stay
+		// unknown: scaling, availability, ownership and release cadence are
+		// organisational facts absent from every repository. Answering it from
+		// code would mean inventing them. It becomes an explicit open question
+		// with the evidence that would settle it, which is honest rather than
+		// merely blank.
+		if ( operationalStatus == "unknown" ) {
+			gates.append( decidedGate(
+				"operational-need",
+				"unknown",
+				"Whether this needs to scale, deploy or be owned independently is not visible in the source.",
+				[],
+				"open-question",
+				"No repository can answer this. Extracting for a need nobody has is how a monolith becomes a distributed monolith.",
+				"none",
+				"not source-derivable",
+				"A stated need for independent scaling, availability, release cadence, or a separate owning team.",
+				true
+			) );
+		} else {
 		gates.append( gate(
 			"operational-need",
 			operationalStatus,
 			operationalStatus == "unknown" ? "Confirm independent scaling, availability, ownership, or release cadence before extracting a service." : "Operational scope is compatible with the proposed placement.",
 			[]
 		) );
+		}
 
 		var routes = routesForPlacement( item, arguments.plan );
 		var routeStatus = targetType == "external-service"
@@ -130,12 +243,107 @@ class threadsafe {
 			if ( itemGate.status == "fail" ) failed++;
 			if ( itemGate.status == "unknown" ) unknown++;
 		}
+		// A recommendation carries the whole placement when every source-derivable
+		// gate agrees. "stay" and "do-not-extract" are first-class answers here:
+		// a plan where everything is extractable reads as a generator, one that
+		// says "these should never leave, and here is why" reads as an architect.
+		var openQuestions = 0;
+		var lowConfidence = 0;
+		var saysStay = false;
+		var saysNever = false;
+		for ( var itemGate in gates ) {
+			if ( itemGate.openQuestion ?: false ) openQuestions++;
+			if ( ( itemGate.confidence ?: "" ) == "low" ) lowConfidence++;
+			if ( ( itemGate.recommendation ?: "" ) == "stay" ) saysStay = true;
+			if ( ( itemGate.recommendation ?: "" ) == "do-not-extract" ) saysNever = true;
+		}
+		item.recommendation = saysNever ? "do-not-extract" : ( saysStay ? "stay" : ( hasBoundary ? "extract" : "" ) );
+		item.openQuestions = openQuestions;
+
 		item.gates = gates;
 		item.gateStatus = failed ? "blocked" : ( unknown ? "needs-review" : "ready-for-decision" );
-		item.decisionRequired = targetType == "external-service" || unknown > 0 || failed > 0;
+		// Was "targetType == external-service || anything unknown", which asked
+		// the user to decide every extraction candidate regardless of how strong
+		// the evidence was. Now it asks only when the evidence is genuinely thin:
+		// a low-confidence recommendation, or an open question nobody has
+		// answered. A confident "stay" backed by four shared tables is a decision
+		// the tool already made.
+		item.decisionRequired = lowConfidence > 0 || openQuestions > 0 || ( !hasBoundary && ( targetType == "external-service" || unknown > 0 || failed > 0 ) );
+		applyJudgeVerdict( item, arguments.plan );
 		item.gateEvidence = evidenceRefsFor( signals, 8 );
 		item.itemFingerprint = identityService.itemFingerprint( "placement", fingerprintInput( item ) );
 		return { placement: item, gates: gates, failed: failed, unknown: unknown };
+	}
+
+	/**
+	 * Fold the judge's verdict into this placement's decision.
+	 *
+	 * The verdict cannot change the boundary — that came from coupling evidence
+	 * and the judge was explicitly told not to redraw it. What it can do is
+	 * disagree, and a disagreement is exactly the case a human should look at.
+	 * So a verdict only ever *raises* scrutiny: it can turn a settled placement
+	 * into one that needs a decision, never the other way round. A confident
+	 * "yes, defensible" is not permission to stop asking.
+	 */
+	private void function applyJudgeVerdict( required struct item, required struct plan ) {
+		var judgement = isStruct( arguments.plan.judgement ?: "" ) ? arguments.plan.judgement : {};
+		var verdicts = isArray( judgement.verdicts ?: "" ) ? judgement.verdicts : [];
+		if ( !verdicts.len() ) return;
+
+		var placementId = trim( toString( arguments.item.id ?: "" ) );
+		for ( var verdict in verdicts ) {
+			if ( trim( toString( verdict.clusterId ?: "" ) ) != placementId ) continue;
+
+			var review = {
+				defensible: verdict.defensible ?: true,
+				confidence: isNumeric( verdict.confidence ?: "" ) ? val( verdict.confidence ) : 0,
+				rationale : trim( toString( verdict.rationale ?: "" ) ),
+				worthIt   : trim( toString( verdict.worthIt ?: "" ) )
+			};
+			if ( isArray( verdict.breaksOnExtraction ?: "" ) ) review.breaksOnExtraction = verdict.breaksOnExtraction;
+			var openQuestion = trim( toString( verdict.openQuestion ?: "" ) );
+			if ( len( openQuestion ) ) review.openQuestion = openQuestion;
+			arguments.item.judgeReview = review;
+
+			if ( !( review.defensible ) || review.confidence < variables.judgeConfidenceFloor || len( openQuestion ) || review.worthIt == "no" ) {
+				arguments.item.decisionRequired = true;
+			}
+			return;
+		}
+	}
+
+	/**
+	 * A gate that answers instead of shrugging.
+	 *
+	 * `status` is the old pass/fail/unknown verdict, kept because validation and
+	 * the UI key on it. Everything else is the answer a reader actually needs:
+	 * what we recommend, why, how sure, what it rests on, and — the important
+	 * one — what evidence would change it.
+	 *
+	 * `whatWouldChangeThis` is not decoration. A recommendation nobody can
+	 * challenge is an assertion; naming the thing that would overturn it is what
+	 * makes it a finding.
+	 */
+	private struct function decidedGate(
+		required string id,
+		required string status,
+		required string explanation,
+		required array evidenceRefs,
+		required string recommendation,
+		required string rationale,
+		required string confidence,
+		required string basis,
+		string whatWouldChangeThis = "",
+		boolean openQuestion = false
+	) {
+		var output = gate( arguments.id, arguments.status, arguments.explanation, arguments.evidenceRefs );
+		output.recommendation = arguments.recommendation;
+		output.rationale = arguments.rationale;
+		output.confidence = arguments.confidence;
+		output.basis = arguments.basis;
+		output.whatWouldChangeThis = arguments.whatWouldChangeThis;
+		output.openQuestion = arguments.openQuestion;
+		return output;
 	}
 
 	private struct function gate( required string id, required string status, required string explanation, required array evidenceRefs ) {

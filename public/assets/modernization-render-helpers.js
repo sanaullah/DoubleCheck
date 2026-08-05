@@ -569,6 +569,41 @@
 	 * from before Parts B/C shipped, or one that skipped those roles, still
 	 * produces a valid (mostly empty) summary rather than throwing.
 	 */
+	/**
+	 * The stated verdict, reduced to what the DOM needs (Step 10).
+	 *
+	 * Pure so it is testable without a browser — same reason
+	 * modernizationBriefSummary() lives here. It reports what the server sent
+	 * and never repairs it: a claim whose citations were dropped server-side
+	 * because they did not resolve must not be quietly rendered as though it
+	 * had evidence.
+	 */
+	function modernizationBriefVerdict(result = {}) {
+		const brief = result && typeof result.brief === "object" && result.brief ? result.brief : {};
+		const verdict = typeof brief.verdict === "string" ? brief.verdict.trim() : "";
+		if (!verdict) return { hasVerdict: false, verdict: "", claims: [], droppedClaims: 0, startHere: "" };
+
+		const claims = (Array.isArray(brief.claims) ? brief.claims : [])
+			.filter((claim) => claim && typeof claim.claim === "string" && claim.claim.trim())
+			.map((claim) => ({
+				claim: claim.claim.trim(),
+				refs: (Array.isArray(claim.evidenceRefs) ? claim.evidenceRefs : [])
+					.map((ref) => `${(ref && ref.filePath) || ""}${ref && ref.startLine ? `:${ref.startLine}` : ""}`)
+					.filter((label) => label && label !== ":")
+			}))
+			// An uncited claim should never have reached the client; if one does,
+			// it is not shown rather than shown as though it were grounded.
+			.filter((claim) => claim.refs.length > 0);
+
+		return {
+			hasVerdict: true,
+			verdict,
+			claims,
+			droppedClaims: Number(brief.droppedClaims) > 0 ? Number(brief.droppedClaims) : 0,
+			startHere: typeof brief.startHere === "string" ? brief.startHere.trim() : ""
+		};
+	}
+
 	function modernizationBriefSummary(result = {}) {
 		const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
 		const placements = modernizationPlacements(result);
@@ -625,6 +660,7 @@
 		buildModernizationArchitectureSubgraph,
 		layoutModernizationArchitectureVertical,
 		modernizationBriefSummary,
+		modernizationBriefVerdict,
 		MODERNIZATION_SIGNAL_GUIDE,
 		modernizationSignalGuide,
 		modernizationSignalLabel,

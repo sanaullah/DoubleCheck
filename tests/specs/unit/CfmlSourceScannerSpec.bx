@@ -1,0 +1,72 @@
+/**
+ * Part 5: shared CFML scanning mechanics.
+ *
+ * The interesting cases are the two behaviour differences between the copies
+ * this replaced. Flattening either one would have silently changed what a
+ * scanner reports, which is worse than the duplication.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CfmlSourceScanner", () => {
+
+			var scanner = new app.models.services.CfmlSourceScanner();
+
+			it( "joins a tag that wraps across lines and stops at the closing bracket", () => {
+				var lines = [ "<cfinvoke", "component=""Orders""", "method=""place"">", "<cfset x = 1>" ];
+				var joined = scanner.joinTagLines( lines, 1 );
+
+				expect( joined.text ).toInclude( "cfinvoke" );
+				expect( joined.text ).toInclude( "place" );
+				expect( joined.text ).notToInclude( "cfset" );
+				expect( joined.endLine ).toBe( 3 );
+			} );
+
+			it( "stops at maxLookahead when the tag never closes", () => {
+				var lines = [ "<cfinvoke", "a", "b", "c", "d", "e", "f", "g" ];
+				expect( scanner.joinTagLines( lines, 1, 2 ).endLine ).toBe( 3 );
+			} );
+
+			it( "does not run past the end of the file", () => {
+				expect( scanner.joinTagLines( [ "<cfinvoke" ], 1 ).endLine ).toBe( 1 );
+			} );
+
+			it( "tolerates a non-string line instead of throwing", () => {
+				// The inventory's copy wrapped each line in toString() for this.
+				expect( scanner.joinTagLines( [ 42, "<x>" ], 1 ).text ).toInclude( "42" );
+			} );
+
+			it( "always reports endLine, which only one of the two copies did", () => {
+				expect( scanner.joinTagLines( [ "<a>" ], 1 ) ).toHaveKey( "endLine" );
+			} );
+
+			it( "normalizes doubled backslashes only when asked", () => {
+				// ModernizationInventoryService writes patterns with BoxLang's
+				// doubled escapes; CfmlParserService writes them for the Java bridge
+				// directly. Both must keep working.
+				var doubled = "\\bcreateObject\\b";
+
+				expect( scanner.matcher( doubled, "we createObject here", true ).find() ).toBeTrue( "normalized form should match a word boundary" );
+				// Without normalization the same literal is a different pattern.
+				expect( scanner.compiledPattern( doubled, true ).pattern() ).notToBe( scanner.compiledPattern( doubled, false ).pattern() );
+			} );
+
+			it( "keeps the two compilations apart in the cache", () => {
+				// Same expression, different flag. A cache keyed on the expression
+				// alone would hand one caller the other's pattern.
+				var expression = "\\bfoo\\b";
+				var normalized = scanner.compiledPattern( expression, true );
+				var raw = scanner.compiledPattern( expression, false );
+
+				expect( normalized.pattern() ).notToBe( raw.pattern() );
+				// And repeat lookups stay stable.
+				expect( scanner.compiledPattern( expression, true ).pattern() ).toBe( normalized.pattern() );
+				expect( scanner.compiledPattern( expression, false ).pattern() ).toBe( raw.pattern() );
+			} );
+
+			it( "matches case-insensitively", () => {
+				expect( scanner.matcher( "cfinvoke", "<CFINVOKE>" ).find() ).toBeTrue();
+			} );
+		} );
+	}
+}

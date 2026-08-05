@@ -1,0 +1,223 @@
+/**
+ * The assessment narrative: verdict, where to start, what blocks the rest.
+ *
+ * Split out of ModernizationExportService because it answers a different
+ * question. The export service renders a plan; this decides what a reader is
+ * told first (section 2.9). It is pure -- every value it prints is read off
+ * decisions already made, so it cannot drift from the register below it -- and
+ * it holds no injected collaborator.
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * Markdown primitives live here rather than in the export service so there
+	 * is one implementation of each. The export service delegates to these.
+	 */
+	public string function mdHeading( required numeric level, required string text ) {
+		return repeatString( char( 35 ), arguments.level ) & " " & arguments.text;
+	}
+
+	public string function escapeMarkdown( required string value ) {
+		return replace( replace( replace( arguments.value, "`", "'", "all" ), char( 13 ), "", "all" ), "|", "\\|", "all" );
+	}
+	/** Last path segment of the analysed repository, for the document title. */
+	public string function repositoryName( required struct run ) {
+		var projectPath = trim( toString( arguments.run.projectPath ?: "" ) );
+		var normalized = reReplace( replace( projectPath, "\", "/", "all" ), "/+$", "" );
+		var name = listLast( normalized, "/" );
+		return len( name ) ? name : "DoubleCheck";
+	}
+
+	/**
+	 * "Start here" — one named slice, why it, and what it unblocks.
+	 *
+	 * A reader who agrees with the verdict still has to decide what to do on
+	 * Monday. The wave order already answers it: the first wave is by definition
+	 * the work with nothing in front of it, and what depends on that wave is
+	 * what finishing it unblocks. Naming one slice is more useful than listing
+	 * six, so this picks the earliest wave's first capability and says why.
+	 */
+	public void function appendStartHere( required array lines, required struct result, required array placements ) {
+		if ( !arguments.placements.len() ) return;
+		var derived = isStruct( arguments.result.derived ?: "" ) ? arguments.result.derived : {};
+		var waveOrder = isStruct( derived.waveOrder ?: "" ) ? derived.waveOrder : {};
+		var order = isArray( waveOrder.order ?: "" ) ? waveOrder.order : [];
+		if ( !order.len() ) return;
+
+		var byId = {};
+		for ( var placement in arguments.placements ) byId[ trim( toString( placement.id ?: "" ) ) ] = placement;
+
+		var lowestWave = -1;
+		var first = {};
+		var firstId = "";
+		for ( var entry in order ) {
+			var entryId = trim( toString( entry.clusterId ?: "" ) );
+			if ( !byId.keyExists( entryId ) ) continue;
+			var wave = val( entry.wave ?: 0 );
+			if ( lowestWave >= 0 && wave >= lowestWave ) continue;
+			lowestWave = wave;
+			first = byId[ entryId ];
+			firstId = entryId;
+		}
+		if ( !firstId.len() ) return;
+
+		// What names this slice as a dependency is what finishing it unblocks.
+		var unblocks = [];
+		for ( var entry in order ) {
+			for ( var dependency in ( entry.dependsOn ?: [] ) ) {
+				if ( dependency != firstId ) continue;
+				var dependent = byId[ trim( toString( entry.clusterId ?: "" ) ) ] ?: {};
+				if ( isStruct( dependent ) && dependent.count() ) unblocks.append( dependent.name ?: entry.clusterId );
+			}
+		}
+
+		arguments.lines.append( mdHeading( 2, "Start here" ) );
+		arguments.lines.append( "" );
+		arguments.lines.append( "**" & escapeMarkdown( toString( first.name ?: firstId ) ) & "**" & ( len( trim( toString( first.purpose ?: "" ) ) ) ? " — " & escapeMarkdown( toString( first.purpose ) ) : "" ) );
+		arguments.lines.append( "" );
+		arguments.lines.append( "Nothing else has to move first: it sits at the front of the derived migration order." );
+		if ( unblocks.len() ) {
+			arguments.lines.append( "Finishing it unblocks " & escapeMarkdown( unblocks.toList( ", " ) ) & "." );
+		}
+		arguments.lines.append( "" );
+	}
+
+	/**
+	 * "What blocks the rest" — the cycles and open questions standing in the way.
+	 *
+	 * Stated as work, not as a status. A cycle is something somebody has to
+	 * break; an open question is something somebody has to answer. Neither is a
+	 * number to report.
+	 */
+	public void function appendBlockers( required array lines, required struct result, required array placements ) {
+		var derived = isStruct( arguments.result.derived ?: "" ) ? arguments.result.derived : {};
+		var derivedGraph = isStruct( derived.graph ?: "" ) ? derived.graph : {};
+		var cycles = isArray( derivedGraph.cycles ?: "" ) ? derivedGraph.cycles : [];
+
+		var undecided = [];
+		for ( var placement in arguments.placements ) {
+			if ( !( placement.decisionRequired ?: false ) ) continue;
+			undecided.append( placement.name ?: placement.id ?: "" );
+		}
+		if ( !cycles.len() && !undecided.len() ) return;
+
+		arguments.lines.append( mdHeading( 2, "What blocks the rest" ) );
+		arguments.lines.append( "" );
+		if ( cycles.len() ) {
+			arguments.lines.append(
+				"- **" & cycles.len() & " dependency cycle(s)** — files that reference each other in a loop cannot be separated until the loop is broken. This is refactoring work, not planning work."
+			);
+		}
+		if ( undecided.len() ) {
+			arguments.lines.append(
+				"- **" & undecided.len() & " capabilit" & ( undecided.len() == 1 ? "y needs" : "ies need" ) & " a human decision** — "
+				& escapeMarkdown( undecided.toList( ", " ) ) & ". The evidence is thin or the question is organisational; see each one's gates."
+			);
+		}
+		arguments.lines.append( "" );
+	}
+
+	/**
+	 * The verdict, first.
+	 *
+	 * The export used to open with run metadata, a static strangler paragraph
+	 * identical on every run, and thirteen lines of pipeline telemetry --
+	 * including provider shard counts -- before saying anything about the system
+	 * it had just analysed (section 2.9). A reader opening this wants to know what
+	 * the tool concluded, not how many shards completed.
+	 *
+	 * Everything here is read off decisions already made. It states nothing the
+	 * placement register does not already carry, so it cannot drift from it.
+	 */
+	public void function appendVerdict( required array lines, required struct result, required array placements ) {
+		arguments.lines.append( mdHeading( 2, "The verdict" ) );
+		arguments.lines.append( "" );
+
+		// When the brief role ran, its prose opens the section — but only the
+		// claims whose citations resolved got this far, and the deterministic
+		// counts below still follow. The narrative is an addition to the derived
+		// answer, never a replacement for it.
+		var brief = isStruct( arguments.result.brief ?: "" ) ? arguments.result.brief : {};
+		if ( len( trim( toString( brief.verdict ?: "" ) ) ) ) {
+			arguments.lines.append( escapeMarkdown( trim( toString( brief.verdict ) ) ) );
+			arguments.lines.append( "" );
+			for ( var claim in ( isArray( brief.claims ?: "" ) ? brief.claims : [] ) ) {
+				var refs = [];
+				for ( var ref in ( isArray( claim.evidenceRefs ?: "" ) ? claim.evidenceRefs : [] ) ) {
+					refs.append( ( ref.filePath ?: "" ) & ( val( ref.startLine ?: 0 ) ? ":" & val( ref.startLine ) : "" ) );
+				}
+				arguments.lines.append( "- " & escapeMarkdown( toString( claim.claim ?: "" ) ) & ( refs.len() ? " — `" & escapeMarkdown( refs.toList( "`, `" ) ) & "`" : "" ) );
+			}
+			if ( val( brief.droppedClaims ?: 0 ) ) {
+				// Saying so is the honest move: the reader can see the narrative was
+				// filtered rather than wondering why it is short.
+				arguments.lines.append( "" );
+				arguments.lines.append( "_" & val( brief.droppedClaims ) & " further claim(s) were dropped because their citations did not resolve against this repository._" );
+			}
+			arguments.lines.append( "" );
+		}
+
+		if ( !arguments.placements.len() ) {
+			arguments.lines.append( "No placement decisions were derived for this repository." );
+			arguments.lines.append( "" );
+			return;
+		}
+
+		var stays = [];
+		var extracts = [];
+		var modules = [];
+		var openQuestions = 0;
+		for ( var placement in arguments.placements ) {
+			var placementType = lCase( trim( toString( placement.placementType ?: "main-app" ) ) );
+			if ( placementType == "external-service" ) extracts.append( placement );
+			else if ( placementType == "coldbox-module" ) modules.append( placement );
+			else stays.append( placement );
+			openQuestions += val( placement.openQuestions ?: 0 );
+		}
+
+		// A stored plan may predate the derived block, or carry a partial one, so
+		// every level is checked rather than chained.
+		var derived = isStruct( arguments.result.derived ?: "" ) ? arguments.result.derived : {};
+		var derivedGraph = isStruct( derived.graph ?: "" ) ? derived.graph : {};
+		var cycles = isArray( derivedGraph.cycles ?: "" ) ? derivedGraph.cycles : [];
+
+		arguments.lines.append(
+			"This repository resolves to **" & arguments.placements.len() & " bounded capabilit" & ( arguments.placements.len() == 1 ? "y" : "ies" )
+			& "**, derived from coupling evidence rather than proposed by a model."
+		);
+		arguments.lines.append( "" );
+		arguments.lines.append( "- **Extract as a service:** " & ( extracts.len() ? extracts.map( ( item ) => item.name ?: item.id ).toList( ", " ) : "none" ) );
+		arguments.lines.append( "- **Separate as a module:** " & ( modules.len() ? modules.map( ( item ) => item.name ?: item.id ).toList( ", " ) : "none" ) );
+		arguments.lines.append( "- **Keep in the monolith:** " & ( stays.len() ? stays.map( ( item ) => item.name ?: item.id ).toList( ", " ) : "none" ) );
+		if ( cycles.len() ) {
+			arguments.lines.append( "- **Blocked by dependency cycles:** " & cycles.len() & " cycle(s) must be broken before the files in them can be separated at all." );
+		}
+		if ( openQuestions ) {
+			arguments.lines.append( "- **Open questions:** " & openQuestions & " — organisational facts no repository can answer. See each placement's gates." );
+		}
+		arguments.lines.append( "" );
+
+		// The refusals are the part a generator never produces, so say them in
+		// prose rather than leaving them to be inferred from a table.
+		var refusals = [];
+		for ( var placement in arguments.placements ) {
+			var recommendation = lCase( trim( toString( placement.recommendation ?: "" ) ) );
+			if ( recommendation != "stay" && recommendation != "do-not-extract" ) continue;
+			var evidence = isStruct( placement.boundaryEvidence ?: "" ) ? placement.boundaryEvidence : {};
+			var reasons = [];
+			if ( isArray( evidence.sharedTablesOutside ?: "" ) && evidence.sharedTablesOutside.len() ) reasons.append( evidence.sharedTablesOutside.len() & " shared table(s)" );
+			if ( isArray( evidence.sharedScopesOutside ?: "" ) && evidence.sharedScopesOutside.len() ) reasons.append( evidence.sharedScopesOutside.len() & " shared scope(s)" );
+			if ( val( evidence.crossingEdges ?: 0 ) ) reasons.append( evidence.crossingEdges & " crossing call(s)" );
+			if ( evidence.inCycleWithOutside ?: false ) reasons.append( "a dependency cycle that leaves the boundary" );
+			if ( reasons.len() ) refusals.append( "**" & ( placement.name ?: placement.id ) & "** stays: " & reasons.toList( ", " ) & "." );
+		}
+		if ( refusals.len() ) {
+			arguments.lines.append( "**What should not move, and why**" );
+			arguments.lines.append( "" );
+			for ( var refusal in refusals ) arguments.lines.append( "- " & refusal );
+			arguments.lines.append( "" );
+		}
+	}
+}
+

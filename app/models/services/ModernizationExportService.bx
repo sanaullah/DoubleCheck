@@ -8,6 +8,7 @@
 @singleton
 class threadsafe {
 	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="assessmentNarrative" inject="ModernizationAssessmentNarrative";
 	variables.supportedFormats = [ "json", "markdown", "sarif" ];
 
 	function init() {
@@ -106,7 +107,56 @@ class threadsafe {
 		var samples = arguments.result.samples ?: [];
 		var unitLinks = arguments.result.unitLinks ?: [];
 
-		lines.append( mdHeading( 1, "DoubleCheck Modernization Plan" ) );
+		// Order is the whole point of this document (§2.9). Verdict, then what to
+		// do about it, then the roadmap and the register -- and only then the
+		// appendices. Run identifiers and pipeline telemetry are the last thing a
+		// reader needs, so they are the last thing they are shown.
+		lines.append( mdHeading( 1, escapeMarkdown( repositoryName( arguments.run ) ) & " — Modernization Assessment" ) );
+		lines.append( "" );
+
+		appendVerdict( lines, arguments.result, placements );
+		appendStartHere( lines, arguments.result, placements );
+		appendBlockers( lines, arguments.result, placements );
+
+		lines.append( "---" );
+		lines.append( "" );
+
+		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
+		appendPlacementRegister( lines, placements );
+
+		lines.append( mdHeading( 2, "Decisions register" ) );
+		lines.append( "" );
+		var decisionItems = isArray( decisions ) ? decisions : ( isArray( decisions.items ?: "" ) ? decisions.items : [] );
+		if ( decisionItems.len() ) {
+			for ( var decision in decisionItems ) {
+				lines.append( "- `" & escapeMarkdown( decision.itemType ?: "item" ) & "` `" & escapeMarkdown( decision.decision ?: "undecided" ) & "` — " & escapeMarkdown( decision.note ?: "" ) );
+			}
+		} else {
+			lines.append( "No decisions have been recorded against this plan yet." );
+		}
+		lines.append( "" );
+		lines.append( "---" );
+		lines.append( "" );
+
+		var commonLabels = { validationStatus: "Validation", provenanceClass: "Evidence basis", evidenceRefs: "Evidence", evidence: "Evidence" };
+		appendRows( lines, mdHeading( 2, "Appendix A — Legacy catalog" ), legacyUnitRows, [ "id", "path", "kind", "name", "extends", "implements", "access", "returnType", "evidenceRefs" ], commonLabels );
+		appendRows( lines, mdHeading( 2, "Appendix B — Target structure" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus", "provenanceClass", "evidenceRefs" ], commonLabels );
+		lines.append( mdHeading( 2, "Appendix C — Routes, database and samples" ) );
+		lines.append( "" );
+		appendRows( lines, mdHeading( 3, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus", "provenanceClass", "evidence" ], structAppend( duplicate( commonLabels ), { legacyPath: "Legacy URL", targetRoute: "Target route" }, true ) );
+		appendRows( lines, mdHeading( 3, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", proposedChange: "Proposed change" }, true ) );
+		appendRows( lines, mdHeading( 3, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", expandContract: "Migration stage" }, true ) );
+		// The placement register above is the single rendering of this dataset.
+		// It previously appeared three more times -- an architecture packaging
+		// summary, a "Contexts and extracts" table and a "Side-app extract
+		// candidates" table -- all projections of the same placements in the v1
+		// vocabulary that no longer exists. One dataset, one section.
+		appendSamples( lines, samples );
+		appendRows( lines, mdHeading( 3, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ], commonLabels );
+
+		// Appendix D. Everything below this line is about the run, not about the
+		// repository -- which is why it is last (§2.9).
+		lines.append( mdHeading( 2, "Appendix D — Run telemetry, coverage and validation" ) );
 		lines.append( "" );
 		lines.append( "- **Run:** `" & escapeMarkdown( arguments.run.id ?: "" ) & "`" );
 		lines.append( "- **Repository:** `" & escapeMarkdown( arguments.run.projectPath ?: "" ) & "`" );
@@ -114,14 +164,6 @@ class threadsafe {
 		lines.append( "- **Run status:** `" & escapeMarkdown( arguments.run.status ?: "" ) & "`" );
 		lines.append( "- **Plan state:** `" & escapeMarkdown( arguments.result.planState ?: arguments.result.state ?: "needs-review" ) & "`" );
 		lines.append( "- **Plan fingerprint:** `" & escapeMarkdown( arguments.result.planFingerprint ?: "" ) & "`" );
-		lines.append( "" );
-
-		lines.append( mdHeading( 2, "Strangler coexistence" ) );
-		lines.append( "" );
-		lines.append( "Move one bounded slice at a time. Prefer coexist-route dual routing and measurable exit criteria before retiring legacy units. Do not treat this plan as a big-bang cutover." );
-		lines.append( "" );
-
-		lines.append( mdHeading( 2, "Overview and coverage" ) );
 		lines.append( "" );
 		lines.append( escapeMarkdown( arguments.result.summary ?: "No modernization summary was generated." ) );
 		lines.append( "" );
@@ -155,37 +197,10 @@ class threadsafe {
 		var providerDisclosure = coverage.remoteProviderDisclosure ?: arguments.result.remoteProviderDisclosure ?: planMetadata.remoteProviderDisclosure ?: "";
 		if ( len( providerDisclosure ) ) lines.append( "- **Provider disclosure:** " & escapeMarkdown( providerDisclosure ) );
 		lines.append( "" );
-
-		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
-		appendPlacementRegister( lines, placements );
-
-		var commonLabels = { validationStatus: "Validation", provenanceClass: "Evidence basis", evidenceRefs: "Evidence", evidence: "Evidence" };
-		appendRows( lines, mdHeading( 2, "Legacy catalog" ), legacyUnitRows, [ "id", "path", "kind", "name", "extends", "implements", "access", "returnType", "evidenceRefs" ], commonLabels );
-		appendRows( lines, mdHeading( 2, "Target structure and samples" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus", "provenanceClass", "evidenceRefs" ], commonLabels );
-		appendRows( lines, mdHeading( 2, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus", "provenanceClass", "evidence" ], structAppend( duplicate( commonLabels ), { legacyPath: "Legacy URL", targetRoute: "Target route" }, true ) );
-		appendRows( lines, mdHeading( 2, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", proposedChange: "Proposed change" }, true ) );
-		appendRows( lines, mdHeading( 2, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", expandContract: "Migration stage" }, true ) );
-		// The placement register above is the single rendering of this dataset.
-		// It previously appeared three more times -- an architecture packaging
-		// summary, a "Contexts and extracts" table and a "Side-app extract
-		// candidates" table -- all projections of the same placements in the v1
-		// vocabulary that no longer exists. One dataset, one section.
-		appendSamples( lines, samples );
-		appendRows( lines, mdHeading( 2, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ], commonLabels );
-
-		lines.append( mdHeading( 2, "Validation and decisions" ) );
-		lines.append( "" );
 		lines.append( "- **Validation status:** `" & escapeMarkdown( validation.status ?: validation.overallStatus ?: "unknown" ) & "`" );
 		lines.append( "- **Blocking issues:** `" & ( validation.blockingCount ?: validation.blockers ?: 0 ) & "`" );
 		lines.append( "- **Warnings:** `" & ( validation.warningCount ?: validation.warnings ?: 0 ) & "`" );
-		var decisionItems = isArray( decisions ) ? decisions : ( isArray( decisions.items ?: "" ) ? decisions.items : [] );
 		lines.append( "- **Decisions recorded:** `" & decisionItems.len() & "`" );
-		if ( decisionItems.len() ) {
-			lines.append( "" );
-			for ( var decision in decisionItems ) {
-				lines.append( "- `" & escapeMarkdown( decision.itemType ?: "item" ) & "` `" & escapeMarkdown( decision.decision ?: "undecided" ) & "` — " & escapeMarkdown( decision.note ?: "" ) );
-			}
-		}
 		lines.append( "" );
 		lines.append( "> AI-proposed artifacts are bounded skeletons. Validate them against the immutable evidence snapshot before applying changes." );
 		return arrayToList( lines, char( 10 ) );
@@ -599,6 +614,16 @@ class threadsafe {
 			return;
 		}
 		for ( var row in arguments.rows ) {
+			// Not every collection is a list of objects. `assumptions` in
+			// particular can arrive as plain strings, and structKeyExists on a
+			// string throws — which took down the whole Markdown export rather
+			// than one row.
+			if ( !isStruct( row ) ) {
+				if ( isSimpleValue( row ) && len( trim( toString( row ) ) ) ) {
+					arguments.lines.append( "- " & escapeMarkdown( toString( row ) ) );
+				}
+				continue;
+			}
 			var label = row.name ?: row.path ?: row.objectRef ?: row.id ?: row.findingId ?: row.transitionId ?: "item";
 			arguments.lines.append( mdHeading( 3, escapeMarkdown( label ) ) );
 			for ( var field in arguments.fields ) {
@@ -642,8 +667,10 @@ class threadsafe {
 		}
 	}
 
+	// Formatting primitives are owned by ModernizationAssessmentNarrative, which
+	// also renders with them. These delegate so there is one implementation.
 	private string function mdHeading( required numeric level, required string text ) {
-		return repeatString( char( 35 ), arguments.level ) & " " & arguments.text;
+		return narrative().mdHeading( arguments.level, arguments.text );
 	}
 
 	private string function coverageLine( required string label, required any value ) {
@@ -655,7 +682,29 @@ class threadsafe {
 	}
 
 	private string function escapeMarkdown( required string value ) {
-		return replace( replace( replace( arguments.value, "`", "'", "all" ), char( 13 ), "", "all" ), "|", "\\|", "all" );
+		return narrative().escapeMarkdown( arguments.value );
+	}
+
+	private any function narrative() {
+		if ( !isNull( variables.assessmentNarrative ?: javacast( "null", "" ) ) ) return variables.assessmentNarrative;
+		variables.assessmentNarrative = new app.models.services.ModernizationAssessmentNarrative();
+		return variables.assessmentNarrative;
+	}
+
+	private string function repositoryName( required struct run ) {
+		return narrative().repositoryName( arguments.run );
+	}
+
+	private void function appendVerdict( required array lines, required struct result, required array placements ) {
+		narrative().appendVerdict( arguments.lines, arguments.result, arguments.placements );
+	}
+
+	private void function appendStartHere( required array lines, required struct result, required array placements ) {
+		narrative().appendStartHere( arguments.lines, arguments.result, arguments.placements );
+	}
+
+	private void function appendBlockers( required array lines, required struct result, required array placements ) {
+		narrative().appendBlockers( arguments.lines, arguments.result, arguments.placements );
 	}
 
 	private string function identityKey( required any value ) {
@@ -713,4 +762,5 @@ class threadsafe {
 	private boolean function isSimpleValue( required any value ) {
 		return !isStruct( arguments.value ) && !isArray( arguments.value ) && !isObject( arguments.value );
 	}
+
 }

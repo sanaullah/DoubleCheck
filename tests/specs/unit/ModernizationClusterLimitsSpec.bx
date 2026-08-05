@@ -182,7 +182,7 @@ class extends="testbox.system.BaseSpec" {
 			} );
 
 			it( "keys shards to clusters so each prompt has one subject", () => {
-				var proposal = new app.models.services.ModernizationProposalService();
+				var proposal = new app.models.services.ModernizationShardExecutor();
 				makePublic( proposal, "chunkPathsByCluster" );
 
 				var evidence = {
@@ -208,7 +208,7 @@ class extends="testbox.system.BaseSpec" {
 			} );
 
 			it( "still shards a path list when no clusters are present", () => {
-				var proposal = new app.models.services.ModernizationProposalService();
+				var proposal = new app.models.services.ModernizationShardExecutor();
 				makePublic( proposal, "chunkPathsByCluster" );
 
 				var chunks = proposal.chunkPathsByCluster( [ "a.cfc", "b.cfc", "c.cfc" ], {}, 2, 10 );
@@ -220,7 +220,7 @@ class extends="testbox.system.BaseSpec" {
 			it( "keeps the shard size cap even for a large cluster", () => {
 				// A high-cohesion domain is a bigger ask than a path batch, which
 				// is why truncation resplitting has to survive the inversion.
-				var proposal = new app.models.services.ModernizationProposalService();
+				var proposal = new app.models.services.ModernizationShardExecutor();
 				makePublic( proposal, "chunkPathsByCluster" );
 
 				var filePaths = [];
@@ -247,6 +247,62 @@ class extends="testbox.system.BaseSpec" {
 
 				expect( clusters ).toHaveLength( 1 );
 				expect( clusters[ 1 ].name ).notToBeEmpty();
+			} );
+
+			it( "gives each shard a whole-system header for its own cluster", () => {
+				var proposal = new app.models.services.ModernizationShardExecutor();
+				makePublic( proposal, "wholeSystemHeader" );
+
+				var evidence = {
+					derived: {
+						clusters: [
+							{
+								id: "c-orders", name: "Orders", purpose: "Takes and prices orders.",
+								placementType: "extracted-service",
+								filePaths: [ "orders/Orders.cfc" ],
+								boundaryEvidence: {
+									crossingEdges: 4,
+									sharedTablesOutside: [ "customers" ],
+									sharedScopesOutside: [ "application.cart" ]
+								}
+							},
+							{ id: "c-billing", name: "Billing", filePaths: [ "billing/Billing.cfc" ] }
+						],
+						waveOrder: {
+							order: [ { clusterId: "c-orders", wave: 2, dependsOn: [ "c-billing" ] } ]
+						}
+					}
+				};
+
+				var header = proposal.wholeSystemHeader( evidence, { "orders/orders.cfc": true } );
+
+				expect( header.capability ).toBe( "Orders" );
+				expect( header.migrationWave ).toBe( 2 );
+				// Dependencies are named, not shown as opaque cluster ids.
+				expect( header.dependsOn ).toBe( [ "Billing" ] );
+				expect( header.crossesBoundary.calls ).toBe( 4 );
+				expect( header.crossesBoundary.tables ).toBe( [ "customers" ] );
+			} );
+
+			it( "says so plainly when a shard's files belong to no cluster", () => {
+				var proposal = new app.models.services.ModernizationShardExecutor();
+				makePublic( proposal, "wholeSystemHeader" );
+
+				var evidence = { derived: { clusters: [ { id: "c-a", filePaths: [ "a/A.cfc" ] } ] } };
+
+				// An unowned shard must not silently inherit the first cluster's
+				// identity -- that would put a confident wrong subject in the prompt.
+				var header = proposal.wholeSystemHeader( evidence, { "z/Z.cfc": true } );
+
+				expect( header ).notToHaveKey( "capability" );
+				expect( header.note ).toInclude( "not owned" );
+			} );
+
+			it( "omits the header entirely when nothing was derived", () => {
+				var proposal = new app.models.services.ModernizationShardExecutor();
+				makePublic( proposal, "wholeSystemHeader" );
+
+				expect( proposal.wholeSystemHeader( {}, { "a.cfc": true } ) ).toBeEmpty();
 			} );
 		} );
 	}

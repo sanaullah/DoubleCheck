@@ -1,0 +1,58 @@
+/**
+ * Part 5: telemetry extraction, split out of SpecialistAgentGateway.
+ *
+ * The property worth pinning is not the field mapping — it is that recorded
+ * observations never carry raw prompt or response text. An observation is
+ * written to local storage and shown in the flight recorder UI; leaking the
+ * prompt body there would put source code somewhere the user did not ask for.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "AiTelemetryExtractor", () => {
+
+			var extractor = new app.models.services.AiTelemetryExtractor();
+
+			it( "redacts scalar text to a length and digest, never the content", () => {
+				var secret = "component { var apiKey = 'sk-live-1234567890'; }";
+				var out = extractor.safeText( secret );
+
+				expect( out ).notToInclude( "sk-live-1234567890" );
+				expect( out ).notToInclude( "apiKey" );
+				expect( out ).toInclude( "redacted-text" );
+				expect( out ).toInclude( "length=" & len( secret ) );
+				expect( out ).toInclude( "sha256=" );
+			} );
+
+			it( "redacts struct values too, keeping only the keys", () => {
+				var out = extractor.safeText( { prompt: "SELECT * FROM users WHERE ssn = '123'", model: "x" } );
+
+				expect( out ).notToInclude( "123" );
+				expect( out ).notToInclude( "SELECT" );
+				// Keys are structural and safe; values are not.
+				expect( out ).toInclude( "prompt" );
+			} );
+
+			it( "reports the same digest for the same text, so repeats are correlatable", () => {
+				expect( extractor.safeText( "abc" ) ).toBe( extractor.safeText( "abc" ) );
+				expect( extractor.safeText( "abc" ) ).notToBe( extractor.safeText( "abd" ) );
+			} );
+
+			it( "survives a null or unserializable body instead of throwing mid-observation", () => {
+				// Telemetry must never take down the call it is observing.
+				expect( extractor.safeText( "" ) ).toBeString();
+				expect( extractor.safeText( [] ) ).toBeString();
+				expect( extractor.safeText( {} ) ).toBeString();
+			} );
+
+			it( "maps an unknown observation kind without throwing", () => {
+				expect( extractor.observationTypeFor( "definitely-not-a-kind" ) ).toBeString();
+			} );
+
+			it( "returns a usage struct even when the context carries nothing", () => {
+				expect( extractor.extractUsage( {} ) ).toBeStruct();
+				expect( extractor.extractToolInfo( {} ) ).toBeStruct();
+			} );
+		} );
+	}
+}

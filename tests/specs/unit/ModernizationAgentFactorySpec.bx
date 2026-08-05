@@ -78,6 +78,76 @@ class extends="testbox.system.BaseSpec" {
 
 
 
+			it( "builds the judge role against fixed boundaries it may not redraw", () => {
+				var prompt = factory.build(
+					"modernization-judge",
+					{ runtime: "boxlang", profile: "modern" },
+					{ clusters: [ { id: "c-orders", name: "Orders" }, { id: "c-billing", name: "Billing" } ] },
+					{}
+				);
+				var instruction = prompt.messages[ 2 ].content;
+				expect( instruction ).toInclude( "c-orders" );
+				expect( instruction ).toInclude( "c-billing" );
+				// The whole point of the inversion: the model argues with a boundary,
+				// it does not draw one.
+				expect( instruction ).toInclude( "may not redraw" );
+				expect( instruction ).toInclude( "breaksOnExtraction" );
+			} );
+
+			it( "gives the judge the clusters as evidence, not the raw repository map", () => {
+				var prompt = factory.build(
+					"modernization-judge",
+					{ runtime: "boxlang", profile: "modern" },
+					{ clusters: [ { id: "c-orders", purpose: "evidence-only-marker" } ], target: { units: [ { id: "should-not-appear-1" } ] } },
+					{}
+				);
+				var userMessage = prompt.messages[ 2 ].content;
+				// The marker lives only in the cluster record, so seeing it proves the
+				// evidence envelope was built -- the instruction alone would not carry it.
+				expect( userMessage ).toInclude( "evidence-only-marker" );
+				// `target` is not in judge's ordered keys, so the repository map must not
+				// ride along; that payload is what made the old whole-repo call time out.
+				expect( userMessage ).notToInclude( "should-not-appear-1" );
+			} );
+
+			it( "builds the narrate role for language only", () => {
+				factory.skillService = new app.models.services.ModernizationSkillService();
+				var prompt = factory.build(
+					"modernization-narrate",
+					{ runtime: "boxlang", profile: "modern" },
+					{ clusters: [ { id: "c-orders" } ] },
+					{}
+				);
+				var instruction = prompt.messages[ 2 ].content;
+				expect( instruction ).toInclude( "c-orders" );
+				expect( instruction ).toInclude( "Structure is not your decision" );
+				expect( instruction ).toInclude( "migrationSteps" );
+				// narrate writes names and code skeletons, so it gets the convention pack.
+				expect( arrayLen( prompt.skillPack ?: [] ) ).toBeGT( 0 );
+			} );
+
+			it( "points the critic at architecture, not at JSON shape", () => {
+				var prompt = factory.build(
+					"modernization-critic",
+					{ runtime: "boxlang", profile: "modern" },
+					{ placements: [ { id: "ctx-derived-a1", crossingEdges: 9 } ], target: { units: [ { id: "must-not-leak-1" } ] } },
+					{}
+				);
+				var content = prompt.messages[ 2 ].content;
+				expect( content ).toInclude( "ctx-derived-a1" );
+				expect( content ).toInclude( "NO authority to rewrite" );
+				// Schema problems are deterministically caught before the critic
+				// speaks; spending its budget there duplicates a check that cannot
+				// fail and skips the one thing only it can do.
+				expect( content ).toInclude( "Do NOT report schema" );
+				// It gets a projection, not the merged plan.
+				expect( content ).notToInclude( "must-not-leak-1" );
+			} );
+
+			it( "refuses a role that is not registered", () => {
+				expect( () => factory.build( "modernization-invent", {}, {}, {} ) ).toThrow( type = "ValidationException" );
+			} );
+
 			it( "tells the roadmap role to follow context/extract groupings into phases", () => {
 				var roadmapPrompt = factory.build( "modernization-roadmap", { runtime: "boxlang", profile: "modern" }, { target: { contexts: [], extracts: [] } }, {} );
 				expect( roadmapPrompt.messages[ 2 ].content ).toInclude( "prefer one phase per coherent group" );

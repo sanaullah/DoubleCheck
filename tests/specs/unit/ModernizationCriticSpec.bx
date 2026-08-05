@@ -1,0 +1,92 @@
+/**
+ * Step 9: the critic evaluates the architecture and cannot change it.
+ *
+ * These specs cover the projection and the guards. Whether the critic is any
+ * good is `criticAccuracy`, measured against the corpus scenarios where the
+ * right answer is planted — that needs a provider run and is Step 9's gate.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Modernization critic", () => {
+
+			var plan = {
+				target: { units: [ { id: "tu-1" }, { id: "tu-2" } ], placements: [
+					{
+						id: "ctx-derived-a1", name: "Orders", placementType: "external-service",
+						recommendation: "extract", targetUnitIds: [ "tu-1", "tu-2" ],
+						decisionRequired: false,
+						boundaryEvidence: { crossingEdges: 9, sharedTablesOutside: [ "customers" ], sharedScopesOutside: [], inCycleWithOutside: true, isolated: false },
+						gates: [ { id: "code-boundary", status: "pass", confidence: "high" } ]
+					}
+				] },
+				derived: {
+					waveOrder: { order: [ { clusterId: "ctx-derived-a1", wave: 0, dependsOn: [] } ], maxWave: 1 },
+					graph: { cycles: [ [ "a.cfc", "b.cfc" ] ], truncated: false }
+				},
+				inventory: { files: [ { filePath: "a.cfc", lineCount: 10 } ] },
+				samples: [ { id: "s-1", code: "component { function everything() {} }" } ]
+			};
+
+			it( "projects decisions and metrics, never the merged plan", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				makePublic( service, "criticProjection" );
+
+				var projection = service.criticProjection( plan );
+
+				expect( projection.placements ).toHaveLength( 1 );
+				expect( projection.placements[ 1 ].crossingEdges ).toBe( 9 );
+				expect( projection.placements[ 1 ].sharedTables ).toBe( [ "customers" ] );
+				expect( projection.placements[ 1 ].unitCount ).toBe( 2 );
+				expect( projection.gates ).toHaveLength( 1 );
+				expect( projection.waveOrder.order ).toHaveLength( 1 );
+				expect( projection.graphMetrics.cycles ).toBe( 1 );
+
+				// The catalog and samples are the whole-repository payload that made
+				// the old unsharded architecture call time out. They must not travel.
+				expect( projection ).notToHaveKey( "target" );
+				expect( projection ).notToHaveKey( "samples" );
+				expect( projection ).notToHaveKey( "inventory" );
+			} );
+
+			it( "does nothing when the plan has no placements to criticise", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				var outcome = service.critique( "run-1", { target: { placements: [] } } );
+				expect( outcome.ran ).toBeFalse();
+				expect( outcome.critiques ).toBeEmpty();
+			} );
+
+			it( "discards a critique aimed at something not in the plan", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				service.agentFactory = {
+					build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [], promptPackage: {} } )
+				};
+				service.agentGateway = {
+					run: ( runId, request, options ) => ( { ok: true, costUsd: 0, data: { critiques: [
+						{ severity: "high", targetItemId: "ctx-derived-a1", claim: "Nine crossing edges contradict the extract recommendation." },
+						{ severity: "high", targetItemId: "ctx-invented", claim: "A capability that does not exist." },
+						{ severity: "low", targetItemId: "ctx-derived-a1", claim: "" }
+					] } } )
+				};
+
+				var outcome = service.critique( "run-1", plan );
+
+				// Only the grounded, non-empty critique survives.
+				expect( outcome.critiques ).toHaveLength( 1 );
+				expect( outcome.critiques[ 1 ].targetItemId ).toBe( "ctx-derived-a1" );
+			} );
+
+			it( "reports a provider failure instead of inventing critiques", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				service.agentFactory = { build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [], promptPackage: {} } ) };
+				service.agentGateway = { run: ( runId, request, options ) => ( { ok: false, error: "request_timeout" } ) };
+
+				var outcome = service.critique( "run-1", plan );
+
+				expect( outcome.critiques ).toBeEmpty();
+				expect( outcome.errors ).toHaveLength( 1 );
+				expect( outcome.errors[ 1 ].message ).toBe( "request_timeout" );
+			} );
+		} );
+	}
+}

@@ -25,6 +25,45 @@ class extends="testbox.system.BaseSpec" {
 				expect( gate.status ).toBe( "unknown" );
 				expect( plan.target.placements[ 1 ].gateStatus ).toBe( "needs-review" );
 			} );
+
+			it( "asks for a human decision when the judge disputes a derived boundary", () => {
+				var service = new app.models.services.ModernizationGateService();
+				var plan = service.evaluatePlan( {
+					target: { units: [ { id: "tu-1" } ], placements: [ { id: "ctx-derived-a1", placementType: "main-app", evidenceBasis: "coupling-derived", targetUnitIds: [ "tu-1" ] } ] },
+					judgement: { verdicts: [ {
+						clusterId: "ctx-derived-a1",
+						defensible: false,
+						confidence: 0.8,
+						rationale: "Writes application.cart, which orders also writes.",
+						breaksOnExtraction: [ "application.cart" ]
+					} ] },
+					signals: []
+				} );
+				var placement = plan.target.placements[ 1 ];
+				expect( placement.judgeReview.defensible ).toBeFalse();
+				expect( placement.judgeReview.breaksOnExtraction ).toBe( [ "application.cart" ] );
+				expect( placement.decisionRequired ).toBeTrue();
+			} );
+
+			it( "treats a hedged verdict as a reason to ask, not as agreement", () => {
+				var service = new app.models.services.ModernizationGateService();
+				var plan = service.evaluatePlan( {
+					target: { units: [ { id: "tu-1" } ], placements: [ { id: "ctx-derived-a1", placementType: "main-app", evidenceBasis: "coupling-derived", targetUnitIds: [ "tu-1" ] } ] },
+					// Says defensible, but barely believes it.
+					judgement: { verdicts: [ { clusterId: "ctx-derived-a1", defensible: true, confidence: 0.3, rationale: "Hard to tell." } ] },
+					signals: []
+				} );
+				expect( plan.target.placements[ 1 ].decisionRequired ).toBeTrue();
+			} );
+
+			it( "does not attach a review when no judge ran", () => {
+				var service = new app.models.services.ModernizationGateService();
+				var plan = service.evaluatePlan( {
+					target: { units: [ { id: "tu-1" } ], placements: [ { id: "ctx-derived-a1", placementType: "main-app", evidenceBasis: "coupling-derived", targetUnitIds: [ "tu-1" ] } ] },
+					signals: []
+				} );
+				expect( plan.target.placements[ 1 ] ).notToHaveKey( "judgeReview" );
+			} );
 		} );
 	}
 }

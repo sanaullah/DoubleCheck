@@ -553,3 +553,49 @@ const legacyResolved = helpers.modernizationPlacements(legacyOnly);
 assert.equal(legacyResolved.length, 2);
 assert.equal(legacyResolved.every((item) => item._placementSource === "legacy"), true);
 assert.equal(helpers.buildModernizationArchitectureSubgraph(legacyOnly).lanes.extracts, 1, "an untyped legacy extract must not become centralized");
+
+// --- modernizationBriefVerdict (Step 10) -----------------------------------
+// The brief may only show what the server could ground. These assert the
+// filtering, not the wording.
+
+const noBrief = helpers.modernizationBriefVerdict({});
+assert.equal(noBrief.hasVerdict, false, "no brief means no verdict block");
+assert.equal(noBrief.claims.length, 0);
+
+const grounded = helpers.modernizationBriefVerdict({
+	brief: {
+		verdict: "  A small estate with one coupled core.  ",
+		startHere: " Orders ",
+		droppedClaims: 2,
+		claims: [
+			{ claim: "Orders writes shared state.", evidenceRefs: [ { filePath: "app/orders/Orders.cfc", startLine: 12 } ] },
+			{ claim: "Notifications calls out.", evidenceRefs: [ { filePath: "app/n/Queue.cfc" } ] }
+		]
+	}
+});
+assert.equal(grounded.hasVerdict, true);
+assert.equal(grounded.verdict, "A small estate with one coupled core.", "verdict is trimmed");
+assert.equal(grounded.startHere, "Orders");
+assert.equal(grounded.claims.length, 2);
+assert.equal(grounded.claims[0].refs[0], "app/orders/Orders.cfc:12", "a ref renders as file:line");
+assert.equal(grounded.claims[1].refs[0], "app/n/Queue.cfc", "a ref without a line renders as the path alone");
+assert.equal(grounded.droppedClaims, 2, "the dropped count is reported, not hidden");
+
+// A claim with no surviving citation must not be rendered as though it had
+// evidence -- that is the fluent-nonsense failure Step 10 exists to avoid.
+const uncited = helpers.modernizationBriefVerdict({
+	brief: { verdict: "Confident.", claims: [
+		{ claim: "Trust me." },
+		{ claim: "Also trust me.", evidenceRefs: [] },
+		{ claim: "", evidenceRefs: [ { filePath: "a.cfc", startLine: 1 } ] },
+		{ claim: "Grounded.", evidenceRefs: [ { filePath: "a.cfc", startLine: 1 } ] }
+	] }
+});
+assert.equal(uncited.claims.length, 1, "only the cited, non-empty claim survives");
+assert.equal(uncited.claims[0].claim, "Grounded.");
+
+// An empty verdict string is not a verdict, however many claims came with it.
+assert.equal(
+	helpers.modernizationBriefVerdict({ brief: { verdict: "   ", claims: [ { claim: "x", evidenceRefs: [ { filePath: "a.cfc", startLine: 1 } ] } ] } }).hasVerdict,
+	false
+);

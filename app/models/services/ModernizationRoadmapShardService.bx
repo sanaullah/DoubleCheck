@@ -1,0 +1,544 @@
+/**
+ * Roadmap sharding: cutting a merged plan into per-slice roadmap calls and
+ * running them.
+ *
+ * Split from ModernizationShardExecutor (Step 11). Roadmap shards key on target
+ * unit groups and produce one phase each; application shards key on file paths
+ * and produce target units. They share only the dispatch primitives — the pool,
+ * the future, and the timeout — which stay on the executor and are used from
+ * here rather than duplicated.
+ */
+@singleton
+class threadsafe {
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="modernizationArtifactService" inject="ModernizationArtifactService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="modernizationShardExecutor" inject="ModernizationShardExecutor";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="log" inject="logbox:logger:{this}";
+
+	variables.cancelledRuns = {};
+	variables.maxItems = 200;
+	variables.defaultRoadmapUnitBatchSize = 24;
+	variables.maxRoadmapShards = 24;
+
+	void function shareRunState( required struct cancelledRuns ) {
+		variables.cancelledRuns = arguments.cancelledRuns;
+	}
+
+	private any function shardExecutor() {
+		if ( !isNull( variables.modernizationShardExecutor ?: javacast( "null", "" ) ) ) return variables.modernizationShardExecutor;
+		variables.modernizationShardExecutor = new app.models.services.ModernizationShardExecutor();
+		return variables.modernizationShardExecutor;
+	}
+
+	private any function artifactService() {
+		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
+		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
+		return variables.modernizationArtifactService;
+	}
+
+	private boolean function isCancelled(required string runId, required struct options) {
+		return variables.cancelledRuns.keyExists( arguments.runId ) || ( structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled() );
+	}
+
+	private void function logInfo( required string message ) {
+		try {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				variables.log.info( arguments.message );
+			}
+		} catch ( any ignored ) {}
+	}
+
+	private void function emitProposalObservation( required struct options, required struct observation ) {
+		if ( structKeyExists( arguments.options, "onObservation" ) && isCustomFunction( arguments.options.onObservation ) ) {
+			try {
+				arguments.options.onObservation( duplicate( arguments.observation ) );
+			} catch ( any ignored ) {}
+		}
+	}
+
+	private struct function redactPayload(required struct payload) {
+		try {
+			var redacted = secretRedactionService.redactStructured( arguments.payload );
+			return isStruct( redacted ) ? redacted : {};
+		} catch ( any ignored ) {
+			// Never persist a provider payload that could not pass redaction;
+			// retaining raw output would violate the local privacy boundary.
+			return {};
+		}
+	}	public array function buildRoadmapShards( required struct plan, struct budgets = {} ) {
+		var batchSize = isNumeric( arguments.budgets.roadmapUnitBatchSize ?: "" )
+			? max( 4, min( 60, int( arguments.budgets.roadmapUnitBatchSize ) ) )
+			: variables.defaultRoadmapUnitBatchSize;
+		var shardCap = isNumeric( arguments.budgets.maxRoadmapShards ?: "" )
+			? max( 1, min( variables.maxRoadmapShards, int( arguments.budgets.maxRoadmapShards ) ) )
+			: variables.maxRoadmapShards;
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		if ( !units.len() ) return [];
+
+		var groups = derivedStructureService.synthesisRoadmapGroups( arguments.plan );
+		var shardGroups = [];
+		var covered = {};
+		if ( groups.len() ) {
+			var groupBatch = min( batchSize, 24 );
+			for ( var group in groups ) {
+				if ( shardGroups.len() >= shardCap ) break;
+				var groupIds = [];
+				for ( var unitId in ( group.targetUnitIds ?: [] ) ) {
+					var id = trim( toString( unitId ) );
+					if ( len( id ) && !covered.keyExists( id ) ) { groupIds.append( id ); covered[ id ] = true; }
+				}
+				if ( !groupIds.len() ) continue;
+				for ( var groupOffset = 1; groupOffset <= groupIds.len() && shardGroups.len() < shardCap; groupOffset += groupBatch ) {
+					var batchIds = [];
+					for ( var groupIndex = groupOffset; groupIndex <= min( groupIds.len(), groupOffset + groupBatch - 1 ); groupIndex++ ) {
+						batchIds.append( groupIds[ groupIndex ] );
+					}
+					if ( batchIds.len() ) {
+						shardGroups.append( {
+							name: groupOffset == 1 ? ( group.name ?: "Slice" ) : "#( group.name ?: 'Slice' )# (#int( ( groupOffset - 1 ) / groupBatch ) + 1#)",
+							targetUnitIds: batchIds,
+							kind: group.kind ?: "context"
+						} );
+					}
+				}
+			}
+			var leftover = [];
+			for ( var unit in units ) {
+				var id = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+				if ( len( id ) && !covered.keyExists( id ) ) leftover.append( id );
+			}
+			// Architecture placements are still being gap-filled by directory after
+			// propose() returns, so at this point a large share of units can be
+			// unclaimed even though the finished plan groups them cleanly. Batching
+			// those sequentially produced "Continue strangler slices (3)" phases
+			// holding half the plan. Group them by the same feature-directory signal
+			// the later gap-fill uses so the phase names carry domain meaning.
+			// Cap each batch so roleInstruction / evidence stay inside the provider
+			// prompt budget: one leftover megashard is what blew immutableCharacters
+			// past 60k previously.
+			var leftoverBatch = min( batchSize, 24 );
+			for ( var leftoverGroup in derivedStructureService.leftoverRoadmapGroups( units, leftover ) ) {
+				var groupLeftoverIds = leftoverGroup.targetUnitIds;
+				for ( var leftoverOffset = 1; leftoverOffset <= groupLeftoverIds.len() && shardGroups.len() < shardCap; leftoverOffset += leftoverBatch ) {
+					var leftoverIds = [];
+					for ( var leftoverIndex = leftoverOffset; leftoverIndex <= min( groupLeftoverIds.len(), leftoverOffset + leftoverBatch - 1 ); leftoverIndex++ ) {
+						leftoverIds.append( groupLeftoverIds[ leftoverIndex ] );
+					}
+					if ( !leftoverIds.len() ) continue;
+					shardGroups.append( {
+						name: leftoverOffset == 1
+							? leftoverGroup.name
+							: "#leftoverGroup.name# (#int( ( leftoverOffset - 1 ) / leftoverBatch ) + 1#)",
+						targetUnitIds: leftoverIds,
+						kind: "leftover"
+					} );
+				}
+				if ( shardGroups.len() >= shardCap ) break;
+			}
+		} else {
+			for ( var offset = 1; offset <= units.len(); offset += batchSize ) {
+				if ( shardGroups.len() >= shardCap ) break;
+				var batchIds = [];
+				for ( var i = offset; i <= min( units.len(), offset + batchSize - 1 ); i++ ) {
+					var unitId = trim( toString( units[ i ].id ?: units[ i ].itemId ?: "" ) );
+					if ( len( unitId ) ) batchIds.append( unitId );
+				}
+				if ( batchIds.len() ) shardGroups.append( { name: "Slice #shardGroups.len() + 1#", targetUnitIds: batchIds, kind: "unit-batch" } );
+			}
+		}
+		if ( !shardGroups.len() ) return [];
+		var shards = [];
+		for ( var index = 1; index <= shardGroups.len(); index++ ) {
+			shards.append( evidenceForRoadmapShard( arguments.plan, shardGroups[ index ], index, shardGroups.len() ) );
+		}
+		return shards;
+	}
+
+	public struct function runRoadmapShards(
+		required string runId,
+		required array roadmapShards,
+		required struct runtime,
+		required struct budgets,
+		required numeric startedAt,
+		required numeric maxDurationMs,
+		required numeric totalOutputLimit,
+		required numeric spentSoFarUsd,
+		struct options = {}
+	) {
+		var outcomes = [];
+		for ( var outcomeIndex = 1; outcomeIndex <= arguments.roadmapShards.len(); outcomeIndex++ ) {
+			outcomes.append( {
+				shard: outcomeIndex,
+				shardTotal: arguments.roadmapShards.len(),
+				groupName: arguments.roadmapShards[ outcomeIndex ].shardMeta.groupName ?: "",
+				status: "not-run",
+				durationMs: 0,
+				costUsd: 0,
+				outputCharacters: 0,
+				usage: {},
+				promptProvenance: {},
+				provenanceClass: "not-observed"
+			} );
+		}
+		var concurrency = isNumeric( arguments.budgets.applicationShardConcurrency ?: "" )
+			? max( 1, min( 12, int( arguments.budgets.applicationShardConcurrency ) ) )
+			: 3;
+		var maxCost = isNumeric( arguments.budgets.maxCostUsd ?: "" ) ? val( arguments.budgets.maxCostUsd ) : 0;
+		var roadmapRequests = [];
+		try {
+			for ( var preflightIndex = 1; preflightIndex <= arguments.roadmapShards.len(); preflightIndex++ ) {
+				var roadmapRequest = agentFactory.build( "modernization-roadmap", arguments.runtime, arguments.roadmapShards[ preflightIndex ], arguments.budgets );
+				roadmapRequest.shardIndex = preflightIndex;
+				var preflightOptions = artifactService().copyGatewayOptions( arguments.options );
+				preflightOptions.role = "modernization-roadmap";
+				preflightOptions.budgets = duplicate( arguments.budgets );
+				agentGateway.preflight( roadmapRequest, preflightOptions );
+				roadmapRequests.append( roadmapRequest );
+			}
+		} catch ( any error ) {
+			for ( var failedOutcome in outcomes ) failedOutcome.status = "omitted";
+			return {
+				roadmapPhases: [], assumptions: [], samples: [], accepted: 0, failed: 0,
+				omitted: outcomes.len(), outcomes: outcomes,
+				errors: [ {
+					role: "modernization-roadmap",
+					message: left( error.message ?: "modernization roadmap prompt preflight failed", 500 ),
+					stage: "prompt-preflight",
+					diagnostics: artifactService().exceptionDiagnostics( error )
+				} ],
+				outputCharacters: 0, costUsd: 0, provider: "", model: ""
+			};
+		}
+
+		var state = {
+			phaseRecords: [],
+			assumptions: [],
+			samples: [],
+			accepted: 0,
+			errors: [],
+			totalOutputCharacters: 0,
+			totalCostUsd: 0,
+			providerId: "",
+			modelId: "",
+			nextShardIndex: 1,
+			dispatchCount: 0,
+			pending: [],
+			outcomes: outcomes,
+			executorName: shardExecutor().ensureShardExecutor( concurrency )
+		};
+		var shardContext = {
+			runId: arguments.runId,
+			roadmapShards: arguments.roadmapShards,
+			roadmapRequests: roadmapRequests,
+			runtime: arguments.runtime,
+			budgets: arguments.budgets,
+			options: arguments.options,
+			startedAt: arguments.startedAt,
+			maxDurationMs: arguments.maxDurationMs,
+			totalOutputLimit: arguments.totalOutputLimit,
+			totalShards: arguments.roadmapShards.len(),
+			concurrency: concurrency,
+			maxCost: maxCost,
+			spentSoFarUsd: arguments.spentSoFarUsd
+		};
+
+		var primed = 0;
+		while ( primed < concurrency && dispatchNextRoadmapShard( state, shardContext ) ) primed = primed + 1;
+
+		while ( state.pending.len() ) {
+			var settledIndex = 0;
+			while ( !settledIndex ) {
+				for ( var scanIndex = 1; scanIndex <= state.pending.len(); scanIndex++ ) {
+					if ( state.pending[ scanIndex ].future.isDone() ) {
+						settledIndex = scanIndex;
+						break;
+					}
+				}
+				if ( !settledIndex ) sleep( 20 );
+			}
+			var settled = state.pending[ settledIndex ];
+			state.pending.deleteAt( settledIndex );
+			recordRoadmapShardResult( state, settled, shardExecutor().awaitShardTask( settled ) );
+			dispatchNextRoadmapShard( state, shardContext );
+		}
+
+		for ( var pendingOutcome in state.outcomes ) {
+			if ( pendingOutcome.status == "not-run" ) pendingOutcome.status = "omitted";
+		}
+
+		// A plan that only ever needed one shard (the common small-plan case)
+		// keeps today's exact single-call behavior: no cross-shard id/dependency
+		// rewriting, since there is nothing to reconcile against.
+		var phases = shardContext.totalShards <= 1
+			? state.phaseRecords.map( ( record ) => record.phase )
+			: reconcileShardedRoadmapPhases( state.phaseRecords );
+
+		return {
+			roadmapPhases: phases,
+			assumptions: state.assumptions,
+			samples: state.samples,
+			accepted: state.accepted,
+			failed: state.outcomes.filter( ( item ) => item.status == "failed" ).len(),
+			omitted: state.outcomes.filter( ( item ) => item.status == "omitted" ).len(),
+			outcomes: state.outcomes,
+			errors: state.errors,
+			outputCharacters: state.totalOutputCharacters,
+			costUsd: state.totalCostUsd,
+			provider: state.providerId,
+			model: state.modelId
+		};
+	}
+
+	private boolean function dispatchNextRoadmapShard( required struct state, required struct context ) {
+		if ( arguments.state.nextShardIndex > arguments.context.totalShards ) return false;
+		if ( isCancelled( arguments.context.runId, arguments.context.options ) ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "cancelled-after-partial-acceptance", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+		var elapsedMs = getTickCount() - arguments.context.startedAt;
+		var remainingMs = arguments.context.maxDurationMs - elapsedMs;
+		if ( remainingMs <= 2000 ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "budget-exceeded", shard: arguments.state.nextShardIndex, elapsedMs: elapsedMs, maxDurationMs: arguments.context.maxDurationMs } );
+			return false;
+		}
+		if ( arguments.state.totalOutputCharacters >= arguments.context.totalOutputLimit ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "total-output-budget-exceeded", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+		if ( arguments.context.maxCost > 0 && ( arguments.context.spentSoFarUsd + arguments.state.totalCostUsd ) >= arguments.context.maxCost ) {
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "cost-budget-exceeded", shard: arguments.state.nextShardIndex } );
+			return false;
+		}
+
+		var shardIndex = arguments.state.nextShardIndex;
+		var shard = arguments.context.roadmapShards[ shardIndex ];
+		var shareCount = arguments.state.dispatchCount < arguments.context.concurrency
+			? min( arguments.context.concurrency, arguments.context.totalShards )
+			: ( arguments.context.totalShards - arguments.state.dispatchCount );
+		var costRemaining = arguments.context.maxCost > 0
+			? max( 0, arguments.context.maxCost - arguments.context.spentSoFarUsd - arguments.state.totalCostUsd )
+			: 0;
+		var perShardCost = arguments.context.maxCost > 0 ? costRemaining / max( 1, shareCount ) : 0;
+
+		var roadmapRequest = arguments.context.roadmapRequests[ shardIndex ];
+		var roadmapOptions = duplicate( arguments.context.options );
+		roadmapOptions.budgets = duplicate( arguments.context.budgets );
+		if ( arguments.context.maxCost > 0 ) roadmapOptions.budgets.maxCostUsd = perShardCost;
+		roadmapOptions.startedAt = getTickCount();
+		roadmapOptions.maxDurationMs = max( 5000, remainingMs );
+		roadmapOptions.maxRetries = isNumeric( arguments.context.options.maxRetries ?: "" )
+			? max( 0, min( 1, int( arguments.context.options.maxRetries ) ) )
+			: 1;
+		roadmapOptions.role = "modernization-roadmap";
+
+		arguments.state.pending.append( shardExecutor().dispatchShardTask( arguments.context.runId, shardIndex, roadmapRequest, roadmapOptions, arguments.state.executorName ) );
+		arguments.state.nextShardIndex = shardIndex + 1;
+		arguments.state.dispatchCount = arguments.state.dispatchCount + 1;
+		return true;
+	}
+
+	private void function recordRoadmapShardResult( required struct state, required struct settled, required struct response ) {
+		var outcome = arguments.state.outcomes[ arguments.settled.shardIndex ];
+		outcome.provider = arguments.response.provider ?: "";
+		outcome.model = arguments.response.model ?: "";
+		outcome.costUsd = isNumeric( arguments.response.costUsd ?: "" ) ? val( arguments.response.costUsd ) : 0;
+		outcome.durationMs = isNumeric( arguments.response.durationMs ?: "" ) ? int( arguments.response.durationMs ) : 0;
+		outcome.outputCharacters = isNumeric( arguments.response.outputCharacters ?: "" ) ? int( arguments.response.outputCharacters ) : 0;
+		outcome.usage = isStruct( arguments.response.usage ?: "" ) ? duplicate( arguments.response.usage ) : {};
+		outcome.promptProvenance = isStruct( arguments.response.promptProvenance ?: "" ) ? duplicate( arguments.response.promptProvenance ) : {};
+		if ( len( outcome.provider ) ) arguments.state.providerId = outcome.provider;
+		if ( len( outcome.model ) ) arguments.state.modelId = outcome.model;
+		arguments.state.totalCostUsd = arguments.state.totalCostUsd + outcome.costUsd;
+		if ( !( arguments.response.ok ?: false ) ) {
+			outcome.status = "failed";
+			outcome.reason = arguments.response.error ?: "provider-failed";
+			arguments.state.errors.append( artifactService().providerRoleError( "modernization-roadmap", arguments.response, arguments.settled.shardIndex ) );
+			return;
+		}
+		if ( !artifactService().validFragment( "modernization-roadmap", arguments.response.payload ?: {} ) ) {
+			outcome.status = "failed";
+			outcome.reason = "malformed-role-output";
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "malformed-role-output", shard: arguments.settled.shardIndex } );
+			return;
+		}
+		var redacted = redactPayload( arguments.response.payload ?: {} );
+		if ( !redacted.count() && ( arguments.response.payload ?: {} ).count() ) {
+			outcome.status = "failed";
+			outcome.reason = "redaction-failed";
+			arguments.state.errors.append( { role: "modernization-roadmap", message: "redaction-failed", shard: arguments.settled.shardIndex } );
+			return;
+		}
+		outcome.status = "accepted";
+		outcome.provenanceClass = "provider-suggested";
+		var phasesOut = isArray( redacted.roadmapPhases ?: "" ) ? redacted.roadmapPhases : ( isArray( redacted.phases ?: "" ) ? redacted.phases : [] );
+		for ( var phase in phasesOut ) if ( isStruct( phase ) ) arguments.state.phaseRecords.append( { phase: phase, shardIndex: arguments.settled.shardIndex } );
+		arguments.state.assumptions.append( artifactService().boundedArray( redacted.assumptions ?: [], 40 ), true );
+		arguments.state.samples.append( artifactService().boundedStructArray( redacted.samples ?: [], 20, arguments.state.errors, "roadmap.samples" ), true );
+		arguments.state.totalOutputCharacters = arguments.state.totalOutputCharacters +
+			( isNumeric( arguments.response.outputCharacters ?: "" ) ? int( arguments.response.outputCharacters ) : len( jsonSerialize( arguments.response.payload ?: {} ) ) );
+		arguments.state.accepted = arguments.state.accepted + 1;
+	}
+
+	private array function signalsForRoadmapShard(
+		required struct plan,
+		required array scopedUnits,
+		numeric maxGroups = 12,
+		numeric maxFilesPerGroup = 3
+	) {
+		var signals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		if ( !signals.len() || !arguments.scopedUnits.len() ) return [];
+		var legacyIdSet = {};
+		var pathSet = {};
+		for ( var unit in arguments.scopedUnits ) {
+			if ( !isStruct( unit ) ) continue;
+			for ( var legacyId in ( isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [] ) ) {
+				var legacyKey = trim( toString( legacyId ) );
+				if ( len( legacyKey ) ) legacyIdSet[ legacyKey ] = true;
+			}
+			for ( var sourcePath in listToArray( unit.sourcePath ?: "", ",", true, true ) ) {
+				var normalizedPath = lCase( artifactService().normalizeLegacyPath( sourcePath ) );
+				if ( len( normalizedPath ) ) pathSet[ normalizedPath ] = true;
+			}
+		}
+		if ( !legacyIdSet.count() && !pathSet.count() ) return [];
+		var buckets = {};
+		var order = [];
+		for ( var signal in signals ) {
+			if ( !isStruct( signal ) ) continue;
+			var inScope = false;
+			for ( var unitId in ( isArray( signal.unitIds ?: "" ) ? signal.unitIds : [] ) ) {
+				if ( legacyIdSet.keyExists( trim( toString( unitId ) ) ) ) { inScope = true; break; }
+			}
+			var refs = signal.evidenceRefs ?: [];
+			var ref = isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? refs[ 1 ] : {};
+			var filePath = trim( toString( ref.filePath ?: "" ) );
+			if ( !inScope && len( filePath ) && pathSet.keyExists( lCase( artifactService().normalizeLegacyPath( filePath ) ) ) ) inScope = true;
+			if ( !inScope ) continue;
+			var signalId = trim( signal.signalId ?: "" );
+			if ( !len( signalId ) ) continue;
+			if ( !buckets.keyExists( signalId ) ) {
+				buckets[ signalId ] = { signalId: signalId, group: signal.group ?: "", meaning: signal.meaning ?: "", count: 0, files: [] };
+				order.append( signalId );
+			}
+			buckets[ signalId ].count = buckets[ signalId ].count + 1;
+			if ( len( filePath ) && buckets[ signalId ].files.len() < arguments.maxFilesPerGroup ) {
+				var label = filePath & ":" & val( ref.startLine ?: 0 );
+				if ( !buckets[ signalId ].files.contains( label ) ) buckets[ signalId ].files.append( label );
+			}
+		}
+		var output = order.map( ( item ) => buckets[ item ] );
+		output.sort( ( a, b ) => a.count != b.count ? b.count - a.count : compareNoCase( a.signalId, b.signalId ) );
+		return output.len() > arguments.maxGroups ? output.slice( 1, arguments.maxGroups ) : output;
+	}
+
+	private struct function evidenceForRoadmapShard( required struct plan, required struct group, required numeric index, required numeric total ) {
+		var idSet = {};
+		for ( var id in ( arguments.group.targetUnitIds ?: [] ) ) idSet[ trim( toString( id ) ) ] = true;
+		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var scopedUnits = [];
+		for ( var unit in units ) if ( idSet.keyExists( trim( toString( unit.id ?: unit.itemId ?: "" ) ) ) ) scopedUnits.append( unit );
+		var links = [];
+		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
+			if ( idSet.keyExists( trim( toString( link.targetUnitId ?: "" ) ) ) ) links.append( link );
+		}
+		var routes = [];
+		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
+			if ( idSet.keyExists( trim( toString( route.targetUnitId ?: "" ) ) ) ) routes.append( route );
+		}
+		// The roadmap role is asked to cite dbFindingIds/transitionIds, so it has to
+		// be shown them. Relation ids alone selected nothing: providers name the
+		// field relatedTargetIds as often as relatedTargetUnitIds and frequently
+		// leave both empty, so every shard used to receive an empty ledger and
+		// every phase came back with no database work attached.
+		var shardHaystack = artifactService().pathHaystackForUnits( scopedUnits );
+		var findings = [];
+		var findingIds = {};
+		for ( var finding in ( isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] ) ) {
+			if ( !isStruct( finding ) ) continue;
+			var relatedIds = [];
+			for ( var relatedField in [ "relatedTargetUnitIds", "relatedTargetIds", "relatedLegacyIds" ] ) {
+				if ( isArray( finding[ relatedField ] ?: "" ) ) relatedIds.append( finding[ relatedField ], true );
+			}
+			var matches = false;
+			for ( var relatedId in relatedIds ) if ( idSet.keyExists( trim( toString( relatedId ) ) ) ) { matches = true; break; }
+			if ( !matches ) {
+				for ( var objectName in artifactService().objectNamesForDbItem( finding ) ) {
+					if ( artifactService().objectMatchesHaystack( objectName, shardHaystack ) ) { matches = true; break; }
+				}
+			}
+			if ( matches ) { findings.append( finding ); findingIds[ trim( toString( finding.id ?: finding.itemId ?: "" ) ) ] = true; }
+		}
+		var transitions = [];
+		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
+			if ( !isStruct( transition ) ) continue;
+			var linked = findingIds.keyExists( trim( toString( transition.dbFindingId ?: "" ) ) );
+			if ( !linked && isArray( transition.dbFindingIds ?: "" ) ) {
+				for ( var relatedFindingId in transition.dbFindingIds ) if ( findingIds.keyExists( trim( toString( relatedFindingId ) ) ) ) { linked = true; break; }
+			}
+			if ( !linked ) {
+				for ( var objectName in artifactService().objectNamesForDbItem( transition ) ) {
+					if ( artifactService().objectMatchesHaystack( objectName, shardHaystack ) ) { linked = true; break; }
+				}
+			}
+			if ( linked ) transitions.append( transition );
+		}
+		var samples = [];
+		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
+			var relatedItemIds = isArray( sample.relatedItemIds ?: "" ) ? sample.relatedItemIds : [];
+			var relates = false;
+			for ( var relatedId in relatedItemIds ) if ( idSet.keyExists( trim( toString( relatedId ) ) ) ) { relates = true; break; }
+			if ( relates ) samples.append( sample );
+		}
+		return {
+			target: { units: scopedUnits, contexts: [], extracts: [] },
+			unitLinks: links,
+			routeContracts: routes,
+			dbFindings: findings,
+			dbTransitions: transitions,
+			samples: samples,
+			signals: signalsForRoadmapShard( arguments.plan, scopedUnits ),
+			coverage: arguments.plan.coverage ?: {},
+			assumptions: [],
+			shardMeta: {
+				index: arguments.index,
+				total: arguments.total,
+				kind: arguments.group.kind ?: "unit-batch",
+				groupName: arguments.group.name ?: "Slice",
+				targetUnitIds: arguments.group.targetUnitIds ?: []
+			}
+		};
+	}
+
+	private array function reconcileShardedRoadmapPhases( required array phaseRecords ) {
+		var ordered = duplicate( arguments.phaseRecords );
+		ordered.sort( ( a, b ) => a.shardIndex - b.shardIndex );
+		var seenIds = {};
+		var previousPhaseId = "";
+		var output = [];
+		var order = 0;
+		for ( var record in ordered ) {
+			order = order + 1;
+			var phase = duplicate( record.phase );
+			var rawId = trim( toString( phase.id ?: phase.itemId ?: "" ) );
+			var candidate = len( rawId ) ? rawId : ( "phase-shard-" & record.shardIndex );
+			var suffix = 2;
+			while ( seenIds.keyExists( lCase( candidate ) ) ) {
+				candidate = ( len( rawId ) ? rawId : "phase-shard-" & record.shardIndex ) & "-" & suffix;
+				suffix = suffix + 1;
+			}
+			seenIds[ lCase( candidate ) ] = true;
+			phase.id = candidate;
+			structDelete( phase, "itemId" );
+			phase.dependencies = len( previousPhaseId ) ? [ previousPhaseId ] : [];
+			phase.currentSlice = ( order == 1 );
+			previousPhaseId = candidate;
+			output.append( phase );
+		}
+		return output;
+	}
+
+}
+

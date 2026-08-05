@@ -1,0 +1,91 @@
+/**
+ * Export/UI parity (Step 7).
+ *
+ * A field the workspace shows as a headline value must also survive a download.
+ * Otherwise the export quietly becomes a weaker artifact than the screen, and
+ * the person who forwards the Markdown to a colleague loses the part they were
+ * actually looking at.
+ *
+ * The list below is derived from what `public/assets/app.js` renders on a
+ * placement card and its detail aside: effort, risk, effort drivers, related
+ * findings, the recommendation, and whether a human still has to decide. When
+ * the UI grows a new headline value, add it here and to the export together.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Export/UI parity", () => {
+
+			var placement = {
+				id: "ctx-derived-a1",
+				name: "Order Pricing",
+				domainKey: "orders",
+				placementType: "external-service",
+				purpose: "Prices an order and holds inventory.",
+				recommendation: "extract",
+				riskLevel: "high",
+				effortSize: "large",
+				effortDrivers: [ "scope.session-heavy", "sql.table-ref" ],
+				relatedFindingCount: 7,
+				decisionRequired: true,
+				targetUnitIds: [ "tu-1" ],
+				evidenceBasis: "coupling-derived",
+				gateStatus: "needs-review"
+			};
+
+			var markdown = () => {
+				var service = new app.models.services.ModernizationExportService();
+				return service.export(
+					{ id: "parity1", projectPath: "C:/legacy-shop", mode: "full", runKind: "modernize", status: "succeeded" },
+					{ target: { units: [ { id: "tu-1" } ], placements: [ placement ] } },
+					"markdown"
+				).content;
+			};
+
+			// Assertions are anchored to the rendered label so a bare value that
+			// happens to appear elsewhere in the document cannot satisfy them.
+			it( "exports every headline value the workspace renders on a placement", () => {
+				var content = markdown();
+				expect( content ).toInclude( "**Capability:** Order Pricing" );
+				expect( content ).toInclude( "**Recommended target:** external-service" );
+				expect( content ).toInclude( "**Effort:** large" );
+				expect( content ).toInclude( "**Risk:** high" );
+				expect( content ).toInclude( "**Effort is driven by:**" );
+				expect( content ).toInclude( "session-heavy" );
+				expect( content ).toInclude( "**Related findings:** 7" );
+			} );
+
+			it( "carries the decision state, not just the description", () => {
+				// The UI badges "needs a decision". An export that renders the same
+				// placement as settled would disagree with the screen it came from.
+				var content = markdown();
+				expect( content ).toInclude( "**Decision required:** true" );
+				expect( content ).toInclude( "**Gate status:** needs-review" );
+			} );
+
+			it( "puts the conclusion before the run telemetry", () => {
+				var content = markdown();
+				expect( findNoCase( '## The verdict', content ) ).toBeGT( 0 );
+				expect( findNoCase( '## Appendix D', content ) ).toBeGT( findNoCase( '## The verdict', content ) );
+			} );
+
+			it( "renders JSON and SARIF without the Markdown restructuring reaching them", () => {
+				// tools/ci-sarif.sh consumes the SARIF shape. Step 7 changed Markdown
+				// only, and this fails if a later edit lets the reordering leak.
+				var service = new app.models.services.ModernizationExportService();
+				var run = { id: "parity1", projectPath: "C:/legacy-shop", mode: "full", runKind: "modernize", status: "succeeded" };
+				var plan = { target: { units: [ { id: "tu-1" } ], placements: [ placement ] } };
+
+				var payload = jsonDeserialize( service.export( run, plan, "json" ).content );
+				expect( payload ).toHaveKey( "run" );
+				expect( payload ).toHaveKey( "export" );
+				expect( payload.target.placements[ 1 ].name ).toBe( "Order Pricing" );
+
+				var sarif = jsonDeserialize( service.export( run, plan, "sarif" ).content );
+				expect( sarif ).toHaveKey( "version" );
+				expect( sarif ).toHaveKey( "runs" );
+				expect( sarif.runs[ 1 ] ).toHaveKey( "tool" );
+			} );
+		} );
+	}
+}

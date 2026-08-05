@@ -1,0 +1,77 @@
+/**
+ * Shared CFML scanning *mechanics*: joining a tag that wraps across lines, and
+ * compiling/caching the regexes used to read it.
+ *
+ * Part 5 asks for this because ModernizationInventoryService and
+ * CfmlParserService each grew their own copy. It deliberately holds mechanics
+ * only — **the extractors are not merged**. Their taxonomies and evidence
+ * contracts legitimately differ, and folding them together would silently change
+ * what each one reports.
+ *
+ * Two real differences surfaced while consolidating, and both are preserved
+ * rather than flattened:
+ *
+ *  - The inventory's pattern compiler normalizes doubled backslashes (BoxLang
+ *    source literals keep `\\` where Java's regex bridge wants `\`); the
+ *    parser's does not. That is a behaviour difference, not an oversight, so it
+ *    is a parameter — and it is part of the cache key, because the same
+ *    expression compiles to two different patterns depending on it.
+ *  - The parser's tag joiner reports `endLine`; the inventory's did not. The
+ *    shared one always reports it. An extra key harms no caller; a missing one
+ *    would.
+ */
+@singleton
+class threadsafe {
+
+	variables.patternCache = {};
+
+	/**
+	 * Joins a tag that wraps across lines into one string, stopping at the first
+	 * line containing `>` or after `maxLookahead` lines.
+	 *
+	 * `toString()` on each line is the inventory's guard: a line array can carry
+	 * non-string values, and concatenating those directly throws.
+	 */
+	struct function joinTagLines( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+		var text = "";
+		var endLine = arguments.startLine;
+		var limit = min( arguments.startLine + arguments.maxLookahead, arguments.lines.len() );
+		for ( var i = arguments.startLine; i <= limit; i++ ) {
+			text &= " " & toString( arguments.lines[ i ] );
+			endLine = i;
+			if ( find( ">", arguments.lines[ i ] ) ) {
+				break;
+			}
+		}
+		return { text: text, endLine: endLine };
+	}
+
+	/**
+	 * Case-insensitive compiled pattern, cached.
+	 *
+	 * The cache key includes `normalizeDoubledEscapes` — without it the two
+	 * callers would collide on the same expression string and one would silently
+	 * receive the other's pattern.
+	 */
+	any function compiledPattern( required string expression, boolean normalizeDoubledEscapes = false ) {
+		var cacheKey = ( arguments.normalizeDoubledEscapes ? "n:" : "r:" ) & arguments.expression;
+		if ( !structKeyExists( variables.patternCache, cacheKey ) ) {
+			// BoxLang source literals retain doubled backslashes while Java's regex
+			// bridge expects a single escape character. Normalize only the doubled
+			// form so the conservative patterns compile consistently.
+			var expressionText = arguments.normalizeDoubledEscapes
+				? replace( arguments.expression, char( 92 ) & char( 92 ), char( 92 ), "all" )
+				: arguments.expression;
+			variables.patternCache[ cacheKey ] = createObject( "java", "java.util.regex.Pattern" ).compile(
+				expressionText,
+				createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE
+			);
+		}
+		return variables.patternCache[ cacheKey ];
+	}
+
+	/** A matcher for `source` against `expression`. */
+	any function matcher( required string expression, required string source, boolean normalizeDoubledEscapes = false ) {
+		return compiledPattern( arguments.expression, arguments.normalizeDoubledEscapes ).matcher( arguments.source );
+	}
+}

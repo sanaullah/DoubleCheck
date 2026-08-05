@@ -1,0 +1,329 @@
+/**
+ * The model's job after the inversion: judge the derived boundaries, narrate
+ * them, criticise the finished plan, and write the verdict.
+ *
+ * Split from ModernizationProposalService (Step 11). None of these decide
+ * structure — the clustering is deterministic and each role is told so
+ * explicitly. They add judgement and language on top of a plan that already
+ * exists, which is why they live apart from the service that builds it.
+ *
+ * Every one is optional: with no provider configured the plan is returned
+ * unchanged, which is the no-key path the product promises.
+ */
+@singleton
+class threadsafe {
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="modernizationArtifactService" inject="ModernizationArtifactService";
+	property name="modernizationShardExecutor" inject="ModernizationShardExecutor";
+	property name="citationResolver" inject="ModernizationCitationResolver";
+
+	// judge/narrate batching. 3 keeps a batch inside the schemas' maxItems of 4
+	// with room for a retry that returns one extra, and keeps a truncated
+	// response from costing more than three clusters' worth of narration.
+	variables.judgeBatchSize = 3;
+	variables.maxClusterPathsInPrompt = 12;
+	variables.maxBriefSignals = 24;
+
+	private any function shardExecutor() {
+		if ( !isNull( variables.modernizationShardExecutor ?: javacast( "null", "" ) ) ) return variables.modernizationShardExecutor;
+		variables.modernizationShardExecutor = new app.models.services.ModernizationShardExecutor();
+		return variables.modernizationShardExecutor;
+	}
+
+	private any function artifactService() {
+		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
+		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
+		return variables.modernizationArtifactService;
+	}
+
+	struct function judgeAndNarrate(
+		required string runId,
+		required struct derived,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { verdicts: [], narrations: [], errors: [], costUsd: 0, outputCharacters: 0, ran: false };
+		var clusters = isArray( arguments.derived.clusters ?: "" ) ? arguments.derived.clusters : [];
+		if ( !clusters.len() ) return outcome;
+
+		var batches = [];
+		var current = [];
+		for ( var cluster in clusters ) {
+			current.append( compactClusterForNarration( cluster ) );
+			if ( current.len() >= variables.judgeBatchSize ) {
+				batches.append( current );
+				current = [];
+			}
+		}
+		if ( current.len() ) batches.append( current );
+
+		var waveOrder = isStruct( arguments.derived.waveOrder ?: "" ) ? arguments.derived.waveOrder : {};
+		var concurrency = max( 1, min( 4, batches.len() ) );
+		var executorName = shardExecutor().ensureShardExecutor( concurrency );
+		var startedAt = getTickCount();
+		var maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 120000;
+
+		var pending = [];
+		var taskIndex = 0;
+		for ( var batch in batches ) {
+			for ( var role in [ "modernization-judge", "modernization-narrate" ] ) {
+				taskIndex = taskIndex + 1;
+				var evidence = { clusters: batch, waveOrder: waveOrder };
+				var request = agentFactory.build( role, arguments.runtime, evidence, arguments.budgets );
+				var roleOptions = artifactService().copyGatewayOptions( arguments.options );
+				roleOptions.budgets = duplicate( arguments.budgets );
+				roleOptions.startedAt = getTickCount();
+				roleOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				roleOptions.maxRetries = 1;
+				roleOptions.role = role;
+				var task = shardExecutor().dispatchShardTask( arguments.runId, taskIndex, request, roleOptions, executorName );
+				task.role = role;
+				pending.append( task );
+			}
+		}
+
+		for ( var item in pending ) {
+			var response = shardExecutor().awaitShardTask( item );
+			outcome.ran = true;
+			outcome.costUsd = outcome.costUsd + val( response.costUsd ?: 0 );
+			outcome.outputCharacters = outcome.outputCharacters + val( response.outputCharacters ?: 0 );
+			var fragment = isStruct( response.data ?: "" ) ? response.data : {};
+			if ( !( response.ok ?: false ) ) {
+				outcome.errors.append( { role: item.role, message: trim( toString( response.error ?: "provider-failed" ) ) } );
+				continue;
+			}
+			if ( item.role == "modernization-judge" ) {
+				for ( var verdict in ( isArray( fragment.verdicts ?: "" ) ? fragment.verdicts : [] ) ) {
+					if ( isStruct( verdict ) && len( trim( verdict.clusterId ?: "" ) ) ) outcome.verdicts.append( verdict );
+				}
+			} else {
+				for ( var narration in ( isArray( fragment.narrations ?: "" ) ? fragment.narrations : [] ) ) {
+					if ( isStruct( narration ) && len( trim( narration.clusterId ?: "" ) ) ) outcome.narrations.append( narration );
+				}
+			}
+		}
+
+		return outcome;
+	}
+
+	/**
+	 * The verdict, written well — and only where it is grounded.
+	 *
+	 * Runs last. Every claim must carry an evidence ref that **resolves** against
+	 * the run's inventory, not merely one that is present: a brief citing a ref
+	 * that points at nothing is exactly the fluent nonsense this step is last to
+	 * avoid (§2.16). Unresolvable claims are dropped and counted, so the artifact
+	 * is honest about how much of the narrative survived.
+	 */
+	struct function brief(
+		required string runId,
+		required struct plan,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { verdict: "", startHere: "", claims: [], droppedClaims: 0, citationValidity: javacast( "null", "" ), errors: [], costUsd: 0, ran: false };
+		var projection = criticProjection( arguments.plan );
+		if ( !projection.placements.len() ) return outcome;
+		// Signals travel because every claim has to cite one, but only the top few
+		// -- the factory's character budget is not a substitute for sending less.
+		var planSignals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		projection.signals = planSignals.len() > variables.maxBriefSignals ? planSignals.slice( 1, variables.maxBriefSignals ) : planSignals;
+
+		var request = agentFactory.build( "modernization-brief", arguments.runtime, projection, arguments.budgets );
+		var briefOptions = artifactService().copyGatewayOptions( arguments.options );
+		briefOptions.budgets = duplicate( arguments.budgets );
+		briefOptions.startedAt = getTickCount();
+		briefOptions.maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 90000;
+		briefOptions.maxRetries = 1;
+		briefOptions.role = "modernization-brief";
+
+		var response = agentGateway.run( arguments.runId, request, briefOptions );
+		outcome.ran = true;
+		outcome.costUsd = val( response.costUsd ?: 0 );
+		if ( !( response.ok ?: false ) ) {
+			outcome.errors.append( { role: "modernization-brief", message: trim( toString( response.error ?: "provider-failed" ) ) } );
+			return outcome;
+		}
+
+		var fragment = isStruct( response.data ?: "" ) ? response.data : {};
+		var inventory = isStruct( arguments.plan.inventory ?: "" ) ? arguments.plan.inventory : {};
+		var resolver = citationResolverInstance();
+		var totalRefs = 0;
+		var resolvedRefs = 0;
+
+		for ( var claim in ( isArray( fragment.claims ?: "" ) ? fragment.claims : [] ) ) {
+			if ( !isStruct( claim ) || !len( trim( toString( claim.claim ?: "" ) ) ) ) continue;
+			var keptRefs = [];
+			for ( var ref in ( isArray( claim.evidenceRefs ?: "" ) ? claim.evidenceRefs : [] ) ) {
+				totalRefs = totalRefs + 1;
+				if ( !resolver.resolve( ref, inventory ).resolved ) continue;
+				resolvedRefs = resolvedRefs + 1;
+				keptRefs.append( ref );
+			}
+			// A claim with no surviving citation is unsupported prose. Dropping it
+			// is the point of running this role last.
+			if ( !keptRefs.len() ) {
+				outcome.droppedClaims = outcome.droppedClaims + 1;
+				continue;
+			}
+			claim.evidenceRefs = keptRefs;
+			outcome.claims.append( claim );
+		}
+
+		outcome.verdict = trim( toString( fragment.verdict ?: "" ) );
+		outcome.startHere = trim( toString( fragment.startHere ?: "" ) );
+		if ( totalRefs ) outcome.citationValidity = resolvedRefs / totalRefs;
+		return outcome;
+	}
+
+	private any function citationResolverInstance() {
+		if ( !isNull( variables.citationResolver ?: javacast( "null", "" ) ) ) return variables.citationResolver;
+		variables.citationResolver = new app.models.services.ModernizationCitationResolver();
+		return variables.citationResolver;
+	}
+
+	/**
+	 * Criticise a finished plan's architecture.
+	 *
+	 * Runs after merge, placement and gates, so it sees decisions rather than
+	 * drafts. It is given a compressed projection — ids, metrics, gate results,
+	 * wave order — and never the merged plan: that payload is the shape that
+	 * made the old unsharded architecture call time out.
+	 *
+	 * The critic has no authority to change anything. Everything it returns is
+	 * advice attached to the plan for a human (or a later rebuild) to act on.
+	 */
+	struct function critique(
+		required string runId,
+		required struct plan,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { critiques: [], errors: [], costUsd: 0, ran: false };
+		var projection = criticProjection( arguments.plan );
+		if ( !projection.placements.len() ) return outcome;
+
+		var request = agentFactory.build( "modernization-critic", arguments.runtime, projection, arguments.budgets );
+		var criticOptions = artifactService().copyGatewayOptions( arguments.options );
+		criticOptions.budgets = duplicate( arguments.budgets );
+		criticOptions.startedAt = getTickCount();
+		criticOptions.maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 90000;
+		criticOptions.maxRetries = 1;
+		criticOptions.role = "modernization-critic";
+
+		var response = agentGateway.run( arguments.runId, request, criticOptions );
+		outcome.ran = true;
+		outcome.costUsd = val( response.costUsd ?: 0 );
+		if ( !( response.ok ?: false ) ) {
+			outcome.errors.append( { role: "modernization-critic", message: trim( toString( response.error ?: "provider-failed" ) ) } );
+			return outcome;
+		}
+
+		var fragment = isStruct( response.data ?: "" ) ? response.data : {};
+		var knownIds = {};
+		for ( var placement in projection.placements ) knownIds[ trim( toString( placement.id ?: "" ) ) ] = true;
+		for ( var critique in ( isArray( fragment.critiques ?: "" ) ? fragment.critiques : [] ) ) {
+			if ( !isStruct( critique ) ) continue;
+			// A critique of something that is not in the plan is not a critique.
+			if ( !knownIds.keyExists( trim( toString( critique.targetItemId ?: "" ) ) ) ) continue;
+			if ( !len( trim( toString( critique.claim ?: "" ) ) ) ) continue;
+			outcome.critiques.append( critique );
+		}
+		return outcome;
+	}
+
+	/**
+	 * The compressed projection the critic sees: ids, metrics, gate results,
+	 * wave order. No prose, no source, no target unit catalog.
+	 */
+	private struct function criticProjection( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var derived = isStruct( arguments.plan.derived ?: "" ) ? arguments.plan.derived : {};
+		var projection = { placements: [], gates: [], waveOrder: {}, graphMetrics: {} };
+
+		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
+			var boundary = isStruct( placement.boundaryEvidence ?: "" ) ? placement.boundaryEvidence : {};
+			projection.placements.append( {
+				id             : placement.id ?: "",
+				name           : placement.name ?: "",
+				placementType  : placement.placementType ?: "",
+				recommendation : placement.recommendation ?: "",
+				unitCount      : ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds.len() : 0 ),
+				crossingEdges  : val( boundary.crossingEdges ?: 0 ),
+				sharedTables   : isArray( boundary.sharedTablesOutside ?: "" ) ? boundary.sharedTablesOutside : [],
+				sharedScopes   : isArray( boundary.sharedScopesOutside ?: "" ) ? boundary.sharedScopesOutside : [],
+				inCycle        : boundary.inCycleWithOutside ?: false,
+				isolated       : boundary.isolated ?: false,
+				decisionRequired: placement.decisionRequired ?: false
+			} );
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				projection.gates.append( {
+					placementId: placement.id ?: "",
+					id         : gate.id ?: "",
+					status     : gate.status ?: "",
+					confidence : gate.confidence ?: ""
+				} );
+			}
+		}
+
+		var waveOrder = isStruct( derived.waveOrder ?: "" ) ? derived.waveOrder : {};
+		var order = [];
+		for ( var entry in ( isArray( waveOrder.order ?: "" ) ? waveOrder.order : [] ) ) {
+			order.append( { clusterId: entry.clusterId ?: "", wave: val( entry.wave ?: 0 ), dependsOn: entry.dependsOn ?: [], inCycleWith: entry.inCycleWith ?: [] } );
+		}
+		projection.waveOrder = { order: order, maxWave: val( waveOrder.maxWave ?: 0 ) };
+
+		var graph = isStruct( derived.graph ?: "" ) ? derived.graph : {};
+		projection.graphMetrics = {
+			cycles   : ( isArray( graph.cycles ?: "" ) ? graph.cycles.len() : 0 ),
+			truncated: graph.truncated ?: false
+		};
+		return projection;
+	}
+
+	/**
+	 * Bounds one cluster for a judge/narrate prompt.
+	 *
+	 * A cluster can own thousands of files. What decides whether a boundary is
+	 * defensible is the boundary evidence, not the file list, so the list is
+	 * capped and a count carries the rest.
+	 */
+	private struct function compactClusterForNarration( required struct cluster ) {
+		var filePaths = isArray( arguments.cluster.filePaths ?: "" ) ? arguments.cluster.filePaths : [];
+		var boundary = isStruct( arguments.cluster.boundaryEvidence ?: "" ) ? arguments.cluster.boundaryEvidence : {};
+		return {
+			id           : arguments.cluster.id ?: "",
+			domainKey    : arguments.cluster.domainKey ?: "",
+			name         : arguments.cluster.name ?: "",
+			purpose      : arguments.cluster.purpose ?: "",
+			placementType: arguments.cluster.placementType ?: "",
+			rationale    : arguments.cluster.rationale ?: "",
+			fileCount    : filePaths.len(),
+			filePaths    : filePaths.len() > variables.maxClusterPathsInPrompt
+				? filePaths.slice( 1, variables.maxClusterPathsInPrompt )
+				: duplicate( filePaths ),
+			boundaryEvidence: {
+				crossingEdges      : val( boundary.crossingEdges ?: 0 ),
+				sharedTablesOutside: isArray( boundary.sharedTablesOutside ?: "" ) ? boundary.sharedTablesOutside : [],
+				sharedScopesOutside: isArray( boundary.sharedScopesOutside ?: "" ) ? boundary.sharedScopesOutside : [],
+				inCycleWithOutside : boundary.inCycleWithOutside ?: false,
+				spansWholeSystem   : boundary.spansWholeSystem ?: false,
+				isolated           : boundary.isolated ?: false,
+				externalIntegration: isArray( boundary.externalIntegration ?: "" ) ? boundary.externalIntegration : []
+			}
+		};
+	}
+
+	/**
+	 * Carries an optional per-run model override (immutable input, set from
+	 * ModernizationPolicyService.normalize()) into the gateway options struct so
+	 * every copied gateway-options struct below inherits it without
+	 * threading a new parameter through each role.
+	 */
+
+}
+

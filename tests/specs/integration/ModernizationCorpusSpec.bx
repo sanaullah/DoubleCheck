@@ -323,6 +323,96 @@ class extends="coldbox.system.testing.BaseTestCase" {
 				} );
 			} );
 
+			describe( "gates decide what is decidable", () => {
+
+				var gateService = getInstance( "ModernizationGateService" );
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+				var placementService = getInstance( "ModernizationPlacementService" );
+
+				var gatedFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					var clusters = derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+					var plan = { target: { units: [], placements: [] } };
+					for ( var cluster in clusters ) {
+						plan.target.placements.append( {
+							id: cluster.id,
+							name: cluster.name,
+							placementType: cluster.placementType,
+							targetUnitIds: cluster.targetUnitIds,
+							boundaryEvidence: cluster.boundaryEvidence
+						} );
+					}
+					return gateService.evaluatePlan( plan, {} );
+				};
+
+				var gateNamed = ( placement, gateId ) => {
+					for ( var entry in ( placement.gates ?: [] ) ) if ( entry.id == gateId ) return entry;
+					return {};
+				};
+
+				it( "answers data-ownership from the co-access matrix, naming the shared tables", () => {
+					var gated = gatedFor( "false-seam" );
+					var placement = gated.target.placements[ 1 ];
+					var dataGate = gateNamed( placement, "data-ownership" );
+
+					expect( dataGate.basis ).toInclude( "co-access" );
+					expect( dataGate.confidence ).toBe( "high" );
+					expect( dataGate.whatWouldChangeThis ).notToBeEmpty(
+						"a recommendation nobody can challenge is an assertion, not a finding"
+					);
+				} );
+
+				it( "says stay, with evidence, instead of asking the user", () => {
+					var gated = gatedFor( "false-seam" );
+					var placement = gated.target.placements[ 1 ];
+
+					expect( [ "stay", "do-not-extract" ] ).toInclude(
+						placement.recommendation,
+						"a plan where everything is extractable reads as a generator"
+					);
+					expect( placement.decisionRequired ).toBeFalse(
+						"a confident refusal backed by shared state is a decision the tool already made"
+					);
+				} );
+
+				it( "leaves operational-need unknown as an explicit open question", () => {
+					// Scaling, availability, ownership and release cadence are
+					// organisational facts absent from every repository. Answering
+					// them from code would be inventing them.
+					var gated = gatedFor( "separable-domain" );
+					var extracted = {};
+					for ( var placement in gated.target.placements ) {
+						if ( placement.placementType == "external-service" ) extracted = placement;
+					}
+					expect( extracted ).notToBeEmpty( "separable-domain must produce an extraction candidate" );
+
+					var operational = gateNamed( extracted, "operational-need" );
+					expect( operational.status ).toBe( "unknown" );
+					expect( operational.openQuestion ).toBeTrue();
+					expect( operational.basis ).toBe( "not source-derivable" );
+					expect( operational.whatWouldChangeThis ).notToBeEmpty();
+					expect( extracted.decisionRequired ).toBeTrue(
+						"an unanswered open question is exactly when to ask the user"
+					);
+				} );
+
+				it( "keeps unknownRate above zero where a real question exists", () => {
+					// Zero everywhere would mean the product started inventing
+					// organisational facts.
+					var gated = gatedFor( "separable-domain" );
+					var total = 0;
+					var unknown = 0;
+					for ( var placement in gated.target.placements ) {
+						for ( var entry in ( placement.gates ?: [] ) ) {
+							total++;
+							if ( entry.status == "unknown" ) unknown++;
+						}
+					}
+					expect( unknown ).toBeGT( 0, "the organisational question must survive" );
+					expect( unknown / total ).toBeLT( 0.5, "but most gates must now decide" );
+				} );
+			} );
+
 			it( "covers every signal group across the four cases", () => {
 				var signalService = getInstance( "ModernizationSignalService" );
 				var groups = {};

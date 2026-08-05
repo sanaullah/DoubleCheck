@@ -1,0 +1,85 @@
+/**
+ * Section 2.16: the modernize side had no citation resolver, only a presence
+ * check. These specs are written against the failures that check let through.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Modernization citation resolver", () => {
+
+			var resolver = new app.models.services.ModernizationCitationResolver();
+			var inventory = {
+				files: [
+					{ filePath: "app/orders/Orders.cfc", lineCount: 40 },
+					{ filePath: "app/billing/Billing.cfc", lines: [ "a", "b", "c" ] }
+				],
+				units: [ { id: "u-1", filePath: "app/legacy/Report.cfm" } ]
+			};
+
+			it( "resolves a ref that points at a real file and a real line range", () => {
+				var outcome = resolver.resolve( { filePath: "app/orders/Orders.cfc", startLine: 4, endLine: 12 }, inventory );
+				expect( outcome.resolved ).toBeTrue();
+				expect( outcome.filePath ).toBe( "app/orders/orders.cfc" );
+				expect( outcome.startLine ).toBe( 4 );
+			} );
+
+			it( "refuses a file the run never inventoried", () => {
+				// The exact failure the presence-only check could not see: a
+				// well-formed citation to a file that does not exist.
+				var outcome = resolver.resolve( { filePath: "app/Invented.cfc", startLine: 1, endLine: 2 }, inventory );
+				expect( outcome.resolved ).toBeFalse();
+				expect( outcome.reason ).toBe( "file-not-in-inventory" );
+			} );
+
+			it( "refuses a line range past the end of the file", () => {
+				var outcome = resolver.resolve( { filePath: "app/billing/Billing.cfc", startLine: 2, endLine: 900 }, inventory );
+				expect( outcome.resolved ).toBeFalse();
+				expect( outcome.reason ).toBe( "line-range-past-end-of-file" );
+			} );
+
+			it( "refuses an inverted or missing line range", () => {
+				expect( resolver.resolve( { filePath: "app/orders/Orders.cfc", startLine: 9, endLine: 3 }, inventory ).reason ).toBe( "inverted-line-range" );
+				expect( resolver.resolve( { filePath: "app/orders/Orders.cfc" }, inventory ).reason ).toBe( "missing-line-range" );
+			} );
+
+			it( "accepts a range in a file whose length was never measured", () => {
+				// The file is real; the run just did not record how long it is.
+				// Failing here would report a citation as wrong on evidence the
+				// resolver does not have.
+				var outcome = resolver.resolve( { filePath: "app/legacy/Report.cfm", startLine: 5, endLine: 9 }, inventory );
+				expect( outcome.resolved ).toBeTrue();
+			} );
+
+			it( "does not resolve a bare id, because an id is not a location", () => {
+				expect( resolver.resolve( "ev-1234", inventory ).reason ).toBe( "unresolvable-id-reference" );
+				expect( resolver.resolve( {}, inventory ).reason ).toBe( "missing-file-path" );
+			} );
+
+			it( "treats matching paths as the same file regardless of separator or case", () => {
+				expect( resolver.resolve( { filePath: "APP\Orders\Orders.cfc", startLine: 1, endLine: 1 }, inventory ).resolved ).toBeTrue();
+			} );
+
+			it( "scores a set of items and names what failed", () => {
+				var summary = resolver.resolveAll( [
+					{ id: "p-1", evidenceRefs: [ { filePath: "app/orders/Orders.cfc", startLine: 1, endLine: 2 } ] },
+					{ id: "p-2", evidenceRefs: [ { filePath: "app/Ghost.cfc", startLine: 1, endLine: 2 } ] }
+				], inventory );
+
+				expect( summary.total ).toBe( 2 );
+				expect( summary.resolved ).toBe( 1 );
+				expect( summary.citationValidity ).toBe( 0.5 );
+				expect( summary.failures ).toHaveLength( 1 );
+				expect( summary.failures[ 1 ].itemId ).toBe( "p-2" );
+				expect( summary.failures[ 1 ].reason ).toBe( "file-not-in-inventory" );
+			} );
+
+			it( "reports no score at all when nothing was cited", () => {
+				// A plan that cites nothing must not read as 100% cited. That is
+				// the vacuous gate section 2.16 describes.
+				var summary = resolver.resolveAll( [ { id: "p-1" }, { id: "p-2", evidenceRefs: [] } ], inventory );
+				expect( summary.total ).toBe( 0 );
+				expect( summary.citationValidity ).toBeNull();
+			} );
+		} );
+	}
+}

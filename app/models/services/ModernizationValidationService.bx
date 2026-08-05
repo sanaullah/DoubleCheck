@@ -1,11 +1,19 @@
 /** Deterministic structural, evidence, syntax and safety gates for modernization plans. */
 @singleton
-class {
+class threadsafe {
+	property name="citationResolver" inject="ModernizationCitationResolver";
+
 	variables.allowedMethods = [ "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "UNKNOWN" ];
 	variables.allowedTransitionOperations = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
 	variables.allowedProvenanceClasses = [ "source-observed", "provider-suggested", "deterministically-derived", "not-observed" ];
 	// "coupling-derived" ranks above both: the boundary came from the graph.
 	variables.allowedEvidenceBasis = [ "coupling-derived", "explicit-seam", "domain-clustering" ];
+
+	private any function citationResolverInstance() {
+		if ( !isNull( variables.citationResolver ?: javacast( "null", "" ) ) ) return variables.citationResolver;
+		variables.citationResolver = new app.models.services.ModernizationCitationResolver();
+		return variables.citationResolver;
+	}
 
 	/**
 	 * Returns deterministic validation messages and blocking status for a
@@ -76,6 +84,16 @@ class {
 					if ( ![ "main-app", "coldbox-module", "external-service", "background-worker", "scheduled-service", "centralized", "worker" ].contains( placementType ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an unsupported placementType", id ); blocking++; }
 					if ( !isArray( item.targetUnitIds ?: item.unitIds ?: "" ) || !( item.targetUnitIds ?: item.unitIds ?: [] ).len() ) { addMessage( messages, collection, "blocking", "Placement #id# must own at least one target unit", id ); blocking++; }
 					if ( !isArray( item.evidenceRefs ?: "" ) || !item.evidenceRefs.len() ) { addMessage( messages, collection, "warning", "Placement #id# has no evidence references", id ); warnings++; }
+					else {
+						// Presence is not validity (section 2.16). A ref to a file the
+						// run never inventoried used to pass this gate unchallenged.
+						for ( var placementRef in item.evidenceRefs ) {
+							var refOutcome = citationResolverInstance().resolve( placementRef, validationInventory );
+							if ( refOutcome.resolved ) continue;
+							addMessage( messages, collection, "warning", "Placement #id# cites evidence that does not resolve: #refOutcome.reason##( len( refOutcome.filePath ) ? ' (' & refOutcome.filePath & ')' : '' )#", id );
+							warnings++;
+						}
+					}
 					if ( isArray( item.gates ?: "" ) ) {
 						for ( var gate in item.gates ) {
 							var gateId = safeTrim( gate.id ?: "architecture" );

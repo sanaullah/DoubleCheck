@@ -928,4 +928,49 @@ class threadsafe {
 		output.metadata.placementSource = "derived";
 		return output;
 	}
+
+	/**
+	 * Overlay model-supplied language onto derived placements.
+	 *
+	 * Language only. `placementType`, `targetUnitIds`, `boundaryEvidence` and
+	 * `evidenceBasis` are derived from coupling data and are not writable from
+	 * here — a narration that tried to move a capability into a different
+	 * placement would silently undo the derivation, which is the exact failure
+	 * the inversion exists to prevent. A narration for an unknown clusterId is
+	 * dropped rather than creating a placement out of prose.
+	 */
+	struct function applyNarrations( required struct plan, array narrations = [] ) {
+		if ( !arguments.narrations.len() ) return arguments.plan;
+		var output = arguments.plan;
+		output.target = isStruct( output.target ?: "" ) ? output.target : {};
+		var placements = isArray( output.target.placements ?: "" ) ? output.target.placements : [];
+		if ( !placements.len() ) return output;
+
+		var byId = {};
+		for ( var narration in arguments.narrations ) {
+			var clusterId = trim( toString( narration.clusterId ?: "" ) );
+			if ( len( clusterId ) ) byId[ clusterId ] = narration;
+		}
+
+		var narrated = 0;
+		for ( var placement in placements ) {
+			var match = byId[ trim( toString( placement.id ?: "" ) ) ] ?: {};
+			if ( !isStruct( match ) || !match.count() ) continue;
+			var name = trim( toString( match.name ?: "" ) );
+			var purpose = trim( toString( match.purpose ?: "" ) );
+			if ( len( name ) ) placement.name = name;
+			if ( len( purpose ) ) placement.purpose = purpose;
+			if ( isArray( match.migrationSteps ?: "" ) && match.migrationSteps.len() ) placement.migrationSteps = match.migrationSteps;
+			if ( isArray( match.samples ?: "" ) && match.samples.len() ) placement.samples = match.samples;
+			// The boundary stays deterministically derived; only its wording came
+			// from the model, and the plan should say so rather than implying the
+			// model chose the boundary.
+			placement.narrationSource = "provider";
+			narrated = narrated + 1;
+		}
+
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.narratedPlacements = narrated;
+		return output;
+	}
 }

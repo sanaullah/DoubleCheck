@@ -13,7 +13,11 @@ class threadsafe {
 		"modernization-application",
 		"modernization-database",
 		"modernization-roadmap",
-		"modernization-slice-rebuild"
+		"modernization-slice-rebuild",
+		// narrate names things and writes migration steps, so it needs the same
+		// convention pack the application role gets. judge decides yes/no about a
+		// boundary and gets no pack -- style guidance is not evidence.
+		"modernization-narrate"
 	];
 
 	function init() {
@@ -30,7 +34,7 @@ class threadsafe {
 		struct budgets = {}
 	) {
 		var safeRole = lCase( trim( arguments.role ) );
-		if ( ![ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-slice-rebuild", "modernization-item-rebuild" ].contains( safeRole ) ) {
+		if ( ![ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-slice-rebuild", "modernization-item-rebuild", "modernization-judge", "modernization-narrate", "modernization-critic", "modernization-brief" ].contains( safeRole ) ) {
 			throw( type = "ValidationException", message = "Unsupported modernization agent role" );
 		}
 		var runtimeName = trim( arguments.runtime.runtime ?: "" );
@@ -157,6 +161,34 @@ class threadsafe {
 				var phaseId = trim( arguments.evidence.phaseId ?: arguments.evidence.phase.id ?: "" );
 				var note = trim( arguments.evidence.note ?: "" );
 				return "Rebuild only roadmap phase `#phaseId#` and its linked target units, unitLinks, routeContracts, samples, and related db findings/transitions. Honor the user note when present: `#note#`. Do not rewrite unrelated phases. Improve idiomatic ColdBox naming and sample-contract compliance using the supplied legacy evidence pack. Emit a fragment with targetUnits, unitLinks, routeContracts, roadmapPhase, samples, and optional dbFindings/dbTransitions arrays.";
+			case "modernization-judge":
+				// The cluster arrives already drawn. Every earlier version of this
+				// pipeline asked the model to find boundaries and got a different
+				// answer per run; the judge is here to argue with a fixed boundary,
+				// which is a question a model can answer consistently.
+				var judged = isArray( arguments.evidence.clusters ?: "" ) ? arguments.evidence.clusters : [];
+				var judgedIds = [];
+				for ( var judgedCluster in judged ) judgedIds.append( judgedCluster.id ?: "" );
+				return "Judge #judgedIds.len()# derived capability boundaries: #judgedIds.toList( ', ' )#. For EACH, return one verdict keyed by that exact clusterId. The boundaries were derived deterministically from coupling evidence — structural edges, shared table access, shared scope state. You may not redraw, merge, split or re-order them; a proposal to do so is not a verdict and will be discarded. Answer three things per boundary. (1) defensible: is this a boundary the coupling data supports, true or false, with a rationale that cites the supplied counts, shared tables or shared scopes by name. (2) breaksOnExtraction: what concretely breaks if this is pulled out of the monolith — name the shared table, scope key or call that would cross a process boundary. (3) worthIt (yes|no|unclear) with worthRationale: whether the disruption buys anything. Set confidence honestly; a boundary with high crossing-edge counts and shared writable scope is not defensible at 0.9 just because it has a tidy name. When the evidence does not settle it, say so in openQuestion rather than guessing. Return COMPLETE COMPACT JSON with key verdicts. Keep rationale under 600 characters and each breaksOnExtraction item under 200. Cite nothing absent from the evidence envelope.";
+			case "modernization-brief":
+				var briefed = isArray( arguments.evidence.placements ?: "" ) ? arguments.evidence.placements : [];
+				var briefedNames = [];
+				for ( var briefedItem in briefed ) briefedNames.append( briefedItem.name ?: briefedItem.id ?: "" );
+				return "Write the verdict on this repository in prose. It resolves to #briefedNames.len()# capabilit#( briefedNames.len() == 1 ? 'y' : 'ies' )#: #briefedNames.toList( ', ' )#. Say what this system is and what shape it is in — five sentences at most — then give the claims that back it. SYNTHESISE, NEVER DISCOVER: every capability, risk, signal and recommendation you mention must already be in the supplied projection. You may not introduce a finding, unit, risk or recommendation that is not there, and you may not disagree with a placement — that argument belongs to the judge and it already happened. Every claim carries at least one evidenceRefs entry with a filePath and a startLine/endLine copied from this projection's own signals or evidence. A ref you compose yourself will be resolved against the repository inventory and dropped when it points at nothing, so do not guess a path or a line. Prefer three well-grounded claims to eight thin ones. Also give startHere: one sentence naming which capability to move first and why. Return COMPLETE COMPACT JSON with keys verdict, claims, startHere. Keep verdict under 900 characters and each claim under 300.";
+			case "modernization-critic":
+				var critiqued = isArray( arguments.evidence.placements ?: "" ) ? arguments.evidence.placements : [];
+				var critiquedIds = [];
+				for ( var critiquedItem in critiqued ) critiquedIds.append( critiquedItem.id ?: "" );
+				// Deterministic validation already owns schema and field shapes. If
+				// this role spends its budget on "field X should be a string" it has
+				// duplicated a check that cannot fail here and skipped the one thing
+				// only it can do.
+				return "Criticise the architecture of this plan. You are reviewing #critiquedIds.len()# placement decision(s): #critiquedIds.toList( ', ' )#. Do NOT report schema, field-shape, formatting or missing-key problems — deterministic validation already covers those and such a critique will be discarded. Look for architecture that the plan's own evidence contradicts: a boundary marked separable while its metrics show shared writable state or shared tables; a migration wave ordered before something it depends on; a capability recommended for extraction whose crossing-edge count says otherwise; a cycle the plan steps over. For each, return severity (blocker|high|medium|low|info), the targetItemId being criticised (an id from the list above), the claim in one or two sentences, contradictingEvidence drawn from the supplied metrics and gates, and a suggestedChange. You have NO authority to rewrite the plan: return critiques only, never a replacement placement, unit, phase or boundary. Say nothing you cannot ground in the supplied projection — a confident critique citing evidence that is not here is worse than silence. Return COMPLETE COMPACT JSON with key critiques, at most 12 entries, claim under 400 characters.";
+			case "modernization-narrate":
+				var narrated = isArray( arguments.evidence.clusters ?: "" ) ? arguments.evidence.clusters : [];
+				var narratedIds = [];
+				for ( var narratedCluster in narrated ) narratedIds.append( narratedCluster.id ?: "" );
+				return "Name and describe #narratedIds.len()# already-decided capabilities: #narratedIds.toList( ', ' )#. Return one narration per clusterId, using that exact id. Structure is not your decision here: do not add, drop, merge, split or re-order capabilities, do not change any placement, and do not comment on whether the grouping is right. Supply language only. Name each capability for what it does for the business — `Order Pricing`, not `OrdersCfc` or `The orders folder`. Purpose is one sentence about behavior. migrationSteps: up to 6 ordered steps, each with an action, and legacyRef ({filePath,symbolName}) / targetRef ({targetPath,methodName}) copied from this capability's own evidence — never invented. At most one sample, a bounded skeleton under 12 lines. Return COMPLETE COMPACT JSON with key narrations. Keep name under 60 characters, purpose under 300, each action under 240.";
 			case "modernization-item-rebuild":
 				var rebuildItemType = trim( arguments.evidence.itemType ?: "" );
 				var rebuildItemId = trim( arguments.evidence.itemId ?: "" );
@@ -215,6 +247,32 @@ class threadsafe {
 				dbTransitions: "array"
 			};
 		}
+		if ( arguments.role == "modernization-judge" ) {
+			return {
+				verdicts: [ { clusterId: "string", defensible: true, confidence: "0..1", rationale: "string", breaksOnExtraction: [ "string" ], worthIt: "yes|no|unclear", worthRationale: "string", openQuestion: "string", evidenceRefs: [ "evidence-id" ] } ],
+				assumptions: "array"
+			};
+		}
+		if ( arguments.role == "modernization-brief" ) {
+			return {
+				verdict: "string",
+				claims: [ { claim: "string", targetItemId: "string", evidenceRefs: [ { filePath: "string", startLine: 1, endLine: 1 } ] } ],
+				startHere: "string",
+				assumptions: "array"
+			};
+		}
+		if ( arguments.role == "modernization-critic" ) {
+			return {
+				critiques: [ { severity: "blocker|high|medium|low|info", targetItemId: "string", claim: "string", contradictingEvidence: [ "string" ], suggestedChange: "string", confidence: "0..1" } ],
+				assumptions: "array"
+			};
+		}
+		if ( arguments.role == "modernization-narrate" ) {
+			return {
+				narrations: [ { clusterId: "string", name: "string", purpose: "string", migrationSteps: [ { order: 1, action: "string", legacyRef: { filePath: "string", symbolName: "string" }, targetRef: { targetPath: "string", methodName: "string" }, note: "string" } ], samples: [ { id: "string", sampleKind: "app|test", targetPath: "string", language: "boxlang|cfml|javascript", code: "bounded skeleton string" } ], evidenceRefs: [ "evidence-id" ] } ],
+				assumptions: "array"
+			};
+		}
 		if ( arguments.role == "modernization-item-rebuild" ) {
 			return {
 				dbFindings: [ { id: "string", category: "type|constraint|index|design|cf-sql-mismatch|coverage", severity: "blocker|high|medium|low|info", objectRef: "string", problem: "string", proposedChange: "string", expandContract: "expand|backfill|contract|safe-now|defer", relatedLegacyUnitIds: [ "string" ], relatedTargetUnitIds: [ "string" ], evidenceRefs: [ "evidence-id" ], confidence: "0..1", validationStatus: "string" } ],
@@ -226,6 +284,7 @@ class threadsafe {
 
 	private struct function boundedEvidence( required struct evidence, string role = "" ) {
 		var result = {};
+		var closedEvidenceRoles = [ "modernization-judge", "modernization-narrate", "modernization-critic", "modernization-brief" ];
 		// Architecture and roadmap see the whole repository map, not a 2-file shard —
 		// they need more room than a single application shard call needs per call, not
 		// less. 40000 stays below application's 48000 (shard scans include raw source
@@ -235,17 +294,32 @@ class threadsafe {
 			? 48000
 			: ( arguments.role == "modernization-database"
 				? 36000
-				: ( arguments.role == "modernization-roadmap" ? 40000 : 24000 ) );
+				: ( arguments.role == "modernization-roadmap"
+					? 40000
+					// judge and narrate are dispatched a few clusters at a time and
+					// receive already-compacted cluster records, not raw source.
+					: ( [ "modernization-judge", "modernization-narrate", "modernization-critic", "modernization-brief" ].contains( arguments.role ) ? 32000 : 24000 ) ) );
 		var source = arguments.role == "modernization-roadmap"
 			? compactRoadmapEvidence( arguments.evidence )
 			: ( arguments.role == "modernization-database" ? compactDatabaseEvidence( arguments.evidence ) : arguments.evidence );
 		var orderedKeys = arguments.role == "modernization-application"
-			? [ "shardMeta", "inventory", "context", "signals", "schemaEvidence", "coverage" ]
+			? [ "wholeSystem", "shardMeta", "inventory", "context", "signals", "schemaEvidence", "coverage" ]
 			: ( arguments.role == "modernization-database"
 				? [ "schemaEvidence", "signals", "coverage" ]
-				: ( arguments.role == "modernization-item-rebuild"
-					? [ "priorItem", "schemaEvidence" ]
-					: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "signals", "coverage", "assumptions" ] ) );
+				: ( arguments.role == "modernization-brief"
+					// The brief needs signals with their evidence refs, because every
+					// claim it makes has to carry one that resolves.
+					? [ "placements", "signals", "waveOrder", "graphMetrics" ]
+					: ( arguments.role == "modernization-critic"
+					// A compressed projection -- ids, metrics, gate results, edges. Not
+					// the merged plan: that is the whole-repository shape that made the
+					// old unsharded architecture role time out.
+					? [ "placements", "graphMetrics", "waveOrder", "gates", "signals" ]
+					: ( [ "modernization-judge", "modernization-narrate" ].contains( arguments.role )
+					? [ "clusters", "waveOrder", "signals", "coverage" ]
+					: ( arguments.role == "modernization-item-rebuild"
+						? [ "priorItem", "schemaEvidence" ]
+						: [ "target", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples", "signals", "coverage", "assumptions" ] ) ) ) ) );
 		var included = {};
 		for ( var key in orderedKeys ) {
 			if ( !source.keyExists( key ) ) continue;
@@ -255,6 +329,12 @@ class threadsafe {
 				: boundedValue( source[ key ], 0, characterLimit );
 			if ( len( jsonSerialize( result ) ) >= characterLimit ) break;
 		}
+		// For most roles orderedKeys is a *preference*: it fixes the order of the
+		// keys it names and everything else is appended after. judge and narrate
+		// are the exception -- their key list is the whole contract. They exist to
+		// reason about derived clusters, and re-sending the repository map is the
+		// payload that made the old unsharded architecture call time out.
+		if ( closedEvidenceRoles.contains( arguments.role ) ) return result;
 		for ( var key in source.keyArray().sort( "textnocase" ) ) {
 			if ( included.keyExists( key ) || len( jsonSerialize( result ) ) >= characterLimit ) continue;
 			result[ key ] = boundedValue( source[ key ], 0, characterLimit );

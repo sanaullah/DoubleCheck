@@ -1,0 +1,82 @@
+/**
+ * Step 10: the brief states the verdict, and only what it can cite.
+ *
+ * The constraint that matters is not fluency — it is that a claim whose
+ * citation does not resolve never reaches the reader (§2.16).
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Modernization brief", () => {
+
+			var plan = {
+				target: { placements: [ { id: "ctx-derived-a1", name: "Orders", placementType: "main-app", targetUnitIds: [ "tu-1" ], boundaryEvidence: { crossingEdges: 4 } } ] },
+				derived: { waveOrder: { order: [], maxWave: 0 }, graph: { cycles: [], truncated: false } },
+				inventory: { files: [ { filePath: "app/orders/Orders.cfc", lineCount: 40 } ] },
+				signals: []
+			};
+
+			var withProvider = ( payload ) => {
+				var service = new app.models.services.ModernizationJudgementService();
+				service.agentFactory = { build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [], promptPackage: {} } ) };
+				service.agentGateway = { run: ( runId, request, options ) => ( { ok: true, costUsd: 0, data: payload } ) };
+				return service;
+			};
+
+			it( "keeps a claim whose citation resolves", () => {
+				var outcome = withProvider( {
+					verdict: "A small estate with one coupled core.",
+					startHere: "Start with Orders.",
+					claims: [ { claim: "Orders writes shared state.", targetItemId: "ctx-derived-a1", evidenceRefs: [ { filePath: "app/orders/Orders.cfc", startLine: 3, endLine: 9 } ] } ]
+				} ).brief( "run-1", plan );
+
+				expect( outcome.claims ).toHaveLength( 1 );
+				expect( outcome.verdict ).toBe( "A small estate with one coupled core." );
+				expect( outcome.startHere ).toBe( "Start with Orders." );
+				expect( outcome.citationValidity ).toBe( 1 );
+				expect( outcome.droppedClaims ).toBe( 0 );
+			} );
+
+			it( "drops a claim whose citation points at nothing", () => {
+				// The exact failure this step is last to avoid: fluent prose citing
+				// a file the run never saw.
+				var outcome = withProvider( {
+					verdict: "Confident narrative.",
+					claims: [
+						{ claim: "Grounded.", evidenceRefs: [ { filePath: "app/orders/Orders.cfc", startLine: 1, endLine: 2 } ] },
+						{ claim: "Invented.", evidenceRefs: [ { filePath: "app/Ghost.cfc", startLine: 1, endLine: 2 } ] }
+					]
+				} ).brief( "run-1", plan );
+
+				expect( outcome.claims ).toHaveLength( 1 );
+				expect( outcome.claims[ 1 ].claim ).toBe( "Grounded." );
+				expect( outcome.droppedClaims ).toBe( 1 );
+				expect( outcome.citationValidity ).toBe( 0.5 );
+			} );
+
+			it( "drops a claim carrying no citation at all", () => {
+				var outcome = withProvider( { verdict: "v", claims: [ { claim: "Trust me." } ] } ).brief( "run-1", plan );
+				expect( outcome.claims ).toBeEmpty();
+				expect( outcome.droppedClaims ).toBe( 1 );
+			} );
+
+			it( "does not run when there is nothing to narrate", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				var outcome = service.brief( "run-1", { target: { placements: [] } } );
+				expect( outcome.ran ).toBeFalse();
+				expect( outcome.verdict ).toBeEmpty();
+			} );
+
+			it( "reports a provider failure rather than an empty verdict that reads as a finding", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				service.agentFactory = { build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [], promptPackage: {} } ) };
+				service.agentGateway = { run: ( runId, request, options ) => ( { ok: false, error: "request_timeout" } ) };
+
+				var outcome = service.brief( "run-1", plan );
+
+				expect( outcome.errors ).toHaveLength( 1 );
+				expect( outcome.claims ).toBeEmpty();
+			} );
+		} );
+	}
+}

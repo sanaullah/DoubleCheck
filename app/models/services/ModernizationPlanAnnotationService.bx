@@ -1,0 +1,290 @@
+/**
+ * Post-merge annotation of a modernization plan: generation summary, coverage
+ * roll-up, provenance stamping, and deterministic ordering.
+ *
+ * Split from ModernizationProposalService (Step 11) -- the plan's target shape
+ * leaves that service as orchestration only. Everything here runs after the
+ * fragments are merged and decorates the result; none of it decides anything,
+ * which is why it is pure and moved verbatim.
+ */
+@singleton
+class threadsafe {
+	property name="modernizationArtifactService" inject="ModernizationArtifactService";
+
+	private any function artifactService() {
+		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
+		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
+		return variables.modernizationArtifactService;
+	}
+
+	private string function inferErrorType( required string message ) {
+		return artifactService().inferErrorType( arguments.message );
+	}
+
+	private boolean function isInformationalProposalMessage( required struct item ) {
+		var message = lCase( trim( arguments.item.message ?: "" ) );
+		var severity = lCase( trim( arguments.item.severity ?: "" ) );
+		if ( severity == "info" || severity == "note" ) return true;
+		if ( findNoCase( "synthesized-", message ) == 1 ) return true;
+		if ( message == "cost-reserved-for-roadmap" ) return true;
+		if ( message == "ignored-non-object-items" ) return true;
+		return false;
+	}
+
+	public struct function buildGenerationSummary(
+		required struct plan,
+		required struct fragments,
+		required array errors,
+		required struct appResult,
+		required string runId
+	) {
+		var completed = [ "inventory", "schema", "context", "evidence" ];
+		var incomplete = [];
+		if ( ( arguments.appResult.accepted ?: 0 ) > 0 ) completed.append( "application-shards" );
+		else incomplete.append( "application-shards" );
+		if ( arguments.fragments.keyExists( "modernization-database" ) ) completed.append( "database" );
+		else incomplete.append( "database" );
+		var architectureSource = arguments.plan.metadata.architectureSource ?: "";
+		var hasArchitecture = ( isArray( arguments.plan.target.placements ?: "" ) && arguments.plan.target.placements.len() )
+			|| ( isArray( arguments.plan.target.contexts ?: "" ) && arguments.plan.target.contexts.len() )
+			|| ( isArray( arguments.plan.target.extracts ?: "" ) && arguments.plan.target.extracts.len() );
+		// Synthesized packaging after budget/provider failure is incomplete truth,
+		// not a completed architecture stage.
+		if ( hasArchitecture && architectureSource != "synthesized" ) completed.append( "architecture" );
+		else if ( hasArchitecture && architectureSource == "synthesized" && !hasRoleError( arguments.errors, "modernization-architecture" ) ) completed.append( "architecture" );
+		else incomplete.append( "architecture" );
+		var roadmapSource = arguments.plan.metadata.roadmapSource ?: "";
+		var hasRoadmap = isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len();
+		var roadmapAccepted = isStruct( arguments.plan.metadata.roadmapShards ?: "" )
+			? val( arguments.plan.metadata.roadmapShards.accepted ?: 0 )
+			: 0;
+		if ( hasRoadmap && roadmapAccepted > 0 && roadmapSource != "synthesized" ) {
+			completed.append( "roadmap" );
+		} else if ( hasRoadmap && roadmapSource != "synthesized" && !hasRoleError( arguments.errors, "modernization-roadmap" ) ) {
+			completed.append( "roadmap" );
+		} else if ( hasRoadmap && roadmapSource == "synthesized" && !hasRoleError( arguments.errors, "modernization-roadmap" ) ) {
+			completed.append( "roadmap" );
+		} else {
+			incomplete.append( "roadmap" );
+		}
+		var primary = arguments.errors.len() ? arguments.errors[ 1 ] : {};
+		var status = arguments.errors.len() ? "partial_failure" : "succeeded";
+		if ( architectureSource == "synthesized" && hasArchitecture && ( primary.role ?: "" ) == "modernization-architecture" ) {
+			for ( var item in arguments.errors ) {
+				if ( ( item.role ?: "" ) != "modernization-architecture" && !isInformationalProposalMessage( item ) ) {
+					primary = item;
+					break;
+				}
+			}
+		}
+		var errorType = primary.errorType ?: inferErrorType( primary.message ?: "" );
+		var omittedPathCount = isArray( arguments.appResult.omittedPaths ?: "" ) ? arguments.appResult.omittedPaths.len() : val( arguments.appResult.omitted ?: 0 );
+		var failedShardCount = val( arguments.appResult.failed ?: 0 );
+		var fallbackStubCount = 0;
+		for ( var note in ( isArray( arguments.plan.generationNotes ?: "" ) ? arguments.plan.generationNotes : [] ) ) {
+			if ( ( note.message ?: "" ) == "inventory-coverage-fallback" ) fallbackStubCount = val( note.count ?: 0 );
+		}
+		var migrationStepCount = 0;
+		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
+			migrationStepCount += isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps.len() : 0;
+		}
+		var sampleCount = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples.len() : 0;
+		var actionabilityIncomplete = ( sampleCount == 0 && migrationStepCount == 0 && ( roadmapSource == "synthesized" || incomplete.contains( "database" ) ) );
+		if ( actionabilityIncomplete && status == "succeeded" ) status = "partial_failure";
+		var limitReached = "";
+		if ( errorType == "request_timeout" || findNoCase( "budget-exceeded", primary.message ?: "" ) || errorType == "budget_exceeded" ) {
+			limitReached = errorType.len() ? errorType : "budget_exceeded";
+		} else if ( omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
+			limitReached = "shard_cap_or_budget";
+		} else if ( status == "partial_failure" && len( errorType ) ) {
+			limitReached = errorType;
+		}
+		var recommendedContinuation = "Review partial plan gates before accepting.";
+		if ( failedShardCount > 0 || omittedPathCount > 0 || val( arguments.appResult.omitted ?: 0 ) > 0 ) {
+			recommendedContinuation = "Continue omitted or failed coverage via POST /api/v1/runs/#arguments.runId#/modernization/continue";
+		} else if ( incomplete.contains( "architecture" ) || architectureSource == "synthesized" ) {
+			recommendedContinuation = "Retry architecture packaging or rebuild placements after coverage is complete.";
+		} else if ( incomplete.contains( "database" ) ) {
+			recommendedContinuation = "Retry the database stage; schema evidence was present but no provider findings were retained.";
+		} else if ( errorType == "request_timeout" ) {
+			recommendedContinuation = "Retry with a narrower scopePaths wave or higher AI_TIMEOUT; partial shards are retained.";
+		} else if ( actionabilityIncomplete ) {
+			recommendedContinuation = "Plan is structurally present but not actionable — retry roadmap/database stages or continue failed shards.";
+		}
+		return {
+			status: status,
+			stage: incomplete.len() ? incomplete[ 1 ] : "proposal_generation",
+			errorType: errorType,
+			message: primary.message ?: ( actionabilityIncomplete ? "actionability-incomplete" : "" ),
+			retryable: structKeyExists( primary, "retryable" ) ? !!primary.retryable : ( status == "partial_failure" ),
+			completedStages: completed,
+			incompleteStages: incomplete,
+			checkpointId: arguments.runId & ":proposal",
+			lastSuccessfulCheckpoint: arguments.runId & ":proposal",
+			architectureSource: architectureSource,
+			roadmapSource: roadmapSource,
+			databaseSource: arguments.plan.metadata.databaseSource ?: ( arguments.fragments.keyExists( "modernization-database" ) ? "provider" : "" ),
+			limitReached: limitReached,
+			actionability: actionabilityIncomplete ? "incomplete" : "present",
+			partialResults: {
+				acceptedShards: val( arguments.appResult.accepted ?: 0 ),
+				failedShards: failedShardCount,
+				omittedPaths: omittedPathCount,
+				fallbackStubCount: fallbackStubCount,
+				migrationSteps: migrationStepCount,
+				samples: sampleCount,
+				phases: isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases.len() : 0,
+				units: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units.len() : 0,
+				placements: isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements.len() : 0
+			},
+			recommendedContinuation: recommendedContinuation
+		};
+	}
+
+	public boolean function hasRoleError( required array errors, required string role ) {
+		for ( var item in arguments.errors ) {
+			if ( ( item.role ?: "" ) == arguments.role && !isInformationalProposalMessage( item ) ) return true;
+		}
+		return false;
+	}
+
+
+	public struct function failure(required string message, array errors = []) {
+		return { ok: false, plan: {}, partial: false, errors: arguments.errors.len() ? arguments.errors : [ { role: "provider", message: arguments.message } ] };
+	}
+
+	public struct function applyGenerationCoverage( required struct coverage, required struct shardReport ) {
+		var result = duplicate( arguments.coverage );
+		result.llm = isStruct( result.llm ?: "" ) ? result.llm : {};
+		var contextOmitted = val( result.llm.omittedPartitions ?: 0 );
+		var contextOmittedPaths = isArray( result.llm.omittedPaths ?: "" ) ? duplicate( result.llm.omittedPaths ) : [];
+		var outcomes = isArray( arguments.shardReport.outcomes ?: "" ) ? duplicate( arguments.shardReport.outcomes ) : [];
+		var omittedPaths = isArray( arguments.shardReport.omittedPaths ?: "" ) ? duplicate( arguments.shardReport.omittedPaths ) : [];
+		var gaps = [];
+		for ( var outcome in outcomes ) {
+			if ( ![ "failed", "omitted" ].contains( outcome.status ?: "" ) ) continue;
+			gaps.append( {
+				kind: "application-shard",
+				shard: outcome.shard ?: 0,
+				status: outcome.status ?: "omitted",
+				reason: outcome.reason ?: "not-run",
+				paths: duplicate( outcome.paths ?: [] ),
+				provenanceClass: "not-observed"
+			} );
+		}
+		if ( omittedPaths.len() ) {
+			gaps.append( {
+				kind: "application-shard-cap",
+				status: "omitted",
+				reason: "max-application-shards",
+				paths: omittedPaths,
+				provenanceClass: "not-observed"
+			} );
+		}
+		if ( contextOmitted > 0 ) {
+			gaps.append( {
+				kind: "context-partition",
+				status: "omitted",
+				reason: "context-budget",
+				paths: contextOmittedPaths,
+				provenanceClass: "not-observed"
+			} );
+		}
+		result.llm.planned = val( arguments.shardReport.total ?: outcomes.len() ) + ( omittedPaths.len() ? 1 : 0 );
+		result.llm.completed = val( arguments.shardReport.accepted ?: 0 );
+		result.llm.failed = val( arguments.shardReport.failed ?: 0 );
+		result.llm.omitted = val( arguments.shardReport.omitted ?: 0 ) + omittedPaths.len() + contextOmitted;
+		result.llm.gaps = gaps;
+		result.llm.shards = outcomes;
+		result.llm.complete = result.llm.failed == 0 && result.llm.omitted == 0 && result.llm.completed >= result.llm.planned;
+		result.llm.status = result.llm.complete ? "complete" : "incomplete";
+		result.complete = result.llm.complete && !( result.truncated ?: false );
+		result.status = result.complete ? "complete" : "incomplete";
+		return result;
+	}
+
+	public struct function annotateProvenance( required struct plan ) {
+		var allowed = [ "source-observed", "provider-suggested", "deterministically-derived", "not-observed" ];
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.provenanceContract = {
+			version: "modernization-provenance-v1",
+			classes: allowed
+		};
+
+		if ( isStruct( arguments.plan.inventory ?: "" ) ) {
+			for ( var inventoryCollection in [ "files", "units", "dependencies", "routeEvidence" ] ) {
+				annotateItems( arguments.plan.inventory[ inventoryCollection ] ?: [], "source-observed", allowed );
+			}
+			annotateItems( arguments.plan.inventory.unresolved ?: [], "not-observed", allowed );
+		}
+		if ( isStruct( arguments.plan.schemaEvidence ?: "" ) ) {
+			var schemaObserved = ( arguments.plan.schemaEvidence.coverage ?: "absent" ) != "absent";
+			arguments.plan.schemaEvidence.provenanceClass = schemaObserved ? "source-observed" : "not-observed";
+			if ( isStruct( arguments.plan.schemaEvidence.database ?: "" ) ) {
+				arguments.plan.schemaEvidence.database.provenanceClass = schemaObserved ? "source-observed" : "not-observed";
+			}
+			for ( var schemaCollection in [ "tables", "columns", "constraints", "indexes", "routines", "objects" ] ) {
+				annotateItems( arguments.plan.schemaEvidence[ schemaCollection ] ?: [], "source-observed", allowed );
+			}
+			annotateItems( arguments.plan.schemaEvidence.unresolved ?: [], "not-observed", allowed );
+		}
+		annotateItems( arguments.plan.signals ?: [], "deterministically-derived", allowed );
+		if ( isStruct( arguments.plan.target ?: "" ) ) {
+			for ( var targetCollection in [ "units", "contexts", "extracts" ] ) {
+				annotateItems( arguments.plan.target[ targetCollection ] ?: [], "provider-suggested", allowed );
+			}
+		}
+		for ( var proposalCollection in [ "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
+			annotateItems( arguments.plan[ proposalCollection ] ?: [], "provider-suggested", allowed );
+		}
+		return arguments.plan;
+	}
+
+	public void function annotateItems( required any items, required string fallback, required array allowed ) {
+		if ( !isArray( arguments.items ) ) return;
+		for ( var index = 1; index <= arguments.items.len(); index++ ) {
+			if ( !isStruct( arguments.items[ index ] ) ) continue;
+			var current = lCase( trim( arguments.items[ index ].provenanceClass ?: "" ) );
+			arguments.items[ index ].provenanceClass = arguments.allowed.contains( current ) ? current : arguments.fallback;
+		}
+	}
+
+	public struct function sortPlan( required struct plan ) {
+		var collections = [ "target.units", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "samples", "assumptions" ];
+		for ( var path in collections ) {
+			var parts = path.listToArray( "." );
+			var parent = parts.len() == 2 ? arguments.plan[ parts[ 1 ] ] : arguments.plan;
+			var key = parts[ parts.len() ];
+			if ( isStruct( parent ) && isArray( parent[ key ] ?: "" ) ) {
+				parent[ key ].sort( ( first, second ) => compareNoCase(
+					identityKey( first ),
+					identityKey( second )
+				) );
+			}
+		}
+		if ( isArray( arguments.plan.dbTransitions ?: "" ) ) {
+			arguments.plan.dbTransitions.sort( ( first, second ) => {
+				var orderCompare = val( first.order ?: 0 ) - val( second.order ?: 0 );
+				return orderCompare != 0 ? orderCompare : compareNoCase( identityKey( first ), identityKey( second ) );
+			} );
+		}
+		return arguments.plan;
+	}
+
+	public string function identityKey( required any item ) {
+		if ( !isStruct( arguments.item ) ) return toString( arguments.item );
+		return lCase( trim( arguments.item.id ?: arguments.item.itemId ?: arguments.item.itemFingerprint ?: arguments.item.filePath ?: arguments.item.path ?: jsonSerialize( arguments.item ) ) );
+	}
+
+	/**
+	 * Partitions the merged plan into small roadmap-generation jobs so no
+	 * single call has to describe the whole plan (the failure mode that made
+	 * the roadmap role truncate on any real project). Prefers one shard per
+	 * architecture group (mirrors the deterministic derivedStructureService.synthesizeGroupedPhases()
+	 * grouping, just producing shard descriptors instead of finished phases);
+	 * falls back to plain unit batches when architecture didn't run/produce
+	 * groups.
+	 */
+
+}
+

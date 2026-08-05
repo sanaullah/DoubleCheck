@@ -15,6 +15,7 @@ class threadsafe {
 	property name="coverageService" inject="ModernizationCoverageService";
 	property name="contextPackService" inject="ModernizationContextPackService";
 	property name="proposalService" inject="ModernizationProposalService";
+	property name="judgementService" inject="ModernizationJudgementService";
 	property name="validationService" inject="ModernizationValidationService";
 property name="modernizationRepository" inject="ModernizationRepository";
 property name="modernizationDecisionService" inject="ModernizationDecisionService";
@@ -302,6 +303,30 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			// decision, and every line of identifier reconciliation that exists to
 			// make provider-invented ids resolve is still load-bearing.
 			plan = placementServiceInstance().applyDerivedPlacements( plan, derivedClusters );
+			// The model's remaining job: argue with the derived boundaries and put
+			// language on them. Runs before the gates so a verdict can lower a
+			// gate's confidence, and after placements so there is a fixed structure
+			// to argue with. A provider failure here costs naming, not structure.
+			// `metadata.provider` is set from agentGateway.isEnabled() during the
+			// proposal, so it reports whether a provider actually exists rather
+			// than what was requested. Without a key the derived structure stands
+			// on its own and no provider call is attempted.
+			if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
+				emit( arguments.callbacks, 78, "modernization-judge", "Judging derived boundaries and naming capabilities" );
+				var judgement = judgementService.judgeAndNarrate(
+					runId,
+					result.derived,
+					input.target ?: {},
+					input.budgets ?: {},
+					{ maxDurationMs: 120000 }
+				);
+				plan = placementServiceInstance().applyNarrations( plan, judgement.narrations );
+				plan.judgement = {
+					verdicts: judgement.verdicts,
+					errors  : judgement.errors,
+					ran     : judgement.ran
+				};
+			}
 			plan = mergeSourceModernizeCoverage( arguments.run, plan );
 			var placementService = placementServiceInstance();
 			var gateService = gateServiceInstance();
@@ -325,6 +350,36 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				emit( arguments.callbacks, 82, "modernization-validation", "Checking proposal structure, evidence, and safety gates" );
 				var validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
 				plan.validation = validation;
+				// The critic runs after merge, placement, gates and deterministic
+				// validation: it evaluates the architecture that was decided, not a
+				// draft, and schema problems are already caught by the time it
+				// speaks. It has no authority to change the plan -- critiques are
+				// attached for a human or a later rebuild to act on. Optional by
+				// construction: without a provider the plan is unchanged.
+				if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
+					emit( arguments.callbacks, 84, "modernization-critic", "Reviewing the plan's architecture against its own evidence" );
+					var critique = judgementService.critique( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
+					plan.critique = {
+						critiques: critique.critiques,
+						errors   : critique.errors,
+						ran      : critique.ran
+					};
+					// The brief is last, deliberately: a confident narrative over a
+					// weak coupling model is fluent nonsense. By this point the
+					// structure has been derived, judged, gated, validated and
+					// criticised, so there is something real to narrate.
+					emit( arguments.callbacks, 86, "modernization-brief", "Writing the verdict" );
+					var brief = judgementService.brief( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
+					plan.brief = {
+						verdict         : brief.verdict,
+						startHere       : brief.startHere,
+						claims          : brief.claims,
+						droppedClaims   : brief.droppedClaims,
+						citationValidity: brief.citationValidity,
+						errors          : brief.errors,
+						ran             : brief.ran
+					};
+				}
 				// Persist the accepted artifact before any repair/cancellation
 				// boundary. A later interruption may leave validation gates open,
 				// but must not discard already accepted provider fragments.
