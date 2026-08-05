@@ -61,7 +61,7 @@ error.
 
 - Keep PRs focused; small and testable beats large and mixed-purpose.
 - Describe what changed and why, and which checks you ran.
-- Update `.docs/PRODUCT.md` when a capability's status changes, and
+- Update `resources/docs/application-features.md` when a capability's status changes, and
   `readme.md` when install/usage instructions change (see the "Docs hygiene"
   notes in `AGENTS.md`).
 

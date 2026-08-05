@@ -20,5 +20,5 @@
 
 ## Docs
 
-- [ ] Updated `.docs/PRODUCT.md` if a capability's status changed
+- [ ] Updated `resources/docs/application-features.md` if a capability's status changed
 - [ ] Updated `readme.md` if install/usage instructions changed

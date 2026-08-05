@@ -5,23 +5,33 @@ BoxLang, ColdFusion, and JavaScript. Keep changes focused on that product.
 
 ## Source of Truth
 
+**`resources/docs/` is the single documentation source of truth.** It is
+committed. There is no `.docs/` tree and no `.superpowers/` tree — if you find
+one, it is stale: delete it rather than read it, and never recreate them.
+
 Read only what the task needs:
 
 1. `readme.md` for product scope, setup, and supported languages.
-2. `resources/docs/application-features.md` for purpose and shipped features
-   (Review vs Modernize, AI contract, out of scope).
-3. `resources/docs/technical-flow.md` for the committed technical map (review /
-   modernize pipelines, HTTP surface, bootstrap).
+2. `resources/docs/application-features.md` for purpose, shipped features, the
+   AI contract, out of scope, **known gaps**, and measured language tiers.
+3. `resources/docs/technical-flow.md` for the technical map (review / modernize
+   pipelines, HTTP surface, bootstrap).
 4. The relevant code and tests (`app/models/README.md` when changing model-layer
    ownership or public APIs).
-5. `.docs/PRODUCT.md` and `.docs/codebase-flow.md` when present and useful.
+5. `resources/docs/plans/modernize-inversion-plan.md` when doing Modernize work.
+   Its Part 2 is a verified evidence base — every claim carries a `file:line`.
+   Execute Part 4 in the order given by its execution graph, not document order.
 
-`.docs/` is gitignored local context and may not exist on another checkout. Do
-not make the application or committed documentation depend on it. When `.docs/`
-duplicates or lags the committed docs, prefer
-`resources/docs/application-features.md`, `resources/docs/technical-flow.md`,
-and the code. Do not invent product claims when the README and code do not
-support them.
+Narrower reference, load only when the task needs it:
+`prompt-system.md`, `cfml-llm-depth.md`, `boxlang-conventions.md`,
+`testing-commands.md`, `open-issues.md`.
+
+Do not invent product claims when the README and code do not support them. A
+capability that cannot be pointed at in the UI, an export, or an API response
+does not get a feature row — it goes in Known gaps, or nowhere.
+
+**One live plan at a time.** When a plan is superseded, delete it — do not
+archive "just in case". A superseded document that stays readable will be read.
 
 Framework reference material and implementation skills live under `.agents/`.
 Load a specific guideline or skill only when the task requires it; do not treat

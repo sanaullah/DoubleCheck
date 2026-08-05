@@ -344,6 +344,15 @@ machine.
 Pipeline contract: **`modernization-pipeline-v8`** (`ModernizationRunService`).
 Full service list: [`app/models/README.md`](../../app/models/README.md) (Modernize workflow).
 
+> **This section documents the current pipeline, which is being reworked.** The
+> proposal stage currently has the model produce plan structure (target units,
+> unit links, placements, phases) which deterministic code then reconciles and
+> repairs. That is being inverted: structure will be derived from a computed
+> coupling graph, and the model will judge and narrate it. Roles drop from seven
+> to five and the `modernization-architecture` and `modernization-repair` roles
+> are removed. Update this section when that lands — do not build new work on the
+> proposal-then-repair shape described above.
+
 ### Stages after shared scan
 
 | Stage | Service(s) | What happens |
