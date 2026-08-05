@@ -10,6 +10,7 @@ class threadsafe {
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="identityService" inject="ModernizationIdentityService";
 	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="placementService" inject="ModernizationPlacementService";
 	property name="log" inject="logbox:logger:{this}";
 	variables.cancelledRuns = {};
 	variables.maxItems = 200;
@@ -49,6 +50,9 @@ class threadsafe {
 	function init() {
 		if ( isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) {
 			variables.derivedStructureService = new app.models.services.ModernizationDerivedStructureService();
+		}
+		if ( isNull( variables.placementService ?: javacast( "null", "" ) ) ) {
+			variables.placementService = new app.models.services.ModernizationPlacementService();
 		}
 		return this;
 	}
@@ -416,7 +420,7 @@ class threadsafe {
 			}
 			var unitsForPath = inventoryUnits.filter( ( item ) => isStruct( item ) && normalizeEvidencePath( item.filePath ?: "" ) == sourcePath );
 			var representative = unitsForPath.len() ? unitsForPath[ 1 ] : {};
-			var layer = fallbackLayerForSource( sourcePath, representative );
+			var layer = placementService.fallbackLayerForSource( sourcePath, representative );
 			var target = {
 				id: "coverage-" & left( hash( sourcePath, "SHA-256" ), 20 ),
 				sourcePath: sourcePath,
@@ -431,7 +435,7 @@ class threadsafe {
 				provenanceClass: "deterministically-derived",
 				newProposal: false
 			};
-			target.targetPath = deriveTargetPath(
+			target.targetPath = placementService.deriveTargetPath(
 				target,
 				sourcePath,
 				lCase( arguments.input.target.runtime ?: "boxlang" ),
@@ -459,7 +463,7 @@ class threadsafe {
 			addedPaths.append( sourcePath );
 		}
 		if ( addedPaths.len() ) {
-			arguments.plan.target.units = normalizeTargetUnits( arguments.plan.target.units, arguments.input );
+			arguments.plan.target.units = placementService.normalizeTargetUnits( arguments.plan.target.units, arguments.input );
 			arguments.notes.append( {
 				role: "modernization-application",
 				message: "inventory-coverage-fallback",
@@ -495,16 +499,6 @@ class threadsafe {
 			if ( len( normalizedOmitted ) ) gapPaths[ normalizedOmitted ] = true;
 		}
 		return gapPaths;
-	}
-
-	private string function fallbackLayerForSource( required string sourcePath, required struct unit ) {
-		var path = lCase( replace( arguments.sourcePath, "\", "/", "all" ) );
-		if ( reFindNoCase( "(^|/)Application\.(?:cfc|bx)$", path ) ) return "config";
-		if ( find( "/handlers/", "/" & path ) ) return "handler";
-		if ( find( "/models/", "/" & path ) || find( "/components/", "/" & path ) ) return "service";
-		if ( find( "/views/", "/" & path ) || find( "/layouts/", "/" & path ) || listLast( path, "." ) == "cfm" || listLast( path, "." ) == "bxm" ) return "view";
-		var observed = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.unitType ?: "" ) ) );
-		return observed == "page" ? "view" : "service";
 	}
 
 	void function cancelRun( required string runId ) {
@@ -612,7 +606,7 @@ class threadsafe {
 				? repaired.metadata
 				: { runtime: arguments.input.target ?: {} };
 			repaired.target = isStruct( repaired.target ?: "" ) ? repaired.target : { units: [], contexts: [], extracts: [] };
-			repaired.target.units = normalizeTargetUnits(
+			repaired.target.units = placementService.normalizeTargetUnits(
 				isArray( repaired.target.units ?: "" ) ? repaired.target.units : [],
 				arguments.input
 			);
@@ -638,7 +632,7 @@ class threadsafe {
 		};
 		var app = fragments[ "modernization-application" ] ?: {};
 		var db = fragments[ "modernization-database" ] ?: {};
-		plan.target.units = normalizeTargetUnits( boundedStructArray( app.targetUnits ?: app.units ?: [], variables.maxItems, arguments.errors, "target.units" ), arguments.input );
+		plan.target.units = placementService.normalizeTargetUnits( boundedStructArray( app.targetUnits ?: app.units ?: [], variables.maxItems, arguments.errors, "target.units" ), arguments.input );
 		var leakedArchitectureFields = [];
 		if ( isArray( app.contexts ?: "" ) && app.contexts.len() ) leakedArchitectureFields.append( "contexts" );
 		if ( isArray( app.extracts ?: "" ) && app.extracts.len() ) leakedArchitectureFields.append( "extracts" );
@@ -678,193 +672,6 @@ class threadsafe {
 	/** Providers often echo a legacy source filename as targetPath. Keep the
 	 * source identity, but derive a legal ColdBox target path before validation
 	 * or persistence so the UI never presents source files as target structure. */
-	private array function normalizeTargetUnits( required array units, required struct input ) {
-		var target = isStruct( arguments.input.target ?: "" ) ? arguments.input.target : {};
-		var runtime = lCase( trim( scalarString( target.runtime ?: arguments.input.targetRuntime ?: "boxlang" ) ) );
-		var profile = lCase( trim( scalarString( target.layoutProfile ?: arguments.input.targetProfile ?: "modern" ) ) );
-		var output = [];
-		for ( var unit in arguments.units ) {
-			if ( !isStruct( unit ) ) continue;
-			var copy = duplicate( unit );
-			// Shard merges sometimes leave path-like fields as arrays (multi-file
-			// units). Coerce before trim() — a raw Array crashes packaging.
-			var sourcePath = trim( scalarString( copy.sourcePath ?: "" ) );
-			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.sourceFile ?: "" ) );
-			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.legacyPath ?: "" ) );
-			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.filePath ?: "" ) );
-			if ( !len( sourcePath ) ) {
-				var idHint = trim( scalarString( copy.id ?: "" ) );
-				if ( find( "/", idHint ) || reFindNoCase( "\.(cfm|cfc|bx|bxm|js)$", idHint ) ) sourcePath = idHint;
-			}
-			sourcePath = replace( sourcePath, "\", "/", "all" );
-			var rawSourceMarker = trim( scalarString( copy.sourcePath ?: "" ) );
-			if ( reFindNoCase( "\(new\)|new proposal|new-proposal", sourcePath ) || reFindNoCase( "\(new\)", rawSourceMarker ) ) {
-				sourcePath = reReplaceNoCase( sourcePath, "\s*\(new\)\s*", "", "all" );
-				copy.newProposal = true;
-				if ( !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) copy.proposalReason = "Provider marked this target as a new scaffold without a legacy source file";
-			}
-			if ( len( sourcePath ) ) copy.sourcePath = sourcePath;
-			var candidate = trim( scalarString( copy.targetPath ?: "" ) );
-			if ( !len( candidate ) ) candidate = trim( scalarString( copy.pathHint ?: "" ) );
-			var sourceIsApplication = reFindNoCase( "(^|/)Application[.](?:cfc|bx)$", sourcePath ) > 0;
-			if ( sourceIsApplication ) {
-				var applicationLayer = lCase( trim( scalarString( copy.layer ?: copy.kind ?: copy.proposedRole ?: "config" ) ) );
-				var parentName = !find( "/", sourcePath )
-					? "Root"
-					: listGetAt( sourcePath, max( 1, listLen( sourcePath, "/" ) - 1 ), "/" );
-				parentName = reReplace( parentName, "[^A-Za-z0-9]", "", "all" );
-				if ( !len( parentName ) ) parentName = "Nested";
-				var classExtension = runtime == "boxlang" ? ".bx" : ".cfc";
-				if ( !find( "/", sourcePath ) && [ "config", "application", "bootstrap", "" ].contains( applicationLayer ) ) {
-					candidate = "Application" & classExtension;
-				} else if ( applicationLayer == "interceptor" ) {
-					candidate = "app/interceptors/#parentName#ApplicationLifecycle#classExtension#";
-				} else if ( [ "service", "model" ].contains( applicationLayer ) ) {
-					candidate = "app/models/services/#parentName#ApplicationLifecycleService#classExtension#";
-				} else {
-					candidate = "app/config/#parentName#ApplicationLifecycle#classExtension#";
-				}
-				if ( find( "/", sourcePath ) ) {
-					copy.proposalReason = "Nested Application lifecycle must be decomposed into ColdBox config, interceptor, and service concerns; verify this placeholder mapping";
-					copy.validationStatus = "needs-review";
-				}
-			}
-			candidate = normalizeLayerExtension( candidate, copy, runtime );
-			if ( !legalModernTargetPath( candidate, runtime, profile ) || !targetPathMatchesLayer( candidate, copy ) ) copy.targetPath = deriveTargetPath( copy, sourcePath, runtime, profile );
-			else copy.targetPath = candidate;
-			copy.targetPath = normalizeLayerExtension( copy.targetPath, copy, runtime );
-			var evidenceRef = trim( scalarString( copy.evidenceRef ?: "" ) );
-			if ( len( evidenceRef ) && !structKeyExists( copy, "evidenceRefs" ) && evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
-			if ( !len( trim( scalarString( copy.sourcePath ?: "" ) ) ) && !( copy.newProposal ?: false ) && !( copy.explicitProposal ?: false ) && !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) {
-				copy.newProposal = true;
-				copy.proposalReason = "Provider proposed a scaffold target without a legacy source path";
-			}
-			ensureIdentity( copy, "target-unit" );
-			output.append( copy );
-		}
-		return ensureUniqueTargetPaths( output, runtime, profile );
-	}
-
-	private string function normalizeLayerExtension( required string path, required struct unit, required string runtime ) {
-		if ( !len( trim( arguments.path ) ) ) return arguments.path;
-		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) ) );
-		var isView = [ "view", "layout" ].contains( layer ) || findNoCase( "/views/", "/" & arguments.path ) || findNoCase( "/layouts/", "/" & arguments.path );
-		var extension = arguments.runtime == "boxlang"
-			? ( isView ? ".bxm" : ".bx" )
-			: ( isView ? ".cfm" : ".cfc" );
-		return reFindNoCase( "\.(?:cfc|cfm|cfml|bx|bxm)$", arguments.path )
-			? reReplaceNoCase( arguments.path, "\.(?:cfc|cfm|cfml|bx|bxm)$", extension )
-			: arguments.path & extension;
-	}
-
-	/**
-	 * Shards cannot coordinate filenames. Resolve cross-shard collisions from
-	 * source identity after all fragments are merged, while retaining every
-	 * target id so unit-link and roadmap references remain stable.
-	 */
-	private array function ensureUniqueTargetPaths( required array units, required string runtime, required string profile ) {
-		var groups = {};
-		for ( var unit in arguments.units ) {
-			var key = lCase( replace( trim( scalarString( unit.targetPath ?: "" ) ), "\", "/", "all" ) );
-			if ( !groups.keyExists( key ) ) groups[ key ] = [];
-			groups[ key ].append( unit );
-		}
-		var used = {};
-		for ( var key in groups.keyArray().sort( "textnocase" ) ) {
-			if ( groups[ key ].len() != 1 && len( key ) ) continue;
-			if ( len( key ) ) used[ key ] = true;
-		}
-		for ( var key in groups.keyArray().sort( "textnocase" ) ) {
-			var members = groups[ key ];
-			if ( members.len() == 1 && len( key ) ) continue;
-			for ( var unit in members ) {
-				var candidate = contextualCollisionPath( unit, arguments.runtime, arguments.profile );
-				var normalized = lCase( replace( candidate, "\", "/", "all" ) );
-				var suffix = 2;
-				while ( used.keyExists( normalized ) ) {
-					candidate = appendPathSuffix( contextualCollisionPath( unit, arguments.runtime, arguments.profile ), suffix );
-					normalized = lCase( replace( candidate, "\", "/", "all" ) );
-					suffix++;
-				}
-				unit.targetPath = candidate;
-				unit.validationStatus = "needs-review";
-				used[ normalized ] = true;
-			}
-		}
-		return arguments.units;
-	}
-
-	private string function contextualCollisionPath( required struct unit, required string runtime, required string profile ) {
-		var sourcePath = replace( trim( scalarString( arguments.unit.sourcePath ?: "" ) ), "\", "/", "all" );
-		var sourceName = len( sourcePath ) ? listLast( sourcePath, "/" ) : "ModernizedUnit";
-		var stem = reReplaceNoCase( sourceName, "\.(?:cfc|cfm|cfml|bx|bxm|js)$", "" );
-		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: "" ) ) );
-		if ( lCase( stem ) == "index" ) {
-			stem = find( "/", sourcePath )
-				? listGetAt( sourcePath, max( 1, listLen( sourcePath, "/" ) - 1 ), "/" )
-				: "Main";
-		}
-		stem = reReplace( stem, "[^A-Za-z0-9]", "", "all" );
-		if ( !len( stem ) ) stem = "ModernizedUnit";
-		if ( reFindNoCase( "\.(?:cfm|bxm)$", sourceName ) && [ "service", "model" ].contains( layer ) ) stem &= "PageService";
-		var current = replace( trim( scalarString( arguments.unit.targetPath ?: "" ) ), "\", "/", "all" );
-		var directory = reFind( "/", current ) ? reReplace( current, "[^/]+$", "" ) : "";
-		var extension = arguments.runtime == "boxlang"
-			? ( [ "view", "layout" ].contains( layer ) ? ".bxm" : ".bx" )
-			: ( [ "view", "layout" ].contains( layer ) ? ".cfm" : ".cfc" );
-		return directory & stem & extension;
-	}
-
-	private string function appendPathSuffix( required string path, required numeric suffix ) {
-		return reReplace( arguments.path, "(\.[^.]+)$", "#arguments.suffix#\1" );
-	}
-
-	private boolean function legalModernTargetPath( required string path, required string runtime, required string profile ) {
-		if ( !len( trim( arguments.path ) ) || find( "..", arguments.path ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", arguments.path ) ) return false;
-		var extension = lCase( listLast( arguments.path, "." ) );
-		var normalized = lCase( replace( arguments.path, "\", "/", "all" ) );
-		var applicationName = arguments.runtime == "boxlang" ? "application.bx" : "application.cfc";
-		if ( normalized == applicationName ) return true;
-		if ( arguments.profile == "flat" && !reFind( "^(?:handlers|models|views|layouts)/", normalized ) ) return false;
-		if ( arguments.profile != "flat" && !reFind( "^app/", normalized ) ) return false;
-		return arguments.runtime == "boxlang" ? [ "bx", "bxm" ].contains( extension ) : ( arguments.runtime == "lucee" ? [ "cfc", "cfm" ].contains( extension ) : true );
-	}
-
-	private boolean function targetPathMatchesLayer( required string path, required struct unit ) {
-		var normalized = lCase( replace( arguments.path, "\", "/", "all" ) );
-		var layer = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: "" ) ) );
-		if ( !len( layer ) ) return true;
-		if ( layer == "service" || layer == "model" ) return find( "/models/", "/" & normalized ) > 0;
-		if ( layer == "handler" || layer == "page" ) return find( "/handlers/", "/" & normalized ) > 0;
-		if ( layer == "view" || layer == "layout" ) return find( "/views/", "/" & normalized ) > 0 || find( "/layouts/", "/" & normalized ) > 0;
-		if ( layer == "config" ) return find( "/config/", "/" & normalized ) > 0 || listLast( normalized, "/" ) == "application.bx";
-		if ( layer == "test" ) return find( "tests/specs/", normalized ) == 1;
-		return true;
-	}
-
-	private string function deriveTargetPath( required struct unit, required string sourcePath, required string runtime, required string profile ) {
-		var extension = arguments.runtime == "boxlang" ? ".bx" : ".cfc";
-		var sourceName = len( trim( arguments.sourcePath ) ) ? listLast( replace( arguments.sourcePath, "\", "/", "all" ), "/" ) : "ModernizedUnit";
-		var stem = sourceName;
-		for ( var legacyExt in [ ".cfc", ".cfm", ".bxm", ".bx", ".js" ] ) {
-			if ( right( lCase( stem ), len( legacyExt ) ) == legacyExt ) {
-				stem = left( stem, len( stem ) - len( legacyExt ) );
-				break;
-			}
-		}
-		stem = reReplace( stem, "[^A-Za-z0-9_-]", "-", "all" );
-		if ( !len( trim( stem ) ) ) stem = "ModernizedUnit";
-		var role = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.kind ?: arguments.unit.proposedRole ?: arguments.unit.category ?: "" ) ) );
-		var root = arguments.profile == "flat" ? "" : "app/";
-		if ( findNoCase( "application", role ) || findNoCase( "bootstrap", role ) ) return "Application" & extension;
-		if ( role == "config" ) return root & "config/" & stem & extension;
-		if ( role == "interceptor" ) return root & "interceptors/" & stem & extension;
-		if ( role == "test" ) return "tests/specs/unit/" & stem & "Spec" & extension;
-		if ( findNoCase( "service", role ) || findNoCase( "component", role ) || findNoCase( "model", role ) ) return root & "models/services/" & stem & extension;
-		if ( findNoCase( "view", role ) || findNoCase( "layout", role ) ) return root & "views/" & stem & extension;
-		return root & "handlers/" & stem & extension;
-	}
-
 	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = []) {
 		arguments.plan.roadmapPhases = boundedStructArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40, arguments.errors, "roadmapPhases" );
 		for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
@@ -1958,15 +1765,7 @@ class threadsafe {
 			single.shardMeta = { index: 1, total: 1, paths: [], foundation: true };
 			return [ single ];
 		}
-		var chunks = [];
-		for ( var offset = 1; offset <= paths.len(); offset += shardSize ) {
-			var slice = [];
-			for ( var i = offset; i <= min( paths.len(), offset + shardSize - 1 ); i++ ) {
-				slice.append( paths[ i ] );
-			}
-			chunks.append( slice );
-			if ( chunks.len() >= shardCap ) break;
-		}
+		var chunks = chunkPathsByCluster( paths, arguments.evidence, shardSize, shardCap );
 		var shards = [];
 		for ( var chunkIndex = 1; chunkIndex <= chunks.len(); chunkIndex++ ) {
 			shards.append( evidenceForShard( arguments.evidence, chunks[ chunkIndex ], chunkIndex, chunks.len() ) );
@@ -2060,6 +1859,80 @@ class threadsafe {
 			if ( len( path ) ) grounded[ lCase( path ) ] = true;
 		}
 		return grounded;
+	}
+
+	/**
+	 * Slice paths into shards along cluster boundaries.
+	 *
+	 * A shard is one prompt. Cutting a flat path list every N entries gives the
+	 * model an arbitrary subject — half of one domain and a third of another —
+	 * and it has to infer a grouping that already exists. Keying to derived
+	 * clusters means each shard is about one thing, which is the whole reason
+	 * the clusters are computed before the context pack.
+	 *
+	 * Falls back to flat slicing when no clusters are present, so a run without
+	 * derived structure keeps working exactly as before.
+	 *
+	 * Cluster size is NOT allowed to override the shard size cap: a high-cohesion
+	 * domain is a *larger* ask than a path batch, which is precisely why
+	 * truncation resplitting has to stay (section 2.4).
+	 */
+	private array function chunkPathsByCluster(
+		required array paths,
+		required struct evidence,
+		required numeric shardSize,
+		required numeric shardCap
+	) {
+		var clusters = [];
+		if ( isStruct( arguments.evidence.derived ?: "" ) && isArray( arguments.evidence.derived.clusters ?: "" ) ) {
+			clusters = arguments.evidence.derived.clusters;
+		}
+
+		var chunks = [];
+		var appendSliced = ( group ) => {
+			for ( var offset = 1; offset <= arguments.group.len(); offset += shardSize ) {
+				if ( chunks.len() >= shardCap ) return;
+				var slice = [];
+				for ( var i = offset; i <= min( arguments.group.len(), offset + shardSize - 1 ); i++ ) slice.append( arguments.group[ i ] );
+				if ( slice.len() ) chunks.append( slice );
+			}
+		};
+
+		if ( !clusters.len() ) {
+			appendSliced( arguments.paths );
+			return chunks;
+		}
+
+		// Path -> cluster. Cluster file paths are normalized lowercase.
+		var clusterOf = {};
+		for ( var cluster in clusters ) {
+			for ( var filePath in ( cluster.filePaths ?: [] ) ) clusterOf[ lCase( filePath ) ] = cluster.id ?: "";
+		}
+
+		var grouped = {};
+		var residual = [];
+		for ( var path in arguments.paths ) {
+			var key = clusterOf[ lCase( normalizeLegacyPath( path ) ) ] ?: "";
+			if ( !len( key ) ) {
+				residual.append( path );
+				continue;
+			}
+			if ( !grouped.keyExists( key ) ) grouped[ key ] = [];
+			grouped[ key ].append( path );
+		}
+
+		// Largest clusters first so the biggest subjects are mapped before any
+		// shard cap bites; ties by id so ordering never drifts between runs.
+		var clusterIds = structKeyArray( grouped );
+		clusterIds.sort( ( a, b ) => {
+			if ( grouped[ a ].len() != grouped[ b ].len() ) return grouped[ b ].len() - grouped[ a ].len();
+			return compareNoCase( a, b );
+		} );
+
+		for ( var clusterId in clusterIds ) appendSliced( grouped[ clusterId ] );
+		// Files no cluster claimed still have to be mapped.
+		appendSliced( residual );
+		return chunks;
 	}
 
 	private array function prioritizedLegacyPaths( required struct evidence ) {

@@ -181,6 +181,60 @@ class extends="testbox.system.BaseSpec" {
 				expect( derived.deriveClusters( graph, disjoint.units, [] ).len() ).toBe( 2 );
 			} );
 
+			it( "keys shards to clusters so each prompt has one subject", () => {
+				var proposal = new app.models.services.ModernizationProposalService();
+				makePublic( proposal, "chunkPathsByCluster" );
+
+				var evidence = {
+					derived: {
+						clusters: [
+							{ id: "c-orders", filePaths: [ "orders/orders.cfc", "orders/orderlines.cfc" ] },
+							{ id: "c-reports", filePaths: [ "reports/reports.cfc", "reports/charts.cfc" ] }
+						]
+					}
+				};
+				var paths = [ "orders/Orders.cfc", "reports/Reports.cfc", "orders/OrderLines.cfc", "reports/Charts.cfc" ];
+
+				// shardSize 2 could cut straight across the two domains if the
+				// flat list order were followed.
+				var chunks = proposal.chunkPathsByCluster( paths, evidence, 2, 10 );
+
+				expect( chunks ).toHaveLength( 2 );
+				for ( var chunk in chunks ) {
+					var prefixes = {};
+					for ( var path in chunk ) prefixes[ listFirst( lCase( path ), "/" ) ] = true;
+					expect( prefixes.count() ).toBe( 1, "a shard mixed two domains: " & chunk.toList( ", " ) );
+				}
+			} );
+
+			it( "still shards a path list when no clusters are present", () => {
+				var proposal = new app.models.services.ModernizationProposalService();
+				makePublic( proposal, "chunkPathsByCluster" );
+
+				var chunks = proposal.chunkPathsByCluster( [ "a.cfc", "b.cfc", "c.cfc" ], {}, 2, 10 );
+
+				expect( chunks ).toHaveLength( 2 );
+				expect( chunks[ 1 ] ).toHaveLength( 2 );
+			} );
+
+			it( "keeps the shard size cap even for a large cluster", () => {
+				// A high-cohesion domain is a bigger ask than a path batch, which
+				// is why truncation resplitting has to survive the inversion.
+				var proposal = new app.models.services.ModernizationProposalService();
+				makePublic( proposal, "chunkPathsByCluster" );
+
+				var filePaths = [];
+				var paths = [];
+				for ( var index = 1; index <= 9; index++ ) {
+					filePaths.append( "big/f#index#.cfc" );
+					paths.append( "big/F#index#.cfc" );
+				}
+				var chunks = proposal.chunkPathsByCluster( paths, { derived: { clusters: [ { id: "c-big", filePaths: filePaths } ] } }, 3, 10 );
+
+				expect( chunks ).toHaveLength( 3 );
+				for ( var chunk in chunks ) expect( chunk.len() ).toBeLTE( 3 );
+			} );
+
 			it( "labels a single-character domain without throwing", () => {
 				// right( value, 0 ) throws in BoxLang; a one-letter folder or a
 				// camelCase split like "aService" reaches that path.
