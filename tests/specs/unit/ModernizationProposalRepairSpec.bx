@@ -58,43 +58,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( covered.count() ).toBe( 2 );
 			} );
 
-			it( "keeps a route whose path is missing but whose link resolves", () => {
-				var service = newService();
-				makePublic( service, "retainEvidencedRoutes" );
-				var errors = [];
-				var routes = service.retainEvidencedRoutes( {
-					target: { units: [ { id: "tu-1", sourcePath: "admin/manageUsers.cfm", targetPath: "app/handlers/Admin.bx" } ] },
-					unitLinks: [ { id: "ul-1", targetUnitId: "tu-1", sourcePath: "admin/manageUsers.cfm" } ],
-					routeContracts: [ {
-						id: "rc-1",
-						targetUnitId: "tu-1",
-						unitLinkId: "ul-1",
-						evidence: [ "admin/manageUsers.cfm:1-10" ]
-					} ]
-				}, errors );
 
-				expect( routes ).toHaveLength( 1 );
-				expect( routes[ 1 ].path ).toBe( "/admin/manageUsers.cfm" );
-				expect( routes[ 1 ].pathProvenance ).toBe( "derived-from-linked-source" );
-			} );
-
-			it( "resolves relative hops so a derived route path passes the safety gate", () => {
-				var service = newService();
-				makePublic( service, "retainEvidencedRoutes" );
-				// Legacy CFML navigation is full of "../" hops; slash-prefixing one
-				// yields "/../login/login.cfm", which the validator blocks.
-				var routes = service.retainEvidencedRoutes( {
-					target: { units: [ { id: "tu-1", sourcePath: "../login/login.cfm", targetPath: "app/handlers/Login.bx" } ] },
-					unitLinks: [ { id: "ul-1", targetUnitId: "tu-1", sourcePath: "../login/login.cfm" } ],
-					routeContracts: [ { id: "rc-1", targetUnitId: "tu-1", unitLinkId: "ul-1", evidence: [ "login/login.cfm:1-5" ] } ]
-				}, [] );
-
-				expect( routes ).toHaveLength( 1 );
-				expect( routes[ 1 ].path ).toBe( "/login/login.cfm" );
-				expect( routes[ 1 ].path ).notToInclude( ".." );
-				expect( left( routes[ 1 ].path, 1 ) ).toBe( "/" );
-				expect( left( routes[ 1 ].path, 2 ) ).notToBe( "//" );
-			} );
 
 			it( "drops a route whose only derivable path escapes the application root", () => {
 				var service = newService();
@@ -105,53 +69,8 @@ class extends="testbox.system.BaseSpec" {
 				expect( service.safeRoutePathFrom( "./playlist/../Library/song.cfm" ) ).toBe( "/Library/song.cfm" );
 			} );
 
-			it( "still drops a route with no path and no resolvable link", () => {
-				var service = newService();
-				makePublic( service, "retainEvidencedRoutes" );
-				var errors = [];
-				var routes = service.retainEvidencedRoutes( {
-					target: { units: [] },
-					unitLinks: [],
-					routeContracts: [ { id: "rc-orphan", targetUnitId: "nope", evidence: [ "x.cfm:1-2" ] } ]
-				}, errors );
 
-				expect( routes ).toBeEmpty();
-				expect( errors.filter( ( item ) => item.message == "omitted-unbacked-route" ) ).notToBeEmpty();
-			} );
 
-			it( "repairs a cross-shard unit link through its source and target paths", () => {
-				var service = newService();
-				makePublic( service, "dropUnresolvedUnitLinks" );
-				var errors = [];
-				var plan = service.dropUnresolvedUnitLinks( {
-					target: { units: [ { id: "canonical-1", sourcePath: "Library/song.cfm", targetPath: "app/handlers/Library.bx" } ] },
-					unitLinks: [
-						// Minted by a different shard, so the id never existed here.
-						{ id: "ul-1", targetUnitId: "handlers/Library.cfc", sourcePath: "Library/song.cfm", targetPath: "app/handlers/Library.bx" },
-						{ id: "ul-2", targetUnitId: "totally-unknown", sourcePath: "nowhere/absent.cfm" }
-					]
-				}, errors );
-
-				expect( plan.unitLinks ).toHaveLength( 1 );
-				expect( plan.unitLinks[ 1 ].targetUnitId ).toBe( "canonical-1" );
-				expect( plan.unitLinks[ 1 ].targetUnitIdProvenance ).toBe( "repaired-by-path" );
-				expect( errors.filter( ( item ) => item.message == "repaired-cross-shard-unit-links" ) ).notToBeEmpty();
-				expect( errors.filter( ( item ) => item.message == "dropped-unresolved-unit-links" ) ).notToBeEmpty();
-			} );
-
-			it( "does not adopt an ambiguous path match", () => {
-				var service = newService();
-				makePublic( service, "dropUnresolvedUnitLinks" );
-				var plan = service.dropUnresolvedUnitLinks( {
-					target: { units: [
-						{ id: "unit-a", sourcePath: "shared/common.cfm", targetPath: "app/handlers/A.bx" },
-						{ id: "unit-b", sourcePath: "shared/common.cfm", targetPath: "app/handlers/B.bx" }
-					] },
-					unitLinks: [ { id: "ul-x", targetUnitId: "unknown", sourcePath: "shared/common.cfm" } ]
-				}, [] );
-
-				expect( plan.unitLinks ).toBeEmpty();
-			} );
 
 			it( "wraps provider up/down statements into a cfmigrations component", () => {
 				var service = newService();
@@ -242,44 +161,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( transitions[ 2 ] ).notToHaveKey( "operationProvided" );
 			} );
 
-			it( "re-mints a duplicate target unit id instead of leaving two units sharing one", () => {
-				var service = newService();
-				makePublic( service, "ensureUniqueTargetUnitIds" );
-				var errors = [];
-				// Two shards proposed the same target for one legacy file; path
-				// de-collision renamed the second without re-minting its id.
-				var plan = service.ensureUniqueTargetUnitIds( {
-					target: { units: [
-						{ id: "shared-id", sourcePath: "home/home.cfm", targetPath: "app/handlers/home.bx" },
-						{ id: "shared-id", sourcePath: "home/home.cfm", targetPath: "app/handlers/home2.bx" }
-					] }
-				}, errors );
 
-				var units = plan.target.units;
-				expect( units[ 1 ].id ).toBe( "shared-id", "first occurrence keeps its id so links stay valid" );
-				expect( units[ 2 ].id ).notToBe( "shared-id" );
-				expect( units[ 2 ].idProvenance ).toBe( "reminted-duplicate" );
-				expect( units[ 2 ].itemFingerprint ).notToBeEmpty();
-				expect( errors.filter( ( item ) => item.message == "reminted-duplicate-target-unit-ids" ) ).notToBeEmpty();
-			} );
-
-			it( "re-mints duplicate ids in the other plan collections too", () => {
-				var service = newService();
-				makePublic( service, "ensureUniqueCollectionIds" );
-				var errors = [];
-				var plan = service.ensureUniqueCollectionIds( {
-					dbTransitions: [
-						{ id: "dup", operation: "expand", objectsTouched: [ "album" ] },
-						{ id: "dup", operation: "contract", objectsTouched: [ "artist" ] }
-					],
-					dbFindings: [ { id: "f1", objectRef: "album" } ]
-				}, errors );
-				expect( plan.dbTransitions[ 1 ].id ).toBe( "dup", "first occurrence keeps its id" );
-				expect( plan.dbTransitions[ 2 ].id ).notToBe( "dup" );
-				expect( plan.dbTransitions[ 2 ].idProvenance ).toBe( "reminted-duplicate" );
-				expect( plan.dbFindings[ 1 ].id ).toBe( "f1" );
-				expect( errors.filter( ( item ) => item.message == "reminted-duplicate-item-ids" ) ).notToBeEmpty();
-			} );
 
 			it( "renumbers transition order monotonically without reordering intent", () => {
 				var service = newService();
@@ -299,17 +181,6 @@ class extends="testbox.system.BaseSpec" {
 				}
 			} );
 
-			it( "leaves distinct target unit ids untouched", () => {
-				var service = newService();
-				makePublic( service, "ensureUniqueTargetUnitIds" );
-				var errors = [];
-				var plan = service.ensureUniqueTargetUnitIds( {
-					target: { units: [ { id: "a", targetPath: "app/handlers/A.bx" }, { id: "b", targetPath: "app/handlers/B.bx" } ] }
-				}, errors );
-				expect( plan.target.units[ 1 ].id ).toBe( "a" );
-				expect( plan.target.units[ 2 ].id ).toBe( "b" );
-				expect( errors ).toBeEmpty();
-			} );
 
 			it( "leaves an already-wrapped migration untouched", () => {
 				var service = newService();
@@ -322,49 +193,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( transitions[ 1 ] ).notToHaveKey( "migrationCodeProvenance" );
 			} );
 
-			it( "links database findings and transitions to the phase touching the same table", () => {
-				var service = newService();
-				makePublic( service, "normalizeRoadmapReferences" );
-				var phases = service.normalizeRoadmapReferences( {
-					target: { units: [
-						{ id: "u-album", sourcePath: "Library/album.cfm", targetPath: "app/handlers/Album.bx" },
-						{ id: "u-login", sourcePath: "login/login.cfm", targetPath: "app/handlers/Login.bx" }
-					] },
-					routeContracts: [],
-					samples: [],
-					dbFindings: [ { id: "f-album", objectRef: "album" } ],
-					dbTransitions: [ { id: "t-album", objectsTouched: [ "album" ] } ],
-					roadmapPhases: [
-						{ id: "p-login", name: "Login", unitIds: [ "u-login" ] },
-						{ id: "p-album", name: "Album", unitIds: [ "u-album" ] }
-					]
-				}, [] );
 
-				var albumPhase = phases.filter( ( item ) => item.id == "p-album" )[ 1 ];
-				expect( albumPhase.dbFindingIds ).toInclude( "f-album" );
-				expect( albumPhase.transitionIds ).toInclude( "t-album" );
-				var loginPhase = phases.filter( ( item ) => item.id == "p-login" )[ 1 ];
-				expect( loginPhase.dbFindingIds ).toBeEmpty();
-			} );
-
-			it( "schedules unmatched database work rather than orphaning it", () => {
-				var service = newService();
-				makePublic( service, "normalizeRoadmapReferences" );
-				var errors = [];
-				var phases = service.normalizeRoadmapReferences( {
-					target: { units: [ { id: "u-1", sourcePath: "home/home.cfm", targetPath: "app/handlers/Home.bx" } ] },
-					routeContracts: [],
-					samples: [],
-					dbFindings: [ { id: "f-orphan", objectRef: "zzz_audit_trail" } ],
-					dbTransitions: [],
-					roadmapPhases: [ { id: "p-1", name: "Home", unitIds: [ "u-1" ] } ]
-				}, errors );
-
-				expect( phases[ 1 ].dbFindingIds ).toInclude( "f-orphan" );
-				var note = errors.filter( ( item ) => item.message == "linked-database-work-to-phases" );
-				expect( note ).notToBeEmpty();
-				expect( note[ 1 ].unmatchedAttachedToFirstPhase ).toBe( 1 );
-			} );
 
 			it( "names leftover roadmap shards after their feature directory", () => {
 				var service = newService();
@@ -464,167 +293,12 @@ class extends="testbox.system.BaseSpec" {
 				expect( phase ).notToHaveKey( "repairedCollections" );
 			} );
 
-			it( "backfills method-level symbols the inventory already extracted", () => {
-				var service = newService();
-				makePublic( service, "backfillUnitSymbolsFromInventory" );
-				var errors = [];
-				// A shard sees a window of a large CFC and answers with a placeholder.
-				var plan = service.backfillUnitSymbolsFromInventory( {
-					target: { units: [
-						{ id: "u-svc", sourcePath: "cfc/services/SongServices.cfc", targetPath: "app/models/services/SongServices.bx",
-						  symbols: [ { name: "UNKNOWN", signature: "UNKNOWN" } ], legacyUnitIds: [ "legacy-1" ] },
-						{ id: "u-keep", sourcePath: "cfc/services/Other.cfc", targetPath: "app/models/services/Other.bx",
-						  symbols: [ { name: "realMethod", signature: "realMethod(id)" } ], legacyUnitIds: [] }
-					] },
-					inventory: { units: [
-						{ id: "legacy-1", filePath: "cfc/services/SongServices.cfc", symbolName: "addAlbum", signature: "addAlbum(album)", startLine: 10, endLine: 11 },
-						{ id: "legacy-2", filePath: "cfc/services/SongServices.cfc", symbolName: "getAllSongByAlbumId", signature: "getAllSongByAlbumId(id)", startLine: 115, endLine: 116 },
-						{ id: "legacy-3", filePath: "cfc/services/Other.cfc", symbolName: "shouldNotOverwrite", signature: "x()", startLine: 1, endLine: 2 }
-					] }
-				}, errors );
 
-				var svc = plan.target.units[ 1 ];
-				expect( svc.symbols ).toHaveLength( 2 );
-				expect( svc.symbols[ 1 ].name ).toBe( "addAlbum" );
-				expect( svc.symbolsProvenance ).toBe( "inventory-backfilled" );
-				expect( svc.legacySymbolCount ).toBe( 2 );
-				expect( svc.legacyUnitIds ).toHaveLength( 2 );
-				// A shard that genuinely named methods keeps its own answer.
-				expect( plan.target.units[ 2 ].symbols[ 1 ].name ).toBe( "realMethod" );
-				expect( plan.target.units[ 2 ] ).notToHaveKey( "symbolsProvenance" );
-				expect( errors.filter( ( item ) => item.message == "backfilled-unit-symbols-from-inventory" ) ).notToBeEmpty();
-			} );
 
-			it( "groups handler units into one ColdBox handler with actions", () => {
-				var service = newService();
-				makePublic( service, "groupHandlerUnitsIntoActions" );
-				var errors = [];
-				var plan = service.groupHandlerUnitsIntoActions( {
-					target: { units: [
-						{ id: "h1", layer: "handler", sourcePath: "admin/fileMove.cfm", targetPath: "app/handlers/fileMove.bx" },
-						{ id: "h2", layer: "handler", sourcePath: "admin/dashboard.cfm", targetPath: "app/handlers/dashboard.bx" },
-						{ id: "h3", layer: "handler", sourcePath: "login/login.cfm", targetPath: "app/handlers/login.bx" },
-						{ id: "v1", layer: "view", sourcePath: "admin/dashboard.cfm", targetPath: "app/views/dashboard.bxm" }
-					] }
-				}, errors );
 
-				var byId = {};
-				for ( var u in plan.target.units ) byId[ u.id ] = u;
-				expect( byId.h1.targetPath ).toBe( "app/handlers/Admin.bx" );
-				expect( byId.h2.targetPath ).toBe( "app/handlers/Admin.bx" );
-				expect( byId.h1.action ).toBe( "fileMove" );
-				expect( byId.h2.action ).toBe( "dashboard" );
-				expect( byId.h1.handlerGrouping.previousTargetPath ).toBe( "app/handlers/fileMove.bx" );
-				// A lone handler in its directory is left alone.
-				expect( byId.h3.targetPath ).toBe( "app/handlers/login.bx" );
-				expect( byId.h3 ).notToHaveKey( "action" );
-				// Views are not handlers and must not be regrouped.
-				expect( byId.v1.targetPath ).toBe( "app/views/dashboard.bxm" );
-				expect( errors.filter( ( item ) => item.message == "grouped-handler-units-into-actions" ) ).notToBeEmpty();
-			} );
 
-			it( "repoints roadmap migration steps at the regrouped handler path", () => {
-				var service = newService();
-				makePublic( service, "groupHandlerUnitsIntoActions" );
-				// Rewriting a unit's targetPath without updating the steps that cite
-				// it produced 74 blocking "not among this phase's own units".
-				var plan = service.groupHandlerUnitsIntoActions( {
-					target: { units: [
-						{ id: "h1", layer: "handler", sourcePath: "admin/fileMove.cfm", targetPath: "app/handlers/fileMove.bx" },
-						{ id: "h2", layer: "handler", sourcePath: "admin/dashboard.cfm", targetPath: "app/handlers/dashboard.bx" }
-					] },
-					roadmapPhases: [ { id: "p1", unitIds: [ "h1", "h2" ], migrationSteps: [
-						{ action: "port", targetRef: { targetPath: "app/handlers/fileMove.bx", methodName: "index" } },
-						{ action: "port", targetRef: { targetPath: "app/views/untouched.bxm" } }
-					] } ]
-				}, [] );
 
-				var steps = plan.roadmapPhases[ 1 ].migrationSteps;
-				expect( steps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Admin.bx" );
-				// The action is what an implementer needs, so it replaces the guess.
-				expect( steps[ 1 ].targetRef.methodName ).toBe( "fileMove" );
-				// A step pointing at something that was not rewritten is left alone.
-				expect( steps[ 2 ].targetRef.targetPath ).toBe( "app/views/untouched.bxm" );
-			} );
 
-			it( "normalizes a leading-slash legacyRef instead of blocking on it", () => {
-				var service = newService();
-				makePublic( service, "pruneUnbackedMigrationSteps" );
-				var errors = [];
-				var plan = service.pruneUnbackedMigrationSteps( {
-					target: { units: [ { id: "u1", targetPath: "app/handlers/Login.bx" } ] },
-					inventory: { files: [ { filePath: "login/login.cfm" } ] },
-					roadmapPhases: [ { id: "p1", migrationSteps: [
-						{ legacyRef: { filePath: "/login/login.cfm" }, targetRef: { targetPath: "app/handlers/Login.bx" } }
-					] } ]
-				}, errors );
-				var steps = plan.roadmapPhases[ 1 ].migrationSteps;
-				expect( steps ).toHaveLength( 1, "a recoverable reference must not be dropped" );
-				expect( steps[ 1 ].legacyRef.filePath ).toBe( "login/login.cfm" );
-			} );
-
-			it( "resolves a provider target path by file name before dropping it", () => {
-				var service = newService();
-				makePublic( service, "pruneUnbackedMigrationSteps" );
-				var errors = [];
-				// Provider emits the source runtime's shape: no app/ prefix, .cfc.
-				var plan = service.pruneUnbackedMigrationSteps( {
-					target: { units: [
-						{ id: "u1", targetPath: "modules/library/handlers/Library.bx" },
-						{ id: "u2", targetPath: "app/views/other.bxm" }
-					] },
-					inventory: { files: [ { filePath: "Library/album.cfm" } ] },
-					roadmapPhases: [ { id: "p1", unitIds: [ "u1" ], migrationSteps: [
-						{ legacyRef: { filePath: "Library/album.cfm" }, targetRef: { targetPath: "handlers/Library.cfc" } }
-					] } ]
-				}, errors );
-				var steps = plan.roadmapPhases[ 1 ].migrationSteps;
-				expect( steps ).toHaveLength( 1, "a name-resolvable target must survive" );
-				expect( steps[ 1 ].targetRef.targetPath ).toBe( "modules/library/handlers/Library.bx" );
-				expect( steps[ 1 ].targetRef.targetPathProvenance ).toBe( "resolved-by-file-name" );
-			} );
-
-			it( "deduplicates identical migration steps", () => {
-				var service = newService();
-				makePublic( service, "pruneUnbackedMigrationSteps" );
-				var errors = [];
-				var repeated = { action: "port", legacyRef: { filePath: "a/x.cfm", symbolName: "x" }, targetRef: { targetPath: "app/handlers/A.bx", methodName: "x" } };
-				var plan = service.pruneUnbackedMigrationSteps( {
-					target: { units: [ { id: "u1", targetPath: "app/handlers/A.bx" } ] },
-					inventory: { files: [ { filePath: "a/x.cfm" } ] },
-					roadmapPhases: [ { id: "p1", unitIds: [ "u1" ], migrationSteps: [
-						duplicate( repeated ), duplicate( repeated ), duplicate( repeated ),
-						{ action: "port", legacyRef: { filePath: "a/x.cfm", symbolName: "y" }, targetRef: { targetPath: "app/handlers/A.bx", methodName: "y" } }
-					] } ]
-				}, errors );
-				// One live phase held 1469 steps of which only 47 were distinct.
-				expect( plan.roadmapPhases[ 1 ].migrationSteps ).toHaveLength( 2 );
-				var note = errors.filter( ( item ) => item.message == "pruned-unbacked-migration-steps" );
-				expect( note[ 1 ].deduplicated ).toBe( 2 );
-			} );
-
-			it( "drops a migration step that nothing in the plan backs", () => {
-				var service = newService();
-				makePublic( service, "pruneUnbackedMigrationSteps" );
-				var errors = [];
-				var plan = service.pruneUnbackedMigrationSteps( {
-					target: { units: [ { id: "u1", targetPath: "app/handlers/Login.bx" } ] },
-					inventory: { files: [ { filePath: "login/login.cfm" } ] },
-					roadmapPhases: [ { id: "p1", migrationSteps: [
-						{ action: "port", legacyRef: { filePath: "login/login.cfm" }, targetRef: { targetPath: "app/handlers/Login.bx" } },
-						// Legacy file that is not in the inventory at all: unrecoverable.
-						{ action: "port", legacyRef: { filePath: "ghost/never.cfm" }, targetRef: { targetPath: "app/handlers/Login.bx" } },
-						// Target that resolves to nothing by path or by file name.
-						{ action: "port", legacyRef: { filePath: "login/login.cfm" }, targetRef: { targetPath: "handlers/NoSuchThing.cfc" } }
-					] } ]
-				}, errors );
-				var steps = plan.roadmapPhases[ 1 ].migrationSteps;
-				expect( steps ).toHaveLength( 1 );
-				expect( steps[ 1 ].targetRef.targetPath ).toBe( "app/handlers/Login.bx" );
-				var note = errors.filter( ( item ) => item.message == "pruned-unbacked-migration-steps" );
-				expect( note ).notToBeEmpty();
-				expect( note[ 1 ].dropped ).toBe( 2 );
-			} );
 
 			it( "drops a placement that owns no units", () => {
 				var placement = new app.models.services.ModernizationPlacementService();
@@ -699,33 +373,6 @@ class extends="testbox.system.BaseSpec" {
 				expect( placement.moduleDisplayName( "userHome", [ "c" ], units ) ).toBe( "User Home services and models" );
 			} );
 
-			it( "collapses mixed numeric and enum confidence onto the enum", () => {
-				var service = newService();
-				makePublic( service, "normalizePlanConfidence" );
-				var plan = service.normalizePlanConfidence( {
-					target: { units: [
-						{ id: "u-1", confidence: 0.7 },
-						{ id: "u-2", confidence: "high" },
-						{ id: "u-3", confidence: 0.95 },
-						{ id: "u-4", confidence: 0.2 },
-						{ id: "u-5", confidence: 85 }
-					] },
-					unitLinks: [ { id: "l-1", confidence: "MEDIUM" } ],
-					dbFindings: [ { id: "f-1", confidence: "certain" } ]
-				} );
-
-				var units = plan.target.units;
-				expect( units[ 1 ].confidence ).toBe( "medium" );
-				expect( units[ 1 ].confidenceScore ).toBe( 0.7 );
-				expect( units[ 2 ].confidence ).toBe( "high" );
-				expect( units[ 3 ].confidence ).toBe( "high" );
-				expect( units[ 4 ].confidence ).toBe( "low" );
-				// 0-100 scale answers are rescaled, not treated as certainty 85.
-				expect( units[ 5 ].confidence ).toBe( "high" );
-				expect( plan.unitLinks[ 1 ].confidence ).toBe( "medium" );
-				expect( plan.dbFindings[ 1 ].confidence ).toBe( "high" );
-				for ( var unit in units ) expect( isNumeric( unit.confidence ) ).toBeFalse();
-			} );
 
 			it( "reports context-omitted paths in the shard omission counters", () => {
 				var gateway = new tests.resources.ScriptedModernizationGateway( responses = {

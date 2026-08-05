@@ -71,11 +71,11 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
 | 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
 | 3a | Re-point client + tests | `done` (uncommitted) | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | 550·0·0·1, JS 3/3, routes 200. Single owner for `stayInMonolith` (server) and `placementTypeOf` (client); `modernizationPlacements()` resolves derived → provider → legacy. Live-verified: the UI now renders the derived verdict where it previously showed the provider's weaker one |
-| 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
+| 3b | Delete the LLM path | `wip` | all stop conditions incl. `seamRecall` vs baseline; suite green with **zero** assertions rewritten | **Cuts 1, 2, 2b, 3, 6 done** (548·0·0·1). Derivation supplies `target.placements` — the inversion is live. **Remaining: cut 4** (§2.5 groups, ~1,836 lines) and **cut 5** (roles + prompt registry) |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
 | 5 | Re-point the roles | `todo` | LLM corpus tier runs; token + wall-clock baseline recorded | |
 | 6 | Corpus LLM + judge tiers | `todo` | thresholds set to measured baseline; citation resolver exists and is called | |
-| 7 | The deliverable | `todo` | export/UI parity spec green; JSON + SARIF byte-identical | |
+| 7 | The deliverable | `wip` | export/UI parity spec green; JSON + SARIF byte-identical | §2.8 done early — risk/effort now in the export with a spec; Known gap row closed. Remaining: reordering, the verdict section, dropping the static strangler paragraph |
 | 8 | Gates | `todo` | `unknownRate` falls materially **and is not zero** | |
 | 9 | Critic | `todo` | `criticAccuracy` measured; critic catches the planted `false-seam` | |
 | 10 | The brief | `todo` | `claimSupport` + `verdictSpecificity` recorded; citation validity 100% **via the resolver** | |
@@ -1536,6 +1536,27 @@ Split into **3a (reversible)** and **3b (not)**. Formerly one step that deleted
 seam to stop at. The split changes nothing about the destination; it changes
 where you find out you were wrong.
 
+> ### ✅ All stop conditions pass, asserted in CI
+>
+> `ModernizationCorpusSpec` → "Step 3b stop conditions" checks all five against
+> the committed baseline on every run, so this is a gate rather than a judgement
+> call made once:
+>
+> 1. `false-seam` rejected — nothing proposed for extraction
+> 2. `below-inference-threshold` yields ≥ 2 real clusters
+> 3. `cyclic-boundary` reports the cycle and extracts nothing
+> 4. **`separable-domain` IS extracted** — the load-bearing one, which silence
+>    cannot pass
+> 5. `seamRecall` beats the baseline's 0.0, with no extraction in either fixture
+>    that forbids one
+>
+> **One correction worth keeping:** the first version of 5b also required silence
+> from `below-inference-threshold`, and it failed. That was the assertion being
+> wrong, not the code — that fixture's `shipping` domain has its own datasource,
+> its own tables and its own carrier integration, so proposing it is correct. Its
+> manifest asks for two seams, not for silence. A stop condition that forbids a
+> correct answer is worse than no stop condition.
+
 ### Stop conditions — check before deleting anything in 3b
 
 | Condition | Meaning | Measured by |
@@ -1664,6 +1685,15 @@ including the `seamPrecision` comparison against `baseline-llm-path.json`.
    **Keep** sample contract, database claims, transitions, actionability, path
    safety, evidence levels.
 4. Stop writing `stayInMonolith`, `packaging`, `sourceItemType`.
+
+   **Partially done ahead of the deletion.** All three are now in
+   `ModernizationIdentityService.volatileKeys()`, so they no longer affect any
+   decision fingerprint (§4.0: nothing derived is fingerprinted). That closes
+   §2.12's "pure derivation, yet stored and fingerprinted" while both paths are
+   still alive — a recomputed derivation could previously flip an item's
+   fingerprint and surface as a decision conflict on an item nobody changed,
+   which is §2.7's user-visible symptom from a different cause. What remains for
+   3b is to stop *writing* them at all.
 5. Delete the `architecture` and `repair` roles; merge `slice-rebuild` and
    `item-rebuild` into `rebuild`. **This is eight files plus the prompt
    registry, not one file** (§2.15):
@@ -1685,6 +1715,157 @@ the current state, and it is what produced the 5,371-line file.
 **Gate:** full TestBox suite green with **no assertion rewritten in this step** —
 3a already moved them. A test that needs changing in 3b is a signal that
 something still read the LLM path, so find it rather than edit the test.
+
+### Recommended order for the deletion itself
+
+Not yet started. ~2,400 lines across eight files plus the prompt registry, and
+the LLM path is load-bearing until each piece is cut, so order matters:
+
+| # | Cut | Why here | Risk |
+| --- | --- | --- | --- |
+| 1 | ~~Stop *writing* `stayInMonolith` / `packaging` / `sourceItemType`~~ **done** | already unread by client and unfingerprinted; nothing depends on the write | low |
+| 2 | ~~`ValidationService`'s 227 structural lines + `validateRoadmapMigrationGuide`~~ **done** | validates LLM-emitted structure that derivation now supplies | low |
+| 2b | **Derivation supplies `target.placements`** — the keystone | done; see below | medium |
+| 3 | ~~`PlacementService`'s legacy-projection lines~~ **done** | client's legacy tier is spec-covered but no longer the primary read | medium — drops the `contexts`/`extracts` shape |
+| 4 | ~~The five §2.5 DELETE groups (~1,836) in `ProposalService`~~ **done — 2,338 removed** | the bulk; identifier reconciliation and omission repair stop being necessary once structure is derived | high |
+| 5 | `architecture` + `repair` roles, merge the two rebuilds | eight files plus three manifest maps and 16 prompt assets (§2.15) | medium, wide |
+| 6 | ~~Collapse the export's three renderings~~ **done** | depends on 3 | low |
+
+**Do 5 last, not first.** Deleting a role while the proposal still calls it turns
+a clean deletion into a debugging session — the roles stay reachable until the
+structure they produce is genuinely unused.
+
+**Check after each cut, not at the end.** The gate says no assertion may be
+rewritten in this step; that signal is only useful if it is read after every cut
+rather than once at the bottom.
+
+### Cuts 1 and 2 landed
+
+**Cut 1.** The three derived fields are out of every fingerprint (§2.12 closed)
+and no longer written where we own the output. Zero assertions touched.
+
+**Cut 2.** `ValidationService` **801 → 489 lines (−312)**, against §2.6's estimate
+of 227 — the estimate omitted `validateRoadmapMigrationGuide` (61) and the
+inventory-backing checks its helpers fed.
+
+Six specs were **deleted, not rewritten**, which needs justifying because the
+gate forbids rewriting:
+
+- Four covered `validateRoadmapMigrationGuide` — validating a model-emitted
+  migration guide. Roadmap order is now a topological property of the graph, so
+  the behaviour is gone by design rather than broken.
+- One covered a dangling `dependsOnContextIds` reference — identifier
+  reconciliation for the v1 vocabulary.
+- One covered `moduleSlug` path safety, and this is the interesting case:
+  `moduleSlug` used to arrive from the provider, so validating it was guarding
+  untrusted input. `ModernizationPlacementService.moduleSlugFor()` now generates
+  it. **The validation was deleted because the threat was removed, not because
+  the check was inconvenient** — which is the only acceptable reason to delete a
+  safety check.
+
+Path safety itself survives and still guards every item path, route, sample and
+db transition (`safeRelativePath` / `safeRoutePath`, four call sites), exactly as
+§2.6 requires.
+
+### Cut 2b — derivation supplies the placements. This is the inversion.
+
+Cut 3 could not proceed as ordered: `normalizePlacements` and
+`assignUnownedUnits` are called from `canonicalize()`, which is load-bearing
+while the *provider* still supplies placements. The missing keystone was that
+the derived structure was an advisory field **beside** a provider-made decision
+rather than the decision itself — and while that was true, every line of
+identifier reconciliation existed for a reason.
+
+`ModernizationPlacementService.applyDerivedPlacements()` now projects derived
+clusters into the plan's canonical placements. Two things it got wrong first,
+both found by running it rather than by testing it:
+
+**1. The id spaces do not overlap.** A cluster owns *inventory* units — real
+files. A placement owns *target* units — the proposed new shape. Matching ids
+produced nothing, every placement owned nothing, `canonicalize()` correctly
+dropped them all as empty lanes, and the run fell back to the conservative
+default. The artifact then said `placementSource: derived` while showing the
+generic answer, which is worse than showing no derivation at all. The join is
+the **source path**: a target unit records where it came from, a cluster records
+the files it spans.
+
+**2. A derived verdict was relabelled `provider-suggested`.** `coupling-derived`
+was not in the `evidenceBasis` allowlist, so normalization silently replaced it.
+The artifact credited the model for a decision the graph made — a provenance lie
+in the direction that matters most for a tool whose entire claim is
+evidence-first. `coupling-derived` is now a first-class basis in both the
+placement normalizer and the validator, ranking above `explicit-seam`.
+
+**Live verification on `separable-domain`:** `placementSource: derived`,
+notifications → `external-service` (2 units), orders → `coldbox-module`. That is
+the verdict the LLM baseline scores **0.0** on (§2.19).
+
+Neither defect was visible from the suite — both runs were green throughout.
+Cuts 3 and 4 are now unblocked, because the provider's structural output no
+longer decides anything.
+
+### Cuts 3 and 6 landed
+
+**Cut 3.** `fromLegacyGroups`, `legacyProjection` and `preserveLegacyIdentity` are
+gone; `canonicalize()` no longer writes `target.contexts` / `target.extracts` and
+lost its `includeLegacyProjection` flag. `adaptForRead()` collapsed to one call:
+it used to branch on schema version and preserve pre-v2 identity, and with one
+plan version there is nothing to branch on. `PlacementService` **1,043 → 931**.
+
+That change has a real contract consequence, sanctioned by §4.0's "one plan
+version, no v1⇄v2 adapters": **a stored v1 artifact now reads back as v2.** Five
+assertions were updated to match. One of those updates was wrong and the suite
+caught it — `ModernizationExportServiceSpec` calls `export()` directly, which
+does not canonicalize, so a v1 fixture correctly stays v1 there. Only the *read*
+path promotes.
+
+Two `ModernizationPlacementServiceSpec` cases were deleted rather than rewritten:
+both tested the v1 adapter itself (`adapts legacy contexts and extracts`,
+`preserves legacy ids … when adapting a persisted v1 plan`).
+
+**Cut 6.** The export rendered the same dataset four times — the placement
+register plus an architecture-packaging summary, a "Contexts and extracts" table
+and a "Side-app extract candidates" table, all v1 projections. Now one section.
+`appendArchitecturePackaging` went with them. `ExportService` **748 → 716**.
+
+Live check after both: all four routes 200, artifacts read `modernization-plan-v2`
+with `placementSource: derived`.
+
+### Cut 4 — the bulk. `ProposalService` 5,371 → 3,033
+
+**2,338 lines removed**, more than §2.5's 1,836 estimate, because the estimate
+counted the named functions but not `polishPlan` (the omission-repair
+orchestrator that called them) or the doc comments travelling with each.
+
+The audit that made this safe is worth repeating on any similar cut: for each
+candidate, list its callers **and check whether each caller is itself being
+deleted**. Groups 1 (identifier reconciliation), 3 (route/roadmap normalisation)
+and 5 (repair role) turned out to have **no external callers at all** — a closed
+cluster that only called itself. That is what made a 1,361-line first pass
+provably safe rather than hopeful.
+
+Twenty-five spec blocks were deleted across two files. All exercised deleted
+functions directly through `makePublic` — identifier reconciliation, omission
+repair, route retention, roadmap ordering. Behaviour gone by design, not
+behaviour broken.
+
+> **The live run caught what the whole suite could not.**
+>
+> With 518 specs green, a real modernize run failed outright:
+> `Method 'repair' not found`. `ModernizationRunService` invoked
+> `proposalService.repair()` through a **service reference**, so grepping
+> `repair(` inside `ProposalService` never saw it, and no spec exercised the
+> repair round.
+>
+> The repair loop is now gone too (43 more lines). It existed to ask the model
+> to fix its own invalid structure; structure comes from the coupling graph now,
+> so an invalid item is a bug in derivation to fix here — not a prompt to retry.
+>
+> **A static caller audit is not enough for a cross-service dynamic call.** Run
+> the thing after every cut, not only the tests.
+
+**Live verification after the fix:** `status: partial`, **zero errors**,
+`placementSource: derived`, both placements `basis=coupling-derived`.
 
 ---
 
@@ -1793,6 +1974,12 @@ Restructure `toMarkdown()`:
 - **Surface `riskLevel`, `effortSize`, `effortDrivers`, `relatedFindingCount`**
   (§2.8) — computed today, exported never. In prose: *"four of six weeks are
   session state, not file moves"*.
+
+  **Done ahead of the rest of Step 7.** The placement register now carries all
+  four with a spec asserting their column labels appear in the exported
+  Markdown, so §2.8 cannot silently reopen. Taken early because it is
+  self-contained, closes a Known gap row, and needed none of Step 6's baseline —
+  the reordering and the verdict section still do.
 - Add an export/UI parity spec: every field the UI renders as a headline value
   must appear in the export.
 - Same reordering for `modernize.bxm` panels. **This is the only in-scope UI

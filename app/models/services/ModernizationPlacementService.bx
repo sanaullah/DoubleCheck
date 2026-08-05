@@ -44,20 +44,13 @@ class threadsafe {
 	/**
 	 * Promote a generated plan to the canonical v2 contract.
 	 */
-	struct function canonicalize( required struct plan, struct evidence = {}, boolean includeLegacyProjection = true ) {
+	struct function canonicalize( required struct plan, struct evidence = {} ) {
 		var output = duplicate( arguments.plan );
 		output = repairStringifiedPhaseCollections( output );
 		var target = isStruct( output.target ?: "" ) ? output.target : {};
 		target.units = isArray( target.units ?: "" ) ? target.units : [];
 		var rawPlacements = isArray( target.placements ?: "" ) ? target.placements : [];
 		var hadCanonicalPlacements = rawPlacements.len() > 0;
-
-		if ( !hadCanonicalPlacements ) {
-			rawPlacements = fromLegacyGroups(
-				isArray( target.contexts ?: "" ) ? target.contexts : [],
-				isArray( target.extracts ?: "" ) ? target.extracts : []
-			);
-		}
 
 		var normalized = normalizePlacements( rawPlacements, target.units, arguments.plan, arguments.evidence );
 		var coverage = assignUnownedUnits( normalized, target.units, arguments.plan, arguments.evidence );
@@ -75,12 +68,6 @@ class threadsafe {
 		target.placements = normalized;
 		applyModulePackagingPaths( normalized, target.units, output );
 		target.placementContractVersion = variables.version;
-		if ( arguments.includeLegacyProjection ) {
-			var projection = legacyProjection( normalized );
-			target.contexts = projection.contexts;
-			target.extracts = projection.extracts;
-			target.legacyProjectionSource = "target.placements";
-		}
 		output.target = target;
 		output.version = variables.planVersion;
 		output.schemaVersion = variables.planVersion;
@@ -90,8 +77,7 @@ class threadsafe {
 		output.metadata.placementContract = {
 			version: variables.version,
 			planVersion: variables.planVersion,
-			source: hadCanonicalPlacements ? "provider-v2" : "v1-adapter",
-			legacyProjection: arguments.includeLegacyProjection
+			source: hadCanonicalPlacements ? "provider-v2" : "derived"
 		};
 		output.metadata.placementSummary = placementSummary( normalized );
 		return output;
@@ -158,79 +144,21 @@ class threadsafe {
 		return output;
 	}
 
-	struct function adaptForRead( required struct plan ) {
-		var sourceVersion = trim( toString( structKeyExists( arguments.plan, "schemaVersion" ) ? arguments.plan.schemaVersion : ( structKeyExists( arguments.plan, "version" ) ? arguments.plan.version : "" ) ) );
-		var hasPlacements = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) && structKeyExists( arguments.plan.target, "placements" ) && isArray( arguments.plan.target.placements );
-		if ( sourceVersion == variables.planVersion || hasPlacements ) {
-			return this.canonicalize( arguments.plan, {}, true );
-		}
-		var adapted = this.canonicalize( arguments.plan, {}, true );
-		adapted = preserveLegacyIdentity( adapted, arguments.plan );
-		adapted.version = len( sourceVersion ) ? sourceVersion : "modernization-plan-v1";
-		adapted.schemaVersion = adapted.version;
-		adapted.adapted = true;
-		adapted.sourcePlanVersion = adapted.version;
-		adapted.metadata = isStruct( adapted.metadata ?: "" ) ? adapted.metadata : {};
-		adapted.metadata.placementAdapter = {
-			version: variables.version,
-			sourcePlanVersion: adapted.version,
-			immutable: true
-		};
-		return adapted;
-	}
-
 	/**
-	 * Preserve the identity fields that an old decision/event stream used. The
-	 * canonical placement is additive at the read boundary; it must not make a
-	 * historical item look like a newly generated item just because it was
-	 * projected into the v2 vocabulary.
+	 * One plan version, one read path.
+	 *
+	 * This used to branch: v2 artifacts canonicalized, older ones canonicalized
+	 * *and* had their pre-v2 identity preserved so a historical decision stream
+	 * still matched. With the legacy projection gone there is one shape, so the
+	 * branch collapsed to the same call twice.
 	 */
-	private struct function preserveLegacyIdentity( required struct adapted, required struct source ) {
-		var output = duplicate( arguments.adapted );
-		var sourceTarget = structKeyExists( arguments.source, "target" ) && isStruct( arguments.source.target ) ? arguments.source.target : {};
-		var byKey = {};
-		for ( var definition in [ { key: "contexts", type: "context" }, { key: "extracts", type: "extract" } ] ) {
-			var items = structKeyExists( sourceTarget, definition.key ) && isArray( sourceTarget[ definition.key ] ) ? sourceTarget[ definition.key ] : [];
-			for ( var item in items ) {
-				if ( !isStruct( item ) ) continue;
-				var itemId = trim( toString( structKeyExists( item, "id" ) ? item.id : ( structKeyExists( item, "itemId" ) ? item.itemId : "" ) ) );
-				if ( len( itemId ) ) byKey[ definition.type & "|" & itemId ] = item;
-			}
-		}
-		var usedIds = {};
-		if ( !structKeyExists( output, "target" ) || !isStruct( output.target ) || !structKeyExists( output.target, "placements" ) || !isArray( output.target.placements ) ) return output;
-		for ( var placement in output.target.placements ) {
-			if ( !isStruct( placement ) ) continue;
-			var sourceType = lCase( trim( toString( placement.sourceItemType ?: "" ) ) );
-			var sourceId = trim( toString( placement.sourceItemId ?: "" ) );
-			var sourceKey = sourceType & "|" & sourceId;
-			var sourceItem = structKeyExists( byKey, sourceKey ) ? byKey[ sourceKey ] : javacast( "null", "" );
-			if ( isNull( sourceItem ) ) continue;
-			placement.adapted = true;
-			placement.legacyItemType = sourceType;
-			placement.legacyItemId = sourceId;
-			var legacyId = trim( toString( structKeyExists( sourceItem, "id" ) ? sourceItem.id : ( structKeyExists( sourceItem, "itemId" ) ? sourceItem.itemId : "" ) ) );
-			if ( len( legacyId ) && !usedIds.keyExists( legacyId ) ) {
-				placement.id = legacyId;
-				usedIds[ legacyId ] = true;
-			}
-			var legacyFingerprint = trim( toString( structKeyExists( sourceItem, "itemFingerprint" ) ? sourceItem.itemFingerprint : "" ) );
-			if ( len( legacyFingerprint ) ) {
-				placement.itemFingerprint = legacyFingerprint;
-				placement.legacyItemFingerprint = legacyFingerprint;
-			}
-		}
-		output.target = output.target;
-		return output;
+	struct function adaptForRead( required struct plan ) {
+		return this.canonicalize( arguments.plan, {} );
 	}
 
 	array function getPlacements( required struct plan ) {
 		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
-		if ( isArray( target.placements ?: "" ) ) return target.placements;
-		return fromLegacyGroups(
-			isArray( target.contexts ?: "" ) ? target.contexts : [],
-			isArray( target.extracts ?: "" ) ? target.extracts : []
-		);
+		return isArray( target.placements ?: "" ) ? target.placements : [];
 	}
 
 	/**
@@ -247,27 +175,6 @@ class threadsafe {
 			);
 		}
 		output.target = target;
-		return output;
-	}
-
-	private array function fromLegacyGroups( required array contexts, required array extracts ) {
-		var output = [];
-		for ( var context in arguments.contexts ) {
-			if ( !isStruct( context ) ) continue;
-			var item = duplicate( context );
-			item.sourceItemType = "context";
-			item.sourceItemId = item.id ?: item.itemId ?: "";
-			item.placementType = normalizePlacementType( item.packaging ?: ( item.stayInMonolith ?: "main-app" ) );
-			output.append( item );
-		}
-		for ( var extract in arguments.extracts ) {
-			if ( !isStruct( extract ) ) continue;
-			var item = duplicate( extract );
-			item.sourceItemType = "extract";
-			item.sourceItemId = item.id ?: item.itemId ?: "";
-			item.placementType = "external-service";
-			output.append( item );
-		}
 		return output;
 	}
 
@@ -290,7 +197,13 @@ class threadsafe {
 			placement.placementType = normalizePlacementType( placement.placementType ?: placement.packaging ?: ( placement.stayInMonolith ?: "main-app" ) );
 			placement.packaging = placement.packaging ?: packagingFor( placement.placementType );
 			placement.evidenceBasis = lCase( trim( placement.evidenceBasis ?: "provider-suggested" ) );
-			if ( ![ "explicit-seam", "domain-clustering", "provider-suggested", "conservative-default" ].contains( placement.evidenceBasis ) ) placement.evidenceBasis = "provider-suggested";
+			// "coupling-derived" is the strongest basis there is: membership came
+			// from structural edges, table co-access and shared scope rather than
+			// from anyone's suggestion. Without it in this list a derived verdict
+			// was silently relabelled "provider-suggested" — the artifact then
+			// credited the model for a decision the graph made, which is a
+			// provenance lie in the direction that matters most.
+			if ( ![ "coupling-derived", "explicit-seam", "domain-clustering", "provider-suggested", "conservative-default" ].contains( placement.evidenceBasis ) ) placement.evidenceBasis = "provider-suggested";
 			placement.evidenceRefs = normalizeEvidenceRefs( placement.evidenceRefs ?: placement.evidence ?: [] );
 			// An id is a content hash, never a label. Falling back to it printed
 			// "add46fccc0a6e039d273ad806476b60568f1c…" as a lane name on the map
@@ -304,7 +217,6 @@ class threadsafe {
 			}
 			placement.purpose = trim( placement.purpose ?: placement.reason ?: placement.recommendation ?: "" );
 			placement.recommendation = trim( placement.recommendation ?: placement.purpose ?: "Keep the capability in the new main application until stronger boundary evidence exists." );
-			placement.stayInMonolith = staysInMonolith( placement.placementType );
 			placement.sourceItemType = placement.sourceItemType ?: ( placement.placementType == "external-service" ? "extract" : "context" );
 			placement.sourceItemId = placement.sourceItemId ?: placement.id ?: placement.itemId ?: "";
 			placement.id = stablePlacementId( placement, units );
@@ -623,25 +535,6 @@ class threadsafe {
 			if ( isStruct( placement ) && normalizePlacementType( placement.placementType ?: placement.packaging ?: "" ) == "main-app" ) return placement;
 		}
 		return javacast( "null", "" );
-	}
-
-	private struct function legacyProjection( required array placements ) {
-		var contexts = [];
-		var extracts = [];
-		for ( var placement in arguments.placements ) {
-			if ( !isStruct( placement ) ) continue;
-			var projection = duplicate( placement );
-			projection.legacyProjection = true;
-			projection.packaging = packagingFor( placement.placementType ?: placement.packaging ?: "main-app" );
-			if ( normalizePlacementType( placement.placementType ?: "" ) == "external-service" ) {
-				projection.sourceItemType = "extract";
-				extracts.append( projection );
-			} else {
-				projection.sourceItemType = "context";
-				contexts.append( projection );
-			}
-		}
-		return { contexts: contexts, extracts: extracts };
 	}
 
 	private string function stablePlacementId( required struct placement, required array units ) {
@@ -966,5 +859,73 @@ class threadsafe {
 		var fingerprint = trim( scalarString( arguments.item.itemFingerprint ?: "" ) );
 		if ( !len( fingerprint ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
 		else arguments.item.itemFingerprint = fingerprint;
+	}
+
+	/**
+	 * Promote derived clusters to the plan's canonical placements.
+	 *
+	 * A cluster and a placement describe the same thing -- one owning decision
+	 * over a set of target units -- so this is a projection, not a merge. The
+	 * derived verdict wins outright: it is computed from structural edges, table
+	 * co-access and shared scope, and it carries the evidence for itself.
+	 *
+	 * The provider's own contexts/extracts are left in place for the legacy
+	 * projection until Step 3b removes them, but they no longer decide anything.
+	 */
+	public struct function applyDerivedPlacements( required struct plan, required array clusters ) {
+		if ( !arguments.clusters.len() ) return arguments.plan;
+		var output = arguments.plan;
+		output.target = isStruct( output.target ?: "" ) ? output.target : {};
+
+		// Bind by source path, not by id.
+		//
+		// A derived cluster owns *inventory* units -- real files on disk. A
+		// placement owns *target* units -- the proposed new shape. The two id
+		// spaces do not overlap, so matching ids yields nothing, every placement
+		// owns nothing, and canonicalize() drops them all and falls back to the
+		// conservative default. The plan then reads "derived" while showing the
+		// generic answer, which is worse than showing no derivation at all.
+		//
+		// A target unit records the sourcePath it came from, and a cluster
+		// records the file paths it spans, so the source path is the join.
+		var unitsByPath = {};
+		for ( var unit in ( isArray( output.target.units ?: "" ) ? output.target.units : [] ) ) {
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !len( unitId ) ) continue;
+			var sourcePath = lCase( replace( trim( toString( unit.sourcePath ?: unit.sourceFile ?: unit.filePath ?: "" ) ), "\", "/", "all" ) );
+			if ( !len( sourcePath ) ) continue;
+			if ( !unitsByPath.keyExists( sourcePath ) ) unitsByPath[ sourcePath ] = [];
+			unitsByPath[ sourcePath ].append( unitId );
+		}
+
+		var placements = [];
+		for ( var cluster in arguments.clusters ) {
+			var ownedIds = [];
+			for ( var filePath in ( cluster.filePaths ?: [] ) ) {
+				for ( var mapped in ( unitsByPath[ lCase( filePath ) ] ?: [] ) ) {
+					if ( !ownedIds.contains( mapped ) ) ownedIds.append( mapped );
+				}
+			}
+			// A cluster that maps to no target unit has nothing to place. Leaving
+			// it in would produce an empty lane that canonicalize() strips anyway.
+			if ( !ownedIds.len() ) continue;
+			placements.append( {
+				id              : cluster.id,
+				name            : cluster.name,
+				domainKey       : cluster.domainKey,
+				placementType   : cluster.placementType,
+				purpose         : cluster.purpose,
+				recommendation  : cluster.rationale,
+				targetUnitIds   : ownedIds,
+				evidenceBasis   : "coupling-derived",
+				provenanceClass : "deterministically-derived",
+				boundaryEvidence: cluster.boundaryEvidence ?: {},
+				filePaths       : cluster.filePaths ?: []
+			} );
+		}
+		output.target.placements = placements;
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.placementSource = "derived";
+		return output;
 	}
 }

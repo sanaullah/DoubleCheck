@@ -223,7 +223,7 @@ Part 2 carries the `file:line` proof for every row below.
 
 | Gap | Detail | Fixed in |
 |---|---|---|
-| Risk / effort not exported | `riskLevel`, `effortSize`, `effortDrivers`, `relatedFindingCount` are computed and shown in the UI but absent from the Markdown export | Step 7 |
+| ~~Risk / effort not exported~~ **closed** | `riskLevel`, `effortSize`, `effortDrivers` and `relatedFindingCount` now appear in the Markdown export's placement register, with a spec asserting the columns are present | Step 7 |
 | Export leads with telemetry | The Markdown export opens with run metadata and 13 lines of coverage counters — including provider shard counts — before any finding | Step 7 |
 
 ### Measurement

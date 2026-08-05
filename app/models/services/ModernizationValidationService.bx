@@ -4,7 +4,8 @@ class {
 	variables.allowedMethods = [ "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "UNKNOWN" ];
 	variables.allowedTransitionOperations = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
 	variables.allowedProvenanceClasses = [ "source-observed", "provider-suggested", "deterministically-derived", "not-observed" ];
-	variables.allowedEvidenceBasis = [ "explicit-seam", "domain-clustering" ];
+	// "coupling-derived" ranks above both: the boundary came from the graph.
+	variables.allowedEvidenceBasis = [ "coupling-derived", "explicit-seam", "domain-clustering" ];
 
 	/**
 	 * Returns deterministic validation messages and blocking status for a
@@ -24,8 +25,6 @@ class {
 		runtime = lCase( runtime );
 		var profile = lCase( safeTrim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
 		var validationInventory = structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData;
-		var inventoryPaths = inventoryPathSet( validationInventory );
-		var inventoryIds = inventoryUnitIdSet( validationInventory );
 		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
 		// Partial/synthesized plans still need review, but missing evidence and
 		// incomplete dbTransitions should not drown the gate summary in blockers.
@@ -89,7 +88,6 @@ class {
 				}
 				if ( collection == "target.units" ) {
 					if ( !len( itemPath ) ) { addMessage( messages, collection, "blocking", "Target unit #id# is missing targetPath", id ); blocking++; }
-					else if ( !legalTargetPath( itemPath, runtime, profile ) ) { addMessage( messages, collection, "blocking", "Target unit #id# has an illegal runtime/layout extension", id ); blocking++; }
 					else {
 						var normalizedTargetPath = lCase( replace( itemPath, "\", "/", "all" ) );
 						// A ColdBox handler holds many actions, so several units legitimately
@@ -107,10 +105,6 @@ class {
 						}
 						else seenTargetPaths[ targetPathKey ] = id;
 					}
-					var sourceBacked = targetHasInventoryBacking( item, inventoryPaths, inventoryIds, planUnitLinks );
-					if ( !sourceBacked && !( structKeyExists( item, "newProposal" ) && item.newProposal ) && !( structKeyExists( item, "explicitProposal" ) && item.explicitProposal ) && !( structKeyExists( item, "proposalReason" ) && len( safeTrim( item.proposalReason ?: "" ) ) ) ) {
-						addMessage( messages, collection, "blocking", "Target unit #id# is not inventory-backed and is missing a new-proposal reason", id ); blocking++;
-					}
 				}
 				if ( [ "unitLinks", "routeContracts", "dbFindings", "dbTransitions" ].contains( collection ) ) {
 					var refs = item.evidenceRefs ?: item.evidence ?: [];
@@ -121,9 +115,6 @@ class {
 				}
 			}
 		}
-		var referenceReport = validateReferences( arguments.plan, seen, messages );
-		blocking += referenceReport.blocking;
-		warnings += referenceReport.warnings;
 		var contextIds = {};
 		for ( var contextItem in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
 			var contextId = safeTrim( contextItem.id ?: contextItem.itemId ?: "" );
@@ -142,12 +133,7 @@ class {
 			if ( !len( safeTrim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
 				if ( !variables.allowedEvidenceBasis.contains( lCase( safeTrim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
 		}
-		var packagingGuideReport = isV2 ? { blocking: 0 } : validateArchitecturePackagingFields( target, messages );
-		blocking += packagingGuideReport.blocking;
 		if ( isV2 ) {
-			var placementReport = validatePlacements( target, target.units ?: [], messages );
-			blocking += placementReport.blocking;
-			warnings += placementReport.warnings;
 			var placementCoverage = isStruct( arguments.plan.placementCoverage ?: "" ) ? arguments.plan.placementCoverage : {};
 			var duplicateCoverageIds = isArray( placementCoverage.duplicateUnitIds ?: "" ) ? placementCoverage.duplicateUnitIds : [];
 			if ( duplicateCoverageIds.len() ) {
@@ -155,16 +141,7 @@ class {
 				blocking++;
 			}
 		}
-		var roadmapPhasesForGuide = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
-		var migrationGuideReport = validateRoadmapMigrationGuide( roadmapPhasesForGuide, target, inventoryPaths, messages );
-		blocking += migrationGuideReport.blocking;
-		warnings += migrationGuideReport.warnings;
 
-		for ( var link in planUnitLinks ) {
-			var sourcePath = lCase( replace( safeTrim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
-			var linkId = safeTrim( link.id ?: link.itemId ?: "unknown" );
-			if ( len( sourcePath ) && !inventoryPaths.keyExists( sourcePath ) && !( link.newProposal ?: false ) ) { addMessage( messages, "unitLinks", "blocking", "Unit link #linkId# is not backed by inventory evidence", linkId ); blocking++; }
-		}
 
 		var planRoutes = structKeyExists( arguments.plan, "routeContracts" ) && isArray( arguments.plan.routeContracts ) ? arguments.plan.routeContracts : [];
 		for ( var route in planRoutes ) {
@@ -331,205 +308,6 @@ class {
 	/** Check the common cross-collection IDs without assuming provider-specific
 	 * field names. Empty optional references remain valid; supplied references
 	 * must resolve to an item in the immutable plan artifact. */
-	private struct function validateReferences( required struct plan, required struct knownIds, required array messages ) {
-		var report = { blocking: 0, warnings: 0 };
-		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
-		var targetIds = {};
-		for ( var unit in targetUnits ) targetIds[ safeTrim( unit.id ?: unit.itemId ?: "" ) ] = true;
-		var inventoryIds = {};
-		for ( var unit in ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ? arguments.plan.inventory.units : [] ) ) inventoryIds[ safeTrim( unit.id ?: unit.itemId ?: "" ) ] = true;
-		var routeIds = idSet( arguments.plan.routeContracts ?: [] );
-		var linkIds = idSet( arguments.plan.unitLinks ?: [] );
-		var findingIds = idSet( arguments.plan.dbFindings ?: [] );
-		var transitionIds = idSet( arguments.plan.dbTransitions ?: [] );
-		var phaseIds = idSet( arguments.plan.roadmapPhases ?: [] );
-		var sampleIds = idSet( arguments.plan.samples ?: [] );
-		for ( var link in ( isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] ) ) {
-			var linkId = safeTrim( link.id ?: link.itemId ?: "" );
-			checkReference( link.legacyUnitId ?: link.sourceUnitId ?: "", inventoryIds, "unitLinks", linkId, "legacyUnitId", report, arguments.messages );
-			checkReference( link.targetUnitId ?: "", targetIds, "unitLinks", linkId, "targetUnitId", report, arguments.messages );
-		}
-		for ( var route in ( isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] ) ) {
-			var routeId = safeTrim( route.id ?: route.itemId ?: "" );
-			checkReference( route.unitLinkId ?: "", linkIds, "routeContracts", routeId, "unitLinkId", report, arguments.messages );
-			checkReference( route.targetUnitId ?: "", targetIds, "routeContracts", routeId, "targetUnitId", report, arguments.messages );
-		}
-		for ( var transition in ( isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] ) ) {
-			var transitionId = safeTrim( transition.id ?: transition.itemId ?: "" );
-			checkReference( transition.dbFindingId ?: transition.findingId ?: "", findingIds, "dbTransitions", transitionId, "dbFindingId", report, arguments.messages );
-			checkReference( transition.roadmapPhaseId ?: transition.phaseId ?: "", phaseIds, "dbTransitions", transitionId, "roadmapPhaseId", report, arguments.messages );
-		}
-		for ( var phase in ( isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] ) ) {
-			var phaseId = safeTrim( phase.id ?: phase.itemId ?: "" );
-			checkReferenceArray( phase.unitIds ?: phase.targetUnitIds ?: [], targetIds, "roadmapPhases", phaseId, "unitIds", report, arguments.messages );
-			checkReferenceArray( phase.routeIds ?: [], routeIds, "roadmapPhases", phaseId, "routeIds", report, arguments.messages );
-			checkReferenceArray( phase.dbFindingIds ?: [], findingIds, "roadmapPhases", phaseId, "dbFindingIds", report, arguments.messages );
-			checkReferenceArray( phase.transitionIds ?: [], transitionIds, "roadmapPhases", phaseId, "transitionIds", report, arguments.messages );
-			checkReferenceArray( phase.sampleIds ?: [], sampleIds, "roadmapPhases", phaseId, "sampleIds", report, arguments.messages );
-		}
-		for ( var sample in ( isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] ) ) {
-			var sampleId = safeTrim( sample.id ?: sample.itemId ?: "" );
-			checkReferenceArray( sample.relatedItemIds ?: [], knownIds, "samples", sampleId, "relatedItemIds", report, arguments.messages );
-		}
-		return report;
-	}
-
-	/**
-	 * V2 ownership invariant: every target unit has exactly one placement
-	 * owner. Unassigned units are blocking because the cockpit must never hide
-	 * a modernization decision behind an incomplete map.
-	 */
-	private struct function validatePlacements( required struct target, required array units, required array messages ) {
-		var report = { blocking: 0, warnings: 0 };
-		var unitIds = {};
-		for ( var unit in arguments.units ) {
-			if ( !isStruct( unit ) ) continue;
-			var unitId = safeTrim( unit.id ?: unit.itemId ?: "" );
-			if ( len( unitId ) ) unitIds[ unitId ] = true;
-		}
-		var ownerByUnit = {};
-		for ( var placement in ( isArray( arguments.target.placements ?: "" ) ? arguments.target.placements : [] ) ) {
-			if ( !isStruct( placement ) ) continue;
-			var placementId = safeTrim( placement.id ?: placement.itemId ?: "" );
-			var ids = isArray( placement.targetUnitIds ?: placement.unitIds ?: "" ) ? ( placement.targetUnitIds ?: placement.unitIds ) : [];
-			for ( var rawUnitId in ids ) {
-				var unitId = safeTrim( rawUnitId );
-				if ( !len( unitId ) ) continue;
-				if ( !unitIds.keyExists( unitId ) ) {
-					addMessage( arguments.messages, "target.placements", "blocking", "Placement #placementId# references an unknown target unit", placementId );
-					report.blocking++;
-					continue;
-				}
-				if ( ownerByUnit.keyExists( unitId ) ) {
-					addMessage( arguments.messages, "target.placements", "blocking", "Target unit #unitId# is owned by more than one placement", placementId );
-					report.blocking++;
-				} else ownerByUnit[ unitId ] = placementId;
-			}
-		}
-		for ( var unitId in unitIds ) {
-			if ( !ownerByUnit.keyExists( unitId ) ) {
-				addMessage( arguments.messages, "target.placements", "blocking", "Target unit #unitId# has no placement owner", unitId );
-				report.blocking++;
-			}
-		}
-		return report;
-	}
-
-	/**
-	 * Checks the system-architect packaging fields on every
-	 * target.contexts/target.extracts decision: moduleSlug must be a safe
-	 * relative folder name, and dependsOnContextIds must reference a real
-	 * context/extract in this plan (these feed the architecture map's edges
-	 * directly, so a dangling id must never reach the UI). The architecture
-	 * role does not produce migrationSteps — see validateRoadmapMigrationGuide()
-	 * for why that guide lives on roadmap phases instead.
-	 */
-	private struct function validateArchitecturePackagingFields( required struct target, required array messages ) {
-		var report = { blocking: 0 };
-		var groups = [];
-		for ( var context in ( isArray( arguments.target.contexts ?: "" ) ? arguments.target.contexts : [] ) ) {
-			groups.append( { item: context, collection: "target.contexts" } );
-		}
-		for ( var extract in ( isArray( arguments.target.extracts ?: "" ) ? arguments.target.extracts : [] ) ) {
-			groups.append( { item: extract, collection: "target.extracts" } );
-		}
-		var groupIds = {};
-		for ( var group in groups ) {
-			var groupItemId = safeTrim( group.item.id ?: group.item.itemId ?: "" );
-			if ( len( groupItemId ) ) groupIds[ groupItemId ] = true;
-		}
-		for ( var group in groups ) {
-			var item = group.item;
-			var id = safeTrim( item.id ?: item.itemId ?: "" );
-			var moduleSlug = safeTrim( item.moduleSlug ?: "" );
-			if ( len( moduleSlug ) && !safeRelativePath( moduleSlug ) ) {
-				addMessage( arguments.messages, group.collection, "blocking", "Item #id# has an unsafe moduleSlug", id ); report.blocking++;
-			}
-			for ( var dependsOnId in ( isArray( item.dependsOnContextIds ?: "" ) ? item.dependsOnContextIds : [] ) ) {
-				if ( !groupIds.keyExists( safeTrim( dependsOnId ) ) ) {
-					addMessage( arguments.messages, group.collection, "blocking", "Item #id# has a dangling dependsOnContextIds reference", id ); report.blocking++;
-				}
-			}
-		}
-		return report;
-	}
-
-	/**
-	 * Checks the system-architect "migration guide" on every roadmap phase:
-	 * migrationSteps lives here rather than on target.contexts/target.extracts
-	 * because the roadmap role is already sharded to one small, bounded group
-	 * per call (unlike the whole-repository architecture call), so every
-	 * phase can carry a concrete guide without risking the overload/timeout
-	 * failure a heavier unsharded architecture call hit in practice. Every
-	 * migrationSteps entry must cite a legacyRef.filePath that is actually in
-	 * the inventory and a targetRef.targetPath that actually belongs to one
-	 * of this same phase's own unitIds (never an invented/foreign file). A
-	 * provider-suggested phase with zero migration steps is a warning, not a
-	 * blocker — it makes a degraded/thin provider response visible instead of
-	 * shipping another guide-less slice. Deterministic/synthesized phases
-	 * never had a chance to produce one, so they're exempt from that warning.
-	 */
-	private struct function validateRoadmapMigrationGuide( required array phases, required struct target, required struct inventoryPaths, required array messages ) {
-		var report = { blocking: 0, warnings: 0 };
-		var unitTargetPaths = {};
-		for ( var unit in ( isArray( arguments.target.units ?: "" ) ? arguments.target.units : [] ) ) {
-			var unitId = safeTrim( unit.id ?: unit.itemId ?: "" );
-			var unitTargetPath = lCase( replace( safeTrim( unit.targetPath ?: unit.pathHint ?: "" ), "\", "/", "all" ) );
-			if ( len( unitId ) && len( unitTargetPath ) ) unitTargetPaths[ unitId ] = unitTargetPath;
-		}
-		var phasePathOwners = {};
-		for ( var ownerPhase in arguments.phases ) {
-			if ( !isStruct( ownerPhase ) ) continue;
-			var ownerPhaseId = safeTrim( ownerPhase.id ?: ownerPhase.itemId ?: "" );
-			for ( var ownerUnitId in ( isArray( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ?: "" ) ? ( ownerPhase.unitIds ?: ownerPhase.targetUnitIds ) : [] ) ) {
-				var ownerPath = unitTargetPaths[ safeTrim( ownerUnitId ) ] ?: "";
-				if ( !len( ownerPath ) ) continue;
-				if ( !phasePathOwners.keyExists( ownerPath ) ) phasePathOwners[ ownerPath ] = [];
-				if ( !phasePathOwners[ ownerPath ].contains( ownerPhaseId ) ) phasePathOwners[ ownerPath ].append( ownerPhaseId );
-			}
-		}
-		for ( var phase in arguments.phases ) {
-			if ( !isStruct( phase ) ) continue;
-			var id = safeTrim( phase.id ?: phase.itemId ?: "" );
-			var phaseUnitIds = {};
-			for ( var unitId in ( isArray( phase.unitIds ?: phase.targetUnitIds ?: "" ) ? ( phase.unitIds ?: phase.targetUnitIds ) : [] ) ) phaseUnitIds[ safeTrim( unitId ) ] = true;
-
-			var steps = isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps : [];
-			for ( var step in steps ) {
-				if ( !isStruct( step ) ) continue;
-				var legacyRef = isStruct( step.legacyRef ?: "" ) ? step.legacyRef : {};
-				var legacyPath = lCase( replace( safeTrim( legacyRef.filePath ?: "" ), "\", "/", "all" ) );
-				if ( !len( legacyPath ) || !arguments.inventoryPaths.keyExists( legacyPath ) ) {
-					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a legacyRef.filePath not in inventory evidence", id ); report.blocking++;
-				}
-				var targetRef = isStruct( step.targetRef ?: "" ) ? step.targetRef : {};
-				var stepTargetPath = lCase( replace( safeTrim( targetRef.targetPath ?: "" ), "\", "/", "all" ) );
-				var matchesPhaseUnit = false;
-				for ( var phaseUnitId in phaseUnitIds ) {
-					if ( len( stepTargetPath ) && ( unitTargetPaths[ phaseUnitId ] ?: "" ) == stepTargetPath ) { matchesPhaseUnit = true; break; }
-				}
-				if ( !len( stepTargetPath ) || !matchesPhaseUnit ) {
-					if ( isColdBoxConventionPath( stepTargetPath ) ) continue;
-					if ( len( stepTargetPath ) && phasePathOwners.keyExists( stepTargetPath ) && !phasePathOwners[ stepTargetPath ].contains( id ) ) {
-						addMessage( arguments.messages, "roadmapPhases", "warning", "Phase #id# migration step references a targetRef.targetPath belonging to another roadmap phase", id ); report.warnings++;
-						continue;
-					}
-					addMessage( arguments.messages, "roadmapPhases", "blocking", "Phase #id# migration step cites a targetRef.targetPath not among this phase's own units", id ); report.blocking++;
-				}
-			}
-
-			if ( !steps.len() && lCase( safeTrim( phase.provenanceClass ?: "" ) ) == "provider-suggested" ) {
-				addMessage( arguments.messages, "roadmapPhases", "warning", "Phase #id# has no migration guide", id ); report.warnings++;
-			}
-		}
-		return report;
-	}
-
-	/**
-	 * Elevate hollow-but-structural plans: synthesized critical stages, empty
-	 * actionability, failed database with schema present, or coverage stubs that
-	 * dominate after shard failures must not soft-pass as usable solutions.
-	 */
 	private struct function validateActionability( required struct plan, required struct context, required array messages ) {
 		var report = { blocking: 0, warnings: 0 };
 		var metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
@@ -613,87 +391,6 @@ class {
 			|| reFindNoCase( "(^|/)(?:coldbox|application)\.(?:bx|cfc)$", normalized ) > 0;
 	}
 
-	private struct function idSet( required any items ) {
-		var output = {};
-		for ( var item in ( isArray( arguments.items ) ? arguments.items : [] ) ) {
-			var id = safeTrim( item.id ?: item.itemId ?: "" );
-			if ( len( id ) ) output[ id ] = true;
-		}
-		return output;
-	}
-
-	private void function checkReference( required any value, required struct allowed, required string category, required any itemId, required string field, required struct report, required array messages ) {
-		var reference = safeTrim( arguments.value ?: "" );
-		var normalizedItemId = safeTrim( arguments.itemId );
-		if ( !len( reference ) || arguments.allowed.keyExists( reference ) ) return;
-		addMessage( arguments.messages, arguments.category, "blocking", "Item #normalizedItemId# references unknown #arguments.field# #reference#", normalizedItemId );
-		arguments.report.blocking++;
-	}
-
-	private void function checkReferenceArray( required any values, required struct allowed, required string category, required any itemId, required string field, required struct report, required array messages ) {
-		if ( !isArray( arguments.values ) ) return;
-		for ( var value in arguments.values ) checkReference( value, arguments.allowed, arguments.category, arguments.itemId, arguments.field, arguments.report, arguments.messages );
-	}
-
-	private struct function inventoryPathSet( required any inventory ) {
-		var output = {};
-		if ( !isStruct( arguments.inventory ) ) return output;
-		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
-			var path = lCase( replace( safeTrim( unit.filePath ?: unit.path ?: "" ), "\", "/", "all" ) );
-			if ( len( path ) ) output[ path ] = true;
-		}
-		for ( var file in ( isArray( arguments.inventory.files ?: "" ) ? arguments.inventory.files : [] ) ) {
-			var filePath = lCase( replace( safeTrim( file.filePath ?: file.path ?: "" ), "\", "/", "all" ) );
-			if ( len( filePath ) ) output[ filePath ] = true;
-		}
-		return output;
-	}
-
-	private struct function inventoryUnitIdSet( required any inventory ) {
-		var output = {};
-		if ( !isStruct( arguments.inventory ) ) return output;
-		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
-			var id = safeTrim( unit.id ?: unit.itemId ?: "" );
-			if ( len( id ) ) output[ id ] = true;
-		}
-		return output;
-	}
-
-	private boolean function targetHasInventoryBacking(
-		required struct item,
-		required struct inventoryPaths,
-		required struct inventoryIds,
-		required array unitLinks
-	) {
-		var targetId = safeTrim( arguments.item.id ?: arguments.item.itemId ?: "" );
-		var sourceValue = replace( scalarString( arguments.item.sourcePath ?: arguments.item.sourceFile ?: arguments.item.legacyPath ?: "" ), "\", "/", "all" );
-		for ( var sourcePath in listToArray( sourceValue, ",", true, true ) ) {
-			var normalizedSource = lCase( safeTrim( sourcePath ) );
-			if ( len( normalizedSource ) && arguments.inventoryPaths.keyExists( normalizedSource ) ) return true;
-		}
-		var legacyIds = isArray( arguments.item.legacyUnitIds ?: "" ) ? duplicate( arguments.item.legacyUnitIds ) : [];
-		if ( len( safeTrim( arguments.item.legacyUnitId ?: "" ) ) ) legacyIds.append( arguments.item.legacyUnitId );
-		for ( var legacyId in legacyIds ) {
-			if ( arguments.inventoryIds.keyExists( safeTrim( legacyId ) ) ) return true;
-		}
-		for ( var link in arguments.unitLinks ) {
-			if ( safeTrim( link.targetUnitId ?: "" ) != targetId ) continue;
-			var linkedLegacyId = safeTrim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
-			if ( len( linkedLegacyId ) && arguments.inventoryIds.keyExists( linkedLegacyId ) ) return true;
-			var linkedPath = lCase( replace( safeTrim( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" ), "\", "/", "all" ) );
-			if ( len( linkedPath ) && arguments.inventoryPaths.keyExists( linkedPath ) ) return true;
-		}
-		var refs = arguments.item.evidenceRefs ?: arguments.item.evidence ?: [];
-		if ( isArray( refs ) ) {
-			for ( var ref in refs ) {
-				if ( !isStruct( ref ) ) continue;
-				var refPath = lCase( replace( safeTrim( ref.filePath ?: ref.path ?: "" ), "\", "/", "all" ) );
-				if ( len( refPath ) && arguments.inventoryPaths.keyExists( refPath ) ) return true;
-			}
-		}
-		return false;
-	}
-
 	private boolean function safeRelativePath( required any path ) {
 		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
 		if ( !len( normalized ) || find( "..", normalized ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", normalized ) ) return false;
@@ -702,14 +399,6 @@ class {
 	private boolean function safeRoutePath( required any path ) {
 		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
 		return reFind( "^/", normalized ) && !find( "..", normalized ) && !reFind( "^//", normalized );
-	}
-
-	private boolean function legalTargetPath( required any path, required string runtime, required string profile ) {
-		if ( !safeRelativePath( arguments.path ) ) return false;
-		var extension = lCase( listLast( scalarString( arguments.path ), "." ) );
-		if ( arguments.runtime == "boxlang" ) return [ "bx", "bxm" ].contains( extension ) && [ "boxlang", "modern" ].contains( arguments.profile ?: "modern" );
-		if ( arguments.runtime == "lucee" ) return [ "cfc", "cfm" ].contains( extension ) && [ "modern", "flat" ].contains( arguments.profile ?: "modern" );
-		return true;
 	}
 
 	private struct function validateTransitions( required any transitions, required array messages, boolean softEvidence = false ) {

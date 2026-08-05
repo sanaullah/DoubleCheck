@@ -295,6 +295,13 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			// `result` is in-memory only, and getResult() rehydrates from the
 			// stored plan.
 			plan.derived = result.derived;
+			// Derivation supplies the placements. This is the inversion itself:
+			// the boundary decision comes from coupling evidence, and the model's
+			// contribution is naming and narration on top of it. Without this the
+			// derived structure is only an advisory field beside a provider-made
+			// decision, and every line of identifier reconciliation that exists to
+			// make provider-invented ids resolve is still load-bearing.
+			plan = placementServiceInstance().applyDerivedPlacements( plan, derivedClusters );
 			plan = mergeSourceModernizeCoverage( arguments.run, plan );
 			var placementService = placementServiceInstance();
 			var gateService = gateServiceInstance();
@@ -302,7 +309,7 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			// canonical v2 placement artifact before the first validation/save.
 			// The adapter is deterministic, bounded, and keeps a marked legacy
 			// projection so existing consumers can coexist during rollout.
-			plan = placementService.canonicalize( plan, evidence, true );
+			plan = placementService.canonicalize( plan, evidence );
 			plan = gateService.evaluatePlan( plan, evidence );
 			plan = placementService.refreshFingerprints( plan );
 			plan.schemaVersion = placementService.planVersion();
@@ -323,53 +330,10 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				// but must not discard already accepted provider fragments.
 				plan.state = "needs-review";
 				modernizationRepository.savePlan( runId, plan, validation, coverage );
-				// Repair is deliberately bounded and fingerprint-scoped.  A repair
-				// response can replace only invalid items identified by this report;
-				// valid items and the rest of the artifact remain untouched.
-				var repairRound = 0;
-				var runBudgets = arguments.run.getBudgets() ?: {};
-				var requestedRepairRounds = runBudgets.maxRepairRounds ?: runBudgets.maxIterations ?: 2;
-				var repairLimit = isNumeric( requestedRepairRounds ) ? min( 2, max( 0, int( requestedRepairRounds ) ) ) : 2;
-				while ( ( validation.blocking ?: 0 ) > 0 && repairRound < repairLimit ) {
-					checkCancellation( arguments.callbacks );
-					repairRound++;
-					emit( arguments.callbacks, 88, "modernization-repair", "Repairing only invalid modernization items" );
-					var repair = proposalService.repair(
-						runId,
-						plan,
-						validation,
-						proposalInput,
-						evidence,
-						repairRound,
-						{
-							isCancelled: () => isCancelled( pipelineCallbacks ),
-							budgets: arguments.run.getBudgets() ?: {},
-							startedAt: getTickCount(),
-							maxDurationMs: max(
-								5000,
-								val( ( arguments.run.getBudgets() ?: {} ).maxDurationMs ?: 180000 ) - ( getTickCount() - pipelineStartedAt )
-							),
-							onObservation: ( observation ) => {
-								if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
-							}
-						}
-					);
-					checkpoint( runId, "repair-#repairRound#", repair, 88, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
-					if ( !( repair.ok ?: false ) || !( repair.repaired ?: false ) ) {
-						if ( len( trim( repair.reason ?: "" ) ) ) result.errors.append( { stage: "repair", message: repair.reason } );
-						break;
-					}
-					plan = repair.plan ?: plan;
-					plan = placementService.canonicalize( plan, evidence, true );
-					plan = gateService.evaluatePlan( plan, evidence );
-					plan = placementService.refreshFingerprints( plan );
-					plan.schemaVersion = placementService.planVersion();
-					plan.metadata = plan.metadata ?: {};
-					plan.metadata.runId = runId;
-					plan.coverage = coverage;
-					validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
-					plan.validation = validation;
-				}
+				// The repair round is gone with the repair role. It existed to ask the
+				// model to fix its own invalid structure; structure now comes from the
+				// coupling graph, so an invalid item is a bug in derivation to be fixed
+				// here, not a prompt to be retried. Validation still reports it.
 				emit( arguments.callbacks, 94, "modernization-roadmap", "Assembling the bounded modernization roadmap" );
 				checkCancellation( arguments.callbacks );
 								var planState = validation.ok ? "needs-review" : "needs-review";
@@ -873,4 +837,5 @@ property name="modernizationGateService" inject="ModernizationGateService";
 		}
 		return result;
 	}
+
 }
