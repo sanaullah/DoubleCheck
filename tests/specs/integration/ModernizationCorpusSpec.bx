@@ -254,6 +254,69 @@ class extends="coldbox.system.testing.BaseTestCase" {
 				} );
 			} );
 
+			describe( "Step 3b stop conditions", () => {
+
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+				var baseline = jsonDeserialize( fileRead( corpusPath & "/baseline-llm-path.json", "UTF-8" ) );
+
+				var verdictFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					var clusters = derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+					var extracted = [];
+					for ( var cluster in clusters ) {
+						if ( cluster.placementType == "external-service" ) extracted.append( cluster.domainKey );
+					}
+					return { clusters: clusters, extracted: extracted };
+				};
+
+				it( "1: false-seam is rejected — the decisive gate", () => {
+					var verdict = verdictFor( "false-seam" );
+					expect( verdict.extracted ).toBeEmpty(
+						"nothing in false-seam may be proposed for extraction, found: " & verdict.extracted.toList( ", " )
+					);
+				} );
+
+				it( "2: below-inference-threshold yields real seams, not one default cluster", () => {
+					expect( verdictFor( "below-inference-threshold" ).clusters.len() ).toBeGTE( 2 );
+				} );
+
+				it( "3: cyclic-boundary reports the cycle and blocks extraction", () => {
+					var inventory = inventoryService.build( { files: caseById[ "cyclic-boundary" ].files } );
+					var graph = graphService.build( inventory );
+
+					expect( graph.getMetrics().cycles ).notToBeEmpty();
+					expect( verdictFor( "cyclic-boundary" ).extracted ).toBeEmpty();
+				} );
+
+				it( "4: separable-domain IS extracted — the load-bearing condition", () => {
+					// The baseline extracts nothing anywhere, so a precision-only
+					// comparison is passed by refusing everything. This is the
+					// condition that cannot be satisfied by silence.
+					expect( verdictFor( "separable-domain" ).extracted ).notToBeEmpty(
+						"the derived path must be able to say yes, not only no"
+					);
+				} );
+
+				it( "5: seamRecall beats the captured LLM baseline", () => {
+					var baselineRecall = baseline.cases[ "separable-domain" ].seamRecall;
+					var derivedExtracted = verdictFor( "separable-domain" ).extracted.len();
+
+					expect( baselineRecall ).toBe( 0, "baseline should have missed the separable domain" );
+					expect( derivedExtracted ).toBeGT(
+						baselineRecall,
+						"the inversion must improve recall, not just avoid regressing precision"
+					);
+				} );
+
+				it( "5b: precision does not regress — no false extraction anywhere", () => {
+					var falseExtractions = 0;
+					for ( var id in [ "false-seam", "cyclic-boundary", "below-inference-threshold" ] ) {
+						falseExtractions += verdictFor( id ).extracted.len();
+					}
+					expect( falseExtractions ).toBe( 0 );
+				} );
+			} );
+
 			it( "covers every signal group across the four cases", () => {
 				var signalService = getInstance( "ModernizationSignalService" );
 				var groups = {};

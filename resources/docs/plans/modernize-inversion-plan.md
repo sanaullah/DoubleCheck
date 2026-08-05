@@ -70,7 +70,7 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 2 | Promote synthesis | `done` (uncommitted) | deterministic corpus tier green on all four scenarios | **All seven items done** (550·0·0·1). Synthesis moved; clustering is weighted modularity; wave order derived; target-path has one owner; shards key to clusters; `execute()` wired and verified by a live run; checkpoints + ladder re-plotted (contract v9) |
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
 | 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
-| 3a | Re-point client + tests | `todo` | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | |
+| 3a | Re-point client + tests | `done` (uncommitted) | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | 550·0·0·1, JS 3/3, routes 200. Single owner for `stayInMonolith` (server) and `placementTypeOf` (client); `modernizationPlacements()` resolves derived → provider → legacy. Live-verified: the UI now renders the derived verdict where it previously showed the provider's weaker one |
 | 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
 | 5 | Re-point the roles | `todo` | LLM corpus tier runs; token + wall-clock baseline recorded | |
@@ -1600,10 +1600,48 @@ while the LLM path is still there to fall back to.
 4. Derive `stayInMonolith`, `packaging`, `sourceItemType` at render time. Stop
    *reading* the stored copies; leave the writes in place until 3b.
 
-**Gate:** full TestBox suite green; `node --test tests/js/` green; deterministic
+**Gate:** full TestBox suite green; `node --test tests/js/*.spec.mjs` green; deterministic
 corpus tier green; app boots and all three routes load — **with the derived path
 serving every one of them.** The LLM path is now dead weight rather than a
 dependency, which is precisely the state 3b is safe to act on.
+
+### Done — and the gate caught the thing the specs could not
+
+Suite 550 · 0 · 0 · 1, JS 3/3, all three routes 200.
+
+**Counts re-derived first**, as item 0 requires, with the regex stated: `app.js`
+has 15 `contexts|extracts` lines and **41** other plan-shape lines (not 17);
+`modernization-render-helpers.js` has 12. Modernization-named TestBox specs hold
+**1,211** `expect(` calls — the §2.10 ceiling reading was far closer than its 594
+estimate.
+
+**One invariant, one owner, twice.** `stayInMonolith` was derived by the same
+inline expression in five server places; it is now
+`ModernizationPlacementService.staysInMonolith()`. On the client
+`placementType || packaging` was inlined in six places; it is now
+`placementTypeOf()`. Both are the §2.7 duplication class, caught before they
+could disagree rather than after.
+
+**The live check found the real defect.** With the suite green, a real run showed
+the derived structure and the provider's placements **disagreeing inside the same
+artifact** — derivation said two `coldbox-module`, the provider said two
+`main-app` — and the UI rendered the provider's weaker answer. Every spec passed
+throughout, because none asserted which source wins.
+
+`modernizationPlacements()` now decides that in one place, in order of authority:
+`derived.clusters` → `target.placements` → `contexts`/`extracts`. Derived wins
+because it is evidence rather than assertion. Verified live: the run that showed
+*2 centralized* now shows **2 modules**.
+
+**A regression the existing suite caught.** The first resolver defaulted every
+legacy item to `main-app`, silently turning untyped members of the `extracts`
+array into centralized placements — in the v1 vocabulary the array *is* the
+verdict. The 108-assertion JS spec failed on it immediately, which is the return
+on Step 0.5 wiring those into the gate.
+
+**Nothing was deleted.** The provider path and the legacy projection still work
+when derivation is absent, both covered by specs. That is what makes 3b a
+deletion rather than a rewrite.
 
 **If this gate cannot be reached, stop here.** Nothing has been lost, the
 baseline is still reproducible, and the answer is that the derived path is not
