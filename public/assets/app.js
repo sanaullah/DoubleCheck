@@ -2756,7 +2756,7 @@ function renderModernizationDetailSummary(host, item = {}) {
 		add("Transition notes", item.notes || item.description);
 		add("Confidence", item.confidence);
 	} else if (item._modernizationType === "placement") {
-		const placementType = String(item.placementType || item.packaging || "main-app").toLowerCase();
+		const placementType = placementTypeOf(item);
 		add("Recommended placement", placementType === "external-service"
 			? "External-service candidate"
 			: (placementType === "coldbox-module"
@@ -3181,8 +3181,8 @@ function renderModernizationArchitecture(result = {}) {
 	const placements = Array.isArray(result.target?.placements) && result.target.placements.length
 		? result.target.placements
 		: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
-	const contexts = placements.filter((item) => !["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
-	const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+	const contexts = placements.filter((item) => !isExtractPlacement(item));
+	const extracts = placements.filter((item) => isExtractPlacement(item));
 	host.hidden = !placements.length;
 	if (host.hidden) return;
 	const architectureCoverage = document.querySelector("#modernization-architecture-coverage");
@@ -3322,7 +3322,7 @@ function renderModernizationArchitectureDetail(item) {
 		host.appendChild(emptyStateElement({ icon: "detail", title: "Select a packaging decision", hint: "Click a node on the map for its migration blueprint." }));
 		return;
 	}
-	const placementType = String(item.placementType || item.packaging || "").toLowerCase();
+	const placementType = placementTypeOf(item);
 	const isExtract = item._modernizationType === "extract" || ["external-service", "microservice", "side-app", "extract"].includes(placementType);
 	const card = document.createElement("div");
 	card.className = "modernization-detail-card";

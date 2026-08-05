@@ -18,6 +18,9 @@
 class threadsafe {
 
 	property name="identityService" inject="ModernizationIdentityService";
+	// Placement owns the stayInMonolith derivation; this service asks rather
+	// than re-deriving. Both are deterministic, so the no-gateway invariant holds.
+	property name="placementService" inject="ModernizationPlacementService";
 	property name="log" inject="logbox:logger:{this}";
 
 	// Configuration, not state. These were class-body constants on
@@ -44,6 +47,9 @@ class threadsafe {
 	function init() {
 		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) {
 			variables.identityService = new app.models.services.ModernizationIdentityService();
+		}
+		if ( isNull( variables.placementService ?: javacast( "null", "" ) ) ) {
+			variables.placementService = new app.models.services.ModernizationPlacementService();
 		}
 		return this;
 	}
@@ -474,7 +480,7 @@ class threadsafe {
 				placementType: cluster.placementType,
 				domainKey: cluster.domainKey,
 				recommendation: cluster.rationale,
-				stayInMonolith: ![ "external-service" ].contains( cluster.placementType ),
+				stayInMonolith: placementService.staysInMonolith( cluster.placementType ),
 				targetUnitIds: duplicate( cluster.targetUnitIds ),
 				evidenceRefs: evidenceRefsForUnitIds( cluster.targetUnitIds, evidenceByUnit ),
 				newProposal: true,
@@ -1271,7 +1277,7 @@ class threadsafe {
 				);
 				placement.placementType = nextType;
 				placement.packaging = nextType == "coldbox-module" ? "coldbox-module" : ( nextType == "external-service" ? "external-service" : ( [ "background-worker", "scheduled-service" ].contains( nextType ) ? "worker" : "centralized" ) );
-				placement.stayInMonolith = nextType != "external-service";
+				placement.stayInMonolith = placementService.staysInMonolith( nextType );
 				if ( nextType == "main-app" && reFindNoCase( "module candidate", placement.name ?: "" ) ) {
 					placement.name = "Main app: " & trim( reReplaceNoCase( placement.name, "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
 				}
@@ -1295,7 +1301,7 @@ class threadsafe {
 				);
 				ctx.placementType = ctxType;
 				ctx.packaging = ctxType == "coldbox-module" ? "coldbox-module" : ( [ "background-worker", "scheduled-service" ].contains( ctxType ) ? "worker" : "centralized" );
-				ctx.stayInMonolith = ctxType != "external-service";
+				ctx.stayInMonolith = placementService.staysInMonolith( ctxType );
 			}
 		}
 		return arguments.plan;

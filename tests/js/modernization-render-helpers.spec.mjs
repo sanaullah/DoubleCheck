@@ -485,3 +485,41 @@ assert.deepEqual(helpers.modernizationSliceDifficulty({}, {}), { total: 0, group
 assert.deepEqual(helpers.modernizationSliceDifficulty({ signals: [] }, { unitIds: ["tu-a"] }), { total: 0, groups: [] });
 
 console.log("modernization-render-helpers.spec.mjs OK");
+
+// --- placement derivation: one owner, derived at render time ---------------
+// `packaging` is the provider's older vocabulary for `placementType`, so every
+// read has to fall back to it. That fallback used to be inlined in six places
+// across the helpers and app.js.
+assert.equal(helpers.placementTypeOf({ placementType: "External-Service" }), "external-service");
+assert.equal(helpers.placementTypeOf({ packaging: "coldbox-module" }), "coldbox-module");
+assert.equal(helpers.placementTypeOf({ placementType: "main-app", packaging: "external-service" }), "main-app");
+assert.equal(helpers.placementTypeOf({}), "main-app");
+
+assert.equal(helpers.isExtractPlacement({ placementType: "external-service" }), true);
+assert.equal(helpers.isExtractPlacement({ packaging: "side-app" }), true);
+assert.equal(helpers.isExtractPlacement({ placementType: "coldbox-module" }), false);
+assert.equal(helpers.isModulePlacement({ packaging: "module" }), true);
+assert.equal(helpers.isModulePlacement({ placementType: "external-service" }), false);
+
+// stayInMonolith is derived, never read from the artifact. A stored value that
+// disagrees with placementType must not win -- that stored copy disappears in
+// Step 3b and the UI cannot depend on it.
+assert.equal(helpers.staysInMonolith({ placementType: "external-service" }), false);
+assert.equal(helpers.staysInMonolith({ placementType: "coldbox-module" }), true);
+assert.equal(helpers.staysInMonolith({ placementType: "main-app" }), true);
+assert.equal(helpers.staysInMonolith({ placementType: "external-service", stayInMonolith: true }), false);
+assert.equal(helpers.staysInMonolith({ placementType: "main-app", stayInMonolith: false }), true);
+
+// The map must read target.placements in preference to the legacy projection.
+const derivedMap = helpers.buildModernizationArchitectureSubgraph({
+	target: {
+		placements: [
+			{ id: "p1", name: "Notifications", placementType: "external-service", targetUnitIds: ["u1"] },
+			{ id: "p2", name: "Orders", placementType: "main-app", targetUnitIds: ["u2"] }
+		],
+		contexts: [{ id: "legacy", name: "Should be ignored", targetUnitIds: ["u9"] }]
+	}
+});
+assert.equal(derivedMap.lanes.extracts, 1, "placements must win over the legacy contexts projection");
+assert.ok(derivedMap.nodes.some((node) => node.path === "Notifications" && node.role === "extract"), "the extracted placement must appear on the map in the extract lane");
+assert.ok(!derivedMap.nodes.some((node) => node.path === "Should be ignored"), "the legacy projection must not be read when placements exist");

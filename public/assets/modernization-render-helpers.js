@@ -9,6 +9,38 @@
 	if (typeof module === "object" && module.exports) module.exports = api;
 	if (root) Object.assign(root, api);
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
+	/*
+	 * Placement type, derived once.
+	 *
+	 * `packaging` is the provider's older vocabulary for the same idea, so every
+	 * read has to fall back to it. That fallback was inlined in six places
+	 * across this file and app.js, which is how one invariant ends up with six
+	 * owners that can drift apart. Read it through here instead.
+	 */
+	function placementTypeOf(item = {}) {
+		return String(item.placementType || item.packaging || "main-app").toLowerCase();
+	}
+
+	const EXTRACT_TYPES = ["external-service", "microservice", "side-app", "extract"];
+	const MODULE_TYPES = ["coldbox-module", "module"];
+
+	function isExtractPlacement(item = {}) {
+		return EXTRACT_TYPES.includes(placementTypeOf(item));
+	}
+
+	function isModulePlacement(item = {}) {
+		return MODULE_TYPES.includes(placementTypeOf(item));
+	}
+
+	/*
+	 * Derived at render time, never read from the artifact. The server still
+	 * persists `stayInMonolith` until Step 3b removes it; the client must not
+	 * depend on that, so it computes the same rule the placement service owns.
+	 */
+	function staysInMonolith(item = {}) {
+		return !EXTRACT_TYPES.includes(placementTypeOf(item));
+	}
+
 	function phaseHasCodeLinks(phase = {}) {
 		return !!(
 			(Array.isArray(phase.unitIds) && phase.unitIds.length) ||
@@ -236,8 +268,8 @@
 		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
 			? result.target.placements
 			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
-		const modules = placements.filter((item) => ["coldbox-module", "module"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
-		const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+		const modules = placements.filter(isModulePlacement);
+		const extracts = placements.filter(isExtractPlacement);
 		const central = placements.filter((item) => !modules.includes(item) && !extracts.includes(item));
 
 		const nodes = [];
@@ -497,8 +529,8 @@
 		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
 			? result.target.placements
 			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
-		const modules = placements.filter((item) => ["coldbox-module", "module"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
-		const extracts = placements.filter((item) => ["external-service", "microservice", "side-app", "extract"].includes(String(item.placementType || item.packaging || "").toLowerCase()));
+		const modules = placements.filter(isModulePlacement);
+		const extracts = placements.filter(isExtractPlacement);
 		const effortCounts = { S: 0, M: 0, L: 0, XL: 0 };
 		let riskyPhaseCount = 0;
 		phases.forEach((phase) => {
@@ -529,6 +561,10 @@
 	}
 
 	return {
+		placementTypeOf,
+		isExtractPlacement,
+		isModulePlacement,
+		staysInMonolith,
 		phaseHasCodeLinks,
 		modernizationItems,
 		modernizationItemLabel,
