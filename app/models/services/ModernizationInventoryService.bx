@@ -7,8 +7,12 @@
 class threadsafe {
 	property name="identityService" inject="ModernizationIdentityService";
 	property name="maxDeepFiles" inject="coldbox:setting:modernizeInventoryMaxDeepFiles";
-	variables.version       = "cfml-inventory-conservative-v5";
+	variables.version       = "cfml-inventory-conservative-v6";
 	variables.patternCache  = {};
+	// How far SQL analysis continues after a query opens. Long enough for a
+	// realistic multi-line statement, short enough that an unclosed tag cannot
+	// make the remainder of a file look like SQL.
+	variables.maxSqlBlockLines = 40;
 
 	struct function build( required any scan ) {
 		var files = isStruct( arguments.scan ) ? ( arguments.scan.files ?: [] ) : arguments.scan;
@@ -95,6 +99,12 @@ class threadsafe {
 			for ( var unresolvedItem in functionsFound.unresolved ) unresolved.append( unresolvedItem );
 
 			var cfmlCommentOpen = false;
+			// Tag-based CFML puts its SQL on the lines *after* <cfquery>, which
+			// is the dominant shape in the legacy estates this tool reads. SQL
+			// analysis therefore continues for a bounded window after a query
+			// opens, or table references — and with them the whole co-access
+			// picture — are silently missed on every multi-line query.
+			var sqlBlockLinesRemaining = 0;
 			for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
 				var sourceLine = toString( lines[ lineNumber ] );
 				var commentSafe = stripCfmlComments( sourceLine, cfmlCommentOpen );
@@ -108,10 +118,17 @@ class threadsafe {
 				var includeMatch = variables.javaPatternMatcher( "(?:<cfinclude\\s+template\\s*=\\s*|\\binclude\\s+)[^A-Za-z0-9_./-]*([A-Za-z0-9_./-]+)", sourceLine );
 				if ( includeMatch.find() ) {
 					var includeTarget = includeMatch.group( 1 );
-					var includeResolution = resolveTarget( includeTarget, resolutionIndex );
-					if ( isStruct( includeResolution ) ) includeResolution.resolution = includeResolution.resolution ?: "include";
+					// The capture stops at the first '#', so an interpolated
+					// template yields a truncated prefix that never contains one.
+					// Testing the captured target for '#' therefore never fires,
+					// and the truncated prefix can resolve to a real file — an
+					// invented edge. Judge the source line instead, and refuse to
+					// resolve anything interpolated.
+					var dynamicInclude = find( char( 35 ), sourceLine ) > 0;
+					var includeResolution = dynamicInclude ? {} : resolveTarget( includeTarget, resolutionIndex );
+					if ( isStruct( includeResolution ) && !includeResolution.isEmpty() ) includeResolution.resolution = includeResolution.resolution ?: "include";
 					dependencies.append( dependency( "include", includeTarget, lineEvidence, includeResolution ) );
-					if ( find( char( 35 ), includeTarget ) ) unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
+					if ( dynamicInclude ) unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
 				} else if ( reFindNoCase( "<cfinclude\\b|\\binclude\\s+", sourceLine ) ) {
 					unresolved.append( unresolvedEvidence( "dynamic-include", path, lineNumber, sourceLine ) );
 				}
@@ -156,8 +173,17 @@ class threadsafe {
 				if ( reFindNoCase( "(cf_file|fileRead|fileWrite|fileCopy|fileMove|directoryList|directoryCreate|fileUpload|cffile)", sourceLine ) ) dependencies.append( dependency( "filesystem", "filesystem", lineEvidence ) );
 				if ( ( findNoCase( "createobject", sourceLine ) && findNoCase( "java", sourceLine ) ) || findNoCase( "new java.", sourceLine ) ) dependencies.append( dependency( "java", "java-interop", lineEvidence ) );
 				if ( reFindNoCase( "(datasource|this[.]datasource)[ ]*=", sourceLine ) ) dependencies.append( dependency( "datasource", extractQuotedOrValue( sourceLine, "datasource" ), lineEvidence ) );
-				if ( reFindNoCase( "(queryExecute|executeQuery|cfquery|queryNew|cfstoredproc)", sourceLine ) ) {
+				var opensQuery = reFindNoCase( "(queryExecute|executeQuery|cfquery|queryNew|cfstoredproc)", sourceLine ) > 0;
+				if ( opensQuery ) {
 					dependencies.append( dependency( "query", "sql", lineEvidence ) );
+					// Bounded so a stray unclosed tag cannot make the rest of a
+					// file look like SQL.
+					sqlBlockLinesRemaining = variables.maxSqlBlockLines;
+				}
+				if ( reFindNoCase( "</cfquery|</cfstoredproc", sourceLine ) ) sqlBlockLinesRemaining = 0;
+
+				if ( opensQuery || sqlBlockLinesRemaining > 0 ) {
+					if ( !opensQuery ) sqlBlockLinesRemaining--;
 					if ( reFindNoCase( "(cf_sql_[A-Za-z0-9_]+|cfsqltype|sqltype)", sourceLine ) ) dependencies.append( dependency( "sql-type-hint", "sql-type-hint", lineEvidence ) );
 					if ( reFindNoCase( "cfstoredproc|CALL[ ]+[A-Za-z_]", sourceLine ) ) dependencies.append( dependency( "sql-proc-call", "stored-procedure", lineEvidence ) );
 					var sqlInfo = sqlReferences( sourceLine );

@@ -1,0 +1,208 @@
+/**
+ * Deterministic tier of the modernization corpus.
+ *
+ * Calls the derivation services directly — inventory -> coupling graph — rather
+ * than executing a modernize run, because a keyless run is impossible and the
+ * run lifecycle adds nothing to what is being measured.
+ *
+ * Predicate kinds that need clustering, placement or gates land in Step 2. This
+ * spec asserts they are *declared* and reports them as pending, so the manifest
+ * cannot quietly claim coverage the code does not yet have.
+ */
+class extends="coldbox.system.testing.BaseTestCase" {
+
+	function run() {
+		describe( "Modernization corpus — deterministic tier", () => {
+
+			var evaluationService = getInstance( "EvaluationService" );
+			var inventoryService = getInstance( "ModernizationInventoryService" );
+			var graphService = getInstance( "ModernizationCouplingGraphService" );
+
+			var corpusPath = getInstance( dsl = "coldbox:setting:modernizationCorpusPath" );
+			var corpus = evaluationService.loadCorpus( corpusPath );
+
+			var caseById = {};
+			for ( var corpusCase in corpus.cases ) caseById[ corpusCase.id ] = corpusCase;
+
+			var graphFor = ( id ) => {
+				var subject = caseById[ id ];
+				return graphService.build( inventoryService.build( { files: subject.files } ) );
+			};
+
+			var norm = ( path ) => lCase( replace( path, "\", "/", "all" ) );
+
+			// resources both files touch
+			var sharedResources = ( graph, a, b ) => {
+				var shared = [];
+				for ( var key in graph.metrics.coAccess ) {
+					var files = graph.metrics.coAccess[ key ];
+					if ( files.contains( norm( a ) ) && files.contains( norm( b ) ) ) shared.append( key );
+				}
+				shared.sort( ( x, y ) => compareNoCase( x, y ) );
+				return shared;
+			};
+
+			// Predicate kinds this tier can evaluate today.
+			var supportedKinds = [ "co-access-shared", "co-access-disjoint", "shared-state-shared", "cycle-reported" ];
+
+			it( "loads without changing EvaluationService.loadCorpus", () => {
+				expect( corpus.version ).toBe( "modernization-corpus-v1" );
+				expect( corpus.cases ).toHaveLength( 4 );
+			} );
+
+			it( "declares every case the plan requires", () => {
+				for ( var required in [ "false-seam", "separable-domain", "below-inference-threshold", "cyclic-boundary" ] ) {
+					expect( caseById ).toHaveKey( required );
+				}
+			} );
+
+			it( "must never promote a language capability tier", () => {
+				// A modernize gate run writing language_capabilities would
+				// overwrite the review-measured tier behind /api/v1/capabilities.
+				var raw = jsonDeserialize( fileRead( corpusPath & "/manifest.json", "UTF-8" ) );
+				expect( raw.promotesLanguageTier ).toBeFalse();
+				expect( raw.corpusKind ).toBe( "modernize" );
+			} );
+
+			describe( "false-seam — the decisive case", () => {
+
+				it( "shows at least four shared tables between the two folders", () => {
+					var graph = graphFor( "false-seam" );
+					var shared = sharedResources( graph, "app/reporting/ReportingService.cfc", "app/billing/BillingService.cfc" );
+
+					expect( shared.len() ).toBeGTE(
+						4,
+						"reporting and billing must share >= 4 resources, found: " & shared.toList( ", " )
+					);
+				} );
+
+				it( "shows both folders touching the same application and session scope", () => {
+					var graph = graphFor( "false-seam" );
+					for ( var scope in [ "scope.application", "scope.session" ] ) {
+						expect( graph.metrics.sharedState ).toHaveKey( scope );
+						expect( graph.metrics.sharedState[ scope ].len() ).toBeGTE(
+							2,
+							scope & " must be touched by more than one file"
+						);
+					}
+				} );
+
+				it( "is NOT separable by structural edges alone — which is the trap", () => {
+					// The two services never reference each other. A clusterer
+					// reading only call edges, or only folders, sees a clean
+					// seam. Only co-access and shared state reveal otherwise.
+					var graph = graphFor( "false-seam" );
+					var cohesionOfReporting = graphService.cohesion( graph, [ "app/reporting/ReportingService.cfc" ] );
+
+					expect( cohesionOfReporting.crossingEdges ).toBe(
+						0,
+						"if this ever becomes non-zero the fixture no longer tests what it claims"
+					);
+					expect( sharedResources( graph, "app/reporting/ReportingService.cfc", "app/billing/BillingService.cfc" ).len() ).toBeGT( 0 );
+				} );
+			} );
+
+			describe( "separable-domain", () => {
+
+				it( "shares no resource between notifications and orders", () => {
+					var graph = graphFor( "separable-domain" );
+					var shared = sharedResources( graph, "app/notifications/NotificationService.cfc", "app/orders/OrderService.cfc" );
+
+					expect( shared ).toBeEmpty( "expected no shared resource, found: " & shared.toList( ", " ) );
+				} );
+
+				it( "keeps the notifications pair coupled to each other", () => {
+					var graph = graphFor( "separable-domain" );
+					var inside = graphService.cohesion( graph, [
+						"app/notifications/NotificationService.cfc",
+						"app/notifications/NotificationQueue.cfc"
+					] );
+
+					expect( inside.internalEdges ).toBeGTE( 1 );
+					expect( inside.crossingEdges ).toBe( 0 );
+					expect( inside.cohesion ).toBe( 1 );
+				} );
+			} );
+
+			describe( "below-inference-threshold", () => {
+
+				it( "stays under the folder-inference threshold", () => {
+					var inventory = inventoryService.build( { files: caseById[ "below-inference-threshold" ].files } );
+
+					expect( inventory.units.len() ).toBeLT(
+						24,
+						"fixture must stay below minUnitsForFolderInference or it stops testing 2.3"
+					);
+				} );
+
+				it( "still exposes two disjoint domains in the graph", () => {
+					var graph = graphFor( "below-inference-threshold" );
+					var shared = sharedResources( graph, "app/CatalogService.cfc", "app/ShippingService.cfc" );
+					expect( shared ).toBeEmpty();
+
+					var catalog = graphService.cohesion( graph, [ "app/CatalogService.cfc", "app/PricingRules.cfc" ] );
+					var shipping = graphService.cohesion( graph, [ "app/ShippingService.cfc", "app/CarrierGateway.cfc" ] );
+
+					expect( catalog.internalEdges ).toBeGTE( 1 );
+					expect( catalog.crossingEdges ).toBe( 0 );
+					expect( shipping.internalEdges ).toBeGTE( 1 );
+					expect( shipping.crossingEdges ).toBe( 0 );
+				} );
+			} );
+
+			describe( "cyclic-boundary", () => {
+
+				it( "reports the order/invoice cycle", () => {
+					var graph = graphFor( "cyclic-boundary" );
+
+					expect( graph.metrics.cycles ).notToBeEmpty( "the planted cycle was not detected" );
+					var members = graphService.cycleMembersFor( graph, "app/orders/OrderService.cfc" );
+					expect( members ).toInclude( "app/invoicing/InvoiceService.cfc" );
+				} );
+
+				it( "records the dynamic include as unresolved rather than inventing an edge", () => {
+					var inventory = inventoryService.build( { files: caseById[ "cyclic-boundary" ].files } );
+					var kinds = [];
+					for ( var item in inventory.unresolved ) kinds.append( item.kind ?: "" );
+
+					expect( kinds ).toInclude( "dynamic-include" );
+				} );
+			} );
+
+			it( "covers every signal group across the four cases", () => {
+				var signalService = getInstance( "ModernizationSignalService" );
+				var groups = {};
+				for ( var id in caseById ) {
+					var signals = signalService.build( inventoryService.build( { files: caseById[ id ].files } ) );
+					for ( var signal in ( signals.signals ?: [] ) ) groups[ signal.group ] = true;
+				}
+
+				// runtime-hints needs a ColdBox config file, which these
+				// fixtures deliberately do not have; the rest must all appear.
+				for ( var required in [
+					"outbound-integration",
+					"include-call-coupling",
+					"datasource-table-coupling",
+					"security-session",
+					"application-lifecycle-state"
+				] ) {
+					expect( groups ).toHaveKey( required, "no fixture produces the " & required & " signal group" );
+				}
+			} );
+
+			it( "declares the Step 2 predicates without pretending they are checked", () => {
+				var pending = [];
+				for ( var id in caseById ) {
+					for ( var expectation in caseById[ id ].expected ) {
+						if ( !supportedKinds.contains( expectation.kind ) ) pending.append( id & ":" & expectation.kind );
+					}
+				}
+
+				// Clustering, placement and gates arrive in Step 2. Until then
+				// these are declared intent, not coverage.
+				expect( pending ).notToBeEmpty();
+				debug( "Pending until Step 2 -> " & pending.toList( ", " ) );
+			} );
+		} );
+	}
+}

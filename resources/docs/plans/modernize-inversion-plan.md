@@ -66,9 +66,9 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | # | Step | Status | Gate — the thing that decides | Evidence |
 | --- | --- | --- | --- | --- |
 | 0 | Clear the ground | `done` (uncommitted) | `box server restart && box testbox run` green; `node --test tests/js/*.spec.mjs` green **and in `box.json:49`**; `/`, `/modernize`, `/aiflight/` load | **Gate green: 492·0·0·1**, `box run-script test` reaches its node stage (3/3), all four routes 200. Required fixing the §2.17 wiring race first |
-| 1 | Coupling graph | `todo` | unit specs for cohesion, fan-in/out, cycles, co-access on Step 2a fixtures; identical input → byte-identical graph | |
+| 1 | Coupling graph | `wip` | unit specs for cohesion, fan-in/out, cycles, co-access on Step 2a fixtures; identical input → byte-identical graph | `ModernizationCouplingGraphService` + 16 specs green (508·0·0·1). **Remaining:** corpus-fixture validation (needs 2a), plus persistence and architecture findings, both deferred to Step 2 — see the note in Step 1 |
 | 2 | Promote synthesis | `todo` | deterministic corpus tier green on all four scenarios | |
-| 2a | Corpus, deterministic tier | `todo` | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | |
+| 2a | Corpus, deterministic tier | `wip` | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting added, 14 specs green (523·0·0·1). Found and fixed two extractor defects (§2.18). **Remaining: `baseline-llm-path.json` (one-shot, needs a provider) and the modernization evaluator** |
 | 12 | Domain types | `todo` | exactly one file computes each invariant; one type answers each | |
 | 3a | Re-point client + tests | `todo` | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | |
 | 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
@@ -585,6 +585,66 @@ Reproduce the original failure by reverting the annotation on
 box server restart && box testbox run "bundles=tests.specs.integration.ArchitecturePlanningSpec"
 ```
 
+## 2.18 Two extractor defects the corpus fixtures found immediately
+
+Both were live in committed code, both silently degraded the evidence this whole
+plan derives structure from, and neither was visible without a fixture written
+to look like real legacy CFML. Fixed while building Step 2a; inventory version
+bumped `cfml-inventory-conservative-v5` → `v6`, which invalidates cached
+inventories that were built without them.
+
+### Table references were missed on every multi-line query
+
+`sqlReferences()` was only called on a line that *itself* matched
+`cfquery|queryExecute|...` (`:159`). Tag-based CFML puts its SQL on the lines
+**after** `<cfquery>`:
+
+```cfml
+<cfquery name="local.rows" datasource="ledgerdb">
+    SELECT i.total, c.segment
+    FROM invoices i              <- never analysed
+    JOIN customers c ON ...      <- never analysed
+</cfquery>
+```
+
+So `table-query` dependencies were produced only for single-line queries. That is
+the minority shape in the legacy estates this product exists to read, which means
+**the co-access matrix was close to empty on real input** — and co-access is the
+primary evidence for rejecting a false seam (§2.3). Step 1's graph would have
+looked healthy and been blind.
+
+Fixed by continuing SQL analysis for a bounded window (`maxSqlBlockLines = 40`)
+after a query opens, ending at `</cfquery>`. Bounded so an unclosed tag cannot
+make the rest of a file look like SQL.
+
+### A dynamic include was never reported as dynamic, and invented an edge
+
+The include regex captures `([A-Za-z0-9_./-]+)`, which **excludes `#`**. For:
+
+```cfml
+<cfinclude template="modules/#url.module#/handler.cfm">
+```
+
+the captured target was `modules/`. The dynamic check was
+`find( char( 35 ), includeTarget )` — testing the capture that cannot contain a
+`#` — so it never fired. Two consequences: dynamic includes were absent from
+`unresolved`, and the truncated prefix was passed to `resolveTarget`, where it
+could resolve to a real file and **create an edge that does not exist**. That is
+precisely the invented structure this plan is written to eliminate, sitting in
+the deterministic layer that was supposed to be the trustworthy half.
+
+Fixed by judging interpolation on the source line and refusing to resolve
+anything interpolated.
+
+### Why this matters beyond the two fixes
+
+The fixtures earned their cost before clustering exists. Both defects sit in the
+evidence base every later step consumes, and neither would have been caught by a
+single small fixture — §2.3's warning applied to extraction as well as
+clustering. Expect more of this when the LLM and judge tiers land: **treat a
+corpus failure as a finding about the product first, and about the fixture
+second.**
+
 ---
 
 # Part 3 — The direction
@@ -966,6 +1026,43 @@ modernize runs. Evidence shapes differ: modernize records carry `contentHash`,
 
 **Gate:** unit specs for cohesion, fan-in/out, cycle detection and co-access on
 the corpus fixtures from Step 2a. Identical input → byte-identical graph.
+
+### Built — and two things deliberately moved to Step 2
+
+`ModernizationCouplingGraphService` exists with 16 green specs covering edges,
+provenance weighting, fan-in/out, cycle detection (including *not* flagging an
+acyclic diamond), co-access, shared-state overlay, cohesion, edge merging,
+truncation, determinism, and the §6.2 no-gateway invariant.
+
+**Persistence and architecture findings moved to Step 2.** Both require calling
+the graph from `ModernizationRunService.execute()`, and Step 2.6 is by the
+plan's own words "the single place the new pipeline order is expressed". Wiring
+`execute()` in Step 1 and rewiring it again in Step 2 would touch the same
+orchestration twice for no gain. Step 1 therefore delivers the derivation and
+its specs; Step 2 calls it, checkpoints it and emits findings from it.
+
+The cost of this is real and should be stated: **Step 1 no longer ships user-
+visible value on its own.** That was already weakened when the "works with no
+key on the Review side" claim turned out to be false (see the box above).
+
+### Nodes are files, not units — a correction to this step's wording
+
+This step asked for a "directed unit/file edge list" and "fan-in / fan-out per
+unit". Only the file half is derivable. A dependency record resolves to a target
+**file** (`ModernizationInventoryService.resolveTarget`); nothing in the
+inventory says which unit *inside* that file is used, so a unit→unit edge would
+be invented — exactly what this plan exists to stop doing.
+
+The graph therefore has file nodes, and each edge carries `sourceUnitIds` from a
+line-range join so a file edge can be attributed back to the units responsible.
+Attribution without false precision. Step 2's clustering should consume file
+nodes and use `sourceUnitIds` for naming and evidence.
+
+Only four dependency kinds carry a resolved `targetFile` — `extends`,
+`implements`, `include`, `component-construction`. The rest name external
+resources and become the co-access matrix (`datasource`, `table-query`, `query`,
+`sql-proc-call`) or the shared-state overlay (`scope.application`,
+`scope.session`, `scope.client`, `security-session-gate`).
 
 ---
 

@@ -1,0 +1,269 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Modernization coupling graph", () => {
+
+			var service = new app.models.services.ModernizationCouplingGraphService();
+
+			// A dependency as ModernizationInventoryService emits it: resolved
+			// edges carry targetFile + resolution, unresolved ones carry neither.
+			var dep = ( kind, filePath, target, line, targetFile, resolution ) => {
+				var record = {
+					id       : "dep-" & filePath & "-" & line,
+					kind     : kind,
+					target   : target,
+					filePath : filePath,
+					startLine: line,
+					endLine  : line
+				};
+				if ( len( targetFile ?: "" ) ) {
+					record.targetFile = targetFile;
+					record.resolution = resolution ?: "path";
+				}
+				return record;
+			};
+
+			var unit = ( id, filePath, startLine, endLine ) => {
+				return { id: id, filePath: filePath, startLine: startLine, endLine: endLine, layer: "component", unitType: "function" };
+			};
+
+			it( "builds file edges only from resolved dependencies", () => {
+				var graph = service.build( {
+					units: [ unit( "u1", "app/Orders.cfc", 1, 50 ) ],
+					dependencies: [
+						dep( "extends", "app/Orders.cfc", "Base", 3, "app/Base.cfc", "path" ),
+						// Ambiguous target: inventory resolved nothing, so no edge.
+						dep( "include", "app/Orders.cfc", "shared.cfm", 10, "", "" )
+					]
+				} );
+
+				expect( graph.edges ).toHaveLength( 1 );
+				expect( graph.edges[ 1 ].fromFile ).toBe( "app/orders.cfc" );
+				expect( graph.edges[ 1 ].toFile ).toBe( "app/base.cfc" );
+				expect( graph.edges[ 1 ].kind ).toBe( "extends" );
+			} );
+
+			it( "weights edges by resolution provenance", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "extends", "a.cfc", "B", 1, "b.cfc", "path" ),
+						dep( "include", "c.cfc", "D", 1, "d.cfc", "stem" )
+					]
+				} );
+
+				var byKind = {};
+				for ( var edge in graph.edges ) byKind[ edge.kind ] = edge.weight;
+				expect( byKind.extends ).toBe( 1.0 );
+				expect( byKind.include ).toBe( 0.5 );
+			} );
+
+			it( "computes fan-in and fan-out per file", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "extends", "a.cfc", "Hub", 1, "hub.cfc", "path" ),
+						dep( "extends", "b.cfc", "Hub", 1, "hub.cfc", "path" ),
+						dep( "include", "c.cfc", "Hub", 1, "hub.cfc", "path" ),
+						dep( "include", "hub.cfc", "Util", 1, "util.cfc", "path" )
+					]
+				} );
+
+				expect( graph.metrics.fanIn[ "hub.cfc" ] ).toBe( 3 );
+				expect( graph.metrics.fanOut[ "hub.cfc" ] ).toBe( 1 );
+				expect( graph.metrics.fanIn[ "a.cfc" ] ).toBe( 0 );
+			} );
+
+			it( "detects a dependency cycle", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "component-construction", "order.cfc", "Invoice", 5, "invoice.cfc", "path" ),
+						dep( "component-construction", "invoice.cfc", "Order", 8, "order.cfc", "path" ),
+						dep( "extends", "loner.cfc", "Base", 1, "base.cfc", "path" )
+					]
+				} );
+
+				expect( graph.metrics.cycles ).toHaveLength( 1 );
+				expect( graph.metrics.cycles[ 1 ] ).toBe( [ "invoice.cfc", "order.cfc" ] );
+				expect( service.cycleMembersFor( graph, "order.cfc" ) ).toHaveLength( 2 );
+				expect( service.cycleMembersFor( graph, "loner.cfc" ) ).toBeEmpty();
+			} );
+
+			it( "does not report an acyclic diamond as a cycle", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "extends", "a.cfc", "B", 1, "b.cfc", "path" ),
+						dep( "extends", "a.cfc", "C", 2, "c.cfc", "path" ),
+						dep( "extends", "b.cfc", "D", 1, "d.cfc", "path" ),
+						dep( "extends", "c.cfc", "D", 1, "d.cfc", "path" )
+					]
+				} );
+
+				expect( graph.metrics.cycles ).toBeEmpty();
+			} );
+
+			it( "builds a table co-access matrix", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "table-query", "orders.cfc", "customers", 4, "", "" ),
+						dep( "table-query", "billing.cfc", "customers", 9, "", "" ),
+						dep( "table-query", "reporting.cfc", "audit_log", 2, "", "" )
+					]
+				} );
+
+				expect( graph.metrics.coAccess[ "table:customers" ] ).toBe( [ "billing.cfc", "orders.cfc" ] );
+				expect( graph.metrics.coAccess[ "table:audit_log" ] ).toHaveLength( 1 );
+			} );
+
+			it( "ignores dependency kinds whose target is a constant, not a resource", () => {
+				// ModernizationInventoryService emits `query` with the literal
+				// target "sql" and `sql-proc-call` with "stored-procedure".
+				// Treating those as resources would make every SQL-touching file
+				// share one fake table and fabricate coupling between unrelated
+				// domains — the precise failure false-seam detection must avoid.
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "query", "orders.cfc", "sql", 3, "", "" ),
+						dep( "query", "unrelated.cfc", "sql", 8, "", "" ),
+						dep( "sql-proc-call", "billing.cfc", "stored-procedure", 2, "", "" ),
+						dep( "table-query", "orders.cfc", "customers", 4, "", "" )
+					]
+				} );
+
+				expect( graph.metrics.coAccess ).toHaveKey( "table:customers" );
+				expect( graph.metrics.coAccess ).notToHaveKey( "table:sql" );
+				expect( graph.metrics.coAccess ).notToHaveKey( "table:stored-procedure" );
+				expect( graph.metrics.coAccess.count() ).toBe( 1 );
+			} );
+
+			it( "overlays shared scope state", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "scope.application", "cart.cfc", "application.cache", 3, "", "" ),
+						dep( "scope.session", "checkout.cfc", "session.user", 7, "", "" ),
+						dep( "scope.application", "pricing.cfc", "application.rates", 1, "", "" )
+					]
+				} );
+
+				expect( graph.metrics.sharedState[ "scope.application" ] ).toBe( [ "cart.cfc", "pricing.cfc" ] );
+				expect( graph.metrics.sharedState[ "scope.session" ] ).toHaveLength( 1 );
+			} );
+
+			it( "scores cohesion of a candidate boundary", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						// orders <-> orderLines internal, one leak to billing.
+						dep( "component-construction", "orders.cfc", "OrderLines", 1, "orderlines.cfc", "path" ),
+						dep( "component-construction", "orderlines.cfc", "Orders", 1, "orders.cfc", "path" ),
+						dep( "component-construction", "orders.cfc", "Billing", 2, "billing.cfc", "path" )
+					]
+				} );
+
+				var tight = service.cohesion( graph, [ "orders.cfc", "orderlines.cfc" ] );
+				expect( tight.internalEdges ).toBe( 2 );
+				expect( tight.crossingEdges ).toBe( 1 );
+				expect( tight.cohesion ).toBe( 0.6667 );
+
+				// A boundary drawn around one leaky file contains nothing.
+				var loose = service.cohesion( graph, [ "billing.cfc" ] );
+				expect( loose.internalEdges ).toBe( 0 );
+				expect( loose.cohesion ).toBe( 0 );
+			} );
+
+			it( "attributes an edge to the source units that produced it", () => {
+				var graph = service.build( {
+					units: [ unit( "u-top", "svc.cfc", 1, 20 ), unit( "u-bottom", "svc.cfc", 21, 40 ) ],
+					dependencies: [ dep( "component-construction", "svc.cfc", "Helper", 25, "helper.cfc", "path" ) ]
+				} );
+
+				expect( graph.edges[ 1 ].sourceUnitIds ).toBe( [ "u-bottom" ] );
+			} );
+
+			it( "merges repeated dependencies and keeps the strongest provenance", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [
+						dep( "include", "a.cfm", "shared", 5, "shared.cfm", "stem" ),
+						dep( "include", "a.cfm", "shared.cfm", 9, "shared.cfm", "path" )
+					]
+				} );
+
+				expect( graph.edges ).toHaveLength( 1 );
+				expect( graph.edges[ 1 ].occurrences ).toBe( 2 );
+				expect( graph.edges[ 1 ].resolution ).toBe( "path" );
+				expect( graph.edges[ 1 ].weight ).toBe( 1.0 );
+			} );
+
+			it( "reports not truncated for a small graph", () => {
+				var graph = service.build( {
+					units: [],
+					dependencies: [ dep( "extends", "a.cfc", "B", 1, "b.cfc", "path" ) ]
+				} );
+
+				expect( graph.truncated ).toBeFalse();
+				expect( graph.truncationReasons ).toBeEmpty();
+			} );
+
+			it( "sets truncated with a reason when a cap is hit", () => {
+				var dependencies = [];
+				for ( var index = 1; index <= 1700; index++ ) {
+					dependencies.append( dep( "extends", "f#index#.cfc", "B", 1, "b.cfc", "path" ) );
+				}
+				var graph = service.build( { units: [], dependencies: dependencies } );
+
+				expect( graph.truncated ).toBeTrue();
+				expect( graph.truncationReasons ).toInclude( "maxNodes" );
+			} );
+
+			it( "is deterministic: identical input yields an identical fingerprint", () => {
+				var input = {
+					units: [ unit( "u1", "b.cfc", 1, 10 ), unit( "u2", "a.cfc", 1, 10 ) ],
+					dependencies: [
+						dep( "extends", "b.cfc", "A", 1, "a.cfc", "path" ),
+						dep( "table-query", "a.cfc", "orders", 3, "", "" ),
+						dep( "scope.session", "b.cfc", "session.id", 4, "", "" )
+					]
+				};
+
+				expect( service.build( input ).fingerprint ).toBe( service.build( duplicate( input ) ).fingerprint );
+			} );
+
+			it( "ignores dependency order when fingerprinting", () => {
+				var forward = service.build( { units: [], dependencies: [
+					dep( "extends", "a.cfc", "B", 1, "b.cfc", "path" ),
+					dep( "extends", "c.cfc", "D", 1, "d.cfc", "path" )
+				] } );
+				var reversed = service.build( { units: [], dependencies: [
+					dep( "extends", "c.cfc", "D", 1, "d.cfc", "path" ),
+					dep( "extends", "a.cfc", "B", 1, "b.cfc", "path" )
+				] } );
+
+				expect( forward.fingerprint ).toBe( reversed.fingerprint );
+			} );
+
+			it( "survives an empty inventory", () => {
+				var graph = service.build( {} );
+
+				expect( graph.nodes ).toBeEmpty();
+				expect( graph.edges ).toBeEmpty();
+				expect( graph.metrics.cycles ).toBeEmpty();
+				expect( graph.truncated ).toBeFalse();
+			} );
+
+			it( "never injects a gateway, so it runs with no provider", () => {
+				var meta = getMetadata( service );
+				var injected = [];
+				for ( var property in ( meta.properties ?: [] ) ) {
+					if ( structKeyExists( property, "inject" ) ) injected.append( property.inject );
+				}
+				expect( injected ).toBeEmpty();
+			} );
+		} );
+	}
+}

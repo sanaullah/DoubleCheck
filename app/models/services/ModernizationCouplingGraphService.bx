@@ -1,0 +1,466 @@
+/**
+ * Deterministic coupling graph for Modernize. No LLM, no gateway, no database.
+ *
+ * Input is `inventory.dependencies`, whose edges already resolve to real files
+ * with provenance. Three layers come out of it:
+ *
+ *   structural   file -> file    extends / implements / include /
+ *                                component-construction. These are the only
+ *                                kinds that carry a resolved `targetFile`.
+ *   resource     file -> table   datasource / table-query / query /
+ *                                sql-proc-call. The co-access matrix.
+ *   shared state file -> scope   application / session / client scope and
+ *                                session gates. Coupling without a call edge.
+ *
+ * Nodes are FILES, not units. Dependencies resolve to a target *file*; nothing
+ * in the inventory says which unit inside that file is used, so a unit->unit
+ * edge would be invented rather than derived. Each edge instead records the
+ * source unit ids it came from, so callers can attribute a file edge back to
+ * the units responsible without the graph claiming precision it does not have.
+ *
+ * Everything is bounded and every cap sets `truncated`. A silently capped graph
+ * reporting as complete is the failure this service exists to avoid.
+ *
+ * @see ModernizationInventoryService
+ */
+@singleton
+class threadsafe {
+
+	variables.version = "modernization-graph-v1";
+
+	// Bounds. Hitting any of these sets truncated and records the reason.
+	variables.maxNodes         = 1500;
+	variables.maxEdgesPerNode  = 60;
+	variables.maxEdges         = 20000;
+	variables.maxCycles        = 100;
+	variables.maxCycleMembers  = 200;
+	variables.maxResourceFiles = 200;
+
+	// Resolution provenance -> edge confidence. An exact path match is a fact;
+	// a bare stem match is a guess that happened to be unambiguous.
+	variables.resolutionWeights = {
+		"path"       : 1.0,
+		"basename"   : 0.75,
+		"stem"       : 0.5,
+		"dotted-path": 0.4
+	};
+
+	variables.structuralKinds = [ "extends", "implements", "include", "component-construction" ];
+
+	// Only kinds whose `target` is a real resource NAME belong here.
+	// `query` and `sql-proc-call` carry constant targets ("sql",
+	// "stored-procedure"), so including them would key every SQL-touching file
+	// to one fake shared resource and manufacture co-access between files that
+	// share nothing — which would defeat false-seam detection outright.
+	variables.resourceKinds = [ "datasource", "table-query" ];
+	variables.sharedStateKinds = [ "scope.application", "scope.session", "scope.client", "security-session-gate" ];
+
+	string function graphVersion() {
+		return variables.version;
+	}
+
+	/**
+	 * Build the graph. Deterministic: identical inventory in, byte-identical
+	 * graph out.
+	 */
+	struct function build( required struct inventory ) {
+		var units        = isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [];
+		var dependencies = isArray( arguments.inventory.dependencies ?: "" ) ? arguments.inventory.dependencies : [];
+
+		var truncation = { truncated: false, reasons: [] };
+		var unitsByFile = indexUnitsByFile( units );
+		var nodes = buildNodes( unitsByFile, dependencies, truncation );
+		var edges = buildStructuralEdges( dependencies, nodes, unitsByFile, truncation );
+		var metrics = {
+			fanIn      : {},
+			fanOut     : {},
+			cycles     : [],
+			sharedState: sharedStateOverlay( dependencies, nodes, truncation ),
+			coAccess   : coAccessMatrix( dependencies, nodes, truncation ),
+			totals     : {}
+		};
+
+		for ( var nodeId in nodes ) {
+			metrics.fanIn[ nodeId ] = 0;
+			metrics.fanOut[ nodeId ] = 0;
+		}
+		for ( var edge in edges ) {
+			metrics.fanOut[ edge.fromFile ] = ( metrics.fanOut[ edge.fromFile ] ?: 0 ) + 1;
+			metrics.fanIn[ edge.toFile ] = ( metrics.fanIn[ edge.toFile ] ?: 0 ) + 1;
+		}
+		metrics.cycles = stronglyConnectedComponents( nodes, edges, truncation );
+		metrics.totals = {
+			nodes         : nodes.count(),
+			edges         : edges.len(),
+			cycles        : metrics.cycles.len(),
+			sharedStateKeys: metrics.sharedState.count(),
+			coAccessKeys  : metrics.coAccess.count()
+		};
+
+		var nodeList = [];
+		for ( var key in sortedKeys( nodes ) ) nodeList.append( nodes[ key ] );
+
+		return {
+			version    : variables.version,
+			nodes      : nodeList,
+			edges      : edges,
+			metrics    : metrics,
+			truncated  : truncation.truncated,
+			truncationReasons: truncation.reasons,
+			fingerprint: stableHash( variables.version & "|" & jsonSerialize( { nodes: nodeList, edges: edges, metrics: metrics } ) )
+		};
+	}
+
+	/**
+	 * Cohesion for a candidate grouping: how much of its coupling stays inside.
+	 *
+	 * Returned rather than stored. Clustering decides membership (Step 2); this
+	 * only answers "how good is this boundary" for a membership someone else
+	 * chose, which keeps one owner per invariant.
+	 */
+	struct function cohesion( required struct graph, required array memberFilePaths ) {
+		var members = {};
+		for ( var path in arguments.memberFilePaths ) {
+			var key = normalizePath( path );
+			if ( len( key ) ) members[ key ] = true;
+		}
+		var internal = 0;
+		var outbound = 0;
+		var inbound = 0;
+		var internalWeight = 0;
+		var externalWeight = 0;
+		for ( var edge in ( arguments.graph.edges ?: [] ) ) {
+			var fromInside = members.keyExists( edge.fromFile );
+			var toInside = members.keyExists( edge.toFile );
+			if ( fromInside && toInside ) {
+				internal++;
+				internalWeight += edge.weight;
+			} else if ( fromInside ) {
+				outbound++;
+				externalWeight += edge.weight;
+			} else if ( toInside ) {
+				inbound++;
+				externalWeight += edge.weight;
+			}
+		}
+		var crossing = outbound + inbound;
+		var total = internal + crossing;
+		return {
+			memberCount   : members.count(),
+			internalEdges : internal,
+			outboundEdges : outbound,
+			inboundEdges  : inbound,
+			crossingEdges : crossing,
+			// 1.0 = every edge stays inside the boundary; 0.0 = none do.
+			cohesion      : total ? round4( internal / total ) : 0,
+			// > 1.0 means the group leaks more coupling than it contains.
+			couplingRatio : internal ? round4( crossing / internal ) : ( crossing ? -1 : 0 ),
+			internalWeight: round4( internalWeight ),
+			externalWeight: round4( externalWeight )
+		};
+	}
+
+	/** Files that appear in a reported cycle cannot be cut apart. */
+	array function cycleMembersFor( required struct graph, required string filePath ) {
+		var key = normalizePath( arguments.filePath );
+		for ( var cycle in ( arguments.graph.metrics.cycles ?: [] ) ) {
+			if ( cycle.contains( key ) ) return cycle;
+		}
+		return [];
+	}
+
+	private struct function indexUnitsByFile( required array units ) {
+		var index = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var key = normalizePath( unit.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			if ( !index.keyExists( key ) ) index[ key ] = [];
+			index[ key ].append( {
+				id       : unit.id ?: "",
+				startLine: val( unit.startLine ?: 0 ),
+				endLine  : val( unit.endLine ?: 0 ),
+				layer    : unit.layer ?: "",
+				unitType : unit.unitType ?: ""
+			} );
+		}
+		for ( var fileKey in index ) {
+			index[ fileKey ].sort( ( a, b ) => a.startLine == b.startLine ? compareNoCase( a.id, b.id ) : ( a.startLine < b.startLine ? -1 : 1 ) );
+		}
+		return index;
+	}
+
+	private struct function buildNodes( required struct unitsByFile, required array dependencies, required struct truncation ) {
+		var candidates = {};
+		for ( var fileKey in arguments.unitsByFile ) candidates[ fileKey ] = true;
+		// A file can be a pure dependency target with no unit of its own.
+		for ( var dep in arguments.dependencies ) {
+			var target = normalizePath( dep.targetFile ?: "" );
+			if ( len( target ) ) candidates[ target ] = true;
+			var source = normalizePath( dep.filePath ?: "" );
+			if ( len( source ) ) candidates[ source ] = true;
+		}
+
+		var nodes = {};
+		var ordered = sortedKeys( candidates );
+		for ( var key in ordered ) {
+			if ( nodes.count() >= variables.maxNodes ) {
+				markTruncated( arguments.truncation, "maxNodes" );
+				break;
+			}
+			var fileUnits = arguments.unitsByFile[ key ] ?: [];
+			var unitIds = [];
+			for ( var unit in fileUnits ) unitIds.append( unit.id );
+			nodes[ key ] = {
+				id       : key,
+				filePath : key,
+				unitIds  : unitIds,
+				unitCount: unitIds.len(),
+				layer    : fileUnits.len() ? ( fileUnits[ 1 ].layer ?: "" ) : "unknown"
+			};
+		}
+		return nodes;
+	}
+
+	private array function buildStructuralEdges(
+		required array dependencies,
+		required struct nodes,
+		required struct unitsByFile,
+		required struct truncation
+	) {
+		var merged = {};
+		var perSource = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( dep.kind ?: "" ) );
+			if ( !variables.structuralKinds.contains( kind ) ) continue;
+
+			var from = normalizePath( dep.filePath ?: "" );
+			var to = normalizePath( dep.targetFile ?: "" );
+			// An unresolved or ambiguous target produces no edge, by design.
+			if ( !len( from ) || !len( to ) || from == to ) continue;
+			if ( !arguments.nodes.keyExists( from ) || !arguments.nodes.keyExists( to ) ) continue;
+
+			var resolution = lCase( trim( dep.resolution ?: "path" ) );
+			var edgeKey = from & "|" & to & "|" & kind;
+			if ( merged.keyExists( edgeKey ) ) {
+				merged[ edgeKey ].occurrences++;
+				appendUnique( merged[ edgeKey ].sourceUnitIds, unitIdsForLine( arguments.unitsByFile, from, val( dep.startLine ?: 0 ) ) );
+				// Keep the strongest provenance seen for this edge.
+				if ( weightFor( resolution ) > merged[ edgeKey ].weight ) {
+					merged[ edgeKey ].weight = weightFor( resolution );
+					merged[ edgeKey ].resolution = resolution;
+				}
+				continue;
+			}
+
+			if ( merged.count() >= variables.maxEdges ) {
+				markTruncated( arguments.truncation, "maxEdges" );
+				break;
+			}
+			perSource[ from ] = ( perSource[ from ] ?: 0 ) + 1;
+			if ( perSource[ from ] > variables.maxEdgesPerNode ) {
+				markTruncated( arguments.truncation, "maxEdgesPerNode" );
+				continue;
+			}
+
+			merged[ edgeKey ] = {
+				fromFile     : from,
+				toFile       : to,
+				kind         : kind,
+				resolution   : resolution,
+				weight       : weightFor( resolution ),
+				occurrences  : 1,
+				sourceUnitIds: unitIdsForLine( arguments.unitsByFile, from, val( dep.startLine ?: 0 ) )
+			};
+		}
+
+		var edges = [];
+		for ( var key in sortedKeys( merged ) ) edges.append( merged[ key ] );
+		return edges;
+	}
+
+	/**
+	 * Shared scope is coupling with no call edge: two files that both write
+	 * application scope are joined even though neither references the other.
+	 */
+	private struct function sharedStateOverlay( required array dependencies, required struct nodes, required struct truncation ) {
+		var overlay = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( dep.kind ?: "" ) );
+			if ( !variables.sharedStateKinds.contains( kind ) ) continue;
+			var from = normalizePath( dep.filePath ?: "" );
+			if ( !len( from ) || !arguments.nodes.keyExists( from ) ) continue;
+			if ( !overlay.keyExists( kind ) ) overlay[ kind ] = [];
+			if ( overlay[ kind ].len() >= variables.maxResourceFiles ) {
+				markTruncated( arguments.truncation, "maxResourceFiles" );
+				continue;
+			}
+			if ( !overlay[ kind ].contains( from ) ) overlay[ kind ].append( from );
+		}
+		for ( var key in overlay ) overlay[ key ].sort( ( a, b ) => compareNoCase( a, b ) );
+		return overlay;
+	}
+
+	/**
+	 * table/datasource -> files that touch it. Two domains sharing four tables
+	 * are not separable regardless of how their folders look.
+	 */
+	private struct function coAccessMatrix( required array dependencies, required struct nodes, required struct truncation ) {
+		var matrix = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( dep.kind ?: "" ) );
+			if ( !variables.resourceKinds.contains( kind ) ) continue;
+			var resource = lCase( trim( dep.target ?: "" ) );
+			var from = normalizePath( dep.filePath ?: "" );
+			if ( !len( resource ) || !len( from ) || !arguments.nodes.keyExists( from ) ) continue;
+			var key = kind == "datasource" ? ( "datasource:" & resource ) : ( "table:" & resource );
+			if ( !matrix.keyExists( key ) ) matrix[ key ] = [];
+			if ( matrix[ key ].len() >= variables.maxResourceFiles ) {
+				markTruncated( arguments.truncation, "maxResourceFiles" );
+				continue;
+			}
+			if ( !matrix[ key ].contains( from ) ) matrix[ key ].append( from );
+		}
+		for ( var matrixKey in matrix ) matrix[ matrixKey ].sort( ( a, b ) => compareNoCase( a, b ) );
+		return matrix;
+	}
+
+	/**
+	 * Tarjan's algorithm, iterative. A cycle is a seam that cannot be cut, so
+	 * this is the check that stops the plan proposing an impossible extraction.
+	 *
+	 * Iterative rather than recursive on purpose: recursion depth would equal
+	 * the longest path, and maxNodes is 1500.
+	 */
+	private array function stronglyConnectedComponents( required struct nodes, required array edges, required struct truncation ) {
+		var adjacency = {};
+		for ( var nodeId in arguments.nodes ) adjacency[ nodeId ] = [];
+		for ( var edge in arguments.edges ) adjacency[ edge.fromFile ].append( edge.toFile );
+		for ( var adjacencyKey in adjacency ) adjacency[ adjacencyKey ].sort( ( a, b ) => compareNoCase( a, b ) );
+
+		var index = {};
+		var lowLink = {};
+		var onStack = {};
+		var stack = [];
+		var counter = 0;
+		var components = [];
+
+		for ( var root in sortedKeys( arguments.nodes ) ) {
+			if ( index.keyExists( root ) ) continue;
+			// Each frame: the node, and how far through its neighbours we are.
+			var frames = [ { node: root, next: 1 } ];
+			index[ root ] = counter;
+			lowLink[ root ] = counter;
+			counter++;
+			stack.append( root );
+			onStack[ root ] = true;
+
+			while ( frames.len() ) {
+				var frame = frames[ frames.len() ];
+				var current = frame.node;
+				var neighbours = adjacency[ current ] ?: [];
+
+				if ( frame.next <= neighbours.len() ) {
+					var neighbour = neighbours[ frame.next ];
+					frame.next++;
+					if ( !index.keyExists( neighbour ) ) {
+						index[ neighbour ] = counter;
+						lowLink[ neighbour ] = counter;
+						counter++;
+						stack.append( neighbour );
+						onStack[ neighbour ] = true;
+						frames.append( { node: neighbour, next: 1 } );
+					} else if ( onStack.keyExists( neighbour ) && onStack[ neighbour ] ) {
+						if ( index[ neighbour ] < lowLink[ current ] ) lowLink[ current ] = index[ neighbour ];
+					}
+					continue;
+				}
+
+				frames.deleteAt( frames.len() );
+				if ( frames.len() ) {
+					var parent = frames[ frames.len() ].node;
+					if ( lowLink[ current ] < lowLink[ parent ] ) lowLink[ parent ] = lowLink[ current ];
+				}
+
+				if ( lowLink[ current ] == index[ current ] ) {
+					var component = [];
+					while ( stack.len() ) {
+						var popped = stack[ stack.len() ];
+						stack.deleteAt( stack.len() );
+						onStack[ popped ] = false;
+						component.append( popped );
+						if ( popped == current ) break;
+					}
+					// A single node is only a cycle if it points at itself, and
+					// self-edges are excluded when edges are built.
+					if ( component.len() > 1 ) {
+						if ( components.len() >= variables.maxCycles ) {
+							markTruncated( arguments.truncation, "maxCycles" );
+						} else {
+							if ( component.len() > variables.maxCycleMembers ) {
+								markTruncated( arguments.truncation, "maxCycleMembers" );
+								component = component.slice( 1, variables.maxCycleMembers );
+							}
+							component.sort( ( a, b ) => compareNoCase( a, b ) );
+							components.append( component );
+						}
+					}
+				}
+			}
+		}
+
+		components.sort( ( a, b ) => compareNoCase( a.toList( "|" ), b.toList( "|" ) ) );
+		return components;
+	}
+
+	/** Range join: which units own the line a dependency was found on. */
+	private array function unitIdsForLine( required struct unitsByFile, required string filePath, required numeric line ) {
+		var candidates = arguments.unitsByFile[ arguments.filePath ] ?: [];
+		var owners = [];
+		for ( var candidate in candidates ) {
+			if ( candidate.startLine <= arguments.line && arguments.line <= candidate.endLine ) owners.append( candidate.id );
+		}
+		// A dependency outside every unit range still belongs to the file.
+		if ( !owners.len() && candidates.len() && arguments.line < 1 ) owners.append( candidates[ 1 ].id );
+		return owners;
+	}
+
+	private void function appendUnique( required array target, required array additions ) {
+		for ( var item in arguments.additions ) {
+			if ( !arguments.target.contains( item ) ) arguments.target.append( item );
+		}
+	}
+
+	private numeric function weightFor( required string resolution ) {
+		return variables.resolutionWeights[ arguments.resolution ] ?: 0.4;
+	}
+
+	private void function markTruncated( required struct truncation, required string reason ) {
+		arguments.truncation.truncated = true;
+		if ( !arguments.truncation.reasons.contains( arguments.reason ) ) arguments.truncation.reasons.append( arguments.reason );
+	}
+
+	/** Sorted key order everywhere, or prompts drift and fingerprints churn. */
+	private array function sortedKeys( required struct source ) {
+		var keys = structKeyArray( arguments.source );
+		arraySort( keys, "textnocase" );
+		return keys;
+	}
+
+	private string function normalizePath( required any path ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return lCase( value );
+	}
+
+	private numeric function round4( required numeric value ) {
+		return round( arguments.value * 10000 ) / 10000;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}
