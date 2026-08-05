@@ -523,3 +523,33 @@ const derivedMap = helpers.buildModernizationArchitectureSubgraph({
 assert.equal(derivedMap.lanes.extracts, 1, "placements must win over the legacy contexts projection");
 assert.ok(derivedMap.nodes.some((node) => node.path === "Notifications" && node.role === "extract"), "the extracted placement must appear on the map in the extract lane");
 assert.ok(!derivedMap.nodes.some((node) => node.path === "Should be ignored"), "the legacy projection must not be read when placements exist");
+
+// --- placement source precedence -------------------------------------------
+// Derived clusters outrank the provider's placements. A real run was observed
+// where derivation said "two coldbox modules" and the provider said "two
+// centralized", with both in the same artifact; the UI was showing the weaker
+// answer. There is now one place that decides which wins.
+const bothSources = {
+	derived: { clusters: [
+		{ id: "c1", domainKey: "notifications", name: "Notifications", placementType: "external-service", targetUnitIds: ["u1"], filePaths: ["a.cfc"] },
+		{ id: "c2", domainKey: "orders", name: "Orders", placementType: "coldbox-module", targetUnitIds: ["u2"], filePaths: ["b.cfc"] }
+	] },
+	target: { placements: [ { id: "p1", name: "Everything", placementType: "main-app", targetUnitIds: ["u1", "u2"] } ] }
+};
+const resolved = helpers.modernizationPlacements(bothSources);
+assert.equal(resolved.length, 2, "derived clusters must win over provider placements");
+assert.equal(resolved[0]._placementSource, "derived");
+assert.equal(helpers.buildModernizationArchitectureSubgraph(bothSources).lanes.extracts, 1);
+
+// Provider placements are used when nothing was derived.
+const providerOnly = { target: { placements: [ { id: "p1", name: "Orders", placementType: "coldbox-module", targetUnitIds: ["u1"] } ] } };
+assert.equal(helpers.modernizationPlacements(providerOnly)[0]._placementSource, "provider");
+assert.equal(helpers.buildModernizationArchitectureSubgraph(providerOnly).lanes.modules, 1);
+
+// And the v1 vocabulary still renders: an untyped item in `extracts` is an
+// extract because of the array it is in, not because of a field it carries.
+const legacyOnly = { target: { contexts: [ { id: "c", name: "Core", targetUnitIds: ["u1"] } ], extracts: [ { id: "e", name: "Search", targetUnitIds: ["u2"] } ] } };
+const legacyResolved = helpers.modernizationPlacements(legacyOnly);
+assert.equal(legacyResolved.length, 2);
+assert.equal(legacyResolved.every((item) => item._placementSource === "legacy"), true);
+assert.equal(helpers.buildModernizationArchitectureSubgraph(legacyOnly).lanes.extracts, 1, "an untyped legacy extract must not become centralized");

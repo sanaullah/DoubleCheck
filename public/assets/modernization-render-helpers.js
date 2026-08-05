@@ -41,6 +41,53 @@
 		return !EXTRACT_TYPES.includes(placementTypeOf(item));
 	}
 
+	/*
+	 * The placements the UI should render, in order of authority.
+	 *
+	 *   1. result.derived.clusters  -- derived from the coupling graph
+	 *   2. result.target.placements -- the provider's canonical v2 output
+	 *   3. contexts/extracts        -- the provider's v1 vocabulary
+	 *
+	 * Derived wins because it is evidence, not assertion: membership comes from
+	 * structural edges, table co-access and shared scope, and each cluster
+	 * carries the boundary evidence for its verdict. The two can disagree -- a
+	 * plan has been observed where derivation said "two modules" and the
+	 * provider said "two centralized" -- and showing the weaker answer while the
+	 * stronger one sits in the same artifact is the failure this ordering fixes.
+	 *
+	 * Step 3b deletes tiers 2 and 3; until then all three are read here so there
+	 * is one place that decides, rather than one decision per render site.
+	 */
+	function modernizationPlacements(result = {}) {
+		const target = result.target || {};
+		const clusters = result.derived?.clusters || [];
+		if (clusters.length) {
+			return clusters.map((cluster) => ({
+				...cluster,
+				itemType: "placement",
+				_placementSource: "derived",
+				name: cluster.name || cluster.domainKey || cluster.id
+			}));
+		}
+		const placements = target.placements || [];
+		if (placements.length) {
+			return placements.map((item) => ({ ...item, _placementSource: "provider" }));
+		}
+		// In the v1 vocabulary the array itself carries the verdict: anything in
+		// `extracts` is an extract even when it declares no placementType, so
+		// the default differs per array. Losing that turns every untyped extract
+		// into a centralized placement.
+		return (target.contexts || result.contexts || [])
+			.map((item) => ({ ...item, placementType: placementTypeOf(item), _placementSource: "legacy" }))
+			.concat(
+				(target.extracts || result.extracts || []).map((item) => ({
+					...item,
+					placementType: String(item.placementType || item.packaging || "external-service").toLowerCase(),
+					_placementSource: "legacy"
+				}))
+			);
+	}
+
 	function phaseHasCodeLinks(phase = {}) {
 		return !!(
 			(Array.isArray(phase.unitIds) && phase.unitIds.length) ||
@@ -265,9 +312,7 @@
 	 * Pure/DOM-free so it's directly unit-testable.
 	 */
 	function buildModernizationArchitectureSubgraph(result = {}) {
-		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
-			? result.target.placements
-			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
+		const placements = modernizationPlacements(result);
 		const modules = placements.filter(isModulePlacement);
 		const extracts = placements.filter(isExtractPlacement);
 		const central = placements.filter((item) => !modules.includes(item) && !extracts.includes(item));
@@ -526,9 +571,7 @@
 	 */
 	function modernizationBriefSummary(result = {}) {
 		const phases = Array.isArray(result.roadmapPhases) ? result.roadmapPhases : [];
-		const placements = Array.isArray(result.target?.placements) && result.target.placements.length
-			? result.target.placements
-			: (result.target?.contexts || result.contexts || []).map((item) => ({ ...item, placementType: item.placementType || item.packaging || "main-app" })).concat((result.target?.extracts || result.extracts || []).map((item) => ({ ...item, placementType: item.placementType || "external-service" })));
+		const placements = modernizationPlacements(result);
 		const modules = placements.filter(isModulePlacement);
 		const extracts = placements.filter(isExtractPlacement);
 		const effortCounts = { S: 0, M: 0, L: 0, XL: 0 };
@@ -562,6 +605,7 @@
 
 	return {
 		placementTypeOf,
+		modernizationPlacements,
 		isExtractPlacement,
 		isModulePlacement,
 		staysInMonolith,
