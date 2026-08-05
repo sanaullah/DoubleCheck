@@ -51,10 +51,21 @@ a validated proposal and never edits the analyzed repository or executes DDL.
 
 ### Domain objects
 
-Classes in `domain/` are small accessors-enabled mementos. `init()` copies only
-known properties from input, and `getMemento()` returns the stable struct shape
-used by handlers, repositories, and the UI. They do not query the database or
-perform business decisions.
+Classes in `domain/` are accessors-enabled mementos. `init()` copies only known
+properties from input, and `getMemento()` returns the stable struct shape used by
+handlers, repositories, and the UI. They do not query the database or perform
+business decisions.
+
+Most stay small. **Derived structural types may be large but must remain
+computation-free** — `CouplingGraph` holds thousands of edges, and that is fine;
+what it must never do is compute them. The service computes and owns the
+invariant, the type holds the result and answers questions over data it already
+has. Answering `fanIn( filePath )` from a metrics struct is a lookup, not a
+business decision; running the graph traversal that produced it would be.
+
+This split is what makes "one owner per invariant" enforceable, and it exists
+because target-path derivation once had two owners — the proposal service derived
+a path and placement canonicalization independently rewrote it.
 
 ### Repositories
 
@@ -88,6 +99,7 @@ deterministic rules behind those public methods.
 | --- | --- | --- |
 | [AgentResult.bx](domain/AgentResult.bx) | Memento for one specialist task result, including status, findings, tool audit, provenance, and timing. | `init`, `getMemento` |
 | [ArchitectureModel.bx](domain/ArchitectureModel.bx) | Memento for deterministic architecture facts plus optional enrichment and fingerprints. | `init`, `getMemento` |
+| [CouplingGraph.bx](domain/CouplingGraph.bx) | Derived coupling structure for Modernize: file nodes, typed and provenance-weighted edges, fan-in/out, cycles, shared-state overlay, co-access matrix. Large but computation-free; `ModernizationCouplingGraphService` owns the computation. | `init`, `getMemento`, `fanIn`, `fanOut`, `hasEdge`, `edgesCrossing`, `truncated`, `cycleMembersFor`, `coAccessPeers` |
 | [ModernizationPlan.bx](domain/ModernizationPlan.bx) | Versioned validated Modernize artifact containing inventory, schema evidence, signals, target units, links, and roadmap data. | `init`, `getMemento` |
 | [ReviewPlan.bx](domain/ReviewPlan.bx) | Immutable bounded specialist plan: tasks, roles, context ranges, budgets, and coverage. | `init`, `getMemento` |
 | [ReviewRun.bx](domain/ReviewRun.bx) | Review lifecycle memento for status, phase, progress, policy, budgets, leases, and project identity. | `init`, `getMemento` |

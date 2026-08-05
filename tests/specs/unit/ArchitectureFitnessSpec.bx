@@ -1,0 +1,135 @@
+/**
+ * Architectural invariants, asserted so drift fails CI rather than accumulating.
+ *
+ * Every rule here exists because its absence already caused a defect:
+ * duplicated volatile-key lists produced spurious decision conflicts, and
+ * singletons without `threadsafe` were silently losing injected dependencies.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Architecture fitness", () => {
+
+			var modelRoot = expandPath( "/tests/../app/models" );
+
+			var modelFiles = () => {
+				var found = [];
+				var listed = directoryList( modelRoot, true, "path", "*.bx" );
+				for ( var path in listed ) found.append( path );
+				found.sort( ( a, b ) => compareNoCase( a, b ) );
+				return found;
+			};
+
+			var read = ( path ) => fileRead( path, "UTF-8" );
+			var relative = ( path ) => replace( replace( path, modelRoot, "", "one" ), "\", "/", "all" );
+
+			it( "keeps the fingerprint volatile-key list in exactly one place", () => {
+				// Three copies once existed and two of them had diverged, so
+				// placement and gate evaluation hashed the same item differently
+				// and users saw ModernizationDecisionConflict on unchanged items.
+				// Two halves of one invariant: exactly one file declares the
+				// list, and nobody re-inlines it. Matching field names alone
+				// would flag ModernizationRiskService, which legitimately
+				// computes riskLevel/effortDrivers without owning the list.
+				var declarers = [];
+				var inliners = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					if ( reFindNoCase( "function\s+volatileKeys\s*\(", source ) ) declarers.append( relative( path ) );
+					// The old shape: the whole exclusion list on one line.
+					if ( reFindNoCase( '"itemFingerprint"[^' & char( 10 ) & ']*"effortDrivers"', source ) ) inliners.append( relative( path ) );
+				}
+
+				expect( declarers ).toHaveLength(
+					1,
+					"exactly one file may declare volatileKeys(), found: " & declarers.toList( ", " )
+				);
+				expect( declarers[ 1 ] ).toInclude( "ModernizationIdentityService" );
+				expect( inliners ).toBeEmpty(
+					"the volatile-key list was re-inlined in: " & inliners.toList( ", " )
+				);
+			} );
+
+			it( "declares every injected singleton threadsafe", () => {
+				// WireBox wires setter/property injections *after* placing the
+				// instance in the singleton scope, unlocked. Without threadsafe
+				// another thread can take a half-wired singleton and later
+				// properties read as null — silently, and only sometimes.
+				var offenders = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					var isSingleton = findNoCase( "@singleton", source ) > 0;
+					var injects = reFindNoCase( 'property\s+name="[^"]+"\s+inject=', source ) > 0;
+					var isThreadsafe = reFindNoCase( "class\s+threadsafe", source ) > 0;
+					if ( isSingleton && injects && !isThreadsafe ) offenders.append( relative( path ) );
+				}
+
+				expect( offenders ).toBeEmpty(
+					"singletons with injected properties must be `class threadsafe {`: " & offenders.toList( ", " )
+				);
+			} );
+
+			it( "keeps the deterministic layer free of any gateway", () => {
+				// This is what keeps the deterministic corpus tier runnable
+				// without a provider.
+				var deterministic = [ "ModernizationCouplingGraphService.bx", "CouplingGraph.bx" ];
+				for ( var path in modelFiles() ) {
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( !deterministic.contains( name ) ) continue;
+					var source = read( path );
+
+					expect( reFindNoCase( 'inject="\w*(Gateway|AgentFactory)', source ) ).toBe(
+						0,
+						name & " must not inject an LLM gateway"
+					);
+				}
+			} );
+
+			it( "holds no service above 900 lines except SchemaService", () => {
+				var offenders = [];
+				for ( var path in modelFiles() ) {
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( name == "SchemaService.bx" ) continue;
+					var lineCount = listToArray( read( path ), char( 10 ), true, true ).len();
+					if ( lineCount > 900 ) offenders.append( relative( path ) & " (" & lineCount & ")" );
+				}
+
+				// Known, each with a destination:
+				//   ModernizationProposalService  -> Step 3b then Step 11
+				//   SpecialistAgentGateway        -> Part 5
+				//   ReviewRunService              -> Part 5
+				//   SpecialistReviewService (943) -> pre-existing, UNASSIGNED.
+				//     The plan's 900-line rule never accounted for it; it is over
+				//     by 43 lines and belongs in Part 5's split alongside the
+				//     gateway. Listed so the rule stays live for new code.
+				var known = [ "ModernizationProposalService", "SpecialistAgentGateway", "ReviewRunService", "SpecialistReviewService" ];
+				var unexpected = [];
+				for ( var offender in offenders ) {
+					var recognised = false;
+					for ( var allowed in known ) if ( findNoCase( allowed, offender ) ) recognised = true;
+					if ( !recognised ) unexpected.append( offender );
+				}
+
+				expect( unexpected ).toBeEmpty(
+					"new service over 900 lines: " & unexpected.toList( ", " )
+				);
+			} );
+
+			it( "gives the coupling graph exactly one computing owner and one answering type", () => {
+				// Step 12's actual test: if two files can answer the same
+				// question, the invariant has two owners again.
+				var computes = [];
+				var answers = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( reFindNoCase( "function\s+stronglyConnectedComponents", source ) ) computes.append( name );
+					if ( reFindNoCase( "function\s+fanIn\s*\(", source ) ) answers.append( name );
+				}
+
+				expect( computes ).toBe( [ "ModernizationCouplingGraphService.bx" ] );
+				expect( answers ).toBe( [ "CouplingGraph.bx" ] );
+			} );
+		} );
+	}
+}

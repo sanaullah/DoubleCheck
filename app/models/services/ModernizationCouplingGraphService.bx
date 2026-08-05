@@ -62,8 +62,11 @@ class threadsafe {
 	/**
 	 * Build the graph. Deterministic: identical inventory in, byte-identical
 	 * graph out.
+	 *
+	 * Returns a `CouplingGraph`, which owns the answers. This service owns the
+	 * computation and nothing else — one owner per invariant.
 	 */
-	struct function build( required struct inventory ) {
+	CouplingGraph function build( required struct inventory ) {
 		var units        = isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [];
 		var dependencies = isArray( arguments.inventory.dependencies ?: "" ) ? arguments.inventory.dependencies : [];
 
@@ -100,7 +103,7 @@ class threadsafe {
 		var nodeList = [];
 		for ( var key in sortedKeys( nodes ) ) nodeList.append( nodes[ key ] );
 
-		return {
+		return new app.models.domain.CouplingGraph( {
 			version    : variables.version,
 			nodes      : nodeList,
 			edges      : edges,
@@ -108,7 +111,7 @@ class threadsafe {
 			truncated  : truncation.truncated,
 			truncationReasons: truncation.reasons,
 			fingerprint: stableHash( variables.version & "|" & jsonSerialize( { nodes: nodeList, edges: edges, metrics: metrics } ) )
-		};
+		} );
 	}
 
 	/**
@@ -118,7 +121,7 @@ class threadsafe {
 	 * only answers "how good is this boundary" for a membership someone else
 	 * chose, which keeps one owner per invariant.
 	 */
-	struct function cohesion( required struct graph, required array memberFilePaths ) {
+	struct function cohesion( required CouplingGraph graph, required array memberFilePaths ) {
 		var members = {};
 		for ( var path in arguments.memberFilePaths ) {
 			var key = normalizePath( path );
@@ -129,7 +132,7 @@ class threadsafe {
 		var inbound = 0;
 		var internalWeight = 0;
 		var externalWeight = 0;
-		for ( var edge in ( arguments.graph.edges ?: [] ) ) {
+		for ( var edge in arguments.graph.getEdges() ) {
 			var fromInside = members.keyExists( edge.fromFile );
 			var toInside = members.keyExists( edge.toFile );
 			if ( fromInside && toInside ) {
@@ -158,15 +161,6 @@ class threadsafe {
 			internalWeight: round4( internalWeight ),
 			externalWeight: round4( externalWeight )
 		};
-	}
-
-	/** Files that appear in a reported cycle cannot be cut apart. */
-	array function cycleMembersFor( required struct graph, required string filePath ) {
-		var key = normalizePath( arguments.filePath );
-		for ( var cycle in ( arguments.graph.metrics.cycles ?: [] ) ) {
-			if ( cycle.contains( key ) ) return cycle;
-		}
-		return [];
 	}
 
 	private struct function indexUnitsByFile( required array units ) {

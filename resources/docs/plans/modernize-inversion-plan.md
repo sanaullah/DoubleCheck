@@ -68,8 +68,8 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 0 | Clear the ground | `done` (uncommitted) | `box server restart && box testbox run` green; `node --test tests/js/*.spec.mjs` green **and in `box.json:49`**; `/`, `/modernize`, `/aiflight/` load | **Gate green: 492·0·0·1**, `box run-script test` reaches its node stage (3/3), all four routes 200. Required fixing the §2.17 wiring race first |
 | 1 | Coupling graph | `wip` | unit specs for cohesion, fan-in/out, cycles, co-access on Step 2a fixtures; identical input → byte-identical graph | `ModernizationCouplingGraphService` + 16 specs green (508·0·0·1). **Remaining:** corpus-fixture validation (needs 2a), plus persistence and architecture findings, both deferred to Step 2 — see the note in Step 1 |
 | 2 | Promote synthesis | `todo` | deterministic corpus tier green on all four scenarios | |
-| 2a | Corpus, deterministic tier | `wip` | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting added, 14 specs green (523·0·0·1). Found and fixed two extractor defects (§2.18). **Remaining: `baseline-llm-path.json` (one-shot, needs a provider) and the modernization evaluator** |
-| 12 | Domain types | `todo` | exactly one file computes each invariant; one type answers each | |
+| 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
+| 12 | Domain types | `wip` | exactly one file computes each invariant; one type answers each | `CouplingGraph` done, README convention amended, `ArchitectureFitnessSpec` added (532·0·0·1). **`Cluster`, `WaveOrder` and `Placement`'s ownership change are blocked on Step 2** — see the step |
 | 3a | Re-point client + tests | `todo` | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | |
 | 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
@@ -645,9 +645,50 @@ clustering. Expect more of this when the LLM and judge tiers land: **treat a
 corpus failure as a finding about the product first, and about the fixture
 second.**
 
----
+## 2.19 The LLM baseline: the current path extracts nothing at all
 
-# Part 3 — The direction
+Captured 2026-08-05 against all four corpus scenarios, provider
+`openai-compatible` / `deepseek-v4-flash`, before any inversion work. Reduced
+artifact committed as
+`resources/evaluation-corpus/modernization-v1/baseline-llm-path.json`; the ~1 MB
+raw capture stays gitignored beside it.
+
+| Scenario | Units | Placements | **Extracted** | All stay | seamPrecision | seamRecall | Wall clock |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `false-seam` | 6 | 4 | **0** | yes | 1.0 | 1.0 | ~210s |
+| `separable-domain` | 3 | 3 | **0** | yes | **0.0** | **0.0** | 130s |
+| `below-inference-threshold` | 4 | 2 | **0** | yes | 1.0 | 1.0 | 135s |
+| `cyclic-boundary` | 3 | 1 | **0** | yes | 1.0 | 1.0 | 246s |
+
+Every run terminated `partial` — "plan retained with review gates".
+
+**The path proposes zero extractions on every scenario, including the one where
+extracting is the correct answer.** Its apparent success on `false-seam` is not
+seam detection; it is a blanket refusal that happens to be right three times out
+of four. `separable-domain` is where that shows: a genuinely separable domain —
+own datasource, own tables, one external provider, no shared scope — and it was
+not extracted.
+
+### This makes Step 3b's fourth stop condition nearly worthless as written
+
+"`seamPrecision` ≥ the current LLM path" is satisfied on three of four scenarios
+by a service that refuses everything, because **precision is undefined-favourable
+when nothing is proposed**. A derived path that also extracts nothing would pass.
+The condition would certify a regression as a success.
+
+Precision alone cannot measure a system whose failure mode is silence. Step 3b's
+stop conditions are amended accordingly — see that step.
+
+### Two further readings
+
+- **This is consistent with §2.3, not a contradiction of it.** Below
+  `minUnitsForFolderInference` every unit lands in one cluster, so at 3–6 units
+  the architecture role has nothing to differentiate and defaults to
+  main-app. The baseline therefore measures the degenerate branch — which is
+  exactly the branch real small estates hit.
+- **Cost floor for comparison:** 130–246 seconds per 3–6 file fixture. Any
+  derived path that is slower than this on the same inputs has a problem
+  independent of quality.
 
 ## 3.1 The inversion
 
@@ -1232,8 +1273,21 @@ where you find out you were wrong.
 | `false-seam` correctly rejected | clustering is coupling-shaped, not folder-shaped — **the decisive gate** | deterministic tier |
 | `below-inference-threshold` yields real seams | the degenerate path is genuinely fixed | deterministic tier |
 | `cyclic-boundary` reports the cycle and blocks extraction | the graph is actually consulted | deterministic tier |
-| `seamPrecision` ≥ the current LLM path on the same scenarios | the inversion is not a regression | **LLM baseline captured in Step 2a — see below** |
+| `separable-domain` **is** extracted | the derived path can say yes, not only no. **This is now the load-bearing condition** — the baseline extracts nothing anywhere, so refusing everything already "passes" on precision (§2.19) | deterministic tier vs `baseline-llm-path.json` |
+| `seamPrecision` ≥ baseline **and** `seamRecall` > baseline | the inversion is not a regression, and not a blanket refusal | `baseline-llm-path.json` |
 
+> ### ✅ Captured — and it moved the goalposts
+>
+> `baseline-llm-path.json` is committed. The headline: **the current LLM path
+> extracts nothing on any of the four scenarios**, so a precision-only
+> comparison is passed by any path that also extracts nothing (§2.19). The
+> decisive condition is therefore `separable-domain`, where the baseline scores
+> **0.0** and the derived path must score 1.0. That is a real bar, unlike the
+> original fourth condition.
+>
+> The note below is kept because its reasoning was right and its timing was the
+> only reason this measurement exists at all.
+>
 > ### ⚠️ The LLM baseline is a one-shot measurement window
 >
 > The fourth condition compares against *the current LLM path*. That path exists
@@ -1612,6 +1666,42 @@ structural types may be large but must remain computation-free.
 **Test:** for each invariant, exactly one file computes it and exactly one type
 answers it. If two services can answer "what is this unit's target path", Step 12
 is not done.
+
+### Done so far — and why the rest waits for Step 2
+
+`CouplingGraph` is built and its service returns it, so
+`ModernizationCouplingGraphService` owns the computation and the type owns every
+answer. `app/models/README.md`'s Domain objects section is amended as this step
+requires: mementos stay small, derived structural types may be large but must
+remain computation-free. `tests/specs/unit/ArchitectureFitnessSpec.bx` now
+enforces the §6.2 invariants.
+
+**The other three types are deliberately not written yet.**
+`ModernizationDerivedStructureService` does not exist until Step 2, so `Cluster`
+and `WaveOrder` have no computing owner and their shapes would be *guessed* —
+which is the precise failure this step exists to prevent, and the stated reason
+it was ordered after Step 2 in the first place. `Placement`'s change is to become
+**sole owner of target-path derivation**, but that derivation only moves into
+`PlacementService` in Step 2 item 2; declaring the type sole owner while the
+proposal service still derives paths would document an invariant that is false.
+
+So Step 12 splits along its own dependency: the graph type lands with the graph,
+the rest lands immediately after Step 2 and still before Step 3a. The execution
+graph is unchanged in intent — only in granularity.
+
+### The fitness spec found a pre-existing violation
+
+`SpecialistReviewService` is **943 lines**, over the 900 limit, and no step in
+this plan owns it. §6.1 tracks services over 1,400 lines and the 900-line rule
+was written for Step 11's gate, so a service sitting 43 lines over slipped
+between them. It is listed as a known exception with the others rather than
+silently exempted, and belongs in Part 5's split alongside `SpecialistAgentGateway`.
+
+The known-exception list is `ModernizationProposalService` (Step 3b, Step 11),
+`SpecialistAgentGateway` (Part 5), `ReviewRunService` (Part 5) and
+`SpecialistReviewService` (Part 5, newly assigned). Everything else fails the
+spec, so the rule stays live for new code instead of being deleted until
+convenient.
 
 ---
 

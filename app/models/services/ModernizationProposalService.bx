@@ -9,6 +9,7 @@ class threadsafe {
 	property name="agentGateway" inject="ModernizationAgentGateway";
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="identityService" inject="ModernizationIdentityService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
 	property name="log" inject="logbox:logger:{this}";
 	variables.cancelledRuns = {};
 	variables.maxItems = 200;
@@ -33,12 +34,24 @@ class threadsafe {
 	variables.maxInferredArchitectureScopes = 12;
 	// Roadmap shards are sized independently of the application-shard
 	// constants above: they cover already-compacted target-unit groups (from
-	// synthesisRoadmapGroups()), not raw file shards, and the failure mode
+	// derivedStructureService.synthesisRoadmapGroups()), not raw file shards, and the failure mode
 	// being fixed is the roadmap role trying to describe an entire ~20-group
 	// plan in one call. 24 gives real projects one phase per group while
 	// still collapsing small/no-architecture-group test plans to one shard.
 	variables.defaultRoadmapUnitBatchSize = 24;
 	variables.maxRoadmapShards = 24;
+
+	/**
+	 * Direct unit construction does not run WireBox injection, and several specs
+	 * build this service with `new`. Seed the derived-structure collaborator so
+	 * those paths keep working after the synthesis block moved out.
+	 */
+	function init() {
+		if ( isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) {
+			variables.derivedStructureService = new app.models.services.ModernizationDerivedStructureService();
+		}
+		return this;
+	}
 
 	struct function propose(
 		required string runId,
@@ -268,8 +281,8 @@ class threadsafe {
 			// role times out or exceeds schema limits, synthesize path-based
 			// placements now so roadmap phases follow ColdBox module / worker seams
 			// instead of one catch-all road.
-			if ( applicationFragmentHasSubstance( merged ) && architectureDecisionsMissing( merged ) ) {
-				merged = applySynthesizedArchitecture( merged, arguments.evidence, notes );
+			if ( applicationFragmentHasSubstance( merged ) && derivedStructureService.architectureDecisionsMissing( merged ) ) {
+				merged = derivedStructureService.applySynthesizedArchitecture( merged, arguments.evidence, notes );
 			}
 
 			var canAffordRoadmap = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
@@ -323,12 +336,12 @@ class threadsafe {
 		merged = polishPlan( merged, samplePolicy, errors );
 		// Architecture packaging must exist before synthesized roadmap groups,
 		// otherwise the road collapses to one generic strangler phase.
-		if ( applicationFragmentHasSubstance( merged ) && architectureDecisionsMissing( merged ) ) {
-			merged = applySynthesizedArchitecture( merged, arguments.evidence, notes );
+		if ( applicationFragmentHasSubstance( merged ) && derivedStructureService.architectureDecisionsMissing( merged ) ) {
+			merged = derivedStructureService.applySynthesizedArchitecture( merged, arguments.evidence, notes );
 			merged = polishPlan( merged, samplePolicy, errors );
 		}
 		if ( applicationFragmentHasSubstance( merged ) && ( !isArray( merged.roadmapPhases ?: "" ) || !merged.roadmapPhases.len() ) ) {
-			merged = applySynthesizedRoadmap( merged, notes );
+			merged = derivedStructureService.applySynthesizedRoadmap( merged, notes );
 			merged = polishPlan( merged, samplePolicy, errors );
 		}
 		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
@@ -867,7 +880,7 @@ class threadsafe {
 	 * Partitions the merged plan into small roadmap-generation jobs so no
 	 * single call has to describe the whole plan (the failure mode that made
 	 * the roadmap role truncate on any real project). Prefers one shard per
-	 * architecture group (mirrors the deterministic synthesizeGroupedPhases()
+	 * architecture group (mirrors the deterministic derivedStructureService.synthesizeGroupedPhases()
 	 * grouping, just producing shard descriptors instead of finished phases);
 	 * falls back to plain unit batches when architecture didn't run/produce
 	 * groups.
@@ -882,7 +895,7 @@ class threadsafe {
 		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
 		if ( !units.len() ) return [];
 
-		var groups = synthesisRoadmapGroups( arguments.plan );
+		var groups = derivedStructureService.synthesisRoadmapGroups( arguments.plan );
 		var shardGroups = [];
 		var covered = {};
 		if ( groups.len() ) {
@@ -924,7 +937,7 @@ class threadsafe {
 			// prompt budget: one leftover megashard is what blew immutableCharacters
 			// past 60k previously.
 			var leftoverBatch = min( batchSize, 24 );
-			for ( var leftoverGroup in leftoverRoadmapGroups( units, leftover ) ) {
+			for ( var leftoverGroup in derivedStructureService.leftoverRoadmapGroups( units, leftover ) ) {
 				var groupLeftoverIds = leftoverGroup.targetUnitIds;
 				for ( var leftoverOffset = 1; leftoverOffset <= groupLeftoverIds.len() && shardGroups.len() < shardCap; leftoverOffset += leftoverBatch ) {
 					var leftoverIds = [];
@@ -1380,7 +1393,7 @@ class threadsafe {
 	 * item on collision), dependencies (may reference an id from a call this
 	 * one never saw), or currentSlice (multiple shards may each claim it).
 	 * All three are normalized deterministically here instead, mirroring how
-	 * synthesizeGroupedPhases() already chains deterministic phases.
+	 * derivedStructureService.synthesizeGroupedPhases() already chains deterministic phases.
 	 */
 	private array function reconcileShardedRoadmapPhases( required array phaseRecords ) {
 		var ordered = duplicate( arguments.phaseRecords );
@@ -1429,808 +1442,7 @@ class threadsafe {
 		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
 		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
 		arguments.plan.metadata.architectureSource = "provider";
-		return normalizeArchitecturePlacementTypes( arguments.plan );
-	}
-
-	/**
-	 * When the provider roadmap is skipped (cost/time), still emit mapped phases
-	 * from retained target/route ids so the Solution Road is usable.
-	 */
-	private struct function applySynthesizedRoadmap( required struct plan, array errors = [] ) {
-		var phases = synthesizeRoadmapPhases( arguments.plan );
-		if ( !phases.len() ) return arguments.plan;
-		arguments.plan.roadmapPhases = phases;
-		for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
-		arguments.errors.append( { role: "modernization-roadmap", message: "synthesized-from-application-maps", severity: "info" } );
-		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
-		arguments.plan.metadata.roadmapSource = "synthesized";
-		logInfo( "Modernize roadmap synthesized from application maps (#arguments.plan.roadmapPhases.len()# phase(s))" );
-		return arguments.plan;
-	}
-
-	private array function synthesizeRoadmapPhases( required struct plan ) {
-		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
-		var routes = isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [];
-		if ( !units.len() && !routes.len() ) return [];
-		var foundation = [];
-		var feature = [];
-		for ( var unit in units ) {
-			if ( !isStruct( unit ) ) continue;
-			var path = lCase( trim( scalarString( unit.targetPath ?: unit.sourcePath ?: unit.id ?: "" ) ) );
-			if ( reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes", path ) ) foundation.append( unit );
-			else feature.append( unit );
-		}
-		var phases = [];
-		if ( foundation.len() ) {
-			phases.append( {
-				id: "phase-foundation",
-				name: "Foundation and config",
-				goal: "Stand up modern Application/config/router coexistence before feature slices.",
-				pattern: "foundation",
-				classification: "refactor-monolith",
-				wave: 0,
-				estimatedComplexity: "medium",
-				risks: [ "Shared bootstrap changes can break every coexist route." ],
-				rollbackStrategy: "Keep legacy Application/config as default entry until coexist routes prove stable.",
-				testingStrategy: "Boot smoke, router coexist checks, and config parity against legacy entrypoints.",
-				dependencies: [],
-				unitIds: foundation.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) ),
-				routeIds: [],
-				dbFindingIds: [],
-				transitionIds: [],
-				sampleIds: [],
-				parityIntent: "Boot and config parity with legacy Application/ColdBox entrypoints.",
-				exitCriteria: [ "Modern app boots", "Router/config coexist with legacy", "No big-bang cutover" ],
-				rollback: "Keep legacy Application/config as default entry until coexist routes prove stable.",
-				implementerPrompt: "Implement foundation targets first. Do not migrate feature handlers until config and routing coexist.",
-				provenanceClass: "deterministically-derived",
-				currentSlice: false
-			} );
-		}
-		var sliceUnits = feature.len() ? feature : units;
-		// applySynthesizedRoadmap() always runs before applySynthesizedArchitecture(),
-		// so target.contexts/.extracts here are either real architecture output or
-		// genuinely empty — never the single "keep everything centralized" fallback
-		// context. When real groups exist, follow them into one phase per group
-		// instead of an arbitrary count-based split.
-		var groups = synthesisRoadmapGroups( arguments.plan );
-		if ( groups.len() ) {
-			phases.append( synthesizeGroupedPhases( sliceUnits, routes, groups, foundation.len() ), true );
-			return phases;
-		}
-		var sliceSize = min( 8, sliceUnits.len() );
-		var firstSlice = [];
-		for ( var i = 1; i <= sliceSize; i++ ) firstSlice.append( sliceUnits[ i ] );
-		var firstIds = firstSlice.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) );
-		var firstIdSet = {};
-		for ( var id in firstIds ) firstIdSet[ id ] = true;
-		var sliceRoutes = routesForUnitIds( routes, firstIdSet, true );
-		phases.append( {
-			id: "phase-first-slice",
-			name: "First vertical slice",
-			goal: "Deliver one coexist-route vertical slice with mapped targets and routes.",
-			pattern: "vertical-slice",
-			dependencies: foundation.len() ? [ "phase-foundation" ] : [],
-			unitIds: firstIds,
-			routeIds: sliceRoutes,
-			dbFindingIds: [],
-			transitionIds: [],
-			sampleIds: [],
-			parityIntent: "Feature parity for the first mapped slice only.",
-			exitCriteria: [ "Coexist route serves the slice", "Target handlers/services compile", "Legacy path remains rollback" ],
-			rollback: "Route traffic back to legacy paths for this slice.",
-			implementerPrompt: "Implement only the listed target units and coexist routes. Keep unlisted legacy files untouched.",
-			provenanceClass: "deterministically-derived",
-			currentSlice: true
-		} );
-		if ( sliceUnits.len() > sliceSize ) {
-			var later = [];
-			for ( var j = sliceSize + 1; j <= sliceUnits.len(); j++ ) later.append( sliceUnits[ j ].id ?: sliceUnits[ j ].itemId ?: "" );
-			phases.append( {
-				id: "phase-continue-strangler",
-				name: "Continue strangler slices",
-				goal: "Migrate remaining mapped targets in later coexist slices.",
-				pattern: "coexist-route",
-				dependencies: [ "phase-first-slice" ],
-				unitIds: later.filter( ( id ) => len( trim( id ) ) ),
-				routeIds: [],
-				dbFindingIds: [],
-				transitionIds: [],
-				sampleIds: [],
-				parityIntent: "Incremental strangler coverage for remaining mapped files.",
-				exitCriteria: [ "Each later slice has coexist routing", "No big-bang retirement" ],
-				rollback: "Leave later slices on legacy until accepted.",
-				implementerPrompt: "Rebuild one later slice at a time from the retained target map.",
-				provenanceClass: "deterministically-derived",
-				currentSlice: false
-			} );
-		}
-		return phases;
-	}
-
-	/** Route ids whose target unit falls inside unitIdSet. Falls back to the
-	 * first few unlinked routes only when nothing in the plan is linked yet
-	 * (mirrors the previous inline behavior for the count-based fallback). */
-	private array function routesForUnitIds( required array routes, required struct unitIdSet, boolean fallbackToUnlinked = false ) {
-		var matched = [];
-		for ( var route in arguments.routes ) {
-			if ( !isStruct( route ) ) continue;
-			var related = route.targetUnitId ?: "";
-			if ( !len( related ) && isArray( route.relatedItemIds ?: "" ) && route.relatedItemIds.len() ) related = route.relatedItemIds[ 1 ];
-			if ( len( related ) && arguments.unitIdSet.keyExists( related ) ) matched.append( route.id ?: route.itemId ?: "" );
-			if ( matched.len() >= 8 ) break;
-		}
-		if ( !matched.len() && arguments.fallbackToUnlinked && !arguments.unitIdSet.count() ) {
-			for ( var route in arguments.routes ) {
-				if ( isStruct( route ) ) matched.append( route.id ?: route.itemId ?: "" );
-				if ( matched.len() >= 6 ) break;
-			}
-		}
-		return matched.filter( ( id ) => len( trim( id ) ) );
-	}
-
-	/** Real (non-degenerate) context/extract groupings, each with the units they
-	 * cover. Empty when the architecture role hasn't produced anything yet. */
-	/**
-	 * Groups roadmap leftovers by feature directory so each shard names a real
-	 * domain instead of "Continue strangler slices (3)".
-	 *
-	 * Uses the unit's legacy sourcePath (falling back to targetPath) because that
-	 * is the same signal the deterministic architecture gap-fill uses when it
-	 * later invents module candidates; grouping the same way keeps roadmap phase
-	 * names aligned with the placements the finished plan ends up with.
-	 *
-	 * Groups are ordered largest-first (ties broken by name) so shard order is
-	 * deterministic across runs.
-	 */
-	private array function leftoverRoadmapGroups( required array units, required array leftoverIds ) {
-		if ( !arguments.leftoverIds.len() ) return [];
-		var unitsById = {};
-		for ( var unit in arguments.units ) {
-			if ( !isStruct( unit ) ) continue;
-			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
-			if ( len( unitId ) ) unitsById[ unitId ] = unit;
-		}
-		var buckets = {};
-		var order = [];
-		for ( var leftoverId in arguments.leftoverIds ) {
-			var id = trim( toString( leftoverId ) );
-			if ( !len( id ) ) continue;
-			var unitRecord = unitsById[ id ] ?: {};
-			var key = featureDomainKey( isStruct( unitRecord ) ? unitRecord : {} );
-			if ( !buckets.keyExists( key ) ) {
-				buckets[ key ] = [];
-				order.append( key );
-			}
-			buckets[ key ].append( id );
-		}
-		var groups = [];
-		for ( var key in order ) {
-			groups.append( {
-				name: featureDomainLabel( key ),
-				targetUnitIds: buckets[ key ],
-				kind: "leftover"
-			} );
-		}
-		groups.sort( ( a, b ) => {
-			if ( a.targetUnitIds.len() != b.targetUnitIds.len() ) return b.targetUnitIds.len() - a.targetUnitIds.len();
-			return compareNoCase( a.name, b.name );
-		} );
-		return groups;
-	}
-
-	/** Feature-directory key for one target unit; "" when nothing usable exists. */
-	private string function featureDomainKey( required struct unit ) {
-		var path = normalizeLegacyPath( arguments.unit.sourcePath ?: "" );
-		if ( !len( trim( path ) ) ) path = normalizeLegacyPath( arguments.unit.targetPath ?: "" );
-		var segments = [];
-		for ( var segment in listToArray( path, "/" ) ) {
-			var cleaned = trim( segment );
-			if ( len( cleaned ) ) segments.append( cleaned );
-		}
-		// Last segment is the file itself, not a domain.
-		if ( segments.len() ) segments.deleteAt( segments.len() );
-		if ( !segments.len() ) return "";
-		// A container folder says nothing about the feature; reach one level in.
-		var containers = [ "app", "src", "cfc", "com", "lib", "libs", "includes", "include", "core", "shared", "common", "handlers", "views", "models", "services", "layouts" ];
-		var first = lCase( segments[ 1 ] );
-		if ( containers.contains( first ) && segments.len() >= 2 ) return lCase( segments[ 1 ] & "/" & segments[ 2 ] );
-		return first;
-	}
-
-	/** Human label for a feature-directory key. */
-	private string function featureDomainLabel( required string key ) {
-		if ( !len( trim( arguments.key ) ) ) return "Remaining application slices";
-		var words = [];
-		for ( var segment in listToArray( arguments.key, "/" ) ) {
-			// Split camelCase and separator-delimited folder names into words.
-			var spaced = reReplace( segment, "([a-z0-9])([A-Z])", "\1 \2", "all" );
-			spaced = reReplace( spaced, "[_\-\.]+", " ", "all" );
-			for ( var word in listToArray( spaced, " " ) ) {
-				var cleaned = trim( word );
-				if ( len( cleaned ) ) words.append( uCase( left( cleaned, 1 ) ) & lCase( right( cleaned, len( cleaned ) - 1 ) ) );
-			}
-		}
-		if ( !words.len() ) return "Remaining application slices";
-		return words.toList( " " );
-	}
-
-	private array function synthesisRoadmapGroups( required struct plan ) {
-		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
-		var groups = [];
-		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
-			if ( !isStruct( placement ) || !isArray( placement.targetUnitIds ?: "" ) || !placement.targetUnitIds.len() ) continue;
-			groups.append( {
-				name: placement.name ?: placement.domainKey ?: "Capability",
-				targetUnitIds: placement.targetUnitIds,
-				placementType: placement.placementType ?: "main-app",
-				kind: ( placement.placementType ?: "main-app" ) == "external-service" ? "extract" : "context"
-			} );
-		}
-		if ( groups.len() ) return groups;
-		for ( var ctx in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
-			if ( isStruct( ctx ) && isArray( ctx.targetUnitIds ?: "" ) && ctx.targetUnitIds.len() ) {
-				groups.append( { name: ctx.name ?: "Slice", targetUnitIds: ctx.targetUnitIds, kind: "context" } );
-			}
-		}
-		for ( var ext in ( isArray( target.extracts ?: "" ) ? target.extracts : [] ) ) {
-			if ( isStruct( ext ) && isArray( ext.targetUnitIds ?: "" ) && ext.targetUnitIds.len() ) {
-				groups.append( { name: ext.name ?: "Extract", targetUnitIds: ext.targetUnitIds, kind: "extract" } );
-			}
-		}
-		return groups;
-	}
-
-	/** Map placement taxonomy onto roadmap classification vocabulary. */
-	private string function synthesizeRoadmapClassification( required string placementType ) {
-		var normalized = lCase( trim( arguments.placementType ) );
-		if ( normalized == "coldbox-module" ) return "coldbox-module";
-		if ( normalized == "background-worker" ) return "background-worker";
-		if ( normalized == "scheduled-service" ) return "scheduled-service";
-		if ( normalized == "external-service" ) return "external-service";
-		if ( normalized == "worker" ) return "background-worker";
-		return "refactor-monolith";
-	}
-
-	/** One roadmap phase per context/extract/placement group (capped near the
-	 * roadmap shard ceiling), chained sequentially so the Road still reads as
-	 * one strangler step at a time. Units no group covers land in batched
-	 * trailing "continue strangler" phases. */
-	private array function synthesizeGroupedPhases( required array sliceUnits, required array routes, required array groups, required boolean hasFoundation ) {
-		var covered = {};
-		var phases = [];
-		var previousPhaseId = arguments.hasFoundation ? "phase-foundation" : "";
-		var index = 0;
-		var groupCap = max( 8, min( variables.maxRoadmapShards, arguments.groups.len() ) );
-		for ( var group in arguments.groups ) {
-			if ( index >= groupCap ) break;
-			var groupIds = [];
-			for ( var unitId in group.targetUnitIds ) {
-				var id = trim( toString( unitId ) );
-				if ( len( id ) && !covered.keyExists( id ) ) groupIds.append( id );
-			}
-			if ( !groupIds.len() ) continue;
-			for ( var id in groupIds ) covered[ id ] = true;
-			index++;
-			var idSet = {};
-			for ( var id in groupIds ) idSet[ id ] = true;
-			var isExtract = ( group.kind ?: "" ) == "extract";
-			var classification = synthesizeRoadmapClassification( group.placementType ?: ( isExtract ? "external-service" : "main-app" ) );
-			phases.append( {
-				id: "phase-slice-" & index,
-				name: group.name,
-				goal: isExtract
-					? "Extract #group.name# behind a coexist boundary, verified before any deployment split."
-					: "Migrate the #group.name# slice behind ColdBox, one strangler step at a time.",
-				pattern: isExtract ? "side-app-extract" : "vertical-slice",
-				classification: classification,
-				wave: index,
-				estimatedComplexity: groupIds.len() > 40 ? "high" : ( groupIds.len() > 15 ? "medium" : "low" ),
-				risks: [
-					"Coexistence cutover may regress routes shared with unmigrated legacy callers.",
-					"Schema or credential coupling may block an early extract."
-				],
-				rollbackStrategy: "Route traffic back to legacy paths for this slice.",
-				testingStrategy: "Parity checks for the listed target units, coexist route smoke, and rollback drill before advancing the wave.",
-				dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
-				unitIds: groupIds,
-				routeIds: routesForUnitIds( arguments.routes, idSet ),
-				dbFindingIds: [],
-				transitionIds: [],
-				sampleIds: [],
-				parityIntent: "Feature parity for the #group.name# slice only.",
-				exitCriteria: [ "Coexist route serves the slice", "Target handlers/services compile", "Legacy path remains rollback" ],
-				rollback: "Route traffic back to legacy paths for this slice.",
-				implementerPrompt: "Implement only the listed target units and coexist routes for #group.name#. Keep unlisted legacy files untouched.",
-				provenanceClass: "deterministically-derived",
-				currentSlice: index == 1
-			} );
-			previousPhaseId = "phase-slice-" & index;
-		}
-		var leftover = [];
-		for ( var unit in arguments.sliceUnits ) {
-			var id = trim( toString( unit.id ?: unit.itemId ?: "" ) );
-			if ( len( id ) && !covered.keyExists( id ) ) leftover.append( id );
-		}
-		if ( leftover.len() ) {
-			var leftoverBatch = 48;
-			var leftoverIndex = 0;
-			while ( leftover.len() && phases.len() < variables.maxRoadmapShards + 1 ) {
-				leftoverIndex++;
-				var batch = [];
-				while ( batch.len() < leftoverBatch && leftover.len() ) {
-					batch.append( leftover[ 1 ] );
-					leftover.deleteAt( 1 );
-				}
-				var phaseId = leftoverIndex == 1 && !leftover.len() ? "phase-continue-strangler" : "phase-continue-strangler-" & leftoverIndex;
-				phases.append( {
-					id: phaseId,
-					name: leftoverIndex == 1 ? "Continue strangler slices" : "Continue strangler slices (#leftoverIndex#)",
-					goal: "Migrate remaining mapped targets not covered by an identified slice.",
-					pattern: "coexist-route",
-					classification: "refactor-monolith",
-					wave: index + leftoverIndex,
-					estimatedComplexity: batch.len() > 24 ? "high" : "medium",
-					risks: [ "Ungrouped leftovers may mix unrelated domains in one wave." ],
-					rollbackStrategy: "Leave later slices on legacy until accepted.",
-					testingStrategy: "Rebuild one leftover batch at a time and verify coexist routing before advancing.",
-					dependencies: len( previousPhaseId ) ? [ previousPhaseId ] : [],
-					unitIds: batch,
-					routeIds: [],
-					dbFindingIds: [],
-					transitionIds: [],
-					sampleIds: [],
-					parityIntent: "Incremental strangler coverage for remaining mapped files.",
-					exitCriteria: [ "Each later slice has coexist routing", "No big-bang retirement" ],
-					rollback: "Leave later slices on legacy until accepted.",
-					implementerPrompt: "Rebuild one later slice at a time from the retained target map.",
-					provenanceClass: "deterministically-derived",
-					currentSlice: !phases.len()
-				} );
-				previousPhaseId = phaseId;
-			}
-		}
-		return phases;
-	}
-
-	private boolean function architectureDecisionsMissing( required struct plan ) {
-		var placements = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [];
-		var contexts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
-		var extracts = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
-		return !placements.len() && !contexts.len() && !extracts.len();
-	}
-
-	/**
-	 * Fill contexts/extracts from maps + signals when shards omitted them
-	 * (to avoid truncation). Follows modular-monolith-first packaging policy.
-	 */
-	private struct function applySynthesizedArchitecture( required struct plan, required struct evidence, array errors = [] ) {
-		var built = synthesizeArchitectureDecisions( arguments.plan, arguments.evidence );
-		if ( !built.contexts.len() && !built.extracts.len() && !built.unitLinks.len() && !( isArray( built.placements ?: "" ) && built.placements.len() ) ) return arguments.plan;
-		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [], placements: [] };
-		arguments.plan.target.contexts = built.contexts;
-		arguments.plan.target.extracts = built.extracts;
-		if ( isArray( built.placements ?: "" ) && built.placements.len() ) {
-			arguments.plan.target.placements = built.placements;
-			for ( var placement in arguments.plan.target.placements ) ensureIdentity( placement, "placement" );
-		}
-		if ( !isArray( arguments.plan.unitLinks ?: "" ) ) arguments.plan.unitLinks = [];
-		arguments.plan.unitLinks.append( built.unitLinks, true );
-		arguments.plan.unitLinks = dedupeById( arguments.plan.unitLinks );
-		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
-		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
-		for ( var link in built.unitLinks ) ensureIdentity( link, "unit-link" );
-		arguments.errors.append( { role: "modernization-application", message: "synthesized-architecture-packaging", severity: "info" } );
-		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
-		arguments.plan.metadata.architectureSource = "synthesized";
-		logInfo( "Modernize architecture packaging synthesized: contexts=#built.contexts.len()#, placements=#( isArray( built.placements ?: '' ) ? built.placements.len() : 0 )#, extracts=#built.extracts.len()#" );
-		return normalizeArchitecturePlacementTypes( arguments.plan );
-	}
-
-	private struct function synthesizeArchitectureDecisions( required struct plan, required struct evidence ) {
-		var units = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
-		var evidenceByUnit = {};
-		for ( var unit in units ) {
-			if ( !isStruct( unit ) ) continue;
-			var unitId = trim( unit.id ?: unit.itemId ?: "" );
-			if ( !len( unitId ) ) continue;
-			evidenceByUnit[ unitId ] = evidenceRefsForUnit( unit );
-		}
-		if ( !units.len() ) return { contexts: [], extracts: [], unitLinks: [], placements: [] };
-		var scopePaths = isArray( arguments.evidence.scopePaths ?: "" )
-			? arguments.evidence.scopePaths
-			: ( isStruct( arguments.evidence.input ?: "" ) && isArray( arguments.evidence.input.scopePaths ?: "" ) ? arguments.evidence.input.scopePaths : [] );
-		var clusters = clusterUnitsForArchitecture( units, scopePaths );
-		var contexts = [];
-		var placements = [];
-		for ( var cluster in clusters ) {
-			var packaging = cluster.placementType == "coldbox-module" ? "coldbox-module" : ( [ "background-worker", "scheduled-service" ].contains( cluster.placementType ) ? "worker" : "centralized" );
-			contexts.append( {
-				id: cluster.id,
-				name: cluster.name,
-				purpose: cluster.purpose,
-				packaging: packaging,
-				placementType: cluster.placementType,
-				domainKey: cluster.domainKey,
-				recommendation: cluster.rationale,
-				stayInMonolith: ![ "external-service" ].contains( cluster.placementType ),
-				targetUnitIds: duplicate( cluster.targetUnitIds ),
-				evidenceRefs: evidenceRefsForUnitIds( cluster.targetUnitIds, evidenceByUnit ),
-				newProposal: true,
-				proposalReason: cluster.rationale,
-				provenanceClass: "deterministically-derived"
-			} );
-			placements.append( {
-				id: cluster.id,
-				domainKey: cluster.domainKey,
-				name: cluster.name,
-				placementType: cluster.placementType,
-				targetUnitIds: duplicate( cluster.targetUnitIds ),
-				rationale: cluster.rationale,
-				evidenceRefs: evidenceRefsForUnitIds( cluster.targetUnitIds, evidenceByUnit ).map( ( ref ) => {
-					if ( isStruct( ref ) ) return trim( toString( ref.filePath ?: ref.ref ?: ref.legacyUnitId ?: "" ) );
-					return trim( toString( ref ) );
-				} ).filter( ( item ) => len( item ) ),
-				uncertainty: [],
-				questions: [],
-				provenanceClass: "deterministically-derived"
-			} );
-		}
-		return { contexts: contexts, extracts: [], unitLinks: [], placements: placements };
-	}
-
-	/**
-	 * Path-aware packaging fallback used when the architecture role fails.
-	 * Scoped directories become distinct placements (nested feature folders →
-	 * coldbox-module candidates; scheduled/job folders → background-worker)
-	 * so the roadmap still gets seams without estate-specific folder names.
-	 */
-	private array function clusterUnitsForArchitecture( required array units, required array scopePaths ) {
-		var clusters = [];
-		var assigned = {};
-		var appendCluster = ( id, domainKey, name, placementType, purpose, rationale, unitIds ) => {
-			if ( !arguments.unitIds.len() ) return;
-			clusters.append( {
-				id: arguments.id,
-				domainKey: arguments.domainKey,
-				name: arguments.name,
-				placementType: arguments.placementType,
-				purpose: arguments.purpose,
-				rationale: arguments.rationale,
-				targetUnitIds: duplicate( arguments.unitIds )
-			} );
-			for ( var unitId in arguments.unitIds ) assigned[ unitId ] = true;
-		};
-		var scopes = [];
-		for ( var scopePath in arguments.scopePaths ) {
-			var needle = lCase( reReplace( replace( trim( toString( scopePath ) ), "\", "/", "all" ), "/+$", "" ) );
-			if ( len( needle ) ) scopes.append( needle );
-		}
-		if ( !scopes.len() ) {
-			// Small unscoped plans stay modular-monolith-first. Large estates
-			// (full-repo modernize) infer top feature folders so packaging and
-			// roadmap seams survive architecture timeouts instead of one hollow
-			// default phase covering thousands of units.
-			if ( arguments.units.len() >= variables.minUnitsForFolderInference ) {
-				scopes = inferArchitectureScopesFromUnits( arguments.units );
-			}
-			if ( !scopes.len() ) {
-				appendCluster(
-					"ctx-modular-monolith-default",
-					"main-app",
-					"ColdBox modular monolith (default)",
-					"main-app",
-					"Keep mapped behavior in one deployable while source-backed feature seams are validated.",
-					"Conservative default because no explicit extraction boundary was established",
-					arguments.units.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) )
-				);
-				return clusters;
-			}
-		}
-		for ( var scopeIndex = 1; scopeIndex <= scopes.len(); scopeIndex++ ) {
-			var scopeNeedle = scopes[ scopeIndex ];
-			var matched = [];
-			for ( var unit in arguments.units ) {
-				var unitId = trim( unit.id ?: unit.itemId ?: "" );
-				if ( !len( unitId ) || assigned.keyExists( unitId ) ) continue;
-				var source = lCase( normalizeLegacyPath( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" ) );
-				if ( !len( source ) ) continue;
-				if ( source == scopeNeedle || left( source, len( scopeNeedle ) + 1 ) == scopeNeedle & "/" || find( "/" & scopeNeedle & "/", "/" & source & "/" ) ) {
-					matched.append( unitId );
-				}
-			}
-			if ( !matched.len() ) continue;
-			var placementType = "main-app";
-			var name = "Main app: " & listLast( scopeNeedle, "/" );
-			var purpose = "Mapped behavior under #scopeNeedle# stays in the modular monolith.";
-			var rationale = "Path-clustered packaging while architecture provider packaging is unavailable.";
-			if ( findNoCase( "/hosting/", "/" & scopeNeedle & "/" ) || reFindNoCase( "(^|/)\d*hosting/", scopeNeedle ) ) {
-				placementType = "external-service";
-				name = "Side application candidate: " & listLast( scopeNeedle, "/" );
-				purpose = "Separate hosting/Application tree — candidate small app or microservice boundary.";
-				rationale = "Distinct hosting root under #scopeNeedle# looks like a separate deployable, not an in-process ColdBox module.";
-			} else if ( findNoCase( "_scheduled", scopeNeedle ) || findNoCase( "scheduled", scopeNeedle ) || findNoCase( "/jobs/", "/" & scopeNeedle & "/" ) || findNoCase( "/workers/", "/" & scopeNeedle & "/" ) ) {
-				placementType = "background-worker";
-				name = "Scheduled / background workers: " & listLast( scopeNeedle, "/" );
-				purpose = "Background and scheduled scripts become workers/tasks in a jobs host or main-app scheduler.";
-				rationale = "Scheduled-script folders are background-worker candidates, not ColdBox UI modules or microservices.";
-			} else if ( findNoCase( "/modules/", "/" & scopeNeedle & "/" ) || findNoCase( "modules/", scopeNeedle ) || listLen( scopeNeedle, "/" ) >= 2 ) {
-				// Nested scoped feature directories are module candidates; bare
-				// top-level roots stay main-app unless modules/ is explicit.
-				placementType = "coldbox-module";
-				name = "ColdBox module candidate: " & listLast( scopeNeedle, "/" );
-				purpose = "Cohesive feature folder suitable for a ColdBox module boundary.";
-				rationale = "Directory cohesion under #scopeNeedle# supports coldbox-module packaging.";
-			}
-			appendCluster(
-				"ctx-scope-" & scopeIndex,
-				reReplace( scopeNeedle, "[^a-zA-Z0-9]+", "-", "all" ),
-				name,
-				placementType,
-				purpose,
-				rationale,
-				matched
-			);
-		}
-		var leftover = [];
-		for ( var unit in arguments.units ) {
-			var unitId = trim( unit.id ?: unit.itemId ?: "" );
-			if ( len( unitId ) && !assigned.keyExists( unitId ) ) leftover.append( unitId );
-		}
-		if ( leftover.len() || !clusters.len() ) {
-			appendCluster(
-				"ctx-modular-monolith-default",
-				"main-app",
-				"ColdBox modular monolith (default)",
-				"main-app",
-				"Keep remaining mapped behavior in one deployable while source-backed feature seams are validated.",
-				clusters.len()
-					? "Residual units without a scoped folder seam stay in the main app."
-					: "Conservative default because no explicit extraction boundary was established",
-				leftover.len() ? leftover : arguments.units.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) )
-			);
-		}
-		return clusters;
-	}
-
-	/**
-	 * Rank feature folders by unit count for unscoped large estates. Caps the
-	 * set so roadmap sharding stays bounded while still surfacing ColdBox-module
-	 * and scheduled-worker candidates (modules/*, _scheduled*, /jobs/, /workers/).
-	 */
-	private array function inferArchitectureScopesFromUnits( required array units ) {
-		var counts = {};
-		for ( var unit in arguments.units ) {
-			if ( !isStruct( unit ) ) continue;
-			var source = lCase( normalizeLegacyPath( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" ) );
-			var folder = featureFolderFromPath( source );
-			if ( !len( folder ) ) continue;
-			counts[ folder ] = ( counts[ folder ] ?: 0 ) + 1;
-		}
-		var ranked = [];
-		for ( var folder in counts ) {
-			ranked.append( { folder: folder, count: counts[ folder ] } );
-		}
-		ranked.sort( ( a, b ) => {
-			if ( a.count != b.count ) return b.count - a.count;
-			return compareNoCase( a.folder, b.folder );
-		} );
-		var selected = [];
-		for ( var item in ranked ) {
-			if ( selected.len() >= variables.maxInferredArchitectureScopes ) break;
-			var forceKeep = reFindNoCase( "/modules/|(^|/)modules/|_scheduled|scheduled|/jobs/|/workers/", item.folder );
-			if ( item.count >= 3 || forceKeep ) selected.append( item.folder );
-		}
-		return selected;
-	}
-
-	private string function featureFolderFromPath( required string path ) {
-		var lower = lCase( arguments.path );
-		if ( !len( lower ) ) return "";
-		var modulesMatch = reMatchNoCase( "modules/[^/]+", lower );
-		if ( isArray( modulesMatch ) && modulesMatch.len() ) return modulesMatch[ 1 ];
-		var hostingAt = reFindNoCase( "\d*hosting/", lower );
-		if ( hostingAt ) {
-			var hostingSlice = mid( lower, hostingAt );
-			var hostingParts = listToArray( hostingSlice, "/" );
-			if ( hostingParts.len() >= 2 ) return hostingParts[ 1 ] & "/" & hostingParts[ 2 ];
-		}
-		var parts = listToArray( lower, "/" );
-		// Common CF/legacy roots keep an extra path segment so feature folders
-		// (root/feature/...) cluster separately from the root itself.
-		if ( parts.len() >= 3 && [ "web", "weboffice", "legacy", "src", "app", "cf", "cfm" ].contains( parts[ 1 ] ) ) {
-			return parts[ 1 ] & "/" & parts[ 2 ];
-		}
-		if ( parts.len() >= 2 ) return parts[ 1 ] & "/" & parts[ 2 ];
-		return parts.len() ? parts[ 1 ] : "";
-	}
-
-	/**
-	 * Reclassify provider/synthesized placements so folder spam is not treated as
-	 * ColdBox modules, and separate Application/hosting trees surface as
-	 * external-service (side-app / small application) candidates.
-	 */
-	private struct function normalizeArchitecturePlacementTypes( required struct plan ) {
-		var unitsById = {};
-		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
-			if ( !isStruct( unit ) ) continue;
-			var unitId = trim( unit.id ?: unit.itemId ?: "" );
-			if ( len( unitId ) ) unitsById[ unitId ] = unit;
-		}
-		if ( isArray( arguments.plan.target.placements ?: "" ) ) {
-			for ( var placement in arguments.plan.target.placements ) {
-				if ( !isStruct( placement ) ) continue;
-				var sourcePaths = [];
-				for ( var targetId in ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds : [] ) ) {
-					var mapped = unitsById[ trim( toString( targetId ) ) ] ?: {};
-					var sourcePath = normalizeLegacyPath( mapped.sourcePath ?: mapped.sourceFile ?: mapped.legacyPath ?: "" );
-					if ( len( sourcePath ) ) sourcePaths.append( sourcePath );
-				}
-				var nextType = classifyPackagingType(
-					placement.name ?: "",
-					placement.domainKey ?: "",
-					placement.placementType ?: "main-app",
-					sourcePaths,
-					isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds.len() : 0
-				);
-				placement.placementType = nextType;
-				placement.packaging = nextType == "coldbox-module" ? "coldbox-module" : ( nextType == "external-service" ? "external-service" : ( [ "background-worker", "scheduled-service" ].contains( nextType ) ? "worker" : "centralized" ) );
-				placement.stayInMonolith = nextType != "external-service";
-				if ( nextType == "main-app" && reFindNoCase( "module candidate", placement.name ?: "" ) ) {
-					placement.name = "Main app: " & trim( reReplaceNoCase( placement.name, "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
-				}
-				if ( nextType == "background-worker" && !reFindNoCase( "worker|scheduled|job", placement.name ?: "" ) ) {
-					placement.name = "Background workers: " & trim( reReplaceNoCase( placement.name ?: "jobs", "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
-				}
-				if ( nextType == "external-service" && !reFindNoCase( "side application|microservice|external", placement.name ?: "" ) ) {
-					placement.name = "Side application candidate: " & trim( reReplaceNoCase( placement.name ?: "capability", "^(coldbox\s+)?module candidate:\s*", "", "one" ) );
-				}
-			}
-		}
-		if ( isArray( arguments.plan.target.contexts ?: "" ) ) {
-			for ( var ctx in arguments.plan.target.contexts ) {
-				if ( !isStruct( ctx ) ) continue;
-				var ctxType = classifyPackagingType(
-					ctx.name ?: "",
-					ctx.domainKey ?: "",
-					( ctx.packaging ?: "" ) == "coldbox-module" ? "coldbox-module" : ( ( ctx.placementType ?: "" ) == "external-service" ? "external-service" : ( [ "background-worker", "scheduled-service" ].contains( ctx.placementType ?: "" ) ? ctx.placementType : "main-app" ) ),
-					[],
-					isArray( ctx.targetUnitIds ?: "" ) ? ctx.targetUnitIds.len() : 0
-				);
-				ctx.placementType = ctxType;
-				ctx.packaging = ctxType == "coldbox-module" ? "coldbox-module" : ( [ "background-worker", "scheduled-service" ].contains( ctxType ) ? "worker" : "centralized" );
-				ctx.stayInMonolith = ctxType != "external-service";
-			}
-		}
-		return arguments.plan;
-	}
-
-	private string function classifyPackagingType(
-		required string name,
-		required string domainKey,
-		required string currentType,
-		array sourcePaths = [],
-		numeric unitCount = 0
-	) {
-		var pathBlob = arguments.sourcePaths.toList( " " );
-		var blob = lCase( trim( arguments.name ) & " " & trim( arguments.domainKey ) & " " & pathBlob );
-		var current = lCase( trim( arguments.currentType ) );
-		if ( !len( current ) ) current = "main-app";
-		// Shared / worker / static folders are never UI modules or microservices.
-		if ( reFindNoCase( "_scheduled|scheduledscripts|/jobs/|/workers/", blob ) ) {
-			// Integration-heavy job folders (payments, mail APIs, webhooks, CRM
-			// / inventory connectors) may later become a separate jobs host.
-			return reFindNoCase( "payment|autopay|billing|invoice|webhook|oauth|smtp|mail.?api|/integrations?/|inventory|crm", blob ) ? "scheduled-service" : "background-worker";
-		}
-		if ( reFindNoCase( "\btemp\b|copyfiles|commonfiles|comingsoon|\bjs\b|/js/|webmanagementwelcome|message.?template", blob ) ) {
-			return "main-app";
-		}
-		var hasApplicationEntrypoint = arguments.sourcePaths.some( ( path ) => reFindNoCase( "(^|/|\\)application\.(cfc|cfm|bx)$", path ) );
-		// *hosting*/AppName trees with their own Application.* look like side-apps.
-		var hostingRoot = reFindNoCase( "(^|/|\\)\d*hosting/[a-z0-9_-]+", blob ) || reFindNoCase( "(^|/|\\)hosting/[a-z0-9_-]+", blob );
-		if ( hostingRoot && ( hasApplicationEntrypoint || reFindNoCase( "application bootstrap|side application|orders application|hosting/", blob ) ) ) {
-			return "external-service";
-		}
-		if ( current == "external-service" && ( hasApplicationEntrypoint || hostingRoot || reFindNoCase( "microservice|side.?app|external.?service|separate deploy", blob ) ) ) {
-			return "external-service";
-		}
-		if ( [ "background-worker", "scheduled-service" ].contains( current ) ) return current;
-		if ( reFindNoCase( "/modules/|moduleconfig\.(cfc|cfm|bx)", blob ) ) {
-			return "coldbox-module";
-		}
-		if ( current == "coldbox-module" ) {
-			if ( arguments.unitCount > 120 && !reFindNoCase( "/modules/", blob ) ) return "main-app";
-			// Keep nested feature directories; demote bare "module candidate" labels
-			// that lack path evidence of a real feature or modules/ package.
-			var nestedFeature = arguments.sourcePaths.some( ( path ) => {
-				var normalized = reReplace( replace( trim( toString( path ) ), "\", "/", "all" ), "^(\./)+", "" );
-				return listLen( normalized, "/" ) >= 2;
-			} );
-			if ( nestedFeature ) return "coldbox-module";
-			if ( reFindNoCase( "module candidate", arguments.name ) ) return "main-app";
-			return "coldbox-module";
-		}
-		return "main-app";
-	}
-
-	private array function evidenceRefsForUnit( required struct unit ) {
-		var refs = [];
-		var existing = arguments.unit.evidenceRefs ?: arguments.unit.evidence ?: [];
-		if ( isArray( existing ) ) {
-			for ( var ref in existing ) {
-				if ( isStruct( ref ) ) refs.append( duplicate( ref ) );
-				else if ( len( trim( toString( ref ) ) ) ) refs.append( { ref: toString( ref ), extractionMethod: "unit-evidence" } );
-			}
-		}
-		var sourcePath = normalizeEvidencePath( arguments.unit.sourcePath ?: arguments.unit.sourceFile ?: arguments.unit.legacyPath ?: "" );
-		if ( len( sourcePath ) ) refs.append( { filePath: sourcePath, extractionMethod: "target-source-path" } );
-		var targetPath = normalizeEvidencePath( arguments.unit.targetPath ?: arguments.unit.pathHint ?: "" );
-		if ( len( targetPath ) ) refs.append( { filePath: targetPath, extractionMethod: "target-path", note: "proposed-target" } );
-		for ( var legacyId in ( isArray( arguments.unit.legacyUnitIds ?: "" ) ? arguments.unit.legacyUnitIds : [] ) ) {
-			if ( len( trim( toString( legacyId ) ) ) ) refs.append( { legacyUnitId: toString( legacyId ), extractionMethod: "legacy-unit" } );
-		}
-		if ( !refs.len() ) {
-			refs.append( {
-				extractionMethod: "synthesized-packaging",
-				targetUnitId: arguments.unit.id ?: arguments.unit.itemId ?: "",
-				note: "Derived from accepted application maps"
-			} );
-		}
-		return refs;
-	}
-
-	private array function evidenceRefsForUnitIds( required array unitIds, required struct evidenceByUnit ) {
-		var refs = [];
-		var seen = {};
-		for ( var unitId in arguments.unitIds ) {
-			var key = trim( toString( unitId ) );
-			if ( !len( key ) || !arguments.evidenceByUnit.keyExists( key ) ) continue;
-			for ( var ref in arguments.evidenceByUnit[ key ] ) {
-				var fingerprint = lCase( jsonSerialize( ref ) );
-				if ( seen.keyExists( fingerprint ) ) continue;
-				seen[ fingerprint ] = true;
-				refs.append( duplicate( ref ) );
-			}
-		}
-		if ( !refs.len() ) refs.append( { extractionMethod: "synthesized-packaging", note: "architecture-from-maps" } );
-		return refs;
-	}
-
-	private boolean function isCentralPath( required string path ) {
-		var lower = lCase( arguments.path );
-		return reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes|/layouts?/|/interceptors?/|wirebox|security|auth|session", lower ) > 0;
-	}
-
-	private string function architectureDomainKey( required string path, required struct unit ) {
-		var parts = listToArray( replace( arguments.path, "\", "/", "all" ), "/" );
-		for ( var i = 1; i <= parts.len(); i++ ) {
-			var piece = lCase( trim( parts[ i ] ) );
-			if ( !len( piece ) ) continue;
-			if ( listFindNoCase( "handlers,views,modules_app,modules,controllers", piece ) && i < parts.len() ) {
-				return sanitizeDomainToken( parts[ i + 1 ] );
-			}
-			if ( piece == "models" && i < parts.len() ) {
-				var next = lCase( trim( parts[ i + 1 ] ) );
-				if ( next == "services" && i + 1 < parts.len() ) return sanitizeDomainToken( parts[ i + 2 ] );
-				return sanitizeDomainToken( parts[ i + 1 ] );
-			}
-			if ( piece == "services" && i < parts.len() ) return sanitizeDomainToken( parts[ i + 1 ] );
-		}
-		var purpose = lCase( trim( arguments.unit.purpose ?: "" ) );
-		if ( len( purpose ) ) {
-			var token = listFirst( reReplace( purpose, "[^a-z0-9]+", "-", "all" ), "-" );
-			if ( len( token ) >= 3 ) return token;
-		}
-		return "";
-	}
-
-	private string function sanitizeDomainToken( required string value ) {
-		var token = reReplaceNoCase( trim( arguments.value ), "\.(bx|cfc|cfm|bxm)$", "" );
-		token = reReplaceNoCase( token, "(service|handler|controller|gateway)$", "" );
-		token = reReplace( lCase( token ), "[^a-z0-9]+", "", "all" );
-		token = reReplaceNoCase( token, "ies$", "y" );
-		if ( len( token ) > 4 && right( token, 1 ) == "s" ) token = left( token, len( token ) - 1 );
-		return len( token ) >= 3 ? token : "";
+		return derivedStructureService.normalizeArchitecturePlacementTypes( arguments.plan );
 	}
 
 	private boolean function applicationFragmentHasSubstance( required struct plan ) {
@@ -4242,7 +3454,7 @@ class threadsafe {
 				for ( var phaseUnitId in ( isArray( copy.unitIds ?: "" ) ? copy.unitIds : [] ) ) {
 					var mapped = placementByUnit[ trim( toString( phaseUnitId ) ) ] ?: "";
 					if ( len( mapped ) ) {
-						inferred = synthesizeRoadmapClassification( mapped );
+						inferred = derivedStructureService.synthesizeRoadmapClassification( mapped );
 						break;
 					}
 				}

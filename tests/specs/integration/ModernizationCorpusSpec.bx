@@ -34,8 +34,8 @@ class extends="coldbox.system.testing.BaseTestCase" {
 			// resources both files touch
 			var sharedResources = ( graph, a, b ) => {
 				var shared = [];
-				for ( var key in graph.metrics.coAccess ) {
-					var files = graph.metrics.coAccess[ key ];
+				for ( var key in graph.getMetrics().coAccess ) {
+					var files = graph.getMetrics().coAccess[ key ];
 					if ( files.contains( norm( a ) ) && files.contains( norm( b ) ) ) shared.append( key );
 				}
 				shared.sort( ( x, y ) => compareNoCase( x, y ) );
@@ -79,8 +79,8 @@ class extends="coldbox.system.testing.BaseTestCase" {
 				it( "shows both folders touching the same application and session scope", () => {
 					var graph = graphFor( "false-seam" );
 					for ( var scope in [ "scope.application", "scope.session" ] ) {
-						expect( graph.metrics.sharedState ).toHaveKey( scope );
-						expect( graph.metrics.sharedState[ scope ].len() ).toBeGTE(
+						expect( graph.getMetrics().sharedState ).toHaveKey( scope );
+						expect( graph.getMetrics().sharedState[ scope ].len() ).toBeGTE(
 							2,
 							scope & " must be touched by more than one file"
 						);
@@ -155,8 +155,8 @@ class extends="coldbox.system.testing.BaseTestCase" {
 				it( "reports the order/invoice cycle", () => {
 					var graph = graphFor( "cyclic-boundary" );
 
-					expect( graph.metrics.cycles ).notToBeEmpty( "the planted cycle was not detected" );
-					var members = graphService.cycleMembersFor( graph, "app/orders/OrderService.cfc" );
+					expect( graph.getMetrics().cycles ).notToBeEmpty( "the planted cycle was not detected" );
+					var members = graph.cycleMembersFor( "app/orders/OrderService.cfc" );
 					expect( members ).toInclude( "app/invoicing/InvoiceService.cfc" );
 				} );
 
@@ -166,6 +166,77 @@ class extends="coldbox.system.testing.BaseTestCase" {
 					for ( var item in inventory.unresolved ) kinds.append( item.kind ?: "" );
 
 					expect( kinds ).toInclude( "dynamic-include" );
+				} );
+			} );
+
+			describe( "derived clustering — the four known-correct verdicts", () => {
+
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+
+				var clustersFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					return derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+				};
+				var clusterHolding = ( clusters, filePath ) => {
+					for ( var cluster in clusters ) {
+						if ( cluster.filePaths.contains( norm( filePath ) ) ) return cluster;
+					}
+					return {};
+				};
+
+				it( "false-seam: reporting and billing land in ONE cluster and stay", () => {
+					var clusters = clustersFor( "false-seam" );
+					var reporting = clusterHolding( clusters, "app/reporting/ReportingService.cfc" );
+					var billing = clusterHolding( clusters, "app/billing/BillingService.cfc" );
+
+					expect( reporting ).notToBeEmpty( "reporting was not placed in any cluster" );
+					expect( reporting.id ).toBe(
+						billing.id,
+						"reporting and billing share four tables and session state; folder-shaped clustering splits them"
+					);
+					expect( reporting.placementType ).notToBe( "external-service" );
+					expect( reporting.boundaryEvidence.isolated ).toBeFalse();
+				} );
+
+				it( "separable-domain: notifications separate from orders, and isolated", () => {
+					var clusters = clustersFor( "separable-domain" );
+					var notifications = clusterHolding( clusters, "app/notifications/NotificationService.cfc" );
+					var orders = clusterHolding( clusters, "app/orders/OrderService.cfc" );
+
+					expect( notifications ).notToBeEmpty();
+					expect( orders ).notToBeEmpty();
+					expect( notifications.id ).notToBe( orders.id, "notifications and orders share nothing and must not merge" );
+
+					// The queue collaborates with the service, so it comes along.
+					expect( notifications.filePaths ).toInclude( "app/notifications/notificationqueue.cfc" );
+					expect( notifications.boundaryEvidence.isolated ).toBeTrue(
+						"nothing crosses the notifications boundary, so it is separable"
+					);
+					expect( notifications.placementType ).notToBe( "main-app" );
+				} );
+
+				it( "below-inference-threshold: two clusters despite being under the threshold", () => {
+					var clusters = clustersFor( "below-inference-threshold" );
+					var catalog = clusterHolding( clusters, "app/CatalogService.cfc" );
+					var shipping = clusterHolding( clusters, "app/ShippingService.cfc" );
+
+					expect( clusters.len() ).toBeGTE( 2, "the degenerate single-default-cluster branch is still running" );
+					expect( catalog.id ).notToBe( shipping.id );
+					expect( catalog.filePaths ).toInclude( "app/pricingrules.cfc" );
+					expect( shipping.filePaths ).toInclude( "app/carriergateway.cfc" );
+				} );
+
+				it( "cyclic-boundary: the cycle keeps both halves together and unextractable", () => {
+					var clusters = clustersFor( "cyclic-boundary" );
+					var orders = clusterHolding( clusters, "app/orders/OrderService.cfc" );
+
+					expect( orders ).notToBeEmpty();
+					expect( orders.filePaths ).toInclude( "app/invoicing/invoiceservice.cfc" );
+					expect( orders.placementType ).notToBe( "external-service" );
+				} );
+
+				it( "is deterministic across repeated derivations", () => {
+					expect( jsonSerialize( clustersFor( "false-seam" ) ) ).toBe( jsonSerialize( clustersFor( "false-seam" ) ) );
 				} );
 			} );
 
