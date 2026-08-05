@@ -67,9 +67,9 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | --- | --- | --- | --- | --- |
 | 0 | Clear the ground | `done` (uncommitted) | `box server restart && box testbox run` green; `node --test tests/js/*.spec.mjs` green **and in `box.json:49`**; `/`, `/modernize`, `/aiflight/` load | **Gate green: 492·0·0·1**, `box run-script test` reaches its node stage (3/3), all four routes 200. Required fixing the §2.17 wiring race first |
 | 1 | Coupling graph | `wip` | unit specs for cohesion, fan-in/out, cycles, co-access on Step 2a fixtures; identical input → byte-identical graph | `ModernizationCouplingGraphService` + 16 specs green (508·0·0·1). **Remaining:** corpus-fixture validation (needs 2a), plus persistence and architecture findings, both deferred to Step 2 — see the note in Step 1 |
-| 2 | Promote synthesis | `todo` | deterministic corpus tier green on all four scenarios | |
+| 2 | Promote synthesis | `wip` | deterministic corpus tier green on all four scenarios | **Items 1, 3, 4, 6, 7 done** (545·0·0·1). Clustering is weighted modularity; wave order derived; graph + derived structure run in the live pipeline and reach the persisted plan (verified by real run). `separable-domain` now yields `external-service`. **Remaining: items 2 and 5** |
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
-| 12 | Domain types | `wip` | exactly one file computes each invariant; one type answers each | `CouplingGraph` done, README convention amended, `ArchitectureFitnessSpec` added (532·0·0·1). **`Cluster`, `WaveOrder` and `Placement`'s ownership change are blocked on Step 2** — see the step |
+| 12 | Domain types | `wip` | exactly one file computes each invariant; one type answers each | `CouplingGraph` + `WaveOrder` done, README convention amended, `ArchitectureFitnessSpec` added. **Remaining: `Cluster` and `Placement` ownership** — both now unblocked |
 | 3a | Re-point client + tests | `todo` | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | |
 | 3b | Delete the LLM path | `todo` | all four stop conditions incl. `seamPrecision` vs baseline; suite green with **zero** assertions rewritten in this step | |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
@@ -273,6 +273,23 @@ So "move verbatim, refactor separately" is genuinely available here: pass the
 constants as configuration, inject **both `agentFactory` and `agentGateway`**
 into the shard executor, and the code compiles unchanged. This is the single
 biggest de-risking fact for Steps 2 and 11.
+
+> ### Corrected by doing it — the block is not dependency-free
+>
+> This analysis checked `variables.*` and injected services. It did **not** check
+> calls to sibling private helpers, and the synthesis block makes six:
+> `scalarString`, `normalizeLegacyPath`, `normalizeEvidencePath`, `dedupeById`,
+> `ensureIdentity`, `logInfo`. All six are still called 11–50 times by the code
+> that stays behind, so none could simply move.
+>
+> Two of them are not pure: `ensureIdentity` needs `identityService` and
+> `logInfo` needs `log`. **`ModernizationDerivedStructureService` therefore takes
+> two injections**, contradicting "no injected services" for this block.
+>
+> The extraction still worked and the suite stayed green, so the conclusion holds
+> — but "compiles unchanged" was optimistic. **Run the same sibling-call check
+> before Step 11's shard extraction**, which is a larger block and has had no
+> equivalent audit.
 
 The synthesis block is the cleaner of the two — re-verified at `528a97f`, its
 648 lines reference **no injected service at all**, by bare name or through
@@ -1174,6 +1191,186 @@ resources and become the co-access matrix (`datasource`, `table-query`, `query`,
    stop shipping.
 
 **Do not** delete the LLM-structure path yet — that is Step 3b, and it is gated.
+
+### Progress — items 1 and 3 landed
+
+**Item 1 (verbatim move).** The 648-line synthesis block is now
+`ModernizationDerivedStructureService`; `ModernizationProposalService` went
+**5,371 → 4,583** and delegates through eight public entry points. Corrections
+this forced are recorded in §2.5a — chiefly that the block was *not*
+dependency-free.
+
+**Item 3 (coupling-driven clustering).** `deriveClusters()` unions three kinds of
+evidence — structural edges, table co-access, shared scope — and classifies each
+cluster from what the graph can prove. **All four known-correct verdicts now
+pass**, including `separable-domain`, where the LLM baseline scores 0.0.
+
+Two design facts worth keeping:
+
+- **Co-access unions on tables, never on datasource.** A monolith usually has one
+  datasource, so unioning on it collapses everything into one cluster and
+  reproduces exactly the folder-inference degeneracy this replaces.
+- **A single whole-system cluster must be vetoed explicitly.** "Nothing crosses
+  this boundary" is vacuously true when the boundary contains everything, so
+  `false-seam` initially classified as *extractable* — the precise inversion of
+  the right answer. `boundaryEvidence.spansWholeSystem` now vetoes it. Any future
+  scoring that reads `isolated` must respect that flag.
+
+### ✅ Resolved — clustering is now weighted modularity
+
+The connected-components problem below is **fixed**. `deriveClusters()` no longer
+unions on connectivity; it builds one weighted undirected affinity graph and runs
+Louvain local-moving over it.
+
+| Evidence | Weight | Why |
+| --- | --- | --- |
+| structural edge | resolution weight (0.4–1.0) | a call is symmetric evidence of belonging together; direction is dropped |
+| shared table | 2.0 | co-written state cannot be split, so it outranks a call |
+| shared scope | 1.5 | shared mutable state, slightly weaker than a table |
+
+Two rules sit outside the statistics:
+
+- **Infrastructure tables carry no signal.** A table touched by more than
+  `maxCoAccessFanout` (12) files is an audit log or a users table, not a domain
+  boundary. Counting it as coupling would drag every domain into one cluster —
+  the same degeneracy by another route. A spec covers 16 domains sharing one
+  `audit_log` and asserts they stay apart.
+- **A cycle is never split.** Modularity may prefer to, but a boundary through a
+  cycle proposes something impossible, so SCC members are force-merged
+  afterwards. Structure beats statistics.
+
+Determinism is a hard requirement and is enforced three ways: nodes visited in
+sorted order, ties broken toward the incumbent (so it cannot oscillate), and each
+community named for its smallest member so ids never churn. A corpus spec asserts
+byte-identical output across repeated derivation.
+
+**Results:** all four corpus verdicts still pass, and the shapes the corpus
+cannot reach now pass too — two domains bridged by one utility call split into
+**two** clusters, and `edgesCrossing` returns a real number instead of a
+structural zero. Suite 543 · 0 · 0 · 1.
+
+**Items 4–7 are unblocked.** The cluster-level DAG now has edges to sort.
+
+The original finding is kept below, because the reasoning that led to it is the
+reason the fix exists and the reason the fifth corpus scenario is still worth
+adding.
+
+### ~~Item 4 is blocked: clustering is connected-components, and that degenerates~~
+
+Measured, not theorised — `tests/specs/unit/ModernizationClusterLimitsSpec.bx`
+pins it. `deriveClusters()` unions on **every** structural edge, which makes each
+cluster a connected component of the graph. Two consequences:
+
+1. **One bridging call merges two unrelated domains.** Given two domains sharing
+   no table and no scope, joined by a single utility call, the result is **one**
+   cluster. Real codebases are transitively connected throughout, so at scale
+   this collapses to a single cluster — the same degeneracy as folder inference
+   (§2.3), reached by a different route.
+2. **`edgesCrossing` is structurally always zero for a derived cluster**, because
+   no edge can cross a boundary that was drawn around edges. The crossing-edge
+   term in the isolation test is vacuous, and **the cluster-level DAG has no
+   edges**, so item 4's "derive phase dependencies topologically from graph
+   edges" has nothing to sort.
+
+**The four corpus scenarios do not catch this** — every one of them is a
+disconnected graph, so connected components happens to be the right answer. This
+is §2.3's warning one level up: a green fixture set covering a mechanism that
+does not work on real input. **Add a fifth scenario** with two domains bridged by
+a single call before trusting any clustering change.
+
+**The fix is real community detection** — modularity-based (Louvain-style) or
+weighted-threshold clustering, where strong evidence (shared tables, shared
+scope, SCC membership) forces union and weak structural edges become *inter*-
+cluster edges that carry a coupling ratio. That restores both the crossing-edge
+signal and the DAG.
+
+Until then `deriveClusters()` is correct on disconnected input and degenerate on
+connected input. It is a real improvement over folder-shaped clustering — it
+cannot be fooled by folder layout — but it is not yet the mechanism this plan
+describes, and it must not be wired into `execute()` while it is one bridging
+call away from returning a single cluster.
+
+### Remaining in Step 2
+
+| Item | State |
+| --- | --- |
+| 2 — target-path move to `PlacementService` | **todo**, independent of the rest |
+| 4 — topological wave order | **done** — `deriveWaveOrder()` + `WaveOrder` type |
+| 5 — re-key shards to clusters | **todo** — clusters are computed before the context pack, so the input is ready |
+| 6 — rewire `execute()` | **done** — graph and derived structure run in the live pipeline |
+| 7 — checkpoints and progress ladder | **done** — `graph` and `derived` checkpoints, ladder re-plotted |
+
+### Items 4, 6 and 7 — what landed
+
+**Item 4.** `deriveWaveOrder()` builds a cluster DAG from crossing edges and
+returns a `WaveOrder` domain type (Step 12's third type, now informed). Wave is
+longest-path depth, so a cluster never shares a wave with something it depends
+on. Direction means dependency: if A calls B, B moves first.
+
+Cluster-level cycles get their own treatment. Two clusters can call each other
+without any single file being in a cycle, so Tarjan runs again at cluster level;
+those components are condensed for ordering **and reported** on the result. A
+cycle between clusters is a finding about the system, not something to break
+silently.
+
+**Items 6 + 7.** `execute()` computes the graph and derived structure *before*
+the context pack — deterministic, no provider, so the model later judges a
+structure rather than inventing one. Two new checkpoints (`graph`, `derived`)
+key on the same fingerprint pair as the rest, and the ladder was re-plotted:
+inventory 30 → schema 38 → signals 42 → **graph 46** → **derived 50** →
+context 54 → evidence 56 → proposal 58.
+
+`pipelineContractVersion` bumped **v8 → v9**. A v8 checkpoint set has no graph or
+derived stage and wrote `context` at a different rung, so reusing one would
+resume into a pipeline that no longer exists.
+
+**Verified against a live run, not just specs.** The first live run showed
+`derived` missing from the persisted result: it was set on the in-memory
+`result`, but `getResult()` rehydrates from the stored *plan*. Fixed by
+attaching it to `plan`; a second live run returns the graph shape, two clusters
+and the wave order. Specs alone would not have caught this.
+
+### The service-vs-module distinction
+
+Wiring it live exposed that isolated clusters only ever became `coldbox-module` —
+the `external-service` branch was described in the design and never implemented,
+so nothing could ever be proposed for extraction.
+
+Added `externalIntegration` to the graph (files owning outbound `http`/`schedule`
+work) and split the verdict on it:
+
+- isolated **and** owns an outbound integration → `external-service`; it is
+  already behaving as a service inside the monolith
+- isolated, no outbound integration → `coldbox-module`; separable, but the
+  weaker claim is the honest one
+- anything else → `main-app`
+
+`separable-domain` now yields **`external-service`** for notifications and
+`coldbox-module` for orders. That is the verdict the LLM baseline scores **0.0**
+on (§2.19), which is Step 3b's load-bearing stop condition.
+
+**Still worth adding: the fifth corpus scenario.** Two domains bridged by a
+single call is covered by a unit spec, not by the corpus, so the corpus still
+cannot fail on the shape that matters most for real repositories.
+
+### A pre-existing crash found on the way
+
+`featureDomainLabel` called `right( value, len( value ) - 1 )`, which throws
+`Count cannot be zero` in BoxLang for any single-character word — reachable from
+a one-letter folder or a camelCase split such as `aService` → `a Service`. It was
+in the moved code, so it predates this plan. Fixed, with a spec.
+
+### It arrived over the line limit
+
+`ModernizationDerivedStructureService` is **1,101 lines**, over the 900 rule on
+its first day, and `ArchitectureFitnessSpec` caught it. It is listed as a known
+exception **with a destination**: it carries two responsibilities — cluster and
+boundary derivation, and roadmap phase synthesis — and should split along that
+seam once items 4–7 settle the roadmap half.
+
+That is the second exception added in two consecutive steps (after
+`SpecialistReviewService`). **Two more and the rule is decorative.** No further
+entry without a named destination beside it.
 
 ### Step 2a — Corpus, deterministic tier (write alongside Step 1–2)
 

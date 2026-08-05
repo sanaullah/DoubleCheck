@@ -10,6 +10,8 @@ class threadsafe {
 	property name="inventoryService" inject="ModernizationInventoryService";
 	property name="evidenceDiscoveryService" inject="ModernizationEvidenceDiscoveryService";
 	property name="signalService" inject="ModernizationSignalService";
+	property name="couplingGraphService" inject="ModernizationCouplingGraphService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
 	property name="coverageService" inject="ModernizationCoverageService";
 	property name="contextPackService" inject="ModernizationContextPackService";
 	property name="proposalService" inject="ModernizationProposalService";
@@ -30,7 +32,12 @@ property name="modernizationGateService" inject="ModernizationGateService";
 	// silently restoring noisy construction signals on every rerun — so v3
 	// checkpoints must not
 	// be reusable.
-	variables.pipelineContractVersion = "modernization-pipeline-v8";
+	// v9: the pipeline now derives a coupling graph and cluster/wave structure
+	// before the context pack. A v8 checkpoint set has no "graph" or "derived"
+	// stage, and its "context" checkpoint was written at a different point in
+	// the ladder, so reusing one would resume into a pipeline that no longer
+	// exists.
+	variables.pipelineContractVersion = "modernization-pipeline-v9";
 
 	/**
 	 * Executes the evidence-first Modernize pipeline, reusing compatible
@@ -101,14 +108,54 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			// nothing ever populated. Mutates the plan's inventory in place, the
 			// same post-checkpoint pattern the routeEvidence append above uses.
 			linkSignalsToInventory( result.inventory, result.signals );
-			emit( arguments.callbacks, 45, "modernization-signals", "Deriving modernization coupling signals" );
+			emit( arguments.callbacks, 42, "modernization-signals", "Deriving modernization coupling signals" );
+
+			// --- derived structure ---------------------------------------------
+			// Deterministic, no provider. Runs before the context pack so clusters
+			// are available to shard against, and before any model call so the
+			// model judges a structure rather than inventing one.
+			emit( arguments.callbacks, 46, "modernization-graph", "Computing the coupling graph" );
+			var graphCheckpoint = reusableCheckpoint( priorCheckpoints, "graph", inputFingerprint, sourceFingerprint );
+			var graphCheckpointValue = !isNull( graphCheckpoint ) ? ( graphCheckpoint.payload.value ?: graphCheckpoint.payload ) : {};
+			var couplingGraph = isStruct( graphCheckpointValue ) && isStruct( graphCheckpointValue.graph ?: "" ) && ( ( graphCheckpointValue.graph.nodes ?: [] ).len() )
+				? new app.models.domain.CouplingGraph( graphCheckpointValue.graph )
+				: couplingGraphService.build( inventory );
+			checkpoint( runId, "graph", { graph: couplingGraph.getMemento() }, 46, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
+			emit( arguments.callbacks, 50, "modernization-derived", "Deriving clusters and migration order" );
+			var derivedClusters = derivedStructureService.deriveClusters(
+				couplingGraph,
+				inventory.units ?: [],
+				isArray( input.scopePaths ?: "" ) ? input.scopePaths : []
+			);
+			var waveOrder = derivedStructureService.deriveWaveOrder( couplingGraph, derivedClusters );
+			result.derived = {
+				version  : "modernization-derived-v1",
+				clusters : derivedClusters,
+				waveOrder: waveOrder.getMemento(),
+				// The graph is large and recomputable, so only its shape travels
+				// with the plan. Nothing derived is stored or fingerprinted (4.0).
+				graph    : {
+					version          : couplingGraph.getVersion(),
+					fingerprint      : couplingGraph.getFingerprint(),
+					nodeCount        : couplingGraph.getNodes().len(),
+					edgeCount        : couplingGraph.getEdges().len(),
+					cycles           : couplingGraph.getMetrics().cycles ?: [],
+					truncated        : couplingGraph.truncated(),
+					truncationReasons: couplingGraph.getTruncationReasons()
+				}
+			};
+			checkpoint( runId, "derived", { derived: result.derived }, 50, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
 			var contextCheckpoint = reusableCheckpoint( priorCheckpoints, "context", inputFingerprint, sourceFingerprint );
 			var contextCheckpointValue = !isNull( contextCheckpoint ) ? ( contextCheckpoint.payload.value ?: contextCheckpoint.payload ) : {};
 			var context = isStruct( contextCheckpointValue ) && isStruct( contextCheckpointValue.context ?: "" )
 				? contextCheckpointValue.context
 				: contextPackService.build( arguments.scan, inventory, result.signals, { schemaPack: schemaPack ?: {}, extraEvidence: extraEvidence, input: input } );
 				result.contexts = context.contexts ?: context;
-				checkpoint( runId, "context", { inventory: inventory.fingerprint ?: "", signals: result.signals, context: context }, 42, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+				checkpoint( runId, "context", { inventory: inventory.fingerprint ?: "", signals: result.signals, context: context }, 54, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
 				checkCancellation( arguments.callbacks );
 
 				var evidenceCheckpoint = reusableCheckpoint( priorCheckpoints, "evidence", inputFingerprint, sourceFingerprint );
@@ -135,7 +182,7 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				if ( !isStruct( evidence.input ?: "" ) ) evidence.input = {};
 				evidence.input.scopePaths = duplicate( scopedPaths );
 			}
-			checkpoint( runId, "evidence", evidence, 48, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkpoint( runId, "evidence", evidence, 56, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
 
 			checkCancellation( arguments.callbacks );
 			emit( arguments.callbacks, 58, "modernization-proposal", "Generating sharded application maps, then database and roadmap proposals" );
@@ -239,6 +286,11 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				return terminal( result, "failed", "Modernization proposal was not generated", "failed" );
 			}
 			plan = proposal.plan ?: {};
+			// The derived structure is computed before the provider runs, so it
+			// has to be attached to the artifact that is actually persisted --
+			// `result` is in-memory only, and getResult() rehydrates from the
+			// stored plan.
+			plan.derived = result.derived;
 			plan = mergeSourceModernizeCoverage( arguments.run, plan );
 			var placementService = placementServiceInstance();
 			var gateService = gateServiceInstance();

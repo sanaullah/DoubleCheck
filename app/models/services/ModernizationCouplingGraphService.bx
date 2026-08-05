@@ -55,6 +55,11 @@ class threadsafe {
 	variables.resourceKinds = [ "datasource", "table-query" ];
 	variables.sharedStateKinds = [ "scope.application", "scope.session", "scope.client", "security-session-gate" ];
 
+	// Files that already talk to something outside the process. A boundary with
+	// its own outbound integration is evidence of a service; one without is a
+	// module that happens to be separable.
+	variables.externalIntegrationKinds = [ "http", "schedule" ];
+
 	string function graphVersion() {
 		return variables.version;
 	}
@@ -80,6 +85,7 @@ class threadsafe {
 			cycles     : [],
 			sharedState: sharedStateOverlay( dependencies, nodes, truncation ),
 			coAccess   : coAccessMatrix( dependencies, nodes, truncation ),
+			externalIntegration: externalIntegrationOverlay( dependencies, nodes ),
 			totals     : {}
 		};
 
@@ -295,6 +301,20 @@ class threadsafe {
 		}
 		for ( var key in overlay ) overlay[ key ].sort( ( a, b ) => compareNoCase( a, b ) );
 		return overlay;
+	}
+
+	/** Files with an outbound integration of their own. */
+	private array function externalIntegrationOverlay( required array dependencies, required struct nodes ) {
+		var files = [];
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			if ( !variables.externalIntegrationKinds.contains( lCase( trim( dep.kind ?: "" ) ) ) ) continue;
+			var from = normalizePath( dep.filePath ?: "" );
+			if ( !len( from ) || !arguments.nodes.keyExists( from ) ) continue;
+			if ( !files.contains( from ) ) files.append( from );
+		}
+		files.sort( ( a, b ) => compareNoCase( a, b ) );
+		return files;
 	}
 
 	/**

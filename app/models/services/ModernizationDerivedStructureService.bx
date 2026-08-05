@@ -26,6 +26,21 @@ class threadsafe {
 	variables.minUnitsForFolderInference   = 24;
 	variables.maxInferredArchitectureScopes = 12;
 
+	// --- clustering weights -------------------------------------------------
+	// Relative, not absolute: only their ratio matters to modularity. Sharing a
+	// table is stronger evidence of one domain than a single call is, because a
+	// call can be a utility reference while co-written state cannot be split.
+	variables.sharedTableWeight = 2.0;
+	variables.sharedScopeWeight = 1.5;
+
+	// A table touched by more than this many files is infrastructure -- an audit
+	// log, a users table, a settings row -- and says nothing about where a seam
+	// runs. Counting it as coupling would drag every domain into one cluster,
+	// which is the degeneracy this algorithm exists to avoid.
+	variables.maxCoAccessFanout = 12;
+
+	variables.maxLouvainPasses = 20;
+
 	function init() {
 		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) {
 			variables.identityService = new app.models.services.ModernizationIdentityService();
@@ -249,7 +264,12 @@ class threadsafe {
 			spaced = reReplace( spaced, "[_\-\.]+", " ", "all" );
 			for ( var word in listToArray( spaced, " " ) ) {
 				var cleaned = trim( word );
-				if ( len( cleaned ) ) words.append( uCase( left( cleaned, 1 ) ) & lCase( right( cleaned, len( cleaned ) - 1 ) ) );
+				// right( value, 0 ) throws "Count cannot be zero" in BoxLang, so a
+			// single-character word must not take the general path. Reachable
+			// from any one-letter folder, and from camelCase splitting like
+			// "aService" -> "a Service".
+			if ( len( cleaned ) == 1 ) words.append( uCase( cleaned ) );
+			else if ( len( cleaned ) > 1 ) words.append( uCase( left( cleaned, 1 ) ) & lCase( right( cleaned, len( cleaned ) - 1 ) ) );
 			}
 		}
 		if ( !words.len() ) return "Remaining application slices";
@@ -508,42 +528,14 @@ class threadsafe {
 		var nodes = arguments.graph.getNodes();
 		if ( !nodes.len() ) return clusterUnitsForArchitecture( arguments.units, arguments.scopePaths );
 
-		// --- union-find over coupling evidence -------------------------------
-		var parent = {};
-		for ( var node in nodes ) parent[ node.id ] = node.id;
+		// --- communities from weighted modularity ----------------------------
+		var affinity = buildAffinityGraph( arguments.graph, nodes );
+		var community = louvainCommunities( affinity );
+		community = mergeCycleCommunities( arguments.graph, community );
 
-		var findRoot = ( id ) => {
-			var root = arguments.id;
-			while ( ( parent[ root ] ?: root ) != root ) root = parent[ root ];
-			return root;
-		};
-		var unite = ( a, b ) => {
-			if ( !parent.keyExists( arguments.a ) || !parent.keyExists( arguments.b ) ) return;
-			var rootA = findRoot( arguments.a );
-			var rootB = findRoot( arguments.b );
-			if ( rootA == rootB ) return;
-			// Deterministic merge direction, or cluster ids churn between runs.
-			if ( compareNoCase( rootA, rootB ) <= 0 ) parent[ rootB ] = rootA;
-			else parent[ rootA ] = rootB;
-		};
-
-		for ( var edge in arguments.graph.getEdges() ) unite( edge.fromFile, edge.toFile );
-
-		var metrics = arguments.graph.getMetrics();
-		for ( var resource in ( metrics.coAccess ?: {} ) ) {
-			if ( left( resource, 6 ) != "table:" ) continue;
-			var sharing = metrics.coAccess[ resource ];
-			for ( var index = 2; index <= sharing.len(); index++ ) unite( sharing[ 1 ], sharing[ index ] );
-		}
-		for ( var scope in ( metrics.sharedState ?: {} ) ) {
-			var touching = metrics.sharedState[ scope ];
-			for ( var index = 2; index <= touching.len(); index++ ) unite( touching[ 1 ], touching[ index ] );
-		}
-
-		// --- group files, then attach their units ----------------------------
 		var groups = {};
 		for ( var node in nodes ) {
-			var root = findRoot( node.id );
+			var root = community[ node.id ] ?: node.id;
 			if ( !groups.keyExists( root ) ) groups[ root ] = [];
 			groups[ root ].append( node.id );
 		}
@@ -571,7 +563,10 @@ class threadsafe {
 			}
 			if ( !unitIds.len() ) continue;
 
-			var domainKey = featureDomainKey( members[ 1 ] );
+			// Membership is derived; naming stays folder-shaped, which is what
+			// folders are actually good for. featureDomainKey wants a unit.
+			var domainKey = featureDomainKey( { sourcePath: members[ 1 ] } );
+			if ( !len( domainKey ) ) domainKey = featureFolderFromPath( members[ 1 ] );
 			if ( !len( domainKey ) ) domainKey = sanitizeDomainToken( listLast( members[ 1 ], "/" ) );
 			if ( !len( domainKey ) ) domainKey = "main-app";
 
@@ -592,6 +587,389 @@ class threadsafe {
 	}
 
 	/**
+	 * Derive migration order from the cluster DAG.
+	 *
+	 * A cluster depends on what it calls: if anything in A references anything
+	 * in B, B has to exist in its new shape before A can move. Wave is longest-
+	 * path depth over those dependencies, so a cluster never shares a wave with
+	 * something it depends on — ordering becomes a property of the graph rather
+	 * than of shard arrival order.
+	 *
+	 * Cluster-level cycles are possible even after file-level cycles are merged:
+	 * A can call B in one file while B calls A in another, with no single file
+	 * cycle. Those are condensed for ordering **and reported**, never silently
+	 * broken — a cycle between clusters is a real finding about the system.
+	 */
+	public WaveOrder function deriveWaveOrder( required any graph, required array clusters ) {
+		var clusterOf = {};
+		for ( var cluster in arguments.clusters ) {
+			for ( var filePath in cluster.filePaths ) clusterOf[ filePath ] = cluster.id;
+		}
+
+		var dependsOn = {};
+		var blocks = {};
+		for ( var cluster in arguments.clusters ) {
+			dependsOn[ cluster.id ] = {};
+			blocks[ cluster.id ] = {};
+		}
+
+		for ( var edge in arguments.graph.getEdges() ) {
+			var from = clusterOf[ edge.fromFile ] ?: "";
+			var to = clusterOf[ edge.toFile ] ?: "";
+			if ( !len( from ) || !len( to ) || from == to ) continue;
+			dependsOn[ from ][ to ] = true;
+			blocks[ to ][ from ] = true;
+		}
+
+		var cycles = clusterCycles( dependsOn );
+
+		// Condense each cycle to its lexicographically smallest member so the
+		// ordering pass runs over a genuine DAG.
+		var representative = {};
+		for ( var clusterId in dependsOn ) representative[ clusterId ] = clusterId;
+		for ( var cycle in cycles ) {
+			var target = cycle[ 1 ];
+			for ( var member in cycle ) representative[ member ] = target;
+		}
+
+		var condensed = {};
+		for ( var clusterId in dependsOn ) {
+			var source = representative[ clusterId ];
+			if ( !condensed.keyExists( source ) ) condensed[ source ] = {};
+			for ( var target in dependsOn[ clusterId ] ) {
+				var mapped = representative[ target ];
+				if ( mapped != source ) condensed[ source ][ mapped ] = true;
+			}
+		}
+
+		// Longest-path depth: a cluster sits one wave after its deepest
+		// dependency. Memoised, with a visiting guard as a belt-and-braces
+		// backstop in case condensation ever misses something.
+		var depth = {};
+		var visiting = {};
+		var resolveDepth = ( id ) => {
+			if ( depth.keyExists( arguments.id ) ) return depth[ arguments.id ];
+			if ( visiting.keyExists( arguments.id ) ) return 0;
+			visiting[ arguments.id ] = true;
+			var deepest = -1;
+			for ( var target in ( condensed[ arguments.id ] ?: {} ) ) {
+				var candidate = resolveDepth( target );
+				if ( candidate > deepest ) deepest = candidate;
+			}
+			structDelete( visiting, arguments.id );
+			depth[ arguments.id ] = deepest + 1;
+			return depth[ arguments.id ];
+		};
+
+		var order = [];
+		var clusterIds = structKeyArray( dependsOn );
+		arraySort( clusterIds, "textnocase" );
+		var maxWave = 0;
+		for ( var clusterId in clusterIds ) {
+			var wave = resolveDepth( representative[ clusterId ] );
+			if ( wave > maxWave ) maxWave = wave;
+			var dependencyIds = structKeyArray( dependsOn[ clusterId ] );
+			arraySort( dependencyIds, "textnocase" );
+			var blockedIds = structKeyArray( blocks[ clusterId ] );
+			arraySort( blockedIds, "textnocase" );
+			order.append( {
+				clusterId  : clusterId,
+				wave       : wave,
+				dependsOn  : dependencyIds,
+				blocks     : blockedIds,
+				inCycleWith : cycleMembersOf( cycles, clusterId )
+			} );
+		}
+
+		return new app.models.domain.WaveOrder( {
+			version     : "modernization-wave-v1",
+			order       : order,
+			maxWave     : maxWave,
+			cycles      : cycles,
+			criticalPath: longestChain( condensed, depth )
+		} );
+	}
+
+	/** Tarjan over the cluster dependency map. Same shape as the file-level one. */
+	private array function clusterCycles( required struct dependsOn ) {
+		var index = {};
+		var lowLink = {};
+		var onStack = {};
+		var stack = [];
+		var counter = 0;
+		var components = [];
+
+		var roots = structKeyArray( arguments.dependsOn );
+		arraySort( roots, "textnocase" );
+
+		for ( var root in roots ) {
+			if ( index.keyExists( root ) ) continue;
+			var frames = [ { node: root, next: 1 } ];
+			index[ root ] = counter;
+			lowLink[ root ] = counter;
+			counter++;
+			stack.append( root );
+			onStack[ root ] = true;
+
+			while ( frames.len() ) {
+				var frame = frames[ frames.len() ];
+				var current = frame.node;
+				var neighbours = structKeyArray( arguments.dependsOn[ current ] ?: {} );
+				arraySort( neighbours, "textnocase" );
+
+				if ( frame.next <= neighbours.len() ) {
+					var neighbour = neighbours[ frame.next ];
+					frame.next++;
+					if ( !arguments.dependsOn.keyExists( neighbour ) ) continue;
+					if ( !index.keyExists( neighbour ) ) {
+						index[ neighbour ] = counter;
+						lowLink[ neighbour ] = counter;
+						counter++;
+						stack.append( neighbour );
+						onStack[ neighbour ] = true;
+						frames.append( { node: neighbour, next: 1 } );
+					} else if ( onStack.keyExists( neighbour ) && onStack[ neighbour ] ) {
+						if ( index[ neighbour ] < lowLink[ current ] ) lowLink[ current ] = index[ neighbour ];
+					}
+					continue;
+				}
+
+				frames.deleteAt( frames.len() );
+				if ( frames.len() ) {
+					var parent = frames[ frames.len() ].node;
+					if ( lowLink[ current ] < lowLink[ parent ] ) lowLink[ parent ] = lowLink[ current ];
+				}
+
+				if ( lowLink[ current ] == index[ current ] ) {
+					var component = [];
+					while ( stack.len() ) {
+						var popped = stack[ stack.len() ];
+						stack.deleteAt( stack.len() );
+						onStack[ popped ] = false;
+						component.append( popped );
+						if ( popped == current ) break;
+					}
+					if ( component.len() > 1 ) {
+						component.sort( ( a, b ) => compareNoCase( a, b ) );
+						components.append( component );
+					}
+				}
+			}
+		}
+
+		components.sort( ( a, b ) => compareNoCase( a.toList( "|" ), b.toList( "|" ) ) );
+		return components;
+	}
+
+	private array function cycleMembersOf( required array cycles, required string clusterId ) {
+		for ( var cycle in arguments.cycles ) {
+			if ( cycle.contains( arguments.clusterId ) ) return cycle;
+		}
+		return [];
+	}
+
+	/**
+	 * The longest dependency chain — what actually sets the length of the
+	 * migration. Shortening anything off this path saves nothing.
+	 */
+	private array function longestChain( required struct condensed, required struct depth ) {
+		var deepest = "";
+		var best = -1;
+		var ids = structKeyArray( arguments.depth );
+		arraySort( ids, "textnocase" );
+		for ( var id in ids ) {
+			if ( arguments.depth[ id ] > best ) {
+				best = arguments.depth[ id ];
+				deepest = id;
+			}
+		}
+		if ( !len( deepest ) ) return [];
+
+		var chain = [ deepest ];
+		var current = deepest;
+		while ( true ) {
+			var next = "";
+			var nextDepth = -1;
+			var targets = structKeyArray( arguments.condensed[ current ] ?: {} );
+			arraySort( targets, "textnocase" );
+			for ( var target in targets ) {
+				var candidate = arguments.depth[ target ] ?: 0;
+				if ( candidate > nextDepth ) {
+					nextDepth = candidate;
+					next = target;
+				}
+			}
+			if ( !len( next ) || chain.contains( next ) ) break;
+			chain.append( next );
+			current = next;
+		}
+		// Dependencies first: the chain is built from dependent to dependency.
+		var ordered = [];
+		for ( var step = chain.len(); step >= 1; step-- ) ordered.append( chain[ step ] );
+		return ordered;
+	}
+
+	/**
+	 * One weighted undirected graph combining all three kinds of coupling.
+	 *
+	 * Modularity needs weights, not just connectivity — that is the whole point.
+	 * Connectivity alone makes every cluster a connected component, so one
+	 * utility call merges two unrelated domains. Weighting lets a single call
+	 * across a boundary be outvoted by dense coupling inside one.
+	 */
+	private struct function buildAffinityGraph( required any graph, required array nodes ) {
+		var adjacency = {};
+		for ( var node in arguments.nodes ) adjacency[ node.id ] = {};
+
+		var link = ( a, b, weight ) => {
+			if ( arguments.a == arguments.b ) return;
+			if ( !adjacency.keyExists( arguments.a ) || !adjacency.keyExists( arguments.b ) ) return;
+			adjacency[ arguments.a ][ arguments.b ] = ( adjacency[ arguments.a ][ arguments.b ] ?: 0 ) + arguments.weight;
+			adjacency[ arguments.b ][ arguments.a ] = ( adjacency[ arguments.b ][ arguments.a ] ?: 0 ) + arguments.weight;
+		};
+
+		// Structural edges, weighted by resolution provenance. Direction is
+		// dropped: for "do these belong together" a call is symmetric evidence.
+		for ( var edge in arguments.graph.getEdges() ) link( edge.fromFile, edge.toFile, edge.weight );
+
+		var metrics = arguments.graph.getMetrics();
+
+		for ( var resource in ( metrics.coAccess ?: {} ) ) {
+			if ( left( resource, 6 ) != "table:" ) continue;
+			var sharing = metrics.coAccess[ resource ];
+			// Infrastructure tables carry no seam signal (see maxCoAccessFanout).
+			if ( sharing.len() > variables.maxCoAccessFanout ) continue;
+			for ( var i = 1; i <= sharing.len(); i++ ) {
+				for ( var j = i + 1; j <= sharing.len(); j++ ) link( sharing[ i ], sharing[ j ], variables.sharedTableWeight );
+			}
+		}
+
+		for ( var scope in ( metrics.sharedState ?: {} ) ) {
+			var touching = metrics.sharedState[ scope ];
+			if ( touching.len() > variables.maxCoAccessFanout ) continue;
+			for ( var a = 1; a <= touching.len(); a++ ) {
+				for ( var b = a + 1; b <= touching.len(); b++ ) link( touching[ a ], touching[ b ], variables.sharedScopeWeight );
+			}
+		}
+
+		var degree = {};
+		var totalWeight = 0;
+		for ( var nodeId in adjacency ) {
+			var sum = 0;
+			for ( var peer in adjacency[ nodeId ] ) sum += adjacency[ nodeId ][ peer ];
+			degree[ nodeId ] = sum;
+			totalWeight += sum;
+		}
+		// Each undirected link was counted from both ends.
+		return { adjacency: adjacency, degree: degree, totalWeight: totalWeight / 2 };
+	}
+
+	/**
+	 * Louvain local-moving: repeatedly move each node into the neighbouring
+	 * community that most improves modularity, until nothing moves.
+	 *
+	 * Single level rather than the full recursive aggregation. At the scale this
+	 * runs on it converges to the same answer for the shapes that matter, and it
+	 * stays readable — which is worth more here than the last fraction of
+	 * modularity.
+	 *
+	 * Determinism is a hard requirement: nodes are visited in sorted order,
+	 * ties break toward the lexicographically smaller community, and a community
+	 * is finally named for its smallest member. Identical input must give a
+	 * byte-identical plan or fingerprints churn.
+	 */
+	private struct function louvainCommunities( required struct affinity ) {
+		var adjacency = arguments.affinity.adjacency;
+		var degree = arguments.affinity.degree;
+		var m = arguments.affinity.totalWeight;
+
+		var nodeIds = structKeyArray( adjacency );
+		arraySort( nodeIds, "textnocase" );
+
+		var community = {};
+		var communityDegree = {};
+		for ( var nodeId in nodeIds ) {
+			community[ nodeId ] = nodeId;
+			communityDegree[ nodeId ] = degree[ nodeId ];
+		}
+		// With no weighted edges at all, every node is its own community.
+		if ( m <= 0 ) return community;
+
+		var passes = 0;
+		var moved = true;
+		while ( moved && passes < variables.maxLouvainPasses ) {
+			moved = false;
+			passes++;
+			for ( var nodeId in nodeIds ) {
+				var current = community[ nodeId ];
+				var k = degree[ nodeId ];
+				communityDegree[ current ] = communityDegree[ current ] - k;
+
+				var weightTo = {};
+				for ( var peer in adjacency[ nodeId ] ) {
+					var peerCommunity = community[ peer ];
+					weightTo[ peerCommunity ] = ( weightTo[ peerCommunity ] ?: 0 ) + adjacency[ nodeId ][ peer ];
+				}
+				if ( !weightTo.keyExists( current ) ) weightTo[ current ] = 0;
+
+				var candidates = structKeyArray( weightTo );
+				arraySort( candidates, "textnocase" );
+
+				var best = current;
+				var bestGain = ( weightTo[ current ] ?: 0 ) - ( ( communityDegree[ current ] ?: 0 ) * k ) / ( 2 * m );
+				for ( var candidate in candidates ) {
+					var gain = weightTo[ candidate ] - ( ( communityDegree[ candidate ] ?: 0 ) * k ) / ( 2 * m );
+					// Strictly greater, so equal-gain ties keep the sorted-order
+					// incumbent and the result cannot oscillate.
+					if ( gain > bestGain + 0.000001 ) {
+						best = candidate;
+						bestGain = gain;
+					}
+				}
+
+				community[ nodeId ] = best;
+				communityDegree[ best ] = ( communityDegree[ best ] ?: 0 ) + k;
+				if ( best != current ) moved = true;
+			}
+		}
+
+		return relabelBySmallestMember( community );
+	}
+
+	/**
+	 * A dependency cycle cannot be cut, so its members must share a cluster
+	 * whatever modularity prefers. Structure beats statistics here: proposing a
+	 * boundary through a cycle would be proposing something impossible.
+	 */
+	private struct function mergeCycleCommunities( required any graph, required struct community ) {
+		var output = duplicate( arguments.community );
+		for ( var cycle in ( arguments.graph.getMetrics().cycles ?: [] ) ) {
+			var target = "";
+			for ( var member in cycle ) {
+				if ( !output.keyExists( member ) ) continue;
+				if ( !len( target ) || compareNoCase( output[ member ], target ) < 0 ) target = output[ member ];
+			}
+			if ( !len( target ) ) continue;
+			var absorbed = {};
+			for ( var member in cycle ) if ( output.keyExists( member ) ) absorbed[ output[ member ] ] = true;
+			for ( var nodeId in output ) if ( absorbed.keyExists( output[ nodeId ] ) ) output[ nodeId ] = target;
+		}
+		return relabelBySmallestMember( output );
+	}
+
+	/** Name each community for its smallest member so ids never churn. */
+	private struct function relabelBySmallestMember( required struct community ) {
+		var smallest = {};
+		for ( var nodeId in arguments.community ) {
+			var key = arguments.community[ nodeId ];
+			if ( !smallest.keyExists( key ) || compareNoCase( nodeId, smallest[ key ] ) < 0 ) smallest[ key ] = nodeId;
+		}
+		var output = {};
+		for ( var nodeId in arguments.community ) output[ nodeId ] = smallest[ arguments.community[ nodeId ] ];
+		return output;
+	}
+
+	/**
 	 * Decide what each derived cluster is, from what the graph can prove.
 	 *
 	 * A cluster is only a candidate to leave the monolith when nothing crosses
@@ -605,6 +983,14 @@ class threadsafe {
 	private array function classifyDerivedClusters( required any graph, required array clusters ) {
 		var metrics = arguments.graph.getMetrics();
 		var output = [];
+
+		// A single cluster spanning the whole system has nothing crossing its
+		// boundary, which makes "isolated" vacuously true. There is no seam to
+		// extract *to*, so it stays. Without this, a system so coupled that it
+		// collapses into one cluster would read as trivially extractable — the
+		// exact inversion of the right answer, and the failure mode false-seam
+		// is built to catch.
+		var singleCluster = arguments.clusters.len() <= 1;
 
 		for ( var cluster in arguments.clusters ) {
 			var members = cluster.filePaths;
@@ -642,17 +1028,25 @@ class threadsafe {
 				}
 			}
 
-			var isolated = crossing == 0 && !sharedOutside.len() && !scopesOutside.len() && !inCycleWithOutside;
+			var isolated = crossing == 0
+				&& !sharedOutside.len()
+				&& !scopesOutside.len()
+				&& !inCycleWithOutside
+				&& !singleCluster;
 
 			cluster.boundaryEvidence = {
 				crossingEdges       : crossing,
 				sharedTablesOutside : sharedOutside,
 				sharedScopesOutside : scopesOutside,
 				inCycleWithOutside  : inCycleWithOutside,
+				spansWholeSystem    : singleCluster,
 				isolated            : isolated
 			};
 
-			if ( !isolated ) {
+			if ( singleCluster ) {
+				cluster.placementType = "main-app";
+				cluster.rationale = "Everything in scope resolves to one cluster: coupling reaches across every candidate boundary, so there is no seam to extract along.";
+			} else if ( !isolated ) {
 				cluster.placementType = "main-app";
 				cluster.rationale = "Coupled to the rest of the system: "
 					& crossing & " crossing edge(s), "
@@ -661,8 +1055,25 @@ class threadsafe {
 					& ( inCycleWithOutside ? ", and part of a dependency cycle that leaves the boundary" : "" )
 					& ". Extracting it would split state that is written in both places.";
 			} else {
-				cluster.placementType = "coldbox-module";
-				cluster.rationale = "No structural edge, shared table or shared scope crosses this boundary.";
+				// Separable either way. What decides service vs module is
+				// whether this boundary already talks to the outside world:
+				// something with its own outbound integration is behaving like
+				// a service already, and saying so is a stronger claim than
+				// "could be a module", so it needs stronger evidence.
+				var externalFiles = [];
+				for ( var filePath in ( metrics.externalIntegration ?: [] ) ) {
+					if ( members.contains( filePath ) ) externalFiles.append( filePath );
+				}
+				cluster.boundaryEvidence.externalIntegration = externalFiles;
+
+				if ( externalFiles.len() ) {
+					cluster.placementType = "external-service";
+					cluster.rationale = "Nothing crosses this boundary, and it already owns an outbound integration ("
+						& externalFiles.len() & " file(s)), so it is behaving as a service inside the monolith.";
+				} else {
+					cluster.placementType = "coldbox-module";
+					cluster.rationale = "No structural edge, shared table or shared scope crosses this boundary, but it has no outbound integration of its own — separable as a module rather than a service.";
+				}
 			}
 			output.append( cluster );
 		}

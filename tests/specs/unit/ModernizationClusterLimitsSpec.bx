@@ -1,0 +1,199 @@
+/**
+ * Clustering behaviour the four corpus scenarios cannot reach.
+ *
+ * Every corpus fixture is a disconnected graph, so all four pass under naive
+ * connected-components clustering. These specs cover the connected shapes that
+ * real codebases actually have, where the interesting question is not "is there
+ * an edge" but "is this edge strong enough to mean one domain".
+ *
+ * They were originally written to pin the limits of union-find clustering and
+ * were expected to fail once modularity replaced it. They did. This is the
+ * rewritten form asserting the capability rather than the limitation.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Derived clustering — known limits", () => {
+
+			var graphService = new app.models.services.ModernizationCouplingGraphService();
+			var derived = new app.models.services.ModernizationDerivedStructureService();
+
+			var dep = ( kind, filePath, target, line, targetFile ) => {
+				var record = { id: filePath & line, kind: kind, target: target, filePath: filePath, startLine: line, endLine: line };
+				if ( len( targetFile ?: "" ) ) {
+					record.targetFile = targetFile;
+					record.resolution = "path";
+				}
+				return record;
+			};
+			var unit = ( id, filePath ) => { return { id: id, filePath: filePath, startLine: 1, endLine: 99 }; };
+
+			// Two domains sharing no table and no scope, bridged by one call.
+			var bridged = {
+				units: [ unit( "u1", "orders/Orders.cfc" ), unit( "u2", "orders/OrderLines.cfc" ), unit( "u3", "reports/Reports.cfc" ), unit( "u4", "reports/Charts.cfc" ) ],
+				dependencies: [
+					dep( "component-construction", "orders/Orders.cfc", "OrderLines", 1, "orders/OrderLines.cfc" ),
+					dep( "component-construction", "reports/Reports.cfc", "Charts", 1, "reports/Charts.cfc" ),
+					dep( "component-construction", "reports/Reports.cfc", "Orders", 9, "orders/Orders.cfc" ),
+					dep( "table-query", "orders/Orders.cfc", "orders", 3, "" ),
+					dep( "table-query", "orders/OrderLines.cfc", "order_lines", 3, "" ),
+					dep( "table-query", "reports/Reports.cfc", "report_cache", 3, "" ),
+					dep( "table-query", "reports/Charts.cfc", "chart_defs", 3, "" )
+				]
+			};
+
+			it( "survives a single bridging edge between two unrelated domains", () => {
+				// The shape every real codebase has: domains that are distinct
+				// but not disconnected. Connectivity alone cannot tell them
+				// apart; relative edge weight can.
+				var graph = graphService.build( bridged );
+				var clusters = derived.deriveClusters( graph, bridged.units, [] );
+
+				expect( clusters.len() ).toBe( 2, "one utility call must not merge two domains" );
+
+				var byFile = {};
+				for ( var cluster in clusters ) {
+					for ( var filePath in cluster.filePaths ) byFile[ filePath ] = cluster.id;
+				}
+				expect( byFile[ "orders/orders.cfc" ] ).toBe( byFile[ "orders/orderlines.cfc" ] );
+				expect( byFile[ "reports/reports.cfc" ] ).toBe( byFile[ "reports/charts.cfc" ] );
+				expect( byFile[ "orders/orders.cfc" ] ).notToBe( byFile[ "reports/reports.cfc" ] );
+			} );
+
+			it( "leaves the bridging edge crossing the boundary, where it can be counted", () => {
+				// Under connected-components this was structurally always zero,
+				// which made the crossing term in the isolation test vacuous and
+				// left the cluster DAG with no edges to sort.
+				var graph = graphService.build( bridged );
+				var clusters = derived.deriveClusters( graph, bridged.units, [] );
+
+				var crossing = 0;
+				for ( var cluster in clusters ) crossing += graph.edgesCrossing( cluster.filePaths ).len();
+
+				expect( crossing ).toBeGT( 0, "a real seam has to leave something to cut" );
+
+				// And the coupling is visible on the cluster, not just the graph.
+				var coupled = 0;
+				for ( var cluster in clusters ) coupled += cluster.boundaryEvidence.crossingEdges;
+				expect( coupled ).toBeGT( 0 );
+			} );
+
+			it( "keeps a cycle together even when modularity would split it", () => {
+				// A boundary through a cycle proposes something impossible, so
+				// structure has to beat statistics here.
+				var cyclic = {
+					units: [ unit( "u1", "x/A.cfc" ), unit( "u2", "x/B.cfc" ) ],
+					dependencies: [
+						dep( "component-construction", "x/A.cfc", "B", 1, "x/B.cfc" ),
+						dep( "component-construction", "x/B.cfc", "A", 1, "x/A.cfc" ),
+						dep( "table-query", "x/A.cfc", "alpha", 3, "" ),
+						dep( "table-query", "x/B.cfc", "beta", 3, "" )
+					]
+				};
+				var graph = graphService.build( cyclic );
+				var clusters = derived.deriveClusters( graph, cyclic.units, [] );
+
+				expect( clusters ).toHaveLength( 1 );
+			} );
+
+			it( "orders clusters by dependency depth, dependencies first", () => {
+				var graph = graphService.build( bridged );
+				var clusters = derived.deriveClusters( graph, bridged.units, [] );
+				var waves = derived.deriveWaveOrder( graph, clusters );
+
+				var ordersCluster = "";
+				var reportsCluster = "";
+				for ( var cluster in clusters ) {
+					if ( cluster.filePaths.contains( "orders/orders.cfc" ) ) ordersCluster = cluster.id;
+					if ( cluster.filePaths.contains( "reports/reports.cfc" ) ) reportsCluster = cluster.id;
+				}
+
+				// reports calls orders, so orders has to move first.
+				expect( waves.wave( ordersCluster ) ).toBe( 0 );
+				expect( waves.wave( reportsCluster ) ).toBe( 1 );
+				expect( waves.blocks( ordersCluster, reportsCluster ) ).toBeTrue();
+				expect( waves.blocks( reportsCluster, ordersCluster ) ).toBeFalse();
+				expect( waves.clustersInWave( 0 ) ).toInclude( ordersCluster );
+				expect( waves.criticalPath() ).toBe( [ ordersCluster, reportsCluster ] );
+				expect( waves.getCycles() ).toBeEmpty();
+			} );
+
+			it( "reports a cluster-level cycle instead of inventing an order", () => {
+				// A calls B in one file, B calls A in another. No single file is
+				// in a cycle, so the clusters stay separate — but neither can be
+				// sequenced before the other.
+				var mutual = {
+					units: [ unit( "u1", "p/One.cfc" ), unit( "u2", "p/OneHelper.cfc" ), unit( "u3", "q/Two.cfc" ), unit( "u4", "q/TwoHelper.cfc" ) ],
+					dependencies: [
+						dep( "component-construction", "p/One.cfc", "OneHelper", 1, "p/OneHelper.cfc" ),
+						dep( "component-construction", "q/Two.cfc", "TwoHelper", 1, "q/TwoHelper.cfc" ),
+						dep( "component-construction", "p/One.cfc", "Two", 5, "q/Two.cfc" ),
+						dep( "component-construction", "q/TwoHelper.cfc", "OneHelper", 5, "p/OneHelper.cfc" ),
+						dep( "table-query", "p/One.cfc", "one_tbl", 3, "" ),
+						dep( "table-query", "p/OneHelper.cfc", "one_tbl", 4, "" ),
+						dep( "table-query", "q/Two.cfc", "two_tbl", 3, "" ),
+						dep( "table-query", "q/TwoHelper.cfc", "two_tbl", 4, "" )
+					]
+				};
+				var graph = graphService.build( mutual );
+				var clusters = derived.deriveClusters( graph, mutual.units, [] );
+				var waves = derived.deriveWaveOrder( graph, clusters );
+
+				expect( clusters.len() ).toBe( 2, "shared tables should hold each pair together" );
+				expect( waves.getCycles() ).notToBeEmpty( "mutual dependency between clusters must be reported" );
+				expect( waves.inCycle( clusters[ 1 ].id ) ).toBeTrue();
+				// Condensed for ordering, so both sit in the same wave.
+				expect( waves.wave( clusters[ 1 ].id ) ).toBe( waves.wave( clusters[ 2 ].id ) );
+			} );
+
+			it( "ignores an infrastructure table touched by everything", () => {
+				// A table used by every file is not evidence of a seam. Counting
+				// it as coupling would drag every domain into one cluster.
+				var dependencies = [];
+				var units = [];
+				for ( var index = 1; index <= 16; index++ ) {
+					var path = "d#index#/Svc#index#.cfc";
+					units.append( unit( "u#index#", path ) );
+					dependencies.append( dep( "table-query", path, "audit_log", 3, "" ) );
+					dependencies.append( dep( "table-query", path, "own_table_#index#", 4, "" ) );
+				}
+				var graph = graphService.build( { units: units, dependencies: dependencies } );
+				var clusters = derived.deriveClusters( graph, units, [] );
+
+				expect( clusters.len() ).toBeGT(
+					1,
+					"a ubiquitous table must not collapse 16 unrelated domains into one cluster"
+				);
+			} );
+
+			it( "still separates domains that share no edge at all", () => {
+				// The property that does hold today, and the one the corpus
+				// scenarios exercise.
+				var disjoint = {
+					units: [ unit( "u1", "a/A.cfc" ), unit( "u2", "b/B.cfc" ) ],
+					dependencies: [
+						dep( "table-query", "a/A.cfc", "alpha", 3, "" ),
+						dep( "table-query", "b/B.cfc", "beta", 3, "" )
+					]
+				};
+				var graph = graphService.build( disjoint );
+
+				expect( derived.deriveClusters( graph, disjoint.units, [] ).len() ).toBe( 2 );
+			} );
+
+			it( "labels a single-character domain without throwing", () => {
+				// right( value, 0 ) throws in BoxLang; a one-letter folder or a
+				// camelCase split like "aService" reaches that path.
+				var single = {
+					units: [ unit( "u1", "a/Thing.cfc" ) ],
+					dependencies: [ dep( "table-query", "a/Thing.cfc", "things", 3, "" ) ]
+				};
+				var graph = graphService.build( single );
+				var clusters = derived.deriveClusters( graph, single.units, [] );
+
+				expect( clusters ).toHaveLength( 1 );
+				expect( clusters[ 1 ].name ).notToBeEmpty();
+			} );
+		} );
+	}
+}
