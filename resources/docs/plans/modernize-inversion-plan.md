@@ -71,7 +71,7 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
 | 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
 | 3a | Re-point client + tests | `done` (uncommitted) | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | 550·0·0·1, JS 3/3, routes 200. Single owner for `stayInMonolith` (server) and `placementTypeOf` (client); `modernizationPlacements()` resolves derived → provider → legacy. Live-verified: the UI now renders the derived verdict where it previously showed the provider's weaker one |
-| 3b | Delete the LLM path | `wip` | all stop conditions incl. `seamRecall` vs baseline; suite green with **zero** assertions rewritten | **Cuts 1, 2, 2b, 3, 6 done** (548·0·0·1). Derivation supplies `target.placements` — the inversion is live. **Remaining: cut 4** (§2.5 groups, ~1,836 lines) and **cut 5** (roles + prompt registry) |
+| 3b | Delete the LLM path | `done` (uncommitted) | all stop conditions; suite green | **All six cuts done** (501·0·0·1). ProposalService 5,371 → 3,000; roles 7 → 5; live run clean with `basis=coupling-derived`. One deferral: merging the two rebuild roles |
 | 11 | Break up the residual | `todo` | no `app/models` service over 900 lines except `SchemaService` | |
 | 5 | Re-point the roles | `todo` | LLM corpus tier runs; token + wall-clock baseline recorded | |
 | 6 | Corpus LLM + judge tiers | `todo` | thresholds set to measured baseline; citation resolver exists and is called | |
@@ -1728,7 +1728,7 @@ the LLM path is load-bearing until each piece is cut, so order matters:
 | 2b | **Derivation supplies `target.placements`** — the keystone | done; see below | medium |
 | 3 | ~~`PlacementService`'s legacy-projection lines~~ **done** | client's legacy tier is spec-covered but no longer the primary read | medium — drops the `contexts`/`extracts` shape |
 | 4 | ~~The five §2.5 DELETE groups (~1,836) in `ProposalService`~~ **done — 2,338 removed** | the bulk; identifier reconciliation and omission repair stop being necessary once structure is derived | high |
-| 5 | `architecture` + `repair` roles, merge the two rebuilds | eight files plus three manifest maps and 16 prompt assets (§2.15) | medium, wide |
+| 5 | ~~`architecture` + `repair` roles~~ **done** (rebuild merge deferred) | eight files plus three manifest maps and 16 prompt assets (§2.15) | medium, wide |
 | 6 | ~~Collapse the export's three renderings~~ **done** | depends on 3 | low |
 
 **Do 5 last, not first.** Deleting a role while the proposal still calls it turns
@@ -1866,6 +1866,44 @@ behaviour broken.
 
 **Live verification after the fix:** `status: partial`, **zero errors**,
 `placementSource: derived`, both placements `basis=coupling-derived`.
+
+### Cut 5 — roles 7 → 5
+
+`modernization-architecture` and `modernization-repair` are gone from every
+surface §2.15 listed: both allow-lists (`AgentFactory:33`,
+`AgentGateway:542`), the role-instruction switch, the output-schema map, the
+budget/evidence/key-ordering chains, the three manifest maps, and six prompt
+assets on disk.
+
+Three helpers went with them once nothing referenced them —
+`compactArchitectureEvidence`, `compactArchitectureResponse`, and the gateway's
+architecture-salvage path (`canSalvageArchitectureValidation` +
+`salvageArchitecturePayload`). That salvage path existed because architecture
+responses routinely blew schema `maxItems` on a whole-repository call; there is
+no whole-repository model call left to blow it.
+
+Fifteen further spec blocks were deleted across five files, all exercising the
+two roles.
+
+**Deferred: merging `slice-rebuild` + `item-rebuild` into one `rebuild` role.**
+It is a rename plus a signature merge inside `ModernizationSliceRebuildService`,
+carries no derivation benefit, and every other part of cut 5 is complete without
+it. Left as the one open item so the deferral is visible rather than implied.
+
+### Step 3b totals
+
+| Service | Before | After |
+| --- | --- | --- |
+| `ModernizationProposalService` | 5,371 | **3,000** |
+| `ModernizationValidationService` | 801 | **490** |
+| `ModernizationPlacementService` | 720 | 931 *(gained target-path ownership; §2.6's cut applied)* |
+| `ModernizationAgentFactory` | 540 | 501 |
+| `ModernizationAgentGateway` | 892 | 854 |
+| `ModernizationExportService` | 748 | 716 |
+| `PromptOutputValidator` | 429 | 356 |
+
+Suite **501 · 0 · 0 · 1**, JS 3/3, all routes 200, live run clean with zero
+errors and `basis=coupling-derived` on every placement.
 
 ---
 
