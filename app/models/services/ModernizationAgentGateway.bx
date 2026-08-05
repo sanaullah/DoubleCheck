@@ -201,21 +201,6 @@ class threadsafe {
 				// request_timeout instead of mislabeling the body as truncated JSON.
 				if ( lastErrorType == "request_timeout" ) break;
 				if ( lastErrorType == "empty_provider_response" ) break;
-				// Architecture packaging often fails schema maxItems even when the
-				// payload is salvageable after compaction — accept compacted value.
-				if ( canSalvageArchitectureValidation( error, schemaId ) ) {
-					var salvaged = salvageArchitecturePayload( error, schemaId, activeRequest, arguments.options );
-					if ( isStruct( salvaged ) ) {
-						payload = salvaged;
-						var usageSalvage = normalizeUsage( {}, activeRequest, payload );
-						var costSalvage = estimateCost( resolved, usageSalvage );
-						spentUsd += costSalvage;
-						emitObservation( arguments.options, { stage: "provider-complete", runId: arguments.runId, attempt: attempt + 1, elapsedMs: getTickCount() - startedAt, outputCharacters: len( jsonSerialize( payload ) ), costUsd: spentUsd, usage: usageSalvage, salvaged: true } );
-						var salvageProvenance = isStruct( activeRequest.provenance ?: "" ) ? duplicate( activeRequest.provenance ) : {};
-						salvageProvenance.architectureSalvaged = true;
-						return { ok: true, payload: payload, outputCharacters: len( jsonSerialize( payload ) ), attempt: attempt + 1, provider: resolved.provider, model: effectiveModel, durationMs: getTickCount() - startedAt, costUsd: spentUsd, usage: usageSalvage, promptProvenance: salvageProvenance };
-					}
-				}
 				if ( attempt < attemptLimit ) {
 					if ( isStruct( error.data ?: "" ) && isArray( error.data.reasonCodes ?: "" ) && isStruct( activeRequest.provenance ?: "" ) ) activeRequest.provenance.validationReasonCodes = duplicate( error.data.reasonCodes );
 					if ( isRepairableOutputError( error ) ) {
@@ -365,29 +350,6 @@ class threadsafe {
 		return false;
 	}
 
-	private boolean function canSalvageArchitectureValidation( required any error, required string schemaId ) {
-		if ( arguments.schemaId != "modernization-architecture-v2" ) return false;
-		var typeName = lCase( toString( arguments.error.type ?: "" ) );
-		if ( findNoCase( "promptoutputvalidation", typeName ) == 0 ) return false;
-		return isStruct( arguments.error.data ?: "" );
-	}
-
-	private any function salvageArchitecturePayload( required any error, required string schemaId, required struct request, required struct options ) {
-		try {
-			var raw = isStruct( arguments.error.data.value ?: "" ) ? arguments.error.data.value : {};
-			if ( !isStruct( raw ) || !raw.count() ) return javacast( "null", "" );
-			var accepted = getValidator().sanitize( raw, arguments.schemaId, validationContext( arguments.request, arguments.options ) );
-			if ( ( accepted.valid ?: false ) && isStruct( accepted.value ?: "" ) ) return accepted.value;
-			// Soft-accept compacted placements when only residual maxItems/length noise remains.
-			if ( isStruct( accepted.value ?: "" ) && isArray( accepted.value.placements ?: "" ) && accepted.value.placements.len() ) {
-				var reasonCodes = isArray( accepted.reasonCodes ?: "" ) ? accepted.reasonCodes : [];
-				var onlySizeNoise = reasonCodes.len() && reasonCodes.every( ( code ) => [ "max-items", "max-length", "maxLength" ].contains( lCase( toString( code ) ) ) );
-				if ( onlySizeNoise || reasonCodes.len() == 0 ) return accepted.value;
-			}
-		} catch ( any ignored ) {}
-		return javacast( "null", "" );
-	}
-
 	private boolean function isRepairableOutputError( required any error ) {
 		if ( isTransportTimeoutError( arguments.error ) ) return false;
 		if ( isEmptyProviderContentError( arguments.error ) ) return false;
@@ -403,9 +365,6 @@ class threadsafe {
 		if ( role == "modernization-database" ) {
 			shrink = "RETRY CONSTRAINT: Previous database JSON was truncated. Return one COMPLETE compact JSON object with keys dbFindings, dbTransitions, samples only. Cap dbFindings at 12, dbTransitions at 16, samples at 1. Prefer high-severity observed tables first. Keep problem/proposedChange/rollback under 120 characters and sampleMigration under 10 lines. Do not invent tables absent from schemaEvidence.";
 			retryTokens = 12000;
-		} else if ( role == "modernization-architecture" ) {
-			shrink = "RETRY CONSTRAINT: Previous architecture JSON was truncated. Return COMPLETE compact JSON with at most 24 placements. Each placement at most 24 targetUnitIds and 12 evidenceRefs. Leave contexts=[] and extracts=[]. Prefer main-app packaging when unsure.";
-			retryTokens = 10000;
 		} else if ( role == "modernization-roadmap" ) {
 			shrink = "RETRY CONSTRAINT: Previous roadmap JSON was truncated. Return COMPLETE compact JSON with exactly one roadmapPhases entry, at most 4 migrationSteps, at most 2 samples, and assumptions=[]. Keep prose fields under 160 characters.";
 			retryTokens = 10000;
@@ -539,7 +498,7 @@ class threadsafe {
 		if ( isStruct( arguments.request.promptPackage ?: "" ) && len( trim( arguments.request.promptPackage.promptId ?: "" ) ) ) return arguments.request.promptPackage.promptId;
 		if ( len( trim( arguments.request.promptId ?: "" ) ) ) return arguments.request.promptId;
 		var role = lCase( trim( arguments.options.role ?: "" ) );
-		return [ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-architecture", "modernization-repair", "modernization-slice-rebuild", "modernization-item-rebuild" ].contains( role ) ? role : "";
+		return [ "modernization-application", "modernization-database", "modernization-roadmap", "modernization-slice-rebuild", "modernization-item-rebuild" ].contains( role ) ? role : "";
 	}
 
 	private string function promptSchemaId( required struct request, required struct options ) {

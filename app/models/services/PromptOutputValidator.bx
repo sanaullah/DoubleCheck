@@ -54,11 +54,10 @@ class threadsafe {
 		required string schemaId,
 		struct context = {}
 	) {
-		var prepared = arguments.response;
-		if ( arguments.schemaId == "modernization-architecture-v2" && isStruct( prepared ) ) {
-			prepared = compactArchitectureResponse( prepared );
-		}
-		var structural = validateStructure( prepared, arguments.schemaId );
+		// The modernization-architecture compaction step is gone with its role:
+		// packaging decisions come from the coupling graph, so there is no
+		// oversized architecture response left to compact.
+		var structural = validateStructure( arguments.response, arguments.schemaId );
 		if ( !structural.valid || !isStruct( structural.value ) ) return structural;
 		var value = duplicate( structural.value );
 		var collections = itemCollections( value, arguments.schemaId );
@@ -280,79 +279,6 @@ class threadsafe {
 		}
 		if ( !isStruct( resolved ) ) throw( type = "PromptSchemaReferenceException", message = "Schema reference does not resolve to an object" );
 		return resolved;
-	}
-
-	/**
-	 * Oversized architecture placements fail schema maxItems (40) and used to
-	 * discard the entire packaging recommendation. Split them into same-type
-	 * parts so ColdBox module / main-app decisions survive validation without
-	 * dropping targetUnitIds. Also hard-cap residual oversized arrays and the
-	 * placements list so salvageable LLM output is not rejected wholesale.
-	 */
-	private struct function compactArchitectureResponse( required struct response ) {
-		var value = duplicate( arguments.response );
-		if ( !isArray( value.placements ?: "" ) || !value.placements.len() ) {
-			value = compactArchitectureCollections( value );
-			return value;
-		}
-		var maxIds = 40;
-		var maxPlacements = 48;
-		var compacted = [];
-		for ( var placement in value.placements ) {
-			if ( !isStruct( placement ) ) continue;
-			var ids = normalizeStringList( placement.targetUnitIds ?: [] );
-			var refs = normalizeStringList( placement.evidenceRefs ?: [] );
-			if ( ids.len() <= maxIds && refs.len() <= maxIds ) {
-				placement.targetUnitIds = ids;
-				placement.evidenceRefs = refs;
-				compacted.append( placement );
-				continue;
-			}
-			var chunkCount = 1;
-			if ( ids.len() || refs.len() ) {
-				chunkCount = max(
-					ids.len() ? ceiling( ids.len() / maxIds ) : 1,
-					refs.len() ? ceiling( refs.len() / maxIds ) : 1
-				);
-			} else {
-				compacted.append( placement );
-				continue;
-			}
-			for ( var chunkIndex = 1; chunkIndex <= chunkCount; chunkIndex++ ) {
-				var idOffset = ( ( chunkIndex - 1 ) * maxIds ) + 1;
-				var refOffset = ( ( chunkIndex - 1 ) * maxIds ) + 1;
-				var chunkIds = ( ids.len() && idOffset <= ids.len() )
-					? ids.slice( idOffset, min( maxIds, ids.len() - idOffset + 1 ) )
-					: [];
-				var chunkRefs = ( refs.len() && refOffset <= refs.len() )
-					? refs.slice( refOffset, min( maxIds, refs.len() - refOffset + 1 ) )
-					: [];
-				if ( !chunkIds.len() && !chunkRefs.len() ) continue;
-				var chunk = duplicate( placement );
-				chunk.targetUnitIds = chunkIds;
-				chunk.evidenceRefs = chunkRefs;
-				if ( chunkCount > 1 ) {
-					var baseId = trim( toString( placement.id ?: placement.domainKey ?: "placement" ) );
-					var baseName = trim( toString( placement.name ?: placement.domainKey ?: baseId ) );
-					if ( !len( baseId ) ) baseId = "placement";
-					if ( !len( baseName ) ) baseName = baseId;
-					chunk.id = baseId & "-part" & chunkIndex;
-					chunk.name = baseName & " (part " & chunkIndex & ")";
-				}
-				compacted.append( chunk );
-			}
-		}
-		// Final hard-cap: never leave an oversized array that can fail schema maxItems.
-		for ( var capped in compacted ) {
-			if ( !isStruct( capped ) ) continue;
-			capped.targetUnitIds = normalizeStringList( capped.targetUnitIds ?: [] );
-			capped.evidenceRefs = normalizeStringList( capped.evidenceRefs ?: [] );
-			if ( capped.targetUnitIds.len() > maxIds ) capped.targetUnitIds = capped.targetUnitIds.slice( 1, maxIds );
-			if ( capped.evidenceRefs.len() > maxIds ) capped.evidenceRefs = capped.evidenceRefs.slice( 1, maxIds );
-		}
-		if ( compacted.len() > maxPlacements ) compacted = compacted.slice( 1, maxPlacements );
-		value.placements = compacted;
-		return compactArchitectureCollections( value );
 	}
 
 	private struct function compactArchitectureCollections( required struct value ) {
