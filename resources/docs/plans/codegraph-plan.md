@@ -26,6 +26,13 @@ starts, this file becomes the sole live plan — delete
 `modernize-inversion-plan.md` (or fold unfinished Part 5 notes into
 `open-issues.md` first). Do not keep both readable.
 
+### True project Overview (approved)
+
+Landing is not “all clusters as a catalog”. Overview shows:
+1. Project strip (name, blurb, file/module stats)
+2. Top ~10 modules by size/connectivity (quieter cards)
+3. “Show all modules” to expand; Files/Neighbourhood for drill
+
 ---
 
 ## Context
@@ -549,4 +556,9 @@ Phase C (search/filter chrome) is deferred and builds on A.
 ### C — later (not this pass)
 
 Canvas search, layer/complexity filters, Fit-to-selection. No React Flow.
+
+### Depth that teaches (approved)
+
+P0: rich Files cards (fan-in/out, hotspot) · clickable inspector files →
+neighbourhood · fix issue labels · neighbourhood edge kinds + focus highlight.
 

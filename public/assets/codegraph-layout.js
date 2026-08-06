@@ -15,13 +15,19 @@
 		gapX: 72,
 		gapY: 20,
 		pad: 24,
-		// Overview (project-module) cards — Understand-Anything style
-		overviewNodeWidth: 280,
-		overviewNodeHeight: 148,
-		overviewGapX: 48,
-		overviewGapY: 36,
-		overviewMaxSummaryChars: 160,
-		overviewMaxSummaryLines: 3
+		// File / neighbourhood detail cards
+		detailNodeWidth: 220,
+		detailNodeHeight: 76,
+		detailGapX: 56,
+		detailGapY: 28,
+		// Overview (project-module) cards — fewer, larger, quieter
+		overviewNodeWidth: 320,
+		overviewNodeHeight: 140,
+		overviewGapX: 40,
+		overviewGapY: 32,
+		overviewMaxSummaryChars: 140,
+		overviewMaxSummaryLines: 2,
+		overviewTopN: 10
 	};
 
 	const LAYER_ORDER = {
@@ -49,36 +55,42 @@
 	function mergeDefaults(opts) {
 		const o = opts || {};
 		const overview = !!o.overview;
+		const detail = !!o.detail && !overview;
+		const widthFallback = overview
+			? DEFAULTS.overviewNodeWidth
+			: detail
+				? DEFAULTS.detailNodeWidth
+				: DEFAULTS.nodeWidth;
+		const heightFallback = overview
+			? DEFAULTS.overviewNodeHeight
+			: detail
+				? DEFAULTS.detailNodeHeight
+				: DEFAULTS.nodeHeight;
+		const gapXFallback = overview
+			? DEFAULTS.overviewGapX
+			: detail
+				? DEFAULTS.detailGapX
+				: DEFAULTS.gapX;
+		const gapYFallback = overview
+			? DEFAULTS.overviewGapY
+			: detail
+				? DEFAULTS.detailGapY
+				: DEFAULTS.gapY;
 		return {
 			maxNodes: Number(opt(o, "maxNodes", DEFAULTS.maxNodes)) || DEFAULTS.maxNodes,
 			maxEdges: Number(opt(o, "maxEdges", DEFAULTS.maxEdges)) || DEFAULTS.maxEdges,
-			nodeWidth:
-				Number(
-					opt(
-						o,
-						"nodeWidth",
-						overview ? DEFAULTS.overviewNodeWidth : DEFAULTS.nodeWidth
-					)
-				) || (overview ? DEFAULTS.overviewNodeWidth : DEFAULTS.nodeWidth),
-			nodeHeight:
-				Number(
-					opt(
-						o,
-						"nodeHeight",
-						overview ? DEFAULTS.overviewNodeHeight : DEFAULTS.nodeHeight
-					)
-				) || (overview ? DEFAULTS.overviewNodeHeight : DEFAULTS.nodeHeight),
-			gapX:
-				Number(opt(o, "gapX", overview ? DEFAULTS.overviewGapX : DEFAULTS.gapX)) ||
-				(overview ? DEFAULTS.overviewGapX : DEFAULTS.gapX),
-			gapY:
-				Number(opt(o, "gapY", overview ? DEFAULTS.overviewGapY : DEFAULTS.gapY)) ||
-				(overview ? DEFAULTS.overviewGapY : DEFAULTS.gapY),
+			nodeWidth: Number(opt(o, "nodeWidth", widthFallback)) || widthFallback,
+			nodeHeight: Number(opt(o, "nodeHeight", heightFallback)) || heightFallback,
+			gapX: Number(opt(o, "gapX", gapXFallback)) || gapXFallback,
+			gapY: Number(opt(o, "gapY", gapYFallback)) || gapYFallback,
 			pad: Number(opt(o, "pad", DEFAULTS.pad)) || DEFAULTS.pad,
 			includeTests: o.includeTests !== false,
 			kinds: Array.isArray(o.kinds) ? o.kinds : null,
 			overview: overview,
-			summaries: Array.isArray(o.summaries) ? o.summaries : null
+			detail: detail,
+			summaries: Array.isArray(o.summaries) ? o.summaries : null,
+			showAll: !!o.showAll,
+			topN: Number(opt(o, "topN", DEFAULTS.overviewTopN)) || DEFAULTS.overviewTopN
 		};
 	}
 
@@ -106,24 +118,82 @@
 
 	function summaryForCluster(cluster, summaries) {
 		const id = String((cluster && (cluster.id || cluster.key)) || "");
+		const label = (cluster && (cluster.label || cluster.name || cluster.key)) || "Module";
+		const files =
+			Number(cluster && cluster.fileCount) ||
+			(Array.isArray(cluster && cluster.filePaths) ? cluster.filePaths.length : 0);
+		const layer = layerLabelOf(cluster, 0);
 		if (Array.isArray(summaries)) {
 			const hit = summaries.find(
-				(s) => s && (s.clusterId === id || s.nodeId === id || (s.title && s.title === (cluster.label || cluster.name)))
+				(s) =>
+					s &&
+					(s.clusterId === id ||
+						s.nodeId === id ||
+						(s.title && s.title === (cluster.label || cluster.name)))
 			);
 			if (hit && hit.text) return { text: String(hit.text), origin: "ai" };
 		}
 		if (cluster && cluster.summary) return { text: String(cluster.summary), origin: "provided" };
-		const files = Number(cluster && cluster.fileCount) || (Array.isArray(cluster && cluster.filePaths) ? cluster.filePaths.length : 0);
-		const crossing = Number(cluster && cluster.crossingEdges) || 0;
-		const cohesion = cluster && cluster.cohesion != null ? Number(cluster.cohesion) : null;
-		const bits = [];
-		bits.push(files === 1 ? "1 file" : files + " files");
-		if (crossing) bits.push(crossing + " crossing edge" + (crossing === 1 ? "" : "s"));
-		if (cohesion != null && !isNaN(cohesion)) bits.push("cohesion " + cohesion.toFixed(2));
-		const label = (cluster && (cluster.label || cluster.name || cluster.key)) || "Module";
+		const fileBit = files === 1 ? "1 file" : files + " files";
 		return {
-			text: label + " — " + bits.join(" · ") + ". Select to inspect; explore files from the panel.",
+			text: label + " — " + fileBit + " in the " + layer + " area.",
 			origin: "deterministic"
+		};
+	}
+
+	function overviewScore(cluster) {
+		const files =
+			Number(cluster && cluster.fileCount) ||
+			(Array.isArray(cluster && cluster.filePaths) ? cluster.filePaths.length : 0);
+		const crossing = Number(cluster && cluster.crossingEdges) || 0;
+		const symbols = Number(cluster && cluster.symbolCount) || 0;
+		const inCycle = !!(cluster && (cluster.inCycle || cluster.hasCycle));
+		return files * 4 + crossing * 3 + Math.floor(symbols / 10) + (inCycle ? 20 : 0);
+	}
+
+	/** Rank clusters for project Overview (largest / most connected first). */
+	function selectTopClusters(clusters, limit) {
+		const list = Array.isArray(clusters) ? clusters.slice() : [];
+		const capped = Math.max(1, Number(limit) || DEFAULTS.overviewTopN);
+		list.sort((a, b) => {
+			const diff = overviewScore(b) - overviewScore(a);
+			if (diff !== 0) return diff;
+			return String(a.label || a.id || "").localeCompare(String(b.label || b.id || ""));
+		});
+		return list.slice(0, capped);
+	}
+
+	/** Project landing copy for the Overview strip (deterministic; AI optional). */
+	function projectOverviewCopy(snapshot, opts) {
+		const o = opts || {};
+		const totals = (snapshot && snapshot.totals) || {};
+		const clusters = Array.isArray(snapshot && snapshot.clusters) ? snapshot.clusters : [];
+		const files = Number(totals.files != null ? totals.files : totals.nodes) || 0;
+		const moduleCount = Number(totals.clusters != null ? totals.clusters : clusters.length) || 0;
+		const cycles = Number(totals.cycles != null ? totals.cycles : (snapshot.cycles || []).length) || 0;
+		const name = String(o.projectName || "Project").trim() || "Project";
+		const summaries = o.summaries || (o.narrative && o.narrative.summaries) || null;
+		let blurb = name + " — " + files + " files across " + moduleCount + " modules.";
+		if (cycles) {
+			blurb += " " + cycles + " dependency cycle" + (cycles === 1 ? "" : "s") + " flagged.";
+		}
+		if (Array.isArray(summaries) && summaries.length && o.preferAi !== false) {
+			const featured = selectTopClusters(clusters, 1)[0];
+			const fid = featured ? String(featured.id || featured.key || "") : "";
+			const hit = summaries.find((s) => s && s.clusterId === fid && s.text);
+			if (hit && hit.text) {
+				blurb = String(hit.text).replace(/\s+/g, " ").trim();
+				if (blurb.length > 220) blurb = blurb.slice(0, 217).replace(/\s+\S*$/, "") + "…";
+			}
+		}
+		return {
+			title: name,
+			blurb: blurb,
+			files: files,
+			modules: moduleCount,
+			cycles: cycles,
+			shown: Number(o.shown) || 0,
+			totalModules: moduleCount
 		};
 	}
 
@@ -256,9 +326,10 @@
 
 	function buildClusterView(snapshot, opts) {
 		const cfg = mergeDefaults(Object.assign({}, opts, { overview: opts && opts.overview !== false }));
-		const clusters = Array.isArray(snapshot && snapshot.clusters) ? snapshot.clusters : [];
+		const allClusters = Array.isArray(snapshot && snapshot.clusters) ? snapshot.clusters : [];
 		const clusterEdges = Array.isArray(snapshot && snapshot.clusterEdges) ? snapshot.clusterEdges : [];
 		const summaries = cfg.summaries;
+		const clusters = cfg.showAll ? allClusters : selectTopClusters(allClusters, cfg.topN);
 
 		const nodes = clusters.map((c, index) => {
 			const summary = summaryForCluster(c, summaries);
@@ -288,13 +359,23 @@
 			return node;
 		});
 
-		const edges = uniqueEdges(clusterEdges);
+		const idSet = new Set(nodes.map((n) => n.id));
+		const edges = uniqueEdges(clusterEdges).filter((e) => idSet.has(e.from) && idSet.has(e.to));
 		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
-		return Object.assign({ mode: "cluster", overview: true }, capped);
+		return Object.assign(
+			{
+				mode: "cluster",
+				overview: true,
+				totalClusters: allClusters.length,
+				shownClusters: capped.nodes.length,
+				overviewCapped: !cfg.showAll && capped.nodes.length < allClusters.length
+			},
+			capped
+		);
 	}
 
 	function buildFileView(snapshot, opts) {
-		const cfg = mergeDefaults(opts);
+		const cfg = mergeDefaults(Object.assign({}, opts, { detail: true, overview: false }));
 		const raw = Array.isArray(snapshot && snapshot.nodes) ? snapshot.nodes : [];
 		let nodes = raw.map((n, index) => {
 			const path = n.path || n.id || "";
@@ -304,12 +385,15 @@
 				label: n.label || fileBasename(path),
 				kind: n.kind || "file",
 				layer: numericLayer(n),
+				layerLabel: typeof n.layer === "string" ? n.layer : n.component || "",
 				component: n.component || n.layer || "",
 				clusterId: n.clusterId || "",
 				fanIn: n.fanIn || 0,
 				fanOut: n.fanOut || 0,
+				symbolCount: n.symbolCount || 0,
 				inCycle: !!n.inCycle,
-				hotspotScore: n.hotspotScore || 0
+				hotspotScore: n.hotspotScore || 0,
+				role: n.role || ""
 			};
 		});
 
@@ -325,29 +409,41 @@
 			: edges;
 
 		const capped = capGraph(nodes, filteredEdges, cfg.maxNodes, cfg.maxEdges);
-		return Object.assign({ mode: "file" }, capped);
+		return Object.assign({ mode: "file", detail: true }, capped);
 	}
 
 	function buildFocusView(subgraph, opts) {
-		const cfg = mergeDefaults(opts);
+		const cfg = mergeDefaults(Object.assign({}, opts, { detail: true, overview: false }));
 		const rawNodes = Array.isArray(subgraph && subgraph.nodes) ? subgraph.nodes : [];
 		const rawEdges = Array.isArray(subgraph && subgraph.edges) ? subgraph.edges : [];
+		const focusId = subgraph && subgraph.focus ? String(subgraph.focus) : "";
 
-		const nodes = rawNodes.map((n, index) => ({
-			id: String(n.id || n.path || "node-" + index),
-			path: n.path || "",
-			label: n.label || fileBasename(n.path || n.id || ""),
-			kind: n.kind || "file",
-			layer: numericLayer(n),
-			clusterId: n.clusterId || "",
-			role: n.role || (n.id === (subgraph && subgraph.focus) ? "focus" : "neighbor")
-		}));
+		const nodes = rawNodes.map((n, index) => {
+			const path = n.path || n.id || "";
+			const id = String(n.id || path || "node-" + index);
+			return {
+				id: id,
+				path: path,
+				label: n.label || fileBasename(path),
+				kind: n.kind || "file",
+				layer: numericLayer(n),
+				layerLabel: typeof n.layer === "string" ? n.layer : n.component || "",
+				clusterId: n.clusterId || "",
+				fanIn: n.fanIn || 0,
+				fanOut: n.fanOut || 0,
+				symbolCount: n.symbolCount || 0,
+				inCycle: !!n.inCycle,
+				hotspotScore: n.hotspotScore || 0,
+				role: n.role || (id === focusId || path === focusId ? "focus" : "neighbor")
+			};
+		});
 		const edges = uniqueEdges(rawEdges);
 		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
 		return Object.assign(
 			{
 				mode: "focus",
-				focus: subgraph && subgraph.focus ? String(subgraph.focus) : ""
+				detail: true,
+				focus: focusId
 			},
 			capped
 		);
@@ -480,7 +576,10 @@
 
 	function layoutClusters(view, opts) {
 		const overview = !!(view && (view.overview || view.mode === "cluster"));
-		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview || !!(opts && opts.overview) }));
+		const detail = !!(view && view.detail) || !!(opts && opts.detail);
+		const cfg = mergeDefaults(
+			Object.assign({}, opts, { overview: overview || !!(opts && opts.overview), detail: detail && !overview })
+		);
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		const cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodes.length))));
@@ -501,13 +600,15 @@
 			nodes: positioned,
 			edges: edges.map((e) => Object.assign({}, e)),
 			mode: (view && view.mode) || "cluster",
-			overview: overview
+			overview: overview,
+			detail: !overview && detail
 		};
 	}
 
 	function layoutLayered(view, opts) {
 		const overview = !!(view && (view.overview || view.mode === "cluster")) || !!(opts && opts.overview);
-		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview }));
+		const detail = !!(view && view.detail) || !!(opts && opts.detail);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview, detail: detail && !overview }));
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		const columns = new Map();
@@ -544,17 +645,19 @@
 			nodes: positioned,
 			edges: edges.map((e) => Object.assign({}, e)),
 			mode: (view && view.mode) || "layered",
-			overview: overview
+			overview: overview,
+			detail: !overview && detail
 		};
 	}
 
 	function layoutRadial(view, opts) {
 		const overview = !!(view && (view.overview || view.mode === "cluster")) || !!(opts && opts.overview);
-		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview }));
+		const detail = !!(view && view.detail) || !!(opts && opts.detail);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview, detail: detail && !overview }));
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		if (!nodes.length) {
-			return { width: cfg.pad * 2, height: cfg.pad * 2, nodes: [], edges: [], mode: "radial", overview: overview };
+			return { width: cfg.pad * 2, height: cfg.pad * 2, nodes: [], edges: [], mode: "radial", overview: overview, detail: !overview && detail };
 		}
 
 		const focusId = (view && view.focus) || (nodes.find((n) => n.role === "focus") || nodes[0]).id;
@@ -638,7 +741,8 @@
 			nodes: shifted,
 			edges: edges.map((e) => Object.assign({}, e)),
 			mode: "radial",
-			overview: overview
+			overview: overview,
+			detail: !overview && detail
 		};
 	}
 
@@ -671,12 +775,12 @@
 	function buildOverviewCard(n, opts) {
 		const title = escapeXml(nodeLabel(n, opts));
 		const complexity = escapeXml(n.complexity || "simple");
-		const layer = escapeXml(String(n.layerLabel || "module").toUpperCase());
+		const layer = escapeXml(String(n.layerLabel || "module"));
 		const files = Number(n.fileCount) || 0;
 		const fileLabel = files === 1 ? "1 file" : files + " files";
 		const lines = wrapText(
 			n.summary || "",
-			Math.floor((n.w - 28) / 7.2),
+			Math.floor((n.w - 28) / 7.4),
 			DEFAULTS.overviewMaxSummaryLines
 		);
 		const summaryOrigin = n.summaryOrigin === "ai" ? "ai" : "deterministic";
@@ -688,7 +792,7 @@
 					'<text class="cg-card-summary" x="' +
 					(n.x + 14) +
 					'" y="' +
-					(n.y + 78 + i * 14) +
+					(n.y + 72 + i * 16) +
 					'">' +
 					escapeXml(line) +
 					"</text>"
@@ -711,7 +815,7 @@
 			n.w +
 			'" height="' +
 			n.h +
-			'" rx="8" ry="8"/>' +
+			'" rx="10" ry="10"/>' +
 			'<rect class="cg-card-accent" x="' +
 			n.x +
 			'" y="' +
@@ -721,24 +825,24 @@
 			'" height="4" rx="2" ry="2" fill="' +
 			accent +
 			'"/>' +
-			'<text class="cg-card-meta" x="' +
+			'<text class="cg-card-complexity" x="' +
 			(n.x + 14) +
 			'" y="' +
-			(n.y + 24) +
-			'">LAYER · <tspan class="cg-card-complexity">' +
+			(n.y + 28) +
+			'">' +
 			complexity +
-			"</tspan></text>" +
+			"</text>" +
 			'<text class="cg-card-layer" x="' +
 			(n.x + n.w - 14) +
 			'" y="' +
-			(n.y + 24) +
+			(n.y + 28) +
 			'" text-anchor="end">' +
 			layer +
 			"</text>" +
 			'<text class="cg-card-title" x="' +
 			(n.x + 14) +
 			'" y="' +
-			(n.y + 48) +
+			(n.y + 52) +
 			'">' +
 			title +
 			"</text>" +
@@ -749,17 +853,74 @@
 			(n.y + n.h - 14) +
 			'">' +
 			escapeXml(fileLabel) +
-			'</text>' +
+			"</text>" +
 			'<text class="cg-card-cta" x="' +
 			(n.x + n.w - 14) +
 			'" y="' +
 			(n.y + n.h - 14) +
-			'" text-anchor="end">Click to inspect</text>' +
+			'" text-anchor="end">Inspect</text>' +
+			"</g>"
+		);
+	}
+
+	function buildFileNode(n, opts) {
+		const title = escapeXml(nodeLabel(n, opts));
+		const isFocus = n.role === "focus";
+		const meta = [];
+		if (n.fanIn != null || n.fanOut != null) {
+			meta.push("in " + (Number(n.fanIn) || 0) + " · out " + (Number(n.fanOut) || 0));
+		}
+		if (n.hotspotScore) meta.push("hot " + Math.round(Number(n.hotspotScore) || 0));
+		if (n.inCycle) meta.push("cycle");
+		const metaText = escapeXml(meta.join(" · "));
+		const cls =
+			"cg-node cg-file" +
+			(isFocus ? " is-focus" : "") +
+			(n.inCycle ? " in-cycle" : "") +
+			(n.hotspotScore >= 40 ? " is-hotspot" : "");
+		return (
+			'<g class="' +
+			cls +
+			'" data-node-id="' +
+			escapeXml(n.id) +
+			'" data-kind="' +
+			escapeXml(n.kind || "file") +
+			'" data-path="' +
+			escapeXml(n.path || "") +
+			'">' +
+			'<rect class="cg-file-body" x="' +
+			n.x +
+			'" y="' +
+			n.y +
+			'" width="' +
+			n.w +
+			'" height="' +
+			n.h +
+			'" rx="8" ry="8"/>' +
+			'<text class="cg-file-title" x="' +
+			(n.x + 12) +
+			'" y="' +
+			(n.y + 28) +
+			'">' +
+			title +
+			"</text>" +
+			(metaText
+				? '<text class="cg-file-meta" x="' +
+					(n.x + 12) +
+					'" y="' +
+					(n.y + 50) +
+					'">' +
+					metaText +
+					"</text>"
+				: "") +
 			"</g>"
 		);
 	}
 
 	function buildSimpleNode(n, opts) {
+		if (n && (n.kind === "file" || n.path || n.role === "focus" || n.role === "neighbor")) {
+			return buildFileNode(n, opts);
+		}
 		const label = escapeXml(nodeLabel(n, opts));
 		return (
 			'<g class="cg-node" data-node-id="' +
@@ -806,21 +967,24 @@
 			const b = byId.get(e.to);
 			if (!a || !b) return;
 			const weight = e.weight != null ? e.weight : e.edgeCount;
+			const edgeLabel = e.kind || e.label || (weight != null ? String(weight) : "");
 			edgeParts.push(
 				'<path class="cg-edge" data-from="' +
 					escapeXml(e.from) +
 					'" data-to="' +
 					escapeXml(e.to) +
+					'" data-kind="' +
+					escapeXml(e.kind || "") +
 					'" d="' +
 					escapeXml(edgePath(a, b, opts)) +
-					'" fill="none" stroke="currentColor" stroke-opacity="0.4"/>' +
-					(weight != null
+					'" fill="none" stroke="currentColor" stroke-opacity="0.45"/>' +
+					(edgeLabel
 						? '<text class="cg-edge-label" x="' +
 							((a.x + a.w + b.x) / 2) +
 							'" y="' +
 							((a.y + a.h / 2 + b.y + b.h / 2) / 2 - 4) +
 							'">' +
-							escapeXml(String(weight)) +
+							escapeXml(String(edgeLabel)) +
 							"</text>"
 						: "")
 			);
@@ -834,6 +998,7 @@
 		return (
 			'<svg xmlns="http://www.w3.org/2000/svg" class="cg-svg' +
 			(overview ? " cg-svg-overview" : "") +
+			(layout && layout.mode === "focus" ? " cg-svg-focus" : "") +
 			'" width="' +
 			width +
 			'" height="' +
@@ -991,6 +1156,9 @@
 		normPath,
 		complexityOf,
 		summaryForCluster,
-		wrapText
+		wrapText,
+		selectTopClusters,
+		overviewScore,
+		projectOverviewCopy
 	};
 });

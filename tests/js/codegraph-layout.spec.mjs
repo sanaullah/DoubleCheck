@@ -155,7 +155,7 @@ test("overview cards include complexity, summary, and explore CTA", () => {
 
 	const invoices = view.nodes.find((n) => n.id === "c2");
 	assert.equal(invoices.summaryOrigin, "deterministic");
-	assert.match(invoices.summary, /Select to inspect/);
+	assert.match(invoices.summary, /in the .+ area/);
 
 	const positioned = layout.layoutClusters(view);
 	assert.equal(positioned.overview, true);
@@ -164,8 +164,35 @@ test("overview cards include complexity, summary, and explore CTA", () => {
 
 	const svg = layout.buildSvg(positioned);
 	assert.ok(svg.includes("cg-card"));
-	assert.ok(svg.includes("Click to inspect"));
+	assert.ok(svg.includes("Inspect"));
 	assert.ok(svg.includes('data-complexity="'));
+});
+
+test("overview defaults to top-N modules not full catalog", () => {
+	const many = {
+		clusters: Array.from({ length: 20 }, (_, i) => ({
+			id: "c" + i,
+			label: "Mod" + i,
+			fileCount: 20 - i,
+			crossingEdges: i % 3,
+			filePaths: ["f" + i + ".bx"]
+		})),
+		clusterEdges: []
+	};
+	const top = layout.buildClusterView(many, { overview: true, topN: 10 });
+	assert.equal(top.nodes.length, 10);
+	assert.equal(top.overviewCapped, true);
+	assert.equal(top.totalClusters, 20);
+	assert.equal(top.nodes[0].id, "c0");
+
+	const all = layout.buildClusterView(many, { overview: true, showAll: true });
+	assert.equal(all.nodes.length, 20);
+	assert.equal(all.overviewCapped, false);
+
+	const copy = layout.projectOverviewCopy(many, { projectName: "DemoApp", shown: 10 });
+	assert.equal(copy.title, "DemoApp");
+	assert.match(copy.blurb, /DemoApp/);
+	assert.equal(copy.modules, 20);
 });
 
 test("complexityOf and wrapText are deterministic helpers", () => {
@@ -177,9 +204,27 @@ test("complexityOf and wrapText are deterministic helpers", () => {
 	assert.ok(lines.join(" ").includes("one"));
 });
 
-test("layered layout respects overview sizing", () => {
-	const view = layout.buildClusterView(sample, { overview: true });
-	const layered = layout.layoutLayered(view, { overview: true });
-	assert.equal(layered.overview, true);
-	assert.ok(layered.nodes[0].w >= layout.DEFAULTS.overviewNodeWidth);
+test("file and focus views render fan-in meta and edge kinds", () => {
+	const files = layout.buildFileView(sample, { detail: true });
+	assert.equal(files.detail, true);
+	const orders = files.nodes.find((n) => n.id.includes("Orders.bx"));
+	assert.ok(orders);
+	const positioned = layout.layoutClusters(files, { detail: true });
+	assert.ok(positioned.nodes[0].w >= layout.DEFAULTS.detailNodeWidth);
+	const svg = layout.buildSvg(positioned);
+	assert.ok(svg.includes("cg-file"));
+	assert.ok(svg.includes("in "));
+	assert.ok(svg.includes("injects") || svg.includes("constructs"));
+
+	const focus = layout.buildFocusView(
+		{
+			focus: "app/handlers/Orders.bx",
+			nodes: sample.nodes.slice(0, 3),
+			edges: sample.edges.slice(0, 2)
+		},
+		{ detail: true }
+	);
+	assert.equal(focus.mode, "focus");
+	const focusSvg = layout.buildSvg(layout.layoutRadial(focus, { detail: true }));
+	assert.ok(focusSvg.includes("is-focus") || focusSvg.includes('data-kind="file"'));
 });
