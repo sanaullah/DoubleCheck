@@ -1,0 +1,93 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraphInventoryAdapter", () => {
+
+			var adapter = new app.models.services.CodeGraphInventoryAdapter();
+
+			it( "maps review edge kinds onto coupling structuralKinds", () => {
+				var inventory = adapter.adapt( {
+					symbols: [],
+					files: [ "app/Orders.cfc", "app/Base.cfc", "views/list.cfm" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/Orders.cfc", kind: "extends", target: "Base", targetFile: "app/Base.cfc", line: 2 },
+						{ id: "d2", sourceFile: "app/Orders.cfc", kind: "implements", target: "IOrder", targetFile: "app/IOrder.cfc", line: 3 },
+						{ id: "d3", sourceFile: "views/list.cfm", kind: "includes", target: "row.cfm", targetFile: "views/row.cfm", line: 4 },
+						{ id: "d4", sourceFile: "app/Orders.cfc", kind: "constructs", target: "Invoice", targetFile: "app/Invoice.cfc", line: 10 },
+						{ id: "d5", sourceFile: "app/Orders.cfc", kind: "injects", target: "Repo", targetFile: "app/Repo.cfc", line: 11 },
+						{ id: "d6", sourceFile: "app/Orders.cfc", kind: "imports", target: "Util", targetFile: "app/Util.cfc", line: 12 },
+						{ id: "d7", sourceFile: "app/Orders.cfc", kind: "calls", target: "save", targetFile: "app/Repo.cfc", line: 13 },
+						{ id: "d8", sourceFile: "app/Orders.cfc", kind: "type-reference", target: "DTO", targetFile: "app/DTO.cfc", line: 14 }
+					]
+				} );
+
+				var byId = {};
+				for ( var dep in inventory.dependencies ) byId[ dep.id ] = dep;
+
+				expect( byId.d1.kind ).toBe( "extends" );
+				expect( byId.d2.kind ).toBe( "implements" );
+				expect( byId.d3.kind ).toBe( "include" );
+				expect( byId.d3.filePath ).toBe( "views/list.cfm" );
+				expect( byId.d3.startLine ).toBe( 4 );
+				expect( byId.d3.resolution ).toBe( "path" );
+				expect( byId.d4.kind ).toBe( "component-construction" );
+				expect( byId.d5.kind ).toBe( "component-construction" );
+				expect( byId.d6.kind ).toBe( "component-construction" );
+				expect( byId.d7.kind ).toBe( "component-construction" );
+				expect( byId.d8.kind ).toBe( "component-construction" );
+			} );
+
+			it( "drops tests edges entirely", () => {
+				var inventory = adapter.adapt( {
+					symbols: [],
+					files: [ "tests/OrdersSpec.bx", "app/Orders.cfc" ],
+					dependencies: [
+						{ id: "t1", sourceFile: "tests/OrdersSpec.bx", kind: "tests", target: "Orders", targetFile: "app/Orders.cfc", line: 1 },
+						{ id: "ok", sourceFile: "app/Orders.cfc", kind: "extends", target: "Base", targetFile: "app/Base.cfc", line: 2 }
+					]
+				} );
+
+				expect( inventory.dependencies ).toHaveLength( 1 );
+				expect( inventory.dependencies[ 1 ].id ).toBe( "ok" );
+			} );
+
+			it( "emits a synthetic file: unit for symbol-less scanned files", () => {
+				var inventory = adapter.adapt( {
+					symbols: [
+						{ id: "s1", filePath: "app/Orders.cfc", kind: "function", name: "save", line: 10 }
+					],
+					files: [ "app/Orders.cfc", "views/empty.cfm" ],
+					dependencies: []
+				} );
+
+				var ids = inventory.units.map( ( unit ) => unit.id );
+				expect( ids ).toInclude( "s1" );
+				expect( ids ).toInclude( "file:app/Orders.cfc" );
+				expect( ids ).toInclude( "file:views/empty.cfm" );
+
+				var empty = inventory.units.filter( ( unit ) => unit.id == "file:views/empty.cfm" )[ 1 ];
+				expect( empty.filePath ).toBe( "views/empty.cfm" );
+				expect( empty.unitType ).toBe( "file" );
+			} );
+
+			it( "round-trips lowercase paths through the canonical map", () => {
+				var inventory = adapter.adapt( {
+					symbols: [
+						{ id: "s1", filePath: "app/Orders.cfc", kind: "class", name: "Orders", line: 1 }
+					],
+					files: [ "app/Orders.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/Orders.cfc", kind: "extends", target: "Base", targetFile: "app/Base.cfc", line: 2 }
+					]
+				} );
+
+				expect( inventory.canonicalPaths[ "app/orders.cfc" ] ).toBe( "app/Orders.cfc" );
+				expect( inventory.canonicalPaths[ "app/base.cfc" ] ).toBe( "app/Base.cfc" );
+				expect( adapter.getCanonicalPath( "APP/ORDERS.CFC", inventory.canonicalPaths ) ).toBe( "app/Orders.cfc" );
+				expect( adapter.getCanonicalPath( "app/missing.cfc", inventory.canonicalPaths ) ).toBe( "" );
+			} );
+
+		} );
+	}
+
+}

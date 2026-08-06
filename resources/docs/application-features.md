@@ -1,7 +1,7 @@
 # DoubleCheck — application features
 
-Committed product map for agents and developers: **why** Review and Modernize
-exist, and **what ships today**. Install and quick start live in
+Committed product map for agents and developers: **why** Review, Modernize, and
+CodeGraph exist, and **what ships today**. Install and quick start live in
 [`readme.md`](../../readme.md). How the system is wired lives in
 [`technical-flow.md`](technical-flow.md).
 
@@ -42,14 +42,16 @@ No other languages are product targets.
 
 ---
 
-## Three product purposes
+## Four product purposes
 
 1. **Evidence-backed local review** — deterministic checks always run; optional
    specialists deepen selected areas with authorized source evidence.
 2. **Legacy ColdFusion modernization assist** — propose and validate a migration
    plan; **assist**, not an automatic migrator. Never writes application source
    or executes DDL.
-3. **Honest capability claims** — measured labels, evidence validation, one clear
+3. **Interactive CodeGraph explorer** — deterministic CF/BoxLang knowledge graph
+   with optional AI summaries; not a findings or migration product.
+4. **Honest capability claims** — measured labels, evidence validation, one clear
    path per feature. Prefer under-claiming over marketing language.
 
 ---
@@ -166,16 +168,60 @@ Stage wiring: [`technical-flow.md`](technical-flow.md). Service ownership:
 
 ---
 
+## CodeGraph — purpose
+
+Use CodeGraph when you want an interactive knowledge graph of a ColdFusion /
+BoxLang repository: files, symbols, dependencies, clusters, cycles, and
+hotspots. Review and Modernize already compute parts of this graph; CodeGraph
+turns it into an explorable workspace.
+
+**Does not require** an AI key — the graph is deterministic. A configured
+provider optionally adds plain-English cluster/hotspot summaries, clearly marked
+as AI and toggleable in the UI.
+
+**Success looks like**
+
+- A persisted snapshot with nodes, clusters, cycles, orphans, layer violations,
+  and hotspots
+- Interactive drill-down (cluster → files → neighbourhood subgraph)
+- Optional AI summaries that never alter deterministic metrics
+
+**CodeGraph does not**
+
+- Analyze JavaScript (JS files are skipped silently)
+- Export Markdown/JSON/SARIF yet (`export` returns 422)
+- Replace Review findings or Modernize migration proposals
+
+---
+
+## CodeGraph — features today
+
+| Area | What you get |
+|---|---|
+| Workspace | `/codegraph` UI on the same local run queue (`runKind=codegraph`) |
+| Scan | CF/BoxLang-only indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`); JS → skipped.unsupported |
+| Graph | Symbols + dependencies via existing parsers; coupling metrics reuse Modernize services |
+| Clusters | Weighted modularity clusters with cohesion and crossing edges |
+| Issues | Cycles, orphans, layer violations, hotspot ranking |
+| Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / radial layouts; pan/zoom |
+| Subgraph | `GET /api/v1/runs/:id/codegraph/subgraph` neighbourhood drill-down |
+| Narrative | Optional LLM summaries (`CodeGraphNarrativeService`); no key → graph still succeeds |
+| History | Dashboard filter + `/api/v1/history?runKind=codegraph` |
+| Export | Not available yet — API returns 422 `export_unsupported` |
+
+---
+
 ## AI provider contract
 
-| Setup | Review | Modernize |
-|---|---|---|
-| **No** AI key / provider disabled | Yes — deterministic findings; graph/architecture when BX/CFML exist | No — provider required |
-| Enabled **local** keyless provider (`ollama` / `docker`) | Yes — specialists when enabled | Yes — subject to local provider availability |
-| Enabled **remote** provider | Yes — after normal provider config | Yes — after explicit remote-egress acknowledgement |
+| Setup | Review | Modernize | CodeGraph |
+|---|---|---|---|
+| **No** AI key / provider disabled | Yes — deterministic findings; graph/architecture when BX/CFML exist | No — provider required | Yes — full deterministic graph; no AI summaries |
+| Enabled **local** keyless provider (`ollama` / `docker`) | Yes — specialists when enabled | Yes — subject to local provider availability | Yes — optional narrative summaries |
+| Enabled **remote** provider | Yes — after normal provider config | Yes — after explicit remote-egress acknowledgement | Yes — optional narrative summaries |
 
-- A key is **never** required for basic local Review.
+- A key is **never** required for basic local Review or CodeGraph.
 - Modernize always `requiresLlm: true` in capabilities.
+- CodeGraph `requiresLlm: false`; narrative is additive.
 - Provider profiles and app settings are managed locally (`/api/v1/ai-providers`,
   `/api/v1/app-settings`); API keys are not stored as review artifacts.
 
@@ -199,9 +245,9 @@ Do not build or claim:
 ## Known gaps
 
 Verified against code, not suspected. Tracked here rather than quietly, per the
-claim rule. Fixes are sequenced in
-[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md), whose
-Part 2 carries the `file:line` proof for every row below.
+claim rule. Historical Modernize inversion notes remain in
+[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). Active
+implementation work is [`plans/codegraph-plan.md`](plans/codegraph-plan.md).
 
 ### Capability limits — the output is thinner than the feature row implies
 
@@ -225,13 +271,15 @@ Part 2 carries the `file:line` proof for every row below.
 |---|---|---|
 | ~~Risk / effort not exported~~ **closed** | `riskLevel`, `effortSize`, `effortDrivers` and `relatedFindingCount` now appear in the Markdown export's placement register, with a spec asserting the columns are present | Step 7 |
 | Export leads with telemetry | The Markdown export opens with run metadata and 13 lines of coverage counters — including provider shard counts — before any finding | Step 7 |
+| Coupling graph UI is CodeGraph-only | Review/Modernize still compute coupling signals; the interactive explorer ships on `/codegraph` only | CodeGraph |
 
 ### Measurement
 
 | Gap | Detail | Fixed in |
 |---|---|---|
 | No Modernize evaluation corpus | Review has a scored corpus with precision/recall/F1 thresholds; Modernize has unit fixtures only, so its quality is unmeasured — and the CFML tier cannot rise without one | Steps 2a, 6 |
-| JS tests are ungated | `tests/js/*.spec.mjs` (146 assertions) is not wired into `box.json` or CI; it runs only when invoked by hand | Step 0 |
+| No CodeGraph evaluation corpus | CodeGraph has unit/integration fixtures; quality is unmeasured beyond those | — |
+| ~~JS tests are ungated~~ **closed** | `tests/js/*.spec.mjs` runs via `box.json` `scripts.test` / `box run-script test` (`node --test tests/js/*.spec.mjs`) | — |
 
 ---
 
@@ -257,8 +305,9 @@ promotion happen — the `measured` flag is what makes the claim honest.
 | Need | Open |
 |---|---|
 | Install / config | [`readme.md`](../../readme.md) |
-| How Review / Modernize are wired | [`technical-flow.md`](technical-flow.md) |
-| Active implementation work | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
+| How Review / Modernize / CodeGraph are wired | [`technical-flow.md`](technical-flow.md) |
+| Active implementation work | [`plans/codegraph-plan.md`](plans/codegraph-plan.md) |
+| Prior Modernize inversion notes | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
 | Open issues | [`open-issues.md`](open-issues.md) |
 | Prompt contract system | [`prompt-system.md`](prompt-system.md) |
 | Service and repository ownership | [`app/models/README.md`](../../app/models/README.md) |

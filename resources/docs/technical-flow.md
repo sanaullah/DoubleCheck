@@ -170,12 +170,12 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | GET | `/api/v1/projects/tree` | ApiProjects | Project path tree |
 | GET | `/api/v1/workers` | ApiWorkers | Worker registry |
 | GET | `/api/v1/quality` | ApiQuality | Seeded evaluation gate |
-| GET | `/api/v1/history` | ApiHistory | Review + Modernize history (`runKind` filter) |
+| GET | `/api/v1/history` | ApiHistory | Review + Modernize + CodeGraph history (`runKind` filter) |
 | GET | `/api/v1/history/:id/comparison` | ApiHistory | Fingerprint comparison vs prior run |
 | GET/POST | `/api/v1/runs` | ApiRuns | List / **create run** |
 | GET/DELETE | `/api/v1/runs/:id` | ApiRuns | Status / cancel |
 | GET | `/api/v1/runs/:id/result` | ApiRuns | Final payload |
-| GET | `/api/v1/runs/:id/export` | ApiRuns | Review: Markdown / JSON / SARIF; Modernize: Markdown / JSON / SARIF |
+| GET | `/api/v1/runs/:id/export` | ApiRuns | Review: Markdown / JSON / SARIF; Modernize: Markdown / JSON / SARIF; CodeGraph: 422 `export_unsupported` |
 | POST | `/api/v1/runs/:id/rerun` | ApiRuns | Rerun from prior input |
 | POST | `/api/v1/runs/:id/follow-up` | ApiRuns | Review-only follow-up |
 | PUT | `/api/v1/runs/:id/findings/:fingerprint/review` | ApiRuns | Finding decision overlay |
@@ -197,6 +197,12 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | POST | `/api/v1/runs/:id/modernization/phases/:phaseId/rebuild` | ApiRuns | Rebuild one roadmap phase |
 | POST | `/api/v1/runs/:id/modernization/items/:itemId/rebuild` | ApiRuns | Rebuild one plan item |
 
+### CodeGraph
+
+| Method | Path | Handler | Role |
+|---|---|---|---|
+| GET | `/api/v1/runs/:id/codegraph/subgraph` | ApiCodeGraph | Neighbourhood drill-down (`focus`, `depth`, `limit`) |
+
 ### Providers & settings
 
 | Method | Path | Handler | Role |
@@ -214,12 +220,17 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 |---|---|---|---|
 | GET | `/review` | Main | Review workspace page |
 | GET | `/modernize` | Main | Modernize workspace page |
+| GET | `/codegraph` | Main | CodeGraph workspace page |
 | — | `/aiflight` | aiFlight module | Optional bx-ai trace explorer |
 
 UI create path: `app.js` → `POST /api/v1/runs` → open SSE on `/events`.
 
 `runKind=modernize` keeps the same queue, lease, cancellation, SSE, and result
 routes, then branches after the shared scan into `ModernizationRunService`.
+
+`runKind=codegraph` follows the same pattern into `CodeGraphRunService`
+(index → metrics/clusters → optional narrative → persist). Export is stubbed
+422 until a real exporter exists.
 
 ```mermaid
 sequenceDiagram
@@ -245,6 +256,36 @@ sequenceDiagram
   API->>RRS: getResult (baselines on read)
   RRS-->>UI: findings + architecture + summary
 ```
+
+---
+
+## One CodeGraph run
+
+CodeGraph is a separate run kind on the same local run queue. It builds a
+deterministic CF/BoxLang knowledge-graph snapshot and optionally asks an LLM for
+plain-English cluster/hotspot summaries. Unlike Modernize, it is **not**
+provider-gated — no key still yields a complete graph.
+
+Phases after the shared scan:
+
+| % | phase | event |
+|---|---|---|
+| 20 | `codegraph-index` | `codegraph.index` |
+| 40 | `codegraph-metrics` | `codegraph.metrics` |
+| 60 | `codegraph-clusters` | `codegraph.clusters` |
+| 75 | `codegraph-narrative` | `codegraph.narrative` |
+| 90 | `codegraph-persist` | — |
+| 100 | `completed` | `codegraph.completed` |
+
+Services: `CodeGraphRunService` (pipeline), `CodeGraphInventoryAdapter` +
+`CodeGraphMetricsService` (deterministic snapshot; reuses
+`ModernizationCouplingGraphService` / `ModernizationDerivedStructureService`),
+`CodeGraphNarrativeService` (optional LLM), `CodeGraphRepository` (SQLite
+`codegraph_snapshots`).
+
+Result payload lives under `data.result.codegraph` (nodes/clusters/hotspots/
+narrative — **no** raw edge list). Subgraph drill-down:
+`GET /api/v1/runs/:id/codegraph/subgraph`.
 
 ---
 
@@ -473,6 +514,11 @@ the versioned proposal/validation snapshot, and `modernization_decisions` plus
 audit trail. Inline schema text and provider credentials are never retained in
 raw form.
 
+CodeGraph persists one blob per run in `codegraph_snapshots` (snapshot JSON,
+fingerprint, truncation flags, optional `narrative_cache_key` /
+`narrative_json` for cross-run narrative reuse). Edges remain in
+`review_dependencies` — not duplicated into the snapshot blob.
+
 AI API keys are **not** stored in SQLite (environment only). Provider profiles
 may store connection settings via `AIProviderProfileRepository`; secrets stay
 out of exports and traces.
@@ -485,8 +531,9 @@ out of exports and traces.
 
 1. Boot health / session / capabilities
 2. Create run → watch SSE + poll status
-3. Render findings, architecture explorer, specialist board, baselines, or the
-   Modernize plan workspace
+3. Render findings, architecture explorer, specialist board, baselines, the
+   Modernize plan workspace, or the CodeGraph explorer
+   (`public/assets/codegraph-layout.js` UMD for layout/SVG math)
 4. History, rerun/follow-up (Review-only), cancel, export, finding/plan decisions
 
 Screenshots: [images/01-workspace.png](images/01-workspace.png),
@@ -521,6 +568,7 @@ Full ownership tables: [`app/models/README.md`](../../app/models/README.md).
 | LLM calls | `SpecialistAgentGateway`, `AIChatGateway` |
 | Tool allowlist / redaction | `ControlledRepositoryToolService` |
 | Modernize pipeline | `ModernizationRunService` (+ services in models README) |
+| CodeGraph pipeline | `CodeGraphRunService`, `CodeGraphMetricsService`, `CodeGraphNarrativeService` |
 | Baselines | `FindingBaselineService` |
 | Export formats | `ReportExportService` / `ModernizationExportService` |
 | Path allowlist / security | `SecurityContextService` |

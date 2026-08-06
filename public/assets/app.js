@@ -2,8 +2,21 @@
 function getCurrentWorkspace() {
 	const path = window.location.pathname;
 	if (path.startsWith("/modernize")) return "modernize";
+	if (path.startsWith("/codegraph")) return "codegraph";
 	if (path.startsWith("/review")) return "review";
 	return "dashboard";
+}
+
+function resolveRunKind(run, fallbackWorkspace = state.workspace) {
+	const kind = String(run?.runKind || fallbackWorkspace || "review").toLowerCase();
+	if (kind === "modernize" || kind === "codegraph") return kind;
+	return "review";
+}
+
+function workspaceDisplayName(kind) {
+	if (kind === "modernize") return "Modernize";
+	if (kind === "codegraph") return "CodeGraph";
+	return "Review";
 }
 
 const state = {
@@ -83,6 +96,25 @@ const state = {
 		decisionSelections: {},
 		notice: "",
 		noticeTone: "info"
+	},
+	codegraph: {
+		result: null,
+		snapshot: null,
+		loading: false,
+		error: "",
+		mode: "cluster",
+		layout: "cluster",
+		selectedId: "",
+		clusterId: "",
+		focusId: "",
+		focusSubgraph: null,
+		issueTab: "cycles",
+		viewport: null,
+		layoutResult: null,
+		viewTruncated: false,
+		panning: false,
+		panLast: null,
+		showAi: true
 	}
 };
 
@@ -116,7 +148,12 @@ const phaseLabels = {
 	"modernization-proposal": "Generating modernization proposals",
 	"modernization-validation": "Validating proposal",
 	"modernization-repair": "Repairing invalid items",
-	"modernization-roadmap": "Assembling roadmap"
+	"modernization-roadmap": "Assembling roadmap",
+	"codegraph-index": "Indexing symbols",
+	"codegraph-metrics": "Computing metrics",
+	"codegraph-clusters": "Deriving clusters",
+	"codegraph-narrative": "Optional narrative",
+	"codegraph-persist": "Saving snapshot"
 };
 
 const eventLabels = {
@@ -142,6 +179,11 @@ const eventLabels = {
 	"modernization.repair": "Repair",
 	"modernization.roadmap": "Roadmap",
 	"modernization.completed": "Plan completed",
+	"codegraph.index": "Graph index",
+	"codegraph.metrics": "Graph metrics",
+	"codegraph.clusters": "Clusters",
+	"codegraph.narrative": "Narrative",
+	"codegraph.completed": "Graph completed",
 	"stream.error": "Stream",
 	"stream.waiting": "Reconnect"
 };
@@ -175,7 +217,12 @@ const phasePipelineStage = {
 	"modernization-proposal": "specialists",
 	"modernization-validation": "completion",
 	"modernization-repair": "completion",
-	"modernization-roadmap": "completion"
+	"modernization-roadmap": "completion",
+	"codegraph-index": "architecture",
+	"codegraph-metrics": "planning",
+	"codegraph-clusters": "deterministic",
+	"codegraph-narrative": "specialists",
+	"codegraph-persist": "completion"
 };
 
 const pipelineLabels = {
@@ -199,6 +246,17 @@ const pipelineLabels = {
 			deterministic: "Evidence coverage",
 			specialists: "Proposal agents",
 			completion: "Validate + roadmap"
+		}
+	},
+	codegraph: {
+		aria: "CodeGraph pipeline",
+		stages: {
+			scan: "Repository scan",
+			architecture: "Symbol index",
+			planning: "Metrics",
+			deterministic: "Clusters",
+			specialists: "Optional narrative",
+			completion: "Persist snapshot"
 		}
 	}
 };
@@ -1613,6 +1671,22 @@ const elements = {
 	modernizationRemoteAckWrap: document.querySelector("#remote-provider-ack-wrap"),
 	modernizationRemoteAck: document.querySelector("#remote-provider-ack"),
 	startRunButton: document.querySelector("#start-run-button"),
+	codegraphExplorer: document.querySelector("#codegraph-explorer"),
+	codegraphStatus: document.querySelector("#codegraph-status"),
+	codegraphEmpty: document.querySelector("#codegraph-empty"),
+	codegraphFailed: document.querySelector("#codegraph-failed"),
+	codegraphTruncation: document.querySelector("#codegraph-truncation"),
+	codegraphBreadcrumb: document.querySelector("#codegraph-breadcrumb"),
+	codegraphToolbar: document.querySelector("#codegraph-toolbar"),
+	codegraphLayout: document.querySelector("#codegraph-layout"),
+	codegraphShowAi: document.querySelector("#codegraph-show-ai"),
+	codegraphAiSummaries: document.querySelector("#codegraph-ai-summaries"),
+	codegraphWorkspace: document.querySelector("#codegraph-workspace"),
+	codegraphCanvas: document.querySelector("#codegraph-canvas"),
+	codegraphInspector: document.querySelector("#codegraph-inspector"),
+	codegraphIssues: document.querySelector("#codegraph-issues"),
+	codegraphIssueTabs: document.querySelector("#codegraph-issue-tabs"),
+	codegraphIssueList: document.querySelector("#codegraph-issue-list"),
 	preferencesForm: document.querySelector("#preferences-form"),
 	preferencesReset: document.querySelector("#preferences-reset"),
 	preferencesStatus: document.querySelector("#preferences-status"),
@@ -1715,12 +1789,16 @@ function updateNewReviewSummary() {
 		const scopeLabel = modeLabels[elements.mode?.value] || "Working tree";
 		elements.readinessDetail.textContent = state.workspace === "modernize"
 			? `${scopeLabel} · Proposal only · Read-only`
-			: `${scopeLabel} · ${preset.label} · Read-only`;
+			: state.workspace === "codegraph"
+				? "Full baseline · Deterministic · Read-only"
+				: `${scopeLabel} · ${preset.label} · Read-only`;
 	}
 	if (elements.readinessLabel) {
 		elements.readinessLabel.textContent = state.workspace === "modernize"
 			? "Ready for a local modernization plan"
-			: "Ready for a local review";
+			: state.workspace === "codegraph"
+				? "Ready for a local CodeGraph run"
+				: "Ready for a local review";
 	}
 	if (elements.reviewGoalCount) {
 		elements.reviewGoalCount.textContent = `${elements.reviewGoal?.value.length || 0} / 500`;
@@ -1990,8 +2068,8 @@ function renderRunConfig(run) {
 function updatePipeline(run) {
 	if (!elements.pipelineSteps) return;
 	const status = run?.status || "Idle";
-	const kind = run?.runKind === "modernize" || (!run && state.workspace === "modernize") ? "modernize" : "review";
-	const labels = pipelineLabels[kind];
+	const kind = resolveRunKind(run);
+	const labels = pipelineLabels[kind] || pipelineLabels.review;
 	elements.pipelineSteps.setAttribute("aria-label", labels.aria);
 	elements.pipelineSteps.querySelectorAll("[data-pipeline-stage]").forEach((item) => {
 		const title = item.querySelector("strong");
@@ -2070,7 +2148,7 @@ function setRun(run) {
 	// The file picker is only useful while setting up a new run; once one is
 	// active/finished, the panel gives its space back to progress/results.
 	if (elements.projectTreePanel) elements.projectTreePanel.hidden = !!run;
-	if (run?.runKind) state.workspace = run.runKind === "modernize" ? "modernize" : "review";
+	if (run?.runKind) state.workspace = resolveRunKind(run);
 	if (run?.id && run.id !== previousRunId && run.runKind === "modernize") {
 		state.modernization.result = null;
 		state.modernization.loading = !state.terminal.has(run.status);
@@ -2086,23 +2164,54 @@ function setRun(run) {
 		state.modernization.phase = "all";
 		state.modernization.activePane = "overview";
 	}
+	if (run?.id && run.id !== previousRunId && run.runKind === "codegraph") {
+		state.codegraph.result = null;
+		state.codegraph.snapshot = null;
+		state.codegraph.loading = !state.terminal.has(run.status);
+		state.codegraph.error = "";
+		state.codegraph.mode = "cluster";
+		state.codegraph.selectedId = "";
+		state.codegraph.clusterId = "";
+		state.codegraph.focusId = "";
+		state.codegraph.layoutResult = null;
+		state.codegraph.viewport = null;
+	}
 	const status = run?.status || "Idle";
-	const workspaceLabel = state.workspace === "modernize" ? "Modernize" : "Review";
-	if (elements.jumpFindings) elements.jumpFindings.textContent = state.workspace === "modernize" ? "View plan" : "View findings";
-	if (elements.commandExport) elements.commandExport.textContent = state.workspace === "modernize" ? "Export plan" : "Export report";
-	if (elements.cancel) elements.cancel.textContent = state.workspace === "modernize" ? "Cancel plan" : "Cancel review";
+	const kind = resolveRunKind(run);
+	const workspaceLabel = workspaceDisplayName(kind);
+	const noun = kind === "modernize" ? "modernization" : kind === "codegraph" ? "CodeGraph run" : "review";
+	const resultNoun = kind === "modernize" ? "plan" : kind === "codegraph" ? "graph" : "findings";
+	if (elements.jumpFindings) {
+		elements.jumpFindings.textContent = kind === "modernize" ? "View plan" : kind === "codegraph" ? "View graph" : "View findings";
+	}
+	if (elements.commandExport) elements.commandExport.textContent = kind === "modernize" ? "Export plan" : "Export report";
+	if (elements.cancel) {
+		elements.cancel.textContent = kind === "modernize" ? "Cancel plan" : kind === "codegraph" ? "Cancel graph" : "Cancel review";
+	}
 	if (elements.commandWorkspaceLabel) elements.commandWorkspaceLabel.textContent = `${workspaceLabel} command center`;
-	if (elements.commandWorkspacePurpose) elements.commandWorkspacePurpose.textContent = state.workspace === "modernize"
-		? "Watch repository evidence, proposal roles, validation gates, and plan milestones for the active run."
-		: "Watch pipeline stages, crew progress, and live milestones for the active run.";
-	elements.title.textContent = run ? `${workspaceLabel} ${run.id.slice(0, 8)}` : `No active ${state.workspace === "modernize" ? "modernization" : "review"}`;
-	elements.status.textContent = friendlyStatus(status);
-	elements.status.dataset.status = status;
-	elements.phase.textContent = friendlyPhase(run?.currentPhase);
-	elements.progress.textContent = `${run?.progress || 0}%`;
-	elements.bar.style.width = `${run?.progress || 0}%`;
-	elements.bar.dataset.status = status;
-	elements.cancel.hidden = !run || state.terminal.has(status);
+	if (elements.commandWorkspacePurpose) {
+		elements.commandWorkspacePurpose.textContent = kind === "modernize"
+			? "Watch repository evidence, proposal roles, validation gates, and plan milestones for the active run."
+			: kind === "codegraph"
+				? "Watch indexing, metrics, clustering, and snapshot persistence for the active run."
+				: "Watch pipeline stages, crew progress, and live milestones for the active run.";
+	}
+	if (elements.title) {
+		elements.title.textContent = run
+			? `${workspaceLabel} ${run.id.slice(0, 8)}`
+			: `No active ${noun}`;
+	}
+	if (elements.status) {
+		elements.status.textContent = friendlyStatus(status);
+		elements.status.dataset.status = status;
+	}
+	if (elements.phase) elements.phase.textContent = friendlyPhase(run?.currentPhase);
+	if (elements.progress) elements.progress.textContent = `${run?.progress || 0}%`;
+	if (elements.bar) {
+		elements.bar.style.width = `${run?.progress || 0}%`;
+		elements.bar.dataset.status = status;
+	}
+	if (elements.cancel) elements.cancel.hidden = !run || state.terminal.has(status);
 	if (elements.jumpTrace) {
 		elements.jumpTrace.hidden = !run;
 	}
@@ -2113,58 +2222,63 @@ function setRun(run) {
 		elements.jumpFindings.hidden = !run;
 	}
 	if (elements.commandExport) {
-		elements.commandExport.hidden = !run || !state.terminal.has(status);
+		elements.commandExport.hidden = kind === "codegraph" || !run || !state.terminal.has(status);
 	}
 	if (elements.commandRunContext) {
 		elements.commandRunContext.textContent = run
-			? `${run.runKind === "modernize" ? "Modernize" : "Review"} · ${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
-			: `Start a ${state.workspace === "modernize" ? "Modernize plan" : "review"} to monitor its pipeline and evidence.`;
+			? `${workspaceLabel} · ${scopeLabel(run.mode)} · ${presetLabelForRun(run)} · ${run.projectPath || "local repository"}`
+			: `Start a ${kind === "modernize" ? "Modernize plan" : kind === "codegraph" ? "CodeGraph run" : "review"} to monitor its pipeline and evidence.`;
 	}
 	renderRunConfig(run);
 	updatePipeline(run);
 	updateCommandMetrics(run);
 	renderObserveIdentity();
 	if (elements.exportActions) {
-		elements.exportActions.hidden = state.workspace === "modernize" || !run || !state.terminal.has(status);
+		elements.exportActions.hidden = kind !== "review" || !run || !state.terminal.has(status);
 	}
 	if (elements.modernizationExportActions) {
-		elements.modernizationExportActions.hidden = state.workspace !== "modernize" || !run || !state.terminal.has(status);
+		elements.modernizationExportActions.hidden = kind !== "modernize" || !run || !state.terminal.has(status);
 	}
-	if (elements.modernizationResults && state.workspace === "modernize") {
+	if (elements.modernizationResults && kind === "modernize") {
 		renderModernizationResult(state.modernization.result || {});
 	} else if (elements.modernizationResults) {
 		elements.modernizationResults.hidden = true;
 	}
-	if (elements.resultsPanel) elements.resultsPanel.hidden = state.workspace === "modernize";
-	if (elements.architectureExplorer) elements.architectureExplorer.hidden = state.workspace === "modernize";
+	if (elements.codegraphExplorer && kind === "codegraph") {
+		renderCodeGraph(state.codegraph.result || {});
+	} else if (elements.codegraphExplorer) {
+		elements.codegraphExplorer.hidden = true;
+	}
+	if (elements.resultsPanel) elements.resultsPanel.hidden = kind !== "review";
+	if (elements.architectureExplorer) elements.architectureExplorer.hidden = kind !== "review";
 	document.querySelectorAll(".history-row").forEach((row) => {
 		row.classList.toggle("is-active", Boolean(run && row.dataset.runId === run.id));
 	});
 	if (elements.message) {
 		if (!run) {
-			elements.message.textContent = `Start a ${state.workspace === "modernize" ? "Modernize plan" : "review"} to watch live progress here.`;
+			elements.message.textContent = `Start a ${kind === "modernize" ? "Modernize plan" : kind === "codegraph" ? "CodeGraph run" : "review"} to watch live progress here.`;
 			elements.message.dataset.tone = "idle";
 		} else if (status === "failed") {
-			elements.message.textContent = run.message || `The ${state.workspace === "modernize" ? "Modernize plan" : "review"} failed.`;
+			elements.message.textContent = run.message || `The ${noun} failed.`;
 			elements.message.dataset.tone = "danger";
 		} else if (status === "partial") {
-				elements.message.textContent = run.message
-					? `${run.message} Check the ${state.workspace === "modernize" ? "plan" : "findings"} panel below for details.`
-					: `${state.workspace === "modernize" ? "Modernize plan" : "Review"} finished with warnings. Check the panel below.`;
+			elements.message.textContent = run.message
+				? `${run.message} Check the ${resultNoun} panel below for details.`
+				: `${workspaceLabel} finished with warnings. Check the panel below.`;
 			elements.message.dataset.tone = "warning";
 		} else if (status === "succeeded") {
-				elements.message.textContent = run.message
-					? `${run.message} Scroll down to review the ${state.workspace === "modernize" ? "plan" : "findings"}.`
-					: `${state.workspace === "modernize" ? "Modernize plan" : "Review"} completed successfully. Scroll down to inspect the result.`;
+			elements.message.textContent = run.message
+				? `${run.message} Scroll down to review the ${resultNoun}.`
+				: `${workspaceLabel} completed successfully. Scroll down to inspect the result.`;
 			elements.message.dataset.tone = "ok";
 		} else if (status === "cancelled") {
-				elements.message.textContent = run.message || `${state.workspace === "modernize" ? "Modernize plan" : "Review"} cancelled.`;
+			elements.message.textContent = run.message || `${workspaceLabel} cancelled.`;
 			elements.message.dataset.tone = "muted";
 		} else if (status === "queued") {
-				elements.message.textContent = run.message || `Waiting for a worker to pick up this ${state.workspace === "modernize" ? "plan" : "review"}…`;
+			elements.message.textContent = run.message || `Waiting for a worker to pick up this ${noun}…`;
 			elements.message.dataset.tone = "info";
 		} else {
-				elements.message.textContent = run.message || `${state.workspace === "modernize" ? "Modernize plan" : "Review"} is in progress…`;
+			elements.message.textContent = run.message || `${workspaceLabel} is in progress…`;
 			elements.message.dataset.tone = "info";
 		}
 	}
@@ -3759,9 +3873,347 @@ function renderModernizationTransitionGuide(result = {}) {
 		)}</div>`;
 }
 
+function codeGraphLayoutApi() {
+	return window.CodeGraphLayout || null;
+}
+
+function resetCodeGraphSelection() {
+	state.codegraph.selectedId = "";
+	state.codegraph.focusId = "";
+	if (elements.codegraphInspector) {
+		elements.codegraphInspector.innerHTML = emptyStateHtml({
+			icon: "detail",
+			title: "Select a node",
+			hint: "Inspect cluster or file details here."
+		});
+	}
+}
+
+function codeGraphApplyViewBox() {
+	const svg = elements.codegraphCanvas?.querySelector("svg");
+	const CG = codeGraphLayoutApi();
+	if (!svg || !CG || !state.codegraph.viewport) return;
+	svg.setAttribute("viewBox", CG.viewBoxOf(state.codegraph.viewport));
+}
+
+function codeGraphCentreOnNode(nodeId) {
+	const CG = codeGraphLayoutApi();
+	const layout = state.codegraph.layoutResult;
+	const node = layout?.nodes?.find((n) => n.id === nodeId);
+	if (!CG || !node || !state.codegraph.viewport) return;
+	const vp = state.codegraph.viewport;
+	vp.x = node.x + node.w / 2 - vp.width / 2;
+	vp.y = node.y + node.h / 2 - vp.height / 2;
+	codeGraphApplyViewBox();
+}
+
+function codeGraphNarrative() {
+	const snapshot = state.codegraph.snapshot || {};
+	const narrative = snapshot.narrative;
+	if (!narrative || typeof narrative !== "object" || !narrative.used) return null;
+	return narrative;
+}
+
+function codeGraphSummaryForNode(node) {
+	const narrative = codeGraphNarrative();
+	if (!narrative || !Array.isArray(narrative.summaries) || !node) return null;
+	const nodeId = node.id || node.path || "";
+	const clusterId = node.kind === "cluster" ? node.id : (node.clusterId || "");
+	return narrative.summaries.find((item) => {
+		if (item.clusterId && clusterId && item.clusterId === clusterId) return true;
+		if (item.nodeId && nodeId && item.nodeId === nodeId) return true;
+		if (item.nodeId && node.path && item.nodeId === node.path) return true;
+		return false;
+	}) || null;
+}
+
+function codeGraphAiSummaryHtml(summary, narrative) {
+	if (!summary) return "";
+	const provider = [narrative?.provider, narrative?.model].filter(Boolean).join("/") || "AI";
+	const title = summary.title ? `<strong>${escapeHtml(summary.title)}</strong> ` : "";
+	return `<div class="codegraph-ai-note" data-origin="ai" title="Generated by ${escapeHtml(provider)} — not evidence"><span class="ai-chip">AI</span>${title}<span>${escapeHtml(summary.text || "")}</span></div>`;
+}
+
+function codeGraphInspectorHtml(node) {
+	if (!node) {
+		return emptyStateHtml({ icon: "detail", title: "Select a node", hint: "Inspect cluster or file details here." });
+	}
+	const rows = [
+		["Kind", node.kind || "—"],
+		["Path", node.path || "—"],
+		["Cluster", node.clusterId || "—"],
+		["Layer", node.layer != null ? String(node.layer) : "—"],
+		["Files", node.fileCount != null ? String(node.fileCount) : ""],
+		["Fan-in", node.fanIn != null ? String(node.fanIn) : ""],
+		["Fan-out", node.fanOut != null ? String(node.fanOut) : ""],
+		["Hotspot", node.hotspotScore != null ? String(node.hotspotScore) : ""],
+		["In cycle", node.inCycle ? "Yes" : ""]
+	].filter(([, value]) => value !== "");
+	const narrative = codeGraphNarrative();
+	const summary = state.codegraph.showAi ? codeGraphSummaryForNode(node) : null;
+	const aiBlock = codeGraphAiSummaryHtml(summary, narrative);
+	return `<div class="codegraph-inspector-body"><h3>${escapeHtml(node.label || node.id || "Node")}</h3><dl class="codegraph-inspector-grid">${rows.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd title="${escapeHtml(v)}">${escapeHtml(v)}</dd></div>`).join("")}</dl>${aiBlock}<p class="field-hint">${node.kind === "cluster" ? "Click again to open files in this cluster." : "Click again to load the neighbourhood subgraph."}</p></div>`;
+}
+
+function renderCodeGraphAiSummaries() {
+	const host = elements.codegraphAiSummaries;
+	const toggle = elements.codegraphShowAi;
+	const narrative = codeGraphNarrative();
+	const hasAi = !!(narrative && Array.isArray(narrative.summaries) && narrative.summaries.length);
+	if (toggle) {
+		toggle.disabled = !hasAi;
+		toggle.checked = hasAi && !!state.codegraph.showAi;
+		toggle.title = hasAi
+			? `Generated by ${[narrative.provider, narrative.model].filter(Boolean).join("/") || "AI"} — not evidence`
+			: "No AI summaries for this snapshot";
+	}
+	if (!host) return;
+	if (!hasAi || !state.codegraph.showAi) {
+		host.hidden = true;
+		host.innerHTML = "";
+		return;
+	}
+	const provider = [narrative.provider, narrative.model].filter(Boolean).join("/") || "AI";
+	host.hidden = false;
+	host.innerHTML = narrative.summaries.slice(0, 24).map((item) => {
+		const label = item.title || item.clusterId || item.nodeId || "Summary";
+		const target = item.clusterId || item.nodeId || "";
+		return `<button type="button" class="codegraph-ai-summary" data-origin="ai" data-codegraph-ai-target="${escapeHtml(String(target))}" title="Generated by ${escapeHtml(provider)} — not evidence"><span class="ai-chip">AI</span><strong>${escapeHtml(String(label))}</strong><span>${escapeHtml(item.text || "")}</span></button>`;
+	}).join("");
+}
+
+function renderCodeGraphIssues() {
+	if (!elements.codegraphIssueList || !elements.codegraphIssueTabs) return;
+	const snapshot = state.codegraph.snapshot || {};
+	const tab = state.codegraph.issueTab || "cycles";
+	elements.codegraphIssueTabs.querySelectorAll("[data-codegraph-issue]").forEach((button) => {
+		const selected = button.dataset.codegraphIssue === tab;
+		button.setAttribute("aria-selected", selected ? "true" : "false");
+	});
+	const lists = {
+		cycles: snapshot.cycles || [],
+		orphans: snapshot.orphans || [],
+		violations: snapshot.layerViolations || [],
+		hotspots: snapshot.hotspots || []
+	};
+	const rows = lists[tab] || [];
+	if (!rows.length) {
+		elements.codegraphIssueList.innerHTML = emptyStateHtml({
+			icon: "inbox",
+			title: `No ${tab}`,
+			hint: "This snapshot has nothing in this issue category."
+		});
+		return;
+	}
+	elements.codegraphIssueList.innerHTML = rows.slice(0, 80).map((item, index) => {
+		const id = item.id || item.path || item.from || item.nodeId || `issue-${index}`;
+		const label = item.label || item.path || item.members?.join(", ") || item.message || id;
+		return `<button type="button" class="codegraph-issue-item" data-codegraph-focus="${escapeHtml(String(id))}" data-codegraph-paths="${escapeHtml(JSON.stringify(item.members || item.filePaths || [item.path || id].filter(Boolean)))}">${escapeHtml(String(label))}</button>`;
+	}).join("");
+}
+
+function renderCodeGraphBreadcrumb() {
+	if (!elements.codegraphBreadcrumb) return;
+	const parts = [{ id: "root", label: "Clusters" }];
+	if (state.codegraph.mode === "file" || state.codegraph.mode === "focus") {
+		parts.push({ id: "cluster", label: state.codegraph.clusterId || "Files" });
+	}
+	if (state.codegraph.mode === "focus") {
+		parts.push({ id: "focus", label: state.codegraph.focusId || "Focus" });
+	}
+	elements.codegraphBreadcrumb.hidden = parts.length < 2;
+	elements.codegraphBreadcrumb.innerHTML = parts.map((part, index) => {
+		const last = index === parts.length - 1;
+		return last
+			? `<span class="codegraph-crumb is-current">${escapeHtml(part.label)}</span>`
+			: `<button type="button" class="codegraph-crumb" data-codegraph-crumb="${escapeHtml(part.id)}">${escapeHtml(part.label)}</button>`;
+	}).join('<span class="codegraph-crumb-sep" aria-hidden="true">/</span>');
+}
+
+function paintCodeGraphCanvas() {
+	const CG = codeGraphLayoutApi();
+	const host = elements.codegraphCanvas;
+	if (!CG || !host) return;
+	const snapshot = state.codegraph.snapshot;
+	if (!snapshot) {
+		host.innerHTML = "";
+		return;
+	}
+	const layoutMode = state.codegraph.layout || "cluster";
+	let view;
+	if (state.codegraph.mode === "focus" && state.codegraph.focusSubgraph) {
+		view = CG.buildFocusView(state.codegraph.focusSubgraph, { maxNodes: 120 });
+	} else if (state.codegraph.mode === "file") {
+		const clusterId = state.codegraph.clusterId;
+		const filtered = {
+			nodes: (snapshot.nodes || []).filter((n) => !clusterId || n.clusterId === clusterId || (n.path && clusterId && String(n.clusterId) === String(clusterId))),
+			edges: snapshot.edges || []
+		};
+		if (clusterId && !filtered.nodes.length) {
+			const cluster = (snapshot.clusters || []).find((c) => String(c.id) === String(clusterId));
+			const paths = new Set((cluster?.filePaths || []).map((p) => String(p).replace(/\\/g, "/").toLowerCase()));
+			filtered.nodes = (snapshot.nodes || []).filter((n) => paths.has(String(n.path || n.id || "").replace(/\\/g, "/").toLowerCase()));
+		}
+		view = CG.buildFileView(filtered, { maxNodes: 120 });
+	} else {
+		view = CG.buildClusterView(snapshot, { maxNodes: 60 });
+	}
+	state.codegraph.viewTruncated = !!(view.truncated || snapshot.truncated);
+	const layout = layoutMode === "layer"
+		? CG.layoutLayered(view)
+		: layoutMode === "radial"
+			? CG.layoutRadial(view)
+			: CG.layoutClusters(view);
+	state.codegraph.layoutResult = layout;
+	host.innerHTML = CG.buildSvg(layout, { ariaLabel: "Code knowledge graph" });
+	const svg = host.querySelector("svg");
+	if (svg) {
+		const rect = host.getBoundingClientRect();
+		const vp = CG.createViewport({
+			x: 0,
+			y: 0,
+			width: Math.max(rect.width || 800, 400),
+			height: Math.max(rect.height || 520, 320),
+			scale: 1
+		});
+		state.codegraph.viewport = CG.fitToBounds(vp, { width: layout.width, height: layout.height }, 24);
+		svg.setAttribute("viewBox", CG.viewBoxOf(state.codegraph.viewport));
+		svg.setAttribute("width", "100%");
+		svg.setAttribute("height", "100%");
+		svg.querySelectorAll(".cg-node").forEach((node) => {
+			node.classList.toggle("is-selected", node.getAttribute("data-node-id") === state.codegraph.selectedId);
+		});
+	}
+	if (elements.codegraphTruncation) {
+		const reasons = [].concat(snapshot.truncationReasons || snapshot.truncation_reasons || []).filter(Boolean);
+		const show = state.codegraph.viewTruncated || !!snapshot.truncated;
+		elements.codegraphTruncation.hidden = !show;
+		elements.codegraphTruncation.textContent = show
+			? `Graph truncated${reasons.length ? `: ${reasons.join("; ")}` : " — showing a capped subset of nodes/edges."}`
+			: "";
+	}
+	renderCodeGraphBreadcrumb();
+}
+
+function renderCodeGraph(result = {}) {
+	const active = state.workspace === "codegraph" || state.activeRun?.runKind === "codegraph";
+	if (elements.codegraphExplorer) {
+		elements.codegraphExplorer.hidden = !active;
+		elements.codegraphExplorer.dataset.state = active ? "active" : "idle";
+	}
+	if (!active) return;
+	if (result && Object.keys(result).length) state.codegraph.result = result;
+	const snapshot = result?.codegraph || state.codegraph.snapshot;
+	if (snapshot && typeof snapshot === "object") state.codegraph.snapshot = snapshot;
+	const hasSnapshot = !!(state.codegraph.snapshot && (state.codegraph.snapshot.clusters || state.codegraph.snapshot.nodes));
+	const totals = state.codegraph.snapshot?.totals || {};
+	if (totals.nodes != null) state.commandMetrics.findings = totals.nodes;
+	if (totals.clusters != null) {
+		state.commandMetrics.specialistTotal = totals.clusters;
+		state.commandMetrics.specialistCompleted = totals.clusters;
+	}
+	updateCommandMetrics(state.activeRun);
+	if (elements.codegraphStatus) {
+		if (state.codegraph.loading && !hasSnapshot) {
+			elements.codegraphStatus.textContent = "Loading graph";
+			elements.codegraphStatus.dataset.state = "running";
+		} else if (state.codegraph.error && !hasSnapshot) {
+			elements.codegraphStatus.textContent = "Unavailable";
+			elements.codegraphStatus.dataset.state = "failed";
+		} else if (hasSnapshot) {
+			elements.codegraphStatus.textContent = `${totals.nodes || 0} nodes · ${totals.clusters || 0} clusters`;
+			elements.codegraphStatus.dataset.state = "ok";
+		} else {
+			elements.codegraphStatus.textContent = "No snapshot";
+			elements.codegraphStatus.dataset.state = "idle";
+		}
+	}
+	if (elements.codegraphFailed) {
+		const failed = !!(state.codegraph.error && !hasSnapshot);
+		elements.codegraphFailed.hidden = !failed;
+		elements.codegraphFailed.textContent = failed ? state.codegraph.error : "";
+	}
+	if (elements.codegraphEmpty) elements.codegraphEmpty.hidden = hasSnapshot || state.codegraph.loading || !!state.codegraph.error;
+	const showChrome = hasSnapshot;
+	if (elements.codegraphToolbar) elements.codegraphToolbar.hidden = !showChrome;
+	if (elements.codegraphWorkspace) elements.codegraphWorkspace.hidden = !showChrome;
+	if (elements.codegraphIssues) elements.codegraphIssues.hidden = !showChrome;
+	if (!showChrome) {
+		if (elements.codegraphCanvas) elements.codegraphCanvas.innerHTML = "";
+		if (elements.codegraphAiSummaries) {
+			elements.codegraphAiSummaries.hidden = true;
+			elements.codegraphAiSummaries.innerHTML = "";
+		}
+		if (elements.codegraphShowAi) {
+			elements.codegraphShowAi.disabled = true;
+			elements.codegraphShowAi.checked = false;
+		}
+		return;
+	}
+	if (elements.codegraphLayout && elements.codegraphLayout.value !== state.codegraph.layout) {
+		elements.codegraphLayout.value = state.codegraph.layout;
+	}
+	paintCodeGraphCanvas();
+	renderCodeGraphIssues();
+	renderCodeGraphAiSummaries();
+	const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === state.codegraph.selectedId);
+	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
+}
+
+async function codeGraphDrillToFocus(nodeId) {
+	const runId = state.activeRun?.id;
+	if (!runId || !nodeId) return;
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/subgraph?focus=${encodeURIComponent(nodeId)}&depth=2&limit=120`
+		);
+		state.codegraph.mode = "focus";
+		state.codegraph.focusId = nodeId;
+		state.codegraph.focusSubgraph = payload.data;
+		state.codegraph.selectedId = nodeId;
+		paintCodeGraphCanvas();
+		codeGraphCentreOnNode(nodeId);
+		if (elements.codegraphInspector) {
+			const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === nodeId);
+			elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
+		}
+	} catch (error) {
+		if (elements.codegraphFailed) {
+			elements.codegraphFailed.hidden = false;
+			elements.codegraphFailed.textContent = error.message || "Could not load subgraph.";
+		}
+	}
+}
+
+function codeGraphSelectNode(nodeId, { drill = false } = {}) {
+	const layout = state.codegraph.layoutResult;
+	const node = layout?.nodes?.find((n) => n.id === nodeId);
+	if (!node) return;
+	const same = state.codegraph.selectedId === nodeId;
+	state.codegraph.selectedId = nodeId;
+	elements.codegraphCanvas?.querySelectorAll(".cg-node").forEach((el) => {
+		el.classList.toggle("is-selected", el.getAttribute("data-node-id") === nodeId);
+	});
+	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(node);
+	if (!drill && !same) return;
+	if (node.kind === "cluster" || state.codegraph.mode === "cluster") {
+		state.codegraph.mode = "file";
+		state.codegraph.clusterId = nodeId;
+		state.codegraph.focusId = "";
+		state.codegraph.focusSubgraph = null;
+		paintCodeGraphCanvas();
+		return;
+	}
+	codeGraphDrillToFocus(nodeId);
+}
+
 function renderResult(result = {}) {
 	if (state.workspace === "modernize" || state.activeRun?.runKind === "modernize") {
 		renderModernizationResult(result);
+		return;
+	}
+	if (state.workspace === "codegraph" || state.activeRun?.runKind === "codegraph") {
+		renderCodeGraph(result);
 		return;
 	}
 	if (!elements.summary) return;
@@ -4476,11 +4928,18 @@ function renderFixedFindings(result = {}) {
 }
 
 async function loadResult(runId) {
-	const modernize = state.workspace === "modernize" || state.activeRun?.runKind === "modernize";
+	const kind = resolveRunKind(state.activeRun);
+	const modernize = kind === "modernize";
+	const codegraph = kind === "codegraph";
 	if (modernize) {
 		state.modernization.loading = true;
 		state.modernization.error = "";
 		renderModernizationResult({});
+	}
+	if (codegraph) {
+		state.codegraph.loading = true;
+		state.codegraph.error = "";
+		renderCodeGraph({});
 	}
 	try {
 		const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/result`);
@@ -4489,6 +4948,10 @@ async function loadResult(runId) {
 			state.modernization.loading = false;
 			state.modernization.error = "";
 		}
+		if (codegraph) {
+			state.codegraph.loading = false;
+			state.codegraph.error = "";
+		}
 		renderResult(payload.data.result);
 		return payload.data.result;
 	} catch (error) {
@@ -4496,6 +4959,10 @@ async function loadResult(runId) {
 			state.modernization.loading = false;
 			state.modernization.error = error.message || "The saved plan request failed.";
 			renderModernizationResult({});
+		} else if (codegraph && (!state.activeRun?.id || state.activeRun.id === runId)) {
+			state.codegraph.loading = false;
+			state.codegraph.error = error.message || "The saved graph request failed.";
+			renderCodeGraph({});
 		} else if (elements.summary) {
 			elements.summary.textContent = error.message;
 			elements.summary.dataset.tone = "danger";
@@ -4553,6 +5020,10 @@ function finishRun(run) {
 		state.modernization.loading = true;
 		state.modernization.error = "";
 	}
+	if (run.runKind === "codegraph" && !state.codegraph.result) {
+		state.codegraph.loading = true;
+		state.codegraph.error = "";
+	}
 	setRun(run);
 	if (state.eventSource) {
 		state.eventSource.close();
@@ -4577,7 +5048,9 @@ function finishRun(run) {
 			loadResult(run.id).then(() => {
 				const resultTarget = run.runKind === "modernize"
 					? elements.modernizationResults
-					: document.querySelector("#results-panel");
+					: run.runKind === "codegraph"
+						? elements.codegraphExplorer
+						: document.querySelector("#results-panel");
 				resultTarget?.scrollIntoView({
 					behavior: "smooth",
 					block: "start"
@@ -4721,7 +5194,9 @@ function openEventStream(run, afterSequence = 0) {
 		"modernization.inventory", "modernization.signals",
 		"modernization.proposal.progress", "modernization.validation",
 		"modernization.repair", "modernization.roadmap",
-		"modernization.completed"
+		"modernization.completed",
+		"codegraph.index", "codegraph.metrics", "codegraph.clusters",
+		"codegraph.narrative", "codegraph.completed"
 	];
 	eventTypes.forEach((type) => source.addEventListener(type, (event) => {
 		try {
@@ -4805,7 +5280,7 @@ async function loadRuns() {
 				title: hasHistoryFilters() ? "No runs match these filters" : "No runs yet",
 				hint: hasHistoryFilters()
 					? "Clear filters or broaden the date range."
-					: "Start a local Review or Modernize run above — completed runs appear here."
+					: "Start a local Review, Modernize, or CodeGraph run above — completed runs appear here."
 			})}</td></tr>`;
 		renderHistoryTrends(meta.trends || {});
 		renderHistoryPagination(meta);
@@ -4813,7 +5288,9 @@ async function loadRuns() {
 			const run = item.run || {};
 			const metrics = item.metrics || {};
 			const modernization = item.modernization || metrics.modernization || {};
-			const isModernize = String(run.runKind || "review").toLowerCase() === "modernize";
+			const runKind = resolveRunKind(run);
+			const isModernize = runKind === "modernize";
+			const isCodegraph = runKind === "codegraph";
 			const row = document.createElement("tr");
 			row.className = "history-row";
 			if (state.activeRun?.id === run.id) {
@@ -4839,7 +5316,7 @@ async function loadRuns() {
 			`;
 			row.querySelector(".repo").textContent = run.projectPath;
 			row.querySelector(".repo").title = run.projectPath || "";
-			row.querySelector(".mode").textContent = `${isModernize ? "Modernize" : "Review"} · ${scopeLabel(run.mode)}`;
+			row.querySelector(".mode").textContent = `${workspaceDisplayName(runKind)} · ${scopeLabel(run.mode)}`;
 			const badge = row.querySelector(".status-badge");
 			badge.textContent = friendlyStatus(run.status);
 			badge.classList.add(run.status);
@@ -4854,6 +5331,17 @@ async function loadRuns() {
 				specialists.textContent = `Validation · ${validation}`;
 				specialists.title = "Modernize validation summary";
 				row.querySelector(".history-compare").hidden = true;
+			} else if (isCodegraph) {
+				const cg = item.codegraph || metrics.codegraph || {};
+				const severity = row.querySelector(".history-severity");
+				const nodes = cg.nodeCount ?? cg.totals?.nodes ?? "—";
+				const clusters = cg.clusterCount ?? cg.totals?.clusters ?? "—";
+				severity.textContent = `Graph · ${nodes} nodes`;
+				severity.title = "CodeGraph snapshot totals";
+				const specialists = row.querySelector(".history-specialists");
+				specialists.textContent = `Clusters · ${clusters}`;
+				specialists.title = "CodeGraph cluster count";
+				row.querySelector(".history-compare").hidden = true;
 			} else {
 				renderHistorySeverity(row.querySelector(".history-severity"), metrics.findings || {});
 				renderHistorySpecialists(row.querySelector(".history-specialists"), metrics.specialists || {});
@@ -4864,7 +5352,7 @@ async function loadRuns() {
 			// live-run or result panels of its own — navigate to the workspace
 			// page that does, instead of calling watchRun() into thin air.
 			const open = () => {
-				window.location.href = `/${isModernize ? "modernize" : "review"}?run=${encodeURIComponent(run.id)}`;
+				window.location.href = `/${runKind}?run=${encodeURIComponent(run.id)}`;
 			};
 			row.addEventListener("click", open);
 			row.querySelector(".history-open").addEventListener("click", (event) => {
@@ -4895,7 +5383,7 @@ async function loadRuns() {
 			});
 			row.querySelector(".history-trace").addEventListener("click", (event) => {
 				event.stopPropagation();
-				window.location.href = `/${isModernize ? "modernize" : "review"}?run=${encodeURIComponent(run.id)}&focus=trace`;
+				window.location.href = `/${runKind}?run=${encodeURIComponent(run.id)}&focus=trace`;
 			});
 			elements.history.appendChild(row);
 		});
@@ -4910,10 +5398,10 @@ async function loadRuns() {
 	}
 }
 
-// Resumes a specific run when the page is loaded as /review?run=<id> or
-// /modernize?run=<id> (e.g. via the dashboard history table's Open/Trace
-// buttons). Fetches the run directly so it works even on pages that don't
-// render a history table of their own.
+// Resumes a specific run when the page is loaded as /review?run=<id>,
+// /modernize?run=<id>, or /codegraph?run=<id> (e.g. via the dashboard history
+// table's Open/Trace buttons). Fetches the run directly so it works even on
+// pages that don't render a history table of their own.
 async function resumeRunFromQuery() {
 	if (state.activeRun || state.didAutoResume) return;
 	const params = new URLSearchParams(window.location.search);
@@ -5746,7 +6234,11 @@ function setRunSubmitBusy(busy) {
 		spinner.className = "button-spinner";
 		spinner.setAttribute("aria-hidden", "true");
 		const label = document.createElement("span");
-		label.textContent = state.workspace === "modernize" ? "Starting modernization…" : "Starting review…";
+		label.textContent = state.workspace === "modernize"
+			? "Starting modernization…"
+			: state.workspace === "codegraph"
+				? "Starting CodeGraph…"
+				: "Starting review…";
 		button.append(spinner, label);
 	} else {
 		button.disabled = false;
@@ -5761,6 +6253,30 @@ elements.form?.addEventListener("submit", async (event) => {
 	try {
 		if (state.workspace === "modernize") {
 			await submitModernization();
+			return;
+		}
+		if (state.workspace === "codegraph") {
+			if (elements.formMessage) {
+				elements.formMessage.textContent = "";
+				elements.formMessage.dataset.tone = "";
+			}
+			const formData = new FormData(elements.form);
+			const body = {
+				runKind: "codegraph",
+				projectPath: String(formData.get("projectPath") || "").trim(),
+				mode: "full",
+				projectId: formData.get("projectId") || undefined
+			};
+			try {
+				const payload = await request("/api/v1/runs", { method: "POST", body: JSON.stringify(body) });
+				watchRun(payload.data);
+				loadRuns();
+			} catch (error) {
+				if (elements.formMessage) {
+					elements.formMessage.textContent = error.message;
+					elements.formMessage.dataset.tone = "danger";
+				}
+			}
 			return;
 		}
 		elements.formMessage.textContent = "";
@@ -6028,11 +6544,174 @@ elements.jumpTrace?.addEventListener("click", () => {
 elements.jumpFindings?.addEventListener("click", () => {
 	const resultTarget = state.workspace === "modernize"
 		? elements.modernizationResults
-		: document.querySelector("#results-panel");
+		: state.workspace === "codegraph"
+			? elements.codegraphExplorer
+			: document.querySelector("#results-panel");
 	resultTarget?.scrollIntoView({
 		behavior: "smooth",
 		block: "start"
 	});
+});
+
+elements.codegraphLayout?.addEventListener("change", (event) => {
+	state.codegraph.layout = event.target.value || "cluster";
+	paintCodeGraphCanvas();
+});
+
+elements.codegraphShowAi?.addEventListener("change", (event) => {
+	state.codegraph.showAi = !!event.target.checked;
+	renderCodeGraphAiSummaries();
+	const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === state.codegraph.selectedId);
+	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
+});
+
+elements.codegraphAiSummaries?.addEventListener("click", (event) => {
+	const item = event.target.closest("[data-codegraph-ai-target]");
+	if (!item) return;
+	const target = item.dataset.codegraphAiTarget || "";
+	if (!target) return;
+	const match = state.codegraph.layoutResult?.nodes?.find((n) =>
+		n.id === target || n.path === target || n.clusterId === target
+	);
+	if (match) codeGraphSelectNode(match.id);
+});
+
+elements.codegraphIssueTabs?.addEventListener("click", (event) => {
+	const tab = event.target.closest("[data-codegraph-issue]");
+	if (!tab) return;
+	state.codegraph.issueTab = tab.dataset.codegraphIssue || "cycles";
+	renderCodeGraphIssues();
+});
+
+elements.codegraphIssueList?.addEventListener("click", (event) => {
+	const item = event.target.closest("[data-codegraph-focus]");
+	if (!item) return;
+	let paths = [];
+	try { paths = JSON.parse(item.dataset.codegraphPaths || "[]"); } catch (_error) { paths = []; }
+	const focusId = item.dataset.codegraphFocus || paths[0] || "";
+	if (state.codegraph.mode === "cluster") {
+		state.codegraph.mode = "file";
+		state.codegraph.clusterId = "";
+		paintCodeGraphCanvas();
+	}
+	const match = state.codegraph.layoutResult?.nodes?.find((n) =>
+		n.id === focusId || paths.includes(n.id) || paths.includes(n.path)
+	);
+	if (match) {
+		state.codegraph.selectedId = match.id;
+		elements.codegraphCanvas?.querySelectorAll(".cg-node").forEach((el) => {
+			el.classList.toggle("is-selected", el.getAttribute("data-node-id") === match.id);
+		});
+		if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(match);
+		codeGraphCentreOnNode(match.id);
+	}
+});
+
+elements.codegraphBreadcrumb?.addEventListener("click", (event) => {
+	const crumb = event.target.closest("[data-codegraph-crumb]");
+	if (!crumb) return;
+	const target = crumb.dataset.codegraphCrumb;
+	if (target === "root") {
+		state.codegraph.mode = "cluster";
+		state.codegraph.clusterId = "";
+		state.codegraph.focusId = "";
+		state.codegraph.focusSubgraph = null;
+		resetCodeGraphSelection();
+		paintCodeGraphCanvas();
+	} else if (target === "cluster") {
+		state.codegraph.mode = "file";
+		state.codegraph.focusId = "";
+		state.codegraph.focusSubgraph = null;
+		paintCodeGraphCanvas();
+	}
+});
+
+elements.codegraphCanvas?.addEventListener("click", (event) => {
+	const node = event.target.closest("[data-node-id]");
+	if (!node) return;
+	codeGraphSelectNode(node.getAttribute("data-node-id"));
+});
+
+elements.codegraphCanvas?.addEventListener("dblclick", (event) => {
+	const node = event.target.closest("[data-node-id]");
+	if (!node) return;
+	event.preventDefault();
+	codeGraphSelectNode(node.getAttribute("data-node-id"), { drill: true });
+});
+
+elements.codegraphCanvas?.addEventListener("pointerdown", (event) => {
+	if (event.target.closest("[data-node-id]")) return;
+	state.codegraph.panning = true;
+	state.codegraph.panLast = { x: event.clientX, y: event.clientY };
+	elements.codegraphCanvas.setPointerCapture?.(event.pointerId);
+});
+
+elements.codegraphCanvas?.addEventListener("pointermove", (event) => {
+	if (!state.codegraph.panning || !state.codegraph.viewport) return;
+	const CG = codeGraphLayoutApi();
+	if (!CG) return;
+	const dx = event.clientX - state.codegraph.panLast.x;
+	const dy = event.clientY - state.codegraph.panLast.y;
+	state.codegraph.panLast = { x: event.clientX, y: event.clientY };
+	state.codegraph.viewport = CG.panBy(state.codegraph.viewport, dx, dy);
+	codeGraphApplyViewBox();
+});
+
+elements.codegraphCanvas?.addEventListener("pointerup", () => {
+	state.codegraph.panning = false;
+	state.codegraph.panLast = null;
+});
+
+elements.codegraphCanvas?.addEventListener("pointercancel", () => {
+	state.codegraph.panning = false;
+	state.codegraph.panLast = null;
+});
+
+elements.codegraphCanvas?.addEventListener("wheel", (event) => {
+	const CG = codeGraphLayoutApi();
+	if (!CG || !state.codegraph.viewport) return;
+	event.preventDefault();
+	const rect = elements.codegraphCanvas.getBoundingClientRect();
+	const point = {
+		x: event.clientX - rect.left,
+		y: event.clientY - rect.top
+	};
+	const factor = event.deltaY < 0 ? 0.9 : 1.1;
+	state.codegraph.viewport = CG.zoomAt(state.codegraph.viewport, point, factor, { min: 0.2, max: 8 });
+	codeGraphApplyViewBox();
+}, { passive: false });
+
+elements.codegraphCanvas?.addEventListener("keydown", (event) => {
+	const CG = codeGraphLayoutApi();
+	if (!CG || !state.codegraph.viewport) return;
+	if (event.key === "+" || event.key === "=") {
+		event.preventDefault();
+		state.codegraph.viewport = CG.zoomAt(state.codegraph.viewport, { x: state.codegraph.viewport.width / 2, y: state.codegraph.viewport.height / 2 }, 0.9, { min: 0.2, max: 8 });
+		codeGraphApplyViewBox();
+	} else if (event.key === "-" || event.key === "_") {
+		event.preventDefault();
+		state.codegraph.viewport = CG.zoomAt(state.codegraph.viewport, { x: state.codegraph.viewport.width / 2, y: state.codegraph.viewport.height / 2 }, 1.1, { min: 0.2, max: 8 });
+		codeGraphApplyViewBox();
+	} else if (event.key === "0") {
+		event.preventDefault();
+		paintCodeGraphCanvas();
+	} else if (event.key === "Escape") {
+		event.preventDefault();
+		if (state.codegraph.mode === "focus") {
+			state.codegraph.mode = "file";
+			state.codegraph.focusId = "";
+			state.codegraph.focusSubgraph = null;
+			paintCodeGraphCanvas();
+		} else if (state.codegraph.mode === "file") {
+			state.codegraph.mode = "cluster";
+			state.codegraph.clusterId = "";
+			resetCodeGraphSelection();
+			paintCodeGraphCanvas();
+		} else {
+			resetCodeGraphSelection();
+			paintCodeGraphCanvas();
+		}
+	}
 });
 
 elements.commandExport?.addEventListener("click", () => {
@@ -6296,7 +6975,11 @@ elements.settingsPanel?.addEventListener("toggle", () => {
 	}
 });
 renderResult();
-setModernizationWorkspace(state.workspace === "modernize" ? "modernize" : "review");
+if (state.workspace === "codegraph") {
+	updatePipeline(state.activeRun);
+} else {
+	setModernizationWorkspace(state.workspace === "modernize" ? "modernize" : "review");
+}
 selectModernizationPane(state.modernization.activePane);
 updateModernizationProviderDisclosure();
 updateModernizationTargetProfiles();

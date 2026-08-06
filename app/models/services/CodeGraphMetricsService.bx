@@ -1,0 +1,529 @@
+/**
+ * CodeGraph metrics and snapshot assembly. Deterministic, no gateway.
+ *
+ * Owns only what nothing else owns: hotspots, orphans, layer violations,
+ * directory rollup, snapshot assembly + fingerprint. Fan-in/out and cycles are
+ * read from CouplingGraph — this class must never declare `fanIn(` or
+ * `stronglyConnectedComponents`.
+ *
+ * @see ModernizationCouplingGraphService
+ * @see ModernizationDerivedStructureService
+ * @see ArchitectureModelService.classifyFile
+ * @see CodeGraphInventoryAdapter
+ */
+@singleton
+class threadsafe {
+
+	property name="couplingGraphService" inject="ModernizationCouplingGraphService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="architectureModelService" inject="ArchitectureModelService";
+	property name="inventoryAdapter" inject="CodeGraphInventoryAdapter";
+
+	variables.snapshotVersion = "codegraph-snapshot-v1";
+	variables.defaultCaps = {
+		maxClusters         : 60,
+		maxHotspots         : 50,
+		maxOrphans          : 200,
+		maxLayerViolations  : 200,
+		maxNodes            : 1500,
+		maxEdges            : 20000
+	};
+
+	function init() {
+		if ( isNull( variables.couplingGraphService ?: javacast( "null", "" ) ) ) {
+			variables.couplingGraphService = new app.models.services.ModernizationCouplingGraphService();
+		}
+		if ( isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) {
+			variables.derivedStructureService = new app.models.services.ModernizationDerivedStructureService();
+		}
+		if ( isNull( variables.architectureModelService ?: javacast( "null", "" ) ) ) {
+			variables.architectureModelService = new app.models.services.ArchitectureModelService();
+		}
+		if ( isNull( variables.inventoryAdapter ?: javacast( "null", "" ) ) ) {
+			variables.inventoryAdapter = new app.models.services.CodeGraphInventoryAdapter();
+		}
+		return this;
+	}
+
+	string function snapshotVersion() {
+		return variables.snapshotVersion;
+	}
+
+	/**
+	 * Build the CodeGraph snapshot from a review graph struct.
+	 * Caps may be overridden via options; defaults match the plan.
+	 */
+	struct function assemble( required struct reviewGraph, struct options = {} ) {
+		var caps = resolveCaps( arguments.options );
+		var truncation = { truncated: false, reasons: [] };
+
+		var inventory = inventoryAdapter.adapt( arguments.reviewGraph );
+		var graph = couplingGraphService.build( inventory );
+		if ( graph.truncated() ) {
+			markTruncated( truncation, "couplingGraph" );
+			for ( var reason in graph.getTruncationReasons() ) {
+				markTruncated( truncation, reason );
+			}
+		}
+
+		var rawClusters = derivedStructureService.deriveClusters( graph, inventory.units ?: [] );
+		var clusterOf = {};
+		var clusters = presentClusters( rawClusters, graph, caps, truncation, clusterOf );
+
+		var clusterEdges = buildClusterEdges( graph, clusterOf, truncation );
+		var fileStats = indexFileStats( inventory, arguments.reviewGraph );
+		var nodes = buildNodes( graph, inventory, fileStats, clusterOf );
+		var cycles = graph.getMetrics().cycles ?: [];
+
+		var hotspots = selectHotspots( nodes, caps.maxHotspots, truncation );
+		var orphans = selectOrphans( nodes, caps.maxOrphans, truncation );
+		var layerViolations = selectLayerViolations( graph, inventory.canonicalPaths ?: {}, caps.maxLayerViolations, truncation );
+		var directories = directoryRollup( nodes );
+
+		if ( nodes.len() > caps.maxNodes ) {
+			markTruncated( truncation, "maxNodes" );
+			nodes = nodes.slice( 1, caps.maxNodes );
+		}
+		if ( graph.getEdges().len() > caps.maxEdges ) {
+			markTruncated( truncation, "maxEdges" );
+		}
+
+		var totals = {
+			files            : fileStats.fileCount,
+			symbols          : fileStats.symbolCount,
+			dependencies     : isArray( arguments.reviewGraph.dependencies ?: "" ) ? arguments.reviewGraph.dependencies.len() : 0,
+			nodes            : nodes.len(),
+			edges            : graph.getEdges().len(),
+			clusters         : clusters.len(),
+			cycles           : cycles.len(),
+			orphans          : orphans.len(),
+			layerViolations  : layerViolations.len()
+		};
+
+		var fingerprintPayload = {
+			nodes       : nodes,
+			clusters    : clusters,
+			clusterEdges: clusterEdges,
+			cycles      : cycles,
+			totals      : totals
+		};
+		var fingerprint = stableHash( variables.snapshotVersion & "|" & canonicalJson( fingerprintPayload ) );
+
+		return {
+			version            : variables.snapshotVersion,
+			fingerprint        : fingerprint,
+			truncated          : truncation.truncated,
+			truncationReasons  : truncation.reasons,
+			totals             : totals,
+			nodes              : nodes,
+			clusters           : clusters,
+			clusterEdges       : clusterEdges,
+			cycles             : cycles,
+			hotspots           : hotspots,
+			orphans            : orphans,
+			layerViolations    : layerViolations,
+			directories        : directories,
+			canonicalPaths     : inventory.canonicalPaths ?: {}
+		};
+	}
+
+	private struct function resolveCaps( required struct options ) {
+		var caps = duplicate( variables.defaultCaps );
+		for ( var key in caps ) {
+			if ( isNumeric( arguments.options[ key ] ?: "" ) ) {
+				caps[ key ] = max( 1, val( arguments.options[ key ] ) );
+			}
+		}
+		return caps;
+	}
+
+	private array function presentClusters(
+		required array rawClusters,
+		required any graph,
+		required struct caps,
+		required struct truncation,
+		required struct clusterOf
+	) {
+		var ordered = duplicate( arguments.rawClusters );
+		ordered.sort( ( a, b ) => compareNoCase( a.id ?: "", b.id ?: "" ) );
+
+		if ( ordered.len() > arguments.caps.maxClusters ) {
+			markTruncated( arguments.truncation, "maxClusters" );
+			ordered = ordered.slice( 1, arguments.caps.maxClusters );
+		}
+
+		var presented = [];
+		for ( var cluster in ordered ) {
+			var filePaths = isArray( cluster.filePaths ?: "" ) ? duplicate( cluster.filePaths ) : [];
+			filePaths.sort( ( a, b ) => compareNoCase( a, b ) );
+			for ( var path in filePaths ) {
+				arguments.clusterOf[ normalizePath( path ) ] = cluster.id;
+			}
+
+			var cohesion = couplingGraphService.cohesion( arguments.graph, filePaths );
+			var symbolCount = 0;
+			for ( var graphNode in arguments.graph.getNodes() ) {
+				if ( filePaths.contains( graphNode.id ) || filePaths.contains( graphNode.filePath ?: "" ) ) {
+					symbolCount += max( 0, val( graphNode.unitCount ?: 0 ) - 1 );
+				}
+			}
+
+			presented.append( {
+				id            : cluster.id,
+				key           : cluster.domainKey ?: "",
+				label         : cluster.name ?: ( cluster.domainKey ?: cluster.id ),
+				fileCount     : filePaths.len(),
+				symbolCount   : max( 0, symbolCount ),
+				internalEdges : cohesion.internalEdges,
+				crossingEdges : cohesion.crossingEdges,
+				cohesion      : cohesion.cohesion,
+				filePaths     : filePaths
+			} );
+		}
+		return presented;
+	}
+
+	private array function buildClusterEdges( required any graph, required struct clusterOf, required struct truncation ) {
+		var merged = {};
+		for ( var edge in arguments.graph.getEdges() ) {
+			var fromCluster = arguments.clusterOf[ edge.fromFile ] ?: "";
+			var toCluster = arguments.clusterOf[ edge.toFile ] ?: "";
+			if ( !len( fromCluster ) || !len( toCluster ) || fromCluster == toCluster ) continue;
+			var key = fromCluster & "\0" & toCluster;
+			if ( !merged.keyExists( key ) ) {
+				merged[ key ] = {
+					from     : fromCluster,
+					to       : toCluster,
+					weight   : 0,
+					edgeCount: 0
+				};
+			}
+			merged[ key ].edgeCount++;
+			merged[ key ].weight = round4( merged[ key ].weight + val( edge.weight ?: 1 ) );
+		}
+
+		var keys = sortedKeys( merged );
+		var output = [];
+		for ( var key in keys ) output.append( merged[ key ] );
+		output.sort( ( a, b ) => {
+			var byFrom = compareNoCase( a.from, b.from );
+			if ( byFrom != 0 ) return byFrom;
+			return compareNoCase( a.to, b.to );
+		} );
+		return output;
+	}
+
+	private struct function indexFileStats( required struct inventory, required struct reviewGraph ) {
+		var byFile = {};
+		var symbolCount = 0;
+		var fileCount = 0;
+
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			var key = normalizePath( unit.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			if ( !byFile.keyExists( key ) ) {
+				byFile[ key ] = {
+					path         : unit.filePath,
+					symbolCount  : 0,
+					lineCount    : 1,
+					language     : languageFor( unit.filePath )
+				};
+				fileCount++;
+			}
+			var isFileUnit = left( toString( unit.id ?: "" ), 5 ) == "file:";
+			if ( !isFileUnit ) {
+				byFile[ key ].symbolCount++;
+				symbolCount++;
+			}
+			byFile[ key ].lineCount = max( byFile[ key ].lineCount, val( unit.endLine ?: 1 ) );
+		}
+
+		// Prefer explicit file metadata when present.
+		var lists = [];
+		if ( isArray( arguments.reviewGraph.files ?: "" ) ) lists.append( arguments.reviewGraph.files );
+		if ( isArray( arguments.reviewGraph.scannedFiles ?: "" ) ) lists.append( arguments.reviewGraph.scannedFiles );
+		for ( var list in lists ) {
+			for ( var entry in list ) {
+				if ( !isStruct( entry ) ) continue;
+				var path = entry.filePath ?: entry.path ?: "";
+				var key = normalizePath( path );
+				if ( !len( key ) || !byFile.keyExists( key ) ) continue;
+				if ( isNumeric( entry.lineCount ?: "" ) ) byFile[ key ].lineCount = max( byFile[ key ].lineCount, val( entry.lineCount ) );
+				if ( isArray( entry.lines ?: "" ) ) byFile[ key ].lineCount = max( byFile[ key ].lineCount, entry.lines.len() );
+				if ( len( trim( toString( entry.language ?: "" ) ) ) ) byFile[ key ].language = entry.language;
+			}
+		}
+
+		return { byFile: byFile, fileCount: fileCount, symbolCount: symbolCount };
+	}
+
+	private array function buildNodes(
+		required any graph,
+		required struct inventory,
+		required struct fileStats,
+		required struct clusterOf
+	) {
+		var canonical = arguments.inventory.canonicalPaths ?: {};
+		var nodes = [];
+		var graphNodes = arguments.graph.getNodes();
+
+		for ( var graphNode in graphNodes ) {
+			var key = normalizePath( graphNode.id ?: graphNode.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			var path = canonical.keyExists( key ) ? canonical[ key ] : ( graphNode.filePath ?: key );
+			var stats = arguments.fileStats.byFile[ key ] ?: {
+				path       : path,
+				symbolCount: max( 0, val( graphNode.unitCount ?: 0 ) - 1 ),
+				lineCount  : 1,
+				language   : languageFor( path )
+			};
+			var clusterId = arguments.clusterOf[ key ] ?: "";
+			var fanInValue = arguments.graph.fanIn( key );
+			var fanOutValue = arguments.graph.fanOut( key );
+			var inCycle = arguments.graph.cycleMembersFor( key ).len() > 0;
+			var crossing = crossingEdgeCount( arguments.graph, key, arguments.clusterOf );
+			var component = architectureModelService.classifyFile( path );
+			var score = hotspotScore( fanInValue, fanOutValue, stats.symbolCount, stats.lineCount, inCycle, crossing );
+
+			nodes.append( {
+				id           : key,
+				path         : path,
+				dir          : parentDir( path ),
+				component    : component,
+				layer        : component,
+				language     : stats.language,
+				symbolCount  : stats.symbolCount,
+				lineCount    : stats.lineCount,
+				fanIn        : fanInValue,
+				fanOut       : fanOutValue,
+				clusterId    : clusterId,
+				hotspotScore : round4( score ),
+				inCycle      : inCycle
+			} );
+		}
+
+		nodes.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+		return nodes;
+	}
+
+	private numeric function crossingEdgeCount( required any graph, required string fileKey, required struct clusterOf ) {
+		var ownCluster = arguments.clusterOf[ arguments.fileKey ] ?: "";
+		if ( !len( ownCluster ) ) return 0;
+		var count = 0;
+		for ( var edge in arguments.graph.getEdges() ) {
+			var other = "";
+			if ( edge.fromFile == arguments.fileKey ) other = edge.toFile;
+			else if ( edge.toFile == arguments.fileKey ) other = edge.fromFile;
+			else continue;
+			var otherCluster = arguments.clusterOf[ other ] ?: "";
+			if ( len( otherCluster ) && otherCluster != ownCluster ) count++;
+		}
+		return count;
+	}
+
+	private numeric function hotspotScore(
+		required numeric fanIn,
+		required numeric fanOut,
+		required numeric symbolCount,
+		required numeric lineCount,
+		required boolean inCycle,
+		required numeric crossingEdgeCount
+	) {
+		return ( 3 * arguments.fanIn ) +
+			( 2 * arguments.fanOut ) +
+			( 1 * arguments.symbolCount ) +
+			( 0.01 * arguments.lineCount ) +
+			( 5 * ( arguments.inCycle ? 1 : 0 ) ) +
+			( 2 * arguments.crossingEdgeCount );
+	}
+
+	private array function selectHotspots( required array nodes, required numeric limit, required struct truncation ) {
+		var ranked = duplicate( arguments.nodes );
+		ranked.sort( ( a, b ) => {
+			if ( a.hotspotScore != b.hotspotScore ) return a.hotspotScore > b.hotspotScore ? -1 : 1;
+			return compareNoCase( a.path, b.path );
+		} );
+		if ( ranked.len() > arguments.limit ) {
+			markTruncated( arguments.truncation, "maxHotspots" );
+			ranked = ranked.slice( 1, arguments.limit );
+		}
+		return ranked.map( ( node ) => {
+			return {
+				id           : node.id,
+				path         : node.path,
+				hotspotScore : node.hotspotScore,
+				fanIn        : node.fanIn,
+				fanOut       : node.fanOut,
+				symbolCount  : node.symbolCount,
+				lineCount    : node.lineCount,
+				inCycle      : node.inCycle,
+				clusterId    : node.clusterId,
+				component    : node.component,
+				layer        : node.layer
+			};
+		} );
+	}
+
+	private array function selectOrphans( required array nodes, required numeric limit, required struct truncation ) {
+		var orphans = [];
+		for ( var node in arguments.nodes ) {
+			if ( node.fanIn != 0 || node.fanOut != 0 ) continue;
+			if ( node.component == "entry-points" || node.component == "tests" ) continue;
+			orphans.append( {
+				id        : node.id,
+				path      : node.path,
+				component : node.component,
+				layer     : node.layer,
+				clusterId : node.clusterId
+			} );
+		}
+		orphans.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+		if ( orphans.len() > arguments.limit ) {
+			markTruncated( arguments.truncation, "maxOrphans" );
+			orphans = orphans.slice( 1, arguments.limit );
+		}
+		return orphans;
+	}
+
+	private array function selectLayerViolations(
+		required any graph,
+		required struct canonicalPaths,
+		required numeric limit,
+		required struct truncation
+	) {
+		var violations = [];
+		for ( var edge in arguments.graph.getEdges() ) {
+			var fromPath = arguments.canonicalPaths[ edge.fromFile ] ?: edge.fromFile;
+			var toPath = arguments.canonicalPaths[ edge.toFile ] ?: edge.toFile;
+			var fromLayer = architectureModelService.classifyFile( fromPath );
+			var toLayer = architectureModelService.classifyFile( toPath );
+			// models depending on handlers is the violation; reverse is allowed.
+			if ( fromLayer == "application-models" && toLayer == "http-handlers" ) {
+				violations.append( {
+					from      : fromPath,
+					to        : toPath,
+					fromLayer : fromLayer,
+					toLayer   : toLayer,
+					kind      : edge.kind ?: "",
+					weight    : edge.weight ?: 1
+				} );
+			}
+		}
+		violations.sort( ( a, b ) => {
+			var byFrom = compareNoCase( a.from, b.from );
+			if ( byFrom != 0 ) return byFrom;
+			return compareNoCase( a.to, b.to );
+		} );
+		if ( violations.len() > arguments.limit ) {
+			markTruncated( arguments.truncation, "maxLayerViolations" );
+			violations = violations.slice( 1, arguments.limit );
+		}
+		return violations;
+	}
+
+	private array function directoryRollup( required array nodes ) {
+		var dirs = {};
+		for ( var node in arguments.nodes ) {
+			var dir = node.dir ?: "";
+			if ( !len( dir ) ) dir = ".";
+			if ( !dirs.keyExists( dir ) ) {
+				dirs[ dir ] = {
+					path        : dir,
+					fileCount   : 0,
+					symbolCount : 0,
+					fanInSum    : 0,
+					fanOutSum   : 0
+				};
+			}
+			dirs[ dir ].fileCount++;
+			dirs[ dir ].symbolCount += val( node.symbolCount ?: 0 );
+			dirs[ dir ].fanInSum += val( node.fanIn ?: 0 );
+			dirs[ dir ].fanOutSum += val( node.fanOut ?: 0 );
+		}
+		var keys = sortedKeys( dirs );
+		var output = [];
+		for ( var key in keys ) output.append( dirs[ key ] );
+		return output;
+	}
+
+	private string function languageFor( required string filePath ) {
+		var extension = lCase( listLast( arguments.filePath, "." ) );
+		if ( listFindNoCase( "bx,bxm,bxs", extension ) ) return "BoxLang";
+		if ( listFindNoCase( "cfc,cfm,cfml", extension ) ) return "CFML";
+		return "";
+	}
+
+	private string function parentDir( required string filePath ) {
+		var path = replace( arguments.filePath, "\", "/", "all" );
+		var parts = listToArray( path, "/" );
+		if ( parts.len() <= 1 ) return "";
+		arrayDeleteAt( parts, parts.len() );
+		return arrayToList( parts, "/" );
+	}
+
+	private void function markTruncated( required struct truncation, required string reason ) {
+		arguments.truncation.truncated = true;
+		if ( !arguments.truncation.reasons.contains( arguments.reason ) ) {
+			arguments.truncation.reasons.append( arguments.reason );
+		}
+	}
+
+	private array function sortedKeys( required struct source ) {
+		var keys = structKeyArray( arguments.source );
+		arraySort( keys, "textnocase" );
+		return keys;
+	}
+
+	private string function normalizePath( required any path ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return lCase( value );
+	}
+
+	private numeric function round4( required numeric value ) {
+		return round( arguments.value * 10000 ) / 10000;
+	}
+
+	/**
+	 * Sorted-key JSON so fingerprints stay stable under key-order shuffle.
+	 * Same SHA-256 discipline as ModernizationCouplingGraphService.stableHash.
+	 */
+	private string function canonicalJson( required any value ) {
+		if ( isNull( arguments.value ) ) return "null";
+		if ( isStruct( arguments.value ) ) {
+			var keys = sortedKeys( arguments.value );
+			var parts = [];
+			for ( var key in keys ) {
+				parts.append( '"' & escapeJson( key ) & '":' & canonicalJson( arguments.value[ key ] ) );
+			}
+			return "{" & arrayToList( parts, "," ) & "}";
+		}
+		if ( isArray( arguments.value ) ) {
+			var items = [];
+			for ( var entry in arguments.value ) {
+				items.append( canonicalJson( entry ) );
+			}
+			return "[" & arrayToList( items, "," ) & "]";
+		}
+		if ( isBoolean( arguments.value ) && !isNumeric( arguments.value ) ) {
+			return arguments.value ? "true" : "false";
+		}
+		if ( isNumeric( arguments.value ) ) {
+			return toString( arguments.value );
+		}
+		return '"' & escapeJson( toString( arguments.value ) ) & '"';
+	}
+
+	private string function escapeJson( required string value ) {
+		var out = replace( arguments.value, "\", "\\", "all" );
+		out = replace( out, '"', '\"', "all" );
+		out = replace( out, char( 10 ), "\n", "all" );
+		out = replace( out, char( 13 ), "\r", "all" );
+		out = replace( out, char( 9 ), "\t", "all" );
+		return out;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

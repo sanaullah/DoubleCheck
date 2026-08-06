@@ -1,0 +1,153 @@
+/**
+ * SQLite persistence for CodeGraph snapshots and reusable narrative cache rows.
+ */
+
+@singleton
+class threadsafe {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	void function save(
+		required string runId,
+		required struct snapshot,
+		string projectPath           = "",
+		string repositoryRevision    = "",
+		string narrativeCacheKey     = "",
+		struct narrative             = {}
+	) {
+		var truncated = arguments.snapshot.truncated ?: false;
+		queryExecute(
+			"
+				INSERT INTO codegraph_snapshots (
+					run_id, snapshot_version, project_path, repository_revision,
+					fingerprint, node_count, edge_count, cluster_count, cycle_count,
+					truncated, truncation_reasons_json, snapshot_json,
+					narrative_cache_key, narrative_json, created_at
+				) VALUES (
+					:runId, :snapshotVersion, :projectPath, :repositoryRevision,
+					:fingerprint, :nodeCount, :edgeCount, :clusterCount, :cycleCount,
+					:truncated, :truncationReasonsJson, :snapshotJson,
+					:narrativeCacheKey, :narrativeJson, :createdAt
+				)
+				ON CONFLICT ( run_id ) DO UPDATE SET
+					snapshot_version = excluded.snapshot_version,
+					project_path = excluded.project_path,
+					repository_revision = excluded.repository_revision,
+					fingerprint = excluded.fingerprint,
+					node_count = excluded.node_count,
+					edge_count = excluded.edge_count,
+					cluster_count = excluded.cluster_count,
+					cycle_count = excluded.cycle_count,
+					truncated = excluded.truncated,
+					truncation_reasons_json = excluded.truncation_reasons_json,
+					snapshot_json = excluded.snapshot_json,
+					narrative_cache_key = excluded.narrative_cache_key,
+					narrative_json = excluded.narrative_json,
+					created_at = excluded.created_at
+			",
+			{
+				runId                 : arguments.runId,
+				snapshotVersion       : arguments.snapshot.version ?: "codegraph-snapshot-v1",
+				projectPath           : arguments.projectPath,
+				repositoryRevision    : arguments.repositoryRevision,
+				fingerprint           : arguments.snapshot.fingerprint ?: "",
+				nodeCount             : val( arguments.snapshot.totals.nodes ?: 0 ),
+				edgeCount             : val( arguments.snapshot.totals.edges ?: 0 ),
+				clusterCount          : val( arguments.snapshot.totals.clusters ?: 0 ),
+				cycleCount            : val( arguments.snapshot.totals.cycles ?: 0 ),
+				truncated             : truncated ? 1 : 0,
+				truncationReasonsJson : jsonSerialize( arguments.snapshot.truncationReasons ?: [] ),
+				snapshotJson          : jsonSerialize( arguments.snapshot ),
+				narrativeCacheKey     : arguments.narrativeCacheKey,
+				narrativeJson         : jsonSerialize( arguments.narrative.count() ? arguments.narrative : { used: false } ),
+				createdAt             : timestamp()
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	any function get( required string runId ) {
+		var record = queryExecute(
+			"
+				SELECT snapshot_json, narrative_json, narrative_cache_key,
+					truncated, truncation_reasons_json, fingerprint,
+					snapshot_version, project_path, repository_revision
+				FROM codegraph_snapshots
+				WHERE run_id = :runId
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		if ( !record.recordCount ) {
+			return javacast( "null", "" );
+		}
+		var snapshot = jsonDeserialize( record.snapshot_json[ 1 ] );
+		if ( !isStruct( snapshot ) ) {
+			snapshot = {};
+		}
+		var narrative = jsonDeserialize( record.narrative_json[ 1 ] ?: "{}" );
+		if ( !isStruct( narrative ) ) {
+			narrative = { used: false };
+		}
+		return {
+			version            : record.snapshot_version[ 1 ] ?: ( snapshot.version ?: "codegraph-snapshot-v1" ),
+			fingerprint        : record.fingerprint[ 1 ] ?: ( snapshot.fingerprint ?: "" ),
+			projectPath        : record.project_path[ 1 ] ?: "",
+			repositoryRevision : record.repository_revision[ 1 ] ?: "",
+			truncated          : ( record.truncated[ 1 ] ?: 0 ) == 1 || ( snapshot.truncated ?: false ),
+			truncationReasons  : jsonDeserialize( record.truncation_reasons_json[ 1 ] ?: "[]" ),
+			narrativeCacheKey  : record.narrative_cache_key[ 1 ] ?: "",
+			snapshot           : snapshot,
+			narrative          : narrative
+		};
+	}
+
+	/**
+	 * Reuse a prior narrative blob when project path, revision, and cache key match.
+	 * Modelled on ArchitectureRepository.findBaseline — returns null when nothing reusable.
+	 */
+	any function findReusableNarrative(
+		required string projectPath,
+		required string repositoryRevision,
+		required string narrativeCacheKey
+	) {
+		if (
+			!len( trim( arguments.projectPath ) ) ||
+			!len( trim( arguments.repositoryRevision ) ) ||
+			!len( trim( arguments.narrativeCacheKey ) )
+		) {
+			return javacast( "null", "" );
+		}
+		var record = queryExecute(
+			"
+				SELECT narrative_json
+				FROM codegraph_snapshots
+				WHERE project_path = :projectPath
+					AND repository_revision = :repositoryRevision
+					AND narrative_cache_key = :narrativeCacheKey
+					AND narrative_json IS NOT NULL
+					AND narrative_json <> ''
+					AND narrative_json <> '{}'
+				ORDER BY created_at DESC
+				LIMIT 1
+			",
+			{
+				projectPath        : arguments.projectPath,
+				repositoryRevision : arguments.repositoryRevision,
+				narrativeCacheKey  : arguments.narrativeCacheKey
+			},
+			{ datasource: datasource }
+		);
+		if ( !record.recordCount ) {
+			return javacast( "null", "" );
+		}
+		var narrative = jsonDeserialize( record.narrative_json[ 1 ] );
+		if ( !isStruct( narrative ) || !( narrative.used ?: false ) ) {
+			return javacast( "null", "" );
+		}
+		return narrative;
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

@@ -1,0 +1,281 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraphRunService", () => {
+
+			it( "emits the phase/progress/event sequence and succeeds with clusters when narrative is disabled", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				var indexed = { called: false, files: [] };
+				var saved = { called: false, narrative: {} };
+				var transitions = [];
+				var events = [];
+
+				service.architectureIndexService = {
+					index: ( runId, files ) => {
+						indexed.called = true;
+						indexed.files = files;
+						return { filesAnalyzed: files.len() };
+					}
+				};
+				service.graphRepository = {
+					getGraph: ( runId, resultLimit ) => {
+						return {
+							symbols: [
+								{ id: "s1", filePath: "app/models/Order.cfc", kind: "function", name: "save", line: 10 }
+							],
+							dependencies: [
+								{
+									id: "d1",
+									sourceFile: "app/handlers/Orders.bx",
+									kind: "injects",
+									target: "Order",
+									targetFile: "app/models/Order.cfc",
+									line: 3
+								}
+							],
+							summary: { symbolCount: 1, dependencyCount: 1 }
+						};
+					}
+				};
+				service.metricsService = new app.models.services.CodeGraphMetricsService();
+				service.codeGraphRepository = {
+					save: ( runId, snapshot, projectPath, repositoryRevision, narrativeCacheKey, narrative ) => {
+						saved.called = true;
+						saved.snapshot = snapshot;
+						saved.narrative = narrative;
+					}
+				};
+				service.eventService = {
+					publish: ( runId, eventType, payload ) => {
+						events.append( { type: eventType, progress: payload.progress ?: 0, phase: payload.phase ?: "" } );
+					}
+				};
+				service.narrativeService = {
+					isEnabled: () => false,
+					cacheKey: ( snapshot, projectPath ) => "unused",
+					narrate: ( snapshot ) => { return { used: false }; }
+				};
+				service.codegraphMaxEdges = 20000;
+				service.codegraphMaxNodes = 1500;
+				service.codegraphMaxClusters = 60;
+				service.codegraphMaxHotspots = 50;
+				service.codegraphMaxOrphans = 200;
+				service.codegraphMaxLayerViolations = 200;
+
+				var run = new tests.resources.ScriptedModernizationRun(
+					"run-cg-1",
+					"codegraph",
+					getTempDirectory(),
+					{ version: "codegraph-input-v1" },
+					{ fingerprint: "fp-1", providerEnabled: false, runKind: "codegraph" },
+					{}
+				);
+				var scan = {
+					files: [
+						{ filePath: "app/models/Order.cfc", language: "CFML" },
+						{ filePath: "app/handlers/Orders.bx", language: "BoxLang" }
+					],
+					repositoryRevision: "rev-1"
+				};
+				var result = service.execute(
+					run,
+					scan,
+					{
+						runId: "run-cg-1",
+						runKind: "codegraph",
+						transition: ( progress, phase, message ) => {
+							transitions.append( { progress: progress, phase: phase, message: message } );
+						},
+						checkCancellation: () => false,
+						renewLease: () => true
+					}
+				);
+
+				expect( result.status ).toBe( "succeeded" );
+				expect( indexed.called ).toBeTrue();
+				expect( saved.called ).toBeTrue();
+				expect( saved.narrative.used ?: true ).toBeFalse();
+				expect( result.narrative.used ?: true ).toBeFalse();
+				expect( isArray( result.snapshot.clusters ?: "" ) ).toBeTrue();
+				expect( result.snapshot.clusters.len() ).toBeGTE( 1 );
+
+				var phases = transitions.map( ( item ) => item.phase );
+				expect( phases ).toBe( [
+					"codegraph-index",
+					"codegraph-metrics",
+					"codegraph-clusters",
+					"codegraph-narrative",
+					"codegraph-persist"
+				] );
+				expect( transitions[ 1 ].progress ).toBe( 20 );
+				expect( transitions[ 2 ].progress ).toBe( 40 );
+				expect( transitions[ 3 ].progress ).toBe( 60 );
+				expect( transitions[ 4 ].progress ).toBe( 75 );
+				expect( transitions[ 5 ].progress ).toBe( 90 );
+
+				var eventTypes = events.map( ( item ) => item.type );
+				expect( eventTypes ).toBe( [
+					"codegraph.index",
+					"codegraph.metrics",
+					"codegraph.clusters",
+					"codegraph.narrative"
+				] );
+			} );
+
+			it( "cancels between stages before indexing when checkCancellation is true", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				var indexed = { called: false };
+				service.architectureIndexService = {
+					index: ( runId, files ) => {
+						indexed.called = true;
+						return {};
+					}
+				};
+				service.codeGraphRepository = { save: () => {} };
+				service.eventService = { publish: () => {} };
+				service.narrativeService = {
+					isEnabled: () => false,
+					cacheKey: ( snapshot, projectPath ) => "",
+					narrate: ( snapshot ) => { return { used: false }; }
+				};
+				var run = new tests.resources.ScriptedModernizationRun( "run-cg-cancel", "codegraph", getTempDirectory() );
+				var result = service.execute(
+					run,
+					{ files: [], repositoryRevision: "" },
+					{ checkCancellation: () => true }
+				);
+				expect( result.status ).toBe( "cancelled" );
+				expect( indexed.called ).toBeFalse();
+			} );
+
+			it( "cancels after index when cancellation arrives before metrics", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				var control = { cancelAfterIndex: false };
+				var indexed = { called: false };
+				var assembled = { called: false };
+				service.architectureIndexService = {
+					index: ( runId, files ) => {
+						indexed.called = true;
+						control.cancelAfterIndex = true;
+						return {};
+					}
+				};
+				service.graphRepository = {
+					getGraph: ( runId, resultLimit ) => {
+						assembled.called = true;
+						return { symbols: [], dependencies: [] };
+					}
+				};
+				service.metricsService = {
+					assemble: ( reviewGraph, options ) => {
+						assembled.called = true;
+						return { version: "codegraph-snapshot-v1", clusters: [], totals: {} };
+					}
+				};
+				service.codeGraphRepository = { save: () => {} };
+				service.eventService = { publish: () => {} };
+				service.narrativeService = {
+					isEnabled: () => false,
+					cacheKey: ( snapshot, projectPath ) => "",
+					narrate: ( snapshot ) => { return { used: false }; }
+				};
+				service.codegraphMaxEdges = 100;
+
+				var run = new tests.resources.ScriptedModernizationRun( "run-cg-mid", "codegraph", getTempDirectory() );
+				var result = service.execute(
+					run,
+					{ files: [ { filePath: "app/models/A.cfc" } ], repositoryRevision: "r1" },
+					{
+						runId: "run-cg-mid",
+						runKind: "codegraph",
+						transition: ( progress, phase, message ) => {},
+						checkCancellation: () => control.cancelAfterIndex,
+						renewLease: () => true
+					}
+				);
+				expect( result.status ).toBe( "cancelled" );
+				expect( indexed.called ).toBeTrue();
+				expect( assembled.called ).toBeFalse();
+			} );
+
+			it( "getResult returns codegraph payload without raw edges and empty shell when missing", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				service.codeGraphRepository = {
+					get: ( id ) => javacast( "null", "" )
+				};
+				var empty = service.getResult( "missing" );
+				expect( empty ).toHaveKey( "codegraph" );
+				expect( empty.codegraph.narrative.used ).toBeFalse();
+				expect( empty.codegraph.nodes ).toBe( [] );
+				expect( empty.codegraph ).notToHaveKey( "edges" );
+				expect( empty.codegraph ).notToHaveKey( "dependencies" );
+
+				service.codeGraphRepository = {
+					get: ( id ) => {
+						return {
+							version: "codegraph-snapshot-v1",
+							fingerprint: "abc",
+							truncated: false,
+							truncationReasons: [],
+							narrative: { used: false },
+							snapshot: {
+								version: "codegraph-snapshot-v1",
+								fingerprint: "abc",
+								totals: { nodes: 1, clusters: 1, edges: 2 },
+								nodes: [ { id: "n1", path: "app/models/A.cfc" } ],
+								clusters: [ { id: "c1", label: "models" } ],
+								clusterEdges: [],
+								cycles: [],
+								hotspots: [],
+								orphans: [],
+								layerViolations: []
+							}
+						};
+					}
+				};
+				var loaded = service.getResult( "run-1" );
+				expect( loaded.codegraph.fingerprint ).toBe( "abc" );
+				expect( loaded.codegraph.nodes ).toHaveLength( 1 );
+				expect( loaded.codegraph.clusters ).toHaveLength( 1 );
+				expect( loaded.codegraph ).notToHaveKey( "edges" );
+			} );
+
+			it( "subgraph BFS from focus is capped by limit and requires focus", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				service.codegraphMaxEdges = 20000;
+				service.codegraphSubgraphMaxNodes = 300;
+				service.codegraphSubgraphMaxDepth = 3;
+				service.graphRepository = {
+					getGraph: ( runId, resultLimit ) => {
+						return {
+							dependencies: [
+								{ id: "d1", sourceFile: "app/A.cfc", kind: "constructs", target: "B", targetFile: "app/B.cfc", line: 1 },
+								{ id: "d2", sourceFile: "app/B.cfc", kind: "constructs", target: "C", targetFile: "app/C.cfc", line: 1 },
+								{ id: "d3", sourceFile: "app/C.cfc", kind: "constructs", target: "D", targetFile: "app/D.cfc", line: 1 }
+							]
+						};
+					}
+				};
+
+				expect( () => service.subgraph( "run-1", {} ) ).toThrow( type = "ValidationException" );
+
+				var limited = service.subgraph( "run-1", { focus: "app/A.cfc", depth: 3, limit: 2 } );
+				expect( limited.focus ).toBe( "app/A.cfc" );
+				expect( limited.nodes ).toHaveLength( 2 );
+				expect( limited.truncated ).toBeTrue();
+				expect( limited.edges.len() ).toBeGTE( 1 );
+
+				expect( () => service.subgraph( "run-1", { focus: "app/A.cfc", limit: 9999 } ) )
+					.toThrow( type = "ValidationException" );
+			} );
+
+			it( "cancelRun is a no-op", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				service.cancelRun( "any-id" );
+				expect( true ).toBeTrue();
+			} );
+
+		} );
+	}
+
+}

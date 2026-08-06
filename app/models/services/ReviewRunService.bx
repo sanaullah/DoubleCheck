@@ -64,6 +64,16 @@ class threadsafe {
 
 	property name="modernizationRepository" inject="ModernizationRepository";
 
+	property name="codeGraphRunService" inject="CodeGraphRunService";
+
+	property name="reviewRunKinds" inject="ReviewRunKinds";
+
+	property name="codegraphScanMaxFiles" inject="coldbox:setting:codegraphScanMaxFiles";
+
+	property name="codegraphScanMaxBytes" inject="coldbox:setting:codegraphScanMaxBytes";
+
+	property name="codegraphScanMaxEntries" inject="coldbox:setting:codegraphScanMaxEntries";
+
 	property name="crewPlannerService" inject="CrewPlannerService";
 
 	property name="runExecutor" inject="coldbox:setting:runExecutor";
@@ -100,6 +110,15 @@ class threadsafe {
 				project.id,
 				input.projectPath ?: ""
 			);
+		// Resolve runKind before mode validation so CodeGraph can force full mode
+		// (a graph of a working-tree/revision diff is meaningless).
+		var runKind = lCase( trim( input.runKind ?: input.workspace ?: "review" ) );
+		if ( !reviewRunKinds.isValid( runKind ) ) {
+			throw( type = "ValidationException", message = reviewRunKinds.invalidMessage() );
+		}
+		if ( runKind == "codegraph" ) {
+			input.mode = "full";
+		}
 		var mode = lCase( trim( input.mode ?: "full" ) );
 		if ( ![ "working-tree", "revision-diff", "full"].contains( mode ) ) {
 			throw(
@@ -114,10 +133,6 @@ class threadsafe {
 				type    = "ValidationException",
 				message = "baseRevision is required for revision-diff mode"
 			);
-		}
-		var runKind = lCase( trim( input.runKind ?: input.workspace ?: "review" ) );
-		if ( ![ "review", "modernize" ].contains( runKind ) ) {
-			throw( type = "ValidationException", message = "runKind must be review or modernize" );
 		}
 		var runContract = {};
 		var runInput = {};
@@ -174,6 +189,20 @@ class threadsafe {
 					: ( structKeyExists( modernizationInput, "selectedFiles" ) ? modernizationInput.selectedFiles : [] )
 			);
 			if ( selectedForModernize.count() ) structAppend( runInput, selectedForModernize, true );
+		} else if ( runKind == "codegraph" ) {
+			runInput = { version: "codegraph-input-v1" };
+			var selectedForCodegraph = normalizeSelectedFiles( arguments.input.selectedFiles ?: [] );
+			if ( selectedForCodegraph.count() ) structAppend( runInput, selectedForCodegraph, true );
+			var codegraphFingerprint = lCase( hash( jsonSerialize( runInput ), "SHA-256" ) );
+			runContract = {
+				policy : {
+					version         : "codegraph-input-v1",
+					fingerprint     : codegraphFingerprint,
+					providerEnabled : false,
+					runKind         : "codegraph"
+				},
+				budgets: {}
+			};
 		} else {
 			runContract = reviewPolicyService.normalize( arguments.input );
 			runInput = normalizeSelectedFiles( arguments.input.selectedFiles ?: [] );
@@ -301,8 +330,11 @@ class threadsafe {
 				{ run: updated.getMemento() }
 			);
 		if ( variables.activeFutures.containsKey( arguments.id ) ) {
-			if ( lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+			var cancelKind = lCase( run.getRunKind() ?: "review" );
+			if ( cancelKind == "modernize" ) {
 				modernizationRunService.cancelRun( arguments.id );
+			} else if ( cancelKind == "codegraph" ) {
+				codeGraphRunService.cancelRun( arguments.id );
 			} else {
 				specialistReviewService.cancelRun( arguments.id );
 			}
@@ -355,13 +387,25 @@ class threadsafe {
 			);
 			var runInputForScan = run.getInput() ?: {};
 			var scanRunId = arguments.runId;
-			var scanOptions = ( lCase( run.getRunKind() ?: "review" ) == "modernize" )
-				? {
+			var scanKind = lCase( run.getRunKind() ?: "review" );
+			var scanOptions = {};
+			if ( scanKind == "modernize" ) {
+				scanOptions = {
 					modernize: true,
 					priorityExtensions: [ "cfm", "cfc", "bx", "bxm", "bxs" ],
 					checkCancellation: () => checkCancellation( scanRunId )
-				}
-				: {};
+				};
+			} else if ( scanKind == "codegraph" ) {
+				// Never set modernize:true — that drops file.lines required by parsers.
+				scanOptions = {
+					codegraph: true,
+					allowedExtensions: [ "cfc", "cfm", "bx", "bxm", "bxs" ],
+					maxFiles: val( variables.codegraphScanMaxFiles ?: 2500 ),
+					maxBytes: val( variables.codegraphScanMaxBytes ?: 33554432 ),
+					maxEntries: val( variables.codegraphScanMaxEntries ?: 30000 ),
+					checkCancellation: () => checkCancellation( scanRunId )
+				};
+			}
 			if ( isArray( runInputForScan.selectedFiles ?: "" ) && runInputForScan.selectedFiles.len() ) {
 				scanOptions.selectedFiles = runInputForScan.selectedFiles;
 			}
@@ -465,6 +509,46 @@ class threadsafe {
 				eventService.publish(
 					arguments.runId, "modernization.completed",
 					{ run: modernCompleted.getMemento(), result: modernizationRunService.getResult( arguments.runId ) }
+				);
+				return;
+			}
+			if ( lCase( run.getRunKind() ?: "review" ) == "codegraph" ) {
+				var codegraphRunId = arguments.runId;
+				var codegraphLeaseToken = arguments.leaseToken;
+				var codegraph = codeGraphRunService.execute(
+					run,
+					scan,
+					{
+						runId: codegraphRunId,
+						runKind: run.getRunKind() ?: "codegraph",
+						transition: ( progress, phase, message ) => transition(
+							runId = codegraphRunId, status = "running", progress = progress,
+							phase = phase, message = message, eventType = "task.progress"
+						),
+						checkCancellation: () => checkCancellation( codegraphRunId ),
+						renewLease: () => renewOwnedLease( codegraphRunId, codegraphLeaseToken )
+					}
+				);
+				resultRepository.saveSummary(
+					runId = arguments.runId,
+					summary = codegraph.message ?: "CodeGraph snapshot generated",
+					languages = scan.languages, filesScanned = scan.files.len(), bytesScanned = scan.totalBytes,
+					findingsCount = 0, aiEnabled = false,
+					reviewScope = scan.scope, repositoryRevision = scan.repositoryRevision,
+					baseRevision = scan.baseRevision, headRevision = scan.headRevision,
+					discoveryTruncated = scan.discoveryTruncated, skipped = scan.skipped
+				);
+				var codegraphStatus = codegraph.status ?: "failed";
+				var codegraphMessage = codegraph.message ?: "CodeGraph run finished";
+				var codegraphCompleted = transition(
+					runId = arguments.runId, status = codegraphStatus, progress = 100,
+					phase = codegraphStatus == "cancelled" ? "cancelled" : "completed",
+					message = codegraphMessage,
+					completedAt = timestamp(), eventType = codegraphStatus == "failed" ? "run.error" : "run.completed"
+				);
+				eventService.publish(
+					arguments.runId, "codegraph.completed",
+					{ run: codegraphCompleted.getMemento(), result: codeGraphRunService.getResult( arguments.runId ) }
 				);
 				return;
 			}

@@ -1,0 +1,375 @@
+/**
+ * Optional LLM narrative for deterministic CodeGraph snapshots.
+ * Never mutates the snapshot; failures return { used:false, error:... }.
+ *
+ * @see ArchitectureEnrichmentService
+ * @see CodeGraphRunService
+ * @see AIChatGateway
+ */
+
+@singleton
+class threadsafe {
+	property name="chatGateway" inject="AIChatGateway";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+	property name="maxClusters" inject="coldbox:setting:codegraphNarrativeMaxClusters";
+	property name="maxHotspots" inject="coldbox:setting:codegraphNarrativeMaxHotspots";
+	property name="maxPromptCharacters" inject="coldbox:setting:codegraphNarrativeMaxCharacters";
+	property name="log" inject="logbox:logger:{this}";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="promptCompiler" inject="PromptCompiler";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+
+	variables.narrativeVersion = "codegraph-narrative-v1";
+	variables.maxClusters = 24;
+	variables.maxHotspots = 20;
+	variables.maxPromptCharacters = 30000;
+
+	boolean function isEnabled() {
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	string function cacheKey( required struct snapshot, string projectPath = "" ) {
+		return stableHash(
+			lCase( trim( arguments.projectPath ) ) & "|" &
+			trim( toString( arguments.snapshot.fingerprint ?: "" ) ) & "|" &
+			signature()
+		);
+	}
+
+	/**
+	 * Produce an optional narrative blob for a deterministic snapshot.
+	 * Does not mutate arguments.snapshot.
+	 */
+	struct function narrate( required struct snapshot ) {
+		return enrich( arguments.snapshot );
+	}
+
+	/**
+	 * ArchitectureEnrichmentService-shaped entry point.
+	 */
+	struct function enrich( required struct snapshot ) {
+		var resolved = aiProviderResolver.resolve();
+		var empty = disabledResult( resolved, "" );
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ) {
+			return empty;
+		}
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
+		if ( !clusters.len() && !hotspots.len() ) {
+			return disabledResult( resolved, "" );
+		}
+
+		var allowedClusterIds = [];
+		var allowedNodeIds = [];
+		for ( var cluster in clusters ) {
+			if ( isStruct( cluster ) && len( trim( cluster.id ?: "" ) ) ) allowedClusterIds.append( cluster.id );
+		}
+		for ( var hotspot in hotspots ) {
+			if ( !isStruct( hotspot ) ) continue;
+			var nodeId = trim( toString( hotspot.id ?: hotspot.path ?: "" ) );
+			if ( len( nodeId ) ) allowedNodeIds.append( nodeId );
+		}
+		for ( var node in ( isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [] ) ) {
+			if ( !isStruct( node ) ) continue;
+			var pathId = trim( toString( node.id ?: node.path ?: "" ) );
+			if ( len( pathId ) && !allowedNodeIds.contains( pathId ) ) allowedNodeIds.append( pathId );
+		}
+
+		var payload = buildPayload( resolved, arguments.snapshot );
+		assertDistinctSystem( resolved.provider ?: "" );
+		var activePackage = payload.promptPackage;
+		var response = "";
+		var attempts = 0;
+		try {
+			while ( attempts < 2 ) {
+				attempts++;
+				try {
+					response = chatGateway.chat(
+						activePackage.messages,
+						buildParams( resolved ),
+						buildOptions( resolved )
+					);
+					var acceptedResponse = getValidator().sanitizeValid(
+						response,
+						"codegraph-narrative-v1",
+						{
+							allowedClusterIds : allowedClusterIds,
+							allowedNodeIds    : allowedNodeIds
+						}
+					);
+					response = acceptedResponse.value;
+					if ( acceptedResponse.rejectedItems.len() ) {
+						activePackage.provenance.rejectedItems = duplicate( acceptedResponse.rejectedItems );
+					}
+					break;
+				} catch ( any attemptError ) {
+					if ( attempts >= 2 || !isRepairablePromptError( attemptError ) ) rethrow;
+					if ( isStruct( attemptError.data ?: "" ) && isArray( attemptError.data.reasonCodes ?: "" ) ) {
+						activePackage.provenance.validationReasonCodes = duplicate( attemptError.data.reasonCodes );
+					}
+					activePackage = getCompiler().compileRepair(
+						activePackage,
+						attemptError.message ?: "output validation failure"
+					);
+				}
+			}
+			var summaries = normalize( response, arguments.snapshot );
+			return {
+				used             : true,
+				enabled          : true,
+				version          : variables.narrativeVersion,
+				provider         : resolved.provider,
+				model            : resolved.model,
+				error            : "",
+				summaries        : summaries,
+				promptProvenance : activePackage.provenance,
+				attempts         : attempts
+			};
+		} catch ( any error ) {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				log.error(
+					"AI CodeGraph narrative failed",
+					{
+						type      : error.type ?: "",
+						message   : secretRedactionService.redactText( error.message ?: "" ),
+						provider  : resolved.provider,
+						model     : resolved.model,
+						stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+					}
+				);
+			}
+			return {
+				used             : false,
+				enabled          : true,
+				version          : variables.narrativeVersion,
+				provider         : resolved.provider,
+				model            : resolved.model,
+				error            : "CodeGraph narrative unavailable",
+				summaries        : [],
+				promptProvenance : activePackage.provenance ?: {},
+				attempts         : attempts
+			};
+		}
+	}
+
+	private struct function disabledResult( required struct resolved, required string error ) {
+		return {
+			used      : false,
+			enabled   : false,
+			version   : variables.narrativeVersion,
+			provider  : arguments.resolved.provider ?: "",
+			model     : arguments.resolved.model ?: "",
+			error     : arguments.error,
+			summaries : []
+		};
+	}
+
+	/**
+	 * Keep only summaries that cite cluster/node ids present in the snapshot.
+	 */
+	private array function normalize( required any response, required struct snapshot ) {
+		if ( isSimpleValue( arguments.response ) ) {
+			try {
+				arguments.response = jsonDeserialize( arguments.response );
+			} catch ( any ignored ) {
+				return [];
+			}
+		}
+		if ( !isStruct( arguments.response ) || !isArray( arguments.response.summaries ?: "" ) ) {
+			return [];
+		}
+
+		var clusterIds = {};
+		for ( var cluster in ( isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [] ) ) {
+			if ( isStruct( cluster ) && len( trim( cluster.id ?: "" ) ) ) clusterIds[ cluster.id ] = true;
+		}
+		var nodeIds = {};
+		for ( var node in ( isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [] ) ) {
+			if ( !isStruct( node ) ) continue;
+			var nid = trim( toString( node.id ?: node.path ?: "" ) );
+			if ( len( nid ) ) nodeIds[ nid ] = true;
+		}
+		for ( var hotspot in ( isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [] ) ) {
+			if ( !isStruct( hotspot ) ) continue;
+			var hid = trim( toString( hotspot.id ?: hotspot.path ?: "" ) );
+			if ( len( hid ) ) nodeIds[ hid ] = true;
+		}
+
+		var out = [];
+		var seen = {};
+		for ( var candidate in arguments.response.summaries ) {
+			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
+			var clusterId = trim( toString( candidate.clusterId ?: "" ) );
+			var nodeId = trim( toString( candidate.nodeId ?: "" ) );
+			if ( len( clusterId ) && !clusterIds.keyExists( clusterId ) ) continue;
+			if ( len( nodeId ) && !nodeIds.keyExists( nodeId ) ) continue;
+			if ( !len( clusterId ) && !len( nodeId ) ) continue;
+
+			var key = ( len( clusterId ) ? "c:" & clusterId : "" ) & ( len( nodeId ) ? "n:" & nodeId : "" );
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+
+			var item = {
+				text  : left( trim( candidate.text ), 800 ),
+				title : left( trim( candidate.title ?: "" ), 120 )
+			};
+			if ( len( clusterId ) ) item.clusterId = clusterId;
+			if ( len( nodeId ) ) item.nodeId = nodeId;
+			out.append( item );
+		}
+		return out;
+	}
+
+	private struct function buildPayload( required struct resolved, required struct snapshot ) {
+		var maxClusterCount = numericSetting( variables.maxClusters, 24 );
+		var maxHotspotCount = numericSetting( variables.maxHotspots, 20 );
+		var maximumCharacters = numericSetting( variables.maxPromptCharacters, 30000 );
+		var window = isNumeric( arguments.resolved.contextWindow )
+			? max( 1024, int( val( arguments.resolved.contextWindow ) ) )
+			: 128000;
+		maximumCharacters = min( maximumCharacters, max( 1000, int( window * .75 * 2 ) ) );
+
+		var clusterRecords = [];
+		var hotspotRecords = [];
+		var characters = 0;
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		for ( var cluster in clusters ) {
+			if ( !isStruct( cluster ) || clusterRecords.len() >= maxClusterCount ) break;
+			var paths = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
+			var samplePaths = [];
+			for ( var pathIndex = 1; pathIndex <= min( 6, paths.len() ); pathIndex++ ) {
+				samplePaths.append( paths[ pathIndex ] );
+			}
+			var record = {
+				id           : cluster.id ?: "",
+				label        : cluster.label ?: "",
+				fileCount    : val( cluster.fileCount ?: 0 ),
+				symbolCount  : val( cluster.symbolCount ?: 0 ),
+				cohesion     : cluster.cohesion ?: "",
+				crossingEdges: val( cluster.crossingEdges ?: 0 ),
+				filePaths    : samplePaths
+			};
+			var encoded = jsonSerialize( record );
+			if ( characters + len( encoded ) > maximumCharacters ) break;
+			clusterRecords.append( record );
+			characters += len( encoded );
+		}
+
+		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
+		for ( var hotspot in hotspots ) {
+			if ( !isStruct( hotspot ) || hotspotRecords.len() >= maxHotspotCount ) break;
+			var record = {
+				id           : hotspot.id ?: hotspot.path ?: "",
+				path         : hotspot.path ?: hotspot.id ?: "",
+				hotspotScore : hotspot.hotspotScore ?: "",
+				fanIn        : val( hotspot.fanIn ?: 0 ),
+				fanOut       : val( hotspot.fanOut ?: 0 ),
+				clusterId    : hotspot.clusterId ?: "",
+				inCycle      : hotspot.inCycle ?: false
+			};
+			var encoded = jsonSerialize( record );
+			if ( characters + len( encoded ) > maximumCharacters ) break;
+			hotspotRecords.append( record );
+			characters += len( encoded );
+		}
+
+		var compiled = getCompiler().compile(
+			"codegraph-narrative",
+			{
+				task: {
+					clusterCount : clusterRecords.len(),
+					hotspotCount : hotspotRecords.len(),
+					fingerprint  : arguments.snapshot.fingerprint ?: ""
+				},
+				evidence: {
+					clusters : clusterRecords,
+					hotspots : hotspotRecords
+				}
+			},
+			{ provider: arguments.resolved.provider, model: arguments.resolved.model }
+		);
+		return { messages: compiled.messages, provenance: compiled.provenance, promptPackage: compiled };
+	}
+
+	private boolean function isRepairablePromptError( required any error ) {
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		return findNoCase( "promptoutputvalidation", typeName ) > 0
+			|| findNoCase( "json", typeName ) > 0
+			|| findNoCase( "parse", message ) > 0
+			|| findNoCase( "json", message ) > 0;
+	}
+
+	private void function assertDistinctSystem( required string provider ) {
+		if ( !( getCompiler().capabilities( arguments.provider ).distinctSystem ?: true ) ) {
+			throw(
+				type = "AIProviderCapabilityException",
+				message = "Provider cannot preserve the immutable prompt system contract"
+			);
+		}
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) {
+			return variables.promptOutputValidator;
+		}
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private struct function buildParams( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow )
+			? max( 1024, int( val( arguments.resolved.contextWindow ) ) )
+			: 128000;
+		var capabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+		var outputCap = isNumeric( capabilities.maxOutputTokens ?: "" ) ? int( capabilities.maxOutputTokens ) : 2000;
+		var params = {
+			temperature : 0,
+			max_tokens  : min( outputCap, min( 2000, max( 256, int( window * .25 ) ) ) )
+		};
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
+		}
+		structAppend(
+			params,
+			getCompiler().structuredOutput( "codegraph-narrative", arguments.resolved.provider ?: "" ),
+			true
+		);
+		return params;
+	}
+
+	private struct function buildOptions( required struct resolved ) {
+		var options = {
+			provider     : arguments.resolved.provider,
+			apiKey       : arguments.resolved.apiKey,
+			returnFormat : "json",
+			timeout      : arguments.resolved.timeout
+		};
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
+		}
+		return options;
+	}
+
+	private string function signature() {
+		var resolved = aiProviderResolver.resolve();
+		return variables.narrativeVersion & ":" & (
+			chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ? "enabled" : "disabled"
+		) & ":" & lCase( resolved.provider ) & ":" & lCase( resolved.model );
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

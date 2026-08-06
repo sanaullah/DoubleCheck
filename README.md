@@ -39,7 +39,10 @@ deepen selected areas when configured.
 
 1. **Evidence-backed local review** while you generate or refactor
 2. **Legacy ColdFusion modernization assist** — guidance, not an auto-migrator
-3. **Honest capability claims** — measured labels, one clear path per feature
+3. **CodeGraph explorer** — interactive CF/BoxLang knowledge graph (optional AI summaries)
+4. **Honest capability claims** — measured labels, one clear path per feature
+
+Desktop workspaces: **Dashboard**, **Review**, **Modernize**, **CodeGraph**.
 
 ---
 

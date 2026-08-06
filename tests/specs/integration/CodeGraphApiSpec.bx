@@ -1,0 +1,239 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		prepareMock( getInstance( "ReviewRunService" ) ).$property(
+				"workerEnabled",
+				"variables",
+				true
+			);
+		super.afterAll();
+	}
+
+	function run() {
+		describe( "CodeGraph API", () => {
+			beforeEach( () => {
+				setup();
+				prepareMock( getInstance( "ReviewRunService" ) ).$property(
+						"workerEnabled",
+						"variables",
+						false
+					);
+			} );
+
+			it( "creates a codegraph run with 202 and Location", () => {
+				var fixturePath = expandPath( "/tests/../resources/evaluation-corpus/modernization-v1/cases/separable-domain" );
+				var created = this.post(
+						route   = "/api/v1/runs",
+						headers = { "Content-Type": "application/json", "Accept": "application/json" },
+						body    = {
+							projectPath: fixturePath,
+							runKind    : "codegraph",
+							mode       : "full"
+						}
+					);
+				var statusCode = created.getRenderData().statusCode ?: 0;
+				if ( !statusCode ) {
+					statusCode = created.getResponse().getStatusCode();
+				}
+				expect( statusCode ).toBe(
+						202,
+						"create body: #left( toString( created.getRenderedContent() ), 500 )#"
+					);
+				var body = jsonDeserialize( created.getRenderedContent() );
+				expect( body.data.runKind ).toBe( "codegraph" );
+				expect( body.data.mode ).toBe( "full" );
+				expect( len( trim( body.data.id ?: "" ) ) ).toBeGT( 0 );
+
+				var expectedLocation = "/api/v1/runs/#body.data.id#";
+				var location = created.getResponse().getMemento().location ?: "";
+				if ( !len( trim( toString( location ) ) ) ) {
+					try {
+						location = created.getResponse().getHeader( "Location" );
+					} catch ( any ignored ) {
+						location = "";
+					}
+				}
+				expect( toString( location ) ).toInclude( expectedLocation );
+				queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: body.data.id } );
+			} );
+
+			it( "returns codegraph result totals without a raw edge list, subgraph caps and validates, history lists, and export is unsupported", () => {
+				var marker = lCase( createUUID() );
+				var runId = "codegraph-api-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var codeGraphRepository = getInstance( "CodeGraphRepository" );
+				var paths = [
+					"app/A.bx",
+					"app/B.bx",
+					"app/C.bx",
+					"app/D.bx",
+					"app/E.bx",
+					"app/F.bx",
+					"app/G.bx",
+					"app/H.bx"
+				];
+				try {
+					runRepository.create( {
+						id           : runId,
+						tenantId     : "default",
+						projectId    : "default",
+						projectPath  : "C:/codegraph-api/#marker#",
+						mode         : "full",
+						runKind      : "codegraph",
+						input        : { version: "codegraph-input-v1" },
+						baseRevision : "",
+						headRevision : "HEAD",
+						status       : "succeeded",
+						progress     : 100,
+						currentPhase : "completed",
+						message      : "CodeGraph API fixture",
+						policy       : { version: "codegraph-input-v1", runKind: "codegraph" },
+						budgets      : {},
+						createdAt    : nowValue,
+						updatedAt    : nowValue
+					} );
+
+					var nodes = [];
+					for ( var path in paths ) {
+						nodes.append( { id: lCase( path ), path: path } );
+					}
+					codeGraphRepository.save(
+						runId              = runId,
+						snapshot           = {
+							version           : "codegraph-snapshot-v1",
+							fingerprint       : "fp-api-#marker#",
+							truncated         : false,
+							truncationReasons : [],
+							totals            : {
+								files           : paths.len(),
+								symbols         : paths.len(),
+								dependencies    : paths.len() - 1,
+								nodes           : paths.len(),
+								edges           : paths.len() - 1,
+								clusters        : 1,
+								cycles          : 0,
+								orphans         : 0,
+								layerViolations : 0
+							},
+							nodes             : nodes,
+							clusters          : [ { id: "c1", label: "app", fileCount: paths.len() } ],
+							clusterEdges      : [ { source: "c1", target: "c1", weight: 1 } ],
+							cycles            : [],
+							hotspots          : [],
+							orphans           : [],
+							layerViolations   : []
+						},
+						projectPath        = "C:/codegraph-api/#marker#",
+						repositoryRevision = "deadbeef",
+						narrativeCacheKey  = "",
+						narrative          = { used: false }
+					);
+
+					var parsedFiles = [];
+					for ( var i = 1; i < paths.len(); i++ ) {
+						parsedFiles.append( {
+							filePath     : paths[ i ],
+							contentHash  : "hash-#i#",
+							parserVersion: "test-v1",
+							symbols      : [],
+							dependencies : [
+								{
+									id        : "dep-#i#",
+									kind      : "constructs",
+									target    : listLast( paths[ i + 1 ], "/" ),
+									targetFile: paths[ i + 1 ],
+									line      : i,
+									evidence  : "fixture"
+								}
+							]
+						} );
+					}
+					getInstance( "AnalysisGraphRepository" ).replaceRunGraph(
+						runId,
+						parsedFiles,
+						[],
+						{
+							parserVersion   : "test-v1",
+							filesAnalyzed   : paths.len(),
+							parserExecutions: paths.len(),
+							cacheHits       : 0,
+							symbolCount     : 0,
+							dependencyCount : paths.len() - 1,
+							impactCount     : 0,
+							baselineRunId   : ""
+						}
+					);
+
+					var resultEvent = this.get( "/api/v1/runs/#runId#/result" );
+					expect( resultEvent.getResponse() ).toHaveStatus( 200 );
+					var resultBody = jsonDeserialize( resultEvent.getRenderedContent() );
+					expect( resultBody.data.result.codegraph.totals.nodes ).toBe( paths.len() );
+					expect( resultBody.data.result.codegraph ).notToHaveKey( "edges" );
+					expect( resultBody.data.result.codegraph.clusterEdges ).toBeArray();
+
+					var subgraphEvent = this.get(
+							"/api/v1/runs/#runId#/codegraph/subgraph",
+							{ focus: "app/A.bx", depth: 3, limit: 5 }
+						);
+					expect( subgraphEvent.getResponse() ).toHaveStatus( 200 );
+					var subgraph = jsonDeserialize( subgraphEvent.getRenderedContent() ).data;
+					expect( subgraph.nodes.len() ).toBeLTE( 5 );
+					expect( subgraph.truncated ).toBeTrue();
+					expect( subgraph.focus ).toBe( "app/A.bx" );
+
+					var overLimit = this.get(
+							"/api/v1/runs/#runId#/codegraph/subgraph",
+							{ focus: "app/A.bx", limit: 9999 }
+						);
+					var overStatus = overLimit.getRenderData().statusCode ?: 0;
+					if ( !overStatus ) overStatus = overLimit.getResponse().getStatusCode();
+					expect( overStatus ).toBe( 422 );
+					expect( jsonDeserialize( overLimit.getRenderedContent() ).error.code ).toBe( "validation_failed" );
+
+					var missing = this.get(
+							"/api/v1/runs/missing-codegraph-id/codegraph/subgraph",
+							{ focus: "app/A.bx" }
+						);
+					var missingStatus = missing.getRenderData().statusCode ?: 0;
+					if ( !missingStatus ) missingStatus = missing.getResponse().getStatusCode();
+					expect( missingStatus ).toBe( 404 );
+
+					var history = this.get( "/api/v1/history?runKind=codegraph&q=#marker#" );
+					expect( history.getResponse() ).toHaveStatus( 200 );
+					var historyBody = jsonDeserialize( history.getRenderedContent() );
+					expect( historyBody.data ).toHaveLength( 1 );
+					expect( historyBody.data[ 1 ].run.runKind ).toBe( "codegraph" );
+					expect( historyBody.data[ 1 ].run.planState ).toBe( "" );
+					expect( historyBody.data[ 1 ].metrics.modernization ).toBeStruct();
+					expect( structCount( historyBody.data[ 1 ].metrics.modernization ) ).toBe( 0 );
+
+					var exportEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "markdown" } );
+					var exportStatus = exportEvent.getRenderData().statusCode ?: 0;
+					if ( !exportStatus ) exportStatus = exportEvent.getResponse().getStatusCode();
+					expect( exportStatus ).toBe( 422 );
+					expect( jsonDeserialize( exportEvent.getRenderedContent() ).error.code ).toBe( "export_unsupported" );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
+			it( "advertises codegraph in capabilities", () => {
+				var event = this.get( "/api/v1/capabilities" );
+				expect( event.getResponse() ).toHaveStatus( 200 );
+				var body = jsonDeserialize( event.getRenderedContent() );
+				expect( body.data.runKinds ).toInclude( "review" );
+				expect( body.data.runKinds ).toInclude( "modernize" );
+				expect( body.data.runKinds ).toInclude( "codegraph" );
+				expect( body.data.codegraph.enabled ).toBeTrue();
+				expect( body.data.codegraph.requiresLlm ).toBeFalse();
+				expect( body.data.codegraph.schemaVersion ).toBe( "codegraph-snapshot-v1" );
+			} );
+		} );
+	}
+
+}

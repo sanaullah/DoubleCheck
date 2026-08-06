@@ -114,6 +114,7 @@ deterministic rules behind those public methods.
 | [AnalysisGraphRepository.bx](repositories/AnalysisGraphRepository.bx) | Stores content-addressed parser caches and per-run symbols, dependencies, and graph lookup results. | `findCached`, `saveCached`, `replaceRunGraph`, `findBaselineGraph`, `getGraph` |
 | [AppSettingsRepository.bx](repositories/AppSettingsRepository.bx) | Persists flat setting overrides by local tenant/project scope. | `getAll`, `set`, `setMany` |
 | [ArchitectureRepository.bx](repositories/ArchitectureRepository.bx) | Persists architecture snapshots, plans, diffs, baselines, and reusable architecture caches. | `save`, `get`, `findReusable`, `saveReusable`, `findBaseline` |
+| [CodeGraphRepository.bx](repositories/CodeGraphRepository.bx) | Persists CodeGraph snapshots and reusable narrative blobs by project/revision/cache key. | `save`, `get`, `findReusableNarrative` |
 | [FindingReviewRepository.bx](repositories/FindingReviewRepository.bx) | Stores fingerprint-level finding decisions and append-only review transitions. | `listForProject`, `setState` |
 | [ModernizationRepository.bx](repositories/ModernizationRepository.bx) | Stores sanitized schema packs, checkpoints, plans, human decisions, and decision events. | `saveSchemaPack`, `getSchemaPack`, `saveCheckpoint`, `getCheckpoints`, `savePlan`, `getPlan`, `upsertDecision`, `findDecision`, `deleteDecision`, `listDecisions`, `appendDecisionEvent`, `listDecisionEvents` |
 | [ReviewEventRepository.bx](repositories/ReviewEventRepository.bx) | Appends and replays the ordered run-event stream used by SSE and observability. | `append`, `after` |
@@ -156,6 +157,20 @@ deterministic rules behind those public methods.
 | [ArchitectureModelService.bx](services/ArchitectureModelService.bx) | Derives bounded deterministic architecture facts from graph data and scanned files. | `build` |
 | [ArchitectureEnrichmentService.bx](services/ArchitectureEnrichmentService.bx) | Optionally enriches deterministic facts with cited AI observations and caches safe results. | `isEnabled`, `cacheKey`, `enrich` |
 | [ArchitectureDiffService.bx](services/ArchitectureDiffService.bx) | Compares current architecture facts with a baseline using stable set differences. | `compare` |
+
+### CodeGraph
+
+CodeGraph reuses `ModernizationCouplingGraphService` and
+`ModernizationDerivedStructureService` for fan-in/out, cycles, and clusters —
+it must not declare a second copy of those algorithms
+(`ArchitectureFitnessSpec` enforces this).
+
+| File | Responsibility | Public API |
+| --- | --- | --- |
+| [CodeGraphInventoryAdapter.bx](services/CodeGraphInventoryAdapter.bx) | Maps review-graph symbols/dependencies into the coupling-inventory shape (synthetic per-file units; drops `tests` edges). | `adapt` |
+| [CodeGraphMetricsService.bx](services/CodeGraphMetricsService.bx) | Assembles the deterministic snapshot: hotspots, orphans, layer violations, directories, fingerprint. Reads fan-in/cycles from CouplingGraph. | `assemble`, `snapshotVersion` |
+| [CodeGraphNarrativeService.bx](services/CodeGraphNarrativeService.bx) | Optional LLM cluster/hotspot summaries; never mutates the snapshot; failures return `{used:false}`. | `isEnabled`, `cacheKey`, `narrate`, `enrich` |
+| [CodeGraphRunService.bx](services/CodeGraphRunService.bx) | Owns the CodeGraph pipeline after shared scan: index → metrics → optional narrative → persist; subgraph drill-down. | `execute`, `getResult`, `subgraph`, `cancelRun` |
 
 ### AI providers and specialist execution
 
@@ -224,6 +239,7 @@ deterministic rules behind those public methods.
 | Run lifecycle, queueing, cancellation, or SSE | `ReviewRunService` | `ReviewRunRepository`, `ReviewEventService`, `WorkerRegistryService` |
 | File selection or Git scope | `RepositoryScannerService` | `GitRepositoryService`, `SupportedLanguageService` |
 | Architecture graph or parser behavior | `ArchitectureIndexService` | `BoxLangParserService`, `CfmlParserService`, `AnalysisGraphRepository` |
+| CodeGraph explorer / snapshot | `CodeGraphRunService` | `CodeGraphMetricsService`, `CodeGraphNarrativeService`, `CodeGraphRepository`, coupling/cluster Modernize services |
 | Deterministic findings | `FindingService` | `FindingSolutionService`, `RulePlaybookCatalog` |
 | Specialist prompts or tools | `SpecialistAgentFactory` | `SpecialistAgentGateway`, `ControlledRepositoryToolService`, `AIChatGateway` |
 | Prompt contracts, schemas, or offline eval | `PromptRegistry` | `PromptCompiler`, `PromptOutputValidator`, `PromptEvaluationService`, `PromptAuthoringService` |

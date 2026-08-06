@@ -18,6 +18,7 @@ tags:
   - name: Health
   - name: Session
   - name: Runs
+  - name: CodeGraph
   - name: AI
   - name: Local
   - name: Settings
@@ -233,7 +234,7 @@ paths:
         - $ref: "#/components/parameters/runId"
       responses:
         "200":
-          description: Result payload; Review and Modernize use different result shapes selected by runKind
+          description: Result payload; Review, Modernize, and CodeGraph use different result shapes selected by runKind
           content:
             application/json:
               schema:
@@ -259,7 +260,63 @@ paths:
         "200":
           description: Exported document
         "422":
-          description: Unsupported export format
+          description: Unsupported export format, or CodeGraph export (code export_unsupported)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                exportUnsupported:
+                  summary: CodeGraph export not available
+                  value:
+                    error:
+                      code: export_unsupported
+                      message: CodeGraph export is not available yet
+
+  /api/v1/runs/{id}/codegraph/subgraph:
+    get:
+      tags: [CodeGraph]
+      summary: Neighbourhood subgraph around a focus file
+      operationId: getCodeGraphSubgraph
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: focus
+          in: query
+          required: true
+          schema: { type: string }
+          description: Repository-relative file path to centre the BFS on
+        - name: depth
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 3, default: 3 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 300, default: 300 }
+        - name: kinds
+          in: query
+          required: false
+          schema: { type: string }
+          description: Comma-separated dependency kinds to include
+        - name: include
+          in: query
+          required: false
+          schema: { type: string }
+          description: Pass tests (or true/1/yes) to include tests edges
+      responses:
+        "200":
+          description: Bounded neighbourhood subgraph
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeGraphSubgraphResponse"
+        "404":
+          description: Run not found or not a codegraph run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Missing focus or depth/limit out of range
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
@@ -419,7 +476,7 @@ paths:
         - { name: projectPath, in: query, schema: { type: string } }
         - { name: mode, in: query, schema: { type: string, enum: [working-tree, revision-diff, full] } }
         - { name: status, in: query, schema: { type: string } }
-        - { name: runKind, in: query, schema: { type: string, enum: [review, modernize] } }
+        - { name: runKind, in: query, schema: { type: string, enum: [review, modernize, codegraph] } }
         - { name: from, in: query, schema: { type: string, format: date-time } }
         - { name: to, in: query, schema: { type: string, format: date-time } }
         - { name: q, in: query, schema: { type: string } }
@@ -744,6 +801,11 @@ components:
               items:
                 type: string
                 enum: [working-tree, revision-diff, full]
+            runKinds:
+              type: array
+              items:
+                type: string
+                enum: [review, modernize, codegraph]
             aiExecution:
               type: object
               properties:
@@ -752,6 +814,8 @@ components:
                 optional: { type: boolean }
             modernization:
               $ref: "#/components/schemas/ModernizationCapabilities"
+            codegraph:
+              $ref: "#/components/schemas/CodeGraphCapabilities"
 
     AISmokeResponse:
       type: object
@@ -802,7 +866,7 @@ components:
           default: working-tree
         runKind:
           type: string
-          enum: [review, modernize]
+          enum: [review, modernize, codegraph]
           default: review
           description: Modernize creates an evidence-backed CFML migration plan and requires an enabled LLM provider.
         baseRevision: { type: string }
@@ -853,7 +917,7 @@ components:
             message: { type: string }
             mode: { type: string }
             projectPath: { type: string }
-            runKind: { type: string, enum: [review, modernize], default: review }
+            runKind: { type: string, enum: [review, modernize, codegraph], default: review }
             input:
               type: object
               description: Immutable normalized run input; Modernize excludes raw schema attachment text.
@@ -891,6 +955,46 @@ components:
           additionalProperties:
             type: array
             items: { type: string }
+
+    CodeGraphCapabilities:
+      type: object
+      properties:
+        enabled: { type: boolean, example: true }
+        requiresLlm: { type: boolean, example: false }
+        schemaVersion: { type: string, example: codegraph-snapshot-v1 }
+
+    CodeGraphSubgraphResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [focus, depth, truncated, totalNodes, totalEdges, nodes, edges]
+          properties:
+            focus: { type: string }
+            depth: { type: integer, minimum: 1 }
+            truncated: { type: boolean }
+            totalNodes: { type: integer, minimum: 0 }
+            totalEdges: { type: integer, minimum: 0 }
+            nodes:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  path: { type: string }
+                  depth: { type: integer, minimum: 0 }
+            edges:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  sourceFile: { type: string }
+                  targetFile: { type: string }
+                  kind: { type: string }
+                  target: { type: string }
+                  line: { type: integer }
+                  evidence: { type: string }
 
     ModernizationDecisionRequest:
       type: object
@@ -1025,7 +1129,7 @@ components:
               type: object
               properties:
                 id: { type: string, format: uuid }
-                runKind: { type: string, enum: [review, modernize] }
+                runKind: { type: string, enum: [review, modernize, codegraph] }
             result:
               oneOf:
                 - $ref: "#/components/schemas/ReviewResult"

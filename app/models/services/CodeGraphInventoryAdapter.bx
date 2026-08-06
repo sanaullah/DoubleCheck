@@ -1,0 +1,213 @@
+/**
+ * Converts a review symbol/dependency graph into the coupling-inventory shape
+ * that ModernizationCouplingGraphService.build() expects.
+ *
+ * Deterministic, no gateway, no database. One owner of the review→coupling
+ * field and kind mapping so CodeGraph never invents a parallel inventory.
+ *
+ * @see ModernizationCouplingGraphService
+ * @see AnalysisGraphRepository.getGraph
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * Adapt a review graph into `{ units, dependencies, canonicalPaths }`.
+	 *
+	 * Accepts `files` or `scannedFiles` (array of paths or structs with
+	 * filePath/path). When neither is present, file paths are collected from
+	 * symbols and dependencies so synthetic `file:` units still appear.
+	 */
+	struct function adapt( required struct reviewGraph ) {
+		var canonicalPaths = {};
+		var units = [];
+		var dependencies = [];
+		var seenUnitIds = {};
+		var fileMeta = {};
+
+		collectFiles( arguments.reviewGraph, fileMeta, canonicalPaths );
+
+		var symbols = isArray( arguments.reviewGraph.symbols ?: "" ) ? arguments.reviewGraph.symbols : [];
+		for ( var symbol in symbols ) {
+			if ( !isStruct( symbol ) ) continue;
+			var filePath = rememberPath( symbol.filePath ?: symbol.file_path ?: "", canonicalPaths );
+			if ( !len( filePath ) ) continue;
+			ensureFileMeta( filePath, fileMeta, canonicalPaths );
+			var startLine = max( 1, val( symbol.line ?: symbol.startLine ?: 1 ) );
+			var unitId = trim( toString( symbol.id ?: "" ) );
+			if ( !len( unitId ) ) {
+				unitId = "sym:#filePath#:#symbol.kind ?: ""#:#symbol.name ?: ""#:#startLine#";
+			}
+			if ( seenUnitIds.keyExists( unitId ) ) continue;
+			seenUnitIds[ unitId ] = true;
+			units.append( {
+				id       : unitId,
+				filePath : filePath,
+				startLine: startLine,
+				endLine  : max( startLine, val( symbol.endLine ?: startLine ) ),
+				layer    : "component",
+				unitType : trim( toString( symbol.kind ?: "symbol" ) ),
+				symbolName: trim( toString( symbol.name ?: "" ) )
+			} );
+			fileMeta[ lCase( filePath ) ].symbolCount++;
+			fileMeta[ lCase( filePath ) ].maxLine = max( fileMeta[ lCase( filePath ) ].maxLine, startLine );
+		}
+
+		var edges = isArray( arguments.reviewGraph.dependencies ?: "" ) ? arguments.reviewGraph.dependencies : [];
+		for ( var edge in edges ) {
+			if ( !isStruct( edge ) ) continue;
+			var mappedKind = mapKind( edge.kind ?: "" );
+			if ( !len( mappedKind ) ) continue;
+
+			var sourceFile = rememberPath( edge.sourceFile ?: edge.filePath ?: edge.source_file ?: "", canonicalPaths );
+			if ( !len( sourceFile ) ) continue;
+			ensureFileMeta( sourceFile, fileMeta, canonicalPaths );
+
+			var targetFile = rememberPath( edge.targetFile ?: edge.target_file ?: "", canonicalPaths );
+			if ( len( targetFile ) ) ensureFileMeta( targetFile, fileMeta, canonicalPaths );
+
+			var startLine = max( 1, val( edge.line ?: edge.startLine ?: 1 ) );
+			fileMeta[ lCase( sourceFile ) ].maxLine = max( fileMeta[ lCase( sourceFile ) ].maxLine, startLine );
+
+			var record = {
+				id       : trim( toString( edge.id ?: "" ) ),
+				kind     : mappedKind,
+				target   : trim( toString( edge.target ?: "" ) ),
+				filePath : sourceFile,
+				startLine: startLine,
+				endLine  : max( startLine, val( edge.endLine ?: startLine ) )
+			};
+			if ( !len( record.id ) ) {
+				record.id = "dep-#sourceFile#-#startLine#-#mappedKind#-#record.target#";
+			}
+			if ( len( targetFile ) ) {
+				record.targetFile = targetFile;
+				record.resolution = "path";
+			}
+			if ( len( trim( toString( edge.evidence ?: "" ) ) ) ) {
+				record.evidence = edge.evidence;
+			}
+			dependencies.append( record );
+		}
+
+		// Synthetic file-level units so zero-symbol templates (.cfm) still cluster.
+		var fileKeys = structKeyArray( fileMeta );
+		arraySort( fileKeys, "textnocase" );
+		for ( var key in fileKeys ) {
+			var meta = fileMeta[ key ];
+			var path = meta.canonical;
+			var fileUnitId = "file:" & path;
+			if ( seenUnitIds.keyExists( fileUnitId ) ) continue;
+			seenUnitIds[ fileUnitId ] = true;
+			var endLine = max( 1, val( meta.lineCount ?: 0 ) );
+			if ( endLine <= 1 ) endLine = max( 1, meta.maxLine );
+			units.append( {
+				id       : fileUnitId,
+				filePath : path,
+				startLine: 1,
+				endLine  : endLine,
+				layer    : "file",
+				unitType : "file",
+				symbolName: listLast( path, "/" )
+			} );
+		}
+
+		units.sort( ( a, b ) => {
+			var byPath = compareNoCase( a.filePath, b.filePath );
+			if ( byPath != 0 ) return byPath;
+			if ( a.startLine != b.startLine ) return a.startLine < b.startLine ? -1 : 1;
+			return compareNoCase( a.id, b.id );
+		} );
+
+		return {
+			units          : units,
+			dependencies   : dependencies,
+			canonicalPaths : canonicalPaths
+		};
+	}
+
+	/**
+	 * Resolve a lowercase (or mixed) path via the lowercase→canonical map.
+	 * Empty string when unknown.
+	 */
+	string function getCanonicalPath( required string lower, struct canonicalPaths = {} ) {
+		var key = normalizeKey( arguments.lower );
+		if ( !len( key ) ) return "";
+		if ( arguments.canonicalPaths.keyExists( key ) ) return arguments.canonicalPaths[ key ];
+		return "";
+	}
+
+	/**
+	 * Review edge kind → coupling structuralKinds vocabulary.
+	 * Returns "" for kinds that must be dropped (`tests`) or unrecognized.
+	 */
+	string function mapKind( required any kind ) {
+		var value = lCase( trim( toString( arguments.kind ?: "" ) ) );
+		if ( !len( value ) || value == "tests" ) return "";
+		if ( value == "includes" || value == "include" ) return "include";
+		if ( value == "extends" || value == "implements" ) return value;
+		if (
+			value == "constructs" ||
+			value == "injects" ||
+			value == "imports" ||
+			value == "calls" ||
+			value == "type-reference" ||
+			value == "component-construction"
+		) {
+			return "component-construction";
+		}
+		return "";
+	}
+
+	private void function collectFiles( required struct reviewGraph, required struct fileMeta, required struct canonicalPaths ) {
+		var lists = [];
+		if ( isArray( arguments.reviewGraph.files ?: "" ) ) lists.append( arguments.reviewGraph.files );
+		if ( isArray( arguments.reviewGraph.scannedFiles ?: "" ) ) lists.append( arguments.reviewGraph.scannedFiles );
+		for ( var list in lists ) {
+			for ( var entry in list ) {
+				if ( isSimpleValue( entry ) ) {
+					var path = rememberPath( toString( entry ), arguments.canonicalPaths );
+					if ( len( path ) ) ensureFileMeta( path, arguments.fileMeta, arguments.canonicalPaths );
+					continue;
+				}
+				if ( !isStruct( entry ) ) continue;
+				var filePath = rememberPath( entry.filePath ?: entry.path ?: "", arguments.canonicalPaths );
+				if ( !len( filePath ) ) continue;
+				ensureFileMeta( filePath, arguments.fileMeta, arguments.canonicalPaths );
+				var meta = arguments.fileMeta[ lCase( filePath ) ];
+				if ( isNumeric( entry.lineCount ?: "" ) ) meta.lineCount = max( meta.lineCount, val( entry.lineCount ) );
+				if ( isArray( entry.lines ?: "" ) ) meta.lineCount = max( meta.lineCount, entry.lines.len() );
+				if ( len( trim( toString( entry.language ?: "" ) ) ) ) meta.language = entry.language;
+			}
+		}
+	}
+
+	private void function ensureFileMeta( required string filePath, required struct fileMeta, required struct canonicalPaths ) {
+		var key = lCase( arguments.filePath );
+		if ( arguments.fileMeta.keyExists( key ) ) return;
+		arguments.fileMeta[ key ] = {
+			canonical  : arguments.filePath,
+			symbolCount: 0,
+			maxLine    : 1,
+			lineCount  : 0,
+			language   : ""
+		};
+	}
+
+	private string function rememberPath( required any path, required struct canonicalPaths ) {
+		var raw = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", raw ) ) raw = replace( raw, "//", "/", "all" );
+		if ( !len( raw ) ) return "";
+		var key = lCase( raw );
+		if ( !arguments.canonicalPaths.keyExists( key ) ) {
+			arguments.canonicalPaths[ key ] = raw;
+		}
+		return arguments.canonicalPaths[ key ];
+	}
+
+	private string function normalizeKey( required any path ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return lCase( value );
+	}
+}

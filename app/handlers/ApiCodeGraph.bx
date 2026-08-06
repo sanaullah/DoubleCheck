@@ -1,0 +1,102 @@
+/**
+ * REST: CodeGraph neighbourhood drill-down (subgraph) for a finished run.
+ *
+ * @see CodeGraphRunService
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="codeGraphRunService" inject="CodeGraphRunService";
+
+	property name="runService" inject="ReviewRunService";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	property name="codegraphSubgraphMaxNodes" inject="coldbox:setting:codegraphSubgraphMaxNodes";
+
+	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
+
+	function preHandler(
+		event,
+		rc,
+		prc,
+		action,
+		eventArguments
+	) {
+		prc.securityContext = securityContextService.authenticate( event );
+	}
+
+	/**
+	 * Neighbourhood subgraph for a CodeGraph run
+	 *
+	 * @tags CodeGraph
+	 * @hint BFS neighbourhood around a focus file path, capped by depth and limit
+	 * @param-focus { "name":"focus", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-depth { "name":"depth", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-kinds { "name":"kinds", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @param-include { "name":"include", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @response-200 Subgraph payload
+	 * @response-404 Run not found or not a codegraph run
+	 * @response-422 Validation failed
+	 */
+	function subgraph( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) {
+			return notFound( event );
+		}
+
+		var focus = trim( toString( rc.focus ?: "" ) );
+		if ( !len( focus ) ) {
+			return validationError( event, "focus is required" );
+		}
+
+		var maxDepth = max( 1, val( variables.codegraphSubgraphMaxDepth ?: 3 ) );
+		var maxNodes = max( 1, val( variables.codegraphSubgraphMaxNodes ?: 300 ) );
+
+		if ( len( trim( toString( rc.depth ?: "" ) ) ) ) {
+			if ( !isNumeric( rc.depth ) || val( rc.depth ) < 1 || val( rc.depth ) > maxDepth ) {
+				return validationError( event, "depth must be between 1 and #maxDepth#" );
+			}
+		}
+		if ( len( trim( toString( rc.limit ?: "" ) ) ) ) {
+			if ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > maxNodes ) {
+				return validationError( event, "limit must be between 1 and #maxNodes#" );
+			}
+		}
+
+		try {
+			var payload = codeGraphRunService.subgraph(
+					run.getId(),
+					{
+						focus  : focus,
+						depth  : rc.depth ?: "",
+						limit  : rc.limit ?: "",
+						kinds  : rc.kinds ?: "",
+						include: rc.include ?: ""
+					}
+				);
+			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	private void function notFound( required event ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 404,
+				data       = { error: { code: "run_not_found", message: "Review run not found" } }
+			);
+	}
+
+	private void function validationError( required event, required string message ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 422,
+				data       = { error: { code: "validation_failed", message: arguments.message } }
+			);
+	}
+}

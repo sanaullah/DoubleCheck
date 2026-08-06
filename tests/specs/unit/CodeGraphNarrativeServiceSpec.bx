@@ -1,0 +1,189 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraphNarrativeService", () => {
+
+			it( "makes zero gateway calls when no key / provider is disabled", () => {
+				var calls = { chat: 0 };
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => false,
+					chat: ( messages, params, options ) => {
+						calls.chat++;
+						return { summaries: [] };
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider: "openai",
+					apiKey  : "",
+					model   : "test",
+					isLocal : false,
+					timeout : 1
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var snapshot = sampleSnapshot();
+				var before = duplicate( snapshot );
+				var result = service.narrate( snapshot );
+
+				expect( result.used ).toBeFalse();
+				expect( calls.chat ).toBe( 0 );
+				expect( snapshot ).toBe( before );
+			} );
+
+			it( "drops summaries that cite an unknown clusterId", () => {
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						return {
+							summaries: [
+								{ clusterId: "cluster-real", title: "Orders", text: "Order domain modules." },
+								{ clusterId: "cluster-unknown", title: "Ghost", text: "Should be dropped." },
+								{ nodeId: "app/models/Order.cfc", title: "Hot", text: "High fan-in order model." }
+							]
+						};
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider      : "deterministic-fake",
+					apiKey        : "test-key",
+					model         : "corpus-v1",
+					isLocal       : false,
+					timeout       : 1,
+					contextWindow : 8000
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				service.promptCompiler = stubCompiler();
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var result = service.narrate( sampleSnapshot() );
+
+				expect( result.used ).toBeTrue();
+				expect( result.summaries.len() ).toBe( 2 );
+				expect( result.summaries[ 1 ].clusterId ).toBe( "cluster-real" );
+				expect( result.summaries[ 2 ].nodeId ).toBe( "app/models/Order.cfc" );
+				var ids = result.summaries.map( ( item ) => item.clusterId ?: item.nodeId ?: "" );
+				expect( ids ).notToInclude( "cluster-unknown" );
+			} );
+
+			it( "never mutates the deterministic snapshot when the gateway throws", () => {
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						throw( type = "AIGatewayException", message = "provider down" );
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider      : "openai",
+					apiKey        : "test-key",
+					model         : "gpt-test",
+					isLocal       : false,
+					timeout       : 1,
+					contextWindow : 8000
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				service.promptCompiler = stubCompiler();
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.log = { error: ( message, detail ) => true };
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var snapshot = sampleSnapshot();
+				snapshot.marker = "untouched";
+				var fingerprintBefore = snapshot.fingerprint;
+				var clusterCountBefore = snapshot.clusters.len();
+
+				var result = service.narrate( snapshot );
+
+				expect( result.used ).toBeFalse();
+				expect( len( result.error ?: "" ) ).toBeGT( 0 );
+				expect( snapshot.marker ).toBe( "untouched" );
+				expect( snapshot.fingerprint ).toBe( fingerprintBefore );
+				expect( snapshot.clusters.len() ).toBe( clusterCountBefore );
+			} );
+
+			it( "produces a stable cacheKey for the same snapshot and project path", () => {
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => false,
+					chat: ( messages, params, options ) => { return {}; }
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider: "openai",
+					apiKey  : "",
+					model   : "test",
+					isLocal : false
+				} );
+
+				var snapshot = sampleSnapshot();
+				var a = service.cacheKey( snapshot, "C:/Projects/Demo" );
+				var b = service.cacheKey( snapshot, "C:/Projects/Demo" );
+				var c = service.cacheKey( snapshot, "C:/Projects/Other" );
+
+				expect( a ).toBe( b );
+				expect( a ).notToBe( c );
+				expect( len( a ) ).toBe( 64 );
+			} );
+
+		} );
+	}
+
+	private struct function sampleSnapshot() {
+		return {
+			version     : "codegraph-snapshot-v1",
+			fingerprint : "fp-narrative-test",
+			clusters    : [
+				{
+					id          : "cluster-real",
+					label       : "models",
+					fileCount   : 1,
+					symbolCount : 2,
+					filePaths   : [ "app/models/Order.cfc" ]
+				}
+			],
+			nodes: [
+				{ id: "app/models/Order.cfc", path: "app/models/Order.cfc", clusterId: "cluster-real" }
+			],
+			hotspots: [
+				{ id: "app/models/Order.cfc", path: "app/models/Order.cfc", hotspotScore: 0.9, fanIn: 3, fanOut: 1 }
+			]
+		};
+	}
+
+	private struct function stubCompiler() {
+		return {
+			compile: ( contractId, data, options ) => {
+				return {
+					messages   : [ { role: "user", content: "test" } ],
+					provenance : { contractId: contractId }
+				};
+			},
+			compileRepair: ( activePackage, message ) => arguments.activePackage,
+			capabilities: ( provider ) => {
+				return { distinctSystem: true, maxOutputTokens: 1000, jsonObject: true };
+			},
+			structuredOutput: ( contractId, provider ) => {
+				return { response_format: { type: "json_object" } };
+			}
+		};
+	}
+
+	private struct function stubPassThroughValidator() {
+		return {
+			sanitizeValid: ( response, schemaId, context ) => {
+				var value = isStruct( arguments.response ) ? arguments.response : jsonDeserialize( arguments.response );
+				return { value: value, rejectedItems: [], valid: true };
+			}
+		};
+	}
+
+}

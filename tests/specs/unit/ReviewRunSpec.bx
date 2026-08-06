@@ -26,6 +26,50 @@ class extends="testbox.system.BaseSpec" {
 						expect( result ).toHaveKey( "cancelRequestedAt" );
 					}
 				);
+
+				it(
+					"forces codegraph mode to full before mode validation in ReviewRunService.create",
+					() => {
+						// ReviewRunService.create needs full DI; document the
+						// coercion contract via source order so it cannot silently
+						// regress (mode check must follow codegraph force).
+						var source = fileRead( expandPath( "/app/models/services/ReviewRunService.bx" ) );
+						var createStart = findNoCase( "any function create(", source );
+						expect( createStart ).toBeGT( 0 );
+						var createBody = mid( source, createStart, 4500 );
+
+						var runKindPos = findNoCase( 'input.runKind ?: input.workspace', createBody );
+						var forcePos = findNoCase( 'runKind == "codegraph"', createBody );
+						var modeAssignPos = findNoCase( 'var mode = lCase( trim( input.mode', createBody );
+						var modeValidatePos = findNoCase( '"working-tree", "revision-diff", "full"', createBody );
+
+						expect( runKindPos ).toBeGT( 0 );
+						expect( forcePos ).toBeGT( 0 );
+						expect( modeAssignPos ).toBeGT( 0 );
+						expect( modeValidatePos ).toBeGT( 0 );
+						expect( runKindPos ).toBeLT( forcePos );
+						expect( forcePos ).toBeLT( modeAssignPos );
+						expect( modeAssignPos ).toBeLT( modeValidatePos );
+						expect( findNoCase( 'input.mode = "full"', createBody ) ).toBeGT( 0 );
+					}
+				);
+
+				it(
+					"routes codegraph cancel away from specialistReviewService",
+					() => {
+						var source = fileRead( expandPath( "/app/models/services/ReviewRunService.bx" ) );
+						var cancelStart = findNoCase( "if ( variables.activeFutures.containsKey( arguments.id ) )", source );
+						expect( cancelStart ).toBeGT( 0 );
+						var cancelBody = mid( source, cancelStart, 800 );
+						expect( findNoCase( 'cancelKind == "codegraph"', cancelBody ) ).toBeGT( 0 );
+						expect( findNoCase( "codeGraphRunService.cancelRun", cancelBody ) ).toBeGT( 0 );
+						var specialistPos = findNoCase( "specialistReviewService.cancelRun", cancelBody );
+						var codegraphPos = findNoCase( "codeGraphRunService.cancelRun", cancelBody );
+						expect( specialistPos ).toBeGT( 0 );
+						expect( codegraphPos ).toBeGT( 0 );
+						expect( codegraphPos ).toBeLT( specialistPos );
+					}
+				);
 			}
 		);
 	}

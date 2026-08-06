@@ -17,6 +17,8 @@ class threadsafe {
 
 	property name="observabilityTraceService" inject="ObservabilityTraceService";
 
+	property name="reviewRunKinds" inject="ReviewRunKinds";
+
 	struct function listScoped( required struct context, struct filters = {} ) {
 		var projectId = trim( arguments.filters.projectId ?: "" );
 		securityContextService.authorize(
@@ -79,7 +81,7 @@ class threadsafe {
 			"COALESCE(r.run_kind, 'review')",
 			"runKind",
 			lCase( trim( arguments.filters.runKind ?: "" ) ),
-			[ "review", "modernize" ]
+			reviewRunKinds.all()
 		);
 		if ( len( trim( arguments.filters.from ?: "" ) ) ) {
 			whereParts.append( "r.created_at >= :fromDate" );
@@ -206,6 +208,14 @@ class threadsafe {
 			return {
 				runId: run.getId(), runKind: "modernize", comparisonAvailable: false,
 				reason: "Modernize comparisons are served by ApiHistory.comparison() directly, not compareScoped()."
+			};
+		}
+		if ( lCase( run.getRunKind() ?: "review" ) == "codegraph" ) {
+			return {
+				runId              : run.getId(),
+				runKind            : "codegraph",
+				comparisonAvailable: false,
+				reason             : "CodeGraph runs do not support findings-style history comparison."
 			};
 		}
 		var baselineRun = runRepository.findPriorEligibleBaseline(

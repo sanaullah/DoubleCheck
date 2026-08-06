@@ -1,0 +1,174 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function run() {
+		describe( "CodeGraph persistence", () => {
+			beforeEach( () => setup() );
+
+			it( "creates codegraph_snapshots table and indexes, and orphan repair keeps FK check clean", () => {
+				var tables = queryExecute(
+					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'codegraph_snapshots'"
+				);
+				expect( tables.recordCount ).toBe( 1 );
+
+				var indexes = queryExecute(
+					"
+						SELECT name FROM sqlite_master
+						WHERE type = 'index'
+							AND name IN (
+								'idx_codegraph_snapshots_narrative_reuse',
+								'idx_codegraph_snapshots_fingerprint'
+							)
+					"
+				);
+				expect( indexes.recordCount ).toBe( 2 );
+
+				var schemaService = getInstance( "SchemaService" );
+				schemaService.ensureSchema();
+				var fkIssues = queryExecute( "PRAGMA foreign_key_check" );
+				expect( fkIssues.recordCount ).toBe( 0 );
+			} );
+
+			it( "saves and reads a snapshot round-trip and cascades on run delete", () => {
+				var runId = lCase( createUUID() );
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var codeGraphRepository = getInstance( "CodeGraphRepository" );
+				var snapshot = {
+					version           : "codegraph-snapshot-v1",
+					fingerprint       : "fp-test-1",
+					truncated         : false,
+					truncationReasons : [],
+					totals            : {
+						files            : 2,
+						symbols          : 3,
+						dependencies     : 1,
+						nodes            : 2,
+						edges            : 1,
+						clusters         : 1,
+						cycles           : 0,
+						orphans          : 0,
+						layerViolations  : 0
+					},
+					nodes        : [ { id: "a", path: "app/models/A.bx" }, { id: "b", path: "app/handlers/B.bx" } ],
+					clusters     : [ { id: "c1", label: "models", fileCount: 1 } ],
+					clusterEdges : [],
+					cycles       : [],
+					hotspots     : [],
+					orphans      : [],
+					layerViolations: []
+				};
+				try {
+					runRepository.create( {
+						id           : runId,
+						tenantId     : "default",
+						projectId    : "default",
+						projectPath  : "C:/codegraph-fixture",
+						mode         : "full",
+						runKind      : "codegraph",
+						input        : { version: "codegraph-input-v1" },
+						baseRevision : "",
+						headRevision : "HEAD",
+						status       : "queued",
+						progress     : 0,
+						currentPhase : "queued",
+						message      : "CodeGraph persistence fixture",
+						policy       : { version: "codegraph-input-v1", runKind: "codegraph" },
+						budgets      : {},
+						createdAt    : nowValue,
+						updatedAt    : nowValue
+					} );
+
+					codeGraphRepository.save(
+						runId               = runId,
+						snapshot            = snapshot,
+						projectPath         = "C:/codegraph-fixture",
+						repositoryRevision  = "abc123",
+						narrativeCacheKey   = "narrative-key-1",
+						narrative           = { used: true, summaries: [ { clusterId: "c1", text: "Models layer" } ] }
+					);
+
+					var loaded = codeGraphRepository.get( runId );
+					expect( isNull( loaded ) ).toBeFalse();
+					expect( loaded.version ).toBe( "codegraph-snapshot-v1" );
+					expect( loaded.fingerprint ).toBe( "fp-test-1" );
+					expect( loaded.snapshot.totals.nodes ).toBe( 2 );
+					expect( loaded.snapshot.nodes[ 1 ].path ).toBe( "app/models/A.bx" );
+					expect( loaded.narrative.used ).toBeTrue();
+					expect( loaded.narrative.summaries[ 1 ].clusterId ).toBe( "c1" );
+					expect( loaded.narrativeCacheKey ).toBe( "narrative-key-1" );
+					expect( loaded.repositoryRevision ).toBe( "abc123" );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+				expect( isNull( codeGraphRepository.get( runId ) ) ).toBeTrue();
+			} );
+
+			it( "reuses narrative by project path, revision, and cache key", () => {
+				var runIdA = lCase( createUUID() );
+				var runIdB = lCase( createUUID() );
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var codeGraphRepository = getInstance( "CodeGraphRepository" );
+				var snapshot = {
+					version           : "codegraph-snapshot-v1",
+					fingerprint       : "fp-reuse",
+					truncated         : false,
+					truncationReasons : [],
+					totals            : { nodes: 1, edges: 0, clusters: 1, cycles: 0 },
+					nodes             : [ { id: "n1", path: "app/Main.bx" } ],
+					clusters          : [ { id: "c1", label: "app" } ],
+					clusterEdges      : [],
+					cycles            : [],
+					hotspots          : [],
+					orphans           : [],
+					layerViolations   : []
+				};
+				try {
+					for ( var runId in [ runIdA, runIdB ] ) {
+						runRepository.create( {
+							id           : runId,
+							tenantId     : "default",
+							projectId    : "default",
+							projectPath  : "C:/codegraph-reuse",
+							mode         : "full",
+							runKind      : "codegraph",
+							input        : {},
+							baseRevision : "",
+							headRevision : "HEAD",
+							status       : "succeeded",
+							progress     : 100,
+							currentPhase : "completed",
+							message      : "ok",
+							policy       : { runKind: "codegraph" },
+							budgets      : {},
+							createdAt    : nowValue,
+							updatedAt    : nowValue
+						} );
+					}
+					codeGraphRepository.save(
+						runId              = runIdA,
+						snapshot           = snapshot,
+						projectPath        = "C:/codegraph-reuse",
+						repositoryRevision = "rev-9",
+						narrativeCacheKey  = "nk-shared",
+						narrative          = { used: true, summaries: [ { clusterId: "c1", text: "reusable" } ] }
+					);
+					var reused = codeGraphRepository.findReusableNarrative(
+						"C:/codegraph-reuse",
+						"rev-9",
+						"nk-shared"
+					);
+					expect( isNull( reused ) ).toBeFalse();
+					expect( reused.used ).toBeTrue();
+					expect( reused.summaries[ 1 ].text ).toBe( "reusable" );
+
+					expect( isNull( codeGraphRepository.findReusableNarrative( "C:/codegraph-reuse", "rev-9", "missing" ) ) ).toBeTrue();
+					expect( isNull( codeGraphRepository.findReusableNarrative( "", "rev-9", "nk-shared" ) ) ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id IN ( :a, :b )", { a: runIdA, b: runIdB } );
+				}
+			} );
+		} );
+	}
+
+}

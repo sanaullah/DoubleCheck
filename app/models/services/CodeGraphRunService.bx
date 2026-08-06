@@ -1,0 +1,430 @@
+/**
+ * CodeGraph stages after the shared repository scan. ReviewRunService owns
+ * queueing, leases, status transitions, and SSE; this service owns the
+ * index → metrics → optional narrative → persist pipeline for runKind=codegraph.
+ *
+ * Deterministic graph work has no gateway. Narrative is optional via
+ * CodeGraphNarrativeService; failures never fail the run.
+ */
+
+@singleton
+class threadsafe {
+	property name="architectureIndexService" inject="ArchitectureIndexService";
+	property name="graphRepository" inject="AnalysisGraphRepository";
+	property name="metricsService" inject="CodeGraphMetricsService";
+	property name="codeGraphRepository" inject="CodeGraphRepository";
+	property name="narrativeService" inject="CodeGraphNarrativeService";
+	property name="eventService" inject="ReviewEventService";
+	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
+	property name="codegraphMaxNodes" inject="coldbox:setting:codegraphMaxNodes";
+	property name="codegraphMaxClusters" inject="coldbox:setting:codegraphMaxClusters";
+	property name="codegraphMaxHotspots" inject="coldbox:setting:codegraphMaxHotspots";
+	property name="codegraphMaxOrphans" inject="coldbox:setting:codegraphMaxOrphans";
+	property name="codegraphMaxLayerViolations" inject="coldbox:setting:codegraphMaxLayerViolations";
+	property name="codegraphSubgraphMaxNodes" inject="coldbox:setting:codegraphSubgraphMaxNodes";
+	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
+	property name="log" inject="logbox:logger:{this}";
+
+	/**
+	 * Executes the CodeGraph pipeline: index, metrics/clusters, optional narrative, persist.
+	 */
+	struct function execute( required any run, required struct scan, struct callbacks = {} ) {
+		var runId = arguments.run.getId();
+		var snapshot = {};
+		var narrative = { used: false };
+		var narrativeCacheKey = "";
+		try {
+			checkCancellation( arguments.callbacks );
+
+			emit( arguments.callbacks, 20, "codegraph-index", "Indexing symbols and dependencies" );
+			architectureIndexService.index( runId, arguments.scan.files ?: [] );
+			checkCancellation( arguments.callbacks );
+			renewLease( arguments.callbacks );
+
+			emit( arguments.callbacks, 40, "codegraph-metrics", "Computing coupling metrics" );
+			var edgeLimit = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+			var reviewGraph = graphRepository.getGraph( runId, edgeLimit );
+			reviewGraph.files = filePathsFromScan( arguments.scan.files ?: [] );
+			snapshot = metricsService.assemble(
+				reviewGraph,
+				{
+					maxClusters        : val( variables.codegraphMaxClusters ?: 60 ),
+					maxHotspots        : val( variables.codegraphMaxHotspots ?: 50 ),
+					maxOrphans         : val( variables.codegraphMaxOrphans ?: 200 ),
+					maxLayerViolations : val( variables.codegraphMaxLayerViolations ?: 200 ),
+					maxNodes           : val( variables.codegraphMaxNodes ?: 1500 ),
+					maxEdges           : edgeLimit
+				}
+			);
+			checkCancellation( arguments.callbacks );
+			renewLease( arguments.callbacks );
+
+			emit( arguments.callbacks, 60, "codegraph-clusters", "Clustering related files" );
+			checkCancellation( arguments.callbacks );
+			renewLease( arguments.callbacks );
+
+			emit( arguments.callbacks, 75, "codegraph-narrative", "Preparing optional narrative" );
+			var projectPath = arguments.run.getProjectPath() ?: "";
+			var repositoryRevision = arguments.scan.repositoryRevision ?: "";
+			narrative = resolveNarrative( snapshot, projectPath, repositoryRevision );
+			if ( isStruct( narrative ) && ( narrative.used ?: false ) ) {
+				narrativeCacheKey = narrativeService.cacheKey( snapshot, projectPath );
+			}
+			checkCancellation( arguments.callbacks );
+			renewLease( arguments.callbacks );
+
+			emit( arguments.callbacks, 90, "codegraph-persist", "Persisting CodeGraph snapshot" );
+			codeGraphRepository.save(
+				runId,
+				snapshot,
+				projectPath,
+				repositoryRevision,
+				narrativeCacheKey,
+				narrative
+			);
+
+			return {
+				status    : "succeeded",
+				message   : "CodeGraph snapshot generated",
+				snapshot  : snapshot,
+				narrative : narrative
+			};
+		} catch ( "RunCancelled" error ) {
+			return {
+				status    : "cancelled",
+				message   : "CodeGraph run cancelled",
+				snapshot  : snapshot,
+				narrative : narrative
+			};
+		} catch ( any error ) {
+			if ( findNoCase( "LeaseLostException", error.type ?: "" ) ) rethrow;
+			var failureMessage = trim( toString( error.message ?: "CodeGraph run failed" ) );
+			try {
+				if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+					log.error( "CodeGraph run #runId# failed: #failureMessage#", error );
+				}
+			} catch ( any ignored ) {}
+			return {
+				status    : "failed",
+				message   : "CodeGraph run failed: " & failureMessage,
+				snapshot  : snapshot,
+				narrative : narrative,
+				errors    : [ { stage: "codegraph", message: failureMessage } ]
+			};
+		}
+	}
+
+	/**
+	 * Cancel token for an in-flight CodeGraph run. No-op in v1 — ReviewRunService
+	 * still marks cancelRequestedAt and stops the executor future.
+	 */
+	void function cancelRun( required string id ) {
+		// v1: no in-pipeline cancel token beyond ReviewRunService callbacks.
+	}
+
+	/**
+	 * Result payload for GET /runs/:id/result — snapshot fields + narrative, no raw edges.
+	 */
+	struct function getResult( required string id ) {
+		var stored = codeGraphRepository.get( arguments.id );
+		if ( isNull( stored ) ) {
+			return {
+				codegraph: {
+					version           : "codegraph-snapshot-v1",
+					fingerprint       : "",
+					truncated         : false,
+					truncationReasons : [],
+					totals            : {
+						files: 0, symbols: 0, dependencies: 0, nodes: 0, edges: 0,
+						clusters: 0, cycles: 0, orphans: 0, layerViolations: 0
+					},
+					nodes             : [],
+					clusters          : [],
+					clusterEdges      : [],
+					cycles            : [],
+					hotspots          : [],
+					orphans           : [],
+					layerViolations   : [],
+					narrative         : { used: false }
+				}
+			};
+		}
+		var snap = isStruct( stored.snapshot ?: "" ) ? duplicate( stored.snapshot ) : {};
+		var payload = {
+			version           : stored.version ?: ( snap.version ?: "codegraph-snapshot-v1" ),
+			fingerprint       : stored.fingerprint ?: ( snap.fingerprint ?: "" ),
+			truncated         : stored.truncated ?: ( snap.truncated ?: false ),
+			truncationReasons : isArray( stored.truncationReasons ?: "" )
+				? stored.truncationReasons
+				: ( isArray( snap.truncationReasons ?: "" ) ? snap.truncationReasons : [] ),
+			totals            : isStruct( snap.totals ?: "" ) ? snap.totals : {},
+			nodes             : isArray( snap.nodes ?: "" ) ? snap.nodes : [],
+			clusters          : isArray( snap.clusters ?: "" ) ? snap.clusters : [],
+			clusterEdges      : isArray( snap.clusterEdges ?: "" ) ? snap.clusterEdges : [],
+			cycles            : isArray( snap.cycles ?: "" ) ? snap.cycles : [],
+			hotspots          : isArray( snap.hotspots ?: "" ) ? snap.hotspots : [],
+			orphans           : isArray( snap.orphans ?: "" ) ? snap.orphans : [],
+			layerViolations   : isArray( snap.layerViolations ?: "" ) ? snap.layerViolations : [],
+			narrative         : isStruct( stored.narrative ?: "" ) ? stored.narrative : { used: false }
+		};
+		return { codegraph: payload };
+	}
+
+	/**
+	 * Neighbourhood drill-down from a focus file path using persisted review_dependencies.
+	 * Caps depth and node count from query / Coldbox settings.
+	 */
+	struct function subgraph( required string runId, required struct query ) {
+		var focus = replace( trim( toString( arguments.query.focus ?: "" ) ), "\", "/", "all" );
+		if ( !len( focus ) ) {
+			throw( type = "ValidationException", message = "focus is required" );
+		}
+		var maxDepthSetting = max( 1, val( variables.codegraphSubgraphMaxDepth ?: 3 ) );
+		var maxNodesSetting = max( 1, val( variables.codegraphSubgraphMaxNodes ?: 300 ) );
+		var depth = max( 1, min( maxDepthSetting, val( arguments.query.depth ?: maxDepthSetting ) ) );
+		var limit = max( 1, min( maxNodesSetting, val( arguments.query.limit ?: maxNodesSetting ) ) );
+		if ( val( arguments.query.limit ?: 0 ) > maxNodesSetting ) {
+			throw( type = "ValidationException", message = "limit must be between 1 and #maxNodesSetting#" );
+		}
+		if ( val( arguments.query.depth ?: 0 ) > maxDepthSetting ) {
+			throw( type = "ValidationException", message = "depth must be between 1 and #maxDepthSetting#" );
+		}
+
+		var kindFilter = normalizeKindFilter( arguments.query.kinds ?: "" );
+		var includeTests = isBoolean( arguments.query.includeTests ?: "" )
+			? arguments.query.includeTests
+			: listFindNoCase( "tests,1,true,yes", trim( toString( arguments.query.include ?: "" ) ) ) > 0;
+
+		var edgeLimit = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		var reviewGraph = graphRepository.getGraph( arguments.runId, edgeLimit );
+		var adjacency = buildAdjacency( reviewGraph.dependencies ?: [], kindFilter, includeTests );
+
+		var focusKey = lCase( focus );
+		var visited = {};
+		var nodeDepth = {};
+		var queue = [];
+		visited[ focusKey ] = focus;
+		nodeDepth[ focusKey ] = 0;
+		queue.append( focus );
+
+		var qi = 1;
+		while ( qi <= queue.len() && visited.count() < limit ) {
+			var current = queue[ qi ];
+			qi++;
+			var currentKey = lCase( current );
+			var currentDepth = nodeDepth[ currentKey ] ?: 0;
+			if ( currentDepth >= depth ) continue;
+			var neighbors = adjacency[ currentKey ] ?: [];
+			for ( var neighbor in neighbors ) {
+				var neighborKey = lCase( neighbor );
+				if ( visited.keyExists( neighborKey ) ) continue;
+				if ( visited.count() >= limit ) break;
+				visited[ neighborKey ] = neighbor;
+				nodeDepth[ neighborKey ] = currentDepth + 1;
+				queue.append( neighbor );
+			}
+		}
+
+		var nodes = [];
+		var nodeKeys = visited.keyArray().sort( "textnocase" );
+		for ( var key in nodeKeys ) {
+			nodes.append( {
+				id    : visited[ key ],
+				path  : visited[ key ],
+				depth : nodeDepth[ key ] ?: 0
+			} );
+		}
+
+		var edges = [];
+		var deps = isArray( reviewGraph.dependencies ?: "" ) ? reviewGraph.dependencies : [];
+		for ( var edge in deps ) {
+			if ( !isStruct( edge ) ) continue;
+			var kind = trim( toString( edge.kind ?: "" ) );
+			if ( !includeTests && lCase( kind ) == "tests" ) continue;
+			if ( kindFilter.len() && !kindFilter.contains( lCase( kind ) ) ) continue;
+			var source = replace( trim( toString( edge.sourceFile ?: "" ) ), "\", "/", "all" );
+			var target = replace( trim( toString( edge.targetFile ?: "" ) ), "\", "/", "all" );
+			if ( !len( source ) || !len( target ) ) continue;
+			if ( !visited.keyExists( lCase( source ) ) || !visited.keyExists( lCase( target ) ) ) continue;
+			edges.append( {
+				id         : edge.id ?: "",
+				sourceFile : source,
+				targetFile : target,
+				kind       : kind,
+				target     : edge.target ?: "",
+				line       : val( edge.line ?: 0 ),
+				evidence   : edge.evidence ?: ""
+			} );
+		}
+
+		var totalNodes = adjacency.count() ? adjacency.count() : nodes.len();
+		var truncated = visited.count() >= limit || nodes.len() < totalNodes;
+		return {
+			focus      : focus,
+			depth      : depth,
+			truncated  : truncated,
+			totalNodes : nodes.len(),
+			totalEdges : edges.len(),
+			nodes      : nodes,
+			edges      : edges
+		};
+	}
+
+	/**
+	 * Optional narrative: reuse by cache key when possible; never fail the run.
+	 * Snapshot is not mutated.
+	 */
+	private struct function resolveNarrative(
+		required struct snapshot,
+		required string projectPath,
+		required string repositoryRevision
+	) {
+		if ( isNull( variables.narrativeService ?: javacast( "null", "" ) ) ) {
+			return { used: false };
+		}
+		try {
+			if ( !narrativeService.isEnabled() ) {
+				return { used: false };
+			}
+			var cacheKey = narrativeService.cacheKey( arguments.snapshot, arguments.projectPath );
+			var reused = codeGraphRepository.findReusableNarrative(
+				arguments.projectPath,
+				arguments.repositoryRevision,
+				cacheKey
+			);
+			if ( !isNull( reused ) && isStruct( reused ) && ( reused.used ?: false ) ) {
+				var reusedCopy = duplicate( reused );
+				reusedCopy.reused = true;
+				return reusedCopy;
+			}
+			return narrativeService.narrate( arguments.snapshot );
+		} catch ( any narrativeError ) {
+			try {
+				if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+					log.info(
+						"CodeGraph narrative skipped: #( narrativeError.message ?: 'unavailable' )#"
+					);
+				}
+			} catch ( any ignored ) {}
+			return {
+				used  : false,
+				error : trim( toString( narrativeError.message ?: "CodeGraph narrative unavailable" ) )
+			};
+		}
+	}
+
+	private array function filePathsFromScan( required array files ) {
+		var paths = [];
+		for ( var entry in arguments.files ) {
+			if ( isSimpleValue( entry ) ) {
+				var simplePath = replace( trim( toString( entry ) ), "\", "/", "all" );
+				if ( len( simplePath ) ) paths.append( simplePath );
+				continue;
+			}
+			if ( !isStruct( entry ) ) continue;
+			var path = replace( trim( toString( entry.filePath ?: entry.path ?: "" ) ), "\", "/", "all" );
+			if ( len( path ) ) paths.append( path );
+		}
+		return paths;
+	}
+
+	private struct function buildAdjacency( required array dependencies, required array kindFilter, required boolean includeTests ) {
+		var adjacency = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( !isStruct( edge ) ) continue;
+			var kind = trim( toString( edge.kind ?: "" ) );
+			if ( !arguments.includeTests && lCase( kind ) == "tests" ) continue;
+			if ( arguments.kindFilter.len() && !arguments.kindFilter.contains( lCase( kind ) ) ) continue;
+			var source = replace( trim( toString( edge.sourceFile ?: "" ) ), "\", "/", "all" );
+			var target = replace( trim( toString( edge.targetFile ?: "" ) ), "\", "/", "all" );
+			if ( !len( source ) || !len( target ) ) continue;
+			var sourceKey = lCase( source );
+			var targetKey = lCase( target );
+			if ( !adjacency.keyExists( sourceKey ) ) adjacency[ sourceKey ] = [];
+			if ( !adjacency.keyExists( targetKey ) ) adjacency[ targetKey ] = [];
+			appendUniqueNeighbor( adjacency[ sourceKey ], target, targetKey );
+			appendUniqueNeighbor( adjacency[ targetKey ], source, sourceKey );
+		}
+		return adjacency;
+	}
+
+	private void function appendUniqueNeighbor( required array list, required string path, required string key ) {
+		for ( var item in arguments.list ) {
+			if ( lCase( item ) == arguments.key ) return;
+		}
+		arguments.list.append( arguments.path );
+	}
+
+	private array function normalizeKindFilter( required any kinds ) {
+		var raw = [];
+		if ( isArray( arguments.kinds ) ) {
+			raw = arguments.kinds;
+		} else if ( isSimpleValue( arguments.kinds ) && len( trim( toString( arguments.kinds ) ) ) ) {
+			raw = listToArray( toString( arguments.kinds ), "," );
+		}
+		var out = [];
+		var seen = {};
+		for ( var item in raw ) {
+			var kind = lCase( trim( toString( item ) ) );
+			if ( !len( kind ) || seen.keyExists( kind ) ) continue;
+			seen[ kind ] = true;
+			out.append( kind );
+		}
+		return out;
+	}
+
+	private void function emit(
+		required struct callbacks,
+		required numeric progress,
+		required string phase,
+		required string message
+	) {
+		renewLease( arguments.callbacks );
+		if ( structKeyExists( arguments.callbacks, "transition" ) && isCustomFunction( arguments.callbacks.transition ) ) {
+			arguments.callbacks.transition( arguments.progress, arguments.phase, arguments.message );
+		}
+		var eventName = {
+			"codegraph-index"     : "codegraph.index",
+			"codegraph-metrics"   : "codegraph.metrics",
+			"codegraph-clusters"  : "codegraph.clusters",
+			"codegraph-narrative" : "codegraph.narrative"
+		}[ arguments.phase ] ?: "";
+		if ( len( eventName ) && len( trim( arguments.callbacks.runId ?: "" ) ) ) {
+			try {
+				if ( !isNull( variables.eventService ?: javacast( "null", "" ) ) ) {
+					eventService.publish(
+						arguments.callbacks.runId,
+						eventName,
+						{
+							progress : arguments.progress,
+							phase    : arguments.phase,
+							message  : arguments.message,
+							runKind  : arguments.callbacks.runKind ?: "codegraph"
+						}
+					);
+				}
+			} catch ( any ignored ) {
+				// Lifecycle progress remains owned by ReviewRunService; event detail is best effort.
+			}
+		}
+		renewLease( arguments.callbacks );
+	}
+
+	private void function renewLease( required struct callbacks ) {
+		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) {
+			arguments.callbacks.renewLease();
+		}
+	}
+
+	private void function checkCancellation( required struct callbacks ) {
+		if ( isCancelled( arguments.callbacks ) ) {
+			throw( type = "RunCancelled", message = "CodeGraph run cancelled" );
+		}
+	}
+
+	private boolean function isCancelled( required struct callbacks ) {
+		return structKeyExists( arguments.callbacks, "checkCancellation" )
+			&& isCustomFunction( arguments.callbacks.checkCancellation )
+			&& arguments.callbacks.checkCancellation();
+	}
+}

@@ -1,0 +1,173 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraphMetricsService", () => {
+
+			var metrics = new app.models.services.CodeGraphMetricsService();
+			var coupling = new app.models.services.ModernizationCouplingGraphService();
+			var adapter = new app.models.services.CodeGraphInventoryAdapter();
+
+			it( "reads fan-in from CouplingGraph rather than recomputing it", () => {
+				var reviewGraph = {
+					symbols: [],
+					files: [ "app/models/Hub.cfc", "app/models/A.cfc", "app/models/B.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d2", sourceFile: "app/models/B.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 }
+					]
+				};
+				var inventory = adapter.adapt( reviewGraph );
+				var graph = coupling.build( inventory );
+				var snapshot = metrics.assemble( reviewGraph );
+
+				var hub = snapshot.nodes.filter( ( node ) => node.path == "app/models/Hub.cfc" )[ 1 ];
+				expect( hub.fanIn ).toBe( graph.fanIn( "app/models/Hub.cfc" ) );
+				expect( hub.fanIn ).toBe( 2 );
+				expect( hub.fanOut ).toBe( graph.fanOut( "app/models/Hub.cfc" ) );
+			} );
+
+			it( "marks both members of a two-file cycle as inCycle", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/models/Order.cfc", "app/models/Invoice.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/Order.cfc", kind: "constructs", target: "Invoice", targetFile: "app/models/Invoice.cfc", line: 5 },
+						{ id: "d2", sourceFile: "app/models/Invoice.cfc", kind: "constructs", target: "Order", targetFile: "app/models/Order.cfc", line: 8 }
+					]
+				} );
+
+				var order = snapshot.nodes.filter( ( node ) => node.path == "app/models/Order.cfc" )[ 1 ];
+				var invoice = snapshot.nodes.filter( ( node ) => node.path == "app/models/Invoice.cfc" )[ 1 ];
+				expect( order.inCycle ).toBeTrue();
+				expect( invoice.inCycle ).toBeTrue();
+				expect( snapshot.cycles ).toHaveLength( 1 );
+			} );
+
+			it( "does not treat Application.bx or tests/ files as orphans", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [
+						"Application.bx",
+						"tests/OrdersSpec.bx",
+						"app/models/Lonely.cfc",
+						"public/index.cfm"
+					],
+					dependencies: []
+				} );
+
+				var orphanPaths = snapshot.orphans.map( ( item ) => item.path );
+				expect( orphanPaths ).toInclude( "app/models/Lonely.cfc" );
+				expect( orphanPaths ).notToInclude( "Application.bx" );
+				expect( orphanPaths ).notToInclude( "tests/OrdersSpec.bx" );
+				expect( orphanPaths ).notToInclude( "public/index.cfm" );
+			} );
+
+			it( "flags models→handlers as a layer violation and not the reverse", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/models/OrderService.cfc", "app/handlers/Orders.bx" ],
+					dependencies: [
+						{ id: "bad", sourceFile: "app/models/OrderService.cfc", kind: "constructs", target: "Orders", targetFile: "app/handlers/Orders.bx", line: 4 },
+						{ id: "ok", sourceFile: "app/handlers/Orders.bx", kind: "injects", target: "OrderService", targetFile: "app/models/OrderService.cfc", line: 6 }
+					]
+				} );
+
+				expect( snapshot.layerViolations ).toHaveLength( 1 );
+				expect( snapshot.layerViolations[ 1 ].from ).toBe( "app/models/OrderService.cfc" );
+				expect( snapshot.layerViolations[ 1 ].to ).toBe( "app/handlers/Orders.bx" );
+				expect( snapshot.layerViolations[ 1 ].fromLayer ).toBe( "application-models" );
+				expect( snapshot.layerViolations[ 1 ].toLayer ).toBe( "http-handlers" );
+			} );
+
+			it( "ranks hotspots byte-stably", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "s1", filePath: "app/models/Hub.cfc", kind: "function", name: "a", line: 2 },
+						{ id: "s2", filePath: "app/models/Hub.cfc", kind: "function", name: "b", line: 8 }
+					],
+					files: [ "app/models/Hub.cfc", "app/models/A.cfc", "app/models/B.cfc", "app/models/C.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d2", sourceFile: "app/models/B.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d3", sourceFile: "app/models/C.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d4", sourceFile: "app/models/Hub.cfc", kind: "constructs", target: "A", targetFile: "app/models/A.cfc", line: 10 }
+					]
+				};
+
+				var first = metrics.assemble( reviewGraph );
+				var second = metrics.assemble( reviewGraph );
+				expect( jsonSerialize( first.hotspots ) ).toBe( jsonSerialize( second.hotspots ) );
+				expect( first.hotspots[ 1 ].path ).toBe( "app/models/Hub.cfc" );
+				expect( first.hotspots[ 1 ].hotspotScore ).toBeGTE( first.hotspots[ 2 ].hotspotScore );
+			} );
+
+			it( "sets truncated when every presenter cap is hit", () => {
+				var files = [];
+				var deps = [];
+				for ( var i = 1; i <= 8; i++ ) {
+					files.append( "app/models/F#i#.cfc" );
+					files.append( "app/handlers/H#i#.bx" );
+					deps.append( {
+						id: "v#i#",
+						sourceFile: "app/models/F#i#.cfc",
+						kind: "constructs",
+						target: "H#i#",
+						targetFile: "app/handlers/H#i#.bx",
+						line: 1
+					} );
+				}
+				// Disconnected orphans to fill orphan cap.
+				for ( var j = 1; j <= 5; j++ ) {
+					files.append( "app/models/Orphan#j#.cfc" );
+				}
+
+				var snapshot = metrics.assemble(
+					{ symbols: [], files: files, dependencies: deps },
+					{
+						maxClusters        : 2,
+						maxHotspots        : 2,
+						maxOrphans         : 2,
+						maxLayerViolations : 2,
+						maxNodes           : 4,
+						maxEdges           : 1
+					}
+				);
+
+				expect( snapshot.truncated ).toBeTrue();
+				expect( snapshot.truncationReasons ).toInclude( "maxClusters" );
+				expect( snapshot.truncationReasons ).toInclude( "maxHotspots" );
+				expect( snapshot.truncationReasons ).toInclude( "maxOrphans" );
+				expect( snapshot.truncationReasons ).toInclude( "maxLayerViolations" );
+				expect( snapshot.truncationReasons ).toInclude( "maxNodes" );
+				expect( snapshot.truncationReasons ).toInclude( "maxEdges" );
+				expect( snapshot.clusters ).toHaveLength( 2 );
+				expect( snapshot.hotspots ).toHaveLength( 2 );
+				expect( snapshot.orphans ).toHaveLength( 2 );
+				expect( snapshot.layerViolations ).toHaveLength( 2 );
+				expect( snapshot.nodes.len() ).toBeLTE( 4 );
+			} );
+
+			it( "keeps fingerprint stable under key-order shuffle of identical content", () => {
+				var reviewGraph = {
+					symbols: [ { id: "s1", filePath: "app/models/A.cfc", kind: "class", name: "A", line: 1 } ],
+					files: [ "app/models/A.cfc", "app/models/B.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "B", targetFile: "app/models/B.cfc", line: 2 }
+					]
+				};
+				var first = metrics.assemble( reviewGraph );
+				var second = metrics.assemble( {
+					dependencies: reviewGraph.dependencies,
+					files: reviewGraph.files,
+					symbols: reviewGraph.symbols
+				} );
+
+				expect( first.fingerprint ).toBe( second.fingerprint );
+				expect( first.version ).toBe( "codegraph-snapshot-v1" );
+				expect( len( first.fingerprint ) ).toBe( 64 );
+			} );
+
+		} );
+	}
+
+}
