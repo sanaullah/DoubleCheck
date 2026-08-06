@@ -273,10 +273,10 @@ test("buildSvg highlights only matching edge kind when parallel edges share from
 		flowEdgeKinds: ["injects"]
 	});
 	const injects = svg.match(
-		/<path class="cg-edge is-flow-highlight"[^>]*data-kind="injects"/
+		/<path class="cg-edge[^"]*is-flow-highlight[^"]*"[^>]*data-kind="injects"/
 	);
 	const calls = svg.match(
-		/<path class="cg-edge is-flow-highlight"[^>]*data-kind="calls"/
+		/<path class="cg-edge[^"]*is-flow-highlight[^"]*"[^>]*data-kind="calls"/
 	);
 	assert.ok(injects, "injects edge should be flow-highlighted");
 	assert.equal(calls, null, "calls edge must not be flow-highlighted");
@@ -300,7 +300,7 @@ test("buildSvg marks flow highlight nodes and consecutive edges", () => {
 		svg,
 		/<g class="[^"]*is-flow-highlight[^"]*" data-node-id="app\/models\/orderservice\.cfc"/
 	);
-	assert.match(svg, /<path class="cg-edge is-flow-highlight"/);
+	assert.match(svg, /<path class="cg-edge[^"]*is-flow-highlight"/);
 	assert.doesNotMatch(
 		svg,
 		/<g class="[^"]*is-flow-highlight[^"]*" data-node-id="app\/models\/orphan\.cfc"/
@@ -331,4 +331,53 @@ test("file and focus views render fan-in meta and edge kinds", () => {
 	assert.equal(focus.mode, "focus");
 	const focusSvg = layout.buildSvg(layout.layoutRadial(focus, { detail: true }));
 	assert.ok(focusSvg.includes("is-focus") || focusSvg.includes('data-kind="file"'));
+});
+
+test("buildFileView stubs outside endpoints for crossing edges", () => {
+	const view = layout.buildFileView(
+		{
+			nodes: [{ id: "app/a.cfc", path: "app/a.cfc", clusterId: "c1" }],
+			edges: [
+				{
+					from: "app/handlers/x.cfc",
+					to: "app/a.cfc",
+					kind: "injects",
+					sourceFile: "app/handlers/X.cfc",
+					targetFile: "app/a.cfc",
+					crossing: true
+				},
+				{
+					from: "app/a.cfc",
+					to: "app/b.cfc",
+					kind: "injects",
+					sourceFile: "app/a.cfc",
+					targetFile: "app/b.cfc",
+					crossing: true
+				}
+			]
+		},
+		{ detail: true }
+	);
+	const outside = view.nodes.filter((n) => n.external);
+	assert.equal(outside.length, 2);
+	assert.ok(outside.some((n) => /x\.cfc$/i.test(n.path || n.id)));
+	assert.ok(outside.some((n) => /b\.cfc$/i.test(n.path || n.id)));
+	assert.ok(outside.every((n) => n.external && (n.role === "outside" || String(n.label || "").length)));
+	assert.equal(view.edges.length, 2);
+	assert.ok(view.edges.every((e) => e.crossing));
+	const svg = layout.buildSvg(layout.layoutClusters(view, { detail: true }));
+	assert.ok(svg.includes("is-external"));
+	assert.ok(svg.includes("is-crossing"));
+	assert.ok(svg.includes('data-role="outside"'));
+	assert.ok(svg.includes("marker-end"));
+	assert.ok(svg.includes("cg-file-complexity") || svg.includes("data-complexity"));
+});
+
+test("fileComplexityOf and fileRoleChip are deterministic", () => {
+	assert.equal(layout.fileComplexityOf({ fanIn: 0, fanOut: 0, hotspotScore: 0 }), "simple");
+	assert.equal(layout.fileComplexityOf({ fanIn: 4, fanOut: 3, hotspotScore: 30 }), "moderate");
+	assert.equal(layout.fileComplexityOf({ fanIn: 8, fanOut: 6, hotspotScore: 60, inCycle: true }), "complex");
+	assert.equal(layout.fileRoleChip({ external: true }), "outside");
+	assert.equal(layout.fileRoleChip({ role: "entry" }), "entry");
+	assert.equal(layout.fileRoleChip({ role: "unknown" }), "");
 });

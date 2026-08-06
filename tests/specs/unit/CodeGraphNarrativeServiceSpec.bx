@@ -34,6 +34,40 @@ class extends="testbox.system.BaseSpec" {
 				expect( snapshot ).toBe( before );
 			} );
 
+			it( "requests enough max_tokens for full v2 narrative JSON", () => {
+				var captured = { max_tokens: 0 };
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						captured.max_tokens = val( params.max_tokens ?: 0 );
+						return v2FixtureResponse();
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider      : "openai-compatible",
+					apiKey        : "test-key",
+					model         : "corpus-v1",
+					isLocal       : false,
+					timeout       : 1,
+					contextWindow : 128000
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				var compiler = stubCompiler();
+				compiler.capabilities = ( provider ) => {
+					return { distinctSystem: true, maxOutputTokens: 16000, jsonObject: true };
+				};
+				service.promptCompiler = compiler;
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var result = service.narrate( sampleSnapshot() );
+				expect( result.used ).toBeTrue();
+				expect( captured.max_tokens ).toBeGTE( 4096 );
+			} );
+
 			it( "drops domains and summaries that cite an unknown clusterId", () => {
 				var service = new app.models.services.CodeGraphNarrativeService();
 				service.chatGateway = {

@@ -4172,8 +4172,26 @@ async function codeGraphSelectFlow(flowId) {
 function renderCodeGraphMeaningBanner(hasSnapshot) {
 	const host = elements.codegraphMeaningBanner;
 	if (!host) return;
-	const show = !!(hasSnapshot && !codeGraphMeaningUsed());
+	const narrative = codeGraphSnapshotNarrative();
+	const used = !!(narrative && narrative.used);
+	const show = !!(hasSnapshot && !used);
 	host.hidden = !show;
+	if (!show) return;
+	const providerLive = !!(state.capabilities?.aiExecution?.enabled);
+	const narrativeEnabled = narrative && narrative.enabled !== false;
+	const err = String(narrative?.error || "").trim();
+	if ((providerLive || narrativeEnabled) && err) {
+		const short = err.length > 140 ? `${err.slice(0, 137)}…` : err;
+		host.textContent = `Meaning briefing failed — ${short} Re-run CodeGraph to retry.`;
+		return;
+	}
+	if (providerLive || narrativeEnabled) {
+		host.textContent =
+			"Meaning briefing unavailable for this run — re-run CodeGraph to generate domain and process briefing.";
+		return;
+	}
+	host.textContent =
+		"Meaning layer unavailable — configure an AI provider for domain and process briefing.";
 }
 
 function renderCodeGraphRoleLegend(hasSnapshot) {
@@ -4458,6 +4476,60 @@ async function codeGraphOpenFile(pathOrId, { neighbourhood = false } = {}) {
 	codeGraphCentreOnNode(id);
 }
 
+function codeGraphRelationLists(node) {
+	const id = codeGraphNormId(node && (node.id || node.path));
+	if (!id) return { callers: [], callees: [] };
+	const edges = state.codegraph.layoutResult?.edges || state.codegraph.fileEdges || [];
+	const callers = [];
+	const callees = [];
+	const seenIn = new Set();
+	const seenOut = new Set();
+	edges.forEach((e) => {
+		const from = codeGraphNormId(e.from || e.sourceFile);
+		const to = codeGraphNormId(e.to || e.targetFile);
+		const kind = e.kind || e.label || "depends";
+		if (to === id && from) {
+			const key = from + "\0" + kind;
+			if (seenIn.has(key)) return;
+			seenIn.add(key);
+			callers.push({
+				id: from,
+				path: e.sourceFile || e.from || from,
+				kind,
+				crossing: !!e.crossing
+			});
+		}
+		if (from === id && to) {
+			const key = to + "\0" + kind;
+			if (seenOut.has(key)) return;
+			seenOut.add(key);
+			callees.push({
+				id: to,
+				path: e.targetFile || e.to || to,
+				kind,
+				crossing: !!e.crossing
+			});
+		}
+	});
+	return { callers, callees };
+}
+
+function codeGraphRelationListHtml(title, items) {
+	if (!items.length) return "";
+	return `<div class="codegraph-inspector-files"><h4>${escapeHtml(title)}</h4><ul>${items
+		.slice(0, 24)
+		.map((item) => {
+			const path = String(item.path || item.id || "");
+			const base = path.replace(/\\/g, "/").split("/").pop() || path;
+			const outside = item.crossing ? " · outside" : "";
+			const kind = item.kind ? ` (${item.kind})` : "";
+			return `<li><button type="button" class="codegraph-file-link" data-codegraph-file="${escapeHtml(path)}" title="${escapeHtml(path)}">${escapeHtml(base)}${escapeHtml(outside)}${escapeHtml(kind)}</button></li>`;
+		})
+		.join("")}${
+		items.length > 24 ? `<li class="codegraph-inspector-more">+${items.length - 24} more</li>` : ""
+	}</ul></div>`;
+}
+
 function codeGraphInspectorHtml(node) {
 	if (!node) {
 		return emptyStateHtml({ icon: "detail", title: "Select a node", hint: "Inspect cluster, file, or edge details here." });
@@ -4469,6 +4541,7 @@ function codeGraphInspectorHtml(node) {
 			["To", node.toPath || node.to || "—"],
 			["Line", node.line != null && node.line !== "" ? String(node.line) : ""],
 			["Target", node.target || ""],
+			["Crossing", node.crossing ? "Yes (outside module)" : ""],
 			["Evidence", node.evidence || ""]
 		].filter(([, value]) => value !== "");
 		return `<div class="codegraph-inspector-body"><h3>Dependency</h3><dl class="codegraph-inspector-grid">${rows
@@ -4478,7 +4551,8 @@ function codeGraphInspectorHtml(node) {
 	const rows = [
 		["Kind", node.kind || "—"],
 		["Path", node.path || "—"],
-		["Cluster", node.clusterId || "—"],
+		["Role", node.role && node.role !== "unknown" ? node.role : ""],
+		["Cluster", node.external ? "outside module" : node.clusterId || "—"],
 		["Layer", node.layerLabel || (node.layer != null ? String(node.layer) : "—")],
 		["Complexity", node.complexity || ""],
 		["Files", node.fileCount != null ? String(node.fileCount) : ""],
@@ -4509,6 +4583,9 @@ function codeGraphInspectorHtml(node) {
 			}</ul></div>`
 		: "";
 	const isFile = node.kind === "file" || (!!node.path && node.kind !== "cluster");
+	const relations = isFile ? codeGraphRelationLists(node) : { callers: [], callees: [] };
+	const callersBlock = codeGraphRelationListHtml("Called from", relations.callers);
+	const calleesBlock = codeGraphRelationListHtml("Calls / injects", relations.callees);
 	const onOverview = state.codegraph.mode === "cluster" || state.codegraph.mode === "overview";
 	const hint = node.kind === "cluster"
 		? onOverview
@@ -4516,7 +4593,7 @@ function codeGraphInspectorHtml(node) {
 			: "Click a file below, then open neighbourhood."
 		: state.codegraph.mode === "focus"
 			? "Click an edge for evidence. Neighbourhood focus for this file."
-			: "Open neighbourhood to see dependents and dependencies. Click an edge for evidence.";
+			: "Called from lists who reaches this file (including outside the module). Open neighbourhood for a wider BFS.";
 	const explore =
 		node.kind === "cluster" && onOverview
 			? `<button type="button" class="secondary-button codegraph-explore-btn" data-codegraph-explore="${escapeHtml(node.id)}">Explore files</button>`
@@ -4527,7 +4604,7 @@ function codeGraphInspectorHtml(node) {
 			: "";
 	return `<div class="codegraph-inspector-body"><h3>${escapeHtml(node.label || node.id || "Node")}</h3><dl class="codegraph-inspector-grid">${rows
 		.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd title="${escapeHtml(v)}">${escapeHtml(v)}</dd></div>`)
-		.join("")}</dl>${detSummary}${aiBlock}${filesBlock}<div class="codegraph-inspector-actions">${explore}${neighbourhood}</div><p class="field-hint">${hint}</p></div>`;
+		.join("")}</dl>${detSummary}${aiBlock}${callersBlock}${calleesBlock}${filesBlock}<div class="codegraph-inspector-actions">${explore}${neighbourhood}</div><p class="field-hint">${hint}</p></div>`;
 }
 
 function renderCodeGraphDepthControl() {
@@ -4873,6 +4950,9 @@ function codeGraphSelectEdge(from, to, kind, attrs = {}) {
 		edge.target = edge.target || fromLayout.target || "";
 		edge.fromPath = fromLayout.sourceFile || edge.fromPath;
 		edge.toPath = fromLayout.targetFile || edge.toPath;
+		edge.crossing = !!fromLayout.crossing;
+	} else if (attrs.crossing != null) {
+		edge.crossing = attrs.crossing === true || attrs.crossing === "true";
 	}
 	state.codegraph.selectedEdge = edge;
 	state.codegraph.selectedId = "";
@@ -7399,6 +7479,7 @@ elements.codegraphCanvas?.addEventListener("pointerdown", (event) => {
 		edgeKind: onEdge ? onEdge.getAttribute("data-kind") || "" : "",
 		edgeEvidence: onEdge ? onEdge.getAttribute("data-evidence") || "" : "",
 		edgeLine: onEdge ? onEdge.getAttribute("data-line") || "" : "",
+		edgeCrossing: onEdge ? onEdge.getAttribute("data-crossing") === "true" : false,
 		forcePan,
 		moved: false,
 		panning: forcePan
@@ -7441,7 +7522,8 @@ elements.codegraphCanvas?.addEventListener("pointerup", (event) => {
 	else if (session.edgeFrom && session.edgeTo) {
 		codeGraphSelectEdge(session.edgeFrom, session.edgeTo, session.edgeKind, {
 			evidence: session.edgeEvidence,
-			line: session.edgeLine
+			line: session.edgeLine,
+			crossing: session.edgeCrossing
 		});
 	}
 });

@@ -16,8 +16,8 @@
 		gapY: 20,
 		pad: 24,
 		// File / neighbourhood detail cards
-		detailNodeWidth: 220,
-		detailNodeHeight: 76,
+		detailNodeWidth: 236,
+		detailNodeHeight: 92,
 		detailGapX: 56,
 		detailGapY: 28,
 		// Overview (project-module) cards — fewer, larger, quieter
@@ -101,9 +101,30 @@
 		const symbols = Number(cluster && cluster.symbolCount) || 0;
 		const inCycle = !!(cluster && (cluster.inCycle || cluster.hasCycle));
 		const score = files + crossing * 3 + Math.floor(symbols / 20) + (inCycle ? 8 : 0);
-		if (score >= 40 || inCycle && files >= 8) return "complex";
+		if (score >= 40 || (inCycle && files >= 8)) return "complex";
 		if (score >= 12) return "moderate";
 		return "simple";
+	}
+
+	/** Deterministic complexity for file / neighbourhood cards. */
+	function fileComplexityOf(node) {
+		const fanIn = Number(node && node.fanIn) || 0;
+		const fanOut = Number(node && node.fanOut) || 0;
+		const hot = Number(node && node.hotspotScore) || 0;
+		const inCycle = !!(node && node.inCycle);
+		const score = fanIn * 2 + fanOut + Math.floor(hot / 10) + (inCycle ? 10 : 0);
+		if (score >= 28 || hot >= 50) return "complex";
+		if (score >= 10 || hot >= 25) return "moderate";
+		return "simple";
+	}
+
+	function fileRoleChip(node) {
+		if (node && node.external) return "outside";
+		const role = String((node && node.role) || "")
+			.toLowerCase()
+			.trim();
+		if (!role || role === "unknown") return "";
+		return role;
 	}
 
 	function layerLabelOf(cluster, index) {
@@ -297,6 +318,7 @@
 				target: e.target != null ? String(e.target) : "",
 				sourceFile: normPath(e.sourceFile || rawFrom),
 				targetFile: normPath(e.targetFile || rawTo),
+				crossing: !!e.crossing,
 				id: e.id != null ? String(e.id) : ""
 			};
 			seen.set(key, edge);
@@ -425,7 +447,9 @@
 				symbolCount: n.symbolCount || 0,
 				inCycle: !!n.inCycle,
 				hotspotScore: n.hotspotScore || 0,
-				role: n.role || ""
+				role: n.role || "",
+				external: !!n.external,
+				complexity: n.complexity || ""
 			};
 		});
 
@@ -439,6 +463,41 @@
 		const filteredEdges = cfg.kinds
 			? edges.filter((e) => cfg.kinds.indexOf(e.kind) >= 0)
 			: edges;
+
+		// Stub outside-module endpoints referenced by crossing edges.
+		const known = new Set(nodes.map((n) => normId(n.id)));
+		filteredEdges.forEach((e) => {
+			[e.from, e.to].forEach((endId) => {
+				const key = normId(endId);
+				if (!key || known.has(key)) return;
+				known.add(key);
+				const path = normPath(
+					normId(e.from) === key ? e.sourceFile || e.from : e.targetFile || e.to
+				);
+				nodes.push({
+					id: key,
+					path: path || key,
+					label: fileBasename(path || key),
+					kind: "file",
+					layer: 3,
+					layerLabel: "outside",
+					component: "",
+					clusterId: "",
+					fanIn: 0,
+					fanOut: 0,
+					symbolCount: 0,
+					inCycle: false,
+					hotspotScore: 0,
+					role: "outside",
+					external: true,
+					complexity: "simple"
+				});
+			});
+		});
+
+		nodes.forEach((n) => {
+			if (!n.complexity) n.complexity = fileComplexityOf(n);
+		});
 
 		const capped = capGraph(nodes, filteredEdges, cfg.maxNodes, cfg.maxEdges);
 		return Object.assign({ mode: "file", detail: true }, capped);
@@ -954,6 +1013,8 @@
 	function buildFileNode(n, opts) {
 		const title = escapeXml(nodeLabel(n, opts));
 		const isFocus = n.role === "focus";
+		const roleChip = fileRoleChip(n);
+		const complexity = n.complexity || fileComplexityOf(n);
 		const meta = [];
 		if (n.fanIn != null || n.fanOut != null) {
 			meta.push("in " + (Number(n.fanIn) || 0) + " · out " + (Number(n.fanOut) || 0));
@@ -965,9 +1026,31 @@
 		const cls =
 			"cg-node cg-file" +
 			(isFocus ? " is-focus" : "") +
+			(n.external ? " is-external" : "") +
 			(n.inCycle ? " in-cycle" : "") +
 			(n.hotspotScore >= 40 ? " is-hotspot" : "") +
 			(flowHighlight ? " is-flow-highlight" : "");
+		const chipY = n.y + 16;
+		const titleY = n.y + (roleChip || complexity ? 40 : 28);
+		const metaY = titleY + 20;
+		const roleMarkup = roleChip
+			? '<text class="cg-file-role" x="' +
+				(n.x + 12) +
+				'" y="' +
+				chipY +
+				'">' +
+				escapeXml(roleChip) +
+				"</text>"
+			: "";
+		const complexityMarkup = complexity
+			? '<text class="cg-file-complexity" text-anchor="end" x="' +
+				(n.x + n.w - 12) +
+				'" y="' +
+				chipY +
+				'">' +
+				escapeXml(complexity) +
+				"</text>"
+			: "";
 		return (
 			'<g class="' +
 			cls +
@@ -977,6 +1060,11 @@
 			escapeXml(n.kind || "file") +
 			'" data-path="' +
 			escapeXml(n.path || "") +
+			'"' +
+			(n.external ? ' data-external="true"' : "") +
+			(roleChip ? ' data-role="' + escapeXml(roleChip) + '"' : n.role ? ' data-role="' + escapeXml(String(n.role)) + '"' : "") +
+			' data-complexity="' +
+			escapeXml(complexity) +
 			'">' +
 			'<rect class="cg-file-body" x="' +
 			n.x +
@@ -987,10 +1075,12 @@
 			'" height="' +
 			n.h +
 			'" rx="8" ry="8"/>' +
+			roleMarkup +
+			complexityMarkup +
 			'<text class="cg-file-title" x="' +
 			(n.x + 12) +
 			'" y="' +
-			(n.y + 28) +
+			titleY +
 			'">' +
 			title +
 			"</text>" +
@@ -998,7 +1088,7 @@
 				? '<text class="cg-file-meta" x="' +
 					(n.x + 12) +
 					'" y="' +
-					(n.y + 50) +
+					metaY +
 					'">' +
 					metaText +
 					"</text>"
@@ -1070,15 +1160,23 @@
 			const weight = e.weight != null ? e.weight : e.edgeCount;
 			const edgeLabel = e.kind || e.label || (weight != null ? String(weight) : "");
 			const edgeKey = normId(e.from) + "\0" + normId(e.to) + "\0" + String(e.kind || "");
+			const kindSlug = String(e.kind || "")
+				.toLowerCase()
+				.replace(/[^a-z0-9_-]+/g, "");
+			const kindClass = kindSlug ? " is-kind-" + kindSlug : "";
 			const selected = selectedEdgeKey && edgeKey === selectedEdgeKey ? " is-selected" : "";
 			const flowHighlight = edgeIsFlowHighlighted(e, flowCtx) ? " is-flow-highlight" : "";
+			const crossing = e.crossing ? " is-crossing" : "";
 			let extraAttrs = "";
 			if (e.evidence) extraAttrs += ' data-evidence="' + escapeXml(String(e.evidence).slice(0, 400)) + '"';
 			if (e.line != null && e.line !== "") extraAttrs += ' data-line="' + escapeXml(String(e.line)) + '"';
+			if (e.crossing) extraAttrs += ' data-crossing="true"';
 			edgeParts.push(
 				'<path class="cg-edge' +
+					kindClass +
 					selected +
 					flowHighlight +
+					crossing +
 					'" data-from="' +
 					escapeXml(e.from) +
 					'" data-to="' +
@@ -1087,9 +1185,9 @@
 					escapeXml(e.kind || "") +
 					'"' +
 					extraAttrs +
-					' d="' +
+					' marker-end="url(#cg-arrow)" d="' +
 					escapeXml(edgePath(a, b, opts)) +
-					'" fill="none" stroke="currentColor" stroke-opacity="0.45"/>' +
+					'" fill="none" stroke="currentColor"/>' +
 					(edgeLabel
 						? '<text class="cg-edge-label" x="' +
 							((a.x + a.w + b.x) / 2) +
@@ -1122,6 +1220,7 @@
 			'" role="img" aria-label="' +
 			aria +
 			'">' +
+			'<defs><marker id="cg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker></defs>' +
 			'<g class="cg-edges">' +
 			edgeParts.join("") +
 			"</g>" +
@@ -1270,6 +1369,8 @@
 		idsEqual,
 		uniqueEdges,
 		complexityOf,
+		fileComplexityOf,
+		fileRoleChip,
 		summaryForCluster,
 		wrapText,
 		selectTopClusters,
