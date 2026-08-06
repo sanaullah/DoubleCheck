@@ -117,7 +117,7 @@ class threadsafe {
 			} );
 		}
 
-		return classifyDerivedClusters( arguments.graph, clusters );
+		return disambiguateClusterNames( classifyDerivedClusters( arguments.graph, clusters ) );
 	}
 
 	/**
@@ -946,6 +946,64 @@ class threadsafe {
 	}
 
 	/** Human label for a feature-directory key. */
+	/**
+	 * Make cluster names distinguishable.
+	 *
+	 * Names come from the folder a cluster's files sit in, which is fine until a
+	 * folder holds several unrelated capabilities. On CFTunes that produced
+	 * twelve placements all called "Cfc Model" and six called "Guitar" -- the
+	 * cards were genuinely different (Album+Song, Artist, Genre, Playlist) but
+	 * the workspace showed a wall of identical labels with no way to tell them
+	 * apart.
+	 *
+	 * A colliding cluster is renamed for the file it is actually about: the
+	 * shortest-path member, which is the one nearest the top of the tree and so
+	 * the most representative of the group. Deterministic -- members are already
+	 * sorted, ties break on the lexicographically smaller path -- because an
+	 * unstable name would churn plan fingerprints on every run.
+	 */
+	private array function disambiguateClusterNames( required array clusters ) {
+		var counts = {};
+		for ( var cluster in arguments.clusters ) {
+			var name = trim( toString( cluster.name ?: "" ) );
+			if ( !len( name ) ) continue;
+			counts[ name ] = val( counts[ name ] ?: 0 ) + 1;
+		}
+
+		var used = {};
+		for ( var cluster in arguments.clusters ) {
+			var currentName = trim( toString( cluster.name ?: "" ) );
+			if ( !len( currentName ) || val( counts[ currentName ] ?: 0 ) < 2 ) {
+				if ( len( currentName ) ) used[ lCase( currentName ) ] = true;
+				continue;
+			}
+
+			var members = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
+			if ( !members.len() ) continue;
+			var best = "";
+			for ( var filePath in members ) {
+				var candidate = trim( toString( filePath ) );
+				if ( !len( candidate ) ) continue;
+				if ( !len( best ) ) { best = candidate; continue; }
+				var here = listLen( candidate, "/" );
+				var there = listLen( best, "/" );
+				// Shallowest wins; a tie falls to the smaller path so the choice is
+				// reproducible run to run.
+				if ( here < there || ( here == there && compareNoCase( candidate, best ) < 0 ) ) best = candidate;
+			}
+			if ( !len( best ) ) continue;
+
+			var stem = listFirst( listLast( best, "/" ), "." );
+			var label = featureDomainLabel( sanitizeDomainToken( stem ) );
+			if ( !len( trim( label ) ) ) continue;
+			// Keep the folder as context when the stem alone would still collide.
+			if ( used.keyExists( lCase( label ) ) ) label = currentName & " · " & label;
+			cluster.name = label;
+			used[ lCase( label ) ] = true;
+		}
+		return arguments.clusters;
+	}
+
 	public string function featureDomainLabel( required string key ) {
 		if ( !len( trim( arguments.key ) ) ) return "Remaining application slices";
 		var words = [];

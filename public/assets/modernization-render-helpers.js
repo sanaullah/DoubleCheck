@@ -44,22 +44,46 @@
 	/*
 	 * The placements the UI should render, in order of authority.
 	 *
-	 *   1. result.derived.clusters  -- derived from the coupling graph
-	 *   2. result.target.placements -- the provider's canonical v2 output
+	 *   1. result.target.placements -- the canonical artifact
+	 *   2. result.derived.clusters  -- raw clusters, for pre-v2 stored plans
 	 *   3. contexts/extracts        -- the provider's v1 vocabulary
 	 *
-	 * Derived wins because it is evidence, not assertion: membership comes from
-	 * structural edges, table co-access and shared scope, and each cluster
-	 * carries the boundary evidence for its verdict. The two can disagree -- a
-	 * plan has been observed where derivation said "two modules" and the
-	 * provider said "two centralized" -- and showing the weaker answer while the
-	 * stronger one sits in the same artifact is the failure this ordering fixes.
+	 * `target.placements` wins because it now *is* the derived answer: since
+	 * applyDerivedPlacements, derivation supplies the placements and
+	 * canonicalize() normalizes them. The raw clusters are an intermediate --
+	 * they include clusters that own no target unit and carry ids from a
+	 * different id space than everything else the UI keys on.
 	 *
-	 * Step 3b deletes tiers 2 and 3; until then all three are read here so there
-	 * is one place that decides, rather than one decision per render site.
+	 * An earlier version of this comment argued the opposite, and was correct at
+	 * the time. See the note inside the function for what changed and what it
+	 * cost on a real repository.
 	 */
 	function modernizationPlacements(result = {}) {
 		const target = result.target || {};
+		// `target.placements` first, because since applyDerivedPlacements landed it
+		// *is* the derived verdict — canonicalized, with clusters that own no
+		// target unit dropped and ids reassigned.
+		//
+		// This used to prefer `derived.clusters`, which was right when the
+		// provider still produced placements and the raw clusters were the only
+		// derived signal. It became wrong the moment derivation started supplying
+		// the placements, and the cost was visible on a real repository: CFTunes
+		// resolves to 48 placements but 86 raw clusters, 85 of which own zero
+		// target units. The map drew all 86 — hence "Admin" sixteen times and
+		// "Cfc Model" twelve times — and every node carried a `ctx-derived-*` id
+		// that no placement could match, so the blueprint pane stayed stuck on
+		// "Select a packaging decision" no matter what you clicked.
+		//
+		// Each placement carries `derivedClusterId`, so nothing about the derived
+		// provenance is lost by preferring the canonical artifact.
+		const placements = target.placements || [];
+		if (placements.length) {
+			return placements.map((item) => ({
+				...item,
+				_placementSource: item.derivedClusterId ? "derived" : "provider"
+			}));
+		}
+		// Only when no placement artifact exists at all — a pre-v2 stored plan.
 		const clusters = result.derived?.clusters || [];
 		if (clusters.length) {
 			return clusters.map((cluster) => ({
@@ -68,10 +92,6 @@
 				_placementSource: "derived",
 				name: cluster.name || cluster.domainKey || cluster.id
 			}));
-		}
-		const placements = target.placements || [];
-		if (placements.length) {
-			return placements.map((item) => ({ ...item, _placementSource: "provider" }));
 		}
 		// In the v1 vocabulary the array itself carries the verdict: anything in
 		// `extracts` is an extract even when it declares no placementType, so
@@ -320,6 +340,10 @@
 		const nodes = [];
 		const idById = new Map();
 		const addNode = (id, path, role, item, unitCount) => {
+			// Never draw the same id twice. The map keys selection on node id, so a
+			// duplicate is not just visual noise -- it makes clicking one card
+			// ambiguous. Cheap guard against any future source that repeats.
+			if (idById.has(id)) return;
 			const node = { id, path, role, item: item || null, unitCount: unitCount || 0 };
 			nodes.push(node);
 			idById.set(id, node);

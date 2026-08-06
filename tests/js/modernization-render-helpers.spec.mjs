@@ -525,10 +525,17 @@ assert.ok(derivedMap.nodes.some((node) => node.path === "Notifications" && node.
 assert.ok(!derivedMap.nodes.some((node) => node.path === "Should be ignored"), "the legacy projection must not be read when placements exist");
 
 // --- placement source precedence -------------------------------------------
-// Derived clusters outrank the provider's placements. A real run was observed
-// where derivation said "two coldbox modules" and the provider said "two
-// centralized", with both in the same artifact; the UI was showing the weaker
-// answer. There is now one place that decides which wins.
+// SUPERSEDED BY MEASUREMENT. This block once asserted that derived clusters
+// outrank target.placements, which was right while the provider still produced
+// placements and the raw clusters were the only derived signal.
+//
+// applyDerivedPlacements changed that: target.placements IS the derived answer
+// now, canonicalized -- clusters owning no target unit dropped, ids reassigned.
+// Preferring the raw clusters drew phantom nodes with unresolvable ids. On
+// CFTunes: 86 clusters vs 48 placements, 85 owning zero target units.
+//
+// The precedence therefore inverts, and derived provenance survives via
+// derivedClusterId rather than via which array was read.
 const bothSources = {
 	derived: { clusters: [
 		{ id: "c1", domainKey: "notifications", name: "Notifications", placementType: "external-service", targetUnitIds: ["u1"], filePaths: ["a.cfc"] },
@@ -537,9 +544,13 @@ const bothSources = {
 	target: { placements: [ { id: "p1", name: "Everything", placementType: "main-app", targetUnitIds: ["u1", "u2"] } ] }
 };
 const resolved = helpers.modernizationPlacements(bothSources);
-assert.equal(resolved.length, 2, "derived clusters must win over provider placements");
-assert.equal(resolved[0]._placementSource, "derived");
-assert.equal(helpers.buildModernizationArchitectureSubgraph(bothSources).lanes.extracts, 1);
+assert.equal(resolved.length, 1, "the canonical placement artifact wins; raw clusters are a fallback");
+assert.equal(resolved[0].id, "p1", "node ids must be resolvable by the blueprint pane");
+assert.equal(resolved[0]._placementSource, "provider", "no derivedClusterId on this fixture, so it reads as provider");
+// The canonical placement here is main-app, so that is the lane drawn. The
+// old expectation (one extract) came from reading the raw cluster instead.
+assert.equal(helpers.buildModernizationArchitectureSubgraph(bothSources).lanes.extracts, 0);
+assert.equal(helpers.buildModernizationArchitectureSubgraph(bothSources).lanes.centralized, 1);
 
 // Provider placements are used when nothing was derived.
 const providerOnly = { target: { placements: [ { id: "p1", name: "Orders", placementType: "coldbox-module", targetUnitIds: ["u1"] } ] } };
@@ -599,3 +610,41 @@ assert.equal(
 	helpers.modernizationBriefVerdict({ brief: { verdict: "   ", claims: [ { claim: "x", evidenceRefs: [ { filePath: "a.cfc", startLine: 1 } ] } ] } }).hasVerdict,
 	false
 );
+
+// --- modernizationPlacements precedence (CFTunes regression) ----------------
+// Real numbers from D:\Temp\CFTunes: 48 canonical placements, 86 raw derived
+// clusters, 85 of which own no target unit. Preferring the clusters drew 86
+// nodes ("Admin" x16, "Cfc Model" x12) whose ctx-derived-* ids matched no
+// placement, so the blueprint pane never resolved a selection.
+
+const cftunesShape = {
+	derived: { clusters: [
+		{ id: "ctx-derived-a", name: "Admin", targetUnitIds: [] },
+		{ id: "ctx-derived-b", name: "Admin", targetUnitIds: [] },
+		{ id: "ctx-derived-c", name: "Admin", targetUnitIds: [] },
+		{ id: "ctx-derived-d", name: "Cfc Model", targetUnitIds: [] }
+	] },
+	target: {
+		units: [ { id: "tu-1" }, { id: "tu-2" } ],
+		placements: [
+			{ id: "placement-1", derivedClusterId: "ctx-derived-a", name: "Admin", placementType: "main-app", targetUnitIds: [ "tu-1" ] },
+			{ id: "placement-2", derivedClusterId: "ctx-derived-d", name: "Cfc Model", placementType: "coldbox-module", targetUnitIds: [ "tu-2" ] }
+		]
+	}
+};
+
+const cftunesResolved = helpers.modernizationPlacements(cftunesShape);
+assert.equal(cftunesResolved.length, 2, "must render canonical placements, not raw derived clusters");
+assert.deepEqual(cftunesResolved.map((p) => p.id), [ "placement-1", "placement-2" ], "node ids must be placement ids the detail pane can resolve");
+assert.equal(cftunesResolved.every((p) => p._placementSource === "derived"), true, "derived provenance is kept via derivedClusterId");
+
+// The map must not repeat a capability just because many raw clusters share a name.
+const cftunesSubgraph = helpers.buildModernizationArchitectureSubgraph(cftunesShape);
+const groupNodes = cftunesSubgraph.nodes.filter((n) => n.role !== "core");
+assert.equal(groupNodes.length, 2, `expected 2 group nodes, got ${groupNodes.length}`);
+assert.equal(new Set(groupNodes.map((n) => n.id)).size, groupNodes.length, "duplicate node ids in the architecture map");
+
+// Fallback still works for a pre-v2 plan that has clusters but no placements.
+const legacyOnlyDerived = { derived: { clusters: [ { id: "ctx-1", name: "Core", targetUnitIds: [ "u1" ] } ] }, target: { units: [] } };
+assert.equal(helpers.modernizationPlacements(legacyOnlyDerived).length, 1, "clusters remain the fallback when no placements exist");
+assert.equal(helpers.modernizationPlacements(legacyOnlyDerived)[0]._placementSource, "derived");
