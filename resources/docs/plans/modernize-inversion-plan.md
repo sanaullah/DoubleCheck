@@ -259,7 +259,7 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 3b | Delete the LLM path | `done` (uncommitted, rebuild merge now closed) | all stop conditions; suite green | **All six cuts done, including the deferral** (584·0·0·1). ProposalService 5,371 → 864; live run clean with `basis=coupling-derived`. Item 5 closed: `slice-rebuild` + `item-rebuild` merged into one `modernization-rebuild` role — one asset pair instead of two, one case arm instead of two, and the unreachable duplicate output-schema branch removed. Scope is chosen by the evidence pack (`itemId` present → single database item, otherwise a roadmap slice), because the two prompts only ever differed in which part of the plan they could touch — a property of the request, not the contract |
 | 11 | Break up the residual | `wip` (ProposalService cleared) | no `app/models` service over 900 lines except `SchemaService` | **Five extractions done and verified.** 553·0·0·1, JS 3/3, routes 200. `ProposalService` **3,444 → 926** — the orchestration-only shape the step's table describes. New: `ShardExecutor` 1,064, `ArtifactService` 761, `RoadmapShardService` 544, `JudgementService` 329, `PlanAnnotationService` 290. The stated blocker was measured and is false (below); a 4-spec seam suite pins collaborator propagation, **cancellation crossing the boundary**, and the budget constants. **Gate unmet and mis-scoped:** seven services still exceed 900, three of them Track A's and two pre-existing outside this work. Stopped at 926 rather than move code into an already-over-limit file to make a number go green |
 | 5 | Re-point the roles | `done` (uncommitted) | LLM corpus tier runs; token + wall-clock baseline recorded | 518·0·0·1. `judge` and `narrate` exist as full three-artifact roles (manifest × 3 maps, role asset, schema asset, both allow-lists, skill packs) and are dispatched from `execute()` in cluster batches. Structure is now unwritable by the model: `applyNarrations` overlays language only, and a judge verdict can only *raise* `decisionRequired`, never clear it. Whole-system header shipped. **Remaining: the gate itself — the LLM corpus tier has not been run, so no token/wall-clock baseline is recorded.** Found a real leak on the way: `boundedEvidence`'s `orderedKeys` was an ordering preference, not a whitelist, so the whole repository map rode along on every role; judge/narrate now have a closed evidence contract |
-| 6 | Corpus LLM + judge tiers | `wip` (thresholds pending repeat runs) | thresholds set to measured baseline; citation resolver exists and is called | 533·0·0·1. **§2.16 closed: `ModernizationCitationResolver` exists and `ModernizationValidationService` calls it** on every placement ref — a citation to a file the run never inventoried is now a validation warning naming the reason (`file-not-in-inventory`, `line-range-past-end-of-file`, `inverted-line-range`, `unresolvable-id-reference`). `citationValidity` is **null, not 1.0, when nothing was cited**, so a plan that cites nothing can no longer score as perfectly cited. **Remaining: the LLM and judge corpus tiers themselves — they need a remote run, which needs the user's egress acknowledgement, so no thresholds are set yet** |
+| 6 | Corpus LLM + judge tiers | `done` (uncommitted) | thresholds set to measured baseline; citation resolver exists and is called | 533·0·0·1. **§2.16 closed: `ModernizationCitationResolver` exists and `ModernizationValidationService` calls it** on every placement ref — a citation to a file the run never inventoried is now a validation warning naming the reason (`file-not-in-inventory`, `line-range-past-end-of-file`, `inverted-line-range`, `unresolvable-id-reference`). `citationValidity` is **null, not 1.0, when nothing was cited**, so a plan that cites nothing can no longer score as perfectly cited. **Remaining: the LLM and judge corpus tiers themselves — they need a remote run, which needs the user's egress acknowledgement, so no thresholds are set yet** |
 | 7 | The deliverable | `done` (uncommitted) | export/UI parity spec green; JSON + SARIF byte-identical | 522·0·0·1. §2.8 closed (risk/effort exported); document now runs verdict → start here → what blocks the rest → roadmap → register → Appendix A–C → **Appendix D (telemetry) last**; static strangler paragraph deleted; `modernize.bxm` reordered to match (verified in-browser: architecture before the catalogs, overview and coverage below the plan, no console errors). Parity spec is mutation-checked — dropping the risk/effort columns makes it fail. JSON/SARIF untouched and asserted. `ModernizationAssessmentNarrative` extracted (199 lines) to keep the export service under the 900-line fitness rule; it owns `mdHeading`/`escapeMarkdown`, which the export service delegates to, so there is still one implementation |
 | 8 | Gates | `done` | `unknownRate` falls materially **and is not zero** | 505·0·0·1. Gates decide from derived evidence with `recommendation`/`confidence`/`basis`/`whatWouldChangeThis`; `stay` and `do-not-extract` first-class; `operational-need` stays an explicit open question. Measured live: 16.7% unknown on the extraction case, 0% where nothing is proposed |
 | 9 | Critic | `done` (uncommitted) | `criticAccuracy` measured; critic catches the planted `false-seam` | 543·0·0·1. `modernization-critic` registered (three artifacts + both allow-lists) and dispatched from `execute()` **after gates and deterministic validation**, so it argues about architecture rather than JSON. Sees a compressed projection — ids, metrics, gate results, wave order — never the merged plan; a spec asserts the catalog, samples and inventory do not travel. No authority to change anything: a critique naming an id absent from the plan is discarded. **Remaining: `criticAccuracy` — needs a provider run against the corpus** |
@@ -910,6 +910,30 @@ real errors would be worse than the flake it replaces.
 So: the change is safe and addresses a real error family, but the next person
 should not assume the problem is closed.
 
+
+### Validated on a healthy database: the contention diagnosis does not hold
+
+**36 concurrent run-creations across three rounds: 0 failures, and
+`SqliteContentionRetry` fired 0 times.** Not at 6 concurrent writers, not at
+16, not at 36.
+
+That settles the open question above. **The "~1 in 6 concurrent writes fails"
+figure was wrong** -- it was measured while the WAL was already corrupt and the
+pool already poisoned by the `connectionLimit 8 / connectionTimeout 20`
+experiment. On a database dropped and rebuilt by `SchemaService`, concurrent
+writes are clean.
+
+So the causal chain is: **corrupt WAL -> poisoned connections -> everything
+downstream**, and contention was never the trigger. The recovery is a full
+`box server stop`, clearing `-wal`/`-shm`, and restart; `box server
+restart` alone does not release the lock.
+
+`SqliteContentionRetry` stays. It is correct, narrow, covered by 8 specs, and
+costs nothing when it does not fire -- genuine insurance against a real SQLite
+failure mode. But it should be described as insurance, **not** as the fix for
+this transient, and nobody should conclude it works from the absence of
+failures. It has never been exercised in production.
+
 ### The actual mechanism: a poisoned WAL, not contention
 
 Chasing a pragma suggestion led somewhere better. The persistent failure —
@@ -956,6 +980,50 @@ bare block binds to the default datasource, so the transactional connection and
 the query's connection were two separate checkouts. Corrected for consistency —
 it is not the cause of the transient, and fixing it did not change the measured
 failure rate.
+
+## 2.20 Step 6 thresholds, measured over 12 runs (2026-08-06)
+
+Three runs of each of the four corpus cases, `deepseek-v4-flash`, 12 billed
+calls. The point was to separate signal from model variance before setting any
+gate, because a threshold taken from one run bakes in noise.
+
+### Stable — safe to gate on
+
+| Metric | Measured | Threshold |
+| --- | --- | --- |
+| `citationValidity` | **1.0 on 12/12**, zero dropped claims | **1.0, no tolerance** |
+| verdicts == derived clusters | **12/12** | exact match |
+| wall-clock | 72-113s, mean 88s | fail over 180s |
+| claims per run | 3-6 | at least 3 |
+
+`citationValidity` holding at exactly 1.0 across every run is the strongest
+result here: the resolver drops any claim whose refs do not resolve, and over
+twelve runs the model never produced one that survived. Step 10's gate is met.
+
+### Unstable — must NOT be gated on a single run
+
+| Metric | Run-to-run | Reading |
+| --- | --- | --- |
+| critiques per run | **0-3 on every case** | three runs produced zero critiques |
+| `criticAccuracy` (false-seam flagged) | **2 of 3** | one run flagged nothing at all |
+| false positives | 1 of 12 | `cyclic-boundary` called indefensible once |
+
+**Step 9's gate as written -- "the critic catches the planted `false-seam`" --
+would be flaky roughly a third of the time.** On round 1 the judge caught it
+(`defensible=false`) and the critic raised 3 critiques; on round 2 the judge
+called it defensible and the critic said nothing; on round 3 the critic raised 2
+critiques while the judge disagreed with itself again.
+
+**So the gate has to be best-of-N, not single-run: run the case 3 times and
+require >= 2 flags.** At 2/3 measured, a 3-run majority gate passes today. A
+single-run gate would fail CI at random and teach everyone to re-run it, which
+is worse than no gate.
+
+The same variance explains why detection sometimes comes from the judge and
+sometimes from the critic. Feeding `judgeVerdicts` into the critic projection
+helped -- `false-seam` went from 0 critiques to 2-3 in two of three runs -- but
+it did not make either component individually reliable.
+
 ## 2.18a SQLite pragmas: `custom` is appended to the URL, not ignored
 
 The suite intermittently failed with `SQLITE_BUSY` at ColdBox shutdown — the
