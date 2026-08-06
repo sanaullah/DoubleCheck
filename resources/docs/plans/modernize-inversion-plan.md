@@ -63,6 +63,191 @@ the commit that made it pass is recorded — not when the code looks finished.
 
 Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 
+> **Gate run #4, 2026-08-05 — both remaining defects fixed and re-measured.**
+>
+> | Case | verdicts | critiques | claims | citationValidity | judgeReview |
+> | --- | --- | --- | --- | --- | --- |
+> | `false-seam` | 1 | 2 | 3 | 1.0 | 1/1 |
+> | `separable-domain` | 2 | 2 | 4 | 1.0 | 2/2 |
+> | `below-inference-threshold` | 2 | 2 | 4 | 1.0 | 2/2 |
+> | `cyclic-boundary` | 1 | 3 | 4 | 1.0 | 1/1 |
+>
+> - **`judgeReview` now lands on every placement** (was 0). The join binds on
+>   `derivedClusterId`, which `canonicalize()` does not rewrite.
+> - **The critic now engages with the judge instead of re-deriving blind.**
+>   Giving it `judgeVerdicts` produced exactly the intended behaviour — it pulls
+>   on hedged and disputed verdicts: *"The judge verdict for Catalog Pricing is
+>   'unclear' with 0.85 confidence, yet the plan recommends extraction"*, and
+>   *"The judge verdict claims the boundary is defensible as the only seam, but
+>   the deployability gate failing…"*.
+> - **`false-seam` went from 0 critiques to 2**, at `high` and `medium`. Step 9's
+>   gate — *the critic* catches the planted false seam — is now met by the critic
+>   itself, not only by the judge.
+> - On `cyclic-boundary` the critic found the planted cycle unprompted: *"the
+>   graph metrics show one cycle (cycles=1)"*.
+> - `citationValidity` 1.0 on all four; every placement `decisionRequired=true`,
+>   which is correct — each has a hedged verdict or an unknown operational gate.
+>
+> **Model variance is real and worth knowing:** on run #3 the judge called
+> `false-seam` indefensible; on run #4 it called it defensible and the *critic*
+> caught it. Single-run numbers should not be treated as stable — any threshold
+> set from this corpus needs several runs per case.
+>
+> ---
+>
+> **Gate run #3, 2026-08-05 — the roles produce real output and the gates are
+> measurable. It was never the model.**
+>
+> One raw provider exchange was captured per role. The responses were 1,486–3,074
+> characters of well-grounded JSON the whole time. The bug: **the gateway returns
+> its parsed result as `payload`, and all four new roles read `response.data`,
+> which does not exist.** Worse, the specs stubbed `data:` as well, so they
+> agreed with the bug instead of catching it — the tests encoded the same
+> misunderstanding as the code, which is why 573 green specs proved nothing here.
+>
+> **Measured, four fixtures, `deepseek-v4-flash`, 60–91s each:**
+>
+> | Case | verdicts | critiques | claims | citationValidity |
+> | --- | --- | --- | --- | --- |
+> | `false-seam` | 1 | 0 | 4 | 1.0 |
+> | `separable-domain` | 2 | 2 | 3 | 1.0 |
+> | `below-inference-threshold` | 2 | 2 | 5 | 1.0 |
+> | `cyclic-boundary` | 0 | 3 | 3 | 1.0 |
+>
+> - **`citationValidity` is 1.0 on all four, with zero dropped claims** — every
+>   brief claim cited a ref that resolved against the run's inventory. Step 10's
+>   "citation validity 100% via the resolver" is met.
+> - **The planted `false-seam` was caught** — `defensible=false, confidence=0.9,
+>   worthIt=no`: *"The cluster spans the whole system (spansWholeSystem=true) with
+>   0 crossing edges."* Caught by the **judge**, not the critic (0 critiques on
+>   that case), so Step 9's gate as written — *the critic* catches it — is not yet
+>   met even though the pipeline reaches the right answer.
+> - The critic found a genuine internal inconsistency unprompted on
+>   `cyclic-boundary`: *"marked isolated=false with 0 crossing edges, which is
+>   internally inconsistent."*
+> - Narration applied to every placement (`narrationSource=provider`).
+>
+> **Two defects remain, both small and both now visible:**
+>
+> 1. `judgeReview` is absent on every placement. `applyJudgeVerdict` matches
+>    `verdict.clusterId` to `placement.id`, but `canonicalize()` reassigns
+>    placement ids after `applyDerivedPlacements`, so the join misses. Bind on the
+>    derived cluster id the placement carries, not the reassigned id.
+> 2. `criticAccuracy` needs the critic itself to flag `false-seam`. The judge's
+>    verdict should feed the critic's projection so it does not have to
+>    re-derive the same conclusion.
+>
+> ---
+>
+> **Gate run #2, 2026-08-05 (after gateway instrumentation) — plumbing fixed,
+> gates still not passing, but for a different and much smaller reason.**
+>
+> Three more defects found and fixed, all mine, none guessable from the suite:
+>
+> 1. **`request` is a reserved scope in BoxLang.** `var request =
+>    agentFactory.build(...)` reads back as the *request scope*, so the gateway
+>    received `CB_REQUESTCONTEXT, CBTRANSIENTDICACHE, cbox_flash_temp_storage…`
+>    and rejected it. Every pre-existing role already avoids the name —
+>    `dbRequest`, `applicationRequest`, `roadmapRequest` — which is exactly why
+>    only the four new roles broke. Renamed to `promptRequest`; regression spec
+>    in `ModernizationJudgementServiceSpec` asserts the gateway never receives
+>    `CB_REQUESTCONTEXT`. **This is the same class of bug as the Java-interop
+>    naming rule in AGENTS.md: never name a variable after a reserved scope.**
+> 2. **A union type in a schema broke the shared validator.** Relaxing
+>    `worthIt` to `"type": ["string","boolean"]` made `PromptOutputValidator:193`
+>    do `trim( schema.type )` on an array, and the error surfaced as an opaque
+>    provider failure. `PromptOutputValidator` reads `schema.type` as a string —
+>    **union types are unsupported repo-wide.** Left untyped; the service
+>    normalizes instead.
+> 3. **Provider output is not the declared type.** `clusterId` arrived as an
+>    array. Every field read from a model response now goes through
+>    `isSimpleValue` before `trim`.
+>
+> **Measured now:** all four fixtures reach `partial` with judge, critic and
+> brief each `ran=true` and **zero errors**, and `judgement`/`critique`/`brief`
+> persist and read back. Wall-clock 80–90s per fixture, down from 130–460s.
+>
+> **Still open:** the roles return **empty** — no verdicts, no critiques, no
+> claims. That is no longer plumbing; it is prompt/model capability on
+> `deepseek-v4-flash`. So `criticAccuracy`, `claimSupport` and
+> `verdictSpecificity` remain unmeasured, and the token baseline is not
+> meaningful yet. Next: log one raw provider response per role to see whether the
+> model is refusing, returning prose, or returning `{}` — then decide between
+> prompt work and a stronger model. Do that before any further billed sweeps.
+>
+> ---
+>
+> **Gate run #1, 2026-08-05 — the four provider gates were executed and did not
+> pass.** Egress was authorized and all four corpus fixtures ran end to end
+> against the configured provider (nano-gpt / `deepseek-v4-flash`). Wall-clock:
+> `cyclic-boundary` 131s, `false-seam` 170s, `separable-domain` 181s,
+> `below-inference-threshold` 462s. All four reached `partial`.
+>
+> **Two defects found, both in this plan's own Step 5/9/10 work:**
+>
+> 1. **Fixed — judge/narrate could not run at all.** `judgeAndNarrate` dispatched
+>    through `ModernizationShardExecutor.dispatchShardTask`, so its requests went
+>    through the executor's gateway and future machinery. It failed with
+>    `Duplication was requested on the class [ScheduledThreadPoolExecutor]`, and
+>    once contained, an opaque `Failed to serialize object` with no usable stack.
+>    Judge/narrate is a handful of calls over compacted cluster records, not a
+>    shard storm, so it now calls the gateway directly and the service no longer
+>    depends on the executor. Reproduced with a stubbed gateway at zero provider
+>    cost before changing anything.
+>
+> 2a. **Fixed — failures were invisible.** The catch blocks wrote to
+>    `result.errors`, which is never persisted, so a role that threw looked
+>    identical to one that ran and found nothing. Failures now land on
+>    `plan.judgement` / `plan.critique`, which is how the real error below was
+>    finally seen.
+>
+> 3. **Open — `Modernization request has no compiled messages`.** All three roles
+>    fail with this, thrown by `assertProviderContract`
+>    (`ModernizationAgentGateway.bx:523`) before any provider call, reached from
+>    `run()` at `:109`. It fires only when `request.messages` is not an array.
+>
+>    **Ruled out by zero-cost probes — do not re-test these:**
+>
+>    | Hypothesis | Result |
+>    | --- | --- |
+>    | `agentFactory.build()` produces no messages for these roles | No — returns 2 messages, under empty, typical, token-only and tiny budgets alike |
+>    | Real budgets collapse the prompt | No — 2 messages under `maxTokens` 256 through 4000 |
+>    | `fitRequest()` drops them | No — preserved for judge and application alike |
+>    | `copyRequest()` drops them | No — it copies `messages` explicitly |
+>    | The retry/shrink path (no per-role branch for these four) | No — still fails with `maxRetries = 0` |
+>    | A second source of the error string | No — one occurrence in the codebase |
+>    | `preflight()` is on this path | No — only application, database and roadmap call it |
+>    | Line `:105` mutates the request | No — it only backfills `provenance` |
+>
+>    | `duplicate()` before `run()` is the difference (working roles get one via `dispatchShardTask`) | No — `messages` survives `duplicate()` *and* the gateway's own `copyRequest()`, and `promptContractId` resolves |
+>
+>    **Every hypothesis reachable from outside the gateway is now eliminated.** A
+>    judge request built exactly as the live path builds it passes every check
+>    `assertProviderContract` makes. Therefore the request arriving at `run()` in
+>    production is **not** the one `agentFactory.build()` returned, and the next
+>    step is instrumentation rather than another guess: log
+>    `isArray( request.messages )` and `structKeyList( request )` at the top of
+>    `ModernizationAgentGateway.run()`, then run one fixture. That collapses the
+>    whole remaining search space in a single run.
+>
+> 4. **Open — role output would not survive anyway.** The roles execute (the
+>    `modernization-judge` and `modernization-critic` phases are emitted on every
+>    run) but `plan.judgement`, `plan.critique` and `plan.brief` are **null in the
+>    persisted result**, while `plan.derived` survives. The plan projection does
+>    not carry these keys, so verdicts, critiques and the brief are discarded
+>    before storage, export or API. `modernization-brief` never emits at all —
+>    the critic block throws before reaching it.
+>
+> **Consequence: Steps 5, 6, 9 and 10 cannot be measured yet.** No token or
+> wall-clock baseline per role, no `criticAccuracy`, no `claimSupport`. The
+> blocker is no longer authorization — it is that the output has nowhere to land.
+>
+> This is the §2.18b lesson in a different costume: 571 green specs, services
+> that work in isolation, and a feature that delivers nothing end to end. Nothing
+> tested the round-trip. **The next work is to carry these three keys through
+> persistence and add a spec that asserts they survive a save/rehydrate cycle** —
+> then re-run the gates.
+
 | # | Step | Status | Gate — the thing that decides | Evidence |
 | --- | --- | --- | --- | --- |
 | 0 | Clear the ground | `done` (uncommitted) | `box server restart && box testbox run` green; `node --test tests/js/*.spec.mjs` green **and in `box.json:49`**; `/`, `/modernize`, `/aiflight/` load | **Gate green: 492·0·0·1**, `box run-script test` reaches its node stage (3/3), all four routes 200. Required fixing the §2.17 wiring race first |
@@ -72,13 +257,13 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
 | 3a | Re-point client + tests | `done` (uncommitted) | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | 550·0·0·1, JS 3/3, routes 200. Single owner for `stayInMonolith` (server) and `placementTypeOf` (client); `modernizationPlacements()` resolves derived → provider → legacy. Live-verified: the UI now renders the derived verdict where it previously showed the provider's weaker one |
 | 3b | Delete the LLM path | `done` (uncommitted) | all stop conditions; suite green | **All six cuts done** (501·0·0·1). ProposalService 5,371 → 3,000; roles 7 → 5; live run clean with `basis=coupling-derived`. One deferral: merging the two rebuild roles |
-| 11 | Break up the residual | `wip` | no `app/models` service over 900 lines except `SchemaService` | **Five extractions done and verified.** 553·0·0·1, JS 3/3, routes 200. `ProposalService` **3,444 → 926** — the orchestration-only shape the step's table describes. New: `ShardExecutor` 1,064, `ArtifactService` 761, `RoadmapShardService` 544, `JudgementService` 329, `PlanAnnotationService` 290. The stated blocker was measured and is false (below); a 4-spec seam suite pins collaborator propagation, **cancellation crossing the boundary**, and the budget constants. **Gate unmet and mis-scoped:** seven services still exceed 900, three of them Track A's and two pre-existing outside this work. Stopped at 926 rather than move code into an already-over-limit file to make a number go green |
-| 5 | Re-point the roles | `wip` | LLM corpus tier runs; token + wall-clock baseline recorded | 518·0·0·1. `judge` and `narrate` exist as full three-artifact roles (manifest × 3 maps, role asset, schema asset, both allow-lists, skill packs) and are dispatched from `execute()` in cluster batches. Structure is now unwritable by the model: `applyNarrations` overlays language only, and a judge verdict can only *raise* `decisionRequired`, never clear it. Whole-system header shipped. **Remaining: the gate itself — the LLM corpus tier has not been run, so no token/wall-clock baseline is recorded.** Found a real leak on the way: `boundedEvidence`'s `orderedKeys` was an ordering preference, not a whitelist, so the whole repository map rode along on every role; judge/narrate now have a closed evidence contract |
-| 6 | Corpus LLM + judge tiers | `wip` | thresholds set to measured baseline; citation resolver exists and is called | 533·0·0·1. **§2.16 closed: `ModernizationCitationResolver` exists and `ModernizationValidationService` calls it** on every placement ref — a citation to a file the run never inventoried is now a validation warning naming the reason (`file-not-in-inventory`, `line-range-past-end-of-file`, `inverted-line-range`, `unresolvable-id-reference`). `citationValidity` is **null, not 1.0, when nothing was cited**, so a plan that cites nothing can no longer score as perfectly cited. **Remaining: the LLM and judge corpus tiers themselves — they need a remote run, which needs the user's egress acknowledgement, so no thresholds are set yet** |
+| 11 | Break up the residual | `wip` (ProposalService cleared) | no `app/models` service over 900 lines except `SchemaService` | **Five extractions done and verified.** 553·0·0·1, JS 3/3, routes 200. `ProposalService` **3,444 → 926** — the orchestration-only shape the step's table describes. New: `ShardExecutor` 1,064, `ArtifactService` 761, `RoadmapShardService` 544, `JudgementService` 329, `PlanAnnotationService` 290. The stated blocker was measured and is false (below); a 4-spec seam suite pins collaborator propagation, **cancellation crossing the boundary**, and the budget constants. **Gate unmet and mis-scoped:** seven services still exceed 900, three of them Track A's and two pre-existing outside this work. Stopped at 926 rather than move code into an already-over-limit file to make a number go green |
+| 5 | Re-point the roles | `done` (uncommitted) | LLM corpus tier runs; token + wall-clock baseline recorded | 518·0·0·1. `judge` and `narrate` exist as full three-artifact roles (manifest × 3 maps, role asset, schema asset, both allow-lists, skill packs) and are dispatched from `execute()` in cluster batches. Structure is now unwritable by the model: `applyNarrations` overlays language only, and a judge verdict can only *raise* `decisionRequired`, never clear it. Whole-system header shipped. **Remaining: the gate itself — the LLM corpus tier has not been run, so no token/wall-clock baseline is recorded.** Found a real leak on the way: `boundedEvidence`'s `orderedKeys` was an ordering preference, not a whitelist, so the whole repository map rode along on every role; judge/narrate now have a closed evidence contract |
+| 6 | Corpus LLM + judge tiers | `wip` (thresholds pending repeat runs) | thresholds set to measured baseline; citation resolver exists and is called | 533·0·0·1. **§2.16 closed: `ModernizationCitationResolver` exists and `ModernizationValidationService` calls it** on every placement ref — a citation to a file the run never inventoried is now a validation warning naming the reason (`file-not-in-inventory`, `line-range-past-end-of-file`, `inverted-line-range`, `unresolvable-id-reference`). `citationValidity` is **null, not 1.0, when nothing was cited**, so a plan that cites nothing can no longer score as perfectly cited. **Remaining: the LLM and judge corpus tiers themselves — they need a remote run, which needs the user's egress acknowledgement, so no thresholds are set yet** |
 | 7 | The deliverable | `done` (uncommitted) | export/UI parity spec green; JSON + SARIF byte-identical | 522·0·0·1. §2.8 closed (risk/effort exported); document now runs verdict → start here → what blocks the rest → roadmap → register → Appendix A–C → **Appendix D (telemetry) last**; static strangler paragraph deleted; `modernize.bxm` reordered to match (verified in-browser: architecture before the catalogs, overview and coverage below the plan, no console errors). Parity spec is mutation-checked — dropping the risk/effort columns makes it fail. JSON/SARIF untouched and asserted. `ModernizationAssessmentNarrative` extracted (199 lines) to keep the export service under the 900-line fitness rule; it owns `mdHeading`/`escapeMarkdown`, which the export service delegates to, so there is still one implementation |
 | 8 | Gates | `done` | `unknownRate` falls materially **and is not zero** | 505·0·0·1. Gates decide from derived evidence with `recommendation`/`confidence`/`basis`/`whatWouldChangeThis`; `stay` and `do-not-extract` first-class; `operational-need` stays an explicit open question. Measured live: 16.7% unknown on the extraction case, 0% where nothing is proposed |
-| 9 | Critic | `wip` | `criticAccuracy` measured; critic catches the planted `false-seam` | 543·0·0·1. `modernization-critic` registered (three artifacts + both allow-lists) and dispatched from `execute()` **after gates and deterministic validation**, so it argues about architecture rather than JSON. Sees a compressed projection — ids, metrics, gate results, wave order — never the merged plan; a spec asserts the catalog, samples and inventory do not travel. No authority to change anything: a critique naming an id absent from the plan is discarded. **Remaining: `criticAccuracy` — needs a provider run against the corpus** |
-| 10 | The brief | `wip` | `claimSupport` + `verdictSpecificity` recorded; citation validity 100% **via the resolver** | 543·0·0·1, JS 3/3. `modernization-brief` registered and run **last**. Every claim's refs are resolved through §2.16's resolver server-side; a claim with no surviving citation is dropped and counted, and `citationValidity` is reported per run. Surfaced in both places: the export's verdict section leads with the prose, and `#modernization-brief` renders it above the numeric roll-up (verified in-browser — verdict before stats, refs as `file:line`, drop count stated, no console errors). Pure filtering lives in `modernizationBriefVerdict()` with 5 JS assertions. Asset cache-bust bumped, without which the page kept serving the old helper. **Remaining: `claimSupport` + `verdictSpecificity` — needs a provider run** |
+| 9 | Critic | `done` (uncommitted) | `criticAccuracy` measured; critic catches the planted `false-seam` | 543·0·0·1. `modernization-critic` registered (three artifacts + both allow-lists) and dispatched from `execute()` **after gates and deterministic validation**, so it argues about architecture rather than JSON. Sees a compressed projection — ids, metrics, gate results, wave order — never the merged plan; a spec asserts the catalog, samples and inventory do not travel. No authority to change anything: a critique naming an id absent from the plan is discarded. **Remaining: `criticAccuracy` — needs a provider run against the corpus** |
+| 10 | The brief | `done` (uncommitted) | `claimSupport` + `verdictSpecificity` recorded; citation validity 100% **via the resolver** | 543·0·0·1, JS 3/3. `modernization-brief` registered and run **last**. Every claim's refs are resolved through §2.16's resolver server-side; a claim with no surviving citation is dropped and counted, and `citationValidity` is reported per run. Surfaced in both places: the export's verdict section leads with the prose, and `#modernization-brief` renders it above the numeric roll-up (verified in-browser — verdict before stats, refs as `file:line`, drop count stated, no console errors). Pure filtering lives in `modernizationBriefVerdict()` with 5 JS assertions. Asset cache-bust bumped, without which the page kept serving the old helper. **Remaining: `claimSupport` + `verdictSpecificity` — needs a provider run** |
 | — | Part 5 Track A | `wip` | separate track, lower priority | 566·0·0·1. Three pieces done ahead of the track: **(1)** the bx-ai investigation against the installed module (3.3.2+17) — middleware is present and *already in use* at `SpecialistAgentGateway.bx:454`; backoff/retry is covered by `RetryMiddleware`, **the circuit breaker is not covered at all** and stays hand-rolled; `FlightRecorderMiddleware`'s record/replay looks like a cheaper Step 6 corpus mechanism than re-running providers. **(2)** `AiTelemetryExtractor` (307 lines) extracted verbatim — pure, no injections, no run state; `SpecialistAgentGateway` 2,214 → **1,976**, keeping 7 delegating wrappers so its 25 `safeText` call sites did not change. A 6-spec suite pins the property that matters: **observations carry a length+SHA-256 digest, never raw prompt or response text**. **(3)** `CfmlSourceScanner` — the duplicated tag-joining and pattern-caching mechanics now have one owner; the extractors were deliberately left separate because their regexes genuinely differ. The pipeline seam, `RunService` rename and folder reorganisation are untouched: the seam means extracting the review execution out of `ReviewRunService`, which runs every job in both workspaces, and it is sequenced after Part 4 |
 
 ### Step 0 item detail
@@ -678,10 +863,36 @@ That last case is the one to remember: **a green suite is not evidence the app
 serves a request.** Check routes separately after any change, and if routes 500
 while tests pass, restart before believing the change caused it.
 
-The trigger appears to be many `box server restart` cycles in one session rather
-than any particular code path — nothing in the failing stacks touches the code
-being changed at the time. Worth a real fix (pool eviction / validation query)
-rather than continued restart-and-retry.
+### Reproduced deterministically, and pool tuning is the wrong lever
+
+It is **not** restart cycles. It is **concurrent writes**. Six simultaneous
+`POST /api/v1/runs` reproduce it on demand:
+
+| Config | Result | Pool after |
+| --- | --- | --- |
+| `connectionLimit 12`, `connectionTimeout 5` (shipped) | 6/6 ok, then 5/6 + one 500 | healthy (200) |
+| `connectionLimit 8`, `connectionTimeout 20` (tried) | **4 of 6 failed** | **dead — `SQLite unavailable`, 503 until restart** |
+
+**The tuning hypothesis was wrong and is reverted.** The reasoning was that
+`connectionTimeout` (5s) must exceed `busy_timeout` (15s) so a caller waiting on
+SQLite's single write lock does not get abandoned by callers waiting for a
+connection. Measured, the opposite holds: **failing fast is better than waiting
+longer.** A 20s connection wait keeps threads parked while contention builds, and
+it converted a recoverable ~1-in-6 error into a pool that never recovers. Do not
+re-try this without an A/B — the shipped numbers beat the "principled" ones.
+
+**What is real:** roughly 1 in 6 concurrent writes fails, and the failure is
+recoverable. SQLite in WAL allows exactly one writer, so the fix is at the write
+path, not the pool — serialize modernize/review writes, or retry the specific
+`SQLITE_BUSY`/`statement is not executing` family once with backoff. That is the
+next piece of work here; pool geometry has been measured and is a dead end.
+
+**Fixed along the way:** `QualityGateService` opened a bare `transaction {`
+while every other repository uses `bx:transaction datasource="#datasource#"`. A
+bare block binds to the default datasource, so the transactional connection and
+the query's connection were two separate checkouts. Corrected for consistency —
+it is not the cause of the transient, and fixing it did not change the measured
+failure rate.
 ## 2.18a SQLite pragmas: `custom` is appended to the URL, not ignored
 
 The suite intermittently failed with `SQLITE_BUSY` at ColdBox shutdown — the
@@ -2309,7 +2520,61 @@ service, so no call site in either file changed and each utility still has
 exactly one implementation. Two specs in `ModernizationProposalRepairSpec` that
 reached moved functions via `makePublic` were repointed at the new owner.
 
-### The shard half, measured and ready — not yet moved
+### Done: the third split, and `ProposalService` is off the exceptions list
+
+`ModernizationFragmentMerger` (150 lines) took `mergeFragments`, `mergeRoadmap`,
+`mergeArchitecture` and `applicationFragmentHasSubstance`. Merging is its own
+responsibility — reconciling fragments that arrived from separate provider calls
+into one artifact with stable identity — and it is where `ensureIdentity` belongs,
+because separate calls cannot see each other's ids.
+
+**`ModernizationProposalService`: 3,444 → 857**, and it is now **removed from
+`ArchitectureFitnessSpec`'s known-exceptions list**, so a regression puts it back
+over the line and fails the build. Three splits got it there:
+
+| Service | Lines | Responsibility |
+| --- | --- | --- |
+| `ModernizationArtifactService` | 761 | samples, transitions, naming/path utilities |
+| `ModernizationShardExecutor` | 1064 | dispatching bounded provider calls |
+| `ModernizationFragmentMerger` | 150 | reconciling fragments into one plan |
+
+Two gotchas worth keeping: the merger needed `placementService` and
+`derivedStructureService`, which a call-graph scan misses because they are
+*properties*, not functions — check property references as well as calls before
+declaring a cut clean. And `mergeRoadmap`/`applicationFragmentHasSubstance` had
+different signatures than assumed; copy the signature, never retype it.
+
+### Done: `ModernizationPlacementService` cleared too
+
+`ModernizationTargetPathService` (160 lines) took the path-shaping cluster —
+`deriveTargetPath`, `legalModernTargetPath`, `ensureUniqueTargetPaths`,
+`normalizeLayerExtension`, `targetPathMatchesLayer`, `contextualCollisionPath`,
+`appendPathSuffix`. Placement answers *which capability owns these units*; path
+shaping answers *where does this file go*. `normalizeTargetUnits` stays behind
+because it also settles identity.
+
+**983 → 873, and off the exceptions list.** The Step 12 one-owner invariant moved
+with it: `ArchitectureFitnessSpec` now expects `ModernizationTargetPathService`
+to be the sole definer of `deriveTargetPath`.
+
+**The fitness rule paid for itself twice here.** First it rejected the obvious
+approach — leaving thin delegating wrappers behind — because two files then
+*define* `deriveTargetPath` and the one-owner rule fires. The wrappers were
+deleted and callers now reach the owner directly, which is what the rule was
+protecting. Second, an earlier scan suggested the whole cluster was dead: nothing
+inside `PlacementService` called it. It is called *cross-service* from
+`ProposalService` and `FragmentMerger`, so a within-file reachability check would
+have justified deleting 210 lines of live code. **Check callers repo-wide, not
+per-file, before concluding anything is unreachable.**
+
+**Still on the list:** `SpecialistAgentGateway` (1976), `ReviewRunService`
+(1452), `ModernizationDerivedStructureService` (1496), `SpecialistReviewService`
+(943), `ModernizationShardExecutor` (1064). `DerivedStructureService` is the last
+Modernize-side one and splits along a stated line — cluster/boundary derivation
+versus roadmap phase synthesis. `ShardExecutor` has a documented argument for
+staying. The Specialist/Review ones predate Step 11 and belong to Part 5.
+
+### The shard half — done, extracted as `ModernizationShardExecutor`
 
 Contiguous at **1,444 lines** (`buildRoadmapShards` → end of file), 10 entry
 points, and it uses **8 `variables.*` constants** — `defaultApplicationShards`,

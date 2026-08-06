@@ -27,12 +27,10 @@ property name="modernizationGateService" inject="ModernizationGateService";
 	property name="eventService" inject="ReviewEventService";
 	property name="log" inject="logbox:logger:{this}";
 
-	// v4: the inventory resolver now changes dependency records and signal
-	// precision in addition to the v3 range join. A v3 "evidence" checkpoint
-	// would restore a pre-join inventory wholesale (see the reuse branch below),
-	// silently restoring noisy construction signals on every rerun — so v3
-	// checkpoints must not
-	// be reusable.
+	// v4: the inventory resolver changes dependency records and signal precision
+	// as well as the v3 range join, so a v3 "evidence" checkpoint would restore a
+	// pre-join inventory wholesale and silently bring back noisy construction
+	// signals on every rerun. v3 checkpoints are therefore not reusable.
 	// v9: the pipeline now derives a coupling graph and cluster/wave structure
 	// before the context pack. A v8 checkpoint set has no "graph" or "derived"
 	// stage, and its "context" checkpoint was written at a different point in
@@ -303,29 +301,34 @@ property name="modernizationGateService" inject="ModernizationGateService";
 			// decision, and every line of identifier reconciliation that exists to
 			// make provider-invented ids resolve is still load-bearing.
 			plan = placementServiceInstance().applyDerivedPlacements( plan, derivedClusters );
-			// The model's remaining job: argue with the derived boundaries and put
-			// language on them. Runs before the gates so a verdict can lower a
-			// gate's confidence, and after placements so there is a fixed structure
-			// to argue with. A provider failure here costs naming, not structure.
-			// `metadata.provider` is set from agentGateway.isEnabled() during the
-			// proposal, so it reports whether a provider actually exists rather
-			// than what was requested. Without a key the derived structure stands
-			// on its own and no provider call is attempted.
+			// Model commentary on a decided structure. Before the gates (a verdict can
+			// lower gate confidence), after placements (there must be something fixed
+			// to argue with). metadata.provider comes from agentGateway.isEnabled(),
+			// so with no key nothing is called. Contained: commentary must never cost
+			// the plan.
 			if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
 				emit( arguments.callbacks, 78, "modernization-judge", "Judging derived boundaries and naming capabilities" );
-				var judgement = judgementService.judgeAndNarrate(
-					runId,
-					result.derived,
-					input.target ?: {},
-					input.budgets ?: {},
-					{ maxDurationMs: 120000 }
-				);
-				plan = placementServiceInstance().applyNarrations( plan, judgement.narrations );
-				plan.judgement = {
-					verdicts: judgement.verdicts,
-					errors  : judgement.errors,
-					ran     : judgement.ran
-				};
+				try {
+					var judgement = judgementService.judgeAndNarrate(
+						runId,
+						result.derived,
+						input.target ?: {},
+						input.budgets ?: {},
+						{ maxDurationMs: 120000 }
+					);
+					plan = placementServiceInstance().applyNarrations( plan, judgement.narrations );
+					plan.judgement = {
+						verdicts: judgement.verdicts,
+						errors  : judgement.errors,
+						ran     : judgement.ran
+					};
+				} catch ( any judgementError ) {
+					// On the plan, not just `result.errors`, which is never persisted —
+					// a silently failing role reads as one that ran and found nothing.
+					plan.judgement = { verdicts: [], errors: [ { role: "modernization-judge", message: trim( toString( judgementError.message ?: "judge/narrate failed" ) ) } ], ran: false };
+					result.errors.append( { stage: "modernization-judge", role: "modernization-judge", message: trim( toString( judgementError.message ?: "judge/narrate failed" ) ) } );
+					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( "Modernize run #runId#: judge/narrate failed, keeping derived structure: #( judgementError.message ?: '' )#" );
+				}
 			}
 			plan = mergeSourceModernizeCoverage( arguments.run, plan );
 			var placementService = placementServiceInstance();
@@ -350,24 +353,20 @@ property name="modernizationGateService" inject="ModernizationGateService";
 				emit( arguments.callbacks, 82, "modernization-validation", "Checking proposal structure, evidence, and safety gates" );
 				var validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
 				plan.validation = validation;
-				// The critic runs after merge, placement, gates and deterministic
-				// validation: it evaluates the architecture that was decided, not a
-				// draft, and schema problems are already caught by the time it
-				// speaks. It has no authority to change the plan -- critiques are
-				// attached for a human or a later rebuild to act on. Optional by
-				// construction: without a provider the plan is unchanged.
+				// Critic and brief run after merge, placement, gates and validation:
+				// they judge the architecture that was decided, not a draft, and
+				// schema problems are already caught by the time they speak. Neither
+				// may change the plan. The brief is last, deliberately — a confident
+				// narrative over a weak model is fluent nonsense.
 				if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
 					emit( arguments.callbacks, 84, "modernization-critic", "Reviewing the plan's architecture against its own evidence" );
+					try {
 					var critique = judgementService.critique( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
 					plan.critique = {
 						critiques: critique.critiques,
 						errors   : critique.errors,
 						ran      : critique.ran
 					};
-					// The brief is last, deliberately: a confident narrative over a
-					// weak coupling model is fluent nonsense. By this point the
-					// structure has been derived, judged, gated, validated and
-					// criticised, so there is something real to narrate.
 					emit( arguments.callbacks, 86, "modernization-brief", "Writing the verdict" );
 					var brief = judgementService.brief( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
 					plan.brief = {
@@ -379,6 +378,11 @@ property name="modernizationGateService" inject="ModernizationGateService";
 						errors          : brief.errors,
 						ran             : brief.ran
 					};
+					} catch ( any narrativeError ) {
+						plan.critique = { critiques: [], errors: [ { role: "modernization-critic", message: trim( toString( narrativeError.message ?: "critic/brief failed" ) ) } ], ran: false };
+						result.errors.append( { stage: "modernization-critic-brief", role: "modernization-critic", message: trim( toString( narrativeError.message ?: "critic/brief failed" ) ) } );
+						if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( "Modernize run #runId#: critic/brief failed, keeping the plan: #( narrativeError.message ?: '' )#" );
+					}
 				}
 				// Persist the accepted artifact before any repair/cancellation
 				// boundary. A later interruption may leave validation gates open,

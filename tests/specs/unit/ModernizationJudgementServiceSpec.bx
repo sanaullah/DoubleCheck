@@ -1,0 +1,60 @@
+/**
+ * `request` is a reserved scope in BoxLang.
+ *
+ * A local `var request = agentFactory.build( ... )` reads back as the *request
+ * scope*, not the variable, so the gateway received CB_REQUESTCONTEXT and friends
+ * and threw "Modernization request has no compiled messages". Every working role
+ * already avoids the name — `dbRequest`, `applicationRequest`, `roadmapRequest` —
+ * which is why only the four new roles were affected.
+ *
+ * Cost: six billed provider runs before the diagnostic named it. This spec makes
+ * the next occurrence free.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Judgement service request naming", () => {
+
+			it( "hands the gateway the built prompt, not the request scope", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				var seen = { keys: "", isArray: false };
+				service.agentFactory = { build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [ { role: "system", content: "s" }, { role: "user", content: "u" } ] } ) };
+				service.agentGateway = {
+					run: ( runId, promptRequest, options ) => {
+						seen.keys = structKeyList( promptRequest );
+						seen.isArray = isArray( promptRequest.messages ?: "" );
+						return { ok: true, costUsd: 0, payload: { verdicts: [], narrations: [] } };
+					}
+				};
+
+				service.judgeAndNarrate( "run-1", { clusters: [ { id: "c1", filePaths: [ "a.cfc" ] } ], waveOrder: {} } );
+
+				expect( seen.isArray ).toBeTrue( "gateway got something without compiled messages: " & seen.keys );
+				expect( seen.keys ).notToInclude( "CB_REQUESTCONTEXT", "the BoxLang request scope leaked in place of the prompt" );
+			} );
+
+			it( "does the same for critic and brief", () => {
+				var service = new app.models.services.ModernizationJudgementService();
+				var arrays = [];
+				service.agentFactory = { build: ( role, runtime, evidence, budgets ) => ( { role: role, messages: [ { role: "user", content: "u" } ] } ) };
+				service.agentGateway = {
+					run: ( runId, promptRequest, options ) => {
+						arrays.append( isArray( promptRequest.messages ?: "" ) );
+						return { ok: true, costUsd: 0, payload: {} };
+					}
+				};
+				var plan = {
+					target: { placements: [ { id: "p1", name: "A", placementType: "main-app", targetUnitIds: [ "u1" ], boundaryEvidence: {} } ] },
+					derived: { waveOrder: { order: [] }, graph: { cycles: [] } },
+					inventory: { files: [] }, signals: []
+				};
+
+				service.critique( "run-1", plan );
+				service.brief( "run-1", plan );
+
+				expect( arrays ).toHaveLength( 2 );
+				for ( var ok in arrays ) expect( ok ).toBeTrue( "a role handed the gateway the request scope" );
+			} );
+		} );
+	}
+}

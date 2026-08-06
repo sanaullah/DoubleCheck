@@ -15,6 +15,8 @@ class threadsafe {
 	property name="modernizationShardExecutor" inject="ModernizationShardExecutor";
 	property name="modernizationRoadmapShardService" inject="ModernizationRoadmapShardService";
 	property name="modernizationPlanAnnotationService" inject="ModernizationPlanAnnotationService";
+	property name="modernizationFragmentMerger" inject="ModernizationFragmentMerger";
+	property name="modernizationTargetPathService" inject="ModernizationTargetPathService";
 	property name="log" inject="logbox:logger:{this}";
 	variables.cancelledRuns = {};
 	variables.shardExecutorReady = false;
@@ -411,7 +413,7 @@ class threadsafe {
 				provenanceClass: "deterministically-derived",
 				newProposal: false
 			};
-			target.targetPath = placementService.deriveTargetPath(
+			target.targetPath = targetPathService().deriveTargetPath(
 				target,
 				sourcePath,
 				lCase( arguments.input.target.runtime ?: "boxlang" ),
@@ -607,6 +609,34 @@ class threadsafe {
 		return invoke( artifactService(), "synthesizeDatabaseFragment", arguments );
 	}
 
+	/**
+	 * Fragment merging moved to ModernizationFragmentMerger (Step 11). These
+	 * delegate so the call sites in propose() did not have to change.
+	 */
+	private any function targetPathService() {
+		if ( !isNull( variables.modernizationTargetPathService ?: javacast( "null", "" ) ) ) return variables.modernizationTargetPathService;
+		variables.modernizationTargetPathService = new app.models.services.ModernizationTargetPathService();
+		return variables.modernizationTargetPathService;
+	}
+
+	private any function fragmentMerger() {
+		if ( !isNull( variables.modernizationFragmentMerger ?: javacast( "null", "" ) ) ) return variables.modernizationFragmentMerger;
+		variables.modernizationFragmentMerger = new app.models.services.ModernizationFragmentMerger();
+		return variables.modernizationFragmentMerger;
+	}
+
+	private struct function mergeFragments( required struct input, required struct evidence, required struct fragments, required array errors ) {
+		return fragmentMerger().mergeFragments( arguments.input, arguments.evidence, arguments.fragments, arguments.errors );
+	}
+
+	private struct function mergeRoadmap( required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = [] ) {
+		return fragmentMerger().mergeRoadmap( arguments.plan, arguments.roadmap, arguments.samplePolicy, arguments.errors );
+	}
+
+	private boolean function applicationFragmentHasSubstance( required struct plan ) {
+		return fragmentMerger().applicationFragmentHasSubstance( arguments.plan );
+	}
+
 	private any function artifactService() {
 		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
 		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
@@ -701,98 +731,6 @@ class threadsafe {
 	 * captured worker/executor state during live runs.
 	 */
 
-	private struct function mergeFragments(required struct input, required struct evidence, required struct fragments, required array errors) {
-		var plan = {
-			version      : "modernization-plan-v1",
-			schemaVersion: "modernization-plan-v1",
-			metadata     : { runId: structKeyExists( arguments.input, "runId" ) ? arguments.input.runId : "", generatedAt: now(), runtime: arguments.input.target ?: {}, targetProfile: ( isStruct( arguments.input.target ?: "" ) && structKeyExists( arguments.input.target, "layoutProfile" ) ? arguments.input.target.layoutProfile : ( structKeyExists( arguments.input, "targetProfile" ) ? arguments.input.targetProfile : "" ) ), samplePolicy: arguments.input.samplePolicy ?: { currentPhasesOnly: true } },
-			coverage     : evidence.coverage ?: {},
-			assumptions  : [],
-			inventory    : evidence.inventory ?: { units: [], routeEvidence: [], dependencies: [], unresolved: [] },
-			schemaEvidence: evidence.schemaEvidence ?: { database: {}, objects: [], routines: [], unresolved: [] },
-			signals      : evidence.signals ?: [],
-			target       : { units: [], placements: [], contexts: [], extracts: [] },
-			unitLinks    : [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
-			validation   : {}, decisions: []
-		};
-		var app = fragments[ "modernization-application" ] ?: {};
-		var db = fragments[ "modernization-database" ] ?: {};
-		plan.target.units = placementService.normalizeTargetUnits( boundedStructArray( app.targetUnits ?: app.units ?: [], variables.maxItems, arguments.errors, "target.units" ), arguments.input );
-		var leakedArchitectureFields = [];
-		if ( isArray( app.contexts ?: "" ) && app.contexts.len() ) leakedArchitectureFields.append( "contexts" );
-		if ( isArray( app.extracts ?: "" ) && app.extracts.len() ) leakedArchitectureFields.append( "extracts" );
-		if ( leakedArchitectureFields.len() ) arguments.errors.append( {
-			role: "modernization-application",
-			message: "dropped-nonempty-application-architecture-fields",
-			severity: "info",
-			fields: leakedArchitectureFields,
-			note: "Application shards do not own packaging decisions; architecture-role values were discarded before merge."
-		} );
-		// Packaging decisions belong exclusively to the architecture role. The
-		// application role's schema asks for empty arrays, but models sometimes
-		// echo thin context/extract objects anyway; seeding them here would make
-		// mergeArchitecture() append duplicate ids later.
-		plan.target.contexts = [];
-		plan.target.extracts = [];
-		plan.unitLinks = boundedStructArray( app.unitLinks ?: [], variables.maxItems, arguments.errors, "unitLinks" );
-		plan.routeContracts = boundedStructArray( app.routeContracts ?: [], variables.maxItems, arguments.errors, "routeContracts" );
-		plan.dbFindings = boundedStructArray( db.dbFindings ?: [], variables.maxItems, arguments.errors, "dbFindings" );
-		plan.dbTransitions = boundedStructArray( db.dbTransitions ?: [], variables.maxItems, arguments.errors, "dbTransitions" );
-		plan.samples = boundedStructArray( app.samples ?: [], 40, arguments.errors, "application.samples" );
-		plan.samples.append( boundedStructArray( db.samples ?: [], 20, arguments.errors, "database.samples" ), true );
-		for ( var item in plan.target.units ) ensureIdentity( item, "target-unit" );
-		for ( var item in plan.unitLinks ) ensureIdentity( item, "unit-link" );
-		for ( var item in plan.routeContracts ) ensureIdentity( item, "route-contract" );
-		for ( var item in plan.dbFindings ) ensureIdentity( item, "db-finding" );
-		for ( var item in plan.dbTransitions ) ensureIdentity( item, "db-transition" );
-		for ( var item in plan.roadmapPhases ) ensureIdentity( item, "roadmap-phase" );
-		for ( var item in plan.samples ) ensureIdentity( item, "sample" );
-		if ( isArray( db.dbFindings ?: "" ) && db.dbFindings.len() ) {
-			var dbProvenance = lCase( trim( db.dbFindings[ 1 ].provenanceClass ?: "" ) );
-			plan.metadata.databaseSource = dbProvenance == "deterministically-derived" ? "synthesized" : "provider";
-		}
-		return plan;
-	}
-
-	/** Providers often echo a legacy source filename as targetPath. Keep the
-	 * source identity, but derive a legal ColdBox target path before validation
-	 * or persistence so the UI never presents source files as target structure. */
-	private struct function mergeRoadmap(required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = []) {
-		arguments.plan.roadmapPhases = boundedStructArray( arguments.roadmap.roadmapPhases ?: arguments.roadmap.phases ?: [], 40, arguments.errors, "roadmapPhases" );
-		for ( var phase in arguments.plan.roadmapPhases ) ensureIdentity( phase, "roadmap-phase" );
-		arguments.plan.assumptions.append( boundedArray( arguments.roadmap.assumptions ?: [], 40 ), true );
-		arguments.plan.samples.append( boundedStructArray( arguments.roadmap.samples ?: [], 20, arguments.errors, "roadmap.samples" ), true );
-		for ( var sample in arguments.plan.samples ) ensureIdentity( sample, "sample" );
-		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
-		arguments.plan.metadata.roadmapSource = "provider";
-		return arguments.plan;
-	}
-
-
-
-	private struct function mergeArchitecture(required struct plan, required struct architecture, array errors = []) {
-		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], placements: [], contexts: [], extracts: [] };
-		arguments.plan.target.placements = isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [];
-		arguments.plan.target.contexts = isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [];
-		arguments.plan.target.extracts = isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [];
-		arguments.plan.target.placements.append( boundedStructArray( arguments.architecture.placements ?: [], variables.maxItems, arguments.errors, "target.placements" ), true );
-		arguments.plan.target.contexts.append( boundedStructArray( arguments.architecture.contexts ?: [], variables.maxItems, arguments.errors, "target.contexts" ), true );
-		arguments.plan.target.extracts.append( boundedStructArray( arguments.architecture.extracts ?: [], variables.maxItems, arguments.errors, "target.extracts" ), true );
-		for ( var item in arguments.plan.target.placements ) ensureIdentity( item, "placement" );
-		for ( var item in arguments.plan.target.contexts ) ensureIdentity( item, "context" );
-		for ( var item in arguments.plan.target.extracts ) ensureIdentity( item, "extract" );
-		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
-		arguments.plan.metadata.architectureSource = "provider";
-		return derivedStructureService.normalizeArchitecturePlacementTypes( arguments.plan );
-	}
-
-	private boolean function applicationFragmentHasSubstance( required struct plan ) {
-		if ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) && arguments.plan.target.units.len() ) return true;
-		if ( isArray( arguments.plan.unitLinks ?: "" ) && arguments.plan.unitLinks.len() ) return true;
-		if ( isArray( arguments.plan.routeContracts ?: "" ) && arguments.plan.routeContracts.len() ) return true;
-		if ( isArray( arguments.plan.samples ?: "" ) && arguments.plan.samples.len() ) return true;
-		return false;
-	}
 
 	private struct function preflightInitialRoles(
 		required array appShards,
