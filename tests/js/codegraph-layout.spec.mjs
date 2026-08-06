@@ -139,3 +139,47 @@ test("module require works without window or document", () => {
 	assert.ok(svg.includes('data-node-id="c1"'));
 	assert.ok(!svg.includes("document."));
 });
+
+test("overview cards include complexity, summary, and explore CTA", () => {
+	const view = layout.buildClusterView(sample, {
+		overview: true,
+		summaries: [{ clusterId: "c1", text: "Orders domain handles checkout flow." }]
+	});
+	assert.equal(view.overview, true);
+	assert.ok(view.nodes.every((n) => n.kind === "cluster"));
+	const orders = view.nodes.find((n) => n.id === "c1");
+	assert.ok(orders);
+	assert.equal(orders.summaryOrigin, "ai");
+	assert.match(orders.summary, /checkout/);
+	assert.ok(["simple", "moderate", "complex"].includes(orders.complexity));
+
+	const invoices = view.nodes.find((n) => n.id === "c2");
+	assert.equal(invoices.summaryOrigin, "deterministic");
+	assert.match(invoices.summary, /Select to inspect/);
+
+	const positioned = layout.layoutClusters(view);
+	assert.equal(positioned.overview, true);
+	assert.ok(positioned.nodes[0].w >= layout.DEFAULTS.overviewNodeWidth);
+	assert.ok(positioned.nodes[0].h >= layout.DEFAULTS.overviewNodeHeight);
+
+	const svg = layout.buildSvg(positioned);
+	assert.ok(svg.includes("cg-card"));
+	assert.ok(svg.includes("Click to inspect"));
+	assert.ok(svg.includes('data-complexity="'));
+});
+
+test("complexityOf and wrapText are deterministic helpers", () => {
+	assert.equal(layout.complexityOf({ fileCount: 1, crossingEdges: 0 }), "simple");
+	assert.equal(layout.complexityOf({ fileCount: 20, crossingEdges: 5 }), "moderate");
+	assert.equal(layout.complexityOf({ fileCount: 30, crossingEdges: 10, inCycle: true }), "complex");
+	const lines = layout.wrapText("one two three four five six seven eight", 12, 2);
+	assert.ok(lines.length <= 2);
+	assert.ok(lines.join(" ").includes("one"));
+});
+
+test("layered layout respects overview sizing", () => {
+	const view = layout.buildClusterView(sample, { overview: true });
+	const layered = layout.layoutLayered(view, { overview: true });
+	assert.equal(layered.overview, true);
+	assert.ok(layered.nodes[0].w >= layout.DEFAULTS.overviewNodeWidth);
+});

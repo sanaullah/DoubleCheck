@@ -526,3 +526,27 @@ key configured to confirm the graph is complete and the AI chips are absent.
 
 **Remember:** editing a `.bx` does nothing until `box server restart` — live
 checks will silently run old code.
+
+---
+
+## Overview UX — Approach A (approved)
+
+Camera-first polish toward Understand Anything’s clean overview → details funnel.
+Phase C (search/filter chrome) is deferred and builds on A.
+
+### A — ship now
+
+1. **Pan:** drag-to-pan after ~6px move threshold (works on cards); middle-mouse
+   and Alt+drag always pan. Do not require empty canvas.
+2. **Camera toolbar:** Zoom − / Fit / Zoom +. Wheel and `+`/`-`/`0` remain.
+   Fit on layout or depth change.
+3. **Overview interaction:** click = select + inspector; drill to Files via
+   Explore button, double-click, or Enter. No auto-drill on first click.
+4. **Layout chrome:** Overview forces Cluster and hides Layer/Radial. Files /
+   Neighbourhood show Cluster | Layer | Radial again.
+5. **Card CTA copy:** “Click to inspect” (explore is explicit).
+
+### C — later (not this pass)
+
+Canvas search, layer/complexity filters, Fit-to-selection. No React Flow.
+

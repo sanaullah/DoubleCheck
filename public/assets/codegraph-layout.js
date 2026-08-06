@@ -14,7 +14,14 @@
 		nodeHeight: 56,
 		gapX: 72,
 		gapY: 20,
-		pad: 24
+		pad: 24,
+		// Overview (project-module) cards — Understand-Anything style
+		overviewNodeWidth: 280,
+		overviewNodeHeight: 148,
+		overviewGapX: 48,
+		overviewGapY: 36,
+		overviewMaxSummaryChars: 160,
+		overviewMaxSummaryLines: 3
 	};
 
 	const LAYER_ORDER = {
@@ -41,17 +48,106 @@
 
 	function mergeDefaults(opts) {
 		const o = opts || {};
+		const overview = !!o.overview;
 		return {
 			maxNodes: Number(opt(o, "maxNodes", DEFAULTS.maxNodes)) || DEFAULTS.maxNodes,
 			maxEdges: Number(opt(o, "maxEdges", DEFAULTS.maxEdges)) || DEFAULTS.maxEdges,
-			nodeWidth: Number(opt(o, "nodeWidth", DEFAULTS.nodeWidth)) || DEFAULTS.nodeWidth,
-			nodeHeight: Number(opt(o, "nodeHeight", DEFAULTS.nodeHeight)) || DEFAULTS.nodeHeight,
-			gapX: Number(opt(o, "gapX", DEFAULTS.gapX)) || DEFAULTS.gapX,
-			gapY: Number(opt(o, "gapY", DEFAULTS.gapY)) || DEFAULTS.gapY,
+			nodeWidth:
+				Number(
+					opt(
+						o,
+						"nodeWidth",
+						overview ? DEFAULTS.overviewNodeWidth : DEFAULTS.nodeWidth
+					)
+				) || (overview ? DEFAULTS.overviewNodeWidth : DEFAULTS.nodeWidth),
+			nodeHeight:
+				Number(
+					opt(
+						o,
+						"nodeHeight",
+						overview ? DEFAULTS.overviewNodeHeight : DEFAULTS.nodeHeight
+					)
+				) || (overview ? DEFAULTS.overviewNodeHeight : DEFAULTS.nodeHeight),
+			gapX:
+				Number(opt(o, "gapX", overview ? DEFAULTS.overviewGapX : DEFAULTS.gapX)) ||
+				(overview ? DEFAULTS.overviewGapX : DEFAULTS.gapX),
+			gapY:
+				Number(opt(o, "gapY", overview ? DEFAULTS.overviewGapY : DEFAULTS.gapY)) ||
+				(overview ? DEFAULTS.overviewGapY : DEFAULTS.gapY),
 			pad: Number(opt(o, "pad", DEFAULTS.pad)) || DEFAULTS.pad,
 			includeTests: o.includeTests !== false,
-			kinds: Array.isArray(o.kinds) ? o.kinds : null
+			kinds: Array.isArray(o.kinds) ? o.kinds : null,
+			overview: overview,
+			summaries: Array.isArray(o.summaries) ? o.summaries : null
 		};
+	}
+
+	/** Deterministic complexity badge for overview cards. */
+	function complexityOf(cluster) {
+		const files = Number(cluster && cluster.fileCount) || 0;
+		const crossing = Number(cluster && (cluster.crossingEdges != null ? cluster.crossingEdges : cluster.crossings)) || 0;
+		const symbols = Number(cluster && cluster.symbolCount) || 0;
+		const inCycle = !!(cluster && (cluster.inCycle || cluster.hasCycle));
+		const score = files + crossing * 3 + Math.floor(symbols / 20) + (inCycle ? 8 : 0);
+		if (score >= 40 || inCycle && files >= 8) return "complex";
+		if (score >= 12) return "moderate";
+		return "simple";
+	}
+
+	function layerLabelOf(cluster, index) {
+		if (cluster && cluster.layerLabel) return String(cluster.layerLabel);
+		if (cluster && typeof cluster.layer === "string" && isNaN(Number(cluster.layer))) {
+			return String(cluster.layer).replace(/-/g, " ");
+		}
+		const labels = ["entry", "config", "domain", "support", "tests"];
+		const layer = typeof cluster.layer === "number" ? cluster.layer : index % labels.length;
+		return labels[Math.max(0, Math.min(labels.length - 1, layer))] || "module";
+	}
+
+	function summaryForCluster(cluster, summaries) {
+		const id = String((cluster && (cluster.id || cluster.key)) || "");
+		if (Array.isArray(summaries)) {
+			const hit = summaries.find(
+				(s) => s && (s.clusterId === id || s.nodeId === id || (s.title && s.title === (cluster.label || cluster.name)))
+			);
+			if (hit && hit.text) return { text: String(hit.text), origin: "ai" };
+		}
+		if (cluster && cluster.summary) return { text: String(cluster.summary), origin: "provided" };
+		const files = Number(cluster && cluster.fileCount) || (Array.isArray(cluster && cluster.filePaths) ? cluster.filePaths.length : 0);
+		const crossing = Number(cluster && cluster.crossingEdges) || 0;
+		const cohesion = cluster && cluster.cohesion != null ? Number(cluster.cohesion) : null;
+		const bits = [];
+		bits.push(files === 1 ? "1 file" : files + " files");
+		if (crossing) bits.push(crossing + " crossing edge" + (crossing === 1 ? "" : "s"));
+		if (cohesion != null && !isNaN(cohesion)) bits.push("cohesion " + cohesion.toFixed(2));
+		const label = (cluster && (cluster.label || cluster.name || cluster.key)) || "Module";
+		return {
+			text: label + " — " + bits.join(" · ") + ". Select to inspect; explore files from the panel.",
+			origin: "deterministic"
+		};
+	}
+
+	function wrapText(text, maxChars, maxLines) {
+		const raw = String(text || "").replace(/\s+/g, " ").trim();
+		if (!raw) return [];
+		const limit = Math.max(8, maxChars || 42);
+		const lines = [];
+		let rest = raw;
+		while (rest.length && lines.length < (maxLines || 3)) {
+			if (rest.length <= limit) {
+				lines.push(rest);
+				break;
+			}
+			let cut = rest.lastIndexOf(" ", limit);
+			if (cut < limit * 0.5) cut = limit;
+			lines.push(rest.slice(0, cut).trim());
+			rest = rest.slice(cut).trim();
+		}
+		if (rest.length && lines.length) {
+			const last = lines[lines.length - 1];
+			lines[lines.length - 1] = last.replace(/\s+\S*$/, "") + "…";
+		}
+		return lines;
 	}
 
 	function normPath(path) {
@@ -159,24 +255,42 @@
 	}
 
 	function buildClusterView(snapshot, opts) {
-		const cfg = mergeDefaults(opts);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: opts && opts.overview !== false }));
 		const clusters = Array.isArray(snapshot && snapshot.clusters) ? snapshot.clusters : [];
 		const clusterEdges = Array.isArray(snapshot && snapshot.clusterEdges) ? snapshot.clusterEdges : [];
+		const summaries = cfg.summaries;
 
-		const nodes = clusters.map((c, index) => ({
-			id: String(c.id || c.key || "cluster-" + index),
-			label: c.label || c.name || c.key || c.id || "cluster",
-			kind: "cluster",
-			layer: typeof c.layer === "number" ? c.layer : index % 5,
-			fileCount: c.fileCount != null ? c.fileCount : Array.isArray(c.filePaths) ? c.filePaths.length : 0,
-			symbolCount: c.symbolCount || 0,
-			cohesion: c.cohesion,
-			filePaths: Array.isArray(c.filePaths) ? c.filePaths.slice() : []
-		}));
+		const nodes = clusters.map((c, index) => {
+			const summary = summaryForCluster(c, summaries);
+			const fileCount =
+				c.fileCount != null ? c.fileCount : Array.isArray(c.filePaths) ? c.filePaths.length : 0;
+			const node = {
+				id: String(c.id || c.key || "cluster-" + index),
+				label: c.label || c.name || c.key || c.id || "cluster",
+				kind: "cluster",
+				layer: typeof c.layer === "number" ? c.layer : index % 5,
+				layerLabel: layerLabelOf(c, index),
+				fileCount: fileCount,
+				symbolCount: c.symbolCount || 0,
+				crossingEdges: c.crossingEdges != null ? c.crossingEdges : 0,
+				cohesion: c.cohesion,
+				inCycle: !!(c.inCycle || c.hasCycle),
+				filePaths: Array.isArray(c.filePaths) ? c.filePaths.slice() : [],
+				summary: summary.text,
+				summaryOrigin: summary.origin,
+				complexity: complexityOf(
+					Object.assign({}, c, {
+						fileCount: fileCount,
+						crossingEdges: c.crossingEdges != null ? c.crossingEdges : 0
+					})
+				)
+			};
+			return node;
+		});
 
 		const edges = uniqueEdges(clusterEdges);
 		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
-		return Object.assign({ mode: "cluster" }, capped);
+		return Object.assign({ mode: "cluster", overview: true }, capped);
 	}
 
 	function buildFileView(snapshot, opts) {
@@ -365,7 +479,8 @@
 	}
 
 	function layoutClusters(view, opts) {
-		const cfg = mergeDefaults(opts);
+		const overview = !!(view && (view.overview || view.mode === "cluster"));
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview || !!(opts && opts.overview) }));
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		const cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodes.length))));
@@ -385,12 +500,14 @@
 			height: bounds.height,
 			nodes: positioned,
 			edges: edges.map((e) => Object.assign({}, e)),
-			mode: (view && view.mode) || "cluster"
+			mode: (view && view.mode) || "cluster",
+			overview: overview
 		};
 	}
 
 	function layoutLayered(view, opts) {
-		const cfg = mergeDefaults(opts);
+		const overview = !!(view && (view.overview || view.mode === "cluster")) || !!(opts && opts.overview);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview }));
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		const columns = new Map();
@@ -426,16 +543,18 @@
 			height: bounds.height || cfg.pad * 2,
 			nodes: positioned,
 			edges: edges.map((e) => Object.assign({}, e)),
-			mode: (view && view.mode) || "layered"
+			mode: (view && view.mode) || "layered",
+			overview: overview
 		};
 	}
 
 	function layoutRadial(view, opts) {
-		const cfg = mergeDefaults(opts);
+		const overview = !!(view && (view.overview || view.mode === "cluster")) || !!(opts && opts.overview);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview }));
 		const nodes = (view && view.nodes) || [];
 		const edges = (view && view.edges) || [];
 		if (!nodes.length) {
-			return { width: cfg.pad * 2, height: cfg.pad * 2, nodes: [], edges: [], mode: "radial" };
+			return { width: cfg.pad * 2, height: cfg.pad * 2, nodes: [], edges: [], mode: "radial", overview: overview };
 		}
 
 		const focusId = (view && view.focus) || (nodes.find((n) => n.role === "focus") || nodes[0]).id;
@@ -518,7 +637,8 @@
 			height: maxY - minY + cfg.pad * 2,
 			nodes: shifted,
 			edges: edges.map((e) => Object.assign({}, e)),
-			mode: "radial"
+			mode: "radial",
+			overview: overview
 		};
 	}
 
@@ -548,6 +668,125 @@
 		return "M " + x1 + " " + y1 + " C " + midX + " " + y1 + ", " + midX + " " + y2 + ", " + x2 + " " + y2;
 	}
 
+	function buildOverviewCard(n, opts) {
+		const title = escapeXml(nodeLabel(n, opts));
+		const complexity = escapeXml(n.complexity || "simple");
+		const layer = escapeXml(String(n.layerLabel || "module").toUpperCase());
+		const files = Number(n.fileCount) || 0;
+		const fileLabel = files === 1 ? "1 file" : files + " files";
+		const lines = wrapText(
+			n.summary || "",
+			Math.floor((n.w - 28) / 7.2),
+			DEFAULTS.overviewMaxSummaryLines
+		);
+		const summaryOrigin = n.summaryOrigin === "ai" ? "ai" : "deterministic";
+		const accent =
+			complexity === "complex" ? "#b45309" : complexity === "moderate" ? "#1d4ed8" : "#15803d";
+		const textParts = lines
+			.map(function (line, i) {
+				return (
+					'<text class="cg-card-summary" x="' +
+					(n.x + 14) +
+					'" y="' +
+					(n.y + 78 + i * 14) +
+					'">' +
+					escapeXml(line) +
+					"</text>"
+				);
+			})
+			.join("");
+		return (
+			'<g class="cg-node cg-card" data-node-id="' +
+			escapeXml(n.id) +
+			'" data-kind="cluster" data-complexity="' +
+			complexity +
+			'" data-summary-origin="' +
+			summaryOrigin +
+			'">' +
+			'<rect class="cg-card-body" x="' +
+			n.x +
+			'" y="' +
+			n.y +
+			'" width="' +
+			n.w +
+			'" height="' +
+			n.h +
+			'" rx="8" ry="8"/>' +
+			'<rect class="cg-card-accent" x="' +
+			n.x +
+			'" y="' +
+			n.y +
+			'" width="' +
+			n.w +
+			'" height="4" rx="2" ry="2" fill="' +
+			accent +
+			'"/>' +
+			'<text class="cg-card-meta" x="' +
+			(n.x + 14) +
+			'" y="' +
+			(n.y + 24) +
+			'">LAYER · <tspan class="cg-card-complexity">' +
+			complexity +
+			"</tspan></text>" +
+			'<text class="cg-card-layer" x="' +
+			(n.x + n.w - 14) +
+			'" y="' +
+			(n.y + 24) +
+			'" text-anchor="end">' +
+			layer +
+			"</text>" +
+			'<text class="cg-card-title" x="' +
+			(n.x + 14) +
+			'" y="' +
+			(n.y + 48) +
+			'">' +
+			title +
+			"</text>" +
+			textParts +
+			'<text class="cg-card-footer" x="' +
+			(n.x + 14) +
+			'" y="' +
+			(n.y + n.h - 14) +
+			'">' +
+			escapeXml(fileLabel) +
+			'</text>' +
+			'<text class="cg-card-cta" x="' +
+			(n.x + n.w - 14) +
+			'" y="' +
+			(n.y + n.h - 14) +
+			'" text-anchor="end">Click to inspect</text>' +
+			"</g>"
+		);
+	}
+
+	function buildSimpleNode(n, opts) {
+		const label = escapeXml(nodeLabel(n, opts));
+		return (
+			'<g class="cg-node" data-node-id="' +
+			escapeXml(n.id) +
+			'" data-kind="' +
+			escapeXml(n.kind || "file") +
+			'">' +
+			'<rect x="' +
+			n.x +
+			'" y="' +
+			n.y +
+			'" width="' +
+			n.w +
+			'" height="' +
+			n.h +
+			'" rx="6" ry="6"/>' +
+			'<text x="' +
+			(n.x + 10) +
+			'" y="' +
+			(n.y + n.h / 2 + 4) +
+			'">' +
+			label +
+			"</text>" +
+			"</g>"
+		);
+	}
+
 	function buildSvg(layout, opts) {
 		const cfg = mergeDefaults(opts);
 		const nodes = (layout && layout.nodes) || [];
@@ -556,12 +795,17 @@
 		const height = (layout && layout.height) || cfg.pad * 2;
 		const byId = new Map(nodes.map((n) => [n.id, n]));
 		const aria = escapeXml((opts && opts.ariaLabel) || "Code graph");
+		const overview =
+			!!(layout && layout.overview) ||
+			(layout && layout.mode === "cluster") ||
+			nodes.some((n) => n.kind === "cluster" && (n.summary || n.complexity));
 
 		const edgeParts = [];
 		edges.forEach((e) => {
 			const a = byId.get(e.from);
 			const b = byId.get(e.to);
 			if (!a || !b) return;
+			const weight = e.weight != null ? e.weight : e.edgeCount;
 			edgeParts.push(
 				'<path class="cg-edge" data-from="' +
 					escapeXml(e.from) +
@@ -569,38 +813,28 @@
 					escapeXml(e.to) +
 					'" d="' +
 					escapeXml(edgePath(a, b, opts)) +
-					'" fill="none" stroke="currentColor" stroke-opacity="0.45"/>'
+					'" fill="none" stroke="currentColor" stroke-opacity="0.4"/>' +
+					(weight != null
+						? '<text class="cg-edge-label" x="' +
+							((a.x + a.w + b.x) / 2) +
+							'" y="' +
+							((a.y + a.h / 2 + b.y + b.h / 2) / 2 - 4) +
+							'">' +
+							escapeXml(String(weight)) +
+							"</text>"
+						: "")
 			);
 		});
 
 		const nodeParts = nodes.map((n) => {
-			const label = escapeXml(nodeLabel(n, opts));
-			return (
-				'<g class="cg-node" data-node-id="' +
-				escapeXml(n.id) +
-				'">' +
-				'<rect x="' +
-				n.x +
-				'" y="' +
-				n.y +
-				'" width="' +
-				n.w +
-				'" height="' +
-				n.h +
-				'" rx="6" ry="6"/>' +
-				'<text x="' +
-				(n.x + 10) +
-				'" y="' +
-				(n.y + n.h / 2 + 4) +
-				'">' +
-				label +
-				"</text>" +
-				"</g>"
-			);
+			if (overview && n.kind === "cluster") return buildOverviewCard(n, opts);
+			return buildSimpleNode(n, opts);
 		});
 
 		return (
-			'<svg xmlns="http://www.w3.org/2000/svg" width="' +
+			'<svg xmlns="http://www.w3.org/2000/svg" class="cg-svg' +
+			(overview ? " cg-svg-overview" : "") +
+			'" width="' +
 			width +
 			'" height="' +
 			height +
@@ -754,6 +988,9 @@
 		viewBoxOf,
 		hitTest,
 		fileBasename,
-		normPath
+		normPath,
+		complexityOf,
+		summaryForCluster,
+		wrapText
 	};
 });
