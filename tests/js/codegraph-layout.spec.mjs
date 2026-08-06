@@ -204,11 +204,64 @@ test("complexityOf and wrapText are deterministic helpers", () => {
 	assert.ok(lines.join(" ").includes("one"));
 });
 
+test("uniqueEdges accepts sourceFile/targetFile and normalizes case", () => {
+	const edges = layout.uniqueEdges([
+		{
+			sourceFile: "app/Handlers/Orders.bx",
+			targetFile: "app/models/OrderService.cfc",
+			kind: "injects",
+			evidence: "property inject",
+			line: 12
+		},
+		{
+			from: "APP/handlers/orders.bx",
+			to: "APP/models/orderservice.cfc",
+			kind: "injects",
+			evidence: "dup"
+		}
+	]);
+	assert.equal(edges.length, 1);
+	assert.equal(edges[0].from, "app/handlers/orders.bx");
+	assert.equal(edges[0].to, "app/models/orderservice.cfc");
+	assert.equal(edges[0].kind, "injects");
+	assert.equal(edges[0].evidence, "property inject");
+	assert.equal(edges[0].line, 12);
+});
+
+test("buildFocusView wires subgraph edges without from/to keys", () => {
+	const focus = layout.buildFocusView(
+		{
+			focus: "app/handlers/Orders.bx",
+			nodes: [
+				{ id: "app/Handlers/Orders.bx", path: "app/Handlers/Orders.bx" },
+				{ id: "app/models/OrderService.cfc", path: "app/models/OrderService.cfc" }
+			],
+			edges: [
+				{
+					sourceFile: "app/Handlers/Orders.bx",
+					targetFile: "app/models/OrderService.cfc",
+					kind: "injects",
+					evidence: "inject=orderService"
+				}
+			]
+		},
+		{ detail: true }
+	);
+	assert.equal(focus.edges.length, 1);
+	assert.equal(focus.edges[0].from, "app/handlers/orders.bx");
+	assert.ok(focus.nodes.every((n) => n.id === n.id.toLowerCase()));
+	const svg = layout.buildSvg(layout.layoutClusters(focus, { detail: true }));
+	assert.ok(svg.includes("cg-edge"));
+	assert.ok(svg.includes("injects"));
+	assert.ok(svg.includes('data-evidence="inject=orderService"'));
+});
+
 test("file and focus views render fan-in meta and edge kinds", () => {
 	const files = layout.buildFileView(sample, { detail: true });
 	assert.equal(files.detail, true);
-	const orders = files.nodes.find((n) => n.id.includes("Orders.bx"));
+	const orders = files.nodes.find((n) => /orders\.bx$/i.test(n.id) || /orders\.bx$/i.test(n.path || ""));
 	assert.ok(orders);
+	assert.equal(orders.id, orders.id.toLowerCase());
 	const positioned = layout.layoutClusters(files, { detail: true });
 	assert.ok(positioned.nodes[0].w >= layout.DEFAULTS.detailNodeWidth);
 	const svg = layout.buildSvg(positioned);

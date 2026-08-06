@@ -1,5 +1,5 @@
 /**
- * REST: CodeGraph neighbourhood drill-down (subgraph) for a finished run.
+ * REST: CodeGraph neighbourhood subgraph and bounded file edges for a finished run.
  *
  * @see CodeGraphRunService
  */
@@ -13,6 +13,8 @@ class extends="coldbox.system.RestHandler" {
 	property name="codegraphSubgraphMaxNodes" inject="coldbox:setting:codegraphSubgraphMaxNodes";
 
 	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
+
+	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
 
 	function preHandler(
 		event,
@@ -76,6 +78,52 @@ class extends="coldbox.system.RestHandler" {
 						limit  : rc.limit ?: "",
 						kinds  : rc.kinds ?: "",
 						include: rc.include ?: ""
+					}
+				);
+			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/**
+	 * Bounded file edges for Files depth (optional clusterId filter)
+	 *
+	 * @tags CodeGraph
+	 * @hint File-to-file dependency edges with kind/evidence, capped by limit
+	 * @param-clusterId { "name":"clusterId", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-kinds { "name":"kinds", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @param-include { "name":"include", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @response-200 File edges payload
+	 * @response-404 Run not found or not a codegraph run
+	 * @response-422 Validation failed
+	 */
+	function edges( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) {
+			return notFound( event );
+		}
+
+		var maxEdges = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		if ( len( trim( toString( rc.limit ?: "" ) ) ) ) {
+			if ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > maxEdges ) {
+				return validationError( event, "limit must be between 1 and #maxEdges#" );
+			}
+		}
+
+		try {
+			var payload = codeGraphRunService.fileEdges(
+					run.getId(),
+					{
+						clusterId: rc.clusterId ?: "",
+						limit    : rc.limit ?: "",
+						kinds    : rc.kinds ?: "",
+						include  : rc.include ?: ""
 					}
 				);
 			event.renderData( type = "json", data = { data: payload } );

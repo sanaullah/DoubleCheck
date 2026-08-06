@@ -224,6 +224,15 @@
 		return String(path || "").replace(/\\/g, "/");
 	}
 
+	/** Stable graph id: forward-slash + lowercase (matches snapshot node.id). */
+	function normId(path) {
+		return normPath(path).toLowerCase();
+	}
+
+	function idsEqual(a, b) {
+		return normId(a) === normId(b) && !!normId(a);
+	}
+
 	function fileBasename(path) {
 		const p = normPath(path);
 		const i = p.lastIndexOf("/");
@@ -253,23 +262,45 @@
 	}
 
 	function uniqueEdges(list) {
-		const seen = new Set();
+		const seen = new Map();
 		const out = [];
 		(list || []).forEach((e) => {
-			const from = String(e.from || "");
-			const to = String(e.to || "");
+			const rawFrom = e.from || e.sourceFile || e.source || "";
+			const rawTo = e.to || e.targetFile || "";
+			const from = normId(rawFrom);
+			const to = normId(rawTo);
 			if (!from || !to || from === to) return;
-			const key = from + "\0" + to + "\0" + String(e.kind || e.label || "");
-			if (seen.has(key)) return;
-			seen.add(key);
-			out.push({
+			const kind = String(e.kind || e.label || "");
+			const key = from + "\0" + to + "\0" + kind;
+			if (seen.has(key)) {
+				const existing = seen.get(key);
+				if (e.evidence && !existing.evidence) existing.evidence = String(e.evidence);
+				if (e.line != null && (existing.line == null || existing.line === 0)) {
+					existing.line = Number(e.line) || 0;
+				}
+				const add = e.weight != null ? Number(e.weight) : e.edgeCount != null ? Number(e.edgeCount) : 1;
+				existing.edgeCount = (Number(existing.edgeCount) || 1) + (Number.isFinite(add) ? add : 1);
+				if (existing.weight != null || e.weight != null) {
+					existing.weight = (Number(existing.weight) || 0) + (Number(e.weight) || 0);
+				}
+				return;
+			}
+			const edge = {
 				from,
 				to,
-				kind: e.kind || e.label || "",
+				kind,
 				weight: e.weight,
-				edgeCount: e.edgeCount,
-				label: e.label || e.kind || ""
-			});
+				edgeCount: e.edgeCount != null ? e.edgeCount : 1,
+				label: e.label || kind || "",
+				evidence: e.evidence != null ? String(e.evidence) : "",
+				line: e.line != null ? Number(e.line) || 0 : null,
+				target: e.target != null ? String(e.target) : "",
+				sourceFile: normPath(e.sourceFile || rawFrom),
+				targetFile: normPath(e.targetFile || rawTo),
+				id: e.id != null ? String(e.id) : ""
+			};
+			seen.set(key, edge);
+			out.push(edge);
 		});
 		return out;
 	}
@@ -298,8 +329,8 @@
 			selectedNodes = selectedNodes.slice(0, maxNodes);
 			truncated = true;
 		}
-		const idSet = new Set(selectedNodes.map((n) => n.id));
-		selectedEdges = selectedEdges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
+		const idSet = new Set(selectedNodes.map((n) => normId(n.id || n.path)));
+		selectedEdges = selectedEdges.filter((e) => idSet.has(normId(e.from)) && idSet.has(normId(e.to)));
 		if (selectedEdges.length > maxEdges) {
 			selectedEdges = selectedEdges.slice(0, maxEdges);
 			truncated = true;
@@ -359,8 +390,8 @@
 			return node;
 		});
 
-		const idSet = new Set(nodes.map((n) => n.id));
-		const edges = uniqueEdges(clusterEdges).filter((e) => idSet.has(e.from) && idSet.has(e.to));
+		const idSet = new Set(nodes.map((n) => normId(n.id)));
+		const edges = uniqueEdges(clusterEdges).filter((e) => idSet.has(normId(e.from)) && idSet.has(normId(e.to)));
 		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
 		return Object.assign(
 			{
@@ -378,10 +409,11 @@
 		const cfg = mergeDefaults(Object.assign({}, opts, { detail: true, overview: false }));
 		const raw = Array.isArray(snapshot && snapshot.nodes) ? snapshot.nodes : [];
 		let nodes = raw.map((n, index) => {
-			const path = n.path || n.id || "";
+			const path = normPath(n.path || n.id || "");
+			const id = normId(n.id || path) || "node-" + index;
 			return {
-				id: String(n.id || path || "node-" + index),
-				path: path,
+				id: id,
+				path: path || id,
 				label: n.label || fileBasename(path),
 				kind: n.kind || "file",
 				layer: numericLayer(n),
@@ -416,14 +448,14 @@
 		const cfg = mergeDefaults(Object.assign({}, opts, { detail: true, overview: false }));
 		const rawNodes = Array.isArray(subgraph && subgraph.nodes) ? subgraph.nodes : [];
 		const rawEdges = Array.isArray(subgraph && subgraph.edges) ? subgraph.edges : [];
-		const focusId = subgraph && subgraph.focus ? String(subgraph.focus) : "";
+		const focusId = subgraph && subgraph.focus ? normId(subgraph.focus) : "";
 
 		const nodes = rawNodes.map((n, index) => {
-			const path = n.path || n.id || "";
-			const id = String(n.id || path || "node-" + index);
+			const path = normPath(n.path || n.id || "");
+			const id = normId(n.id || path) || "node-" + index;
 			return {
 				id: id,
-				path: path,
+				path: path || id,
 				label: n.label || fileBasename(path),
 				kind: n.kind || "file",
 				layer: numericLayer(n),
@@ -434,7 +466,7 @@
 				symbolCount: n.symbolCount || 0,
 				inCycle: !!n.inCycle,
 				hotspotScore: n.hotspotScore || 0,
-				role: n.role || (id === focusId || path === focusId ? "focus" : "neighbor")
+				role: n.role || (idsEqual(id, focusId) || idsEqual(path, focusId) ? "focus" : "neighbor")
 			};
 		});
 		const edges = uniqueEdges(rawEdges);
@@ -954,28 +986,43 @@
 		const edges = (layout && layout.edges) || [];
 		const width = (layout && layout.width) || cfg.pad * 2;
 		const height = (layout && layout.height) || cfg.pad * 2;
-		const byId = new Map(nodes.map((n) => [n.id, n]));
+		const byId = new Map();
+		nodes.forEach((n) => {
+			byId.set(n.id, n);
+			byId.set(normId(n.id), n);
+			if (n.path) byId.set(normId(n.path), n);
+		});
 		const aria = escapeXml((opts && opts.ariaLabel) || "Code graph");
 		const overview =
 			!!(layout && layout.overview) ||
 			(layout && layout.mode === "cluster") ||
 			nodes.some((n) => n.kind === "cluster" && (n.summary || n.complexity));
+		const selectedEdgeKey = opts && opts.selectedEdgeKey ? String(opts.selectedEdgeKey) : "";
 
 		const edgeParts = [];
 		edges.forEach((e) => {
-			const a = byId.get(e.from);
-			const b = byId.get(e.to);
+			const a = byId.get(e.from) || byId.get(normId(e.from));
+			const b = byId.get(e.to) || byId.get(normId(e.to));
 			if (!a || !b) return;
 			const weight = e.weight != null ? e.weight : e.edgeCount;
 			const edgeLabel = e.kind || e.label || (weight != null ? String(weight) : "");
+			const edgeKey = normId(e.from) + "\0" + normId(e.to) + "\0" + String(e.kind || "");
+			const selected = selectedEdgeKey && edgeKey === selectedEdgeKey ? " is-selected" : "";
+			let extraAttrs = "";
+			if (e.evidence) extraAttrs += ' data-evidence="' + escapeXml(String(e.evidence).slice(0, 400)) + '"';
+			if (e.line != null && e.line !== "") extraAttrs += ' data-line="' + escapeXml(String(e.line)) + '"';
 			edgeParts.push(
-				'<path class="cg-edge" data-from="' +
+				'<path class="cg-edge' +
+					selected +
+					'" data-from="' +
 					escapeXml(e.from) +
 					'" data-to="' +
 					escapeXml(e.to) +
 					'" data-kind="' +
 					escapeXml(e.kind || "") +
-					'" d="' +
+					'"' +
+					extraAttrs +
+					' d="' +
 					escapeXml(edgePath(a, b, opts)) +
 					'" fill="none" stroke="currentColor" stroke-opacity="0.45"/>' +
 					(edgeLabel
@@ -1154,6 +1201,9 @@
 		hitTest,
 		fileBasename,
 		normPath,
+		normId,
+		idsEqual,
+		uniqueEdges,
 		complexityOf,
 		summaryForCluster,
 		wrapText,

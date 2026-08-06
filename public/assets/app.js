@@ -105,9 +105,14 @@ const state = {
 		mode: "cluster",
 		layout: "cluster",
 		selectedId: "",
+		selectedEdge: null,
 		clusterId: "",
 		focusId: "",
 		focusSubgraph: null,
+		fileEdges: [],
+		fileEdgesKey: "",
+		fileEdgesLoading: "",
+		fileEdgesTruncated: false,
 		issueTab: "cycles",
 		viewport: null,
 		layoutResult: null,
@@ -2181,8 +2186,14 @@ function setRun(run) {
 		state.codegraph.error = "";
 		state.codegraph.mode = "cluster";
 		state.codegraph.selectedId = "";
+		state.codegraph.selectedEdge = null;
 		state.codegraph.clusterId = "";
 		state.codegraph.focusId = "";
+		state.codegraph.focusSubgraph = null;
+		state.codegraph.fileEdges = [];
+		state.codegraph.fileEdgesKey = "";
+		state.codegraph.fileEdgesLoading = "";
+		state.codegraph.fileEdgesTruncated = false;
 		state.codegraph.layoutResult = null;
 		state.codegraph.viewport = null;
 		state.codegraph.overviewShowAll = false;
@@ -3888,14 +3899,81 @@ function codeGraphLayoutApi() {
 	return window.CodeGraphLayout || null;
 }
 
+function codeGraphNormId(pathOrId) {
+	const CG = codeGraphLayoutApi();
+	if (CG?.normId) return CG.normId(pathOrId);
+	return String(pathOrId || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function codeGraphIdsEqual(a, b) {
+	const CG = codeGraphLayoutApi();
+	if (CG?.idsEqual) return CG.idsEqual(a, b);
+	return codeGraphNormId(a) === codeGraphNormId(b) && !!codeGraphNormId(a);
+}
+
+function codeGraphEdgeKey(edge) {
+	if (!edge) return "";
+	return `${codeGraphNormId(edge.from)}\0${codeGraphNormId(edge.to)}\0${String(edge.kind || "")}`;
+}
+
+async function codeGraphEnsureFileEdges(clusterId) {
+	const key = String(clusterId || "__all__");
+	if (state.codegraph.fileEdgesKey === key && Array.isArray(state.codegraph.fileEdges)) return true;
+	const runId = state.activeRun?.id;
+	if (!runId) {
+		state.codegraph.fileEdges = [];
+		state.codegraph.fileEdgesKey = key;
+		state.codegraph.fileEdgesTruncated = false;
+		return true;
+	}
+	if (state.codegraph.fileEdgesLoading === key) return false;
+	state.codegraph.fileEdgesLoading = key;
+	try {
+		const params = new URLSearchParams({ limit: "2000" });
+		if (clusterId) params.set("clusterId", clusterId);
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/edges?${params.toString()}`
+		);
+		if (state.codegraph.fileEdgesLoading !== key) return false;
+		state.codegraph.fileEdges = payload.data?.edges || [];
+		state.codegraph.fileEdgesKey = key;
+		state.codegraph.fileEdgesTruncated = !!payload.data?.truncated;
+		return true;
+	} catch (error) {
+		if (state.codegraph.fileEdgesLoading === key) {
+			state.codegraph.fileEdges = [];
+			state.codegraph.fileEdgesKey = key;
+			state.codegraph.fileEdgesTruncated = false;
+		}
+		if (elements.codegraphFailed) {
+			elements.codegraphFailed.hidden = false;
+			elements.codegraphFailed.textContent = error.message || "Could not load file edges.";
+		}
+		return false;
+	} finally {
+		if (state.codegraph.fileEdgesLoading === key) state.codegraph.fileEdgesLoading = "";
+	}
+}
+
+async function codeGraphEnterFiles(clusterId, { fit = true } = {}) {
+	state.codegraph.mode = "file";
+	state.codegraph.clusterId = clusterId || "";
+	state.codegraph.focusId = "";
+	state.codegraph.focusSubgraph = null;
+	state.codegraph.selectedEdge = null;
+	await codeGraphEnsureFileEdges(clusterId || "");
+	paintCodeGraphCanvas({ fit });
+}
+
 function resetCodeGraphSelection() {
 	state.codegraph.selectedId = "";
+	state.codegraph.selectedEdge = null;
 	state.codegraph.focusId = "";
 	if (elements.codegraphInspector) {
 		elements.codegraphInspector.innerHTML = emptyStateHtml({
 			icon: "detail",
 			title: "Select a node",
-			hint: "Inspect cluster or file details here."
+			hint: "Inspect cluster, file, or edge details here."
 		});
 	}
 }
@@ -4009,7 +4087,7 @@ function renderCodeGraphProjectStrip(view) {
 function codeGraphCentreOnNode(nodeId) {
 	const CG = codeGraphLayoutApi();
 	const layout = state.codegraph.layoutResult;
-	const node = layout?.nodes?.find((n) => n.id === nodeId);
+	const node = layout?.nodes?.find((n) => codeGraphIdsEqual(n.id, nodeId) || codeGraphIdsEqual(n.path, nodeId));
 	if (!CG || !node || !state.codegraph.viewport) return;
 	const vp = state.codegraph.viewport;
 	vp.x = node.x + node.w / 2 - vp.width / 2;
@@ -4163,16 +4241,19 @@ async function codeGraphOpenFile(pathOrId, { neighbourhood = false } = {}) {
 		}
 		state.codegraph.focusId = "";
 		state.codegraph.focusSubgraph = null;
+		state.codegraph.selectedEdge = null;
+		await codeGraphEnsureFileEdges(state.codegraph.clusterId || "");
 		paintCodeGraphCanvas({ fit: true });
 	}
 	state.codegraph.selectedId = id;
+	state.codegraph.selectedEdge = null;
 	if (neighbourhood) {
 		await codeGraphDrillToFocus(id);
 		return;
 	}
-	const laid = state.codegraph.layoutResult?.nodes?.find((n) => n.id === id || n.path === id) || node;
+	const laid = state.codegraph.layoutResult?.nodes?.find((n) => codeGraphIdsEqual(n.id, id) || codeGraphIdsEqual(n.path, id)) || node;
 	elements.codegraphCanvas?.querySelectorAll(".cg-node").forEach((el) => {
-		el.classList.toggle("is-selected", el.getAttribute("data-node-id") === id);
+		el.classList.toggle("is-selected", codeGraphIdsEqual(el.getAttribute("data-node-id"), id));
 	});
 	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(laid);
 	codeGraphCentreOnNode(id);
@@ -4180,7 +4261,20 @@ async function codeGraphOpenFile(pathOrId, { neighbourhood = false } = {}) {
 
 function codeGraphInspectorHtml(node) {
 	if (!node) {
-		return emptyStateHtml({ icon: "detail", title: "Select a node", hint: "Inspect cluster or file details here." });
+		return emptyStateHtml({ icon: "detail", title: "Select a node", hint: "Inspect cluster, file, or edge details here." });
+	}
+	if (node.kind === "edge") {
+		const rows = [
+			["Kind", node.edgeKind || node.kindLabel || "—"],
+			["From", node.fromPath || node.from || "—"],
+			["To", node.toPath || node.to || "—"],
+			["Line", node.line != null && node.line !== "" ? String(node.line) : ""],
+			["Target", node.target || ""],
+			["Evidence", node.evidence || ""]
+		].filter(([, value]) => value !== "");
+		return `<div class="codegraph-inspector-body"><h3>Dependency</h3><dl class="codegraph-inspector-grid">${rows
+			.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd title="${escapeHtml(v)}">${escapeHtml(v)}</dd></div>`)
+			.join("")}</dl><p class="field-hint">Edge evidence from the dependency index.</p></div>`;
 	}
 	const rows = [
 		["Kind", node.kind || "—"],
@@ -4222,8 +4316,8 @@ function codeGraphInspectorHtml(node) {
 			? "Explore opens module files. Click a file for neighbourhood."
 			: "Click a file below, then open neighbourhood."
 		: state.codegraph.mode === "focus"
-			? "Neighbourhood focus for this file."
-			: "Open neighbourhood to see dependents and dependencies.";
+			? "Click an edge for evidence. Neighbourhood focus for this file."
+			: "Open neighbourhood to see dependents and dependencies. Click an edge for evidence.";
 	const explore =
 		node.kind === "cluster" && onOverview
 			? `<button type="button" class="secondary-button codegraph-explore-btn" data-codegraph-explore="${escapeHtml(node.id)}">Explore files</button>`
@@ -4360,15 +4454,24 @@ function paintCodeGraphCanvas(options = {}) {
 			...sub,
 			nodes: (sub.nodes || []).map((n) => {
 				const hit = codeGraphLookupNode(n.id || n.path);
-				return hit ? { ...hit, ...n, role: n.role || hit.role } : n;
+				return hit ? { ...hit, ...n, id: codeGraphNormId(n.id || n.path || hit.id), role: n.role || hit.role } : {
+					...n,
+					id: codeGraphNormId(n.id || n.path)
+				};
 			})
 		};
 		view = CG.buildFocusView(enriched, { maxNodes: 120, detail: true });
 	} else if (depth === "file") {
 		const clusterId = state.codegraph.clusterId;
+		const edgesKey = String(clusterId || "__all__");
+		if (state.codegraph.fileEdgesKey !== edgesKey) {
+			codeGraphEnsureFileEdges(clusterId || "").then((ok) => {
+				if (ok && state.codegraph.mode === "file") paintCodeGraphCanvas({ fit: false });
+			});
+		}
 		const filtered = {
 			nodes: (snapshot.nodes || []).filter((n) => !clusterId || n.clusterId === clusterId || (n.path && clusterId && String(n.clusterId) === String(clusterId))),
-			edges: snapshot.edges || []
+			edges: state.codegraph.fileEdgesKey === edgesKey ? state.codegraph.fileEdges || [] : []
 		};
 		if (clusterId && !filtered.nodes.length) {
 			const cluster = (snapshot.clusters || []).find((c) => String(c.id) === String(clusterId));
@@ -4385,7 +4488,7 @@ function paintCodeGraphCanvas(options = {}) {
 			summaries
 		});
 	}
-	state.codegraph.viewTruncated = !!(view.truncated || snapshot.truncated);
+	state.codegraph.viewTruncated = !!(view.truncated || snapshot.truncated || (depth === "file" && state.codegraph.fileEdgesTruncated));
 	const layoutOpts =
 		depth === "cluster" || depth === "overview"
 			? { overview: true }
@@ -4397,7 +4500,8 @@ function paintCodeGraphCanvas(options = {}) {
 			: CG.layoutClusters(view, layoutOpts);
 	state.codegraph.layoutResult = layout;
 	host.innerHTML = CG.buildSvg(layout, {
-		ariaLabel: depth === "file" ? "Module files" : depth === "focus" ? "Neighbourhood graph" : "Project overview"
+		ariaLabel: depth === "file" ? "Module files" : depth === "focus" ? "Neighbourhood graph" : "Project overview",
+		selectedEdgeKey: codeGraphEdgeKey(state.codegraph.selectedEdge)
 	});
 	const svg = host.querySelector("svg");
 	if (svg) {
@@ -4418,8 +4522,10 @@ function paintCodeGraphCanvas(options = {}) {
 		svg.setAttribute("viewBox", CG.viewBoxOf(state.codegraph.viewport));
 		svg.setAttribute("width", "100%");
 		svg.setAttribute("height", "100%");
+		const selectedNorm = codeGraphNormId(state.codegraph.selectedId);
 		svg.querySelectorAll(".cg-node").forEach((node) => {
-			node.classList.toggle("is-selected", node.getAttribute("data-node-id") === state.codegraph.selectedId);
+			const nid = node.getAttribute("data-node-id") || "";
+			node.classList.toggle("is-selected", codeGraphIdsEqual(nid, selectedNorm) || nid === state.codegraph.selectedId);
 		});
 	}
 	if (elements.codegraphTruncation) {
@@ -4495,25 +4601,36 @@ function renderCodeGraph(result = {}) {
 	paintCodeGraphCanvas();
 	renderCodeGraphIssues();
 	renderCodeGraphAiSummaries();
-	const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === state.codegraph.selectedId);
-	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
+	const selected = state.codegraph.layoutResult?.nodes?.find((n) =>
+		codeGraphIdsEqual(n.id, state.codegraph.selectedId)
+	);
+	if (elements.codegraphInspector) {
+		elements.codegraphInspector.innerHTML = state.codegraph.selectedEdge
+			? codeGraphInspectorHtml(state.codegraph.selectedEdge)
+			: codeGraphInspectorHtml(selected);
+	}
 }
 
 async function codeGraphDrillToFocus(nodeId) {
 	const runId = state.activeRun?.id;
 	if (!runId || !nodeId) return;
+	const node = codeGraphLookupNode(nodeId);
+	const focus = node?.path || node?.id || nodeId;
 	try {
 		const payload = await request(
-			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/subgraph?focus=${encodeURIComponent(nodeId)}&depth=2&limit=120`
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/subgraph?focus=${encodeURIComponent(focus)}&depth=2&limit=120`
 		);
 		state.codegraph.mode = "focus";
-		state.codegraph.focusId = nodeId;
+		state.codegraph.focusId = codeGraphNormId(focus);
 		state.codegraph.focusSubgraph = payload.data;
-		state.codegraph.selectedId = nodeId;
+		state.codegraph.selectedId = codeGraphNormId(focus);
+		state.codegraph.selectedEdge = null;
 		paintCodeGraphCanvas({ fit: true });
-		codeGraphCentreOnNode(nodeId);
+		codeGraphCentreOnNode(state.codegraph.selectedId);
 		if (elements.codegraphInspector) {
-			const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === nodeId);
+			const selected = state.codegraph.layoutResult?.nodes?.find((n) =>
+				codeGraphIdsEqual(n.id, state.codegraph.selectedId) || codeGraphIdsEqual(n.path, focus)
+			);
 			elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
 		}
 	} catch (error) {
@@ -4524,35 +4641,66 @@ async function codeGraphDrillToFocus(nodeId) {
 	}
 }
 
+function codeGraphSelectEdge(from, to, kind, attrs = {}) {
+	const edge = {
+		kind: "edge",
+		from: codeGraphNormId(from),
+		to: codeGraphNormId(to),
+		edgeKind: kind || "",
+		kindLabel: kind || "",
+		fromPath: attrs.sourceFile || from || "",
+		toPath: attrs.targetFile || to || "",
+		evidence: attrs.evidence || "",
+		line: attrs.line,
+		target: attrs.target || "",
+		label: `${kind || "edge"}`
+	};
+	const fromLayout = (state.codegraph.layoutResult?.edges || []).find(
+		(e) => codeGraphIdsEqual(e.from, from) && codeGraphIdsEqual(e.to, to) && String(e.kind || "") === String(kind || "")
+	);
+	if (fromLayout) {
+		edge.evidence = edge.evidence || fromLayout.evidence || "";
+		edge.line = edge.line != null ? edge.line : fromLayout.line;
+		edge.target = edge.target || fromLayout.target || "";
+		edge.fromPath = fromLayout.sourceFile || edge.fromPath;
+		edge.toPath = fromLayout.targetFile || edge.toPath;
+	}
+	state.codegraph.selectedEdge = edge;
+	state.codegraph.selectedId = "";
+	elements.codegraphCanvas?.querySelectorAll(".cg-node").forEach((el) => el.classList.remove("is-selected"));
+	elements.codegraphCanvas?.querySelectorAll(".cg-edge").forEach((el) => {
+		const match =
+			codeGraphIdsEqual(el.getAttribute("data-from"), from) &&
+			codeGraphIdsEqual(el.getAttribute("data-to"), to) &&
+			String(el.getAttribute("data-kind") || "") === String(kind || "");
+		el.classList.toggle("is-selected", match);
+	});
+	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(edge);
+}
+
 function codeGraphSelectNode(nodeId, { drill = false } = {}) {
 	const layout = state.codegraph.layoutResult;
-	let node = layout?.nodes?.find((n) => n.id === nodeId || n.path === nodeId);
+	let node = layout?.nodes?.find((n) => codeGraphIdsEqual(n.id, nodeId) || codeGraphIdsEqual(n.path, nodeId));
 	if (!node) node = codeGraphLookupNode(nodeId);
 	if (!node) return;
-	const same = state.codegraph.selectedId === nodeId;
+	const same = codeGraphIdsEqual(state.codegraph.selectedId, nodeId);
 	const onOverview = state.codegraph.mode === "cluster" || state.codegraph.mode === "overview";
-	state.codegraph.selectedId = nodeId;
+	state.codegraph.selectedId = node.id || nodeId;
+	state.codegraph.selectedEdge = null;
 	elements.codegraphCanvas?.querySelectorAll(".cg-node").forEach((el) => {
-		el.classList.toggle("is-selected", el.getAttribute("data-node-id") === nodeId);
+		el.classList.toggle("is-selected", codeGraphIdsEqual(el.getAttribute("data-node-id"), state.codegraph.selectedId));
 	});
+	elements.codegraphCanvas?.querySelectorAll(".cg-edge").forEach((el) => el.classList.remove("is-selected"));
 	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(node);
 	// Overview: select only unless explicit drill (Explore / double-click / Enter)
 	if (onOverview && node.kind === "cluster") {
 		if (!drill) return;
-		state.codegraph.mode = "file";
-		state.codegraph.clusterId = nodeId;
-		state.codegraph.focusId = "";
-		state.codegraph.focusSubgraph = null;
-		paintCodeGraphCanvas({ fit: true });
+		codeGraphEnterFiles(nodeId, { fit: true });
 		return;
 	}
 	if (!drill && !same) return;
 	if (node.kind === "cluster") {
-		state.codegraph.mode = "file";
-		state.codegraph.clusterId = nodeId;
-		state.codegraph.focusId = "";
-		state.codegraph.focusSubgraph = null;
-		paintCodeGraphCanvas({ fit: true });
+		codeGraphEnterFiles(nodeId, { fit: true });
 		return;
 	}
 	codeGraphDrillToFocus(nodeId);
@@ -6917,17 +7065,18 @@ elements.codegraphDepth?.addEventListener("click", (event) => {
 		state.codegraph.mode = "cluster";
 		state.codegraph.focusId = "";
 		state.codegraph.focusSubgraph = null;
+		state.codegraph.selectedEdge = null;
 		resetCodeGraphSelection();
+		paintCodeGraphCanvas({ fit: true });
 	} else if (depth === "file") {
 		if (!state.codegraph.clusterId && state.codegraph.mode !== "file") return;
-		state.codegraph.mode = "file";
-		state.codegraph.focusId = "";
-		state.codegraph.focusSubgraph = null;
+		codeGraphEnterFiles(state.codegraph.clusterId, { fit: true });
 	} else if (depth === "focus") {
 		if (!state.codegraph.focusSubgraph) return;
 		state.codegraph.mode = "focus";
+		state.codegraph.selectedEdge = null;
+		paintCodeGraphCanvas({ fit: true });
 	}
-	paintCodeGraphCanvas({ fit: true });
 });
 
 elements.codegraphZoomIn?.addEventListener("click", () => codeGraphZoomBy(0.9));
@@ -6942,8 +7091,14 @@ elements.codegraphShowAi?.addEventListener("change", (event) => {
 	state.codegraph.showAi = !!event.target.checked;
 	paintCodeGraphCanvas({ fit: false });
 	renderCodeGraphAiSummaries();
-	const selected = state.codegraph.layoutResult?.nodes?.find((n) => n.id === state.codegraph.selectedId);
-	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(selected);
+	const selected = state.codegraph.layoutResult?.nodes?.find((n) =>
+		codeGraphIdsEqual(n.id, state.codegraph.selectedId)
+	);
+	if (elements.codegraphInspector) {
+		elements.codegraphInspector.innerHTML = state.codegraph.selectedEdge
+			? codeGraphInspectorHtml(state.codegraph.selectedEdge)
+			: codeGraphInspectorHtml(selected);
+	}
 });
 
 elements.codegraphAiSummaries?.addEventListener("click", (event) => {
@@ -7006,16 +7161,14 @@ elements.codegraphBreadcrumb?.addEventListener("click", (event) => {
 		resetCodeGraphSelection();
 		paintCodeGraphCanvas({ fit: true });
 	} else if (target === "cluster") {
-		state.codegraph.mode = "file";
-		state.codegraph.focusId = "";
-		state.codegraph.focusSubgraph = null;
-		paintCodeGraphCanvas({ fit: true });
+		codeGraphEnterFiles(state.codegraph.clusterId, { fit: true });
 	}
 });
 
 elements.codegraphCanvas?.addEventListener("pointerdown", (event) => {
 	if (event.button === 2) return;
 	const onNode = event.target.closest("[data-node-id]");
+	const onEdge = !onNode ? event.target.closest(".cg-edge") : null;
 	const forcePan = event.button === 1 || event.altKey;
 	state.codegraph.panSession = {
 		pointerId: event.pointerId,
@@ -7024,6 +7177,11 @@ elements.codegraphCanvas?.addEventListener("pointerdown", (event) => {
 		lastX: event.clientX,
 		lastY: event.clientY,
 		nodeId: onNode ? onNode.getAttribute("data-node-id") || "" : "",
+		edgeFrom: onEdge ? onEdge.getAttribute("data-from") || "" : "",
+		edgeTo: onEdge ? onEdge.getAttribute("data-to") || "" : "",
+		edgeKind: onEdge ? onEdge.getAttribute("data-kind") || "" : "",
+		edgeEvidence: onEdge ? onEdge.getAttribute("data-evidence") || "" : "",
+		edgeLine: onEdge ? onEdge.getAttribute("data-line") || "" : "",
 		forcePan,
 		moved: false,
 		panning: forcePan
@@ -7063,6 +7221,12 @@ elements.codegraphCanvas?.addEventListener("pointerup", (event) => {
 	elements.codegraphCanvas.classList.remove("is-panning");
 	if (session.moved) return;
 	if (session.nodeId) codeGraphSelectNode(session.nodeId);
+	else if (session.edgeFrom && session.edgeTo) {
+		codeGraphSelectEdge(session.edgeFrom, session.edgeTo, session.edgeKind, {
+			evidence: session.edgeEvidence,
+			line: session.edgeLine
+		});
+	}
 });
 
 elements.codegraphCanvas?.addEventListener("pointercancel", () => {
@@ -7112,10 +7276,7 @@ elements.codegraphCanvas?.addEventListener("keydown", (event) => {
 	} else if (event.key === "Escape") {
 		event.preventDefault();
 		if (state.codegraph.mode === "focus") {
-			state.codegraph.mode = "file";
-			state.codegraph.focusId = "";
-			state.codegraph.focusSubgraph = null;
-			paintCodeGraphCanvas({ fit: true });
+			codeGraphEnterFiles(state.codegraph.clusterId, { fit: true });
 		} else if (state.codegraph.mode === "file") {
 			state.codegraph.mode = "cluster";
 			state.codegraph.clusterId = "";

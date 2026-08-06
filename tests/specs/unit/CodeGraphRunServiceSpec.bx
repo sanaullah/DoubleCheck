@@ -249,7 +249,7 @@ class extends="testbox.system.BaseSpec" {
 					getGraph: ( runId, resultLimit ) => {
 						return {
 							dependencies: [
-								{ id: "d1", sourceFile: "app/A.cfc", kind: "constructs", target: "B", targetFile: "app/B.cfc", line: 1 },
+								{ id: "d1", sourceFile: "app/A.cfc", kind: "constructs", target: "B", targetFile: "app/B.cfc", line: 1, evidence: "new B()" },
 								{ id: "d2", sourceFile: "app/B.cfc", kind: "constructs", target: "C", targetFile: "app/C.cfc", line: 1 },
 								{ id: "d3", sourceFile: "app/C.cfc", kind: "constructs", target: "D", targetFile: "app/D.cfc", line: 1 }
 							]
@@ -264,9 +264,49 @@ class extends="testbox.system.BaseSpec" {
 				expect( limited.nodes ).toHaveLength( 2 );
 				expect( limited.truncated ).toBeTrue();
 				expect( limited.edges.len() ).toBeGTE( 1 );
+				expect( limited.edges[ 1 ] ).toHaveKey( "from" );
+				expect( limited.edges[ 1 ] ).toHaveKey( "to" );
+				expect( limited.nodes[ 1 ].id ).toBe( lCase( limited.nodes[ 1 ].id ) );
 
 				expect( () => service.subgraph( "run-1", { focus: "app/A.cfc", limit: 9999 } ) )
 					.toThrow( type = "ValidationException" );
+			} );
+
+			it( "fileEdges filters by cluster and returns from/to with evidence", () => {
+				var service = new app.models.services.CodeGraphRunService();
+				service.codegraphMaxEdges = 20000;
+				service.codeGraphRepository = {
+					get: ( runId ) => {
+						return {
+							snapshot: {
+								clusters: [ {
+									id: "c1",
+									filePaths: [ "app/A.cfc", "app/B.cfc" ]
+								} ],
+								nodes: []
+							}
+						};
+					}
+				};
+				service.graphRepository = {
+					getGraph: ( runId, resultLimit ) => {
+						return {
+							dependencies: [
+								{ id: "d1", sourceFile: "app/A.cfc", kind: "injects", targetFile: "app/B.cfc", evidence: "inject", line: 4 },
+								{ id: "d2", sourceFile: "app/B.cfc", kind: "injects", targetFile: "app/C.cfc", evidence: "out", line: 5 },
+								{ id: "d3", sourceFile: "app/A.cfc", kind: "tests", targetFile: "app/B.cfc" }
+							]
+						};
+					}
+				};
+
+				var payload = service.fileEdges( "run-1", { clusterId: "c1", limit: 50 } );
+				expect( payload.edges ).toHaveLength( 1 );
+				expect( payload.edges[ 1 ].from ).toBe( "app/a.cfc" );
+				expect( payload.edges[ 1 ].to ).toBe( "app/b.cfc" );
+				expect( payload.edges[ 1 ].kind ).toBe( "injects" );
+				expect( payload.edges[ 1 ].evidence ).toBe( "inject" );
+				expect( payload.truncated ).toBeFalse();
 			} );
 
 			it( "cancelRun is a no-op", () => {

@@ -562,3 +562,10 @@ Canvas search, layer/complexity filters, Fit-to-selection. No React Flow.
 P0: rich Files cards (fan-in/out, hotspot) · clickable inspector files →
 neighbourhood · fix issue labels · neighbourhood edge kinds + focus highlight.
 
+### Linking Slice 1 (shipped)
+
+- Subgraph edges expose `from`/`to` (+ evidence); layout accepts `sourceFile`/`targetFile`.
+- Node ids case-normalized (lowercase path keys) end-to-end.
+- `GET /api/v1/runs/:id/codegraph/edges?clusterId=` feeds Files depth wires.
+- Click edge → inspector shows kind / evidence / line.
+
