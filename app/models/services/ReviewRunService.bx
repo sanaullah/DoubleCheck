@@ -13,6 +13,7 @@ class threadsafe {
 	property name="runRepository" inject="ReviewRunRepository";
 
 	property name="eventService" inject="ReviewEventService";
+	property name="sqliteContentionRetry" inject="SqliteContentionRetry";
 
 	property name="scannerService" inject="RepositoryScannerService";
 
@@ -181,6 +182,12 @@ class threadsafe {
 		var run;
 		// Run creation and its sanitized schema snapshot are one short SQLite
 		// transaction. Nothing is published or queued until both records commit.
+		// Wrapped in the contention retry because this is the write that actually
+		// failed: six concurrent run creations lost the SQLite write lock about
+		// one time in six and 500'd (section 2.18b). The whole transaction is
+		// inside the closure, never part of one -- retrying a fragment would
+		// re-apply work the first attempt already committed.
+		sqliteContentionRetry.run( () => {
 		bx:transaction datasource="#datasource#" {
 			run = runRepository.create(
 				{
@@ -211,6 +218,7 @@ class threadsafe {
 				);
 			}
 		}
+		}, "run-create" );
 
 		eventService.publish(
 				run.getId(),

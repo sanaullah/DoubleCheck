@@ -256,7 +256,7 @@ Status values: `todo` · `wip` · `blocked` · `done <sha>`.
 | 2a | Corpus, deterministic tier | `done` (uncommitted) | four scenarios green; `baseline-llm-path.json` committed; modernize gate leaves `language_capabilities` untouched | Four fixtures + manifest at `resources/evaluation-corpus/modernization-v1/`, `modernizationCorpusPath` setting, 14 specs green (523·0·0·1). Two extractor defects found and fixed (§2.18). **`baseline-llm-path.json` captured — the one-way door is closed** (§2.19), and it rewrote Step 3b's stop conditions. The generic evaluator is deferred to Step 2, where the predicates it must score become computable |
 | 12 | Domain types | `done` (uncommitted) | exactly one file computes each invariant; one type answers each | `CouplingGraph`, `WaveOrder`, `Cluster` added; README convention amended; `ArchitectureFitnessSpec` asserts one owner each for target path, cluster membership, wave order and the volatile-key list. `Placement` ownership closed by Step 2 item 2 |
 | 3a | Re-point client + tests | `done` (uncommitted) | full TestBox + `node --test tests/js/` + corpus tier green **with the derived path serving all three routes** | 550·0·0·1, JS 3/3, routes 200. Single owner for `stayInMonolith` (server) and `placementTypeOf` (client); `modernizationPlacements()` resolves derived → provider → legacy. Live-verified: the UI now renders the derived verdict where it previously showed the provider's weaker one |
-| 3b | Delete the LLM path | `done` (uncommitted) | all stop conditions; suite green | **All six cuts done** (501·0·0·1). ProposalService 5,371 → 3,000; roles 7 → 5; live run clean with `basis=coupling-derived`. One deferral: merging the two rebuild roles |
+| 3b | Delete the LLM path | `done` (uncommitted, rebuild merge now closed) | all stop conditions; suite green | **All six cuts done, including the deferral** (584·0·0·1). ProposalService 5,371 → 864; live run clean with `basis=coupling-derived`. Item 5 closed: `slice-rebuild` + `item-rebuild` merged into one `modernization-rebuild` role — one asset pair instead of two, one case arm instead of two, and the unreachable duplicate output-schema branch removed. Scope is chosen by the evidence pack (`itemId` present → single database item, otherwise a roadmap slice), because the two prompts only ever differed in which part of the plan they could touch — a property of the request, not the contract |
 | 11 | Break up the residual | `wip` (ProposalService cleared) | no `app/models` service over 900 lines except `SchemaService` | **Five extractions done and verified.** 553·0·0·1, JS 3/3, routes 200. `ProposalService` **3,444 → 926** — the orchestration-only shape the step's table describes. New: `ShardExecutor` 1,064, `ArtifactService` 761, `RoadmapShardService` 544, `JudgementService` 329, `PlanAnnotationService` 290. The stated blocker was measured and is false (below); a 4-spec seam suite pins collaborator propagation, **cancellation crossing the boundary**, and the budget constants. **Gate unmet and mis-scoped:** seven services still exceed 900, three of them Track A's and two pre-existing outside this work. Stopped at 926 rather than move code into an already-over-limit file to make a number go green |
 | 5 | Re-point the roles | `done` (uncommitted) | LLM corpus tier runs; token + wall-clock baseline recorded | 518·0·0·1. `judge` and `narrate` exist as full three-artifact roles (manifest × 3 maps, role asset, schema asset, both allow-lists, skill packs) and are dispatched from `execute()` in cluster batches. Structure is now unwritable by the model: `applyNarrations` overlays language only, and a judge verdict can only *raise* `decisionRequired`, never clear it. Whole-system header shipped. **Remaining: the gate itself — the LLM corpus tier has not been run, so no token/wall-clock baseline is recorded.** Found a real leak on the way: `boundedEvidence`'s `orderedKeys` was an ordering preference, not a whitelist, so the whole repository map rode along on every role; judge/narrate now have a closed evidence contract |
 | 6 | Corpus LLM + judge tiers | `wip` (thresholds pending repeat runs) | thresholds set to measured baseline; citation resolver exists and is called | 533·0·0·1. **§2.16 closed: `ModernizationCitationResolver` exists and `ModernizationValidationService` calls it** on every placement ref — a citation to a file the run never inventoried is now a validation warning naming the reason (`file-not-in-inventory`, `line-range-past-end-of-file`, `inverted-line-range`, `unresolvable-id-reference`). `citationValidity` is **null, not 1.0, when nothing was cited**, so a plan that cites nothing can no longer score as perfectly cited. **Remaining: the LLM and judge corpus tiers themselves — they need a remote run, which needs the user's egress acknowledgement, so no thresholds are set yet** |
@@ -881,11 +881,74 @@ longer.** A 20s connection wait keeps threads parked while contention builds, an
 it converted a recoverable ~1-in-6 error into a pool that never recovers. Do not
 re-try this without an A/B — the shipped numbers beat the "principled" ones.
 
-**What is real:** roughly 1 in 6 concurrent writes fails, and the failure is
-recoverable. SQLite in WAL allows exactly one writer, so the fix is at the write
-path, not the pool — serialize modernize/review writes, or retry the specific
-`SQLITE_BUSY`/`statement is not executing` family once with backoff. That is the
-next piece of work here; pool geometry has been measured and is a dead end.
+**What is real:** the error family is real and observed. SQLite in WAL allows
+exactly one writer, so the fix belongs at the write path, not the pool.
+
+### `SqliteContentionRetry` — landed, correct, but NOT yet proven against the bug
+
+`ReviewRunService.create()`'s transaction — the write that actually failed — is
+now wrapped in `SqliteContentionRetry.run()`. Up to 3 attempts, 50ms linear
+backoff, retrying **only** a named list of lock/connection-state signatures where
+the transaction demonstrably did not commit. Everything else rethrows on the
+first attempt, unchanged. Eight specs pin the boundary in both directions,
+including "does NOT retry a `UNIQUE constraint failed`" — a retry that swallowed
+real errors would be worse than the flake it replaces.
+
+**Be honest about what is and is not demonstrated:**
+
+- Proven: the retry logic is correct and narrow (8 unit specs).
+- **Not proven: that it fixes the transient.** After the fix, 30 then 16
+  concurrent run-creations all succeeded — but **the retry never fired once**,
+  so those runs prove only that contention did not occur, not that it was
+  absorbed. A green result from a mechanism that never ran is not evidence.
+- **The "1 in 6" rate is now suspect.** Those failures were measured *after* the
+  `connectionLimit 8 / connectionTimeout 20` experiment had already degraded the
+  pool. On a freshly restarted server the failure has not reproduced at 6 or 16
+  concurrent writers. The original transient may have been driven by accumulated
+  pool damage across a long session rather than by contention alone.
+
+So: the change is safe and addresses a real error family, but the next person
+should not assume the problem is closed.
+
+### The actual mechanism: a poisoned WAL, not contention
+
+Chasing a pragma suggestion led somewhere better. The persistent failure —
+`Cannot invoke "org.sqlite.core.SafeStmtPtr.isClosed()" because "this.pointer"
+is null`, health `503 SQLite unavailable`, **surviving every restart** — is a
+**damaged write-ahead log**, not lock contention.
+
+Recovery, and the procedure to use when it happens:
+
+```
+box server stop          # a full stop, so the file lock is actually released
+# move .db/doublecheck.db-wal and .db/doublecheck.db-shm aside
+box server start         # SQLite reopens clean; the main .db is intact
+```
+
+The `.db` file itself was never corrupt — only the WAL. `box server restart` is
+**not** sufficient: it does not reliably release the lock, which is exactly why
+this looked like a random transient that "sometimes cleared on restart".
+
+**Why the WAL gets poisoned** is the open question, and the evidence points at
+the original §2.18a note: the test harness tears ColdBox down on every request
+while the background worker is mid-write, so connections die inside a statement.
+The WAL grew back to ~5MB and health returned to 503 during a single suite run,
+so it reproduces under ordinary test load, not just under the stress runs.
+
+**Three hypotheses are now eliminated, which is worth as much as the finding:**
+
+1. Pool geometry — measured, made it strictly worse.
+2. `transaction_mode=IMMEDIATE` — a genuinely good idea (SQLite's DEFERRED
+   transactions upgrade a read lock to a write lock and return `SQLITE_BUSY`
+   *ignoring `busy_timeout`*, which would explain everything). **Untested.** It
+   was tried while the WAL was already poisoned, so the boot failure that
+   followed proves nothing about the pragma. **Re-test it on a healthy database
+   before dismissing it** — the reasoning still holds.
+3. Write-path retry — landed and correct, but it never fired, so it is not what
+   was breaking.
+
+Next step is the shutdown/write race: make the background worker finish or abort
+its write before ColdBox tears down, rather than being killed mid-statement.
 
 **Fixed along the way:** `QualityGateService` opened a bare `transaction {`
 while every other repository uses `bx:transaction datasource="#datasource#"`. A
@@ -2812,6 +2875,36 @@ convenient.
 ---
 
 # Part 5 — Track A: structural separation (independent, lower priority)
+
+### Started: `SpecialistObservationService` extracted (264 lines)
+
+`SpecialistAgentGateway` **1976 → 1811**. Observation emitting and redaction
+moved out: the gateway calls a provider and gets a valid answer back; this says
+what happened, safely. They change for different reasons — telemetry shape
+churns with dashboards, provider handling churns with models. `redactSecrets`
+runs inside the emit path rather than at each call site, because "remember to
+redact" is not something convention can enforce.
+
+**This extraction was attempted, reverted, and redone. The revert was worth
+recording:**
+
+The wrappers used `argumentCollection = arguments`, but the ~20 call sites pass
+**positionally** — and a positional `arguments` struct has numeric keys that
+never bind to named parameters. `observePayload` returned null with no error,
+and the failure surfaced three layers away as
+`Cannot dereference key [meta] on a null object`. **Delegating wrappers must
+repeat the full signature explicitly**; `argumentCollection` is only safe when
+every caller passes by name. The redo declares all four signatures in full and
+`SpecialistAgentsSpec`'s 16 specs — which are what caught it — pass.
+
+Second trap in the same move: the settings the emit path reads
+(`observabilityEnabled`, `observabilityPreviewCharacters`) are injected, and
+specs build the service with `new`. Absent now means **on**, because a split
+that silently disables telemetry is worse than one that leaves it noisy.
+
+Still over 900 and still on the exceptions list — 1811 is Part 5's larger job.
+`ReviewRunService` (1452) and `SpecialistReviewService` (943) are untouched.
+
 
 Review and Modernize share a run engine but the sharing is implemented as
 `runKind == "modernize"` branches inside review-named classes, across 14 files.

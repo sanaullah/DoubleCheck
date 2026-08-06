@@ -1,0 +1,91 @@
+/**
+ * The retry must be narrow.
+ *
+ * A retry that catches too much turns a constraint violation into "tried three
+ * times, still failed" with the real cause buried — strictly worse than the
+ * flake it replaces. These specs pin the boundary in both directions.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "SQLite contention retry", () => {
+
+			var service = new app.models.services.SqliteContentionRetry();
+
+			it( "returns the value when the write succeeds first time", () => {
+				var calls = 0;
+				var result = service.run( () => { calls++; return "written"; } );
+				expect( result ).toBe( "written" );
+				expect( calls ).toBe( 1, "a successful write must not be repeated" );
+			} );
+
+			it( "retries a locked database and returns the eventual success", () => {
+				var calls = 0;
+				var result = service.run( () => {
+					calls++;
+					if ( calls < 3 ) throw( type = "DatabaseException", message = "database is locked" );
+					return "written";
+				} );
+				expect( result ).toBe( "written" );
+				expect( calls ).toBe( 3 );
+			} );
+
+			it( "recognises every contention signature that was actually observed", () => {
+				// Each of these was seen in a real failing run (section 2.18b).
+				for ( var message in [
+					"database is locked",
+					"[SQLITE_BUSY] The database file is locked",
+					"statement is not executing",
+					"Failed to rollback transaction: Connection is closed",
+					"SQLite JDBC: inconsistent internal state"
+				] ) {
+					expect( service.isContention( { message: message, detail: "" } ) ).toBeTrue( "not recognised: " & message );
+				}
+			} );
+
+			it( "does NOT retry a real database error", () => {
+				// The whole point. A constraint violation is not contention, and
+				// re-running it three times just delays the report.
+				var calls = 0;
+				expect( () => service.run( () => {
+					calls++;
+					throw( type = "DatabaseException", message = "UNIQUE constraint failed: runs.id" );
+				} ) ).toThrow();
+				expect( calls ).toBe( 1, "a constraint violation must fail on the first attempt" );
+			} );
+
+			it( "does not retry ordinary application errors", () => {
+				var calls = 0;
+				expect( () => service.run( () => {
+					calls++;
+					throw( type = "ValidationException", message = "projectPath is required" );
+				} ) ).toThrow();
+				expect( calls ).toBe( 1 );
+			} );
+
+			it( "rethrows the original error, not a wrapper, once attempts run out", () => {
+				// A caller inspecting error.message must still see what happened.
+				try {
+					service.run( () => { throw( type = "DatabaseException", message = "database is locked" ); } );
+					fail( "expected the original error to surface" );
+				} catch ( any error ) {
+					expect( error.message ).toInclude( "database is locked" );
+				}
+			} );
+
+			it( "gives up rather than retrying forever", () => {
+				var calls = 0;
+				try {
+					service.run( () => { calls++; throw( type = "DatabaseException", message = "database is locked" ); } );
+				} catch ( any ignored ) {}
+				expect( calls ).toBe( 3, "bounded attempts: contention that never clears is a real failure" );
+			} );
+
+			it( "treats an empty or unrecognised message as not retryable", () => {
+				expect( service.isContention( {} ) ).toBeFalse();
+				expect( service.isContention( { message: "", detail: "" } ) ).toBeFalse();
+				expect( service.isContention( { message: "something else entirely", detail: "" } ) ).toBeFalse();
+			} );
+		} );
+	}
+}

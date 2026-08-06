@@ -1,0 +1,106 @@
+/**
+ * Retries a write that failed only because SQLite was busy.
+ *
+ * SQLite in WAL mode allows many readers but exactly ONE writer. Six concurrent
+ * `POST /api/v1/runs` reproduce a failure in roughly one of six requests
+ * (section 2.18b): the second writer loses the race for the write lock and the
+ * request 500s, even though nothing is wrong and the same write succeeds
+ * immediately afterwards.
+ *
+ * Pool geometry was measured and is a dead end — enlarging the wait made it
+ * strictly worse. The fix belongs here, at the write, where we can tell
+ * "somebody else holds the lock" from "this write is bad".
+ *
+ * **This retries contention and nothing else.** A retry that swallowed real
+ * errors would be worse than the flake it replaces: a constraint violation, a
+ * bad column, a type error would all silently become "tried twice, still
+ * failed" with the original cause buried. Every signature in
+ * `variables.retryableSignatures` is a lock/connection-state condition where the
+ * transaction demonstrably did not commit, so re-running the whole unit is
+ * safe. Anything else rethrows on the first attempt, unchanged.
+ *
+ * Callers must pass a **whole transactional unit**, never a fragment of one.
+ * Retrying half a transaction would re-apply work the first attempt already
+ * committed.
+ */
+@singleton
+class threadsafe {
+	property name="log" inject="logbox:logger:{this}";
+
+	// Matched case-insensitively against the exception message and detail.
+	// Each entry is a state where the write never took effect:
+	//   - the first three are SQLite's own lock-contention codes
+	//   - the last three are a connection that died under the driver, which
+	//     rolls the transaction back rather than committing part of it
+	variables.retryableSignatures = [
+		"database is locked",
+		"database table is locked",
+		"sqlite_busy",
+		"statement is not executing",
+		"connection is closed",
+		"inconsistent internal state"
+	];
+
+	// Two extra attempts. The lock is held for the length of one short write, so
+	// if it is still held after ~350ms the problem is not contention and a third
+	// wait would only delay a real failure.
+	variables.maxAttempts = 3;
+	variables.baseBackoffMs = 50;
+
+	/**
+	 * Run `work` and retry it if — and only if — it failed on SQLite contention.
+	 *
+	 * `work` must be a closure containing the entire transaction. Returns
+	 * whatever `work` returns.
+	 */
+	any function run( required any work, string label = "sqlite-write" ) {
+		var attempt = 0;
+		while ( true ) {
+			attempt = attempt + 1;
+			try {
+				return arguments.work();
+			} catch ( any error ) {
+				if ( attempt >= variables.maxAttempts || !isContention( error ) ) throw( object = error );
+				// Linear backoff. SQLite's lock is released at the end of one
+				// short write, so waiting longer buys nothing that waiting a
+				// little does not.
+				sleep( variables.baseBackoffMs * attempt );
+				logRetry( arguments.label, attempt, error );
+			}
+		}
+	}
+
+	/**
+	 * Whether this exception is SQLite telling us to come back in a moment.
+	 *
+	 * Deliberately matched on message text: the JDBC driver reports these as
+	 * generic `java.sql.SQLException` and `DatabaseException`, so the type gives
+	 * nothing to key on. If a future driver exposes real error codes, key on
+	 * those instead and delete this.
+	 */
+	boolean function isContention( required any error ) {
+		var haystack = lCase(
+			toString( arguments.error.message ?: "" ) & " " &
+			toString( arguments.error.detail ?: "" ) & " " &
+			toString( arguments.error.cause.message ?: "" )
+		);
+		if ( !len( trim( haystack ) ) ) return false;
+		for ( var signature in variables.retryableSignatures ) {
+			if ( findNoCase( signature, haystack ) ) return true;
+		}
+		return false;
+	}
+
+	private void function logRetry( required string label, required numeric attempt, required any error ) {
+		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) return;
+		try {
+			// Logged at warn, not debug: a retry means real contention. If these
+			// become frequent the answer is fewer concurrent writers, not more
+			// retries, and that is only visible if they are recorded.
+			variables.log.warn(
+				"SQLite contention on #arguments.label# (attempt #arguments.attempt#), retrying: "
+				& left( toString( arguments.error.message ?: "" ), 160 )
+			);
+		} catch ( any ignored ) {}
+	}
+}

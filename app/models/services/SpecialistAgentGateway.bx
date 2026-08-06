@@ -29,6 +29,7 @@ class threadsafe {
 
 	property name="aiTelemetryExtractor" inject="AiTelemetryExtractor";
 	property name="log" inject="logbox:logger:{this}";
+	property name="specialistObservationService" inject="SpecialistObservationService";
 	// Dense source/code often tokenizes near ~2 characters per token.
 	variables.charsPerToken = 2;
 	variables.promptSafetyTokens = 512;
@@ -46,6 +47,63 @@ class threadsafe {
 		return variables.aiTelemetryExtractor;
 	}
 
+	/**
+	 * Observation emitting and redaction moved to SpecialistObservationService
+	 * (Part 5 Track A). Explicit signatures, NOT `argumentCollection = arguments`:
+	 * the call sites pass positionally, and a positional `arguments` struct has
+	 * numeric keys that never bind to named parameters -- the payload came back
+	 * null with no error. That cost this extraction one full revert.
+	 */
+	private any function observations() {
+		if ( !isNull( variables.specialistObservationService ?: javacast( "null", "" ) ) ) return variables.specialistObservationService;
+		variables.specialistObservationService = new app.models.services.SpecialistObservationService();
+		return variables.specialistObservationService;
+	}
+
+	private void function emitLlmObserve(
+		required function progressCallback,
+		required numeric round,
+		required string stage,
+		required string titlePrefix,
+		required string preview,
+		required string modelName,
+		required string providerName,
+		struct usage       = {},
+		numeric durationMs = 0
+	) {
+		observations().emitLlmObserve(
+			arguments.progressCallback, arguments.round, arguments.stage, arguments.titlePrefix,
+			arguments.preview, arguments.modelName, arguments.providerName, arguments.usage, arguments.durationMs
+		);
+	}
+
+	private void function emitToolObserve(
+		required function progressCallback,
+		required string stage,
+		required string titlePrefix,
+		required string toolName,
+		required string preview,
+		required string toolCallId
+	) {
+		observations().emitToolObserve(
+			arguments.progressCallback, arguments.stage, arguments.titlePrefix,
+			arguments.toolName, arguments.preview, arguments.toolCallId
+		);
+	}
+
+	private any function observePayload(
+		required string kind,
+		required string title,
+		required string body,
+		struct meta   = {},
+		struct extras = {}
+	) {
+		return observations().observePayload( arguments.kind, arguments.title, arguments.body, arguments.meta, arguments.extras );
+	}
+
+	private string function redactSecrets( required string text ) {
+		return observations().redactSecrets( arguments.text );
+	}
 	private string function observationTypeFor( required string kind ) {
 		return telemetry().observationTypeFor( arguments.kind );
 	}
@@ -1304,229 +1362,6 @@ class threadsafe {
 		return isNumeric( arguments.value ) ? max( 0, int( val( arguments.value ) ) ) : arguments.fallback;
 	}
 
-	private void function emitLlmObserve(
-		required function progressCallback,
-		required numeric round,
-		required string stage,
-		required string titlePrefix,
-		required string preview,
-		required string modelName,
-		required string providerName,
-		struct usage       = {},
-		numeric durationMs = 0
-	) {
-		var done = arguments.stage == "provider-llm-done";
-		var meta = {
-			round   : arguments.round,
-			model   : arguments.modelName,
-			provider: arguments.providerName,
-			io      : done ? "output" : "input"
-		};
-		var modelParameters = {
-			provider: arguments.providerName,
-			model   : arguments.modelName,
-			round   : arguments.round
-		};
-		if ( arguments.durationMs > 0 ) {
-			meta.durationMs = arguments.durationMs;
-			modelParameters.durationMs = arguments.durationMs;
-		}
-		if ( isStruct( arguments.usage ) && arguments.usage.count() ) {
-			if ( structKeyExists( arguments.usage, "promptTokens" ) ) {
-				meta.promptTokens = arguments.usage.promptTokens;
-				modelParameters.promptTokens = arguments.usage.promptTokens;
-			}
-			if ( structKeyExists( arguments.usage, "completionTokens" ) ) {
-				meta.completionTokens = arguments.usage.completionTokens;
-				modelParameters.completionTokens = arguments.usage.completionTokens;
-			}
-			if ( structKeyExists( arguments.usage, "totalTokens" ) ) {
-				meta.totalTokens = arguments.usage.totalTokens;
-				modelParameters.totalTokens = arguments.usage.totalTokens;
-			}
-		}
-		var observe = observePayload(
-			"llm",
-			arguments.titlePrefix & " round " & arguments.round,
-			arguments.preview,
-			meta,
-			{
-				observationType: "generation",
-				input          : done ? "" : arguments.preview,
-				output         : done ? arguments.preview : "",
-				model          : arguments.modelName,
-				modelParameters: modelParameters,
-				usage          : arguments.usage,
-				durationMs     : arguments.durationMs
-			}
-		);
-		arguments.progressCallback(
-				{
-					stage  : arguments.stage,
-					attempt: arguments.round,
-					message: done
-						? (
-							"Model round " & arguments.round & " finished" & (
-								arguments.durationMs > 0 ? ( " (" & arguments.durationMs & " ms)" ) : ""
-							)
-						)
-						: ( "Model round " & arguments.round ),
-					observe: observe
-				}
-			);
-	}
-
-	private void function emitToolObserve(
-		required function progressCallback,
-		required string stage,
-		required string titlePrefix,
-		required string toolName,
-		required string preview,
-		required string toolCallId
-	) {
-		var done = arguments.stage == "tool-done";
-		var observe = observePayload(
-			"tool",
-			arguments.titlePrefix & " - " & arguments.toolName,
-			arguments.preview,
-			{
-				toolName  : arguments.toolName,
-				toolCallId: arguments.toolCallId,
-				io        : done ? "output" : "input"
-			},
-			{
-				observationType: "tool",
-				input          : done ? "" : arguments.preview,
-				output         : done ? arguments.preview : "",
-				modelParameters: {
-					toolName  : arguments.toolName,
-					toolCallId: arguments.toolCallId
-				}
-			}
-		);
-		arguments.progressCallback(
-				{
-					stage  : arguments.stage,
-					message: arguments.titlePrefix & " - " & arguments.toolName,
-					observe: observe
-				}
-			);
-	}
-
-	private any function observePayload(
-		required string kind,
-		required string title,
-		required string body,
-		struct meta   = {},
-		struct extras = {}
-	) {
-		if ( !isTrue( observabilityEnabled ) ) {
-			return;
-		}
-		var text = redactSecrets( arguments.body );
-		var limit = max(
-			200,
-			numericSetting( observabilityPreviewCharacters, 1600 )
-		);
-		var truncated = len( text ) > limit;
-		var clipped = truncated ? ( left( text, limit ) & char( 10 ) & "[truncated]" ) : text;
-		var inputText = structKeyExists( arguments.extras, "input" ) ? redactSecrets( toString( arguments.extras.input ?: "" ) ) : "";
-		var outputText = structKeyExists( arguments.extras, "output" ) ? redactSecrets( toString( arguments.extras.output ?: "" ) ) : "";
-		if ( !len( inputText ) && !len( outputText ) ) {
-			if ( ( arguments.meta.io ?: "" ) == "output" || listFindNoCase( "response,fallback", arguments.kind ) ) {
-				outputText = clipped;
-			} else if ( ( arguments.meta.io ?: "" ) == "input" || listFindNoCase( "prompt,agent", arguments.kind ) ) {
-				inputText = clipped;
-			} else {
-				inputText = clipped;
-			}
-		} else {
-			if ( len( inputText ) > limit ) {
-				inputText = left( inputText, limit ) & char( 10 ) & "[truncated]";
-				truncated = true;
-			}
-			if ( len( outputText ) > limit ) {
-				outputText = left( outputText, limit ) & char( 10 ) & "[truncated]";
-				truncated = true;
-			}
-		}
-		var modelParameters = {};
-		if ( structKeyExists( arguments.extras, "modelParameters" ) && isStruct( arguments.extras.modelParameters ) ) {
-			modelParameters = shallowMeta( arguments.extras.modelParameters );
-		}
-		var usage = {};
-		if ( structKeyExists( arguments.extras, "usage" ) && isStruct( arguments.extras.usage ) ) {
-			usage = shallowMeta( arguments.extras.usage );
-		}
-		var payload = {
-			kind           : arguments.kind,
-			observationType: arguments.extras.observationType ?: observationTypeFor( arguments.kind ),
-			title          : arguments.title,
-			preview        : clipped,
-			input          : inputText,
-			output         : outputText,
-			truncated      : truncated,
-			characters     : len( text ),
-			model          : toString( arguments.extras.model ?: ( arguments.meta.model ?: "" ) ),
-			modelParameters: modelParameters,
-			meta           : shallowMeta( arguments.meta )
-		};
-		if ( usage.count() ) {
-			payload.usage = usage;
-		}
-		if (
-			structKeyExists( arguments.extras, "durationMs" ) && isNumeric( arguments.extras.durationMs ) &&
-				val( arguments.extras.durationMs ) > 0
-		) {
-			payload.durationMs = int( val( arguments.extras.durationMs ) );
-		}
-		return payload;
-	}
-
-
-
-	private struct function shallowMeta( required struct meta ) {
-		var safe = {};
-		for ( var key in arguments.meta ) {
-			var value = arguments.meta[ key ];
-			if ( isNull( value ) || isSimpleValue( value ) ) {
-				safe[ key ] = isNull( value ) ? "" : value;
-			} else {
-				safe[ key ] = "[complex]";
-			}
-		}
-		return safe;
-	}
-
-
-
-
-
-
-	/** Normal telemetry carries shape, size, and a stable hash—not source/output text. */
-
-	private string function redactSecrets( required string text ) {
-		var value = arguments.text;
-		value = reReplaceNoCase(
-			value,
-			"Bearer [A-Za-z0-9._~+/-]+=*",
-			"Bearer [REDACTED]",
-			"all"
-		);
-		value = reReplaceNoCase(
-			value,
-			"sk-[A-Za-z0-9]{10,}",
-			"sk-[REDACTED]",
-			"all"
-		);
-		value = reReplaceNoCase(
-			value,
-			"(api[_-]?key|token|secret|password)(=|: )[^,\s\)\}]+",
-			"\1=[REDACTED]",
-			"all"
-		);
-		return value;
-	}
 
 	private boolean function supportsNativeJsonObjectFormat() {
 		var resolved = aiProviderResolver.resolve();

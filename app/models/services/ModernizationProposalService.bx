@@ -10,6 +10,7 @@ class threadsafe {
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="identityService" inject="ModernizationIdentityService";
 	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="roadmapSynthesisService" inject="ModernizationRoadmapSynthesisService";
 	property name="placementService" inject="ModernizationPlacementService";
 	property name="modernizationArtifactService" inject="ModernizationArtifactService";
 	property name="modernizationShardExecutor" inject="ModernizationShardExecutor";
@@ -49,7 +50,7 @@ class threadsafe {
 	variables.maxInferredArchitectureScopes = 12;
 	// Roadmap shards are sized independently of the application-shard
 	// constants above: they cover already-compacted target-unit groups (from
-	// derivedStructureService.synthesisRoadmapGroups()), not raw file shards, and the failure mode
+	// roadmapSynthesis().synthesisRoadmapGroups()), not raw file shards, and the failure mode
 	// being fixed is the roadmap role trying to describe an entire ~20-group
 	// plan in one call. 24 gives real projects one phase per group while
 	// still collapsing small/no-architecture-group test plans to one shard.
@@ -61,6 +62,11 @@ class threadsafe {
 	 * build this service with `new`. Seed the derived-structure collaborator so
 	 * those paths keep working after the synthesis block moved out.
 	 */
+	private any function roadmapSynthesis() {
+		if ( !isNull( variables.roadmapSynthesisService ?: javacast( "null", "" ) ) ) return variables.roadmapSynthesisService;
+		variables.roadmapSynthesisService = new app.models.services.ModernizationRoadmapSynthesisService();
+		return variables.roadmapSynthesisService;
+	}
 	function init() {
 		if ( isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) {
 			variables.derivedStructureService = new app.models.services.ModernizationDerivedStructureService();
@@ -266,8 +272,8 @@ class threadsafe {
 			// role times out or exceeds schema limits, synthesize path-based
 			// placements now so roadmap phases follow ColdBox module / worker seams
 			// instead of one catch-all road.
-			if ( applicationFragmentHasSubstance( merged ) && derivedStructureService.architectureDecisionsMissing( merged ) ) {
-				merged = derivedStructureService.applySynthesizedArchitecture( merged, arguments.evidence, notes );
+			if ( applicationFragmentHasSubstance( merged ) && roadmapSynthesis().architectureDecisionsMissing( merged ) ) {
+				merged = roadmapSynthesis().applySynthesizedArchitecture( merged, arguments.evidence, notes );
 			}
 
 			var canAffordRoadmap = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
@@ -320,11 +326,11 @@ class threadsafe {
 		}
 		// Architecture packaging must exist before synthesized roadmap groups,
 		// otherwise the road collapses to one generic strangler phase.
-		if ( applicationFragmentHasSubstance( merged ) && derivedStructureService.architectureDecisionsMissing( merged ) ) {
-			merged = derivedStructureService.applySynthesizedArchitecture( merged, arguments.evidence, notes );
+		if ( applicationFragmentHasSubstance( merged ) && roadmapSynthesis().architectureDecisionsMissing( merged ) ) {
+			merged = roadmapSynthesis().applySynthesizedArchitecture( merged, arguments.evidence, notes );
 		}
 		if ( applicationFragmentHasSubstance( merged ) && ( !isArray( merged.roadmapPhases ?: "" ) || !merged.roadmapPhases.len() ) ) {
-			merged = derivedStructureService.applySynthesizedRoadmap( merged, notes );
+			merged = roadmapSynthesis().applySynthesizedRoadmap( merged, notes );
 		}
 		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
 		merged.metadata.promptVersion = agentFactory.version();
