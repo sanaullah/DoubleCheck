@@ -147,6 +147,7 @@ class threadsafe {
 		if ( listFindNoCase( "specialist-findings-v1,bulk-review-v1", arguments.schemaId ) ) return [ "findings" ];
 		if ( arguments.schemaId == "architecture-enrichment-v1" ) return [ "statements" ];
 		if ( arguments.schemaId == "codegraph-narrative-v1" ) return [ "summaries" ];
+		if ( arguments.schemaId == "codegraph-narrative-v2" ) return [ "domains", "processes", "onboarding", "risk", "summaries" ];
 		if ( findNoCase( "modernization-", arguments.schemaId ) == 1 ) {
 			var output = [];
 			for ( var key in arguments.value ) if ( isArray( arguments.value[ key ] ) ) output.append( key );
@@ -271,6 +272,9 @@ class threadsafe {
 				}
 			}
 		}
+		if ( arguments.schemaId == "codegraph-narrative-v2" ) {
+			validateCodegraphNarrativeV2Evidence( arguments.value, arguments.context, arguments.errors );
+		}
 		if ( findNoCase( "modernization-", arguments.schemaId ) && ( isArray( arguments.context.allowedEvidenceIds ?: "" ) || isArray( arguments.context.allowedFilePaths ?: "" ) ) ) {
 			validateModernizationEvidence( arguments.value, arguments.context, arguments.errors, "$." );
 		}
@@ -344,6 +348,84 @@ class threadsafe {
 			seen[ key ] = true;
 		}
 		return false;
+	}
+
+	private void function rejectUnauthorizedV2EvidenceId(
+		required string id,
+		required array allowedIds,
+		required array errors,
+		required string message
+	) {
+		var normalizedId = trim( toString( arguments.id ) );
+		if ( !len( normalizedId ) ) {
+			addError( arguments.errors, "unauthorized-evidence", arguments.message );
+			return;
+		}
+		if ( !arguments.allowedIds.len() || !arguments.allowedIds.contains( normalizedId ) ) {
+			addError( arguments.errors, "unauthorized-evidence", arguments.message );
+		}
+	}
+
+	private void function validateCodegraphNarrativeV2Evidence( required any value, required struct context, required array errors ) {
+		if ( !isStruct( arguments.value ) ) return;
+
+		var allowedClusters = isArray( arguments.context.allowedClusterIds ?: "" ) ? arguments.context.allowedClusterIds : [];
+		var allowedNodes = isArray( arguments.context.allowedNodeIds ?: "" ) ? arguments.context.allowedNodeIds : [];
+		var allowedFlows = isArray( arguments.context.allowedFlowIds ?: "" ) ? arguments.context.allowedFlowIds : [];
+		var allowedHotspots = isArray( arguments.context.allowedHotspotIds ?: "" ) ? arguments.context.allowedHotspotIds : [];
+		var allowedCycles = isArray( arguments.context.allowedCycleIds ?: "" ) ? arguments.context.allowedCycleIds : [];
+
+		if ( isArray( arguments.value.domains ?: "" ) ) {
+			for ( var domain in arguments.value.domains ) {
+				if ( !isStruct( domain ) ) continue;
+				rejectUnauthorizedV2EvidenceId( domain.clusterId ?: "", allowedClusters, arguments.errors, "domain cites an unknown clusterId" );
+			}
+		}
+
+		if ( isArray( arguments.value.processes ?: "" ) ) {
+			for ( var process in arguments.value.processes ) {
+				if ( !isStruct( process ) ) continue;
+				rejectUnauthorizedV2EvidenceId( process.flowId ?: "", allowedFlows, arguments.errors, "process cites an unknown flowId" );
+			}
+		}
+
+		if ( isArray( arguments.value.onboarding ?: "" ) ) {
+			for ( var step in arguments.value.onboarding ) {
+				if ( !isStruct( step ) ) continue;
+				var refType = lCase( trim( toString( step.refType ?: "" ) ) );
+				var refId = step.refId ?: "";
+				if ( refType == "cluster" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedClusters, arguments.errors, "onboarding step cites an unknown cluster id" );
+				}
+				if ( refType == "node" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedNodes, arguments.errors, "onboarding step cites an unknown node id" );
+				}
+				if ( refType == "flow" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedFlows, arguments.errors, "onboarding step cites an unknown flow id" );
+				}
+			}
+		}
+
+		if ( isArray( arguments.value.risk ?: "" ) ) {
+			for ( var risk in arguments.value.risk ) {
+				if ( !isStruct( risk ) ) continue;
+				var riskType = lCase( trim( toString( risk.refType ?: "" ) ) );
+				var riskId = risk.refId ?: "";
+				if ( riskType == "hotspot" ) {
+					rejectUnauthorizedV2EvidenceId( riskId, allowedHotspots, arguments.errors, "risk item cites an unknown hotspot id" );
+				}
+				if ( riskType == "cycle" ) {
+					rejectUnauthorizedV2EvidenceId( riskId, allowedCycles, arguments.errors, "risk item cites an unknown cycle id" );
+				}
+			}
+		}
+
+		if ( isArray( arguments.value.summaries ?: "" ) ) {
+			for ( var summary in arguments.value.summaries ) {
+				if ( !isStruct( summary ) ) continue;
+				rejectUnauthorizedV2EvidenceId( summary.clusterId ?: "", allowedClusters, arguments.errors, "summary cites an unknown clusterId" );
+			}
+		}
 	}
 
 	private void function validateModernizationEvidence( required any value, required struct context, required array errors, required string path ) {

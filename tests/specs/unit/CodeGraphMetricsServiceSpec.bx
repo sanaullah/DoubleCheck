@@ -147,6 +147,139 @@ class extends="testbox.system.BaseSpec" {
 				expect( snapshot.nodes.len() ).toBeLTE( 4 );
 			} );
 
+			it( "assigns entry role to handler paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/handlers/Orders.bx" ],
+					dependencies: []
+				} );
+
+				var handler = snapshot.nodes.filter( ( node ) => node.path == "app/handlers/Orders.bx" )[ 1 ];
+				expect( handler ).toHaveKey( "role" );
+				expect( handler.role ).toBe( "entry" );
+			} );
+
+			it( "assigns persistence role to DAO-ish model paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [
+						"app/models/repositories/OrderRepository.bx",
+						"app/models/OrderDAO.cfc"
+					],
+					dependencies: []
+				} );
+
+				var repository = snapshot.nodes.filter( ( node ) => node.path == "app/models/repositories/OrderRepository.bx" )[ 1 ];
+				var dao = snapshot.nodes.filter( ( node ) => node.path == "app/models/OrderDAO.cfc" )[ 1 ];
+				expect( repository.role ).toBe( "persistence" );
+				expect( dao.role ).toBe( "persistence" );
+			} );
+
+			it( "assigns test role to test paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "tests/specs/unit/OrdersSpec.bx" ],
+					dependencies: []
+				} );
+
+				var spec = snapshot.nodes.filter( ( node ) => node.path == "tests/specs/unit/OrdersSpec.bx" )[ 1 ];
+				expect( spec.role ).toBe( "test" );
+			} );
+
+			it( "extracts handler to service to model flow with steps", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "ha-index", filePath: "app/handlers/Orders.bx", kind: "handler-action", name: "index", line: 5 }
+					],
+					files: [
+						"app/handlers/Orders.bx",
+						"app/models/OrderService.cfc",
+						"app/models/Order.cfc"
+					],
+					dependencies: [
+						{
+							id: "d1",
+							sourceFile: "app/handlers/Orders.bx",
+							kind: "injects",
+							target: "OrderService",
+							targetFile: "app/models/OrderService.cfc",
+							line: 6
+						},
+						{
+							id: "d2",
+							sourceFile: "app/models/OrderService.cfc",
+							kind: "calls",
+							target: "Order",
+							targetFile: "app/models/Order.cfc",
+							line: 12
+						}
+					]
+				};
+
+				var snapshot = metrics.assemble( reviewGraph );
+				expect( snapshot ).toHaveKey( "flows" );
+				expect( snapshot.flows ).toBeArray();
+				expect( snapshot.flows.len() ).toBeGTE( 1 );
+
+				var flow = snapshot.flows.filter( ( item ) => {
+					return item.entrySymbol == "index" && findNoCase( "orders.bx", item.entryFile );
+				} )[ 1 ];
+				expect( flow ).notToBeNull();
+				expect( flow ).toHaveKey( "id" );
+				expect( left( flow.id, 5 ) ).toBe( "flow-" );
+				expect( flow.steps.len() ).toBe( 3 );
+				expect( flow.steps[ 1 ] ).toMatch( "orders\.bx" );
+				expect( flow.steps[ 2 ] ).toMatch( "orderservice" );
+				expect( flow.steps[ 3 ] ).toMatch( "order\.cfc" );
+				expect( flow.sinkFile ).toMatch( "order\.cfc" );
+				expect( flow.sinkFile ).notToBe( flow.entryFile );
+				expect( flow.edgeKinds.len() ).toBe( 2 );
+				expect( flow.edgeKinds ).toInclude( "injects" );
+				expect( flow.edgeKinds ).toInclude( "calls" );
+			} );
+
+			it( "extracts cyclic handler to service flow when service calls back", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "ha-index", filePath: "app/handlers/Orders.bx", kind: "handler-action", name: "index", line: 5 }
+					],
+					files: [
+						"app/handlers/Orders.bx",
+						"app/models/OrderService.cfc"
+					],
+					dependencies: [
+						{
+							id: "d1",
+							sourceFile: "app/handlers/Orders.bx",
+							kind: "injects",
+							target: "OrderService",
+							targetFile: "app/models/OrderService.cfc",
+							line: 6
+						},
+						{
+							id: "d2",
+							sourceFile: "app/models/OrderService.cfc",
+							kind: "calls",
+							target: "Orders",
+							targetFile: "app/handlers/Orders.bx",
+							line: 12
+						}
+					]
+				};
+
+				var snapshot = metrics.assemble( reviewGraph );
+				expect( snapshot.flows.len() ).toBeGTE( 1 );
+
+				var flow = snapshot.flows.filter( ( item ) => {
+					return item.entrySymbol == "index" && findNoCase( "orders.bx", item.entryFile );
+				} )[ 1 ];
+				expect( flow ).notToBeNull();
+				expect( flow.steps.len() ).toBe( 2 );
+				expect( flow.sinkFile ).toMatch( "orderservice" );
+				expect( flow.edgeKinds.len() ).toBe( 1 );
+				expect( flow.edgeKinds ).toInclude( "injects" );
+			} );
+
 			it( "keeps fingerprint stable under key-order shuffle of identical content", () => {
 				var reviewGraph = {
 					symbols: [ { id: "s1", filePath: "app/models/A.cfc", kind: "class", name: "A", line: 1 } ],

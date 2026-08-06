@@ -10,7 +10,7 @@ class extends="testbox.system.BaseSpec" {
 					isEnabled: ( apiKey, isLocal ) => false,
 					chat: ( messages, params, options ) => {
 						calls.chat++;
-						return { summaries: [] };
+						return { pitch: { text: "" }, domains: [], processes: [], onboarding: [], risk: [], summaries: [] };
 					}
 				};
 				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
@@ -34,18 +34,12 @@ class extends="testbox.system.BaseSpec" {
 				expect( snapshot ).toBe( before );
 			} );
 
-			it( "drops summaries that cite an unknown clusterId", () => {
+			it( "drops domains and summaries that cite an unknown clusterId", () => {
 				var service = new app.models.services.CodeGraphNarrativeService();
 				service.chatGateway = {
 					isEnabled: ( apiKey, isLocal ) => true,
 					chat: ( messages, params, options ) => {
-						return {
-							summaries: [
-								{ clusterId: "cluster-real", title: "Orders", text: "Order domain modules." },
-								{ clusterId: "cluster-unknown", title: "Ghost", text: "Should be dropped." },
-								{ nodeId: "app/models/Order.cfc", title: "Hot", text: "High fan-in order model." }
-							]
-						};
+						return v2FixtureResponse();
 					}
 				};
 				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
@@ -66,11 +60,74 @@ class extends="testbox.system.BaseSpec" {
 				var result = service.narrate( sampleSnapshot() );
 
 				expect( result.used ).toBeTrue();
-				expect( result.summaries.len() ).toBe( 2 );
+				expect( result.version ).toBe( "codegraph-narrative-v2" );
+				expect( result.domains.len() ).toBe( 1 );
+				expect( result.domains[ 1 ].clusterId ).toBe( "cluster-real" );
+				expect( result.summaries.len() ).toBe( 1 );
 				expect( result.summaries[ 1 ].clusterId ).toBe( "cluster-real" );
-				expect( result.summaries[ 2 ].nodeId ).toBe( "app/models/Order.cfc" );
-				var ids = result.summaries.map( ( item ) => item.clusterId ?: item.nodeId ?: "" );
-				expect( ids ).notToInclude( "cluster-unknown" );
+				var domainIds = result.domains.map( ( item ) => item.clusterId );
+				expect( domainIds ).notToInclude( "cluster-unknown" );
+			} );
+
+			it( "drops processes that cite an unknown flowId", () => {
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						return v2FixtureResponse();
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider      : "deterministic-fake",
+					apiKey        : "test-key",
+					model         : "corpus-v1",
+					isLocal       : false,
+					timeout       : 1,
+					contextWindow : 8000
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				service.promptCompiler = stubCompiler();
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var result = service.narrate( sampleSnapshot() );
+
+				expect( result.used ).toBeTrue();
+				expect( result.processes.len() ).toBe( 1 );
+				expect( result.processes[ 1 ].flowId ).toBe( "flow-real" );
+				var flowIds = result.processes.map( ( item ) => item.flowId );
+				expect( flowIds ).notToInclude( "flow-unknown" );
+			} );
+
+			it( "retains pitch text when the model supplies it", () => {
+				var service = new app.models.services.CodeGraphNarrativeService();
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						return v2FixtureResponse();
+					}
+				};
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider      : "deterministic-fake",
+					apiKey        : "test-key",
+					model         : "corpus-v1",
+					isLocal       : false,
+					timeout       : 1,
+					contextWindow : 8000
+				} );
+				service.secretRedactionService = { redactText: ( text ) => text };
+				service.promptCompiler = stubCompiler();
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.maxClusters = 24;
+				service.maxHotspots = 20;
+				service.maxPromptCharacters = 30000;
+
+				var result = service.narrate( sampleSnapshot() );
+
+				expect( result.used ).toBeTrue();
+				expect( result.pitch.text ).toBe( "A local BoxLang review helper." );
 			} );
 
 			it( "never mutates the deterministic snapshot when the gateway throws", () => {
@@ -151,10 +208,42 @@ class extends="testbox.system.BaseSpec" {
 				}
 			],
 			nodes: [
-				{ id: "app/models/Order.cfc", path: "app/models/Order.cfc", clusterId: "cluster-real" }
+				{ id: "app/models/Order.cfc", path: "app/models/Order.cfc", clusterId: "cluster-real", role: "domain" }
 			],
 			hotspots: [
 				{ id: "app/models/Order.cfc", path: "app/models/Order.cfc", hotspotScore: 0.9, fanIn: 3, fanOut: 1 }
+			],
+			flows: [
+				{
+					id          : "flow-real",
+					entryFile   : "app/handlers/Orders.bx",
+					entrySymbol : "create",
+					steps       : [ "app/handlers/Orders.bx", "app/models/Order.cfc" ],
+					sinkFile    : "app/models/Order.cfc"
+				}
+			],
+			cycles: [
+				[ "app/models/Order.cfc", "app/models/Invoice.cfc" ]
+			]
+		};
+	}
+
+	private struct function v2FixtureResponse() {
+		return {
+			pitch: { text: "A local BoxLang review helper." },
+			domains: [
+				{ clusterId: "cluster-real", title: "Orders", text: "Order domain modules." },
+				{ clusterId: "cluster-unknown", title: "Ghost", text: "Should be dropped." }
+			],
+			processes: [
+				{ flowId: "flow-real", title: "Create order", text: "Handler to model." },
+				{ flowId: "flow-unknown", title: "Ghost flow", text: "Should be dropped." }
+			],
+			onboarding: [],
+			risk: [],
+			summaries: [
+				{ clusterId: "cluster-real", title: "Orders", text: "Order domain modules." },
+				{ clusterId: "cluster-unknown", title: "Ghost", text: "Should be dropped." }
 			]
 		};
 	}

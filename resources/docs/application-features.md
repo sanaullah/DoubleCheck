@@ -50,7 +50,8 @@ No other languages are product targets.
    plan; **assist**, not an automatic migrator. Never writes application source
    or executes DDL.
 3. **Interactive CodeGraph explorer** — deterministic CF/BoxLang knowledge graph
-   with optional AI summaries; not a findings or migration product.
+   (roles, flows, clusters) plus an LLM Domain lens for business meaning; not a
+   findings or migration product.
 4. **Honest capability claims** — measured labels, evidence validation, one clear
    path per feature. Prefer under-claiming over marketing language.
 
@@ -171,23 +172,32 @@ Stage wiring: [`technical-flow.md`](technical-flow.md). Service ownership:
 ## CodeGraph — purpose
 
 Use CodeGraph when you want an interactive knowledge graph of a ColdFusion /
-BoxLang repository: files, symbols, dependencies, clusters, cycles, and
-hotspots. Review and Modernize already compute parts of this graph; CodeGraph
-turns it into an explorable workspace.
+BoxLang repository: files, symbols, dependencies, clusters, cycles, hotspots,
+file roles, and handler-seeded flows. Review and Modernize already compute parts
+of this graph; CodeGraph turns it into an explorable workspace with a Domain
+lens for strangers to the repo.
 
-**Does not require** an AI key — the graph is deterministic. A configured
-provider optionally adds plain-English cluster/hotspot summaries, clearly marked
-as AI and toggleable in the UI.
+**Structure without an AI key** — indexing, metrics, clusters, roles, flows,
+cycles, orphans, layer violations, hotspots, and drill-down all succeed
+deterministically. Folder/cluster keys are evidence labels, not business domains.
+
+**Meaning requires a configured provider** — domain names, process stories,
+onboarding path, and risk briefing come from the LLM Domain lens
+(`codegraph-narrative-v2`). Without AI, the UI shows *“Meaning layer
+unavailable — configure an AI provider for domain and process briefing.”* The
+run still completes; do not treat deterministic labels as business meaning.
 
 **Success looks like**
 
-- A persisted snapshot with nodes, clusters, cycles, orphans, layer violations,
-  and hotspots
-- Interactive drill-down (cluster → files → neighbourhood subgraph)
-- Optional AI summaries that never alter deterministic metrics
+- A persisted snapshot with nodes (with `role`), clusters, extracted `flows`,
+  cycles, orphans, layer violations, and hotspots
+- Interactive drill-down (Overview → module/cluster files → neighbourhood subgraph)
+- With AI: pitch, domain summaries, process stories, onboarding steps, and risk
+  briefing — all citing computed ids; never altering deterministic metrics
 
 **CodeGraph does not**
 
+- Present business domains or process narratives without a successful LLM narrative
 - Analyze JavaScript (JS files are skipped silently)
 - Export Markdown/JSON/SARIF yet (`export` returns 422)
 - Replace Review findings or Modernize migration proposals
@@ -201,11 +211,13 @@ as AI and toggleable in the UI.
 | Workspace | `/codegraph` UI on the same local run queue (`runKind=codegraph`) |
 | Scan | CF/BoxLang-only indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`); JS → skipped.unsupported |
 | Graph | Symbols + dependencies via existing parsers; coupling metrics reuse Modernize services |
+| Roles | Per-node `entry` / `orchestrator` / `domain` / `persistence` / `shared` / `test` legend (deterministic) |
+| Flows | Handler-seeded call paths in snapshot `flows[]`; Overview process chips + graph highlight |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
 | Issues | Cycles, orphans, layer violations, hotspot ranking |
 | Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / radial layouts; pan/zoom |
 | Subgraph | `GET /api/v1/runs/:id/codegraph/subgraph` neighbourhood drill-down |
-| Narrative | Optional LLM summaries (`CodeGraphNarrativeService`); no key → graph still succeeds |
+| Domain lens | LLM narrative v2 (`CodeGraphNarrativeService`): pitch, domains, processes, onboarding, risk; no key → structure only + meaning banner |
 | History | Dashboard filter + `/api/v1/history?runKind=codegraph` |
 | Export | Not available yet — API returns 422 `export_unsupported` |
 
@@ -215,13 +227,14 @@ as AI and toggleable in the UI.
 
 | Setup | Review | Modernize | CodeGraph |
 |---|---|---|---|
-| **No** AI key / provider disabled | Yes — deterministic findings; graph/architecture when BX/CFML exist | No — provider required | Yes — full deterministic graph; no AI summaries |
-| Enabled **local** keyless provider (`ollama` / `docker`) | Yes — specialists when enabled | Yes — subject to local provider availability | Yes — optional narrative summaries |
-| Enabled **remote** provider | Yes — after normal provider config | Yes — after explicit remote-egress acknowledgement | Yes — optional narrative summaries |
+| **No** AI key / provider disabled | Yes — deterministic findings; graph/architecture when BX/CFML exist | No — provider required | Yes — structure (graph, roles, flows); meaning banner; no domain/process briefing |
+| Enabled **local** keyless provider (`ollama` / `docker`) | Yes — specialists when enabled | Yes — subject to local provider availability | Yes — structure + Domain lens when narrative succeeds |
+| Enabled **remote** provider | Yes — after normal provider config | Yes — after explicit remote-egress acknowledgement | Yes — structure + Domain lens when narrative succeeds |
 
-- A key is **never** required for basic local Review or CodeGraph.
+- A key is **never** required for basic local Review or CodeGraph **structure**.
 - Modernize always `requiresLlm: true` in capabilities.
-- CodeGraph `requiresLlm: false`; narrative is additive.
+- CodeGraph `requiresLlm: false` (run succeeds without AI); `meaningRequiresLlm: true`
+  (domain/process briefing needs a provider).
 - Provider profiles and app settings are managed locally (`/api/v1/ai-providers`,
   `/api/v1/app-settings`); API keys are not stored as review artifacts.
 

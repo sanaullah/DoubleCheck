@@ -256,6 +256,57 @@ test("buildFocusView wires subgraph edges without from/to keys", () => {
 	assert.ok(svg.includes('data-evidence="inject=orderService"'));
 });
 
+test("buildSvg highlights only matching edge kind when parallel edges share from/to", () => {
+	const parallel = {
+		nodes: [
+			{ id: "app/handlers/Orders.bx", path: "app/handlers/Orders.bx", layer: 0 },
+			{ id: "app/models/OrderService.cfc", path: "app/models/OrderService.cfc", layer: 1 }
+		],
+		edges: [
+			{ from: "app/handlers/Orders.bx", to: "app/models/OrderService.cfc", kind: "injects" },
+			{ from: "app/handlers/Orders.bx", to: "app/models/OrderService.cfc", kind: "calls" }
+		]
+	};
+	const positioned = layout.layoutLayered(parallel, { detail: true });
+	const svg = layout.buildSvg(positioned, {
+		flowStepSet: ["app/handlers/Orders.bx", "app/models/OrderService.cfc"],
+		flowEdgeKinds: ["injects"]
+	});
+	const injects = svg.match(
+		/<path class="cg-edge is-flow-highlight"[^>]*data-kind="injects"/
+	);
+	const calls = svg.match(
+		/<path class="cg-edge is-flow-highlight"[^>]*data-kind="calls"/
+	);
+	assert.ok(injects, "injects edge should be flow-highlighted");
+	assert.equal(calls, null, "calls edge must not be flow-highlighted");
+});
+
+test("buildSvg marks flow highlight nodes and consecutive edges", () => {
+	const files = layout.buildFileView(sample, { detail: true });
+	const positioned = layout.layoutClusters(files, { detail: true });
+	const steps = [
+		"app/handlers/Orders.bx",
+		"app/models/OrderService.cfc",
+		"app/models/Invoice.cfc"
+	];
+	const svg = layout.buildSvg(positioned, { flowStepSet: steps });
+	assert.ok(svg.includes("is-flow-highlight"));
+	assert.match(
+		svg,
+		/<g class="[^"]*is-flow-highlight[^"]*" data-node-id="app\/handlers\/orders\.bx"/
+	);
+	assert.match(
+		svg,
+		/<g class="[^"]*is-flow-highlight[^"]*" data-node-id="app\/models\/orderservice\.cfc"/
+	);
+	assert.match(svg, /<path class="cg-edge is-flow-highlight"/);
+	assert.doesNotMatch(
+		svg,
+		/<g class="[^"]*is-flow-highlight[^"]*" data-node-id="app\/models\/orphan\.cfc"/
+	);
+});
+
 test("file and focus views render fan-in meta and edge kinds", () => {
 	const files = layout.buildFileView(sample, { detail: true });
 	assert.equal(files.detail, true);

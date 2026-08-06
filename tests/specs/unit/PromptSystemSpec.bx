@@ -124,6 +124,113 @@ class extends="testbox.system.BaseSpec" {
 					expect( result.reasonCodes ).toInclude( "unauthorized-evidence" );
 				} );
 
+				it( "uses codegraph-narrative v2 as the active role", () => {
+					var registry = new app.models.services.PromptRegistry();
+					var compiler = new app.models.services.PromptCompiler();
+					expect( registry.activeVersion( "codegraph-narrative" ) ).toBe( "v2" );
+					var activeContract = registry.contract( "codegraph-narrative" );
+					expect( activeContract.version ).toBe( "v2" );
+					expect( activeContract.outputSchema ).toBe( "codegraph-narrative-v2" );
+					expect( registry.schema( "codegraph-narrative-v2" ).required ).toInclude( "pitch" );
+					var package = compiler.compile(
+						"codegraph-narrative",
+						{
+							task: { clusterCount: 1, flowCount: 1, fingerprint: "abc" },
+							evidence: { clusters: [], hotspots: [], flows: [], cycles: [], roleCounts: {} }
+						}
+					);
+					expect( package.outputSchema ).toBe( "codegraph-narrative-v2" );
+					expect( package.promptVersion ).toBe( "v2" );
+					var v1Package = compiler.compile(
+						"codegraph-narrative",
+						{
+							task: { clusterCount: 1, fingerprint: "abc" },
+							evidence: { clusters: [], hotspots: [] }
+						},
+						{ contractVersion: "v1" }
+					);
+					expect( v1Package.promptVersion ).toBe( "v1" );
+				} );
+
+				it( "validates codegraph-narrative v2 fixture and rejects unauthorized ids", () => {
+					var validator = new app.models.services.PromptOutputValidator();
+					var context = {
+						allowedClusterIds: [ "cluster-a" ],
+						allowedNodeIds: [ "node-a" ],
+						allowedFlowIds: [ "flow-a" ],
+						allowedHotspotIds: [ "hotspot-a" ],
+						allowedCycleIds: [ "cycle-a" ]
+					};
+					var fixture = {
+						pitch: { text: "A local BoxLang review helper." },
+						domains: [ { clusterId: "cluster-a", title: "Orders", text: "Handles order workflows." } ],
+						processes: [ { flowId: "flow-a", title: "Create order", text: "Handler to service to model." } ],
+						onboarding: [ { step: 1, refType: "cluster", refId: "cluster-a", text: "Start with the orders domain." } ],
+						risk: [ { refType: "hotspot", refId: "hotspot-a", text: "High fan-in coupling." } ],
+						summaries: [ { clusterId: "cluster-a", title: "Orders", text: "Handles order workflows." } ]
+					};
+					expect( validator.validate( fixture, "codegraph-narrative-v2", context ).valid ).toBeTrue();
+					fixture.domains[ 1 ].clusterId = "invented-cluster";
+					expect( validator.validate( fixture, "codegraph-narrative-v2", context ).valid ).toBeFalse();
+				} );
+
+				it( "rejects codegraph-narrative v2 citations when allowlists are empty", () => {
+					var validator = new app.models.services.PromptOutputValidator();
+					var fixture = {
+						pitch: { text: "A local BoxLang review helper." },
+						domains: [ { clusterId: "invented-cluster", title: "Orders", text: "Handles order workflows." } ],
+						processes: [],
+						onboarding: [],
+						risk: [],
+						summaries: []
+					};
+					var result = validator.validate( fixture, "codegraph-narrative-v2", {} );
+					expect( result.valid ).toBeFalse();
+					expect( result.reasonCodes ).toInclude( "unauthorized-evidence" );
+				} );
+
+				it( "rejects codegraph-narrative v2 blank ids and unauthorized process or risk ids", () => {
+					var validator = new app.models.services.PromptOutputValidator();
+					var context = {
+						allowedClusterIds: [ "cluster-a" ],
+						allowedNodeIds: [ "node-a" ],
+						allowedFlowIds: [ "flow-a" ],
+						allowedHotspotIds: [ "hotspot-a" ],
+						allowedCycleIds: [ "cycle-a" ]
+					};
+					var baseFixture = {
+						pitch: { text: "A local BoxLang review helper." },
+						domains: [ { clusterId: "cluster-a", title: "Orders", text: "Handles order workflows." } ],
+						processes: [ { flowId: "flow-a", title: "Create order", text: "Handler to service to model." } ],
+						onboarding: [ { step: 1, refType: "cluster", refId: "cluster-a", text: "Start with the orders domain." } ],
+						risk: [ { refType: "hotspot", refId: "hotspot-a", text: "High fan-in coupling." } ],
+						summaries: [ { clusterId: "cluster-a", title: "Orders", text: "Handles order workflows." } ]
+					};
+					var blankFixture = duplicate( baseFixture );
+					blankFixture.domains[ 1 ].clusterId = "";
+					var blankResult = validator.validate( blankFixture, "codegraph-narrative-v2", context );
+					expect( blankResult.valid ).toBeFalse();
+					expect( blankResult.reasonCodes ).toInclude( "min-length" );
+
+					var whitespaceFixture = duplicate( baseFixture );
+					whitespaceFixture.domains[ 1 ].clusterId = " ";
+					var whitespaceResult = validator.validate( whitespaceFixture, "codegraph-narrative-v2", context );
+					expect( whitespaceResult.valid ).toBeFalse();
+					expect( whitespaceResult.reasonCodes ).toInclude( "unauthorized-evidence" );
+
+					var processFixture = duplicate( baseFixture );
+					processFixture.processes[ 1 ].flowId = "invented-flow";
+					var processResult = validator.validate( processFixture, "codegraph-narrative-v2", context );
+					expect( processResult.valid ).toBeFalse();
+					expect( processResult.reasonCodes ).toInclude( "unauthorized-evidence" );
+
+					var riskFixture = duplicate( baseFixture );
+					riskFixture.risk[ 1 ].refId = "invented-hotspot";
+					var riskResult = validator.validate( riskFixture, "codegraph-narrative-v2", context );
+					expect( riskResult.valid ).toBeFalse();
+					expect( riskResult.reasonCodes ).toInclude( "unauthorized-evidence" );
+				} );
+
 				it( "validates referenced bulk finding fields and repair confidence", () => {
 					var validator = new app.models.services.PromptOutputValidator();
 					var result = validator.validate(

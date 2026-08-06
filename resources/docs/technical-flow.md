@@ -3,6 +3,8 @@
 Local desktop review and modernization helper for **BoxLang, ColdFusion, and
 JavaScript**. Analysis and SQLite run on the developer’s machine.
 LLM specialists are optional for Review; Modernize requires an enabled provider.
+CodeGraph runs without AI for structure; the Domain lens (meaning) requires a
+provider.
 
 This document describes how the system is wired. Install and product summary live in
 [`readme.md`](../../readme.md). Purpose and shipped features (Review vs Modernize)
@@ -229,8 +231,8 @@ UI create path: `app.js` → `POST /api/v1/runs` → open SSE on `/events`.
 routes, then branches after the shared scan into `ModernizationRunService`.
 
 `runKind=codegraph` follows the same pattern into `CodeGraphRunService`
-(index → metrics/clusters → optional narrative → persist). Export is stubbed
-422 until a real exporter exists.
+(index → metrics/clusters/roles/flows → optional narrative v2 → persist). Export
+is stubbed 422 until a real exporter exists.
 
 ```mermaid
 sequenceDiagram
@@ -262,9 +264,10 @@ sequenceDiagram
 ## One CodeGraph run
 
 CodeGraph is a separate run kind on the same local run queue. It builds a
-deterministic CF/BoxLang knowledge-graph snapshot and optionally asks an LLM for
-plain-English cluster/hotspot summaries. Unlike Modernize, it is **not**
-provider-gated — no key still yields a complete graph.
+deterministic CF/BoxLang knowledge-graph snapshot (nodes with `role`, clusters,
+handler-seeded `flows[]`, issues) and optionally asks an LLM for a Domain lens
+briefing. Unlike Modernize, the run is **not** provider-gated — no key still
+yields complete structure; the UI shows a meaning banner when narrative is absent.
 
 Phases after the shared scan:
 
@@ -278,14 +281,18 @@ Phases after the shared scan:
 | 100 | `completed` | `codegraph.completed` |
 
 Services: `CodeGraphRunService` (pipeline), `CodeGraphInventoryAdapter` +
-`CodeGraphMetricsService` (deterministic snapshot; reuses
-`ModernizationCouplingGraphService` / `ModernizationDerivedStructureService`),
-`CodeGraphNarrativeService` (optional LLM), `CodeGraphRepository` (SQLite
-`codegraph_snapshots`).
+`CodeGraphMetricsService` (deterministic snapshot — roles on nodes, `flows[]`
+from handler actions; reuses `ModernizationCouplingGraphService` /
+`ModernizationDerivedStructureService`), `CodeGraphNarrativeService` (optional
+Domain lens via `codegraph-narrative-v2`: pitch, domains, processes, onboarding,
+risk + backward-compatible summaries; soft-fails without mutating snapshot),
+`CodeGraphRepository` (SQLite `codegraph_snapshots`).
 
-Result payload lives under `data.result.codegraph` (nodes/clusters/hotspots/
-narrative — **no** raw edge list). Subgraph drill-down:
-`GET /api/v1/runs/:id/codegraph/subgraph`.
+Result payload lives under `data.result.codegraph` via `CodeGraphRunService.getResult()`
+(nodes, clusters, `flows[]`, hotspots, narrative — **no** raw edge list; `flows`
+default `[]` when absent from snapshot). Subgraph drill-down:
+`GET /api/v1/runs/:id/codegraph/subgraph`. File edges:
+`GET /api/v1/runs/:id/codegraph/edges`.
 
 ---
 

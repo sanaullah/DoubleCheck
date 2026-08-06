@@ -12,7 +12,8 @@ recreate them; one documentation tree, in version control.
 |---|---|
 | [application-features.md](application-features.md) | Purpose, shipped features, AI contract, out of scope, **known gaps**, measured language tiers |
 | [technical-flow.md](technical-flow.md) | Technical implementation, project flow, Mermaid diagrams |
-| [plans/codegraph-plan.md](plans/codegraph-plan.md) | **Live plan** — CodeGraph workspace (deterministic graph + optional narrative) |
+| [plans/codegraph-domain-lens-design.md](plans/codegraph-domain-lens-design.md) | **Approved design** — CodeGraph meaning / Domain lens (LLM-required briefing) |
+| [plans/codegraph-plan.md](plans/codegraph-plan.md) | **Live plan** — Domain lens implementation tasks |
 | [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | Prior Modernize inversion notes (kept for Part 2 evidence); not the active plan |
 
 ## Reference — open only when the task needs it

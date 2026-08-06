@@ -804,6 +804,59 @@
 		return "M " + x1 + " " + y1 + " C " + midX + " " + y1 + ", " + midX + " " + y2 + ", " + x2 + " " + y2;
 	}
 
+	function buildFlowHighlightContext(opts) {
+		const ctx = { nodeSet: new Set(), flowEdgeKeys: new Set() };
+		if (!opts) return ctx;
+		const addNode = function (id) {
+			const n = normId(id);
+			if (n) ctx.nodeSet.add(n);
+		};
+		if (Array.isArray(opts.highlightIds)) {
+			opts.highlightIds.forEach(addNode);
+		}
+		const ordered = Array.isArray(opts.flowStepSet) ? opts.flowStepSet : [];
+		const edgeKinds = Array.isArray(opts.flowEdgeKinds)
+			? opts.flowEdgeKinds
+			: Array.isArray(opts.edgeKinds)
+				? opts.edgeKinds
+				: null;
+		ordered.forEach(addNode);
+		for (let i = 0; i < ordered.length - 1; i++) {
+			const from = normId(ordered[i]);
+			const to = normId(ordered[i + 1]);
+			const kind =
+				edgeKinds && edgeKinds[i] != null && edgeKinds[i] !== ""
+					? String(edgeKinds[i])
+					: "";
+			if (kind) {
+				ctx.flowEdgeKeys.add(from + "\0" + to + "\0" + kind);
+			} else {
+				ctx.flowEdgeKeys.add(from + "\0" + to);
+			}
+		}
+		return ctx;
+	}
+
+	function nodeIsFlowHighlighted(n, ctx) {
+		if (!ctx || !ctx.nodeSet.size || !n) return false;
+		return ctx.nodeSet.has(normId(n.id)) || (n.path && ctx.nodeSet.has(normId(n.path)));
+	}
+
+	function edgeIsFlowHighlighted(e, ctx) {
+		if (!ctx || !ctx.nodeSet.size || !e) return false;
+		const from = normId(e.from);
+		const to = normId(e.to);
+		const kind = String(e.kind || "");
+		if (ctx.flowEdgeKeys.size) {
+			const keyWithKind = from + "\0" + to + "\0" + kind;
+			const keyPair = from + "\0" + to;
+			if (ctx.flowEdgeKeys.has(keyWithKind)) return true;
+			if (ctx.flowEdgeKeys.has(keyPair)) return true;
+			return false;
+		}
+		return ctx.nodeSet.has(from) && ctx.nodeSet.has(to);
+	}
+
 	function buildOverviewCard(n, opts) {
 		const title = escapeXml(nodeLabel(n, opts));
 		const complexity = escapeXml(n.complexity || "simple");
@@ -831,8 +884,11 @@
 				);
 			})
 			.join("");
+		const flowHighlight = nodeIsFlowHighlighted(n, opts && opts._flowHighlightCtx);
 		return (
-			'<g class="cg-node cg-card" data-node-id="' +
+			'<g class="cg-node cg-card' +
+			(flowHighlight ? " is-flow-highlight" : "") +
+			'" data-node-id="' +
 			escapeXml(n.id) +
 			'" data-kind="cluster" data-complexity="' +
 			complexity +
@@ -905,11 +961,13 @@
 		if (n.hotspotScore) meta.push("hot " + Math.round(Number(n.hotspotScore) || 0));
 		if (n.inCycle) meta.push("cycle");
 		const metaText = escapeXml(meta.join(" · "));
+		const flowHighlight = nodeIsFlowHighlighted(n, opts && opts._flowHighlightCtx);
 		const cls =
 			"cg-node cg-file" +
 			(isFocus ? " is-focus" : "") +
 			(n.inCycle ? " in-cycle" : "") +
-			(n.hotspotScore >= 40 ? " is-hotspot" : "");
+			(n.hotspotScore >= 40 ? " is-hotspot" : "") +
+			(flowHighlight ? " is-flow-highlight" : "");
 		return (
 			'<g class="' +
 			cls +
@@ -953,9 +1011,12 @@
 		if (n && (n.kind === "file" || n.path || n.role === "focus" || n.role === "neighbor")) {
 			return buildFileNode(n, opts);
 		}
+		const flowHighlight = nodeIsFlowHighlighted(n, opts && opts._flowHighlightCtx);
 		const label = escapeXml(nodeLabel(n, opts));
 		return (
-			'<g class="cg-node" data-node-id="' +
+			'<g class="cg-node' +
+			(flowHighlight ? " is-flow-highlight" : "") +
+			'" data-node-id="' +
 			escapeXml(n.id) +
 			'" data-kind="' +
 			escapeXml(n.kind || "file") +
@@ -982,6 +1043,8 @@
 
 	function buildSvg(layout, opts) {
 		const cfg = mergeDefaults(opts);
+		const flowCtx = buildFlowHighlightContext(opts);
+		const renderOpts = Object.assign({}, opts || {}, { _flowHighlightCtx: flowCtx });
 		const nodes = (layout && layout.nodes) || [];
 		const edges = (layout && layout.edges) || [];
 		const width = (layout && layout.width) || cfg.pad * 2;
@@ -1008,12 +1071,14 @@
 			const edgeLabel = e.kind || e.label || (weight != null ? String(weight) : "");
 			const edgeKey = normId(e.from) + "\0" + normId(e.to) + "\0" + String(e.kind || "");
 			const selected = selectedEdgeKey && edgeKey === selectedEdgeKey ? " is-selected" : "";
+			const flowHighlight = edgeIsFlowHighlighted(e, flowCtx) ? " is-flow-highlight" : "";
 			let extraAttrs = "";
 			if (e.evidence) extraAttrs += ' data-evidence="' + escapeXml(String(e.evidence).slice(0, 400)) + '"';
 			if (e.line != null && e.line !== "") extraAttrs += ' data-line="' + escapeXml(String(e.line)) + '"';
 			edgeParts.push(
 				'<path class="cg-edge' +
 					selected +
+					flowHighlight +
 					'" data-from="' +
 					escapeXml(e.from) +
 					'" data-to="' +
@@ -1038,8 +1103,8 @@
 		});
 
 		const nodeParts = nodes.map((n) => {
-			if (overview && n.kind === "cluster") return buildOverviewCard(n, opts);
-			return buildSimpleNode(n, opts);
+			if (overview && n.kind === "cluster") return buildOverviewCard(n, renderOpts);
+			return buildSimpleNode(n, renderOpts);
 		});
 
 		return (
