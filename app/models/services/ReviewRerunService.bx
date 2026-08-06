@@ -1,0 +1,253 @@
+/**
+ * Creates a new run derived from an existing one: rerun, follow-up, or a
+ * scoped continuation of a Modernize plan.
+ *
+ * Split out of ReviewRunService (Part 5 Track A). That service owns the run
+ * lifecycle — queue, lease, status, cancel. This one answers a narrower
+ * question: given a run that already happened, what new run should follow, and
+ * over which paths? It reads a finished run and hands the answer to
+ * `ReviewRunService.create()`.
+ *
+ * The dependency runs one way. Rerun calls into the run service; the run
+ * service never calls back, which is why this could move without a cycle.
+ */
+@singleton
+class threadsafe {
+	property name="runService" inject="ReviewRunService";
+	property name="modernizationRepository" inject="ModernizationRepository";
+	property name="eventService" inject="ReviewEventService";
+
+	private any function runs() {
+		if ( !isNull( variables.runService ?: javacast( "null", "" ) ) ) return variables.runService;
+		variables.runService = new app.models.services.ReviewRunService();
+		return variables.runService;
+	}
+
+	private any function create( required struct input, struct context = {} ) {
+		return runs().create( arguments.input, arguments.context );
+	}
+
+	private any function getScoped( required string id, struct context = {} ) {
+		return runs().getScoped( arguments.id, arguments.context );
+	}
+
+	private any function getResult( required string id ) {
+		return runs().getResult( arguments.id );
+	}
+	public any function rerunScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped(
+			arguments.id,
+			arguments.context,
+			arguments.projectId
+		);
+		if ( isNull( source ) ) {
+			return javacast( "null", "" );
+		}
+		var sourceSchemaPack = {};
+		if ( lCase( source.getRunKind() ?: "review" ) == "modernize" ) {
+			var storedSourcePack = modernizationRepository.getSchemaPack( source.getId() );
+			if ( !isNull( storedSourcePack ) ) sourceSchemaPack = duplicate( storedSourcePack.sanitized ?: storedSourcePack );
+		}
+		var rerunInput = {
+			projectId   : source.getProjectId(),
+			projectPath : source.getProjectPath(),
+			runKind     : source.getRunKind(),
+			mode        : source.getMode(),
+			baseRevision: source.getBaseRevision(),
+			headRevision: source.getHeadRevision(),
+			policy      : source.getPolicy(),
+			budgets     : source.getBudgets(),
+			modernization: source.getRunKind() == "modernize" ? rerunModernizationInput( source ) : {},
+			sourceRunId : source.getId()
+		};
+		if ( isStruct( sourceSchemaPack ) && sourceSchemaPack.count() ) rerunInput.sanitizedSchemaPack = sourceSchemaPack;
+		var rerun = create(
+			rerunInput,
+			arguments.context
+		);
+		eventService.publish(
+				rerun.getId(),
+				"run.rerun",
+				{ sourceRunId: source.getId(), runId: rerun.getId() }
+			);
+		return rerun;
+	}
+
+	private struct function rerunModernizationInput( required any source ) {
+		var input = duplicate( arguments.source.getInput() ?: {} );
+		// Reruns must reuse the immutable sanitized schema snapshot. Suppress
+		// re-ingestion of a path or inline descriptor during create(); the
+		// snapshot is supplied through the internal atomic create path.
+		try {
+			var stored = modernizationRepository.getSchemaPack( arguments.source.getId() );
+			if ( !isNull( stored ) ) input.schemaPack = {
+				sourceKind: "none",
+				format: stored.format ?: "",
+				relativePath: stored.relativePath ?: "",
+				contentHash: stored.contentHash ?: "",
+				packVersion: stored.packVersion ?: ""
+			};
+		} catch ( any ignored ) {}
+		return input;
+	}
+
+	/**
+	 * Creates a scoped follow-up run for unresolved specialist coverage gaps.
+	 * Modernize runs are rejected because follow-up roles are Review-only.
+	 */
+	public any function followUpScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped(
+			arguments.id,
+			arguments.context,
+			arguments.projectId
+		);
+		if ( isNull( source ) ) {
+			return javacast( "null", "" );
+		}
+		if ( lCase( source.getRunKind() ?: "review" ) == "modernize" ) {
+			throw( type = "ValidationException", message = "Specialist follow-up is only available for Review runs. Use POST /api/v1/runs/:id/modernization/continue for omitted modernization coverage." );
+		}
+		var coverage = getResult( source.getId() ).coverage;
+		if ( !( coverage.followUp.available ?: false ) || !( coverage.followUp.roles ?: [] ).len() ) {
+			throw(
+				type    = "ValidationException",
+				message = "This review has no specialist coverage gaps eligible for follow-up"
+			);
+		}
+		var policy = duplicate( source.getPolicy() );
+		policy.allowedRoles = coverage.followUp.roles;
+		policy.reviewGoal = "Targeted follow-up for unresolved coverage gaps from run #source.getId()#.";
+		var budgets = duplicate( source.getBudgets() );
+		budgets.maxTasks = min(
+			int( budgets.maxTasks ?: coverage.followUp.maxTasks ),
+			coverage.followUp.maxTasks
+		);
+		var followUp = create(
+			{
+				projectId   : source.getProjectId(),
+				projectPath : source.getProjectPath(),
+				mode        : source.getMode(),
+				baseRevision: source.getBaseRevision(),
+				headRevision: source.getHeadRevision(),
+				policy      : policy,
+				budgets     : budgets,
+				sourceRunId : source.getId()
+			},
+			arguments.context
+		);
+		eventService.publish(
+				followUp.getId(),
+				"run.follow-up",
+				{
+					sourceRunId: source.getId(),
+					roles      : coverage.followUp.roles,
+					maxTasks   : coverage.followUp.maxTasks
+				}
+			);
+		return followUp;
+	}
+
+	/**
+	 * Continue a partial modernize run by analyzing omitted/failed shard paths
+	 * as a new wave. Accumulates coverage via sourceRunId decision carry-forward
+	 * and path-scoped proposal generation.
+	 */
+	public any function continueModernizeScoped( required string id, required struct context, string projectId = "" ) {
+		var source = getScoped( arguments.id, arguments.context, arguments.projectId );
+		if ( isNull( source ) ) return javacast( "null", "" );
+		if ( lCase( source.getRunKind() ?: "review" ) != "modernize" ) {
+			throw( type = "ValidationException", message = "Modernization continue is only available for modernize runs" );
+		}
+		if ( ![ "partial", "succeeded", "failed" ].contains( lCase( source.getStatus() ?: "" ) ) ) {
+			throw( type = "ValidationException", message = "Modernization continue requires a finished run" );
+		}
+		var result = getResult( source.getId() );
+		var omittedPaths = collectModernizeContinuationPaths( result );
+		if ( !omittedPaths.len() ) {
+			throw( type = "ValidationException", message = "This modernization run has no omitted or failed shard paths to continue" );
+		}
+		var waveCap = 400;
+		if ( omittedPaths.len() > waveCap ) omittedPaths = omittedPaths.slice( 1, waveCap );
+		var priorInput = isStruct( source.getInput() ?: "" ) ? duplicate( source.getInput() ) : {};
+		// Keep directory prefixes only. Omitted FILE paths go through selectedFiles
+		// so ModernizationPolicyService's 40-entry scopePaths cap cannot truncate the wave.
+		var directoryScopes = [];
+		for ( var scopePath in ( isArray( priorInput.scopePaths ?: "" ) ? priorInput.scopePaths : [] ) ) {
+			var normalizedScope = replace( trim( toString( scopePath ) ), "\", "/", "all" );
+			if ( !len( normalizedScope ) ) continue;
+			if ( reFindNoCase( "\.(cfm|cfc|cfml|bx|bxm|bxs|js)$", normalizedScope ) ) continue;
+			directoryScopes.append( normalizedScope );
+		}
+		priorInput.scopePaths = directoryScopes;
+		structDelete( priorInput, "selectedFiles" );
+		priorInput.outcomes = isArray( priorInput.outcomes ?: "" ) ? priorInput.outcomes : [];
+		if ( !priorInput.outcomes.contains( "continue omitted modernization coverage" ) ) {
+			priorInput.outcomes.append( "continue omitted modernization coverage" );
+		}
+		var budgets = duplicate( source.getBudgets() ?: {} );
+		if ( !isNumeric( budgets.maxDurationMs ?: "" ) || val( budgets.maxDurationMs ) < 7200000 ) {
+			budgets.maxDurationMs = 7200000;
+		}
+		// Prefer enough shards to cover this wave (2 files/shard default).
+		budgets.maxApplicationShards = max( val( budgets.maxApplicationShards ?: 80 ), min( 200, ceiling( omittedPaths.len() / 2 ) ) );
+		var continuation = create(
+			{
+				runKind     : "modernize",
+				projectId   : source.getProjectId(),
+				projectPath : source.getProjectPath(),
+				mode        : source.getMode(),
+				baseRevision: source.getBaseRevision(),
+				headRevision: source.getHeadRevision(),
+				sourceRunId : source.getId(),
+				budgets     : budgets,
+				selectedFiles: omittedPaths,
+				modernization: priorInput
+			},
+			arguments.context
+		);
+		eventService.publish(
+			continuation.getId(),
+			"run.modernize-continue",
+			{
+				sourceRunId : source.getId(),
+				omittedPaths: omittedPaths.len(),
+				waveCap     : waveCap
+			}
+		);
+		return continuation;
+	}
+
+	private array function collectModernizeContinuationPaths( required struct result ) {
+		var seen = {};
+		var paths = [];
+		var appendPath = ( value ) => {
+			var candidate = trim( replace( toString( arguments.value ), "\", "/", "all" ) );
+			if ( !len( candidate ) || seen.keyExists( lCase( candidate ) ) ) return;
+			seen[ lCase( candidate ) ] = true;
+			paths.append( candidate );
+		};
+		var shards = isStruct( arguments.result.metadata ?: "" ) && isStruct( arguments.result.metadata.applicationShards ?: "" )
+			? arguments.result.metadata.applicationShards
+			: {};
+		for ( var omitted in ( isArray( shards.omittedPaths ?: "" ) ? shards.omittedPaths : [] ) ) {
+			appendPath( omitted );
+		}
+		for ( var outcome in ( isArray( shards.outcomes ?: "" ) ? shards.outcomes : [] ) ) {
+			if ( !isStruct( outcome ) ) continue;
+			var status = lCase( trim( outcome.status ?: "" ) );
+			if ( ![ "omitted", "failed" ].contains( status ) ) continue;
+			if ( isArray( outcome.paths ?: "" ) ) {
+				for ( var path in outcome.paths ) appendPath( path );
+			}
+			if ( len( trim( outcome.path ?: "" ) ) ) appendPath( outcome.path );
+		}
+		var llmOmitted = isStruct( arguments.result.coverage ?: "" ) && isStruct( arguments.result.coverage.llm ?: "" )
+			? arguments.result.coverage.llm.omittedPaths
+			: [];
+		if ( isArray( llmOmitted ) ) {
+			for ( var path in llmOmitted ) appendPath( path );
+		}
+		return paths;
+	}
+}
+

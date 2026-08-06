@@ -798,35 +798,6 @@ class threadsafe {
 		}
 	}
 
-	private string function friendlyFailureMessage( required any error ) {
-		if ( ( arguments.error.type ?: "" ) == "SpecialistCircuitOpen" ) {
-			return "Specialist provider circuit is open";
-		}
-		var raw = trim( toString( arguments.error.message ?: "" ) );
-		if ( !len( raw ) ) {
-			return "Specialist review unavailable";
-		}
-		if ( findNoCase( "tool-call markup", raw ) || findNoCase( "<|tool_call", raw ) || findNoCase( "functions.read_", raw ) ) {
-			return "Specialist review unavailable: model returned tool-call markup instead of JSON. Retrying with embedded source context.";
-		}
-		if ( findNoCase( "not valid JSON", raw ) ) {
-			return "Specialist review unavailable: model response was not valid JSON (often truncated by reasoning-token use — raise max tokens per task)";
-		}
-		if ( findNoCase( "response is empty", raw ) || findNoCase( "empty after retry", raw ) ) {
-			return "Specialist review unavailable: model returned empty content (reasoning models need a higher token budget)";
-		}
-		if ( findNoCase( "circuit is open", raw ) ) {
-			return "Specialist provider circuit is open";
-		}
-		if (
-			findNoCase( "exceed_context_size", raw ) || findNoCase( "exceeds the available context size", raw ) ||
-				findNoCase( "n_ctx", raw )
-		) {
-			return "Specialist review unavailable: prompt exceeds the model context window. Raise AI_CONTEXT_WINDOW / server context size, or lower max tokens per task and plan context budgets.";
-		}
-		return "Specialist review unavailable: " & left( raw, 160 );
-	}
-
 	private void function cancelAll( required array items ) {
 		for ( var item in arguments.items ) {
 			item.control.cancelled = true;
@@ -883,57 +854,29 @@ class threadsafe {
 		);
 	}
 
+	/**
+	 * Failure presentation moved to SpecialistFailurePresenter (Part 5 Track A).
+	 * Explicit signatures -- the call sites pass positionally.
+	 */
+	private any function failurePresenter() {
+		if ( !isNull( variables.specialistFailurePresenter ?: javacast( "null", "" ) ) ) return variables.specialistFailurePresenter;
+		var presenter = new app.models.services.SpecialistFailurePresenter();
+		if ( !isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) presenter.secretRedactionService = variables.secretRedactionService;
+		variables.specialistFailurePresenter = presenter;
+		return variables.specialistFailurePresenter;
+	}
+
+	private string function friendlyFailureMessage( required any error ) {
+		return failurePresenter().friendlyFailureMessage( arguments.error );
+	}
+
 	private string function previewText( required any body ) {
-		if ( !isTrue( observabilityEnabled ) ) {
-			return "";
-		}
-		if ( isSimpleValue( arguments.body ) ) {
-			var simple = toString( arguments.body );
-			var limit = max(
-				200,
-				isNumeric( observabilityPreviewCharacters ) ? int( val( observabilityPreviewCharacters ) ) : 1600
-			);
-			if ( len( simple ) > limit ) {
-				return left( simple, limit ) & char( 10 ) & "[truncated]";
-			}
-			return simple;
-		}
-		if ( isStruct( arguments.body ) ) {
-			var lines = [];
-			for ( var key in arguments.body ) {
-				var value = arguments.body[ key ];
-				if ( isNull( value ) || isSimpleValue( value ) ) {
-					lines.append( "#key#: #isNull( value ) ? "" : value#" );
-				} else if ( isArray( value ) ) {
-					lines.append( "#key#: [array:#arrayLen( value )#]" );
-				} else {
-					lines.append( "#key#: [complex]" );
-				}
-			}
-			var text = lines.toList( char( 10 ) );
-			var maxChars = max(
-				200,
-				isNumeric( observabilityPreviewCharacters ) ? int( val( observabilityPreviewCharacters ) ) : 1600
-			);
-			if ( len( text ) > maxChars ) {
-				return left( text, maxChars ) & char( 10 ) & "[truncated]";
-			}
-			return text;
-		}
-		return "[complex payload]";
+		return failurePresenter().previewText( arguments.body );
 	}
 
 	private void function logSpecialistError( required string message, required any error, struct context = {} ) {
-		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
-			return;
-		}
-		var detail = duplicate( arguments.context );
-		detail.type = arguments.error.type ?: "";
-		detail.message = secretRedactionService.redactText( arguments.error.message ?: "" );
-		detail.stackTrace = secretRedactionService.redactText( arguments.error.stackTrace ?: "" );
-		log.error( arguments.message, detail );
+		failurePresenter().logSpecialistError( arguments.message, arguments.error, arguments.context );
 	}
-
 	private boolean function isTrue( required any value ) {
 		if ( isBoolean( arguments.value ) ) {
 			return arguments.value;

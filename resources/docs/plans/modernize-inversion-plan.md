@@ -2902,8 +2902,280 @@ Second trap in the same move: the settings the emit path reads
 specs build the service with `new`. Absent now means **on**, because a split
 that silently disables telemetry is worse than one that leaves it noisy.
 
-Still over 900 and still on the exceptions list — 1811 is Part 5's larger job.
-`ReviewRunService` (1452) and `SpecialistReviewService` (943) are untouched.
+### Done: `ProviderResilienceService` extracted (132 lines) — the plan's named split
+
+`SpecialistAgentGateway` **1976 → 1365**. Circuit breaker, backoff and
+provider-error classification now live in one place.
+
+**Taken for the reason the plan gives, not for line count:** the Modernize
+gateway has *no breaker at all*, so a repeatedly failing provider is retried on
+every run. `bx-ai`'s `RetryMiddleware` covers backoff and retry but has **no
+breaker concept**, which is why this stays in DoubleCheck. A shared owner is the
+precondition for giving Modernize one.
+
+**An earlier note in this plan said moving the breaker "splits mutable state"
+and used that to argue against the split. That was wrong.** The state is only
+split if *some* readers move; every function touching `variables.circuits` moved
+together, so the map has exactly one owner and nothing is shared across a
+boundary. The correct test is not "does this touch shared state" but "does
+anything left behind still touch it".
+
+Two corrections during the move, both the same shape as earlier ones:
+- the moved functions kept `private` and were unreachable from the gateway;
+- the specs inject `circuitFailureThreshold` / `circuitCooldownMs` into the
+  **gateway** to make the breaker trip quickly. A resilience service reading only
+  its own injected settings ignored them and the circuit never opened under test.
+  The gateway now propagates its tuning, the same pattern used for the chat
+  fitter's `StubAIProviderResolver`.
+
+**This is now three times that a split broke because a spec configures the
+outer object.** Anything a spec injects or stubs on the parent must be
+propagated to an extracted collaborator — check the spec's setup before
+declaring a seam clean, not after the failure.
+
+### `ReviewRunService`: the pipeline extraction was attempted twice and reverted twice
+
+The seam is real. `executeRun`'s review half is 397 contiguous lines, the
+modernize branch above it returns early, and all 42 locals are internal to the
+block -- so it moves whole rather than needing them threaded through parameters.
+Both attempts produced a **green 584-spec suite on the first run**.
+
+Both also **broke the review pipeline in production**, and only running a real
+review caught it:
+
+1. First attempt passed lifecycle callbacks as a struct of closures and wrote
+   `( argumentCollection ) => transition( argumentCollection = arguments )`,
+   which declares a literal parameter of that name. Every transition misfired;
+   the run died as "Run was cancelled".
+2. Second attempt replaced the closures with explicitly-signed forwarders and a
+   lazy back-reference. That fixed the syntax, and WireBox then failed to boot
+   on the circular singleton (`Singleton.cfc:95`) until the `inject=` was
+   removed from the pipeline's side. The suite passed; the review still failed.
+
+**The lesson is about the acceptance test, not the seam.** Nothing in the suite
+exercises `executeRun` end to end, so a green run says nothing about this
+change. **Anyone attempting this must treat "a real review run reaches
+`partial` with a non-empty summary" as the gate**, and should add a spec that
+covers `executeRun` *before* moving anything -- otherwise the third attempt
+will look green and be broken too.
+
+`ReviewRunService` stands at 1138 with the two extractions that did hold
+(`ReviewRerunService`, `ReviewRunQueryService`) and the contention retry.
+
+### Done: `SpecialistAgentGateway` cleared, 1976 -> 798
+
+Nine splits. The last 120 lines came from deleting the delegating wrappers the
+earlier moves left dead -- but only after **repointing the specs at the real
+owners**.
+
+That ordering is the lesson. Deleting the wrappers first broke five specs,
+because about ten of them were reached from tests via `makePublic` even though
+no production code called them any more. The wrappers were not dead; the tests
+were holding them alive through the wrong object. Pointing
+`SpecialistAgentsSpec` at `SpecialistChatFitter` and
+`SpecialistResponseParser` -- with the same stubs the gateway had been given --
+made the tests better *and* made the wrappers genuinely removable.
+
+**A spec that reaches a moved function through its old owner is not a passing
+test; it is a test aimed at the wrong object.** Fix the aim, then delete.
+
+Off the exceptions list. Three services remain: `ReviewRunService` (1159),
+`ModernizationShardExecutor` (1064), `ModernizationDerivedStructureService`
+(969).
+
+### Done: both provider paths extracted -- gateway 1976 -> 917
+
+`SpecialistChatInvoker` (333) and `SpecialistAgentInvoker` (381). The design
+question this plan posed -- two strategies behind one interface, or one path
+with a branch? -- is answered by the signatures: `invokeChatFallback` takes the
+agent path's `agentError`. It is a **fallback in a sequence**, not a peer
+strategy. So the gateway keeps the policy (try agent, fall back to chat) and
+each invoker owns the mechanics of its own call.
+
+**The earlier small cuts are what made these possible.** `invokeChatFallback`
+had 15 outbound calls and `invokeAgent` 13 -- but 11 and 12 of those
+respectively already had owners from the observation / parser / fitter /
+telemetry / resilience splits. Only cancellation needed copying. Doing the
+cheap, clean cuts first turned two "untouchable" functions into mechanical
+extractions, both green on the first run.
+
+**917 -- seventeen lines over, and it stops there.** Removing the now-dead
+delegating wrappers looked like the obvious way to close the gap and was tried:
+it broke five specs, because about ten of those wrappers are reached from tests
+via `makePublic` even though nothing in the gateway calls them any more.
+Reverted. Deleting test-reachable code to win seventeen lines is the wrong
+trade; the seam is already where it belongs.
+
+### Part 5''s named splits are done, and they do not reach its target
+
+Both splits this plan names for `SpecialistAgentGateway` now exist:
+`AiTelemetryExtractor` (307) and `ProviderResilienceService` (132).
+
+**The plan''s own arithmetic never reached its stated target, and that should be
+corrected rather than carried forward:**
+
+```
+gateway when the plan was written      2214
+named splits  ~250 + ~450            =  700
+2214 - 700                           = 1514
+stated target                          <= 900
+```
+
+Doing exactly what Part 5 prescribes lands at ~1514. The target was
+unreachable from the named work — the gap is ~600 lines that no listed split
+accounts for.
+
+Actual result is **1365**, better than the plan predicted, because five splits
+were done rather than two: `SpecialistObservationService`,
+`SpecialistResponseParser`, `SpecialistChatFitter`,
+`SpecialistFailurePresenter` and `ProviderResilienceService`.
+
+**To actually reach ≤ 900** the remaining ~465 lines have to come from
+`invokeAgent` (298) and `invokeChatFallback` (212) — the two provider paths.
+That is decomposition of the gateway''s reason for existing, not extraction of a
+neighbouring concern, and it needs a design decision first: are the agent path
+and the chat path two strategies behind one interface, or one path with a
+branch? Answer that before cutting; the line count alone will not decide it.
+
+### Where Part 5 Track A stops, and why
+
+Six extractions landed (below). Two services remain over 900, and **neither has
+a remaining seam** — this is measured, not assumed:
+
+**`SpecialistAgentGateway` (1976 → 1377).** Three candidates checked:
+- async-retry cluster: **19 outbound calls** — into circuit breaker, validation,
+  execution, logging, cancellation, context building. That is the orchestration
+  core, not a seam.
+- circuit breaker: **extracted** as `ProviderResilienceService` (see above).
+  An earlier reading here called it unsafe because it owns `variables.circuits`;
+  that was wrong — moving *every* toucher together relocates the state rather
+  than splitting it.
+- what remains is `invokeAgent` (298) and `invokeChatFallback` (212): the
+  provider paths, which are what the gateway *is*.
+
+**`ReviewRunService` (1460 → 1159).** `executeRun` is 563 lines carrying
+**42 local variables** across its phases — scan, graph, plan, specialists,
+persist. Splitting those phases means threading 42 pieces of state through
+parameters or inventing a context object. That is a redesign of the review
+execution path, not an extraction, and it is the highest-risk change available
+in this codebase. The modernize branch inside it (73 lines) *is* self-contained,
+but its natural home `ModernizationRunService` sits at exactly 900 — moving it
+relocates the problem rather than solving it.
+
+**The rule this follows:** a split needs a reason beyond the line count. That
+reasoning already kept `ModernizationShardExecutor` intact; applying it
+inconsistently here to make a number go down would make the rule meaningless.
+Both services stay on the exceptions list with these measurements attached.
+
+### Started: `ReviewRunQueryService` extracted (140 lines)
+
+`ReviewRunService` **1460 → 1159**. That service *executes* runs — queue, lease,
+transition, cancel. This one only answers questions about runs that already
+exist, with the tenant/project scoping those answers require.
+
+**The cleanest seam measured all session: zero outbound calls.** Wrappers were
+kept rather than repointing, because `get`/`getResult` have ~140 call sites
+across handlers and specs and the seam is worth having without that churn.
+
+One correction on the way: the surface scan found four collaborators, but the
+moved code actually uses **ten** — `graphRepository`, `architectureRepository`,
+`specialistResultRepository`, `findingBaselineService`, `findingReviewService`
+and `coverageAssessmentService` as well. A scan for `name.method(` misses
+anything reached through a local alias. **Enumerate identifiers used as
+receivers, not just the injected-property list**, before declaring a surface
+complete.
+
+### Started: `SpecialistChatFitter` extracted (360 lines)
+
+`SpecialistAgentGateway` **1976 → 1377** across three cuts. The gateway owns the
+call — whether to invoke, retry, or give up. The fitter owns making the call
+*fit*: token budgets, context-window arithmetic, trimming the context pack, and
+one JSON-repair round trip. It reads responses through `SpecialistResponseParser`
+and reports through `SpecialistObservationService` rather than re-implementing
+either.
+
+**This was the most entangled cut of the session and needed five corrections,
+every one caught by a test rather than by reading:**
+
+1. `aiProviderResolver` was not declared on the new service.
+2. **Constants were retyped, not copied** — `promptSafetyTokens` went in as 900
+   (real: 512) and `charsPerToken` as 4 (real: 2). This plan already warns about
+   exactly this and it still happened. Copy constants; never retype them.
+3. **`chatOnlyInstructions` was fabricated.** The real one takes a `definition`
+   and builds on `definition.instructions`; the invented version was a bare
+   string with no argument, which would have silently changed every chat-only
+   prompt. Copy the implementation, do not reconstruct it from its name.
+4. The resolver needed a lazy accessor for `new`-constructed specs.
+5. **The fitter built its own `AIProviderResolverService`, bypassing the
+   `StubAIProviderResolver` the specs inject into the gateway** — it would have
+   reached for live provider config under test. The gateway now shares its
+   collaborators with the fitter, the same propagation pattern recorded for
+   `ProposalService → ShardExecutor`.
+
+Points 2, 3 and 5 are the general lesson: **a verbatim move is only verbatim if
+you move the text.** Anything retyped or inferred from a name is a new defect
+with an old function's reputation.
+
+### Started: `SpecialistResponseParser` extracted (238 lines)
+
+`SpecialistAgentGateway` **1811 → 1620** (1976 at session start). The gateway
+decides *whether* to call, retry, or give up; the parser decides *what the
+answer means* — unwrapping envelopes, finding the JSON object inside prose, and
+refusing tool-call markup a chat-only path must not accept. Pure: no provider,
+no run state.
+
+`assertNotToolCallMarkup` / `containsToolCallMarkup` / `sanitizeErrorSnippet`
+moved with it even though the gateway still calls them, because they are about
+interpreting provider output — same responsibility. The gateway delegates, so
+there is still one implementation of each.
+
+### Started: `ReviewRerunService` extracted (253 lines)
+
+`ReviewRunService` **1460 → 1245**. Rerun, follow-up and scoped Modernize
+continuation moved out: that service owns the run *lifecycle* — queue, lease,
+status, cancel — while this answers a narrower question, "given a run that
+already happened, what new run should follow, and over which paths?".
+
+The dependency runs one way (rerun → run service), so no cycle. The three
+handler call sites in `ApiRuns.bx` were repointed rather than wrapped, which
+avoids `ReviewRunService` having to know about its own derivative. Verified
+beyond the suite: `POST /api/v1/runs/<id>/rerun` returns a proper
+`run_not_found`, so the handler really does reach the new service.
+
+### Done: `SpecialistReviewService` cleared (943 → 886)
+
+`SpecialistFailurePresenter` (110 lines) took `friendlyFailureMessage`,
+`previewText` and `logSpecialistError`. Orchestrating specialist runs and
+explaining a failure are different jobs, and `previewText` redacts before
+anything is displayed or logged — which is why redaction belongs there rather
+than at each call site. **Off the exceptions list**, so a regression now fails
+the build.
+
+**An earlier reading of this file said "no seam worth cutting" and that was
+wrong.** The measurement behind it was sound — the async task-dispatch family
+does call out to eight functions including the service's core loop, and is
+still not worth extracting. The error was concluding *the file* had no seam from
+*one candidate* having none. A second, smaller cluster was sitting in the tail
+the whole time.
+
+### `SpecialistReviewService`: the dispatch cluster still should not move
+
+The obvious candidate — the async task-dispatch family (`executeTaskAsync`,
+`launchTask`, `awaitTask`, `failedTask`, ~270 contiguous lines) — calls out to
+**eight** functions including `prepareTask` (119 lines) and `assembleSuccess`
+(133 lines), which are the service's core loop. Extracting it would need eight
+delegating callbacks or a back-reference: more coupling than it removes.
+
+At 43 lines over, this one should stay until a second responsibility actually
+appears. Splitting it now would be splitting for the metric — the same reasoning
+already recorded for `ModernizationShardExecutor`.
+
+**Remaining on the exceptions list:** `SpecialistAgentGateway` (1811),
+`ReviewRunService` (1245), `SpecialistReviewService` (943),
+`ModernizationDerivedStructureService` (969), `ModernizationShardExecutor`
+(1064). `ReviewRunService`'s bulk is `executeRun` at 562 lines — one function,
+so the next cut there is internal decomposition, not extraction, and carries
+more risk than the moves so far.
 
 
 Review and Modernize share a run engine but the sharing is implemented as

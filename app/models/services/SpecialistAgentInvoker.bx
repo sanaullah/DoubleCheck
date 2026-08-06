@@ -1,0 +1,381 @@
+/**
+ * The agent invocation path: the gateway's primary route to a provider, using
+ * `aiAgent()` with tools.
+ *
+ * Split out of SpecialistAgentGateway (Part 5 Track A). It owns the mechanics
+ * of an agent call — tool wiring, per-turn observation, usage extraction — and
+ * falls back to SpecialistChatInvoker when the agent path fails, which is the
+ * sequence the gateway previously held inline.
+ *
+ * Twelve of its thirteen outbound calls already had owners from earlier splits;
+ * only cancellation needed copying. That is the compounding return on doing the
+ * small, clean cuts first.
+ */
+@singleton
+class threadsafe {
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="specialistChatInvoker" inject="SpecialistChatInvoker";
+	property name="specialistObservationService" inject="SpecialistObservationService";
+	property name="specialistResponseParser" inject="SpecialistResponseParser";
+	property name="aiTelemetryExtractor" inject="AiTelemetryExtractor";
+	property name="providerResilienceService" inject="ProviderResilienceService";
+	property name="log" inject="logbox:logger:{this}";
+
+	private any function chatInvoker() {
+		if ( !isNull( variables.specialistChatInvoker ?: javacast( "null", "" ) ) ) return variables.specialistChatInvoker;
+		variables.specialistChatInvoker = new app.models.services.SpecialistChatInvoker();
+		return variables.specialistChatInvoker;
+	}
+	private any function observations() {
+		if ( !isNull( variables.specialistObservationService ?: javacast( "null", "" ) ) ) return variables.specialistObservationService;
+		variables.specialistObservationService = new app.models.services.SpecialistObservationService();
+		return variables.specialistObservationService;
+	}
+	private any function parser() {
+		if ( !isNull( variables.specialistResponseParser ?: javacast( "null", "" ) ) ) return variables.specialistResponseParser;
+		variables.specialistResponseParser = new app.models.services.SpecialistResponseParser();
+		return variables.specialistResponseParser;
+	}
+	private any function telemetry() {
+		if ( !isNull( variables.aiTelemetryExtractor ?: javacast( "null", "" ) ) ) return variables.aiTelemetryExtractor;
+		variables.aiTelemetryExtractor = new app.models.services.AiTelemetryExtractor();
+		return variables.aiTelemetryExtractor;
+	}
+	private any function resilience() {
+		if ( !isNull( variables.providerResilienceService ?: javacast( "null", "" ) ) ) return variables.providerResilienceService;
+		variables.providerResilienceService = new app.models.services.ProviderResilienceService();
+		return variables.providerResilienceService;
+	}
+
+	// Cancellation is the only helper without an owner elsewhere; copied verbatim.
+	private void function assertNotCancelled( required struct control ) {
+		if ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) {
+			throw(
+				type    = "RunCancelled",
+				message = "Specialist task cancelled"
+			);
+		}
+	}
+
+	// Delegations to the owners established by earlier splits.
+	private void function emitLlmObserve( required function progressCallback, required numeric round, required string stage, required string titlePrefix, required string preview, required string modelName, required string providerName, struct usage = {}, numeric durationMs = 0 ) {
+		observations().emitLlmObserve( arguments.progressCallback, arguments.round, arguments.stage, arguments.titlePrefix, arguments.preview, arguments.modelName, arguments.providerName, arguments.usage, arguments.durationMs );
+	}
+	private void function emitToolObserve( required function progressCallback, required string stage, required string titlePrefix, required string toolName, required string preview, required string toolCallId ) {
+		observations().emitToolObserve( arguments.progressCallback, arguments.stage, arguments.titlePrefix, arguments.toolName, arguments.preview, arguments.toolCallId );
+	}
+	private any function observePayload( required string kind, required string title, required string body, struct meta = {}, struct extras = {} ) {
+		return observations().observePayload( arguments.kind, arguments.title, arguments.body, arguments.meta, arguments.extras );
+	}
+	private struct function normalizeResponse( required any response ) { return parser().normalizeResponse( arguments.response ); }
+	private struct function extractUsage( required any ctx ) { return telemetry().extractUsage( arguments.ctx ); }
+	private string function extractLlmInput( required any ctx ) { return telemetry().extractLlmInput( arguments.ctx ); }
+	private string function extractLlmOutput( required any ctx ) { return telemetry().extractLlmOutput( arguments.ctx ); }
+	private struct function extractToolInfo( required any ctx ) { return telemetry().extractToolInfo( arguments.ctx ); }
+	private string function safeText( required any body ) { return telemetry().safeText( arguments.body ); }
+	private numeric function currentTimeMillis() { return resilience().currentTimeMillis(); }
+	private boolean function isTransientProviderError( required any error ) { return resilience().isTransientProviderError( arguments.error ); }
+	private any function invokeChatFallback( required struct definition, required string input, required struct params, required struct options, required struct control, required any agentError, function onProgress = ( detail ) => {}, string contextPack = "" ) {
+		return chatInvoker().invokeChatFallback( arguments.definition, arguments.input, arguments.params, arguments.options, arguments.control, arguments.agentError, arguments.onProgress, arguments.contextPack );
+	}
+	public any function invokeAgent(
+		required struct definition,
+		required array tools,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required function onProgress,
+		string contextPack = "",
+		struct resolved     = aiProviderResolver.resolve()
+	) {
+		var progressCallback = arguments.onProgress;
+		var counters = { llmRound: 0, llmStartedAt: {} };
+		var resolved = arguments.resolved;
+		var agent = aiAgent(
+			name         = arguments.definition.name,
+			description  = arguments.definition.description,
+			instructions = arguments.definition.instructions,
+			tools        = arguments.tools,
+			middleware   = [
+				new bxModules.bxai.models.middleware.core.MaxToolCallsMiddleware( maxCalls = arguments.definition.maxIterations ),
+				new bxModules.bxai.models.middleware.StructMiddlewareAdapter(
+					{
+						beforeLLMCall: ( ctx ) => {
+							counters.llmRound = counters.llmRound + 1;
+							counters.llmStartedAt[ counters.llmRound ] = currentTimeMillis();
+							emitLlmObserve(
+								progressCallback,
+								counters.llmRound,
+								"provider-llm",
+								"LLM request",
+								extractLlmInput( ctx ),
+								params.model ?: resolved.model,
+								options.provider ?: resolved.provider,
+								{},
+								0
+							);
+							return new bxModules.bxai.models.middleware.AiMiddlewareResult( "continue" );
+						},
+						afterLLMCall: ( ctx ) => {
+							var started = counters.llmStartedAt[ counters.llmRound ] ?: 0;
+							var durationMs = started > 0 ? max( 0, currentTimeMillis() - started ) : 0;
+							emitLlmObserve(
+								progressCallback,
+								counters.llmRound,
+								"provider-llm-done",
+								"LLM response",
+								extractLlmOutput( ctx ),
+								params.model ?: resolved.model,
+								options.provider ?: resolved.provider,
+								extractUsage( ctx ),
+								durationMs
+							);
+							return new bxModules.bxai.models.middleware.AiMiddlewareResult( "continue" );
+						},
+						beforeToolCall: ( ctx ) => {
+							var toolInfo = extractToolInfo( ctx );
+							emitToolObserve(
+								progressCallback,
+								"tool-call",
+								"Tool call",
+								toolInfo.name,
+								toolInfo.args,
+								toolInfo.id
+							);
+							return new bxModules.bxai.models.middleware.AiMiddlewareResult( "continue" );
+						},
+						afterToolCall: ( ctx ) => {
+							var toolInfo = extractToolInfo( ctx );
+							emitToolObserve(
+								progressCallback,
+								"tool-done",
+								"Tool result",
+								toolInfo.name,
+								toolInfo.result,
+								toolInfo.id
+							);
+							return new bxModules.bxai.models.middleware.AiMiddlewareResult( "continue" );
+						}
+					}
+				)
+			]
+		);
+		assertNotCancelled( arguments.control );
+		arguments.onProgress(
+				{
+					stage  : "provider-run",
+					message: "Starting specialist agent",
+					observe: observePayload(
+						"agent",
+						arguments.definition.name,
+						safeText(
+							{
+								role         : arguments.definition.role,
+								description  : arguments.definition.description,
+								instructions : trim( arguments.definition.instructions ),
+								maxTokens    : arguments.definition.maxTokens,
+								maxIterations: arguments.definition.maxIterations,
+								toolCount    : arguments.tools.len(),
+								provider     : arguments.options.provider ?: resolved.provider,
+								model        : arguments.params.model ?: resolved.model,
+								baseURL      : len( trim( resolved.baseURL ) ) ? resolved.baseURL : "(default)"
+							}
+						),
+						{
+							role     : arguments.definition.role,
+							provider : arguments.options.provider ?: resolved.provider,
+							model    : arguments.params.model ?: resolved.model,
+							toolCount: arguments.tools.len(),
+							maxTokens: arguments.definition.maxTokens
+						},
+						{
+							observationType: "span",
+							model          : arguments.params.model ?: resolved.model,
+							modelParameters: {
+								provider     : arguments.options.provider ?: resolved.provider,
+								model        : arguments.params.model ?: resolved.model,
+								maxTokens    : arguments.definition.maxTokens,
+								maxIterations: arguments.definition.maxIterations,
+								toolCount    : arguments.tools.len()
+							}
+						}
+					)
+				}
+			);
+		arguments.onProgress(
+				{
+					stage  : "prompt-sent",
+					message: "Sending task payload (#len( arguments.input )# chars)",
+					observe: observePayload(
+						"prompt",
+						"Task payload sent",
+						arguments.input,
+						{
+							characters: len( arguments.input ),
+							role      : arguments.definition.role,
+							io        : "input"
+						},
+						{
+							observationType: "span",
+							model          : arguments.params.model ?: resolved.model,
+							modelParameters: {
+								provider  : arguments.options.provider ?: resolved.provider,
+								model     : arguments.params.model ?: resolved.model,
+								characters: len( arguments.input )
+							}
+						}
+					)
+				}
+			);
+		try {
+			var response = agent.run(
+					arguments.input,
+					arguments.params,
+					arguments.options
+				);
+			assertNotCancelled( arguments.control );
+			arguments.onProgress(
+					{
+						stage         : "provider-complete",
+						charactersSeen: isSimpleValue( response ) ? len( toString( response ) ) : 0,
+						message       : "Agent finished; normalizing response",
+						observe       : observePayload(
+							"response",
+							"Raw agent response",
+							safeText( response ),
+							{
+								characters: isSimpleValue( response ) ? len( toString( response ) ) : 0,
+								io        : "output"
+							},
+							{
+								observationType: "span",
+								model          : arguments.params.model ?: resolved.model,
+								modelParameters: {
+									provider: arguments.options.provider ?: resolved.provider,
+									model   : arguments.params.model ?: resolved.model
+								}
+							}
+						)
+					}
+				);
+			try {
+				return normalizeResponse( response );
+			} catch ("SpecialistResultException" normalizeError) {
+				arguments.onProgress(
+						{
+							stage  : "provider-chat-fallback",
+							message: "Unstructured agent output; completing via chat",
+							observe: observePayload(
+								"fallback",
+								"Completing via chat (unstructured agent output)",
+								normalizeError.message ?: "unstructured",
+								{ reason: "unstructured-agent-output", io: "output" },
+								{ observationType: "event" }
+							)
+						}
+					);
+				return normalizeResponse(
+					invokeChatFallback(
+						arguments.definition,
+						arguments.input,
+						arguments.params,
+						arguments.options,
+						arguments.control,
+						normalizeError,
+						arguments.onProgress,
+						arguments.contextPack,
+						false,
+						arguments.resolved
+					)
+				);
+			}
+		} catch ("SpecialistResultException" resultError) {
+			rethrow;
+		} catch ("SpecialistProviderException" providerError) {
+			rethrow;
+		} catch ("RunCancelled" cancelled) {
+			rethrow;
+		} catch (any agentError) {
+			if ( isTransientProviderError( agentError ) ) {
+				arguments.onProgress(
+						{
+							stage  : "provider-retry",
+							message: "Transient provider error; retrying agent once",
+							observe: observePayload(
+								"event",
+								"Retrying agent after transient provider error",
+								agentError.message ?: "transient-error",
+								{
+									reason: agentError.type ?: "transient-error",
+									io    : "output"
+								},
+								{ observationType: "event" }
+							)
+						}
+					);
+				try {
+					sleep( 350 );
+					assertNotCancelled( arguments.control );
+					var retryResponse = agent.run(
+							arguments.input,
+							arguments.params,
+							arguments.options
+						);
+					assertNotCancelled( arguments.control );
+					arguments.onProgress(
+							{
+								stage  : "provider-complete",
+								message: "Agent finished after retry; normalizing response",
+								observe: observePayload(
+									"response",
+									"Raw agent response",
+									safeText( retryResponse ),
+									{ io: "output" },
+									{
+										observationType: "span",
+										model          : arguments.params.model ?: resolved.model
+									}
+								)
+							}
+						);
+					return normalizeResponse( retryResponse );
+				} catch (any retryError) {
+					agentError = retryError;
+				}
+			}
+			arguments.onProgress(
+					{
+						stage  : "provider-chat-fallback",
+						message: "Provider agent call failed; completing via chat",
+						observe: observePayload(
+							"fallback",
+							"Completing via chat (agent provider error)",
+							agentError.message ?: "agent-error",
+							{
+								reason: agentError.type ?: "agent-error",
+								io    : "output"
+							},
+							{ observationType: "event" }
+						)
+					}
+				);
+			return normalizeResponse(
+				invokeChatFallback(
+					arguments.definition,
+					arguments.input,
+					arguments.params,
+					arguments.options,
+					arguments.control,
+					agentError,
+					arguments.onProgress,
+					arguments.contextPack,
+					false,
+					arguments.resolved
+				)
+			);
+		}
+	}
+}
+

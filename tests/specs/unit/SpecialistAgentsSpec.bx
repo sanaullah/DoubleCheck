@@ -77,24 +77,24 @@ class extends="testbox.system.BaseSpec" {
 									model   : "moonshotai/kimi-k2.7-code"
 								} )
 							);
-						makePublic( gateway, "containsToolCallMarkup" );
 						makePublic( gateway, "shouldPreferChatWithContext" );
-						makePublic( gateway, "sanitizeErrorSnippet" );
-						makePublic( gateway, "assertNotToolCallMarkup" );
+						// Response interpretation moved to SpecialistResponseParser
+						// (Part 5 Track A) and is public there, so no makePublic needed.
+						var parser = new app.models.services.SpecialistResponseParser();
 
 						expect( gateway.shouldPreferChatWithContext() ).toBeTrue();
 						expect(
-							gateway.containsToolCallMarkup(
+							parser.containsToolCallMarkup(
 									"<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:0"
 								)
 						).toBeTrue();
 						expect(
-							gateway.sanitizeErrorSnippet(
+							parser.sanitizeErrorSnippet(
 									"Specialist response is not valid JSON: <|tool_call_begin|>functions.read_file"
 								)
 						).toBe( "[tool-call markup omitted]" );
 						expect(
-							() => gateway.assertNotToolCallMarkup( "<|tool_call_begin|>functions.read_file:0" )
+							() => parser.assertNotToolCallMarkup( "<|tool_call_begin|>functions.read_file:0" )
 						).toThrow( type = "SpecialistToolMarkupException" );
 					}
 				);
@@ -105,16 +105,17 @@ class extends="testbox.system.BaseSpec" {
 						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
 						var resolverStub = new tests.resources.StubAIProviderResolver( { model: "moonshotai/kimi-k2.7-code" } );
 						gateway.$property( "aiProviderResolver", "variables", resolverStub );
-						makePublic( gateway, "isReasoningHeavyModel" );
-						makePublic( gateway, "providerMaxTokens" );
+						// Model-class and token ceilings are owned by SpecialistChatFitter.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = resolverStub;
 
-						expect( gateway.isReasoningHeavyModel() ).toBeTrue();
-						expect( gateway.providerMaxTokens( 3000 ) ).toBe( 12000 );
-						expect( gateway.providerMaxTokens( 3000, 6 ) ).toBe( 18000 );
+						expect( fitter.isReasoningHeavyModel() ).toBeTrue();
+						expect( fitter.providerMaxTokens( 3000 ) ).toBe( 12000 );
+						expect( fitter.providerMaxTokens( 3000, 6 ) ).toBe( 18000 );
 
 						resolverStub.set( { model: "gpt-4.1-mini" } );
-						expect( gateway.isReasoningHeavyModel() ).toBeFalse();
-						expect( gateway.providerMaxTokens( 3000 ) ).toBe( 3000 );
+						expect( fitter.isReasoningHeavyModel() ).toBeFalse();
+						expect( fitter.providerMaxTokens( 3000 ) ).toBe( 3000 );
 					}
 				);
 
@@ -127,18 +128,20 @@ class extends="testbox.system.BaseSpec" {
 								"variables",
 								new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "ornith-1.0-9b" } )
 							);
-						makePublic( gateway, "completionTokenBudget" );
-						makePublic( gateway, "retryCompletionTokenBudget" );
 						makePublic( gateway, "contextPackCharacterBudget" );
-						makePublic( gateway, "fitChatPrompt" );
+						// Token budgeting and prompt fitting are owned by
+						// SpecialistChatFitter (Part 5 Track A) and public there, so
+						// this targets the owner with the same stubbed resolver.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "ornith-1.0-9b" } );
 
-						expect( gateway.completionTokenBudget( 6000 ) ).toBeLTE( 2048 );
-						expect( gateway.retryCompletionTokenBudget( 6000, 2048 ) ).toBe( 3072 );
+						expect( fitter.completionTokenBudget( 6000 ) ).toBeLTE( 2048 );
+						expect( fitter.retryCompletionTokenBudget( 6000, 2048 ) ).toBe( 3072 );
 						expect( gateway.contextPackCharacterBudget( 2000, 2000 ) ).toBeLTE( 8192 * 2 );
 						expect( gateway.contextPackCharacterBudget( 2000, 2000 ) ).toBeGTE( 1000 );
 
 						var hugePack = repeatString( "code line" & char( 10 ), 8000 );
-						var fitted = gateway.fitChatPrompt(
+						var fitted = fitter.fitChatPrompt(
 								"system instructions",
 								"task payload",
 								hugePack,
@@ -154,11 +157,11 @@ class extends="testbox.system.BaseSpec" {
 							fitted.maxTokens;
 						expect( estimatedTokens ).toBeLTE( 8192 );
 
-						var retryFitted = gateway.fitChatPrompt(
+						var retryFitted = fitter.fitChatPrompt(
 								"compact JSON system instructions",
 								fitted.userPrompt,
 								"",
-								gateway.retryCompletionTokenBudget( 6000, 2048 ),
+								fitter.retryCompletionTokenBudget( 6000, 2048 ),
 								.375
 							);
 						expect( retryFitted.maxTokens ).toBe( 3072 );
@@ -169,7 +172,7 @@ class extends="testbox.system.BaseSpec" {
 						expect( retryEstimatedTokens ).toBeLTE( 8192 );
 
 						var requiredFooter = char( 10 ) & "BEGIN_REPAIR_REQUEST" & char( 10 ) & "Repair serialization only." & char( 10 ) & "END_REPAIR_REQUEST";
-						var repairFitted = gateway.fitChatPrompt(
+						var repairFitted = fitter.fitChatPrompt(
 								"immutable role and schema contract",
 								repeatString( "dynamic task data", 4000 ),
 								"",
@@ -192,9 +195,11 @@ class extends="testbox.system.BaseSpec" {
 								"variables",
 								new tests.resources.StubAIProviderResolver( { model: "test-model" } )
 							);
-						makePublic( gateway, "chatOnlyInstructions" );
+						// chatOnlyInstructions is owned by SpecialistChatFitter.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { model: "test-model" } );
 
-						var instructions = gateway.chatOnlyInstructions( { instructions: "OUTPUT_SCHEMA: specialist-findings-v1" } );
+						var instructions = fitter.chatOnlyInstructions( { instructions: "OUTPUT_SCHEMA: specialist-findings-v1" } );
 						expect( instructions ).toInclude( "use message, never detail" );
 						expect( instructions ).notToInclude( "title, detail" );
 					}
@@ -209,8 +214,10 @@ class extends="testbox.system.BaseSpec" {
 								"variables",
 								new tests.resources.StubAIProviderResolver( { contextWindow: 8192 } )
 							);
-						makePublic( gateway, "fitChatPrompt" );
-						var fitted = gateway.fitChatPrompt(
+						// fitChatPrompt is owned by SpecialistChatFitter (Part 5 Track A).
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192 } );
+						var fitted = fitter.fitChatPrompt(
 								"system",
 								"task-body",
 								"## a.bx:1-2" & char( 10 ) & "1| x",
@@ -248,10 +255,14 @@ class extends="testbox.system.BaseSpec" {
 								"variables",
 								chatStub
 							);
-						makePublic( gateway, "ensureChatJsonResponse" );
+						// ensureChatJsonResponse is owned by SpecialistChatFitter
+						// (Part 5 Track A); give it the same stubs the gateway had.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "test-model" } );
+						fitter.chatGateway = chatStub;
 						var progressEvents = [];
 
-						var response = gateway.ensureChatJsonResponse(
+						var response = fitter.ensureChatJsonResponse(
 								"not-json",
 								[
 									{ role: "system", content: "ORIGINAL ROLE CONTRACT" & char( 10 ) & "OUTPUT_SCHEMA: specialist-findings-v1" },

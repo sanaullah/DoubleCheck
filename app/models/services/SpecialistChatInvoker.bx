@@ -1,0 +1,333 @@
+/**
+ * The chat invocation path: what the gateway falls back to when the agent path
+ * fails.
+ *
+ * Split out of SpecialistAgentGateway (Part 5 Track A). It is a fallback, not a
+ * peer strategy — it receives the agent path's error and works from it — so the
+ * gateway keeps the policy (try agent, fall back to chat) and this owns the
+ * mechanics of making a chat call and getting valid JSON back.
+ *
+ * Most of what it needs was already extracted: prompt fitting and repair
+ * (SpecialistChatFitter), response interpretation (SpecialistResponseParser),
+ * observations (SpecialistObservationService), telemetry shaping
+ * (AiTelemetryExtractor). Those earlier cuts are what made this one tractable —
+ * 11 of its 15 outbound calls already had homes.
+ */
+@singleton
+class threadsafe {
+	property name="chatGateway" inject="AIChatGateway";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+	property name="promptCompiler" inject="PromptCompiler";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="specialistChatFitter" inject="SpecialistChatFitter";
+	property name="specialistResponseParser" inject="SpecialistResponseParser";
+	property name="specialistObservationService" inject="SpecialistObservationService";
+	property name="aiTelemetryExtractor" inject="AiTelemetryExtractor";
+	property name="providerResilienceService" inject="ProviderResilienceService";
+	property name="log" inject="logbox:logger:{this}";
+
+	private any function fitter() {
+		if ( !isNull( variables.specialistChatFitter ?: javacast( "null", "" ) ) ) return variables.specialistChatFitter;
+		variables.specialistChatFitter = new app.models.services.SpecialistChatFitter();
+		return variables.specialistChatFitter;
+	}
+	private any function parser() {
+		if ( !isNull( variables.specialistResponseParser ?: javacast( "null", "" ) ) ) return variables.specialistResponseParser;
+		variables.specialistResponseParser = new app.models.services.SpecialistResponseParser();
+		return variables.specialistResponseParser;
+	}
+	private any function observations() {
+		if ( !isNull( variables.specialistObservationService ?: javacast( "null", "" ) ) ) return variables.specialistObservationService;
+		variables.specialistObservationService = new app.models.services.SpecialistObservationService();
+		return variables.specialistObservationService;
+	}
+	private any function telemetry() {
+		if ( !isNull( variables.aiTelemetryExtractor ?: javacast( "null", "" ) ) ) return variables.aiTelemetryExtractor;
+		variables.aiTelemetryExtractor = new app.models.services.AiTelemetryExtractor();
+		return variables.aiTelemetryExtractor;
+	}
+	private any function resilience() {
+		if ( !isNull( variables.providerResilienceService ?: javacast( "null", "" ) ) ) return variables.providerResilienceService;
+		variables.providerResilienceService = new app.models.services.ProviderResilienceService();
+		return variables.providerResilienceService;
+	}
+
+	// Delegations to the already-extracted owners.
+	private string function chatOnlyInstructions( required struct definition ) { return fitter().chatOnlyInstructions( arguments.definition ); }
+	private any function ensureChatJsonResponse( required any chatResponse, required array messages, required struct chatParams, required struct chatOptions, required struct definition, required function onProgress, required string titlePrefix ) {
+		return fitter().ensureChatJsonResponse( arguments.chatResponse, arguments.messages, arguments.chatParams, arguments.chatOptions, arguments.definition, arguments.onProgress, arguments.titlePrefix );
+	}
+	private struct function fitChatPrompt( required string systemPrompt, required string taskInput, string contextPack = "", numeric requestedMaxTokens = 3000, numeric completionWindowFraction = .25, string requiredUserFooter = "" ) {
+		return fitter().fitChatPrompt( arguments.systemPrompt, arguments.taskInput, arguments.contextPack, arguments.requestedMaxTokens, arguments.completionWindowFraction, arguments.requiredUserFooter );
+	}
+	private numeric function numericContextWindow() { return fitter().numericContextWindow(); }
+	private numeric function providerMaxTokens( required numeric requested, numeric multiplier = 0 ) { return fitter().providerMaxTokens( arguments.requested, arguments.multiplier ); }
+	private string function repairRequest( required string reason ) { return fitter().repairRequest( arguments.reason ); }
+	private void function assertNotToolCallMarkup( required any response ) { parser().assertNotToolCallMarkup( arguments.response ); }
+	private any function observePayload( required string kind, required string title, required string body, struct meta = {}, struct extras = {} ) {
+		return observations().observePayload( arguments.kind, arguments.title, arguments.body, arguments.meta, arguments.extras );
+	}
+	private string function safeText( required any body ) { return telemetry().safeText( arguments.body ); }
+	private string function summarizeMessages( required any messages ) { return telemetry().summarizeMessages( arguments.messages ); }
+	private numeric function currentTimeMillis() { return resilience().currentTimeMillis(); }
+	private string function redactSecrets( required string text ) { return parser().sanitizeErrorSnippet( arguments.text ); }
+	private void function assertNotCancelled( required struct control ) {
+		if ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) {
+			throw(
+				type    = "RunCancelled",
+				message = "Specialist task cancelled"
+			);
+		}
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private void function logProviderFailure(
+		required string message,
+		required any error,
+		required numeric attempt,
+		boolean warning = false
+	) {
+		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
+			return;
+		}
+		var resolved = aiProviderResolver.resolve();
+		var detail = {
+			type      : arguments.error.type ?: "",
+			message   : redactSecrets( arguments.error.message ?: "" ),
+			provider  : resolved.provider,
+			model     : resolved.model,
+			attempt   : arguments.attempt,
+			stackTrace: redactSecrets( arguments.error.stackTrace ?: "" )
+		};
+		if ( arguments.warning ) {
+			log.warn( arguments.message, detail );
+		} else {
+			log.error( arguments.message, detail );
+		}
+	}
+
+	private string function specialistContractId( required struct definition ) {
+		if ( len( trim( arguments.definition.promptId ?: "" ) ) ) return arguments.definition.promptId;
+		if ( isStruct( arguments.definition.promptPackage ?: "" ) && len( trim( arguments.definition.promptPackage.promptId ?: "" ) ) ) return arguments.definition.promptPackage.promptId;
+		var role = lCase( trim( arguments.definition.role ?: "" ) );
+		return len( role ) && [ "security", "correctness", "architecture", "testing", "performance", "boxlang-conventions", "cfml-conventions" ].contains( role ) ? "specialist." & role : "";
+	}
+
+	public any function invokeChatFallback(
+		required struct definition,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required any agentError,
+		function onProgress = ( detail ) => {
+
+		},
+		string contextPack  = "",
+		boolean primaryPath = false,
+		struct resolved     = aiProviderResolver.resolve()
+	) {
+		assertNotCancelled( arguments.control );
+		var resolved = arguments.resolved;
+		var systemPrompt = chatOnlyInstructions( arguments.definition );
+		var chatOptions = {
+			provider      : arguments.options.provider ?: resolved.provider,
+			apiKey        : arguments.options.apiKey ?: resolved.apiKey,
+			timeout       : arguments.options.timeout ?: resolved.timeout,
+			returnFormat  : "single",
+			conversationId: arguments.options.conversationId ?: "",
+			tenantId      : arguments.options.tenantId ?: "",
+			usageMetadata : arguments.options.usageMetadata ?: {}
+		};
+		if ( arguments.options.keyExists( "baseURL" ) ) {
+			chatOptions.baseURL = arguments.options.baseURL;
+		} else if ( len( trim( resolved.baseURL ) ) ) {
+			chatOptions.baseURL = resolved.baseURL;
+		}
+		var chatParams = duplicate( arguments.params );
+		structDelete( chatParams, "response_format" );
+		if ( !chatParams.keyExists( "max_tokens" ) ) {
+			chatParams.max_tokens = providerMaxTokens( arguments.definition.maxTokens ?: 3000 );
+		} else {
+			chatParams.max_tokens = providerMaxTokens( chatParams.max_tokens );
+		}
+		var fitted = fitChatPrompt(
+			systemPrompt,
+			arguments.input,
+			arguments.contextPack,
+			chatParams.max_tokens
+		);
+		if ( fitted.truncated && isStruct( arguments.definition.promptPackage ?: "" ) ) {
+			arguments.definition.promptPackage.truncation = { applied: true, omitted: [ "authorized-context-or-task" ], boundaries: [ "complete-line" ] };
+			if ( isStruct( arguments.definition.provenance ?: "" ) ) arguments.definition.provenance.truncation = duplicate( arguments.definition.promptPackage.truncation );
+		}
+		if ( isStruct( arguments.definition.provenance ?: "" ) ) {
+			arguments.definition.provenance.promptHash = lCase( hash( fitted.systemPrompt, "SHA-256" ) );
+			arguments.definition.provenance.promptMode = arguments.primaryPath ? "chat-context" : "chat-fallback";
+		}
+		chatParams.max_tokens = fitted.maxTokens;
+		var fittedUserPrompt = fitted.userPrompt;
+		var messages = [ { role: "system", content: fitted.systemPrompt }, { role: "user", content: fittedUserPrompt }];
+		var contractId = specialistContractId( arguments.definition );
+		if ( len( contractId ) ) structAppend( chatParams, getCompiler().structuredOutput( contractId, resolved.provider ?: "" ), true );
+		var titlePrefix = arguments.primaryPath ? "Chat review" : "Chat fallback";
+		arguments.onProgress(
+				{
+					stage  : "provider-chat-request",
+					message: titlePrefix & " request",
+					observe: observePayload(
+						"llm",
+						titlePrefix & " request",
+						summarizeMessages( messages ),
+						{
+							round   : 1,
+							model   : chatParams.model ?: resolved.model,
+							provider: chatOptions.provider,
+							io      : "input",
+							mode    : arguments.primaryPath ? "chat-context" : "chat-fallback"
+						},
+						{
+							observationType: "generation",
+							input          : summarizeMessages( messages ),
+							output         : "",
+							model          : chatParams.model ?: resolved.model,
+							modelParameters: {
+								provider        : chatOptions.provider,
+								model           : chatParams.model ?: resolved.model,
+								mode            : arguments.primaryPath ? "chat-context" : "chat-fallback",
+								contextChars    : len( arguments.contextPack ),
+								contextTruncated: fitted.truncated,
+								maxTokens       : chatParams.max_tokens,
+								contextWindow   : numericContextWindow()
+							}
+						}
+					)
+				}
+			);
+		var chatStartedAt = currentTimeMillis();
+		try {
+			var chatResponse = chatGateway.chat(
+					messages,
+					chatParams,
+					chatOptions
+				);
+			assertNotToolCallMarkup( chatResponse );
+			chatResponse = ensureChatJsonResponse(
+				chatResponse,
+				messages,
+				chatParams,
+				chatOptions,
+				arguments.definition,
+				arguments.onProgress,
+				titlePrefix
+			);
+			var chatDurationMs = max( 0, currentTimeMillis() - chatStartedAt );
+			arguments.onProgress(
+					{
+						stage  : "provider-chat-response",
+						message: titlePrefix & " response",
+						observe: observePayload(
+							"llm",
+							titlePrefix & " response",
+							safeText( chatResponse ),
+							{
+								round     : 1,
+								model     : chatParams.model ?: resolved.model,
+								provider  : chatOptions.provider,
+								io        : "output",
+								mode      : arguments.primaryPath ? "chat-context" : "chat-fallback",
+								durationMs: chatDurationMs
+							},
+							{
+								observationType: "generation",
+								input          : "",
+								output         : safeText( chatResponse ),
+								model          : chatParams.model ?: resolved.model,
+								durationMs     : chatDurationMs,
+								modelParameters: {
+									provider  : chatOptions.provider,
+									model     : chatParams.model ?: resolved.model,
+									mode      : arguments.primaryPath ? "chat-context" : "chat-fallback",
+									durationMs: chatDurationMs,
+									maxTokens : chatParams.max_tokens ?: 0
+								}
+							}
+						)
+					}
+				);
+			return chatResponse;
+		} catch ("SpecialistToolMarkupException" markupError) {
+			// One hard JSON-only retry under the same role, evidence, and output contract.
+			arguments.onProgress(
+					{
+						stage  : "provider-chat-retry",
+						message: "Model emitted tool markup; forcing JSON-only retry",
+						observe: observePayload(
+							"retry",
+							"Forcing JSON-only chat retry",
+							markupError.message ?: "tool-markup",
+							{ reason: "tool-call-markup", io: "output" },
+							{ observationType: "event" }
+						)
+					}
+				);
+			var strictFitted = fitChatPrompt(
+				fitted.systemPrompt,
+				fittedUserPrompt,
+				"",
+				chatParams.max_tokens,
+				.25,
+				repairRequest( "tool-call markup" )
+			);
+			var strictMessages = [
+				{
+					role   : "system",
+					content: strictFitted.systemPrompt
+				},
+				{
+					role   : "user",
+					content: strictFitted.userPrompt
+				}
+			];
+			var retryResponse = chatGateway.chat(
+					strictMessages,
+					chatParams,
+					chatOptions
+				);
+			assertNotToolCallMarkup( retryResponse );
+			return retryResponse;
+		} catch (any chatError) {
+			logProviderFailure(
+				"#titlePrefix# failed",
+				chatError,
+				1,
+				false
+			);
+			arguments.onProgress(
+					{
+						stage  : "provider-chat-error",
+						message: titlePrefix & " failed",
+						observe: observePayload(
+							"fallback",
+							titlePrefix & " failed",
+							chatError.message ?: "chat-error",
+							{
+								reason: chatError.type ?: "chat-error",
+								io    : "output"
+							}
+						)
+					}
+				);
+			throw(
+				type    = "SpecialistProviderException",
+				message = "Specialist agent failed (#arguments.agentError.message#); chat completion failed (#chatError.message#)"
+			);
+		}
+	}
+}
+

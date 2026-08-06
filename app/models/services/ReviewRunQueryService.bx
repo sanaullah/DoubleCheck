@@ -1,0 +1,146 @@
+/**
+ * Reads runs and their results.
+ *
+ * Split out of ReviewRunService (Part 5 Track A). That service *executes* runs —
+ * queue, lease, transition, cancel. This one only answers questions about runs
+ * that already exist, with the tenant/project scoping those answers require.
+ *
+ * It calls nothing back into the run lifecycle: the measured seam had zero
+ * outbound calls, which is why it could move whole.
+ */
+@singleton
+class threadsafe {
+	property name="runRepository" inject="ReviewRunRepository";
+	property name="resultRepository" inject="ReviewResultRepository";
+	property name="securityContextService" inject="SecurityContextService";
+	property name="modernizationRunService" inject="ModernizationRunService";
+	property name="graphRepository" inject="AnalysisGraphRepository";
+	property name="architectureRepository" inject="ArchitectureRepository";
+	property name="specialistResultRepository" inject="SpecialistResultRepository";
+	property name="findingBaselineService" inject="FindingBaselineService";
+	property name="findingReviewService" inject="FindingReviewService";
+	property name="coverageAssessmentService" inject="CoverageAssessmentService";
+	any function get( required string id ) {
+		return runRepository.find( arguments.id );
+	}
+
+	any function getScoped( required string id, required struct context, string projectId = "" ) {
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				arguments.projectId
+			);
+		return runRepository.findScoped(
+				arguments.id,
+				arguments.context.tenantId,
+				arguments.projectId
+			);
+	}
+
+	/**
+	 * Assembles a result from persisted findings, graph, architecture,
+	 * specialist, baseline, review-decision, and coverage data.
+	 */
+	struct function getResult( required string id ) {
+		var run = runRepository.find( arguments.id );
+		if ( !isNull( run ) && lCase( run.getRunKind() ?: "review" ) == "modernize" ) {
+			return modernizationRunService.getResult( arguments.id );
+		}
+		var result = resultRepository.getResult( arguments.id );
+		result.graph = graphRepository.getGraph( arguments.id );
+		var architectureBundle = architectureRepository.get( arguments.id );
+		result.architecture = architectureBundle.architecture;
+		result.architectureDiff = architectureBundle.architectureDiff;
+		result.architectureReused = architectureBundle.architectureReused;
+		result.plan = architectureBundle.plan;
+		result.specialists = specialistResultRepository.get( arguments.id );
+		result.coverage = coverageAssessmentService.assess( result );
+
+		if ( isNull( run ) ) {
+			return findingBaselineService.applyToResult( result );
+		}
+		var baselineRun = runRepository.findPriorEligibleBaseline(
+				run.getProjectPath(),
+				run.getMode(),
+				run.getCreatedAt(),
+				run.getId(),
+				run.getTenantId(),
+				run.getProjectId()
+			);
+		if ( isNull( baselineRun ) ) {
+			return findingReviewService.applyToResult( run, findingBaselineService.applyToResult( result ) );
+		}
+		var baselineFindings = resultRepository.getResult( baselineRun.getId() ).findings ?: [];
+		return findingReviewService.applyToResult(
+				run,
+				findingBaselineService.applyToResult(
+						result           = result,
+						baselineMeta     = {
+							runId    : baselineRun.getId(),
+							status   : baselineRun.getStatus(),
+							createdAt: baselineRun.getCreatedAt()
+						},
+						baselineFindings = baselineFindings
+					)
+			);
+	}
+
+	struct function getResultScoped( required string id, required struct context ) {
+		var run = getScoped( arguments.id, arguments.context );
+		if ( isNull( run ) ) {
+			return {};
+		}
+		return getResult( run.getId() );
+	}
+
+	struct function list( numeric page = 1, numeric limit = 20 ) {
+		var safePage = max( 1, int( arguments.page ) );
+		var safeLimit = min( 100, max( 1, int( arguments.limit ) ) );
+		var result = runRepository.list( limit = safeLimit, offset = ( safePage - 1 ) * safeLimit );
+		return {
+			data: result.data.map( ( run ) => run.getMemento() ),
+			meta: {
+				page      : safePage,
+				limit     : safeLimit,
+				total     : result.total,
+				totalPages: result.total ? ceiling( result.total / safeLimit ) : 0
+			}
+		};
+	}
+
+	struct function listScoped(
+		required struct context,
+		string projectId = "",
+		numeric page     = 1,
+		numeric limit    = 20
+	) {
+		securityContextService.authorize(
+				arguments.context,
+				"runs:read",
+				arguments.projectId
+			);
+		var safePage = max( 1, int( arguments.page ) );
+		var safeLimit = min( 100, max( 1, int( arguments.limit ) ) );
+		var result = runRepository.listScoped(
+				tenantId  = arguments.context.tenantId,
+				projectId = arguments.projectId,
+				limit     = safeLimit,
+				offset    = ( safePage - 1 ) * safeLimit
+			);
+		return {
+			data: result.data.map( ( run ) => run.getMemento() ),
+			meta: {
+				page      : safePage,
+				limit     : safeLimit,
+				total     : result.total,
+				totalPages: result.total ? ceiling( result.total / safeLimit ) : 0
+			}
+		};
+	}
+
+	/**
+	 * Persists a cancellation request, publishes the state change, and signals
+	 * any active in-process executor. Completed runs are returned unchanged.
+	 */
+}
+
