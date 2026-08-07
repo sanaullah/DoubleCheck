@@ -1,7 +1,7 @@
 # CodeGraph Domain lens — design
 
 **Status:** Approved 2026-08-06  
-**Live plan:** [codegraph-plan.md](codegraph-plan.md) (implementation tasks)  
+**Live plan:** [codegraph-depth-plan.md](codegraph-depth-plan.md) (implementation tasks)  
 **Canvas:** `codegraph-domain-lens-design.canvas.tsx` (companion)
 
 ## Goal
@@ -101,18 +101,28 @@ Unchanged spine. Add process highlight. Edge click → evidence (shipped).
 - Second Domain/Structural graph product
 - Semantic search, wiki, editable local vocabulary file
 - Symbol-level explorer
-- Languages outside BoxLang / ColdFusion (JS remains skipped)
 - SaaS / hosted / mobile
+
+**Superseded scope.** Two lines here are no longer accurate. "JS remains
+skipped" and the P2 deferral of a glossary are both overturned by
+[codegraph-depth-plan.md](codegraph-depth-plan.md) Steps 5 and 10 — JavaScript
+becomes a parsed language, and domain labels persist across runs with
+provenance. Everything else in this document stands.
 
 ## Ship order
 
-| Step | Outcome |
-|---|---|
-| P0 substrate | Roles, legend, flow extraction, better cluster keys |
-| P0 narrative v2 | Pitch + domains + processes + onboarding (+ risk if tokens allow) |
-| P1 UI meaning mode | Overview/cards driven by narrative; banner when missing |
-| P1 process overlay | Highlight computed flow on canvas |
-| P2 glossary + impact-as-story | Jargon chips; “if you change X…” |
+| Step | Outcome | Status |
+|---|---|---|
+| P0 substrate | Roles, legend, flow extraction, better cluster keys | Shipped |
+| P0 narrative v2 | Pitch + domains + processes + onboarding (+ risk if tokens allow) | Shipped |
+| P1 UI meaning mode | Overview/cards driven by narrative; banner when missing | Shipped |
+| P1 process overlay | Highlight computed flow on canvas | Shipped |
+| P2 glossary + impact-as-story | Jargon chips; “if you change X…” | See depth plan |
+
+The substrate this design assumed is thinner than it needs to be — the parsers
+read one line at a time, and the graph has no front end and no data layer.
+[codegraph-depth-plan.md](codegraph-depth-plan.md) is the live plan that fixes
+that.
 
 ## Non-goals vs Review/Modernize
 

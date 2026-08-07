@@ -5,22 +5,20 @@ BoxLang, ColdFusion, and JavaScript. Keep changes focused on that product.
 
 ## Source of Truth
 
-**`resources/docs/` is the single documentation source of truth.** It is
-committed. There is no `.docs/` tree and no `.superpowers/` tree — if you find
-one, it is stale: delete it rather than read it, and never recreate them.
+**`resources/docs/` is the single documentation source of truth.**
 
 Read only what the task needs:
 
 1. `readme.md` for product scope, setup, and supported languages.
 2. `resources/docs/application-features.md` for purpose, shipped features, the
-   AI contract, out of scope, **known gaps**, and measured language tiers.
+	 AI contract, out of scope, **known gaps**, and measured language tiers.
 3. `resources/docs/technical-flow.md` for the technical map (review / modernize
-   pipelines, HTTP surface, bootstrap).
+	 pipelines, HTTP surface, bootstrap).
 4. The relevant code and tests (`app/models/README.md` when changing model-layer
-   ownership or public APIs).
+	 ownership or public APIs).
 5. `resources/docs/plans/modernize-inversion-plan.md` when doing Modernize work.
-   Its Part 2 is a verified evidence base — every claim carries a `file:line`.
-   Execute Part 4 in the order given by its execution graph, not document order.
+	 Its Part 2 is a verified evidence base — every claim carries a `file:line`.
+	 Execute Part 4 in the order given by its execution graph, not document order.
 
 Narrower reference, load only when the task needs it:
 `prompt-system.md`, `cfml-llm-depth.md`, `boxlang-conventions.md`,
@@ -43,7 +41,7 @@ When reporting information to me, be extremely concise and sacrifice grammar for
 
 - Local-only application; SQLite and analysis run on the user's machine.
 - Desktop-only workspace; narrow-window breakage is preferable to a separate
-  mobile experience.
+	mobile experience.
 - Supported languages are BoxLang, ColdFusion, and JavaScript only.
 - Basic review must work without an AI key. LLM specialists are optional.
 - This is a review and modernization assistant, not an automatic migrator.
@@ -66,7 +64,7 @@ in scope.
 - `app/` — ColdBox application code
 - `app/handlers/` — HTTP handlers and versioned `/api/v1/*` endpoints
 - `app/models/services/` — review runs, findings, parsers, graph and architecture
-  analysis, planners, specialists, and quality gates
+	analysis, planners, specialists, and quality gates
 - `app/config/` — ColdBox configuration and routes
 - `public/` — web root and desktop UI
 - `resources/apidocs/` — OpenAPI source
@@ -85,27 +83,27 @@ Keep application code outside the public web root. Preserve the modern
 
 - Prefer the smallest change that completes the requested behavior.
 - Extend the existing service, handler, view, and test patterns before creating
-  new abstractions.
+	new abstractions.
 - Keep one clear implementation path per feature; remove or avoid parallel
-  legacy paths when safe and within scope.
+	legacy paths when safe and within scope.
 - Base UI work on the existing wide desktop composition. Do not add
-  `@media (max-width: ...)` rules to restack it for phones or tablets.
+	`@media (max-width: ...)` rules to restack it for phones or tablets.
 - Use `prc` for internal request data and `rc` only for user input. Validate
-  untrusted `rc` values.
+	untrusted `rc` values.
 - Use dependency injection rather than manually resolving services.
 - Keep API changes under `/api/v1/*` and update OpenAPI material when the
-  contract changes.
+	contract changes.
 - Change the local SQLite schema in `SchemaService` (single source of truth).
-  Do not reintroduce CommandBox/cfmigrations under `resources/database/`.
-  Do not commit local database files, secrets, generated runtime state, or
-  `.env`.
+	Do not reintroduce CommandBox/cfmigrations under `resources/database/`.
+	Do not commit local database files, secrets, generated runtime state, or
+	`.env`.
 - Preserve basic non-LLM behavior when adding or changing AI-assisted features.
 - Follow nearby BoxLang/CFML formatting and naming rather than applying a broad
-  unrelated rewrite.
+	unrelated rewrite.
 - Prefer `import java:` / `new java:` over `createObject( "java", ... )`. Because
-  BoxLang is case-insensitive, do not name a variable the same as an imported
-  class short name (e.g. after `import java:java.io.File`, avoid `file` /
-  `File`). See `.cursor/rules/boxlang-java-interop.mdc`.
+	BoxLang is case-insensitive, do not name a variable the same as an imported
+	class short name (e.g. after `import java:java.io.File`, avoid `file` /
+	`File`). See `.cursor/rules/boxlang-java-interop.mdc`.
 
 ## Verification
 

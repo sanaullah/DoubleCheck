@@ -260,7 +260,7 @@ Do not build or claim:
 Verified against code, not suspected. Tracked here rather than quietly, per the
 claim rule. Historical Modernize inversion notes remain in
 [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). Active
-implementation work is [`plans/codegraph-plan.md`](plans/codegraph-plan.md).
+implementation work is [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-plan.md).
 
 ### Capability limits — the output is thinner than the feature row implies
 
@@ -319,7 +319,7 @@ promotion happen — the `measured` flag is what makes the claim honest.
 |---|---|
 | Install / config | [`readme.md`](../../readme.md) |
 | How Review / Modernize / CodeGraph are wired | [`technical-flow.md`](technical-flow.md) |
-| Active implementation work | [`plans/codegraph-plan.md`](plans/codegraph-plan.md) |
+| Active implementation work | [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-plan.md) |
 | Prior Modernize inversion notes | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
 | Open issues | [`open-issues.md`](open-issues.md) |
 | Prompt contract system | [`prompt-system.md`](prompt-system.md) |
