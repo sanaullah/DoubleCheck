@@ -234,6 +234,39 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					if ( !exportStatus ) exportStatus = exportEvent.getResponse().getStatusCode();
 					expect( exportStatus ).toBe( 422 );
 					expect( jsonDeserialize( exportEvent.getRenderedContent() ).error.code ).toBe( "export_unsupported" );
+
+					var codeGraphRunService = getInstance( "CodeGraphRunService" );
+					prepareMock( codeGraphRunService ).$property(
+							"narrativeService",
+							"variables",
+							{
+								isEnabled: () => true,
+								cacheKey : ( snapshot, projectPath ) => "retry-cache-key",
+								narrate  : ( snapshot ) => {
+									return {
+										used       : true,
+										enabled    : true,
+										pitch      : { text: "Retried pitch" },
+										domains    : [],
+										processes  : [],
+										onboarding : [],
+										risk       : [],
+										summaries  : []
+									};
+								}
+							}
+						);
+					var narrateEvent = this.post(
+							route   = "/api/v1/runs/#runId#/codegraph/narrative",
+							headers = { "Accept": "application/json" }
+						);
+					expect( narrateEvent.getResponse() ).toHaveStatus( 200 );
+					var narrateBody = jsonDeserialize( narrateEvent.getRenderedContent() );
+					expect( narrateBody.data.narrative.used ).toBeTrue();
+					expect( narrateBody.data.narrative.pitch.text ).toBe( "Retried pitch" );
+					var stored = codeGraphRepository.get( runId );
+					expect( stored.narrative.used ).toBeTrue();
+					expect( stored.narrative.pitch.text ).toBe( "Retried pitch" );
 				} finally {
 					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
 				}

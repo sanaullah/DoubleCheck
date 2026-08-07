@@ -18,6 +18,7 @@
 		// File / neighbourhood detail cards
 		detailNodeWidth: 236,
 		detailNodeHeight: 92,
+		focusHubScale: 1.38,
 		detailGapX: 56,
 		detailGapY: 28,
 		// Overview (project-module) cards — fewer, larger, quieter
@@ -90,7 +91,8 @@
 			detail: detail,
 			summaries: Array.isArray(o.summaries) ? o.summaries : null,
 			showAll: !!o.showAll,
-			topN: Number(opt(o, "topN", DEFAULTS.overviewTopN)) || DEFAULTS.overviewTopN
+			topN: Number(opt(o, "topN", DEFAULTS.overviewTopN)) || DEFAULTS.overviewTopN,
+			focusHubScale: Number(opt(o, "focusHubScale", DEFAULTS.focusHubScale)) || DEFAULTS.focusHubScale
 		};
 	}
 
@@ -125,6 +127,50 @@
 			.trim();
 		if (!role || role === "unknown") return "";
 		return role;
+	}
+
+	function isFocusNode(node, view) {
+		if (!node) return false;
+		if (node.role === "focus") return true;
+		const focusId = view && view.focus ? normId(view.focus) : "";
+		return !!(focusId && (idsEqual(node.id, focusId) || idsEqual(node.path, focusId)));
+	}
+
+	function nodeBoxSize(node, cfg, view) {
+		const baseW = cfg.nodeWidth;
+		const baseH = cfg.nodeHeight;
+		const focusMode = !!(view && view.mode === "focus");
+		if (focusMode && isFocusNode(node, view)) {
+			const scale = Number(cfg.focusHubScale) || DEFAULTS.focusHubScale;
+			return {
+				w: Math.round(baseW * scale),
+				h: Math.round(baseH * scale)
+			};
+		}
+		return { w: baseW, h: baseH };
+	}
+
+	function fileTooltip(n) {
+		const path = normPath((n && (n.path || n.id)) || "");
+		const parts = [];
+		if (path) parts.push(path);
+		if (n && n.external) parts.push("outside module");
+		const role = fileRoleChip(n);
+		if (role) parts.push("role: " + role);
+		const complexity = (n && n.complexity) || fileComplexityOf(n || {});
+		if (complexity) parts.push("complexity: " + complexity);
+		return parts.join(" · ");
+	}
+
+	function edgeTooltip(e) {
+		const kind = (e && (e.kind || e.label)) || "depends";
+		const from = (e && (e.sourceFile || e.from)) || "";
+		const to = (e && (e.targetFile || e.to)) || "";
+		const parts = [String(kind) + ": " + from + " → " + to];
+		if (e && e.line) parts.push("line " + e.line);
+		if (e && e.evidence) parts.push(String(e.evidence).slice(0, 180));
+		if (e && e.crossing) parts.push("crosses module boundary");
+		return parts.join(" · ");
 	}
 
 	function layerLabelOf(cluster, index) {
@@ -677,11 +723,12 @@
 		const positioned = nodes.map((n, i) => {
 			const col = i % cols;
 			const row = Math.floor(i / cols);
+			const box = nodeBoxSize(n, cfg, view);
 			return Object.assign({}, n, {
 				x: cfg.pad + col * (cfg.nodeWidth + cfg.gapX),
 				y: cfg.pad + row * (cfg.nodeHeight + cfg.gapY),
-				w: cfg.nodeWidth,
-				h: cfg.nodeHeight
+				w: box.w,
+				h: box.h
 			});
 		});
 		const bounds = layoutBounds(positioned, cfg.pad);
@@ -722,8 +769,8 @@
 						layer,
 						x: cfg.pad + colIndex * (cfg.nodeWidth + cfg.gapX),
 						y: cfg.pad + row * (cfg.nodeHeight + cfg.gapY),
-						w: cfg.nodeWidth,
-						h: cfg.nodeHeight
+						w: nodeBoxSize(n, cfg, view).w,
+						h: nodeBoxSize(n, cfg, view).h
 					})
 				);
 			});
@@ -786,12 +833,13 @@
 		rings.forEach((list, d) => {
 			if (d === 0) {
 				const n = byId.get(focusId) || list[0];
+				const box = nodeBoxSize(n, cfg, view);
 				positioned.push(
 					Object.assign({}, n, {
-						x: cx - cfg.nodeWidth / 2,
-						y: cy - cfg.nodeHeight / 2,
-						w: cfg.nodeWidth,
-						h: cfg.nodeHeight
+						x: cx - box.w / 2,
+						y: cy - box.h / 2,
+						w: box.w,
+						h: box.h
 					})
 				);
 				return;
@@ -799,12 +847,13 @@
 			const radius = d * (cfg.nodeWidth + cfg.gapX);
 			list.forEach((n, i) => {
 				const angle = (Math.PI * 2 * i) / Math.max(1, list.length) - Math.PI / 2;
+				const box = nodeBoxSize(n, cfg, view);
 				positioned.push(
 					Object.assign({}, n, {
-						x: cx + Math.cos(angle) * radius - cfg.nodeWidth / 2,
-						y: cy + Math.sin(angle) * radius - cfg.nodeHeight / 2,
-						w: cfg.nodeWidth,
-						h: cfg.nodeHeight
+						x: cx + Math.cos(angle) * radius - box.w / 2,
+						y: cy + Math.sin(angle) * radius - box.h / 2,
+						w: box.w,
+						h: box.h
 					})
 				);
 			});
@@ -864,7 +913,11 @@
 	}
 
 	function buildFlowHighlightContext(opts) {
-		const ctx = { nodeSet: new Set(), flowEdgeKeys: new Set() };
+		const ctx = {
+			nodeSet: new Set(),
+			flowEdgeKeys: new Set(),
+			cycleHighlight: !!(opts && opts.cycleHighlight)
+		};
 		if (!opts) return ctx;
 		const addNode = function (id) {
 			const n = normId(id);
@@ -891,6 +944,7 @@
 				ctx.flowEdgeKeys.add(from + "\0" + to + "\0" + kind);
 			} else {
 				ctx.flowEdgeKeys.add(from + "\0" + to);
+				if (ctx.cycleHighlight) ctx.flowEdgeKeys.add(to + "\0" + from);
 			}
 		}
 		return ctx;
@@ -1023,13 +1077,19 @@
 		if (n.inCycle) meta.push("cycle");
 		const metaText = escapeXml(meta.join(" · "));
 		const flowHighlight = nodeIsFlowHighlighted(n, opts && opts._flowHighlightCtx);
+		const cycleHighlight = !!(opts && opts._flowHighlightCtx && opts._flowHighlightCtx.cycleHighlight && flowHighlight);
+		const hot = Number(n.hotspotScore) || 0;
+		const heat =
+			hot >= 50 ? " heat-high" : hot >= 30 ? " heat-mid" : hot >= 15 ? " heat-low" : "";
 		const cls =
 			"cg-node cg-file" +
 			(isFocus ? " is-focus" : "") +
 			(n.external ? " is-external" : "") +
 			(n.inCycle ? " in-cycle" : "") +
-			(n.hotspotScore >= 40 ? " is-hotspot" : "") +
-			(flowHighlight ? " is-flow-highlight" : "");
+			(hot >= 40 ? " is-hotspot" : "") +
+			heat +
+			(flowHighlight ? " is-flow-highlight" : "") +
+			(cycleHighlight ? " is-cycle-highlight" : "");
 		const chipY = n.y + 16;
 		const titleY = n.y + (roleChip || complexity ? 40 : 28);
 		const metaY = titleY + 20;
@@ -1066,6 +1126,9 @@
 			' data-complexity="' +
 			escapeXml(complexity) +
 			'">' +
+			"<title>" +
+			escapeXml(fileTooltip(n)) +
+			"</title>" +
 			'<rect class="cg-file-body" x="' +
 			n.x +
 			'" y="' +
@@ -1165,7 +1228,9 @@
 				.replace(/[^a-z0-9_-]+/g, "");
 			const kindClass = kindSlug ? " is-kind-" + kindSlug : "";
 			const selected = selectedEdgeKey && edgeKey === selectedEdgeKey ? " is-selected" : "";
-			const flowHighlight = edgeIsFlowHighlighted(e, flowCtx) ? " is-flow-highlight" : "";
+			const flowOn = edgeIsFlowHighlighted(e, flowCtx);
+			const flowHighlight = flowOn ? " is-flow-highlight" : "";
+			const cycleHighlight = flowOn && flowCtx.cycleHighlight ? " is-cycle-highlight" : "";
 			const crossing = e.crossing ? " is-crossing" : "";
 			let extraAttrs = "";
 			if (e.evidence) extraAttrs += ' data-evidence="' + escapeXml(String(e.evidence).slice(0, 400)) + '"';
@@ -1176,6 +1241,7 @@
 					kindClass +
 					selected +
 					flowHighlight +
+					cycleHighlight +
 					crossing +
 					'" data-from="' +
 					escapeXml(e.from) +
@@ -1187,7 +1253,9 @@
 					extraAttrs +
 					' marker-end="url(#cg-arrow)" d="' +
 					escapeXml(edgePath(a, b, opts)) +
-					'" fill="none" stroke="currentColor"/>' +
+					'" fill="none" stroke="currentColor"><title>' +
+					escapeXml(edgeTooltip(e)) +
+					"</title></path>" +
 					(edgeLabel
 						? '<text class="cg-edge-label" x="' +
 							((a.x + a.w + b.x) / 2) +
@@ -1371,6 +1439,8 @@
 		complexityOf,
 		fileComplexityOf,
 		fileRoleChip,
+		fileTooltip,
+		edgeTooltip,
 		summaryForCluster,
 		wrapText,
 		selectTopClusters,

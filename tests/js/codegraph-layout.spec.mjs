@@ -381,3 +381,82 @@ test("fileComplexityOf and fileRoleChip are deterministic", () => {
 	assert.equal(layout.fileRoleChip({ role: "entry" }), "entry");
 	assert.equal(layout.fileRoleChip({ role: "unknown" }), "");
 });
+
+test("focus hub enlarges the focus node and tooltips include path and evidence", () => {
+	const focus = layout.buildFocusView(
+		{
+			focus: "app/handlers/Orders.bx",
+			nodes: [
+				{ id: "app/handlers/Orders.bx", path: "app/handlers/Orders.bx", role: "focus" },
+				{ id: "app/models/OrderService.cfc", path: "app/models/OrderService.cfc", role: "neighbor" }
+			],
+			edges: [
+				{
+					from: "app/handlers/Orders.bx",
+					to: "app/models/OrderService.cfc",
+					kind: "injects",
+					evidence: "inject=orderService",
+					line: 12
+				}
+			]
+		},
+		{ detail: true }
+	);
+	const positioned = layout.layoutRadial(focus, { detail: true });
+	const hub = positioned.nodes.find((n) => n.role === "focus");
+	const neighbor = positioned.nodes.find((n) => n.role === "neighbor");
+	assert.ok(hub);
+	assert.ok(neighbor);
+	assert.ok(hub.w > neighbor.w);
+	assert.ok(hub.h > neighbor.h);
+	const svg = layout.buildSvg(positioned);
+	assert.ok(svg.includes("<title>"));
+	assert.ok(svg.includes("app/handlers/Orders.bx"));
+	assert.ok(svg.includes("inject=orderService"));
+	assert.match(layout.fileTooltip({ path: "app/A.bx", role: "entry" }), /app\/A\.bx/);
+	assert.match(
+		layout.edgeTooltip({ kind: "injects", from: "a", to: "b", evidence: "x", crossing: true }),
+		/crosses module boundary/
+	);
+});
+
+test("cycle highlight marks undirected consecutive pairs", () => {
+	const view = {
+		mode: "focus",
+		focus: "app/a.bx",
+		nodes: [
+			{ id: "app/a.bx", path: "app/a.bx", role: "focus", layer: 0 },
+			{ id: "app/b.bx", path: "app/b.bx", role: "neighbor", layer: 1 },
+			{ id: "app/c.bx", path: "app/c.bx", role: "neighbor", layer: 1 }
+		],
+		edges: [
+			{ from: "app/a.bx", to: "app/b.bx", kind: "calls" },
+			{ from: "app/b.bx", to: "app/c.bx", kind: "calls" },
+			{ from: "app/c.bx", to: "app/a.bx", kind: "calls" }
+		]
+	};
+	const positioned = layout.layoutClusters(view, { detail: true });
+	const svg = layout.buildSvg(positioned, {
+		flowStepSet: ["app/a.bx", "app/b.bx", "app/c.bx", "app/a.bx"],
+		cycleHighlight: true
+	});
+	assert.ok(svg.includes("is-cycle-highlight"));
+	assert.ok(svg.includes("heat-") || svg.includes("data-complexity"));
+});
+
+test("hotspot heat classes scale with score", () => {
+	const files = layout.buildFileView(
+		{
+			nodes: [
+				{ id: "app/hot.bx", path: "app/hot.bx", hotspotScore: 55, fanIn: 2, fanOut: 2 },
+				{ id: "app/warm.bx", path: "app/warm.bx", hotspotScore: 32, fanIn: 1, fanOut: 1 }
+			],
+			edges: []
+		},
+		{ detail: true }
+	);
+	const positioned = layout.layoutClusters(files, { detail: true });
+	const svg = layout.buildSvg(positioned);
+	assert.ok(svg.includes("heat-high"));
+	assert.ok(svg.includes("heat-mid"));
+});

@@ -320,6 +320,54 @@ class extends="testbox.system.BaseSpec" {
 				expect( payload.truncated ).toBeFalse();
 			} );
 
+			it( "refreshNarrative re-narrates stored snapshot and persists without re-index", () => {
+				var calls = { narrate: 0, update: 0 };
+				var service = new app.models.services.CodeGraphRunService();
+				service.codeGraphRepository = {
+					get: ( runId ) => {
+						return {
+							projectPath        : "C:/proj",
+							repositoryRevision : "HEAD",
+							snapshot           : {
+								fingerprint : "fp-1",
+								clusters    : [ { id: "c1" } ],
+								nodes       : [ { id: "app/a.cfc", path: "app/a.cfc" } ],
+								flows       : []
+							}
+						};
+					},
+					updateNarrative: ( runId, narrative, cacheKey ) => {
+						calls.update++;
+						expect( runId ).toBe( "run-narrate" );
+						expect( narrative.used ).toBeTrue();
+						expect( len( trim( cacheKey ) ) ).toBeGT( 0 );
+					}
+				};
+				service.narrativeService = {
+					isEnabled: () => true,
+					cacheKey: ( snapshot, projectPath ) => "cache-key-1",
+					narrate: ( snapshot ) => {
+						calls.narrate++;
+						expect( snapshot.fingerprint ).toBe( "fp-1" );
+						return {
+							used    : true,
+							enabled : true,
+							pitch   : { text: "Hello" },
+							domains : [],
+							processes: [],
+							onboarding: [],
+							risk    : [],
+							summaries: []
+						};
+					}
+				};
+
+				var result = service.refreshNarrative( "run-narrate" );
+				expect( result.used ).toBeTrue();
+				expect( calls.narrate ).toBe( 1 );
+				expect( calls.update ).toBe( 1 );
+			} );
+
 			it( "cancelRun is a no-op", () => {
 				var service = new app.models.services.CodeGraphRunService();
 				service.cancelRun( "any-id" );

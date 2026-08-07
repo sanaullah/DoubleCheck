@@ -375,6 +375,40 @@ class threadsafe {
 	}
 
 	/**
+	 * Re-run optional LLM narrative for an existing CodeGraph snapshot (no re-index).
+	 * Always calls the model when enabled — does not reuse a prior cache hit.
+	 */
+	struct function refreshNarrative( required string runId ) {
+		var stored = codeGraphRepository.get( arguments.runId );
+		if ( isNull( stored ) ) {
+			throw( type = "NotFoundException", message = "CodeGraph snapshot not found" );
+		}
+		var snapshot = isStruct( stored.snapshot ?: "" ) ? stored.snapshot : {};
+		if ( isNull( variables.narrativeService ?: javacast( "null", "" ) ) ) {
+			return { used: false, enabled: false, error: "Narrative service unavailable" };
+		}
+		if ( !narrativeService.isEnabled() ) {
+			var disabled = {
+				used    : false,
+				enabled : false,
+				error   : "AI provider is not configured"
+			};
+			codeGraphRepository.updateNarrative( arguments.runId, disabled, "" );
+			return disabled;
+		}
+		var projectPath = trim( toString( stored.projectPath ?: "" ) );
+		var narrative = narrativeService.narrate( snapshot );
+		if ( !isStruct( narrative ) ) {
+			narrative = { used: false, error: "CodeGraph narrative unavailable" };
+		}
+		var cacheKey = ( narrative.used ?: false )
+			? narrativeService.cacheKey( snapshot, projectPath )
+			: "";
+		codeGraphRepository.updateNarrative( arguments.runId, narrative, cacheKey );
+		return narrative;
+	}
+
+	/**
 	 * Optional narrative: reuse by cache key when possible; never fail the run.
 	 * Snapshot is not mutated.
 	 */
