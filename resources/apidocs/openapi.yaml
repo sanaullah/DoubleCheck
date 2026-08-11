@@ -452,6 +452,96 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /api/v1/runs/{id}/codegraph/graph:
+    get:
+      tags: [CodeGraph]
+      summary: One level of the stored knowledge graph
+      operationId: getCodeGraphLevel
+      description: >-
+        Serves the graph by query instead of shipping the whole snapshot. Levels are linked by
+        parentId (cluster to directory to file to symbol), so drilling is a scoped request rather
+        than a client-side filter over a downloaded blob. Every response carries a completeness
+        account naming what was omitted and the ordering that decided it.
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: level
+          in: query
+          schema: { type: string, enum: [cluster, directory, file, symbol], default: cluster }
+        - name: scope
+          in: query
+          description: Parent node id; omit for the top of the level
+          schema: { type: string }
+        - name: rank
+          in: query
+          description: Which nodes survive the limit
+          schema: { type: string, enum: [hotspot, fanIn, name], default: hotspot }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, default: 200 }
+        - name: include
+          in: query
+          schema: { type: string, enum: [both, nodes], default: both }
+      responses:
+        "200":
+          description: Level payload with nodes, edges and a completeness account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CodeGraphLevelResponse" }
+        "404":
+          description: Run not found or no indexed graph
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "409":
+          description: Snapshot predates levelled storage; rebuild to explore below the canvas
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Invalid level or limit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/runs/{id}/codegraph/search:
+    get:
+      tags: [CodeGraph]
+      summary: Server-side node search across every level
+      operationId: getCodeGraphSearch
+      description: >-
+        Matches path, symbol name, role and kind against stored nodes, including nodes the canvas
+        never drew. Client-side search can only find what was already downloaded.
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: level
+          in: query
+          schema: { type: string, enum: [cluster, directory, file, symbol] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Matches with a completeness account
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CodeGraphSearchResponse" }
+        "404":
+          description: Run not found or no indexed graph
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Missing query or invalid limit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /api/v1/runs/{id}/codegraph/narrative:
     post:
       tags: [CodeGraph]
@@ -1211,14 +1301,14 @@ components:
         enabled: { type: boolean, example: true }
         requiresLlm: { type: boolean, example: false, description: Run succeeds without AI (structure only) }
         meaningRequiresLlm: { type: boolean, example: true, description: Domain/process briefing requires a configured provider }
-        schemaVersion: { type: string, example: codegraph-snapshot-v1 }
+        schemaVersion: { type: string, example: codegraph-snapshot-v2 }
         narrativeVersion: { type: string, example: codegraph-narrative-v2 }
 
     CodeGraphResult:
       type: object
       description: Deterministic CodeGraph snapshot. Structure is available without an AI provider.
       properties:
-        version: { type: string, example: codegraph-snapshot-v1 }
+        version: { type: string, example: codegraph-snapshot-v2 }
         fingerprint: { type: string }
         truncated: { type: boolean }
         truncationReasons: { type: array, items: { type: string } }
@@ -1278,6 +1368,89 @@ components:
             truncated: { type: boolean }
             reason: { type: string, enum: ["", unreachable, explored-cap, result-cap] }
             exploredNodes: { type: integer, minimum: 0 }
+
+    CodeGraphCompleteness:
+      type: object
+      description: What this response kept, out of what exists, and the ordering that decided it.
+      required: [returned, available, omitted, rankedBy, complete]
+      properties:
+        returned: { type: integer, minimum: 0 }
+        available: { type: integer, minimum: 0 }
+        omitted: { type: integer, minimum: 0 }
+        rankedBy: { type: string, example: hotspot }
+        complete: { type: boolean }
+
+    CodeGraphLevelResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [level, nodes, edges, completeness]
+          properties:
+            level: { type: string, enum: [cluster, directory, file, symbol] }
+            scope: { type: string }
+            nodes:
+              type: array
+              items:
+                type: object
+                required: [id, level]
+                properties:
+                  id: { type: string }
+                  level: { type: string }
+                  parentId: { type: string }
+                  path: { type: string }
+                  symbolName: { type: string }
+                  kind: { type: string }
+                  role: { type: string }
+                  language: { type: string }
+                  line: { type: integer, minimum: 0 }
+                  endLine: { type: integer, minimum: 0 }
+                  fanIn: { type: integer, minimum: 0 }
+                  fanOut: { type: integer, minimum: 0 }
+                  hotspot: { type: number }
+            edges:
+              type: array
+              items:
+                type: object
+                required: [id, from, to]
+                properties:
+                  id: { type: string }
+                  level: { type: string }
+                  from: { type: string }
+                  to: { type: string }
+                  kind: { type: string }
+                  kinds: { type: array, items: { type: string } }
+                  occurrences: { type: integer, minimum: 0 }
+                  weight: { type: number }
+                  resolution: { type: string }
+                  line: { type: integer, minimum: 0 }
+                  evidence: { type: string }
+            completeness: { $ref: "#/components/schemas/CodeGraphCompleteness" }
+
+    CodeGraphSearchResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [term, matches, completeness]
+          properties:
+            term: { type: string }
+            matches:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  level: { type: string }
+                  parentId: { type: string }
+                  path: { type: string }
+                  symbolName: { type: string }
+                  kind: { type: string }
+                  role: { type: string }
+                  line: { type: integer, minimum: 0 }
+                  fanIn: { type: integer, minimum: 0 }
+                  fanOut: { type: integer, minimum: 0 }
+            completeness: { $ref: "#/components/schemas/CodeGraphCompleteness" }
 
     CodeGraphSourceResponse:
       type: object

@@ -365,6 +365,8 @@ class threadsafe {
 				{ sql: "DELETE FROM modernization_decisions WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_decisions.run_id = review_runs.id )" },
 				{ sql: "DELETE FROM modernization_decision_events WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE modernization_decision_events.run_id = review_runs.id )" },
 				{ sql: "DELETE FROM codegraph_snapshots WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE codegraph_snapshots.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM codegraph_nodes WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE codegraph_nodes.run_id = review_runs.id )" },
+				{ sql: "DELETE FROM codegraph_edges WHERE NOT EXISTS ( SELECT 1 FROM review_runs WHERE codegraph_edges.run_id = review_runs.id )" },
 				{ sql: "DELETE FROM language_capabilities WHERE NOT EXISTS ( SELECT 1 FROM evaluation_gate_runs WHERE evaluation_gate_runs.id = language_capabilities.gate_run_id )" }
 			],
 			tables               : [
@@ -536,6 +538,13 @@ class threadsafe {
 							line INTEGER NOT NULL,
 							end_line INTEGER NOT NULL DEFAULT 0,
 							evidence TEXT NOT NULL,
+							-- Symbol whose body encloses this dependency line. Without
+							-- it an edge only names its source file, which makes the
+							-- graph a file dependency diagram rather than a code
+							-- graph. Empty when the dependency sits outside any
+							-- symbol body, such as imports or top-level code.
+							source_symbol_id TEXT NOT NULL DEFAULT '',
+							source_symbol TEXT NOT NULL DEFAULT '',
 							PRIMARY KEY ( run_id, id ),
 							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
 						)
@@ -596,6 +605,50 @@ class threadsafe {
 							narrative_cache_key TEXT,
 							narrative_json TEXT,
 							created_at TEXT,
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+						name: "codegraph_nodes",
+					sql : "
+						CREATE TABLE IF NOT EXISTS codegraph_nodes (
+							run_id TEXT NOT NULL,
+							node_id TEXT NOT NULL,
+							level TEXT NOT NULL,
+							parent_id TEXT NOT NULL DEFAULT '',
+							path TEXT NOT NULL DEFAULT '',
+							symbol_name TEXT NOT NULL DEFAULT '',
+							kind TEXT NOT NULL DEFAULT '',
+							role TEXT NOT NULL DEFAULT '',
+							language TEXT NOT NULL DEFAULT '',
+							line INTEGER NOT NULL DEFAULT 0,
+							end_line INTEGER NOT NULL DEFAULT 0,
+							fan_in INTEGER NOT NULL DEFAULT 0,
+							fan_out INTEGER NOT NULL DEFAULT 0,
+							hotspot REAL NOT NULL DEFAULT 0,
+							PRIMARY KEY ( run_id, node_id ),
+							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "codegraph_edges",
+					sql : "
+						CREATE TABLE IF NOT EXISTS codegraph_edges (
+							run_id TEXT NOT NULL,
+							edge_id TEXT NOT NULL,
+							level TEXT NOT NULL,
+							from_node TEXT NOT NULL,
+							to_node TEXT NOT NULL,
+							group_kind TEXT NOT NULL DEFAULT '',
+							kinds_json TEXT NOT NULL DEFAULT '[]',
+							occurrences INTEGER NOT NULL DEFAULT 1,
+							weight REAL NOT NULL DEFAULT 0,
+							resolution TEXT NOT NULL DEFAULT '',
+							line INTEGER NOT NULL DEFAULT 0,
+							evidence TEXT NOT NULL DEFAULT '',
+							PRIMARY KEY ( run_id, edge_id ),
 							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
 						)
 					"
@@ -939,6 +992,8 @@ class threadsafe {
 				{ tableName: "review_dependencies", columnName: "target_file", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "review_symbols", columnName: "end_line", definition: "INTEGER NOT NULL DEFAULT 0" },
 				{ tableName: "review_dependencies", columnName: "end_line", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_dependencies", columnName: "source_symbol_id", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_dependencies", columnName: "source_symbol", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "codegraph_snapshots", columnName: "snapshot_reuse_key", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "codegraph_labels", columnName: "cluster_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "review_graph_summaries", columnName: "impact_count", definition: "INTEGER NOT NULL DEFAULT 0" },
@@ -970,6 +1025,12 @@ class threadsafe {
 				{ name: "idx_codegraph_snapshots_fingerprint", sql: "CREATE INDEX idx_codegraph_snapshots_fingerprint ON codegraph_snapshots ( fingerprint )" },
 				{ name: "idx_codegraph_snapshots_project_revision", sql: "CREATE INDEX idx_codegraph_snapshots_project_revision ON codegraph_snapshots ( project_path, repository_revision, snapshot_reuse_key, created_at DESC )" },
 				{ name: "idx_codegraph_labels_project_cluster", sql: "CREATE INDEX idx_codegraph_labels_project_cluster ON codegraph_labels ( project_path, cluster_key )" },
+				// parent_id is the whole navigation model: children of any node at
+				// any level is one indexed self-join, not three code paths.
+				{ name: "idx_codegraph_nodes_level_parent", sql: "CREATE INDEX idx_codegraph_nodes_level_parent ON codegraph_nodes ( run_id, level, parent_id, path )" },
+				{ name: "idx_codegraph_nodes_rank", sql: "CREATE INDEX idx_codegraph_nodes_rank ON codegraph_nodes ( run_id, level, hotspot DESC )" },
+				{ name: "idx_codegraph_edges_from", sql: "CREATE INDEX idx_codegraph_edges_from ON codegraph_edges ( run_id, level, from_node )" },
+				{ name: "idx_codegraph_edges_to", sql: "CREATE INDEX idx_codegraph_edges_to ON codegraph_edges ( run_id, level, to_node )" },
 				{ name: "idx_codegraph_shards_project_cluster", sql: "CREATE INDEX idx_codegraph_shards_project_cluster ON codegraph_narrative_shards ( project_path, cluster_key, created_at DESC )" },
 				{ name: "idx_review_architecture_revision", sql: "CREATE INDEX idx_review_architecture_revision ON review_architecture_models ( repository_revision, model_version )" },
 				{ name: "idx_architecture_cache_revision", sql: "CREATE INDEX idx_architecture_cache_revision ON architecture_model_cache ( project_path, repository_revision, model_version )" },

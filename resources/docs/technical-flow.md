@@ -212,6 +212,8 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | GET | `/api/v1/runs/:id/codegraph/subgraph` | ApiCodeGraph | Neighbourhood drill-down (`focus`, `depth`, `limit`) |
 | GET | `/api/v1/runs/:id/codegraph/edges` | ApiCodeGraph | Bounded file edges, optional cluster/kind filter |
 | GET | `/api/v1/runs/:id/codegraph/paths` | ApiCodeGraph | Bounded directed/reverse/any paths with hop evidence |
+| GET | `/api/v1/runs/:id/codegraph/graph` | ApiCodeGraph | One level of the stored graph (`level`, `scope`, `rank`, `limit`); 409 when the snapshot predates levelled storage |
+| GET | `/api/v1/runs/:id/codegraph/search` | ApiCodeGraph | Server-side node search across every level, including symbols the canvas never drew |
 | GET | `/api/v1/runs/:id/codegraph/source` | ApiCodeGraph | Cited local source excerpt, bounded to the indexed run root |
 | POST | `/api/v1/runs/:id/codegraph/narrative` | ApiCodeGraph | Retry optional CodeGraph meaning layer |
 | PUT/DELETE | `/api/v1/runs/:id/codegraph/label` | ApiCodeGraph | Persist or clear a local user module label |
@@ -550,6 +552,24 @@ CodeGraph persists one blob per run in `codegraph_snapshots` (snapshot JSON,
 fingerprint, truncation flags, optional `narrative_cache_key` /
 `narrative_json` for cross-run narrative reuse). Edges remain in
 `review_dependencies` — not duplicated into the snapshot blob.
+
+Alongside the blob, `CodeGraphProjectionService` writes the same run into
+`codegraph_nodes` and `codegraph_edges` at four levels — `cluster`,
+`directory`, `file`, `symbol` — linked by `parent_id`. The blob is what the
+canvas draws; the rows are what `/codegraph/graph` and `/codegraph/search`
+query, so drilling and searching reach nodes the canvas never received. Rows are
+written **after** the structure save, so time-to-first-map does not pay for
+them; a projection failure leaves the snapshot usable and is reported on the run
+event stream rather than swallowed.
+
+Symbol-level fidelity comes from `review_dependencies.source_symbol_id` /
+`source_symbol`, filled during indexing by interval containment: the innermost
+symbol whose `[line, end_line]` body encloses the dependency's line. Empty means
+the dependency sits outside any symbol body, and callers render "file level"
+rather than guessing. Because this is derived in `materialize`, downstream of
+parsing, `ArchitectureIndexService.indexVersion` participates in the graph
+adoption signature — otherwise a run would adopt pre-attribution rows and serve
+the old shape.
 
 AI API keys are **not** stored in SQLite (environment only). Provider profiles
 may store connection settings via `AIProviderProfileRepository`; secrets stay

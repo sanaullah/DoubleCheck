@@ -14,6 +14,8 @@ class threadsafe {
 	property name="metricsService" inject="CodeGraphMetricsService";
 	property name="codeGraphRepository" inject="CodeGraphRepository";
 	property name="codeGraphQueryService" inject="CodeGraphQueryService";
+	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
+	property name="graphProjectionService" inject="CodeGraphProjectionService";
 	property name="narrativeService" inject="CodeGraphNarrativeService";
 	property name="eventService" inject="ReviewEventService";
 	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
@@ -147,7 +149,12 @@ class threadsafe {
 
 			emit( arguments.callbacks, 20, "codegraph-index", "Indexing symbols and dependencies" );
 			var adoptedIndexedGraph = false;
-			if ( fullScan && len( trim( repositoryRevision ) ) ) {
+			// Adoption matches on the Git revision, which uncommitted edits do not
+			// change — so a dirty tree would adopt the last run's index and draw a
+			// map of the last commit instead of the files on disk. Snapshot reuse
+			// already refuses to serve a stale picture for the same reason; the
+			// index has to hold the same line.
+			if ( fullScan && len( trim( repositoryRevision ) ) && repositoryIsClean( projectPath ) ) {
 				try {
 					var expectedParserVersion = architectureIndexService.parserVersionFor( arguments.scan.files ?: [] );
 					var sourceRunId = graphRepository.findIndexedRun( projectPath, repositoryRevision, runId, expectedParserVersion );
@@ -200,6 +207,10 @@ class threadsafe {
 			// graph therefore survives cancellation or a provider failure.
 			saveSnapshot( runId, snapshot, projectPath, repositoryRevision, "", pendingNarrative, snapshotReuseKey );
 			structureSaved = true;
+			// Deeper levels are written after the structure is durable so
+			// time-to-first-map does not pay for the row write. If this fails the
+			// snapshot still serves; only drill-down below the canvas is missing.
+			var levelsSummary = projectGraphRows( runId, snapshot, reviewGraph );
 			checkCancellation( arguments.callbacks );
 			renewLease( arguments.callbacks );
 
@@ -213,7 +224,14 @@ class threadsafe {
 			checkCancellation( arguments.callbacks );
 			renewLease( arguments.callbacks );
 
-			emit( arguments.callbacks, 90, "codegraph-persist", "Persisting CodeGraph snapshot" );
+			// The levels result rides the existing phase message rather than adding
+			// a transition, so the phase sequence stays one entry per phase.
+			emit(
+				arguments.callbacks,
+				90,
+				"codegraph-persist",
+				len( trim( levelsSummary ) ) ? "Persisting CodeGraph snapshot (#levelsSummary#)" : "Persisting CodeGraph snapshot"
+			);
 			if ( structureSaved ) {
 				try {
 					try {
@@ -328,7 +346,7 @@ class threadsafe {
 		if ( isNull( stored ) ) {
 			return {
 				codegraph: {
-					version           : "codegraph-snapshot-v1",
+					version           : "codegraph-snapshot-v2",
 					fingerprint       : "",
 					truncated         : false,
 					truncationReasons : [],
@@ -362,6 +380,7 @@ class threadsafe {
 			truncationReasons : isArray( stored.truncationReasons ?: "" )
 				? stored.truncationReasons
 				: ( isArray( snap.truncationReasons ?: "" ) ? snap.truncationReasons : [] ),
+			completeness      : isStruct( snap.completeness ?: "" ) ? snap.completeness : {},
 			totals            : isStruct( snap.totals ?: "" ) ? snap.totals : {},
 			nodes             : isArray( snap.nodes ?: "" ) ? snap.nodes : [],
 			clusters          : isArray( snap.clusters ?: "" ) ? snap.clusters : [],
@@ -645,6 +664,29 @@ class threadsafe {
 		}
 	}
 
+	/**
+	 * Levelled rows for the explorer. Never fails the run — but never fails
+	 * silently either: a swallowed error here looks exactly like a snapshot that
+	 * predates levelled storage, and the two need different remedies.
+	 */
+	private string function projectGraphRows(
+		required string runId,
+		required struct snapshot,
+		required struct reviewGraph
+	) {
+		if ( isNull( variables.graphProjectionService ?: javacast( "null", "" ) ) || isNull( variables.codeGraphGraphRepository ?: javacast( "null", "" ) ) ) {
+			return "levelled graph unavailable in this configuration";
+		}
+		try {
+			var projected = graphProjectionService.project( arguments.snapshot, arguments.reviewGraph );
+			codeGraphGraphRepository.replaceGraph( arguments.runId, projected.nodes, projected.edges );
+			return "#projected.nodes.len()# graph nodes, #projected.edges.len()# graph edges";
+		} catch ( any projectionError ) {
+			// Structure is already durable; drill-down degrades rather than the run.
+			return "levelled graph unavailable: #projectionError.message#";
+		}
+	}
+
 	private string function buildSnapshotReuseKey( array files = [] ) {
 		var parserVersion = "";
 		try {
@@ -672,7 +714,7 @@ class threadsafe {
 			layerPolicy        : variables.codegraphLayerPolicy ?: "application-models>http-handlers",
 			coChangeEnabled    : structKeyExists( variables, "codegraphCoChangeEnabled" ) ? variables.codegraphCoChangeEnabled : true,
 			coChangeMaxCommits : variables.codegraphCoChangeMaxCommits ?: 500,
-			snapshotVersion    : "codegraph-snapshot-v1"
+			snapshotVersion    : "codegraph-snapshot-v2"
 		};
 		return lCase( hash( jsonSerialize( settings ), "SHA-256" ) );
 	}

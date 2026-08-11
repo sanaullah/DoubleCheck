@@ -72,43 +72,182 @@ class threadsafe {
 				if ( path.steps.len() < 2 ) continue;
 				var steps = duplicate( path.steps );
 				var kinds = duplicate( path.edgeKinds );
-				if ( len( seed.routeId ?: "" ) ) { steps.prepend( seed.routeId ); kinds.prepend( "routes" ); }
-				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds ), depth: kinds.len() } );
+				var edgeSymbols = duplicate( path.edgeSymbols ?: [] );
+				if ( len( seed.routeId ?: "" ) ) { steps.prepend( seed.routeId ); kinds.prepend( "routes" ); edgeSymbols.prepend( "" ); }
+				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, edgeSymbols: edgeSymbols, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds ), depth: kinds.len() } );
 			}
 		}
-		candidates.sort( ( a, b ) => {
-			var typed = ( a.sinkKind != "unknown" ? 1 : 0 ) - ( b.sinkKind != "unknown" ? 1 : 0 );
-			if ( typed != 0 ) return typed > 0 ? -1 : 1;
-			if ( a.depth != b.depth ) return a.depth > b.depth ? -1 : 1;
-			if ( a.steps.len() != b.steps.len() ) return a.steps.len() > b.steps.len() ? -1 : 1;
-			var byEntry = compareNoCase( a.entryFile, b.entryFile );
-			if ( byEntry != 0 ) return byEntry;
-			var bySymbol = compareNoCase( a.entrySymbol, b.entrySymbol );
-			return bySymbol != 0 ? bySymbol : compareNoCase( a.sinkFile, b.sinkFile );
-		} );
-		var flows = [];
-		var seen = {};
-		var perCluster = {};
+		var visible = [];
 		for ( var candidate in candidates ) {
 			if ( arguments.visibleNodes.count() ) {
-				var visible = true;
-				for ( var step in candidate.steps ) if ( !arguments.visibleNodes.keyExists( normalizePath( step ) ) ) visible = false;
-				if ( !visible ) continue;
+				var allVisible = true;
+				for ( var step in candidate.steps ) if ( !arguments.visibleNodes.keyExists( normalizePath( step ) ) ) allVisible = false;
+				if ( !allVisible ) continue;
 			}
+			visible.append( candidate );
+		}
+		return selectFlows( visible, arguments.caps, arguments.truncation, arguments.clusterOf );
+	}
+
+	/**
+	 * A process list should cover the application's surface, not enumerate
+	 * variants of its deepest walk. Depth-first ranking produced 55 flows that
+	 * all drained into one infrastructure table; this selects for distinct
+	 * (entry, sink) pairs instead and spreads the list across sinks.
+	 */
+	private array function selectFlows(
+		required array candidates,
+		required struct caps,
+		required struct truncation,
+		required struct clusterOf
+	) {
+		if ( !arguments.candidates.len() ) return [];
+		// A sink most candidates reach is infrastructure, not a destination.
+		var sinkTotals = {};
+		for ( var candidate in arguments.candidates ) sinkTotals[ candidate.sinkFile ] = ( sinkTotals[ candidate.sinkFile ] ?: 0 ) + 1;
+
+		// One listed flow per (entry, sink): the same process reached by a
+		// slightly different chain is a variant, not a second process.
+		var groups = {};
+		var order = [];
+		for ( var candidate in arguments.candidates ) {
+			var groupKey = candidate.entryFile & "\0" & candidate.sinkFile;
 			var signature = arrayToList( candidate.steps, "|" );
-			if ( seen.keyExists( signature ) ) continue;
+			if ( !groups.keyExists( groupKey ) ) {
+				groups[ groupKey ] = { best: candidate, signatures: {}, variantCount: 0 };
+				order.append( groupKey );
+			}
+			var group = groups[ groupKey ];
+			if ( !group.signatures.keyExists( signature ) ) {
+				group.signatures[ signature ] = true;
+				group.variantCount++;
+			}
+			if ( preferCandidate( candidate, group.best ) ) group.best = candidate;
+		}
+
+		var total = arguments.candidates.len();
+		var ranked = [];
+		for ( var groupKey in order ) {
+			var group = groups[ groupKey ];
+			ranked.append( {
+				key         : groupKey,
+				candidate   : group.best,
+				variantCount: group.variantCount,
+				sinkShare   : ( sinkTotals[ group.best.sinkFile ] ?: 1 ) / total
+			} );
+		}
+		ranked.sort( ( a, b ) => compareRanked( a, b ) );
+
+		// Round-robin by sink: every sink gets its best flow before any sink
+		// gets a second. With three or more distinct sinks no single sink can
+		// dominate the list.
+		var bySink = {};
+		var sinkOrder = [];
+		for ( var entry in ranked ) {
+			var sink = entry.candidate.sinkFile;
+			if ( !bySink.keyExists( sink ) ) { bySink[ sink ] = []; sinkOrder.append( sink ); }
+			bySink[ sink ].append( entry );
+		}
+		var rounds = [];
+		var roundIndex = 1;
+		var moreRounds = true;
+		while ( moreRounds ) {
+			moreRounds = false;
+			for ( var sink in sinkOrder ) {
+				var bucket = bySink[ sink ];
+				if ( bucket.len() < roundIndex ) continue;
+				rounds.append( bucket[ roundIndex ] );
+				moreRounds = true;
+			}
+			roundIndex++;
+		}
+
+		// Ordering alone does not stop one sink dominating; it only spreads it
+		// through the list. Hold every sink to a third of the list.
+		//
+		// Solve the list length directly rather than filling and re-filling until
+		// it converges: for a list of k, each sink may contribute ceil( k / 3 ),
+		// so the largest honest k is the largest one the sinks can actually
+		// supply. Monotonic in k, so binary search finds it in O(n log n) instead
+		// of the O(n^2) repeated-pass fill.
+		var enforceSinkShare = sinkOrder.len() >= 3;
+		var target = rounds.len();
+		if ( enforceSinkShare ) {
+			var supply = ( k ) => {
+				var perSinkCap = max( 1, ceiling( k / 3 ) );
+				var total = 0;
+				for ( var sink in sinkOrder ) total += min( bySink[ sink ].len(), perSinkCap );
+				return total;
+			};
+			var low = 0;
+			var high = rounds.len();
+			while ( low < high ) {
+				var mid = ceiling( ( low + high ) / 2 );
+				if ( supply( mid ) >= mid ) low = mid; else high = mid - 1;
+			}
+			target = low;
+		}
+		var perSinkCap = enforceSinkShare ? max( 1, ceiling( target / 3 ) ) : rounds.len();
+		var accepted = [];
+		var perSink = {};
+		for ( var entry in rounds ) {
+			if ( accepted.len() >= target ) break;
+			var sink = entry.candidate.sinkFile;
+			if ( ( perSink[ sink ] ?: 0 ) >= perSinkCap ) continue;
+			perSink[ sink ] = ( perSink[ sink ] ?: 0 ) + 1;
+			accepted.append( entry );
+		}
+		if ( accepted.len() < rounds.len() ) markTruncated( arguments.truncation, "flowSinkDiversity" );
+
+		var flows = [];
+		var perCluster = {};
+		var maxPerCluster = max( 1, val( arguments.caps.maxFlowsPerCluster ?: 4 ) );
+		for ( var entry in accepted ) {
+			var candidate = entry.candidate;
 			var clusterKey = "__unclustered__";
 			for ( var step in candidate.steps ) {
 				var cluster = arguments.clusterOf[ normalizePath( step ) ] ?: "";
 				if ( len( cluster ) ) { clusterKey = cluster; break; }
 			}
-			var maxPerCluster = max( 1, val( arguments.caps.maxFlowsPerCluster ?: 4 ) );
 			if ( ( perCluster[ clusterKey ] ?: 0 ) >= maxPerCluster ) { markTruncated( arguments.truncation, "maxFlowsPerCluster" ); continue; }
-			seen[ signature ] = true;
 			perCluster[ clusterKey ] = ( perCluster[ clusterKey ] ?: 0 ) + 1;
-			flows.append( { id: flowId( candidate.entryFile, candidate.entrySymbol, signature ), entryFile: candidate.entryFile, entrySymbol: candidate.entrySymbol, steps: duplicate( candidate.steps ), stepSymbols: stepSymbolsFor( candidate.steps, arguments.inventory.units ?: [] ), sinkFile: candidate.sinkFile, edgeKinds: duplicate( candidate.edgeKinds ), sinkKind: candidate.sinkKind, routeId: candidate.routeId } );
+			var signature = arrayToList( candidate.steps, "|" );
+			flows.append( {
+				id          : flowId( candidate.entryFile, candidate.entrySymbol, signature ),
+				entryFile   : candidate.entryFile,
+				entrySymbol : candidate.entrySymbol,
+				steps       : duplicate( candidate.steps ),
+				stepSymbols : stepSymbolsFor( candidate.steps, candidate.edgeSymbols ?: [] ),
+				sinkFile    : candidate.sinkFile,
+				edgeKinds   : duplicate( candidate.edgeKinds ),
+				sinkKind    : candidate.sinkKind,
+				routeId     : candidate.routeId,
+				variantCount: entry.variantCount
+			} );
 		}
 		return flows;
+	}
+
+	/** Within one (entry, sink) group the shortest chain is the clearest story. */
+	private boolean function preferCandidate( required struct candidate, required struct current ) {
+		if ( arguments.candidate.steps.len() != arguments.current.steps.len() ) return arguments.candidate.steps.len() < arguments.current.steps.len();
+		return compareNoCase( arrayToList( arguments.candidate.steps, "|" ), arrayToList( arguments.current.steps, "|" ) ) < 0;
+	}
+
+	private numeric function compareRanked( required struct a, required struct b ) {
+		var aTyped = arguments.a.candidate.sinkKind != "unknown" ? 1 : 0;
+		var bTyped = arguments.b.candidate.sinkKind != "unknown" ? 1 : 0;
+		if ( aTyped != bTyped ) return aTyped > bTyped ? -1 : 1;
+		// Lower share first: a flow ending somewhere most flows already end
+		// explains less of the application than one ending somewhere rare.
+		var aShare = round( arguments.a.sinkShare * 1000 );
+		var bShare = round( arguments.b.sinkShare * 1000 );
+		if ( aShare != bShare ) return aShare < bShare ? -1 : 1;
+		if ( arguments.a.candidate.depth != arguments.b.candidate.depth ) return arguments.a.candidate.depth > arguments.b.candidate.depth ? -1 : 1;
+		var byEntry = compareNoCase( arguments.a.candidate.entryFile, arguments.b.candidate.entryFile );
+		if ( byEntry != 0 ) return byEntry;
+		var bySymbol = compareNoCase( arguments.a.candidate.entrySymbol, arguments.b.candidate.entrySymbol );
+		return bySymbol != 0 ? bySymbol : compareNoCase( arguments.a.candidate.sinkFile, arguments.b.candidate.sinkFile );
 	}
 
 	private struct function walk( required struct seeds, required struct adjacency ) {
@@ -141,7 +280,9 @@ class threadsafe {
 			if ( seen.keyExists( key ) ) continue;
 			seen[ key ] = true;
 			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
-			adjacency[ from ].append( { to: to, kind: kind } );
+			// The edge carries the symbol that owns it, so a hop can name the
+			// method that made the call rather than restating the file name.
+			adjacency[ from ].append( { to: to, kind: kind, sourceSymbol: trim( toString( dep.sourceSymbol ?: "" ) ) } );
 		}
 		for ( var from in adjacency ) adjacency[ from ].sort( ( a, b ) => { var byTo = compareNoCase( a.to, b.to ); return byTo != 0 ? byTo : compareNoCase( a.kind, b.kind ); } );
 		return adjacency;
@@ -188,9 +329,10 @@ class threadsafe {
 		var results = [];
 		var steps = [ arguments.startFile ];
 		var edgeKinds = [];
+		var edgeSymbols = [];
 		var visited = { "#arguments.startFile#": true };
 		var explored = { count: 0 };
-		collectPaths( arguments.startFile, arguments.adjacency, arguments.maxDepth, steps, edgeKinds, visited, results, explored );
+		collectPaths( arguments.startFile, arguments.adjacency, arguments.maxDepth, steps, edgeKinds, edgeSymbols, visited, results, explored );
 		results.sort( ( a, b ) => {
 			var aTyped = sinkKind( a.edgeKinds ) != "unknown";
 			var bTyped = sinkKind( b.edgeKinds ) != "unknown";
@@ -210,18 +352,19 @@ class threadsafe {
 		required numeric maxDepth,
 		required array steps,
 		required array edgeKinds,
+		required array edgeSymbols,
 		required struct visited,
 		required array results,
 		required struct explored
 	) {
 		if ( ++arguments.explored.count > 5000 ) return;
 		if ( arguments.edgeKinds.len() >= arguments.maxDepth ) {
-			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
 			return;
 		}
 		var outbound = arguments.adjacency[ arguments.current ] ?: [];
 		if ( !outbound.len() ) {
-			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
 			return;
 		}
 		var expanded = false;
@@ -231,24 +374,32 @@ class threadsafe {
 			arguments.visited[ edge.to ] = true;
 			arguments.steps.append( edge.to );
 			arguments.edgeKinds.append( edge.kind );
-			collectPaths( edge.to, arguments.adjacency, arguments.maxDepth, arguments.steps, arguments.edgeKinds, arguments.visited, arguments.results, arguments.explored );
+			arguments.edgeSymbols.append( edge.sourceSymbol ?: "" );
+			collectPaths( edge.to, arguments.adjacency, arguments.maxDepth, arguments.steps, arguments.edgeKinds, arguments.edgeSymbols, arguments.visited, arguments.results, arguments.explored );
+			arguments.edgeSymbols.pop();
 			arguments.edgeKinds.pop();
 			arguments.steps.pop();
 			arguments.visited.delete( edge.to );
 		}
-		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
 	}
 
-	private array function stepSymbolsFor( required array steps, required array units ) {
-		var byFile = {};
-		for ( var unit in arguments.units ) {
-			if ( !isStruct( unit ) || lCase( toString( unit.unitType ?: "" ) ) == "file" ) continue;
-			var key = normalizePath( unit.filePath ?: "" );
-			if ( !len( key ) ) continue;
-			if ( !byFile.keyExists( key ) ) byFile[ key ] = [];
-			byFile[ key ].append( unit.symbolName ?: unit.id ?: "" );
+	/**
+	 * The symbol at each hop is the one that owns the outgoing edge, resolved by
+	 * line containment when the dependency was indexed
+	 * (`review_dependencies.source_symbol`).
+	 *
+	 * It is deliberately empty rather than approximated: the previous
+	 * implementation returned the file's first declaration, which for a class
+	 * file is the class name and therefore restates the path. An empty entry
+	 * means "file level", and the UI says so.
+	 */
+	private array function stepSymbolsFor( required array steps, required array edgeSymbols ) {
+		var symbols = [];
+		for ( var index = 1; index <= arguments.steps.len(); index++ ) {
+			symbols.append( index <= arguments.edgeSymbols.len() ? trim( toString( arguments.edgeSymbols[ index ] ?: "" ) ) : "" );
 		}
-		return arguments.steps.map( ( step ) => { var symbols = byFile[ normalizePath( step ) ] ?: []; return isArray( symbols ) && symbols.len() ? symbols[ 1 ] : ""; } );
+		return symbols;
 	}
 
 	private string function sinkKind( required array kinds ) {

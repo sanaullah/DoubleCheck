@@ -13,7 +13,7 @@ documentation tree in version control. `.superpowers/` is local scratch.
 | [application-features.md](application-features.md) | Purpose, shipped features, AI contract, out of scope, **known gaps**, measured language tiers |
 | [technical-flow.md](technical-flow.md) | Technical implementation, project flow, Mermaid diagrams |
 | [plans/codegraph-domain-lens-design.md](plans/codegraph-domain-lens-design.md) | **Approved design** — CodeGraph meaning / Domain lens (LLM-required briefing) |
-| [plans/codegraph-depth-plan.md](plans/codegraph-depth-plan.md) | **Live plan** — CodeGraph depth: shared defects, AST parsing, route/view/table edges, JS, flows, explorer, path finder |
+| [plans/codegraph-graph-fidelity-design.md](plans/codegraph-graph-fidelity-design.md) | **Live plan** — CodeGraph graph fidelity: symbol attribution, ranked truncation with a completeness contract, levelled node/edge storage, server-side search. §8 records measured results and known limits |
 | [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | Prior Modernize inversion notes (kept for Part 2 evidence); not the active plan |
 
 ## Reference — open only when the task needs it

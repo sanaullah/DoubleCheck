@@ -386,6 +386,143 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				}
 			} );
 
+			it( "serves levelled graph rows and finds symbols the canvas never drew", () => {
+				var marker = lCase( createUUID() );
+				var runId = "codegraph-levels-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var fixtureRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1/cases/order-flow" );
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id          : runId,
+						tenantId    : "default",
+						projectId   : "default",
+						projectPath : fixtureRoot,
+						mode        : "full",
+						runKind     : "codegraph",
+						input       : { version: "codegraph-input-v1" },
+						baseRevision: "",
+						headRevision: "HEAD",
+						status      : "succeeded",
+						progress    : 100,
+						currentPhase: "completed",
+						message     : "CodeGraph levels fixture",
+						policy      : { version: "codegraph-input-v1", runKind: "codegraph" },
+						budgets     : {},
+						createdAt   : nowValue,
+						updatedAt   : nowValue
+					} );
+					// An indexed graph is the precondition every structural endpoint tests.
+					var levelsSource = "class {" & char( 10 ) & "function place() {" & char( 10 ) & "orderRepository.save();" & char( 10 ) & "}" & char( 10 ) & "}";
+					getInstance( "ArchitectureIndexService" ).index( runId, [ {
+						filePath   : "app/OrderService.bx",
+						contentHash: lCase( hash( levelsSource & marker, "SHA-256" ) ),
+						language   : "BoxLang",
+						content    : levelsSource,
+						lines      : listToArray( levelsSource, char( 10 ), true, true )
+					} ] );
+
+					var projection = getInstance( "CodeGraphProjectionService" ).project(
+						{
+							clusters    : [ { id: "c1", label: "Orders", filePaths: [ "app/OrderService.bx" ], fileCount: 1 } ],
+							directories : [ { path: "app", fileCount: 1, symbolCount: 2 } ],
+							nodes       : [ { id: "app/orderservice.bx", path: "app/OrderService.bx", dir: "app", role: "domain", component: "application-models", hotspotScore: 3, fanIn: 1, fanOut: 2 } ],
+							clusterEdges: []
+						},
+						{
+							symbols     : [
+								{ id: "sym-place", filePath: "app/OrderService.bx", kind: "function", name: "place", line: 2, endLine: 4 }
+							],
+							dependencies: [
+								{ sourceFile: "app/OrderService.bx", targetFile: "app/OrderRepository.bx", kind: "calls", target: "save", line: 3, sourceSymbolId: "sym-place" }
+							]
+						}
+					);
+					expect( projection.nodes.len() ).toBeGT( 0 );
+					getInstance( "CodeGraphGraphRepository" ).replaceGraph( runId, projection.nodes, projection.edges );
+
+					var clusterLevel = this.get( "/api/v1/runs/#runId#/codegraph/graph", { level: "cluster", limit: 10 } );
+					expect( clusterLevel.getResponse() ).toHaveStatus( 200 );
+					var clusterBody = jsonDeserialize( clusterLevel.getRenderedContent() );
+					expect( clusterBody.data.level ).toBe( "cluster" );
+					expect( clusterBody.data.nodes ).notToBeEmpty();
+					expect( clusterBody.data.completeness.complete ).toBeTrue();
+
+					// Scoping to a parent is how drill-down works at every level.
+					var symbolLevel = this.get(
+						"/api/v1/runs/#runId#/codegraph/graph",
+						{ level: "symbol", scope: "file:app/orderservice.bx", limit: 10 }
+					);
+					expect( symbolLevel.getResponse() ).toHaveStatus( 200 );
+					var symbolBody = jsonDeserialize( symbolLevel.getRenderedContent() );
+					expect( symbolBody.data.nodes ).notToBeEmpty();
+					expect( symbolBody.data.nodes[ 1 ].symbolName ).toBe( "place" );
+
+					// A capped level must state the cap, not merely be short.
+					var capped = this.get( "/api/v1/runs/#runId#/codegraph/graph", { level: "symbol", limit: 1 } );
+					var cappedBody = jsonDeserialize( capped.getRenderedContent() );
+					expect( cappedBody.data.completeness.returned ).toBe( 1 );
+					expect( cappedBody.data.completeness.rankedBy ).toBe( "hotspot" );
+
+					var found = this.get( "/api/v1/runs/#runId#/codegraph/search", { q: "place" } );
+					expect( found.getResponse() ).toHaveStatus( 200 );
+					var foundBody = jsonDeserialize( found.getRenderedContent() );
+					expect( foundBody.data.matches ).notToBeEmpty();
+					expect( foundBody.data.matches[ 1 ].level ).toBe( "symbol" );
+
+					// renderData-set statuses surface on the render data, not the response.
+					var missingTerm = this.get( "/api/v1/runs/#runId#/codegraph/search", { q: "" } );
+					expect( missingTerm.getRenderData().statusCode ?: 0 ).toBe( 422, "empty q must be rejected" );
+					var badLevel = this.get( "/api/v1/runs/#runId#/codegraph/graph", { level: "galaxy" } );
+					expect( badLevel.getRenderData().statusCode ?: 0 ).toBe( 422 );
+				} finally {
+					queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: runId } );
+					queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runId } );
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
+			it( "reports a snapshot that predates levelled storage instead of returning an empty graph", () => {
+				var marker = lCase( createUUID() );
+				var runId = "codegraph-nolevels-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var fixtureRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1/cases/order-flow" );
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id          : runId,
+						tenantId    : "default",
+						projectId   : "default",
+						projectPath : fixtureRoot,
+						mode        : "full",
+						runKind     : "codegraph",
+						input       : { version: "codegraph-input-v1" },
+						baseRevision: "",
+						headRevision: "HEAD",
+						status      : "succeeded",
+						progress    : 100,
+						currentPhase: "completed",
+						message     : "CodeGraph legacy snapshot fixture",
+						policy      : { version: "codegraph-input-v1", runKind: "codegraph" },
+						budgets     : {},
+						createdAt   : nowValue,
+						updatedAt   : nowValue
+					} );
+					var legacySource = "class {" & char( 10 ) & "function run() {}" & char( 10 ) & "}";
+					getInstance( "ArchitectureIndexService" ).index( runId, [ {
+						filePath   : "app/Legacy.bx",
+						contentHash: lCase( hash( legacySource & marker, "SHA-256" ) ),
+						language   : "BoxLang",
+						content    : legacySource,
+						lines      : listToArray( legacySource, char( 10 ), true, true )
+					} ] );
+					var event = this.get( "/api/v1/runs/#runId#/codegraph/graph", { level: "file" } );
+					expect( event.getRenderData().statusCode ?: 0 ).toBe( 409 );
+					var body = jsonDeserialize( event.getRenderedContent() );
+					expect( body.error.code ).toBe( "snapshot_predates_node_tables" );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
 			it( "advertises codegraph in capabilities", () => {
 				var event = this.get( "/api/v1/capabilities" );
 				expect( event.getResponse() ).toHaveStatus( 200 );
@@ -396,7 +533,7 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				expect( body.data.codegraph.enabled ).toBeTrue();
 				expect( body.data.codegraph.requiresLlm ).toBeFalse();
 				expect( body.data.codegraph.meaningRequiresLlm ).toBeTrue();
-				expect( body.data.codegraph.schemaVersion ).toBe( "codegraph-snapshot-v1" );
+				expect( body.data.codegraph.schemaVersion ).toBe( "codegraph-snapshot-v2" );
 				expect( body.data.codegraph.narrativeVersion ).toBe( "codegraph-narrative-v2" );
 			} );
 

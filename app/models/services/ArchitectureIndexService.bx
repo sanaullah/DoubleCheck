@@ -22,6 +22,9 @@ class threadsafe {
 	property name="impactMaxNodes" inject="coldbox:setting:graphImpactMaxNodes";
 	variables.impactMaxDepth = 3;
 	variables.impactMaxNodes = 2000;
+	// Bump when materialize() changes what it derives from a parse. v2 attributes
+	// each dependency to the symbol whose body encloses it.
+	variables.indexVersion = "architecture-index-v2";
 
 	/**
 	 * Parses supported files, reuses content-addressed parser results, persists
@@ -76,7 +79,7 @@ class threadsafe {
 					)
 				);
 		}
-		metrics.parserVersion = usedParserVersions.sort( "text" ).toList( "+" );
+		metrics.parserVersion = indexSignature( usedParserVersions );
 
 		var baseline = graphRepository.findBaselineGraph( arguments.runId, numericSetting( variables.impactMaxNodes, 2000 ) );
 		metrics.baselineRunId = baseline.runId;
@@ -130,7 +133,7 @@ class threadsafe {
 			var version = parser.getVersion();
 			if ( !versions.contains( version ) ) versions.append( version );
 		}
-		return versions.sort( "text" ).toList( "+" );
+		return indexSignature( versions );
 	}
 
 	/** Stable all-parser signature for pre-scan snapshot reuse. */
@@ -144,7 +147,20 @@ class threadsafe {
 			var version = parser.getVersion();
 			if ( !versions.contains( version ) ) versions.append( version );
 		}
-		return versions.sort( "text" ).toList( "+" );
+		return indexSignature( versions );
+	}
+
+	/**
+	 * Adoption contract for a stored graph.
+	 *
+	 * Parser versions alone are not enough: what `materialize` derives from a
+	 * parse — symbol attribution, ids — also decides whether stored rows are
+	 * usable. Without the index version in this signature, a run adopts rows
+	 * produced before a materializer change and silently serves the old shape.
+	 */
+	private string function indexSignature( required array versions ) {
+		var joined = arguments.versions.sort( "text" ).toList( "+" );
+		return len( joined ) ? joined & "+" & variables.indexVersion : variables.indexVersion;
 	}
 
 	array function buildImpactCone(
@@ -426,6 +442,9 @@ class threadsafe {
 		var dependencies = [];
 		var seenDependencyIds = {};
 		var dependencyOccurrences = {};
+		// Built once per file so attribution is a lookup, not a scan of every
+		// symbol for every dependency.
+		var ownerByLine = symbolLineIndex( symbols );
 		for ( var item in arguments.parsed.dependencies ) {
 			var dependencyItem = duplicate( item );
 			var dependencyKey = lCase( trim( toString( item.kind ?: "dependency" ) ) & "|" & trim( toString( item.target ?: "" ) ) );
@@ -442,6 +461,9 @@ class threadsafe {
 			}
 			seenDependencyIds[ dependencyItem.id ] = true;
 			dependencyItem.targetFile = "";
+			var owner = ownerByLine[ val( dependencyItem.line ?: 0 ) ] ?: { id: "", name: "" };
+			dependencyItem.sourceSymbolId = owner.id;
+			dependencyItem.sourceSymbol = owner.name;
 			dependencies.append( dependencyItem );
 		}
 		return {
@@ -452,6 +474,40 @@ class threadsafe {
 			symbols      : symbols,
 			dependencies : dependencies
 		};
+	}
+
+	/**
+	 * Line number to the innermost symbol whose body contains it.
+	 *
+	 * A class declaration spans the whole file, so without "innermost wins" every
+	 * dependency would attribute to the class and say nothing the file path did
+	 * not already say. Widest spans are written first and narrower ones overwrite
+	 * them, which leaves each line owned by the tightest enclosing symbol.
+	 *
+	 * Built once per file: attributing by scanning every symbol for every
+	 * dependency is O(symbols x dependencies), which a large generated file makes
+	 * expensive. This is O(sum of symbol spans) once, then O(1) per lookup.
+	 * Symbols with no usable end line cannot contain anything and are skipped
+	 * rather than guessed at.
+	 */
+	private struct function symbolLineIndex( required array symbols ) {
+		var spans = [];
+		for ( var symbol in arguments.symbols ) {
+			var start = val( symbol.line ?: 0 );
+			var finish = val( symbol.endLine ?: 0 );
+			if ( start <= 0 || finish < start ) continue;
+			spans.append( { start: start, finish: finish, span: finish - start, id: symbol.id ?: "", name: trim( toString( symbol.name ?: "" ) ) } );
+		}
+		spans.sort( ( a, b ) => {
+			if ( a.span != b.span ) return a.span > b.span ? -1 : 1;
+			return a.start > b.start ? 1 : ( a.start < b.start ? -1 : 0 );
+		} );
+		var index = {};
+		for ( var entry in spans ) {
+			var owner = { id: entry.id, name: entry.name };
+			for ( var line = entry.start; line <= entry.finish; line++ ) index[ line ] = owner;
+		}
+		return index;
 	}
 
 	private string function resolveTypeFile( required string target, required struct typeFiles ) {

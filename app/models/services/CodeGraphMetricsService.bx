@@ -19,8 +19,9 @@ class threadsafe {
 	property name="architectureModelService" inject="ArchitectureModelService";
 	property name="inventoryAdapter" inject="CodeGraphInventoryAdapter";
 	property name="flowService" inject="CodeGraphFlowService";
+	property name="completenessService" inject="CodeGraphCompletenessService";
 
-	variables.snapshotVersion = "codegraph-snapshot-v1";
+	variables.snapshotVersion = "codegraph-snapshot-v2";
 	variables.defaultCaps = {
 		maxClusters         : 60,
 		maxHotspots         : 50,
@@ -47,6 +48,9 @@ class threadsafe {
 		}
 		if ( isNull( variables.flowService ?: javacast( "null", "" ) ) ) {
 			variables.flowService = new app.models.services.CodeGraphFlowService();
+		}
+		if ( isNull( variables.completenessService ?: javacast( "null", "" ) ) ) {
+			variables.completenessService = new app.models.services.CodeGraphCompletenessService();
 		}
 		return this;
 	}
@@ -93,9 +97,15 @@ class threadsafe {
 		var nodes = buildNodes( graph, inventory, fileStats, clusterOf, crossingCounts, roleEvidence, coChange.files );
 		appendSyntheticNodes( nodes, arguments.reviewGraph.dependencies ?: [] );
 		var orphanCandidateCount = countOrphanCandidates( nodes );
+		var availableNodes = nodes.len();
+		var nodeRanking = "path";
 		if ( nodes.len() > caps.maxNodes ) {
 			markTruncated( truncation, "maxNodes" );
-			nodes = nodes.slice( 1, caps.maxNodes );
+			// Selecting alphabetically deletes whole late-alphabet directories.
+			// Select by importance, then restore path order for presentation so
+			// the returned array stays stable and comparable.
+			nodeRanking = "hotspotScore";
+			nodes = completenessService.rankNodes( nodes, caps.maxNodes );
 		}
 		var visibleNodes = {};
 		for ( var visibleNode in nodes ) visibleNodes[ normalizePath( visibleNode.id ?: visibleNode.path ?: "" ) ] = true;
@@ -129,6 +139,23 @@ class threadsafe {
 			flows            : flows.len()
 		};
 
+		// Each collection reports what it kept, out of what existed, by which
+		// ordering. `truncated` says only that something was lost somewhere.
+		var completeness = completenessService.report( {
+			loaded              : arguments.reviewGraph.completeness ?: {},
+			graph               : graph,
+			nodeCount           : nodes.len(),
+			availableNodes      : availableNodes,
+			nodeRanking         : nodeRanking,
+			hotspotCount        : hotspots.len(),
+			orphanCount         : orphans.len(),
+			orphanCandidateCount: orphanCandidateCount,
+			layerViolationCount : layerViolations.len(),
+			flowCount           : flows.len(),
+			symbolCount         : fileStats.symbolCount,
+			dependencyCount     : totals.dependencies
+		} );
+
 		var fingerprintPayload = {
 			nodes       : fingerprintNodes( nodes ),
 			clusters    : clusters,
@@ -144,6 +171,7 @@ class threadsafe {
 			fingerprint        : fingerprint,
 			truncated          : truncation.truncated,
 			truncationReasons  : truncation.reasons,
+			completeness       : completeness,
 			totals             : totals,
 			nodes              : nodes,
 			clusters           : clusters,

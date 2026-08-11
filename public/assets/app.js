@@ -122,6 +122,11 @@ const state = {
 		panSession: null,
 		showAi: true,
 		overviewShowAll: false,
+		roleFilter: "",
+		openedFromSavedMap: false,
+		serverSearch: null,
+		searchTimer: null,
+		symbolLevel: null,
 		activeFlowId: "",
 		activeCyclePaths: [],
 		pathFrom: "",
@@ -1740,6 +1745,10 @@ const elements = {
 	codegraphIssues: document.querySelector("#codegraph-issues"),
 	codegraphIssueTabs: document.querySelector("#codegraph-issue-tabs"),
 	codegraphIssueList: document.querySelector("#codegraph-issue-list"),
+	codegraphSourceBar: document.querySelector("#codegraph-source-bar"),
+	codegraphSourceText: document.querySelector("#codegraph-source-text"),
+	codegraphRebuild: document.querySelector("#codegraph-rebuild"),
+	appShell: document.querySelector("main.app-shell"),
 	preferencesForm: document.querySelector("#preferences-form"),
 	preferencesReset: document.querySelector("#preferences-reset"),
 	preferencesStatus: document.querySelector("#preferences-status"),
@@ -4188,17 +4197,33 @@ function codeGraphProcessChips() {
 		const p = String(path || "").replace(/\\/g, "/");
 		return p.split("/").pop() || p || "Process";
 	};
+	// A hop reads "Handler.index" when the dependency resolved to a symbol and
+	// "handler.bx" when it did not. Never a symbol the edge did not come from.
+	const hopLabel = (step, symbol) => {
+		const raw = String(step || "");
+		if (/^(route|table|http|schedule):/i.test(raw)) return raw;
+		const base = basename(raw).replace(/\.(bx|bxm|bxs|cfc|cfm|js|jsx)$/i, "");
+		const sym = String(symbol || "").trim();
+		return sym ? `${base}.${sym}` : basename(raw);
+	};
 	return flows.slice(0, 12).map((flow) => {
 		const flowId = String(flow.id || "");
 		const proc = byFlowId.get(flowId);
 		const entryBase = basename(flow.entryFile);
+		const steps = Array.isArray(flow.steps) ? flow.steps : [];
+		const symbols = Array.isArray(flow.stepSymbols) ? flow.stepSymbols : [];
+		const chain = steps.map((step, index) => hopLabel(step, symbols[index])).join(" → ");
+		const variants = Number(flow.variantCount) || 1;
 		const title =
 			(proc && proc.title) ||
+			(flow.routeId ? String(flow.routeId).replace(/^route:/, "") : "") ||
 			(entryBase && flow.entrySymbol ? `${entryBase}#${flow.entrySymbol}` : entryBase || flowId || "Process");
-		const tip =
-			(proc && proc.text) ||
-			[flow.entryFile, flow.sinkFile].filter(Boolean).join(" → ") ||
-			title;
+		const evidence = [
+			chain || [flow.entryFile, flow.sinkFile].filter(Boolean).join(" → "),
+			flow.sinkKind && flow.sinkKind !== "unknown" ? `ends in a ${String(flow.sinkKind).replace(/-/g, " ")}` : "",
+			variants > 1 ? `${variants} variant paths` : ""
+		].filter(Boolean).join("\n");
+		const tip = proc && proc.text ? `${proc.text}\n\n${evidence}` : evidence || title;
 		return { flowId, title, tip, hasAi: !!(proc && proc.text) };
 	});
 }
@@ -4584,7 +4609,63 @@ function renderCodeGraphRoleLegend(hasSnapshot) {
 	};
 	const counts = state.codegraph.snapshot?.roleCounts || {};
 	const roles = Object.keys(counts).filter((role) => Number(counts[role]) > 0).sort((a, b) => (labels[a] || a).localeCompare(labels[b] || b));
-	host.innerHTML = roles.map((role) => `<span class="codegraph-legend-item" data-role="${escapeHtml(role)}"><span class="codegraph-legend-swatch" aria-hidden="true"></span>${escapeHtml(labels[role] || role)} <small>${Number(counts[role])}</small></span>`).join("");
+	const active = state.codegraph.roleFilter || "";
+	host.innerHTML = roles.map((role) => {
+		const pressed = role === active;
+		const label = labels[role] || role;
+		const title = pressed ? `Show all roles again` : `Show only ${label.toLowerCase()} files`;
+		return `<button type="button" class="codegraph-legend-item" data-codegraph-role="${escapeHtml(role)}" data-role="${escapeHtml(role)}" aria-pressed="${pressed ? "true" : "false"}" title="${escapeHtml(title)}"><span class="codegraph-legend-swatch" aria-hidden="true"></span>${escapeHtml(label)} <small>${Number(counts[role])}</small></button>`;
+	}).join("");
+	applyCodeGraphRoleFilter();
+}
+
+// Dimming happens through one attribute on the canvas host so the filter costs
+// no re-layout and cannot drift from the drawn graph.
+function applyCodeGraphRoleFilter() {
+	const host = elements.codegraphCanvas;
+	if (!host) return;
+	const role = state.codegraph.roleFilter || "";
+	if (role) host.dataset.roleFilter = role;
+	else delete host.dataset.roleFilter;
+}
+
+function toggleCodeGraphRoleFilter(role) {
+	const next = String(role || "").trim();
+	state.codegraph.roleFilter = state.codegraph.roleFilter === next ? "" : next;
+	renderCodeGraphRoleLegend(true);
+	renderCodeGraphDirectoryTree();
+}
+
+function formatRelativeTime(value) {
+	const stamp = new Date(value);
+	if (Number.isNaN(stamp.getTime())) return "";
+	const seconds = Math.round((Date.now() - stamp.getTime()) / 1000);
+	if (seconds < 90) return "just now";
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes} min ago`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.round(hours / 24);
+	if (days < 7) return `${days}d ago`;
+	return stamp.toLocaleDateString();
+}
+
+// The saved-map bar answers "what am I looking at, and is it current?" — the
+// first question of a user who did not just start this run.
+function renderCodeGraphSourceBar(hasSnapshot) {
+	const host = elements.codegraphSourceBar;
+	if (!host) return;
+	const run = state.activeRun;
+	const terminal = !!run && ["succeeded", "completed", "failed", "cancelled"].includes(String(run.status || "").toLowerCase());
+	host.hidden = !(hasSnapshot && terminal);
+	if (host.hidden) return;
+	const built = run?.completedAt || run?.startedAt || "";
+	const when = built ? formatRelativeTime(built) : "";
+	const opened = state.codegraph.openedFromSavedMap ? "Saved map" : "Map";
+	const path = String(run?.projectPath || "").trim();
+	if (elements.codegraphSourceText) {
+		elements.codegraphSourceText.innerHTML = `<strong>${escapeHtml(opened)}</strong> of ${escapeHtml(path || "this project")}${when ? ` · built ${escapeHtml(when)}` : ""} · run <code>${escapeHtml(String(run?.id || "").slice(0, 8))}</code>`;
+	}
 }
 
 function renderCodeGraphRisk() {
@@ -4647,17 +4728,121 @@ function codeGraphSymbolsForFile(snapshot, pathOrId) {
 	return symbols.sort((a, b) => a.localeCompare(b));
 }
 
+// Server-side search reaches symbols and files the canvas never drew. A failure
+// is not fatal: the client-side list over the loaded snapshot still stands.
+async function codeGraphServerSearch(term) {
+	const runId = state.activeRun?.id || "";
+	const query = String(term || "").trim();
+	if (!runId || query.length < 2) {
+		state.codegraph.serverSearch = null;
+		renderCodeGraphDirectoryTree();
+		return;
+	}
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/search?q=${encodeURIComponent(query)}&limit=60`
+		);
+		state.codegraph.serverSearch = { term: query, ...(payload.data || {}) };
+	} catch (error) {
+		state.codegraph.serverSearch = null;
+	}
+	renderCodeGraphDirectoryTree();
+}
+
+// Symbols inside one file, straight from the stored graph. This level does not
+// exist in the snapshot the canvas draws from.
+async function codeGraphLoadSymbols(filePath) {
+	const runId = state.activeRun?.id || "";
+	const normalized = String(filePath || "").replace(/\\/g, "/").toLowerCase();
+	if (!runId || !normalized) return;
+	// Cache is per (run, file): the same path in a different run is a different
+	// graph, so the run id has to be part of the identity.
+	if (state.codegraph.symbolLevel?.file === normalized && state.codegraph.symbolLevel?.runId === runId) {
+		renderCodeGraphDirectoryTree();
+		return;
+	}
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/graph?level=symbol&scope=${encodeURIComponent("file:" + normalized)}&rank=fanIn&limit=60`
+		);
+		state.codegraph.symbolLevel = { file: normalized, runId, ...(payload.data || {}) };
+	} catch (error) {
+		// 409 means this snapshot predates levelled storage; 404 means no graph.
+		state.codegraph.symbolLevel = { file: normalized, runId, nodes: [], unavailable: true };
+	}
+	renderCodeGraphDirectoryTree();
+}
+
+function codeGraphRoleItems(snapshot, role) {
+	const wanted = String(role || "").trim().toLowerCase();
+	if (!wanted) return [];
+	const nodes = Array.isArray(snapshot?.nodes) ? snapshot.nodes : [];
+	return nodes
+		.filter((node) => String(node.role || "").toLowerCase() === wanted)
+		.map((node) => ({
+			type: "node",
+			id: node.id || node.path,
+			label: node.path || node.id,
+			meta: `${node.component || "file"} · in ${node.fanIn ?? 0} / out ${node.fanOut ?? 0}`
+		}))
+		.sort((a, b) => String(a.label).localeCompare(String(b.label)))
+		.slice(0, 200);
+}
+
 function renderCodeGraphDirectoryTree() {
 	const host = elements.codegraphDirectoryTree;
 	if (!host) return;
 	const snapshot = state.codegraph.snapshot || {};
 	const query = state.codegraph.search || "";
 	const items = codeGraphSearchItems(snapshot, query);
+	// A role chip is only useful if it lists something at every drill level —
+	// the canvas shows cluster cards on the overview, so the list carries it.
+	if (!query.trim() && state.codegraph.roleFilter) {
+		const roleItems = codeGraphRoleItems(snapshot, state.codegraph.roleFilter);
+		host.hidden = false;
+		host.innerHTML = roleItems.length
+			? `<p class="codegraph-tree-meta">${roleItems.length} ${escapeHtml(state.codegraph.roleFilter)} file${roleItems.length === 1 ? "" : "s"} — click one to open it</p>${roleItems.map((item) => `<button type="button" class="codegraph-tree-item" data-codegraph-search-type="${item.type}" data-codegraph-search-target="${escapeHtml(String(item.id))}"><strong>${escapeHtml(String(item.label))}</strong><small>${escapeHtml(String(item.meta))}</small></button>`).join("")}`
+			: `<p class="field-hint">No file carries the role “${escapeHtml(state.codegraph.roleFilter)}”.</p>`;
+		return;
+	}
 	if (query.trim()) {
 		host.hidden = false;
+		const server = state.codegraph.serverSearch;
+		if (server && server.term === query.trim() && Array.isArray(server.matches)) {
+			const c = server.completeness || {};
+			const omitted = Number(c.omitted) || 0;
+			const head = `<p class="codegraph-tree-meta">${server.matches.length} of ${Number(c.available || server.matches.length).toLocaleString()} matches across the whole graph${omitted ? ` · ${omitted.toLocaleString()} more` : ""}</p>`;
+			host.innerHTML = server.matches.length
+				? head + server.matches.map((m) => {
+						const label = m.symbolName ? `${m.symbolName}` : String(m.path || m.id);
+						const meta = m.symbolName
+							? `${m.kind || "symbol"} · ${m.path}:${m.line}`
+							: `${m.level}${m.role ? ` · ${m.role}` : ""}`;
+						// A symbol match drills to its file; the file is the level the
+						// canvas can actually show.
+						const target = m.level === "symbol" ? String(m.path || "") : String(m.path || m.id);
+						return `<button type="button" class="codegraph-tree-item" data-codegraph-search-type="node" data-codegraph-search-target="${escapeHtml(target)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(meta)}</small></button>`;
+					}).join("")
+				: `<p class="field-hint">Nothing in the graph matches “${escapeHtml(query)}”.</p>`;
+			return;
+		}
 		host.innerHTML = items.length
-			? `<p class="codegraph-tree-meta">${items.length}${items.length === 60 ? "+" : ""} matches</p>${items.map((item) => `<button type="button" class="codegraph-tree-item" data-codegraph-search-type="${item.type}" data-codegraph-search-target="${escapeHtml(String(item.id))}"><strong>${escapeHtml(String(item.label))}</strong><small>${escapeHtml(String(item.meta))}</small></button>`).join("")}`
+			? `<p class="codegraph-tree-meta">${items.length}${items.length === 60 ? "+" : ""} matches in the loaded view</p>${items.map((item) => `<button type="button" class="codegraph-tree-item" data-codegraph-search-type="${item.type}" data-codegraph-search-target="${escapeHtml(String(item.id))}"><strong>${escapeHtml(String(item.label))}</strong><small>${escapeHtml(String(item.meta))}</small></button>`).join("")}`
 			: `<p class="field-hint">No graph item matches “${escapeHtml(query)}”.</p>`;
+		return;
+	}
+	// A selected file gets its symbol level, which the snapshot does not carry.
+	// Gated on the selection still being that file: without this the panel stays
+	// stuck on the last file's symbols after drilling back to the overview.
+	const symbols = state.codegraph.symbolLevel;
+	const selectedPath = String(state.codegraph.selectedId || "").replace(/\\/g, "/").toLowerCase();
+	const onFileSelection = !!selectedPath && symbols?.file === selectedPath;
+	if (onFileSelection && !state.codegraph.roleFilter && Array.isArray(symbols.nodes) && symbols.nodes.length) {
+		const c = symbols.completeness || {};
+		const omitted = Number(c.omitted) || 0;
+		host.hidden = false;
+		host.innerHTML = `<p class="codegraph-tree-meta">${symbols.nodes.length} symbols in ${escapeHtml(String(symbols.file))}${omitted ? ` · ${omitted} more` : ""}</p>` +
+			symbols.nodes.map((n) => `<button type="button" class="codegraph-tree-item" data-codegraph-symbol-path="${escapeHtml(String(n.path))}" data-codegraph-symbol-line="${Number(n.line) || 1}"><strong>${escapeHtml(String(n.symbolName))}</strong><small>${escapeHtml(String(n.kind))} · line ${Number(n.line) || 0} · in ${Number(n.fanIn) || 0} / out ${Number(n.fanOut) || 0}</small></button>`).join("");
 		return;
 	}
 	const directories = Array.isArray(snapshot.directories) ? snapshot.directories : [];
@@ -4796,19 +4981,77 @@ function codeGraphNarrative() {
 }
 
 /** Map snapshot truncation reason codes to desktop-facing copy. */
+// "Showing 398 of 5,043 files, ranked by hotspotScore" beats a list of enum
+// codes: it says what is missing, how much, and on what basis it was chosen.
+function codeGraphCompletenessLines(completeness) {
+	if (!completeness || typeof completeness !== "object") return [];
+	const labels = {
+		nodes: "files on the canvas",
+		edges: "dependency edges",
+		symbols: "symbols indexed",
+		dependencies: "dependencies loaded",
+		hotspots: "hotspots",
+		orphans: "orphans",
+		flows: "process flows",
+		layerViolations: "layer violations",
+		impacts: "impact rows"
+	};
+	const rankings = {
+		hotspotScore: "most connected first",
+		path: "by path",
+		"file_path,line": "by file path",
+		"kind_priority,source_file": "by edge kind, then file path",
+		"changed_file,depth": "by changed file",
+		resolutionWeight: "strongest resolution first",
+		sinkCoverage: "widest coverage first",
+		severity: "most severe first"
+	};
+	return Object.entries(completeness)
+		.filter(([, value]) => value && typeof value === "object" && Number(value.omitted) > 0)
+		.sort((a, b) => Number(b[1].omitted) - Number(a[1].omitted))
+		.map(([key, value]) => {
+			const label = labels[key] || key;
+			const ranking = rankings[value.rankedBy] || String(value.rankedBy || "");
+			const shown = Number(value.returned).toLocaleString();
+			const total = Number(value.available).toLocaleString();
+			return `${shown} of ${total} ${label}${ranking ? ` — kept ${ranking}` : ""}`;
+		});
+}
+
 function codeGraphTruncationMessage(reasons, viewTruncated) {
 	const labels = {
 		maxHotspots: "hotspot list capped",
 		maxOrphans: "orphan list capped",
 		maxLayerViolations: "layer-violation list capped",
+		maxFlowsPerCluster: "flows per module capped",
 		maxClusters: "cluster count capped",
 		maxNodes: "node count capped",
 		maxEdges: "edge count capped",
-		couplingGraph: "coupling graph capped"
+		couplingGraph: "coupling graph capped",
+		// Reasons raised while loading the stored graph. Without these the raw
+		// enum leaked into the banner.
+		graphLoad: "the stored graph hit a load limit",
+		graphSymbols: "symbol limit reached (codegraphMaxSymbols)",
+		graphDependencies: "dependency limit reached (codegraphMaxEdges)",
+		graphImpacts: "impact limit reached"
 	};
-	const listReasons = new Set(["maxHotspots", "maxOrphans", "maxLayerViolations"]);
-	const structuralReasons = new Set(["maxClusters", "maxNodes", "maxEdges", "couplingGraph"]);
-	const codes = (reasons || []).map((r) => String(r || "").trim()).filter(Boolean);
+	const listReasons = new Set(["maxHotspots", "maxOrphans", "maxLayerViolations", "maxFlowsPerCluster"]);
+	const structuralReasons = new Set([
+		"maxClusters",
+		"maxNodes",
+		"maxEdges",
+		"couplingGraph",
+		"graphLoad",
+		"graphSymbols",
+		"graphDependencies",
+		"graphImpacts"
+	]);
+	let codes = (reasons || []).map((r) => String(r || "").trim()).filter(Boolean);
+	// graphLoad is the umbrella reason the specific graph* limits travel under;
+	// showing both just says the same thing twice.
+	if (codes.some((code) => code.startsWith("graph") && code !== "graphLoad")) {
+		codes = codes.filter((code) => code !== "graphLoad");
+	}
 	const readable = codes.map((code) => labels[code] || code);
 	const onlyLists = codes.length > 0 && codes.every((code) => listReasons.has(code));
 	const hasStructural = codes.some((code) => structuralReasons.has(code));
@@ -4820,7 +5063,7 @@ function codeGraphTruncationMessage(reasons, viewTruncated) {
 			? "Graph truncated — showing a capped subset of nodes or edges."
 			: "Some issue lists were capped for display.";
 	}
-	return `Graph truncated — ${readable.join("; ")}.`;
+	return `Showing a capped view — ${readable.join("; ")}. Counts below describe what was kept; search still reaches nodes the canvas does not draw.`;
 }
 
 function codeGraphSummaryForNode(node) {
@@ -4950,6 +5193,7 @@ async function codeGraphOpenFile(pathOrId, { neighbourhood = false } = {}) {
 	});
 	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(laid);
 	codeGraphCentreOnNode(id);
+	void codeGraphLoadSymbols(node?.path || id);
 }
 
 function codeGraphRelationLists(node) {
@@ -5346,7 +5590,16 @@ function paintCodeGraphCanvas(options = {}) {
 		const reasons = [].concat(snapshot.truncationReasons || snapshot.truncation_reasons || []).filter(Boolean);
 		const show = state.codegraph.viewTruncated || !!snapshot.truncated;
 		elements.codegraphTruncation.hidden = !show;
-		elements.codegraphTruncation.textContent = show ? codeGraphTruncationMessage(reasons, !!state.codegraph.viewTruncated) : "";
+		if (show) {
+			// Prefer the server's own account of what it kept. The reason-code
+			// sentence is the fallback for snapshots built before completeness.
+			const counted = codeGraphCompletenessLines(snapshot.completeness);
+			elements.codegraphTruncation.innerHTML = counted.length
+				? `<strong>Showing part of the graph.</strong><ul class="codegraph-completeness">${counted.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`
+				: escapeHtml(codeGraphTruncationMessage(reasons, !!state.codegraph.viewTruncated));
+		} else {
+			elements.codegraphTruncation.textContent = "";
+		}
 	}
 	renderCodeGraphBreadcrumb();
 	renderCodeGraphDepthControl();
@@ -5392,8 +5645,10 @@ function renderCodeGraph(result = {}) {
 		elements.codegraphFailed.textContent = failed ? state.codegraph.error : "";
 	}
 	if (elements.codegraphEmpty) elements.codegraphEmpty.hidden = hasSnapshot || state.codegraph.loading || !!state.codegraph.error;
+	if (elements.appShell) elements.appShell.dataset.codegraphMap = hasSnapshot ? "ready" : "idle";
 	renderCodeGraphMeaningBanner(hasSnapshot);
 	renderCodeGraphRoleLegend(hasSnapshot);
+	renderCodeGraphSourceBar(hasSnapshot);
 	renderCodeGraphRisk();
 	renderCodeGraphDirectoryTree();
 	if (elements.codegraphSearch && elements.codegraphSearch.value !== (state.codegraph.search || "")) elements.codegraphSearch.value = state.codegraph.search || "";
@@ -5417,6 +5672,7 @@ function renderCodeGraph(result = {}) {
 		if (elements.codegraphProjectStrip) elements.codegraphProjectStrip.hidden = true;
 		if (elements.codegraphMeaningBanner) elements.codegraphMeaningBanner.hidden = true;
 		if (elements.codegraphRoleLegend) elements.codegraphRoleLegend.hidden = true;
+		if (elements.codegraphSourceBar) elements.codegraphSourceBar.hidden = true;
 		if (elements.codegraphOnboarding) elements.codegraphOnboarding.hidden = true;
 		if (elements.codegraphProcesses) elements.codegraphProcesses.hidden = true;
 		if (elements.codegraphRisk) elements.codegraphRisk.hidden = true;
@@ -6751,7 +7007,12 @@ async function resumeRunFromQuery() {
 	if (state.activeRun || state.didAutoResume) return;
 	const params = new URLSearchParams(window.location.search);
 	const resumeId = params.get("run");
-	const projectPath = params.get("projectPath") || params.get("project") || "";
+	// Plain /codegraph is an orientation request, not a run request: fall back to
+	// the form's project path and open the newest saved map for it. A project
+	// with no snapshot yet still lands on the run form, unchanged.
+	const projectPath = params.get("projectPath")
+		|| params.get("project")
+		|| (state.workspace === "codegraph" ? String(elements.projectPath?.value || "").trim() : "");
 	if (!resumeId && !(state.workspace === "codegraph" && projectPath)) return;
 	state.didAutoResume = true;
 	try {
@@ -6760,8 +7021,17 @@ async function resumeRunFromQuery() {
 			watchRun(payload.data);
 		} else {
 			if (elements.projectPath) elements.projectPath.value = projectPath;
-			const payload = await request(`/api/v1/codegraph?projectPath=${encodeURIComponent(projectPath)}`);
-			if (payload.data?.run) watchRun(payload.data.run);
+			let payload = null;
+			try {
+				payload = await request(`/api/v1/codegraph?projectPath=${encodeURIComponent(projectPath)}`);
+			} catch (lookupError) {
+				// No saved map for this project is the normal first-visit case.
+				return;
+			}
+			if (payload?.data?.run) {
+				state.codegraph.openedFromSavedMap = true;
+				watchRun(payload.data.run);
+			}
 		}
 		if (params.get("focus") === "trace") {
 			window.setTimeout(() => {
@@ -7915,9 +8185,34 @@ elements.codegraphSearch?.addEventListener("input", (event) => {
 	state.codegraph.search = String(event.target.value || "");
 	renderCodeGraphDirectoryTree();
 	syncCodeGraphUrl();
+	// Client-side search can only find what was downloaded. Ask the server too,
+	// debounced, and prefer its answer when it arrives.
+	if (state.codegraph.searchTimer) window.clearTimeout(state.codegraph.searchTimer);
+	state.codegraph.searchTimer = window.setTimeout(() => {
+		void codeGraphServerSearch(state.codegraph.search);
+	}, 220);
 });
 
 elements.codegraphDirectoryTree?.addEventListener("click", (event) => {
+	const symbolItem = event.target.closest("[data-codegraph-symbol-path]");
+	if (symbolItem) {
+		// A symbol's payoff is its source, at its own line.
+		const inspector = elements.codegraphInspector;
+		if (inspector) {
+			let host = inspector.querySelector(".codegraph-source-excerpt");
+			if (!host) {
+				host = document.createElement("div");
+				host.className = "codegraph-source-excerpt";
+				inspector.prepend(host);
+			}
+			void codeGraphLoadSourceExcerpt(
+				symbolItem.dataset.codegraphSymbolPath || "",
+				Number(symbolItem.dataset.codegraphSymbolLine) || 1,
+				host
+			);
+		}
+		return;
+	}
 	const item = event.target.closest("[data-codegraph-search-target]");
 	if (!item) return;
 	const target = item.dataset.codegraphSearchTarget || "";
@@ -7930,6 +8225,20 @@ elements.codegraphDirectoryTree?.addEventListener("click", (event) => {
 		state.codegraph.search = "";
 		codeGraphOpenFile(target, { neighbourhood: false });
 	}
+});
+
+elements.codegraphRoleLegend?.addEventListener("click", (event) => {
+	const chip = event.target.closest("[data-codegraph-role]");
+	if (!chip) return;
+	toggleCodeGraphRoleFilter(chip.dataset.codegraphRole || "");
+});
+
+// Rebuild reuses the run form rather than opening a second way to start a run.
+elements.codegraphRebuild?.addEventListener("click", () => {
+	if (!elements.form) return;
+	elements.form.scrollIntoView({ behavior: "smooth", block: "center" });
+	if (typeof elements.form.requestSubmit === "function") elements.form.requestSubmit();
+	else elements.form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
 });
 
 elements.codegraphPathDirection?.addEventListener("change", (event) => {

@@ -1,0 +1,384 @@
+/**
+ * Row storage for the CodeGraph knowledge graph.
+ *
+ * The snapshot blob answers "show me everything you kept"; these tables answer
+ * "show me this part of the graph". Levels are `cluster`, `directory`, `file`
+ * and `symbol`, linked by `parent_id`, so drilling at any depth is one indexed
+ * self-join rather than a full download filtered in the browser.
+ *
+ * @see CodeGraphRepository
+ * @see CodeGraphMetricsService
+ */
+
+@singleton
+class threadsafe {
+	property name="datasource" inject="coldbox:setting:datasource";
+	property name="sqliteContentionRetry" inject="SqliteContentionRetry";
+
+	variables.levels = [ "cluster", "directory", "file", "symbol" ];
+	variables.insertChunkSize = 50;
+	// The allowlist and the SQL fragment are the same structure, so an unlisted
+	// rank cannot reach the ORDER BY clause even if the guard above it moves.
+	variables.orderings = {
+		hotspot: "hotspot DESC, path ASC",
+		fanin  : "fan_in DESC, path ASC",
+		name   : "path ASC, symbol_name ASC"
+	};
+
+	/**
+	 * Replace every stored row for a run.
+	 *
+	 * Called after the snapshot is persisted so time-to-structure does not pay
+	 * for the write. A failure here leaves the snapshot usable and the deeper
+	 * levels unavailable, which the read path reports rather than hides.
+	 */
+	void function replaceGraph( required string runId, required array nodes, required array edges ) {
+		// Bind before the closure: inside an arrow function `arguments` is the
+		// closure's own empty scope, not this method's.
+		var runIdValue = arguments.runId;
+		var nodeRows = arguments.nodes;
+		var edgeRows = arguments.edges;
+		withSqliteRetry( () => {
+			bx:transaction datasource="#datasource#" {
+				queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: runIdValue }, { datasource: datasource } );
+				queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runIdValue }, { datasource: datasource } );
+				insertNodes( runIdValue, nodeRows );
+				insertEdges( runIdValue, edgeRows );
+			}
+		}, "codegraph-graph-write" );
+	}
+
+	/**
+	 * Multi-row inserts, chunked.
+	 *
+	 * A repository of this size projects thousands of rows per run; one statement
+	 * each is thousands of round trips inside the transaction. Chunk size is set
+	 * by SQLite's bound-variable ceiling (999 on older builds), not by taste:
+	 * 50 rows x 14 columns leaves headroom. The VALUES list is built from a fixed
+	 * literal repeated per row, so every value still arrives as a bound
+	 * parameter.
+	 */
+	private void function insertNodes( required string runId, required array rows ) {
+		var rowSql = "( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )";
+		var index = 1;
+		while ( index <= arguments.rows.len() ) {
+			var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
+			var placeholders = [];
+			var params = [];
+			for ( var position = index; position <= last; position++ ) {
+				var node = arguments.rows[ position ];
+				placeholders.append( rowSql );
+				params.append( arguments.runId );
+				params.append( toString( node.id ) );
+				params.append( toString( node.level ) );
+				params.append( toString( node.parentId ?: "" ) );
+				params.append( toString( node.path ?: "" ) );
+				params.append( toString( node.symbolName ?: "" ) );
+				params.append( toString( node.kind ?: "" ) );
+				params.append( toString( node.role ?: "" ) );
+				params.append( toString( node.language ?: "" ) );
+				params.append( { value: val( node.line ?: 0 ), sqltype: "INTEGER" } );
+				params.append( { value: val( node.endLine ?: 0 ), sqltype: "INTEGER" } );
+				params.append( { value: val( node.fanIn ?: 0 ), sqltype: "INTEGER" } );
+				params.append( { value: val( node.fanOut ?: 0 ), sqltype: "INTEGER" } );
+				params.append( { value: val( node.hotspot ?: 0 ), sqltype: "DOUBLE" } );
+			}
+			queryExecute(
+				"
+					INSERT INTO codegraph_nodes (
+						run_id, node_id, level, parent_id, path, symbol_name, kind, role,
+						language, line, end_line, fan_in, fan_out, hotspot
+					) VALUES #placeholders.toList( ", " )#
+					ON CONFLICT ( run_id, node_id ) DO NOTHING
+				",
+				params,
+				{ datasource: datasource }
+			);
+			index = last + 1;
+		}
+	}
+
+	private void function insertEdges( required string runId, required array rows ) {
+		var rowSql = "( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )";
+		var index = 1;
+		while ( index <= arguments.rows.len() ) {
+			var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
+			var placeholders = [];
+			var params = [];
+			for ( var position = index; position <= last; position++ ) {
+				var edge = arguments.rows[ position ];
+				placeholders.append( rowSql );
+				params.append( arguments.runId );
+				params.append( toString( edge.id ) );
+				params.append( toString( edge.level ) );
+				params.append( toString( edge.from ) );
+				params.append( toString( edge.to ) );
+				params.append( toString( edge.groupKind ?: "" ) );
+				params.append( jsonSerialize( isArray( edge.kinds ?: "" ) ? edge.kinds : [] ) );
+				params.append( { value: val( edge.occurrences ?: 1 ), sqltype: "INTEGER" } );
+				params.append( { value: val( edge.weight ?: 0 ), sqltype: "DOUBLE" } );
+				params.append( toString( edge.resolution ?: "" ) );
+				params.append( { value: val( edge.line ?: 0 ), sqltype: "INTEGER" } );
+				params.append( left( toString( edge.evidence ?: "" ), 500 ) );
+			}
+			queryExecute(
+				"
+					INSERT INTO codegraph_edges (
+						run_id, edge_id, level, from_node, to_node, group_kind,
+						kinds_json, occurrences, weight, resolution, line, evidence
+					) VALUES #placeholders.toList( ", " )#
+					ON CONFLICT ( run_id, edge_id ) DO NOTHING
+				",
+				params,
+				{ datasource: datasource }
+			);
+			index = last + 1;
+		}
+	}
+
+	boolean function hasGraph( required string runId ) {
+		var record = queryExecute(
+			"SELECT 1 AS present FROM codegraph_nodes WHERE run_id = :runId LIMIT 1",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		return record.recordCount > 0;
+	}
+
+	/**
+	 * One level of the graph, optionally scoped to a parent.
+	 *
+	 * Returns the requested slice plus an exact `completeness` account, because
+	 * a caller cannot reason about a capped result that does not say it is one.
+	 */
+	struct function readLevel( required string runId, required struct query ) {
+		var level = normalizeLevel( arguments.query.level ?: "cluster" );
+		var scope = trim( toString( arguments.query.scope ?: "" ) );
+		var rank = lCase( trim( toString( arguments.query.rank ?: "hotspot" ) ) );
+		if ( !variables.orderings.keyExists( rank ) ) rank = "hotspot";
+		var limit = max( 1, val( arguments.query.limit ?: 200 ) );
+
+		var available = queryExecute(
+			"
+				SELECT COUNT(*) AS total FROM codegraph_nodes
+				WHERE run_id = :runId AND level = :level
+					AND ( :scope = '' OR parent_id = :scope )
+			",
+			{ runId: arguments.runId, level: level, scope: scope },
+			{ datasource: datasource }
+		);
+		var totalAvailable = val( available.total[ 1 ] ?: 0 );
+		var records = queryExecute(
+			"
+				SELECT node_id, level, parent_id, path, symbol_name, kind, role, language,
+					line, end_line, fan_in, fan_out, hotspot
+				FROM codegraph_nodes
+				WHERE run_id = :runId AND level = :level
+					AND ( :scope = '' OR parent_id = :scope )
+				ORDER BY #variables.orderings[ rank ]#
+				LIMIT :nodeLimit
+			",
+			{
+				runId    : arguments.runId,
+				level    : level,
+				scope    : scope,
+				nodeLimit: { value: limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var nodes = [];
+		var nodeIds = {};
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			nodeIds[ records.node_id[ row ] ] = true;
+			nodes.append( {
+				id        : records.node_id[ row ],
+				level     : records.level[ row ],
+				parentId  : records.parent_id[ row ],
+				path      : records.path[ row ],
+				symbolName: records.symbol_name[ row ],
+				kind      : records.kind[ row ],
+				role      : records.role[ row ],
+				language  : records.language[ row ],
+				line      : records.line[ row ],
+				endLine   : records.end_line[ row ],
+				fanIn     : records.fan_in[ row ],
+				fanOut    : records.fan_out[ row ],
+				hotspot   : records.hotspot[ row ]
+			} );
+		}
+		nodes.sort( ( a, b ) => compareNoCase( a.path & a.symbolName, b.path & b.symbolName ) );
+
+		var edges = [];
+		if ( nodes.len() && ( arguments.query.include ?: "both" ) != "nodes" ) {
+			edges = readEdgesWithin( arguments.runId, level, scope, max( 1, val( arguments.query.edgeLimit ?: 2000 ) ), nodeIds );
+		}
+		return {
+			level       : level,
+			scope       : scope,
+			nodes       : nodes,
+			edges       : edges,
+			completeness: {
+				returned : nodes.len(),
+				available: totalAvailable,
+				omitted  : max( 0, totalAvailable - nodes.len() ),
+				rankedBy : rank,
+				complete : totalAvailable <= nodes.len()
+			}
+		};
+	}
+
+	/** Server-side search reaches nodes the canvas never drew. */
+	struct function search( required string runId, required struct query ) {
+		var term = trim( toString( arguments.query.q ?: "" ) );
+		var limit = max( 1, val( arguments.query.limit ?: 50 ) );
+		if ( !len( term ) ) return { term: "", matches: [], completeness: { returned: 0, available: 0, omitted: 0, rankedBy: "hotspot", complete: true } };
+		// Escape LIKE wildcards so a term containing % or _ matches literally.
+		var like = "%" & escapeLike( lCase( term ) ) & "%";
+		var levelFilter = trim( toString( arguments.query.level ?: "" ) );
+		var available = queryExecute(
+			"
+				SELECT COUNT(*) AS total FROM codegraph_nodes
+				WHERE run_id = :runId
+					AND ( :level = '' OR level = :level )
+					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
+			",
+			{ runId: arguments.runId, level: levelFilter, term: like },
+			{ datasource: datasource }
+		);
+		var records = queryExecute(
+			"
+				SELECT node_id, level, parent_id, path, symbol_name, kind, role, line, fan_in, fan_out, hotspot
+				FROM codegraph_nodes
+				WHERE run_id = :runId
+					AND ( :level = '' OR level = :level )
+					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
+				ORDER BY hotspot DESC, path ASC, symbol_name ASC
+				LIMIT :matchLimit
+			",
+			{
+				runId     : arguments.runId,
+				level     : levelFilter,
+				term      : like,
+				matchLimit: { value: limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var matches = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			matches.append( {
+				id        : records.node_id[ row ],
+				level     : records.level[ row ],
+				parentId  : records.parent_id[ row ],
+				path      : records.path[ row ],
+				symbolName: records.symbol_name[ row ],
+				kind      : records.kind[ row ],
+				role      : records.role[ row ],
+				line      : records.line[ row ],
+				fanIn     : records.fan_in[ row ],
+				fanOut    : records.fan_out[ row ]
+			} );
+		}
+		var totalAvailable = val( available.total[ 1 ] ?: 0 );
+		return {
+			term        : term,
+			matches     : matches,
+			completeness: {
+				returned : matches.len(),
+				available: totalAvailable,
+				omitted  : max( 0, totalAvailable - matches.len() ),
+				rankedBy : "hotspot",
+				complete : totalAvailable <= matches.len()
+			}
+		};
+	}
+
+	/**
+	 * Edges whose endpoints both sit inside the requested scope.
+	 *
+	 * The scope predicate has to be in the SQL, not applied to the rows after
+	 * they come back: taking the globally strongest N edges and then keeping the
+	 * ones inside this cluster returns nothing once a repository has more than N
+	 * edges outside it. `nodeIds` stays as a final guard for the node cap, which
+	 * SQL cannot see.
+	 */
+	private array function readEdgesWithin(
+		required string runId,
+		required string level,
+		required string scope,
+		required numeric limit,
+		required struct nodeIds
+	) {
+		var records = queryExecute(
+			"
+				SELECT edge_id, level, from_node, to_node, group_kind, kinds_json,
+					occurrences, weight, resolution, line, evidence
+				FROM codegraph_edges e
+				WHERE e.run_id = :runId AND e.level = :level
+					AND EXISTS (
+						SELECT 1 FROM codegraph_nodes n
+						WHERE n.run_id = :runId AND n.level = :level AND n.node_id = e.from_node
+							AND ( :scope = '' OR n.parent_id = :scope )
+					)
+					AND EXISTS (
+						SELECT 1 FROM codegraph_nodes n
+						WHERE n.run_id = :runId AND n.level = :level AND n.node_id = e.to_node
+							AND ( :scope = '' OR n.parent_id = :scope )
+					)
+				ORDER BY weight DESC, occurrences DESC, from_node ASC, to_node ASC
+				LIMIT :edgeLimit
+			",
+			{
+				runId    : arguments.runId,
+				level    : arguments.level,
+				scope    : arguments.scope,
+				edgeLimit: { value: arguments.limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var edges = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var from = records.from_node[ row ];
+			var to = records.to_node[ row ];
+			if ( !arguments.nodeIds.keyExists( from ) || !arguments.nodeIds.keyExists( to ) ) continue;
+			edges.append( {
+				id         : records.edge_id[ row ],
+				level      : records.level[ row ],
+				from       : from,
+				to         : to,
+				kind       : records.group_kind[ row ],
+				kinds      : deserializeKinds( records.kinds_json[ row ] ),
+				occurrences: records.occurrences[ row ],
+				weight     : records.weight[ row ],
+				resolution : records.resolution[ row ],
+				line       : records.line[ row ],
+				evidence   : records.evidence[ row ]
+			} );
+		}
+		return edges;
+	}
+
+	private string function escapeLike( required string term ) {
+		var value = replace( arguments.term, "\", "\\", "all" );
+		value = replace( value, "%", "\%", "all" );
+		return replace( value, "_", "\_", "all" );
+	}
+
+	private array function deserializeKinds( required any raw ) {
+		try {
+			var parsed = jsonDeserialize( toString( arguments.raw ?: "[]" ) );
+			return isArray( parsed ) ? parsed : [];
+		} catch ( any ignored ) {
+			return [];
+		}
+	}
+
+	private string function normalizeLevel( required any value ) {
+		var level = lCase( trim( toString( arguments.value ?: "" ) ) );
+		return variables.levels.contains( level ) ? level : "cluster";
+	}
+
+	private any function withSqliteRetry( required any work, required string label ) {
+		if ( isNull( variables.sqliteContentionRetry ?: javacast( "null", "" ) ) ) return arguments.work();
+		return sqliteContentionRetry.run( arguments.work, arguments.label );
+	}
+}

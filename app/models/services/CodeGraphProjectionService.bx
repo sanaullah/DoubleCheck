@@ -1,0 +1,239 @@
+/**
+ * Projects a finished snapshot into levelled graph rows.
+ *
+ * The snapshot is file-shaped because that is what fits on a canvas. The code
+ * graph is symbol-shaped. This service derives both, plus the directory and
+ * cluster rollups between them, and links every node to its parent so the
+ * explorer can drill by query instead of by filtering a downloaded blob.
+ *
+ * Symbol edges come from `review_dependencies.source_symbol_id`, which is
+ * populated by interval containment during indexing. An edge whose source
+ * symbol is unknown stays at file level rather than being attributed to a
+ * guess.
+ *
+ * @see CodeGraphGraphRepository
+ * @see ArchitectureIndexService
+ */
+
+@singleton
+class threadsafe {
+
+	struct function project( required struct snapshot, required struct reviewGraph ) {
+		var nodes = [];
+		var edges = [];
+		var seenNodes = {};
+		var clusterOfFile = {};
+		var fileNodeIds = {};
+
+		var appendNode = ( node ) => {
+			if ( seenNodes.keyExists( node.id ) ) return;
+			seenNodes[ node.id ] = true;
+			nodes.append( node );
+		};
+
+		for ( var cluster in ( arguments.snapshot.clusters ?: [] ) ) {
+			if ( !isStruct( cluster ) ) continue;
+			var clusterId = "cluster:" & trim( toString( cluster.id ?: "" ) );
+			appendNode( {
+				id        : clusterId,
+				level     : "cluster",
+				parentId  : "",
+				path      : trim( toString( cluster.label ?: cluster.id ?: "" ) ),
+				symbolName: "",
+				kind      : "cluster",
+				role      : "",
+				language  : "",
+				line      : 0,
+				endLine   : 0,
+				fanIn     : val( cluster.crossingEdges ?: 0 ),
+				fanOut    : val( cluster.fileCount ?: 0 ),
+				hotspot   : val( cluster.fileCount ?: 0 )
+			} );
+			for ( var filePath in ( cluster.filePaths ?: [] ) ) {
+				clusterOfFile[ normalizePath( filePath ) ] = clusterId;
+			}
+		}
+
+		var directorySeen = {};
+		for ( var directory in ( arguments.snapshot.directories ?: [] ) ) {
+			if ( !isStruct( directory ) ) continue;
+			var dirPath = normalizePath( directory.path ?: "" );
+			var dirId = "dir:" & dirPath;
+			directorySeen[ dirPath ] = dirId;
+			appendNode( {
+				id        : dirId,
+				level     : "directory",
+				parentId  : "",
+				path      : dirPath,
+				symbolName: "",
+				kind      : "directory",
+				role      : "",
+				language  : "",
+				line      : 0,
+				endLine   : 0,
+				fanIn     : val( directory.fanInSum ?: 0 ),
+				fanOut    : val( directory.fanOutSum ?: 0 ),
+				hotspot   : val( directory.fileCount ?: 0 )
+			} );
+		}
+
+		for ( var node in ( arguments.snapshot.nodes ?: [] ) ) {
+			if ( !isStruct( node ) ) continue;
+			var filePath = normalizePath( node.path ?: node.id ?: "" );
+			if ( !len( filePath ) ) continue;
+			var fileId = "file:" & filePath;
+			fileNodeIds[ filePath ] = fileId;
+			// A file's parent is its cluster when it has one, so drilling a domain
+			// lists its files; otherwise its directory, so nothing is unreachable.
+			var parentId = clusterOfFile[ filePath ] ?: ( directorySeen[ normalizePath( node.dir ?: "" ) ] ?: "" );
+			appendNode( {
+				id        : fileId,
+				level     : "file",
+				parentId  : parentId,
+				path      : node.path ?: filePath,
+				symbolName: "",
+				kind      : trim( toString( node.component ?: "file" ) ),
+				role      : trim( toString( node.role ?: "" ) ),
+				language  : trim( toString( node.language ?: "" ) ),
+				line      : 0,
+				endLine   : val( node.lineCount ?: 0 ),
+				fanIn     : val( node.fanIn ?: 0 ),
+				fanOut    : val( node.fanOut ?: 0 ),
+				hotspot   : val( node.hotspotScore ?: 0 )
+			} );
+		}
+
+		var symbolIdByKey = {};
+		var symbolsByFile = {};
+		for ( var symbol in ( arguments.reviewGraph.symbols ?: [] ) ) {
+			if ( !isStruct( symbol ) ) continue;
+			var symbolFile = normalizePath( symbol.filePath ?: "" );
+			if ( !fileNodeIds.keyExists( symbolFile ) ) continue;
+			var symbolName = trim( toString( symbol.name ?: "" ) );
+			if ( !len( symbolName ) ) continue;
+			var symbolId = "symbol:" & trim( toString( symbol.id ?: ( symbolFile & "##" & symbolName ) ) );
+			symbolIdByKey[ trim( toString( symbol.id ?: "" ) ) ] = symbolId;
+			if ( !symbolsByFile.keyExists( symbolFile ) ) symbolsByFile[ symbolFile ] = {};
+			symbolsByFile[ symbolFile ][ lCase( symbolName ) ] = symbolId;
+			appendNode( {
+				id        : symbolId,
+				level     : "symbol",
+				parentId  : fileNodeIds[ symbolFile ],
+				path      : symbol.filePath ?: symbolFile,
+				symbolName: symbolName,
+				kind      : trim( toString( symbol.kind ?: "symbol" ) ),
+				role      : "",
+				language  : "",
+				line      : val( symbol.line ?: 0 ),
+				endLine   : val( symbol.endLine ?: 0 ),
+				fanIn     : 0,
+				fanOut    : 0,
+				hotspot   : 0
+			} );
+		}
+
+		for ( var edge in ( arguments.snapshot.clusterEdges ?: [] ) ) {
+			if ( !isStruct( edge ) ) continue;
+			var from = "cluster:" & trim( toString( edge.from ?: edge.source ?: "" ) );
+			var to = "cluster:" & trim( toString( edge.to ?: edge.target ?: "" ) );
+			if ( !seenNodes.keyExists( from ) || !seenNodes.keyExists( to ) || from == to ) continue;
+			edges.append( {
+				id         : edgeId( "cluster", from, to, "" ),
+				level      : "cluster",
+				from       : from,
+				to         : to,
+				groupKind  : "cluster-dependency",
+				kinds      : [],
+				occurrences: val( edge.weight ?: edge.occurrences ?: 1 ),
+				weight     : val( edge.weight ?: 0 ),
+				resolution : "",
+				line       : 0,
+				evidence   : ""
+			} );
+		}
+
+		// Holds keys for both levels; file and symbol ids cannot collide.
+		var edgeSeen = {};
+		var symbolFanIn = {};
+		var symbolFanOut = {};
+		for ( var dep in ( arguments.reviewGraph.dependencies ?: [] ) ) {
+			if ( !isStruct( dep ) ) continue;
+			var fromFile = normalizePath( dep.sourceFile ?: "" );
+			var toFile = normalizePath( dep.targetFile ?: "" );
+			if ( !fileNodeIds.keyExists( fromFile ) || !fileNodeIds.keyExists( toFile ) || fromFile == toFile ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			var fileFrom = fileNodeIds[ fromFile ];
+			var fileTo = fileNodeIds[ toFile ];
+			var fileKey = fileFrom & "|" & fileTo & "|" & kind;
+			if ( !edgeSeen.keyExists( fileKey ) ) {
+				edgeSeen[ fileKey ] = true;
+				edges.append( {
+					id         : edgeId( "file", fileFrom, fileTo, kind ),
+					level      : "file",
+					from       : fileFrom,
+					to         : fileTo,
+					groupKind  : kind,
+					kinds      : [ kind ],
+					occurrences: 1,
+					weight     : 1,
+					resolution : "path",
+					line       : val( dep.line ?: 0 ),
+					evidence   : trim( toString( dep.evidence ?: "" ) )
+				} );
+			}
+
+			var sourceSymbolId = trim( toString( dep.sourceSymbolId ?: "" ) );
+			if ( !len( sourceSymbolId ) || !symbolIdByKey.keyExists( sourceSymbolId ) ) continue;
+			var symbolFrom = symbolIdByKey[ sourceSymbolId ];
+			// An edge at the symbol level must join two symbols. When the target
+			// names no symbol in that file, the dependency is already represented
+			// by the file-level edge above — emitting a symbol-to-file edge here
+			// would break the level contract and the reader would drop it anyway.
+			var targetName = lCase( trim( toString( dep.target ?: "" ) ) );
+			var symbolTo = ( symbolsByFile[ toFile ] ?: {} )[ targetName ] ?: "";
+			if ( !len( symbolTo ) || symbolFrom == symbolTo ) continue;
+			var symbolKey = symbolFrom & "|" & symbolTo & "|" & kind;
+			if ( edgeSeen.keyExists( symbolKey ) ) continue;
+			edgeSeen[ symbolKey ] = true;
+			symbolFanOut[ symbolFrom ] = ( symbolFanOut[ symbolFrom ] ?: 0 ) + 1;
+			symbolFanIn[ symbolTo ] = ( symbolFanIn[ symbolTo ] ?: 0 ) + 1;
+			edges.append( {
+				id         : edgeId( "symbol", symbolFrom, symbolTo, kind ),
+				level      : "symbol",
+				from       : symbolFrom,
+				to         : symbolTo,
+				groupKind  : kind,
+				kinds      : [ kind ],
+				occurrences: 1,
+				weight     : 1,
+				resolution : "symbol",
+				line       : val( dep.line ?: 0 ),
+				evidence   : trim( toString( dep.evidence ?: "" ) )
+			} );
+		}
+
+		for ( var node in nodes ) {
+			if ( node.level != "symbol" ) continue;
+			node.fanIn = symbolFanIn[ node.id ] ?: 0;
+			node.fanOut = symbolFanOut[ node.id ] ?: 0;
+			node.hotspot = node.fanIn + ( 0.5 * node.fanOut );
+		}
+
+		return { nodes: nodes, edges: edges };
+	}
+
+	private string function edgeId(
+		required string level,
+		required string from,
+		required string to,
+		required string kind
+	) {
+		return arguments.level & "-" & lCase( hash( arguments.from & "|" & arguments.to & "|" & arguments.kind, "SHA-256" ) );
+	}
+
+	private string function normalizePath( required any path ) {
+		var value = lCase( replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" ) );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return value;
+	}
+}

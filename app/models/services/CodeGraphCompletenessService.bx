@@ -1,0 +1,102 @@
+/**
+ * What a snapshot kept, out of what existed, and the ordering that decided it.
+ *
+ * `truncated` says only that something was lost somewhere. Every capped
+ * collection needs its own account, or a reader cannot tell a small repository
+ * from an amputated one. This service owns that account and the ranked
+ * selection that makes truncation defensible: keeping the most connected nodes
+ * rather than the alphabetically first.
+ *
+ * @see CodeGraphMetricsService
+ */
+
+@singleton
+class threadsafe {
+
+	/**
+	 * Keep the most connected nodes, then restore path order for presentation.
+	 *
+	 * Slicing a path-sorted array deletes whole late-alphabet directories, which
+	 * is how a repository could lose everything under `tests/` or `resources/`
+	 * and report only that it was "truncated".
+	 */
+	array function rankNodes( required array nodes, required numeric limit ) {
+		var ranked = duplicate( arguments.nodes );
+		ranked.sort( ( a, b ) => {
+			var aScore = val( a.hotspotScore ?: 0 );
+			var bScore = val( b.hotspotScore ?: 0 );
+			if ( aScore != bScore ) return aScore > bScore ? -1 : 1;
+			return compareNoCase( a.path ?: "", b.path ?: "" );
+		} );
+		ranked = ranked.slice( 1, min( arguments.limit, ranked.len() ) );
+		ranked.sort( ( a, b ) => compareNoCase( a.path ?: "", b.path ?: "" ) );
+		return ranked;
+	}
+
+	/** One collection's account. */
+	struct function entry(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy
+	) {
+		var omitted = max( 0, val( arguments.available ) - val( arguments.returned ) );
+		return {
+			returned : val( arguments.returned ),
+			available: val( arguments.available ),
+			omitted  : omitted,
+			rankedBy : arguments.rankedBy,
+			complete : omitted == 0
+		};
+	}
+
+	/**
+	 * The coupling graph reports that it capped edges but not how many it
+	 * dropped, so `complete` carries the truth and `omitted` stays 0 rather than
+	 * inventing a count.
+	 */
+	struct function edges( required any graph ) {
+		var kept = arguments.graph.getEdges().len();
+		var capped = false;
+		try {
+			capped = arguments.graph.truncated();
+		} catch ( any ignored ) {
+			capped = false;
+		}
+		return {
+			returned : kept,
+			available: kept,
+			omitted  : 0,
+			rankedBy : "resolutionWeight",
+			complete : !capped
+		};
+	}
+
+	/**
+	 * The whole account for one snapshot.
+	 *
+	 * `loaded` carries what the SQL layer already measured for symbols and
+	 * dependencies — exact counts from the run summary, not estimates — so those
+	 * entries pass through rather than being recomputed less accurately here.
+	 */
+	struct function report( required struct parts ) {
+		var loaded = isStruct( arguments.parts.loaded ?: "" ) ? arguments.parts.loaded : {};
+		return {
+			nodes          : entry( arguments.parts.nodeCount, arguments.parts.availableNodes, arguments.parts.nodeRanking ),
+			edges          : edges( arguments.parts.graph ),
+			hotspots       : entry(
+				arguments.parts.hotspotCount,
+				min( arguments.parts.availableNodes, max( arguments.parts.hotspotCount, arguments.parts.orphanCandidateCount ) ),
+				"hotspotScore"
+			),
+			orphans        : entry( arguments.parts.orphanCount, arguments.parts.orphanCandidateCount, "path" ),
+			layerViolations: entry( arguments.parts.layerViolationCount, arguments.parts.layerViolationCount, "severity" ),
+			flows          : entry( arguments.parts.flowCount, arguments.parts.flowCount, "sinkCoverage" ),
+			symbols        : isStruct( loaded.symbols ?: "" )
+				? loaded.symbols
+				: entry( arguments.parts.symbolCount, arguments.parts.symbolCount, "file_path" ),
+			dependencies   : isStruct( loaded.dependencies ?: "" )
+				? loaded.dependencies
+				: entry( arguments.parts.dependencyCount, arguments.parts.dependencyCount, "kind_priority,source_file" )
+		};
+	}
+}

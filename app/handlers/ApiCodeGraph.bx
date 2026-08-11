@@ -7,6 +7,7 @@ class extends="coldbox.system.RestHandler" {
 	property name="codeGraphRunService" inject="CodeGraphRunService";
 	property name="graphRepository" inject="AnalysisGraphRepository";
 	property name="codeGraphRepository" inject="CodeGraphRepository";
+	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
 
 	property name="runService" inject="ReviewRunService";
 
@@ -209,6 +210,83 @@ class extends="coldbox.system.RestHandler" {
 		} catch ( "ValidationException" error ) {
 			validationError( event, error.message );
 		}
+	}
+
+	/**
+	 * One level of the stored knowledge graph.
+	 *
+	 * @tags CodeGraph
+	 * @hint Nodes and edges at one level (cluster, directory, file, symbol), optionally scoped to a parent node
+	 * @param-level { "name":"level", "in":"query", "required":false, "schema":{"type":"string","enum":["cluster","directory","file","symbol"]} }
+	 * @param-scope { "name":"scope", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @param-rank { "name":"rank", "in":"query", "required":false, "schema":{"type":"string","enum":["hotspot","fanIn","name"]} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-include { "name":"include", "in":"query", "required":false, "schema":{"type":"string","enum":["both","nodes"]} }
+	 * @response-200 Level payload with a completeness account
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot predates the node tables
+	 * @response-422 Validation failed
+	 */
+	function graph( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) return notFound( event );
+		var maxNodes = max( 1, val( variables.codegraphMaxNodes ?: 1500 ) );
+		if ( len( trim( toString( rc.limit ?: "" ) ) ) && ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > maxNodes ) ) {
+			return validationError( event, "limit must be between 1 and #maxNodes#" );
+		}
+		var level = lCase( trim( toString( rc.level ?: "cluster" ) ) );
+		if ( !listFindNoCase( "cluster,directory,file,symbol", level ) ) {
+			return validationError( event, "level must be cluster, directory, file, or symbol" );
+		}
+		// A snapshot written before the node tables cannot answer deeper levels.
+		// Say so, with the remedy, instead of returning an empty graph.
+		if ( !codeGraphGraphRepository.hasGraph( run.getId() ) ) {
+			return event.renderData(
+				type       = "json",
+				statusCode = 409,
+				data       = { error: { code: "snapshot_predates_node_tables", message: "This snapshot was built before levelled storage. Rebuild the map to explore below the canvas." } }
+			);
+		}
+		try {
+			var payload = codeGraphGraphRepository.readLevel( run.getId(), {
+				level  : level,
+				scope  : rc.scope ?: "",
+				rank   : rc.rank ?: "hotspot",
+				limit  : len( trim( toString( rc.limit ?: "" ) ) ) ? val( rc.limit ) : 200,
+				include: rc.include ?: "both"
+			} );
+			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/**
+	 * Server-side node search across every level.
+	 *
+	 * @tags CodeGraph
+	 * @hint Find nodes by path, symbol name, role or kind, including nodes the canvas never drew
+	 * @param-q { "name":"q", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-level { "name":"level", "in":"query", "required":false, "schema":{"type":"string","enum":["cluster","directory","file","symbol"]} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @response-200 Matches with a completeness account
+	 * @response-404 Run not found or no indexed graph
+	 * @response-422 Validation failed
+	 */
+	function search( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) return notFound( event );
+		var term = trim( toString( rc.q ?: "" ) );
+		if ( !len( term ) ) return validationError( event, "q is required" );
+		if ( len( trim( toString( rc.limit ?: "" ) ) ) && ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > 200 ) ) {
+			return validationError( event, "limit must be between 1 and 200" );
+		}
+		var payload = codeGraphGraphRepository.search( run.getId(), {
+			q    : term,
+			level: rc.level ?: "",
+			limit: len( trim( toString( rc.limit ?: "" ) ) ) ? val( rc.limit ) : 50
+		} );
+		event.renderData( type = "json", data = { data: payload } );
 	}
 
 	/**

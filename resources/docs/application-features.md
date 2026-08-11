@@ -199,6 +199,14 @@ run still completes; do not treat deterministic labels as business meaning.
 
 - Present business domains or process narratives without a successful LLM narrative
 - Replace Review findings or Modernize migration proposals
+- Mount its explorer inside Review or Modernize. Review and Modernize compute
+  coupling signals and consume them in their own surfaces; the interactive canvas
+  ships on `/codegraph` only. **This is a deliberate boundary, not a gap** —
+  CodeGraph answers "what is this, and how does a request move" before work;
+  Review answers "what did I miss" after it, and impact analysis stays Review's.
+  A CodeGraph run reuses an index any run kind already built, and
+  `/codegraph/subgraph` and `/codegraph/edges` serve any run with an indexed
+  graph; `/codegraph/narrative` stays CodeGraph-only
 
 ---
 
@@ -207,10 +215,13 @@ run still completes; do not treat deterministic labels as business meaning.
 | Area | What you get |
 |---|---|
 | Workspace | `/codegraph` UI on the same local run queue (`runKind=codegraph`) |
+| Arrival | Opening `/codegraph` loads the newest saved map for the project (`GET /api/v1/codegraph?projectPath=`) and leads with it; the map states when it was built and offers **Rebuild map**. A project with no snapshot yet still opens on the run form |
 | Scan | BoxLang/CFML/JavaScript indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`/`js`/`jsx`); bounded parser fallback is recorded |
 | Graph | Symbols + dependencies, routes, views, tables, HTTP/schedule resources; coupling metrics reuse Modernize services |
-| Roles | Per-node evidence-backed `entry` / `client` / `integration` / `orchestrator` / `domain` / `persistence` / `view` / `shared` / `test` legend |
-| Flows | Handler- and browser-seeded bounded paths in snapshot `flows[]`; route/table sinks retain typed evidence |
+| Roles | Per-node evidence-backed `entry` / `client` / `integration` / `orchestrator` / `domain` / `persistence` / `view` / `shared` / `test` legend, rendered from snapshot counts. Legend chips filter: one click dims every other role on the canvas and lists that role's files |
+| Flows | Route- and browser-seeded bounded paths in snapshot `flows[]`; each hop names the **symbol that owns the edge** (`OrderHandler.index`) or says file level; one flow per (entry, sink) with `variantCount`, selected for sink coverage rather than path depth |
+| Levels | The run is stored as rows in `codegraph_nodes` / `codegraph_edges` at `cluster` / `directory` / `file` / `symbol`, linked by `parentId`. `GET /codegraph/graph?level=&scope=` serves one level; `GET /codegraph/search?q=` finds nodes — including symbols — that the canvas never drew |
+| Completeness | Every capped collection reports `{ returned, available, omitted, rankedBy }`, and the UI prints it ("20,000 of 40,911 dependencies loaded — kept by edge kind, then file path"). Node truncation now keeps the most connected files instead of the alphabetically first |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
 | Issues | Cycles, orphans, layer violations, hotspot ranking, reachability gaps |
 | Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / swimlane / radial layouts; pan/zoom |
@@ -259,8 +270,10 @@ Do not build or claim:
 
 Verified against code, not suspected. Tracked here rather than quietly, per the
 claim rule. Historical Modernize inversion notes remain in
-[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). Active
-implementation work is [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-plan.md).
+[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). The live
+CodeGraph plan is
+[`plans/codegraph-graph-fidelity-design.md`](plans/codegraph-graph-fidelity-design.md);
+its §8 records measured results, two design corrections, and known limits.
 
 ### Capability limits — the output is thinner than the feature row implies
 
@@ -284,7 +297,6 @@ implementation work is [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-p
 |---|---|---|
 | ~~Risk / effort not exported~~ **closed** | `riskLevel`, `effortSize`, `effortDrivers` and `relatedFindingCount` now appear in the Markdown export's placement register, with a spec asserting the columns are present | Step 7 |
 | Export leads with telemetry | The Markdown export opens with run metadata and 13 lines of coverage counters — including provider shard counts — before any finding | Step 7 |
-| Coupling graph UI is CodeGraph-only | Review/Modernize still compute coupling signals; the interactive explorer ships on `/codegraph` only | CodeGraph |
 
 ### Measurement
 
@@ -319,7 +331,7 @@ promotion happen — the `measured` flag is what makes the claim honest.
 |---|---|
 | Install / config | [`readme.md`](../../readme.md) |
 | How Review / Modernize / CodeGraph are wired | [`technical-flow.md`](technical-flow.md) |
-| Active implementation work | [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-plan.md) |
+| CodeGraph plan (live; measured results + known limits) | [`plans/codegraph-graph-fidelity-design.md`](plans/codegraph-graph-fidelity-design.md) |
 | Prior Modernize inversion notes | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
 | Open issues | [`open-issues.md`](open-issues.md) |
 | Prompt contract system | [`prompt-system.md`](prompt-system.md) |

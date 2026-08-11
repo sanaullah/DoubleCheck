@@ -125,24 +125,28 @@ class threadsafe {
 						"
 							INSERT INTO review_dependencies (
 								id, run_id, source_file, content_hash, parser_version,
-								kind, target, target_file, line, evidence, end_line
+								kind, target, target_file, line, evidence, end_line,
+								source_symbol_id, source_symbol
 							) VALUES (
 								:id, :runId, :sourceFile, :contentHash, :parserVersion,
-								:kind, :target, :targetFile, :line, :evidence, :endLine
+								:kind, :target, :targetFile, :line, :evidence, :endLine,
+								:sourceSymbolId, :sourceSymbol
 							)
 						",
 						{
-							id           : edge.id,
-							runId        : arguments.runId,
-							sourceFile   : parsedFile.filePath,
-							contentHash  : parsedFile.contentHash,
-							parserVersion: parsedFile.parserVersion,
-							kind         : edge.kind,
-							target       : edge.target,
-							targetFile   : edge.targetFile ?: "",
-							line         : edge.line,
-							evidence     : edge.evidence,
-							endLine      : max( val( edge.line ?: 1 ), val( edge.endLine ?: edge.line ?: 1 ) )
+							id            : edge.id,
+							runId         : arguments.runId,
+							sourceFile    : parsedFile.filePath,
+							contentHash   : parsedFile.contentHash,
+							parserVersion : parsedFile.parserVersion,
+							kind          : edge.kind,
+							target        : edge.target,
+							targetFile    : edge.targetFile ?: "",
+							line          : edge.line,
+							evidence      : edge.evidence,
+							endLine       : max( val( edge.line ?: 1 ), val( edge.endLine ?: edge.line ?: 1 ) ),
+							sourceSymbolId: edge.sourceSymbolId ?: "",
+							sourceSymbol  : edge.sourceSymbol ?: ""
 						},
 						{ datasource: datasource }
 					);
@@ -309,8 +313,8 @@ class threadsafe {
 			);
 			queryExecute(
 				"
-					INSERT INTO review_dependencies ( id, run_id, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence )
-					SELECT id, :targetRunId, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence
+					INSERT INTO review_dependencies ( id, run_id, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol )
+					SELECT id, :targetRunId, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
 					FROM review_dependencies WHERE run_id = :sourceRunId
 				",
 				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
@@ -375,7 +379,7 @@ class threadsafe {
 		);
 		var dependencyRecords = queryExecute(
 			"
-				SELECT id, source_file, kind, target, target_file, line, end_line, evidence
+				SELECT id, source_file, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
 				FROM review_dependencies
 				WHERE run_id = :runId
 				ORDER BY
@@ -434,14 +438,16 @@ class threadsafe {
 		for ( var row = 1; row <= dependencyRecords.recordCount; row++ ) {
 			dependencies.append(
 					{
-						id        : dependencyRecords.id[ row ],
-						sourceFile: dependencyRecords.source_file[ row ],
-						kind      : dependencyRecords.kind[ row ],
-						target    : dependencyRecords.target[ row ],
-						targetFile: dependencyRecords.target_file[ row ],
-						line      : dependencyRecords.line[ row ],
-						endLine   : dependencyRecords.end_line[ row ],
-						evidence  : dependencyRecords.evidence[ row ]
+						id            : dependencyRecords.id[ row ],
+						sourceFile    : dependencyRecords.source_file[ row ],
+						kind          : dependencyRecords.kind[ row ],
+						target        : dependencyRecords.target[ row ],
+						targetFile    : dependencyRecords.target_file[ row ],
+						line          : dependencyRecords.line[ row ],
+						endLine       : dependencyRecords.end_line[ row ],
+						evidence      : dependencyRecords.evidence[ row ],
+						sourceSymbolId: dependencyRecords.source_symbol_id[ row ],
+						sourceSymbol  : dependencyRecords.source_symbol[ row ]
 					}
 				);
 		}
@@ -493,7 +499,31 @@ class threadsafe {
 				(summary.symbol_count[ 1 ] > symbols.len() ? "graphSymbols" : ""),
 				(summary.dependency_count[ 1 ] > dependencies.len() ? "graphDependencies" : ""),
 				(summary.impact_count[ 1 ] > impacts.len() ? "graphImpacts" : "")
-			].filter( ( reason ) => len( reason ) ) : []
+			].filter( ( reason ) => len( reason ) ) : [],
+			// The run summary already holds exact totals, so the loader can state
+			// what it dropped instead of only that it dropped something. Naming the
+			// ordering matters as much as the count: these LIMITs cut by file path,
+			// so what goes missing is a directory, not a sample.
+			completeness: {
+				symbols     : loadCompleteness( symbols.len(), summary.recordCount ? summary.symbol_count[ 1 ] : symbols.len(), "file_path,line" ),
+				dependencies: loadCompleteness( dependencies.len(), summary.recordCount ? summary.dependency_count[ 1 ] : dependencies.len(), "kind_priority,source_file" ),
+				impacts     : loadCompleteness( impacts.len(), summary.recordCount ? summary.impact_count[ 1 ] : impacts.len(), "changed_file,depth" )
+			}
+		};
+	}
+
+	private struct function loadCompleteness(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy
+	) {
+		var omitted = max( 0, val( arguments.available ) - val( arguments.returned ) );
+		return {
+			returned : val( arguments.returned ),
+			available: val( arguments.available ),
+			omitted  : omitted,
+			rankedBy : arguments.rankedBy,
+			complete : omitted == 0
 		};
 	}
 
@@ -532,7 +562,7 @@ class threadsafe {
 	private array function loadDependencies( required string runId, required numeric limit ) {
 		var records = queryExecute(
 			"
-				SELECT id, source_file, kind, target, target_file, line, end_line, evidence
+				SELECT id, source_file, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
 				FROM review_dependencies
 				WHERE run_id = :runId
 				ORDER BY source_file, line, kind, target
@@ -555,7 +585,9 @@ class threadsafe {
 						targetFile: records.target_file[ row ],
 						line      : records.line[ row ],
 						endLine   : records.end_line[ row ],
-						evidence  : records.evidence[ row ]
+						evidence  : records.evidence[ row ],
+						sourceSymbolId: records.source_symbol_id[ row ],
+						sourceSymbol  : records.source_symbol[ row ]
 					}
 				);
 		}
