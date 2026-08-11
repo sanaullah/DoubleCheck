@@ -107,7 +107,17 @@ class threadsafe {
 		};
 	}
 
-	/** Latest usable snapshot for the local project map entry point. */
+	/**
+	 * Latest usable snapshot for the local project map entry point.
+	 *
+	 * Deliberately laxer than `findReusableSnapshot`. Reuse must refuse a
+	 * pending narrative — adopting a row another run is still writing would
+	 * strand it. Opening the map has the opposite obligation: structure is
+	 * durable from the moment phase one writes it, and withholding it until the
+	 * optional narrative lands is exactly the wait the two-phase persist exists
+	 * to remove. A run still in progress, cancelled, or with no narrative at all
+	 * still has a map worth showing.
+	 */
 	any function findLatestProjectSnapshot( required string projectPath ) {
 		if ( !len( trim( arguments.projectPath ) ) ) return javacast( "null", "" );
 		var projectPathValue = arguments.projectPath;
@@ -120,8 +130,6 @@ class threadsafe {
 					WHERE s.project_path = :projectPath
 						AND s.snapshot_json IS NOT NULL
 						AND s.snapshot_json <> ''
-					AND ( s.narrative_json IS NULL OR s.narrative_json = '' OR s.narrative_json NOT LIKE '%""pending"":true%' )
-						AND r.status IN ( 'succeeded', 'partial', 'failed', 'cancelled' )
 					ORDER BY s.created_at DESC
 					LIMIT 1
 				",

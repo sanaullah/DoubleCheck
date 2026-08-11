@@ -28,7 +28,7 @@
 		overviewGapY: 32,
 		overviewMaxSummaryChars: 140,
 		overviewMaxSummaryLines: 2,
-		overviewTopN: 10
+		overviewTopN: 18
 	};
 
 	const LAYER_ORDER = {

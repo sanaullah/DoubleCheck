@@ -1748,6 +1748,9 @@ const elements = {
 	codegraphSourceBar: document.querySelector("#codegraph-source-bar"),
 	codegraphSourceText: document.querySelector("#codegraph-source-text"),
 	codegraphRebuild: document.querySelector("#codegraph-rebuild"),
+	codegraphDrawer: document.querySelector("#codegraph-drawer"),
+	codegraphDrawerTabs: document.querySelector("#codegraph-drawer-tabs"),
+	codegraphDrawerToggle: document.querySelector("#codegraph-drawer-toggle"),
 	appShell: document.querySelector("main.app-shell"),
 	preferencesForm: document.querySelector("#preferences-form"),
 	preferencesReset: document.querySelector("#preferences-reset"),
@@ -1944,6 +1947,8 @@ function renderSession(session) {
 
 async function loadSession() {
 	try {
+		restoreCodeGraphDrawer();
+		observeCodeGraphCanvasSize();
 		const payload = await request("/api/v1/session");
 		renderSession(payload.data);
 		await loadCapabilities();
@@ -4636,6 +4641,85 @@ function toggleCodeGraphRoleFilter(role) {
 	renderCodeGraphDirectoryTree();
 }
 
+// The drawer holds everything that explains the map. It starts closed so the
+// canvas gets the screen on arrival; the choice is remembered per workspace.
+function renderCodeGraphDrawer(hasSnapshot) {
+	const drawer = elements.codegraphDrawer;
+	if (!drawer) return;
+	drawer.hidden = !hasSnapshot;
+	if (!hasSnapshot) return;
+	const open = drawer.dataset.open === "true";
+	const active = drawer.dataset.tab || "briefing";
+	drawer.querySelectorAll("[data-cg-drawer]").forEach((tab) => {
+		tab.setAttribute("aria-selected", tab.dataset.cgDrawer === active ? "true" : "false");
+	});
+	drawer.querySelectorAll("[data-cg-panel]").forEach((panel) => {
+		panel.hidden = panel.dataset.cgPanel !== active;
+	});
+	if (elements.codegraphDrawerToggle) {
+		elements.codegraphDrawerToggle.textContent = open ? "Close" : "Open";
+		elements.codegraphDrawerToggle.setAttribute("aria-expanded", open ? "true" : "false");
+	}
+}
+
+function setCodeGraphDrawer({ tab, open } = {}) {
+	const drawer = elements.codegraphDrawer;
+	if (!drawer) return;
+	if (tab) drawer.dataset.tab = tab;
+	if (open !== undefined) drawer.dataset.open = open ? "true" : "false";
+	try {
+		window.localStorage?.setItem(
+			"codegraph.drawer",
+			JSON.stringify({ tab: drawer.dataset.tab || "briefing", open: drawer.dataset.open === "true" })
+		);
+	} catch (error) {
+		// Private mode or a blocked store is not a reason to fail the interaction.
+	}
+	renderCodeGraphDrawer(true);
+	// Opening or closing changes the canvas box, so the view has to be refit.
+	codeGraphScheduleRefit();
+}
+
+function restoreCodeGraphDrawer() {
+	const drawer = elements.codegraphDrawer;
+	if (!drawer) return;
+	let stored = null;
+	try {
+		stored = JSON.parse(window.localStorage?.getItem("codegraph.drawer") || "null");
+	} catch (error) {
+		stored = null;
+	}
+	drawer.dataset.tab = stored?.tab || "briefing";
+	drawer.dataset.open = stored?.open ? "true" : "false";
+}
+
+// The canvas is viewport-sized now, so its box changes with the window, the
+// drawer and the rail. Layout maths reads that box, so it has to be re-run.
+let codeGraphRefitTimer = null;
+function codeGraphScheduleRefit() {
+	if (codeGraphRefitTimer) window.clearTimeout(codeGraphRefitTimer);
+	codeGraphRefitTimer = window.setTimeout(() => {
+		if (!state.codegraph.snapshot || elements.codegraphWorkspace?.hidden) return;
+		paintCodeGraphCanvas({ fit: true });
+	}, 120);
+}
+
+function observeCodeGraphCanvasSize() {
+	const host = elements.codegraphCanvas;
+	if (!host || typeof ResizeObserver !== "function") return;
+	let lastWidth = 0;
+	let lastHeight = 0;
+	new ResizeObserver((entries) => {
+		const rect = entries[0]?.contentRect;
+		if (!rect) return;
+		// Sub-pixel churn during layout must not trigger a repaint loop.
+		if (Math.abs(rect.width - lastWidth) < 8 && Math.abs(rect.height - lastHeight) < 8) return;
+		lastWidth = rect.width;
+		lastHeight = rect.height;
+		codeGraphScheduleRefit();
+	}).observe(host);
+}
+
 function formatRelativeTime(value) {
 	const stamp = new Date(value);
 	if (Number.isNaN(stamp.getTime())) return "";
@@ -4864,9 +4948,11 @@ function syncCodeGraphUrl() {
 function renderCodeGraphProjectStrip(view) {
 	const host = elements.codegraphProjectStrip;
 	if (!host) return;
-	const onOverview = state.codegraph.mode === "cluster" || state.codegraph.mode === "overview";
+	// The briefing describes the project, not the current drill level, and it
+	// lives in a drawer the user opens deliberately — so it no longer disappears
+	// the moment you look at a file.
 	const snapshot = state.codegraph.snapshot;
-	if (!onOverview || !snapshot) {
+	if (!snapshot) {
 		host.hidden = true;
 		if (elements.codegraphOnboarding) elements.codegraphOnboarding.hidden = true;
 		if (elements.codegraphProcesses) elements.codegraphProcesses.hidden = true;
@@ -5538,7 +5624,9 @@ function paintCodeGraphCanvas(options = {}) {
 		view = CG.buildClusterView(viewSnapshot, {
 			maxNodes: 60,
 			overview: true,
-			topN: 10,
+			// The cap was chosen for a 594px canvas; the shell gives the graph the
+			// viewport, so more modules fit before the overview stops being legible.
+			topN: 18,
 			showAll: !!state.codegraph.overviewShowAll,
 			summaries
 		});
@@ -5649,6 +5737,7 @@ function renderCodeGraph(result = {}) {
 	renderCodeGraphMeaningBanner(hasSnapshot);
 	renderCodeGraphRoleLegend(hasSnapshot);
 	renderCodeGraphSourceBar(hasSnapshot);
+	renderCodeGraphDrawer(hasSnapshot);
 	renderCodeGraphRisk();
 	renderCodeGraphDirectoryTree();
 	if (elements.codegraphSearch && elements.codegraphSearch.value !== (state.codegraph.search || "")) elements.codegraphSearch.value = state.codegraph.search || "";
@@ -8225,6 +8314,20 @@ elements.codegraphDirectoryTree?.addEventListener("click", (event) => {
 		state.codegraph.search = "";
 		codeGraphOpenFile(target, { neighbourhood: false });
 	}
+});
+
+elements.codegraphDrawerTabs?.addEventListener("click", (event) => {
+	const toggle = event.target.closest("#codegraph-drawer-toggle");
+	if (toggle) {
+		setCodeGraphDrawer({ open: elements.codegraphDrawer?.dataset.open !== "true" });
+		return;
+	}
+	const tab = event.target.closest("[data-cg-drawer]");
+	if (!tab) return;
+	// Clicking the active tab while open closes it; otherwise switch and open.
+	const active = elements.codegraphDrawer?.dataset.tab;
+	const isOpen = elements.codegraphDrawer?.dataset.open === "true";
+	setCodeGraphDrawer({ tab: tab.dataset.cgDrawer, open: !(isOpen && active === tab.dataset.cgDrawer) });
 });
 
 elements.codegraphRoleLegend?.addEventListener("click", (event) => {

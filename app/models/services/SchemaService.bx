@@ -106,14 +106,35 @@ class threadsafe {
 			);
 		}
 
-		// Recreate fixed indexes so a partially repaired database receives the
-		// same index definitions as a clean database.
+		// A partially repaired database must end up with the same index
+		// definitions as a clean one — but rebuilding every index on every boot
+		// is not how to get there. `review_dependencies` reaches hundreds of
+		// thousands of rows on a long-lived local database, and dropping then
+		// recreating its indexes at startup is slow enough to fail under WAL
+		// contention, which surfaces as an exception page on every request.
+		//
+		// Compare the stored definition instead and only touch what differs.
+		var storedIndexes = {};
+		var indexRecords = queryExecute(
+			"SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+			{},
+			{ datasource: datasource }
+		);
+		for ( var row = 1; row <= indexRecords.recordCount; row++ ) {
+			storedIndexes[ indexRecords.name[ row ] ] = normalizeSql( indexRecords.sql[ row ] );
+		}
 		for ( var indexDefinition in arguments.definition.indexes ) {
-			queryExecute(
-				"DROP INDEX IF EXISTS #indexDefinition.name#",
-				{},
-				{ datasource: datasource }
-			);
+			var expected = normalizeSql( indexDefinition.sql );
+			if ( storedIndexes.keyExists( indexDefinition.name ) && storedIndexes[ indexDefinition.name ] == expected ) {
+				continue;
+			}
+			if ( storedIndexes.keyExists( indexDefinition.name ) ) {
+				queryExecute(
+					"DROP INDEX IF EXISTS #indexDefinition.name#",
+					{},
+					{ datasource: datasource }
+				);
+			}
 			queryExecute( indexDefinition.sql, {}, { datasource: datasource } );
 		}
 
@@ -125,6 +146,11 @@ class threadsafe {
 			);
 			queryExecute( triggerDefinition.sql, {}, { datasource: datasource } );
 		}
+	}
+
+	/** Whitespace-insensitive comparison so formatting is not a schema change. */
+	private string function normalizeSql( required any sql ) {
+		return lCase( trim( reReplace( toString( arguments.sql ?: "" ), "[[:space:]]+", " ", "all" ) ) );
 	}
 
 	private void function ensureColumn(
