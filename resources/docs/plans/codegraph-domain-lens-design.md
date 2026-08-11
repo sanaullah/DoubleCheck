@@ -105,7 +105,7 @@ Unchanged spine. Add process highlight. Edge click → evidence (shipped).
 
 **Superseded scope.** Two lines here are no longer accurate. "JS remains
 skipped" and the P2 deferral of a glossary are both overturned by
-[codegraph-depth-plan.md](codegraph-depth-plan.md) Steps 5 and 10 — JavaScript
+[codegraph-depth-plan.md](codegraph-depth-plan.md) Steps 6 and 11 — JavaScript
 becomes a parsed language, and domain labels persist across runs with
 provenance. Everything else in this document stands.
 

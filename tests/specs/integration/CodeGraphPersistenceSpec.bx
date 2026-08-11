@@ -103,6 +103,57 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				expect( isNull( codeGraphRepository.get( runId ) ) ).toBeTrue();
 			} );
 
+			it( "retains orientation edges when a dependency read is capped", () => {
+				var runId = lCase( createUUID() );
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var graphRepository = getInstance( "AnalysisGraphRepository" );
+				try {
+					runRepository.create( {
+						id: runId, tenantId: "default", projectId: "default", projectPath: "C:/codegraph-cap",
+						mode: "full", runKind: "codegraph", input: {}, baseRevision: "", headRevision: "HEAD",
+						status: "succeeded", progress: 100, currentPhase: "completed", message: "ok",
+						policy: { runKind: "codegraph" }, budgets: {}, createdAt: nowValue, updatedAt: nowValue
+					} );
+					graphRepository.replaceRunGraph(
+						runId,
+						[
+							{
+								filePath: "a/Generic.bx", contentHash: "hash-a", parserVersion: "test-v1", symbols: [],
+								dependencies: [
+									{ id: lCase( createUUID() ), kind: "calls", target: "one", targetFile: "b/One.bx", line: 1, endLine: 1, evidence: "generic one" },
+									{ id: lCase( createUUID() ), kind: "calls", target: "two", targetFile: "b/Two.bx", line: 2, endLine: 2, evidence: "generic two" }
+								]
+							},
+							{
+								filePath: "z/Client.js", contentHash: "hash-z", parserVersion: "test-v1", symbols: [],
+								dependencies: [
+									{ id: lCase( createUUID() ), kind: "calls-api", target: "/api/v1/orders", targetFile: "app/config/Router.bx", line: 10, endLine: 10, evidence: "request orders" },
+									{ id: lCase( createUUID() ), kind: "routes", target: "/api/v1/orders", targetFile: "app/handlers/Orders.bx", line: 20, endLine: 20, evidence: "orders route" }
+								]
+							}
+						],
+						[
+							{ id: lCase( createUUID() ), changedFile: "a/Generic.bx", changedSymbol: "one", impactedFile: "b/One.bx", reason: "calls", depth: 1, viaFile: "a/Generic.bx" }
+						],
+						{ parserVersion: "test-v1", filesAnalyzed: 2, parserExecutions: 2, cacheHits: 0, symbolCount: 0, dependencyCount: 4, impactCount: 1, baselineRunId: "" }
+					);
+					var defaultGraph = graphRepository.getGraph( runId );
+					expect( defaultGraph.impacts ).toHaveLength( 1 );
+
+					var graph = graphRepository.getGraph(
+						runId = runId,
+						symbolLimit = 10,
+						dependencyLimit = 2,
+						impactLimit = 10
+					);
+					expect( graph.dependencies.map( ( edge ) => edge.kind ) ).toBe( [ "calls-api", "routes" ] );
+					expect( graph.truncationReasons ).toInclude( "graphDependencies" );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
 			it( "reuses narrative by project path, revision, and cache key", () => {
 				var runIdA = lCase( createUUID() );
 				var runIdB = lCase( createUUID() );
@@ -166,6 +217,57 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					expect( isNull( codeGraphRepository.findReusableNarrative( "", "rev-9", "nk-shared" ) ) ).toBeTrue();
 				} finally {
 					queryExecute( "DELETE FROM review_runs WHERE id IN ( :a, :b )", { a: runIdA, b: runIdB } );
+				}
+			} );
+
+			it( "excludes pending structure then reuses the same finalized cancelled row", () => {
+				var runId = lCase( createUUID() );
+				var projectPath = "C:/codegraph-phase-one-" & runId;
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var runRepository = getInstance( "ReviewRunRepository" );
+				var codeGraphRepository = getInstance( "CodeGraphRepository" );
+				var snapshot = {
+					version: "codegraph-snapshot-v1",
+					fingerprint: "phase-one-fingerprint",
+					truncated: false,
+					truncationReasons: [],
+					totals: { nodes: 1, edges: 0, clusters: 1, cycles: 0 },
+					nodes: [ { id: "app/main.bx", path: "app/Main.bx" } ],
+					clusters: [ { id: "cluster-app", label: "app", filePaths: [ "app/Main.bx" ] } ],
+					clusterEdges: [], cycles: [], flows: [], hotspots: [], orphans: [], layerViolations: []
+				};
+				try {
+					runRepository.create( {
+						id: runId, tenantId: "default", projectId: "default", projectPath: projectPath,
+						mode: "full", runKind: "codegraph", input: {}, baseRevision: "", headRevision: "HEAD",
+						status: "running", progress: 60, currentPhase: "codegraph-clusters", message: "structure saved",
+						policy: { runKind: "codegraph" }, budgets: {}, createdAt: nowValue, updatedAt: nowValue
+					} );
+					codeGraphRepository.save(
+						runId = runId, snapshot = snapshot, projectPath = projectPath,
+						repositoryRevision = "rev-phase-one", narrative = { used: false, pending: true },
+						snapshotReuseKey = "reuse-phase-one"
+					);
+
+					expect( isNull( codeGraphRepository.findReusableSnapshot( projectPath, "rev-phase-one", "reuse-phase-one" ) ) ).toBeTrue();
+
+					codeGraphRepository.updateNarrative( runId, { used: false, pending: false, error: "cancelled" }, "", snapshot );
+					runRepository.updateState(
+						id = runId,
+						status = "cancelled",
+						progress = 60,
+						currentPhase = "cancelled",
+						message = "cancelled after structure",
+						completedAt = nowValue
+					);
+					var reusable = codeGraphRepository.findReusableSnapshot( projectPath, "rev-phase-one", "reuse-phase-one" );
+					expect( isNull( reusable ) ).toBeFalse();
+					expect( reusable.fingerprint ).toBe( "phase-one-fingerprint" );
+					expect( reusable.narrative.pending ).toBeFalse();
+					var rows = queryExecute( "SELECT COUNT(*) AS total FROM codegraph_snapshots WHERE run_id = :runId", { runId: runId } );
+					expect( rows.total[ 1 ] ).toBe( 1 );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
 				}
 			} );
 		} );

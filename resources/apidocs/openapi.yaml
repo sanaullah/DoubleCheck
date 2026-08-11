@@ -49,6 +49,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/CapabilitiesResponse"
 
+  /api/v1/openapi.json:
+    get:
+      tags: [Health]
+      summary: Curated OpenAPI JSON contract
+      operationId: getOpenApiJson
+      responses:
+        "200":
+          description: OpenAPI JSON document
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/openapi.yaml:
+    get:
+      tags: [Health]
+      summary: Curated OpenAPI YAML contract
+      operationId: getOpenApiYaml
+      responses:
+        "200":
+          description: OpenAPI YAML document
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /api/v1/codegraph:
+    get:
+      tags: [CodeGraph]
+      summary: Open the newest usable local CodeGraph snapshot for a project
+      operationId: getProjectCodeGraph
+      parameters:
+        - name: projectPath
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/projectId"
+      responses:
+        "200":
+          description: Project-scoped snapshot entry point with the run memento
+        "404":
+          description: No usable snapshot for the project
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Invalid project path
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /api/v1/ai/smoke:
     get:
       tags: [AI]
@@ -245,7 +297,7 @@ paths:
   /api/v1/runs/{id}/export:
     get:
       tags: [Runs]
-      summary: Export result as markdown, json, or sarif
+      summary: Export result; CodeGraph supports markdown, json, mermaid, or svg
       operationId: exportRun
       parameters:
         - $ref: "#/components/parameters/runId"
@@ -253,29 +305,26 @@ paths:
           in: query
           schema:
             type: string
-            enum: [markdown, json, sarif]
+            enum: [markdown, json, sarif, mermaid, svg]
             default: markdown
-          description: Modernize SARIF contains validation and coverage gates; it does not recast proposals as compiler/security findings.
+          description: Modernize SARIF contains validation and coverage gates; CodeGraph Mermaid/SVG exports are local structural renderings.
+        - name: flowId
+          in: query
+          schema: { type: string }
+          description: Optional CodeGraph flow id for Mermaid export; defaults to the first bounded flow.
       responses:
         "200":
           description: Exported document
         "422":
-          description: Unsupported export format, or CodeGraph export (code export_unsupported)
+          description: Unsupported export format
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
-              examples:
-                exportUnsupported:
-                  summary: CodeGraph export not available
-                  value:
-                    error:
-                      code: export_unsupported
-                      message: CodeGraph export is not available yet
 
   /api/v1/runs/{id}/codegraph/subgraph:
     get:
       tags: [CodeGraph]
-      summary: Neighbourhood subgraph around a focus file
+      summary: Neighbourhood subgraph around a focus file; any run with an indexed graph
       operationId: getCodeGraphSubgraph
       parameters:
         - $ref: "#/components/parameters/runId"
@@ -311,7 +360,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/CodeGraphSubgraphResponse"
         "404":
-          description: Run not found or not a codegraph run
+          description: Run not found or no indexed graph
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
@@ -321,12 +370,94 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /api/v1/runs/{id}/codegraph/edges:
+    get:
+      tags: [CodeGraph]
+      summary: Bounded file dependency edges for an indexed graph
+      operationId: getCodeGraphEdges
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: clusterId
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 20000, default: 2000 }
+        - name: kinds
+          in: query
+          schema: { type: string }
+        - name: include
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Bounded file edges; available for any run with an indexed graph
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CodeGraphEdgesResponse" }
+        "404":
+          description: Run not found or no indexed graph
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Limit out of range
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/runs/{id}/codegraph/paths:
+    get:
+      tags: [CodeGraph]
+      summary: Bounded directed dependency paths between graph nodes
+      operationId: getCodeGraphPaths
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: from
+          in: query
+          required: true
+          schema: { type: string }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string }
+        - name: direction
+          in: query
+          schema: { type: string, enum: [forward, reverse, any], default: forward }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 3, default: 3 }
+        - name: depth
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 12, default: 12 }
+        - name: includeTests
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Paths, with explicit unreachable versus search-cap reasons
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CodeGraphPathsResponse" }
+        "404":
+          description: Run not found or no indexed graph
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Invalid endpoints or cap
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
   /api/v1/runs/{id}/codegraph/narrative:
     post:
       tags: [CodeGraph]
       summary: Retry meaning briefing for a stored CodeGraph snapshot
       operationId: postCodeGraphNarrative
-      description: Re-runs the optional LLM narrative against the persisted snapshot without re-indexing. Returns narrative.used false when the provider is off or validation fails.
+      description: Re-runs the optional LLM narrative against the persisted CodeGraph snapshot without re-indexing. This meaning endpoint remains CodeGraph-run-only; structural graph endpoints accept any run with an indexed graph.
       parameters:
         - $ref: "#/components/parameters/runId"
         - $ref: "#/components/parameters/projectId"
@@ -345,7 +476,96 @@ paths:
                         type: object
                         additionalProperties: true
         "404":
-          description: Run not found or not a codegraph run
+          description: Run not found or not a CodeGraph run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/runs/{id}/codegraph/label:
+    put:
+      tags: [CodeGraph]
+      summary: Set a local user label for a CodeGraph cluster
+      operationId: putCodeGraphLabel
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [clusterId, label]
+              properties:
+                clusterId: { type: string }
+                label: { type: string, minLength: 1, maxLength: 160 }
+      responses:
+        "200":
+          description: User label saved
+        "404":
+          description: CodeGraph run or snapshot not found
+        "422":
+          description: Invalid cluster or label
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+    delete:
+      tags: [CodeGraph]
+      summary: Clear a local user label for a CodeGraph cluster
+      operationId: deleteCodeGraphLabel
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: clusterId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: User label cleared
+        "404":
+          description: CodeGraph run or snapshot not found
+        "422":
+          description: Invalid cluster
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /api/v1/runs/{id}/codegraph/source:
+    get:
+      tags: [CodeGraph]
+      summary: Cited local source excerpt for graph evidence
+      operationId: getCodeGraphSource
+      parameters:
+        - $ref: "#/components/parameters/runId"
+        - $ref: "#/components/parameters/projectId"
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+        - name: line
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - name: before
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 20, default: 3 }
+        - name: after
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 40, default: 12 }
+      responses:
+        "200":
+          description: Local source excerpt with line numbers
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CodeGraphSourceResponse" }
+        "404":
+          description: Run or source file not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "422":
+          description: Invalid path, line, or window cap
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
@@ -994,6 +1214,93 @@ components:
         schemaVersion: { type: string, example: codegraph-snapshot-v1 }
         narrativeVersion: { type: string, example: codegraph-narrative-v2 }
 
+    CodeGraphResult:
+      type: object
+      description: Deterministic CodeGraph snapshot. Structure is available without an AI provider.
+      properties:
+        version: { type: string, example: codegraph-snapshot-v1 }
+        fingerprint: { type: string }
+        truncated: { type: boolean }
+        truncationReasons: { type: array, items: { type: string } }
+        totals: { type: object, additionalProperties: true }
+        nodes: { type: array, items: { type: object, additionalProperties: true } }
+        clusters: { type: array, items: { type: object, additionalProperties: true } }
+        cycles: { type: array, items: { type: object, additionalProperties: true } }
+        hotspots: { type: array, items: { type: object, additionalProperties: true } }
+        orphans: { type: array, items: { type: object, additionalProperties: true } }
+        layerViolations: { type: array, items: { type: object, additionalProperties: true } }
+        directories: { type: array, items: { type: object, additionalProperties: true } }
+        roleCounts: { type: object, additionalProperties: { type: integer } }
+        flows: { type: array, items: { type: object, additionalProperties: true } }
+        unreachable: { type: array, items: { type: object, additionalProperties: true } }
+        reachability: { type: object, additionalProperties: true }
+        coChange: { type: object, additionalProperties: true, description: Bounded local Git temporal signal; degraded structural-only when unavailable. }
+        hotspotFormula: { type: string, description: Deterministic formula used for hotspotScore. }
+        narrative:
+          type: object
+          description: Optional provider-backed meaning layer; absent or used=false is a valid no-key result.
+          properties:
+            used: { type: boolean }
+            pending: { type: boolean, description: Structure persisted; optional meaning is still resolving. }
+            coverage: { type: object, additionalProperties: true, description: Included versus available evidence counts by section. }
+            trimmedSections: { type: array, items: { type: string } }
+            risk: { type: array, items: { type: object, additionalProperties: true } }
+          additionalProperties: true
+
+    CodeGraphEdgesResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [edges, truncated, totalEdges]
+          properties:
+            clusterId: { type: string }
+            truncated: { type: boolean }
+            totalEdges: { type: integer, minimum: 0 }
+            edges: { type: array, items: { type: object, additionalProperties: true } }
+
+    CodeGraphPathsResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [paths, truncated, reason]
+          properties:
+            paths:
+              type: array
+              items:
+                type: object
+                required: [hops, weight, hopCount]
+                properties:
+                  hops: { type: array, items: { type: object, additionalProperties: true } }
+                  weight: { type: number }
+                  hopCount: { type: integer, minimum: 0 }
+            truncated: { type: boolean }
+            reason: { type: string, enum: ["", unreachable, explored-cap, result-cap] }
+            exploredNodes: { type: integer, minimum: 0 }
+
+    CodeGraphSourceResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required: [available, path, focusLine, startLine, endLine, lines]
+          properties:
+            available: { type: boolean }
+            path: { type: string }
+            focusLine: { type: integer, minimum: 1 }
+            startLine: { type: integer, minimum: 1 }
+            endLine: { type: integer, minimum: 1 }
+            lines:
+              type: array
+              items:
+                type: object
+                required: [number, text, focus]
+                properties:
+                  number: { type: integer, minimum: 1 }
+                  text: { type: string }
+                  focus: { type: boolean }
+
     CodeGraphSubgraphResponse:
       type: object
       properties:
@@ -1004,7 +1311,9 @@ components:
             focus: { type: string }
             depth: { type: integer, minimum: 1 }
             truncated: { type: boolean }
-            totalNodes: { type: integer, minimum: 0 }
+            totalNodes: { type: integer, minimum: 0, deprecated: true, description: Legacy returned-node count; use graphNodes and returnedNodes. }
+            graphNodes: { type: integer, minimum: 0, description: Total graph nodes before the response cap. }
+            returnedNodes: { type: integer, minimum: 0, description: Nodes returned after the response cap. }
             totalEdges: { type: integer, minimum: 0 }
             nodes:
               type: array
@@ -1023,6 +1332,7 @@ components:
                   sourceFile: { type: string }
                   targetFile: { type: string }
                   kind: { type: string }
+                  kinds: { type: array, items: { type: string } }
                   target: { type: string }
                   line: { type: integer }
                   evidence: { type: string }
@@ -1165,7 +1475,8 @@ components:
               oneOf:
                 - $ref: "#/components/schemas/ReviewResult"
                 - $ref: "#/components/schemas/ModernizationResult"
-              description: Review findings or Modernize plan result; select by data.run.runKind
+                - $ref: "#/components/schemas/CodeGraphResult"
+              description: Review findings, Modernize plan, or CodeGraph snapshot; select by data.run.runKind
 
     ModernizationResult:
       type: object

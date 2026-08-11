@@ -5,6 +5,10 @@ JavaScript**. Analysis and SQLite run on the developer’s machine.
 LLM specialists are optional for Review; Modernize requires an enabled provider.
 CodeGraph runs without AI for structure; the Domain lens (meaning) requires a
 provider.
+The source-backed acceptance corpus lives at
+`resources/evaluation-corpus/codegraph-v1`; its TestBox spec scores route/table
+flows, bounded paths, and repeated-run label stability without promoting a
+language tier.
 
 This document describes how the system is wired. Install and product summary live in
 [`readme.md`](../../readme.md). Purpose and shipped features (Review vs Modernize)
@@ -42,7 +46,7 @@ deepen selected areas when configured.
 | Layer | Deterministic engineering | Agent / LLM (optional) |
 |---|---|---|
 | Discovery | Git scoping, file indexing, language filtering | — |
-| Structure | BoxLang + CFML parsers, dependency graph, architecture facts | Optional fact enrichment with citation checks |
+| Structure | BoxLang AST-first parser with regex fallback, CFML parser, bounded JavaScript parser, dependency graph, architecture facts | Optional fact enrichment with citation checks |
 | Planning | Role selection, budgets, context packs, policy | Optional crew planner (roles + briefs) |
 | Findings | High-confidence rules (secrets, SQL interpolation, …) | Semantic review by specialist role |
 | Trust | Evidence must match indexed source; authorized spans; fingerprints | Proposes candidates; must pass deterministic validation |
@@ -66,7 +70,8 @@ ReviewRunService          ← orchestrates one run end-to-end
         │    └─ ModernizationRepository (plans, checkpoints, decisions)
         ├─ RepositoryScannerService / GitRepositoryService
         ├─ ArchitectureIndexService
-        │    → BoxLangParserService / CfmlParserService → graph DB
+        │    → BoxLangParserService / CfmlParserService / JavaScriptParserService → graph DB
+        ├─ CodeGraphRunService (routes/resources, roles, flows, reachability, paths)
         ├─ ArchitectureModelService (+ optional Enrichment)
         ├─ CrewPlannerService (LLM roles + briefs when AI on)
         ├─ ReviewPlannerService + ContextPackService
@@ -170,6 +175,7 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | GET | `/api/v1/session` | ApiSession | Local session / principal |
 | GET | `/api/v1/projects` | ApiProjects | Local project list |
 | GET | `/api/v1/projects/tree` | ApiProjects | Project path tree |
+| GET | `/api/v1/codegraph` | ApiCodeGraph | Newest usable CodeGraph snapshot for a project path |
 | GET | `/api/v1/workers` | ApiWorkers | Worker registry |
 | GET | `/api/v1/quality` | ApiQuality | Seeded evaluation gate |
 | GET | `/api/v1/history` | ApiHistory | Review + Modernize + CodeGraph history (`runKind` filter) |
@@ -177,7 +183,7 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | GET/POST | `/api/v1/runs` | ApiRuns | List / **create run** |
 | GET/DELETE | `/api/v1/runs/:id` | ApiRuns | Status / cancel |
 | GET | `/api/v1/runs/:id/result` | ApiRuns | Final payload |
-| GET | `/api/v1/runs/:id/export` | ApiRuns | Review: Markdown / JSON / SARIF; Modernize: Markdown / JSON / SARIF; CodeGraph: 422 `export_unsupported` |
+| GET | `/api/v1/runs/:id/export` | ApiRuns | Review/Modernize: Markdown / JSON / SARIF; CodeGraph: Markdown / JSON / Mermaid / SVG |
 | POST | `/api/v1/runs/:id/rerun` | ApiRuns | Rerun from prior input |
 | POST | `/api/v1/runs/:id/follow-up` | ApiRuns | Review-only follow-up |
 | PUT | `/api/v1/runs/:id/findings/:fingerprint/review` | ApiRuns | Finding decision overlay |
@@ -204,6 +210,11 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | Method | Path | Handler | Role |
 |---|---|---|---|
 | GET | `/api/v1/runs/:id/codegraph/subgraph` | ApiCodeGraph | Neighbourhood drill-down (`focus`, `depth`, `limit`) |
+| GET | `/api/v1/runs/:id/codegraph/edges` | ApiCodeGraph | Bounded file edges, optional cluster/kind filter |
+| GET | `/api/v1/runs/:id/codegraph/paths` | ApiCodeGraph | Bounded directed/reverse/any paths with hop evidence |
+| GET | `/api/v1/runs/:id/codegraph/source` | ApiCodeGraph | Cited local source excerpt, bounded to the indexed run root |
+| POST | `/api/v1/runs/:id/codegraph/narrative` | ApiCodeGraph | Retry optional CodeGraph meaning layer |
+| PUT/DELETE | `/api/v1/runs/:id/codegraph/label` | ApiCodeGraph | Persist or clear a local user module label |
 
 ### Providers & settings
 
@@ -231,8 +242,11 @@ UI create path: `app.js` → `POST /api/v1/runs` → open SSE on `/events`.
 routes, then branches after the shared scan into `ModernizationRunService`.
 
 `runKind=codegraph` follows the same pattern into `CodeGraphRunService`
-(index → metrics/clusters/roles/flows → optional narrative v2 → persist). Export
-is stubbed 422 until a real exporter exists.
+(parser-compatible Review graph adoption when available → index fallback →
+metrics/clusters/roles/flows → persist structure → optional narrative v2 →
+update narrative). Export is local through `ReportExportService`; Markdown and
+JSON carry the snapshot, Mermaid renders a bounded flow, and SVG renders a
+bounded node canvas.
 
 ```mermaid
 sequenceDiagram
@@ -264,8 +278,8 @@ sequenceDiagram
 ## One CodeGraph run
 
 CodeGraph is a separate run kind on the same local run queue. It builds a
-deterministic CF/BoxLang knowledge-graph snapshot (nodes with `role`, clusters,
-handler-seeded `flows[]`, issues) and optionally asks an LLM for a Domain lens
+deterministic CF/BoxLang/JavaScript knowledge-graph snapshot (nodes with `role`, clusters,
+handler/browser-seeded `flows[]`, issues) and optionally asks an LLM for a Domain lens
 briefing. Unlike Modernize, the run is **not** provider-gated — no key still
 yields complete structure; the UI shows a meaning banner when narrative is absent.
 
@@ -280,19 +294,30 @@ Phases after the shared scan:
 | 90 | `codegraph-persist` | — |
 | 100 | `completed` | `codegraph.completed` |
 
-Services: `CodeGraphRunService` (pipeline), `CodeGraphInventoryAdapter` +
-`CodeGraphMetricsService` (deterministic snapshot — roles on nodes, `flows[]`
-from handler actions; reuses `ModernizationCouplingGraphService` /
+Services: `CodeGraphRunService` (pipeline; structure is persisted before optional meaning), `CodeGraphInventoryAdapter` +
+`CodeGraphMetricsService` (deterministic snapshot — roles on nodes, routes/resources,
+reachability, bounded co-change/churn, `flows[]` from handler/browser actions; reuses `ModernizationCouplingGraphService` /
 `ModernizationDerivedStructureService`), `CodeGraphNarrativeService` (optional
 Domain lens via `codegraph-narrative-v2`: pitch, domains, processes, onboarding,
 risk + backward-compatible summaries; soft-fails without mutating snapshot),
-`CodeGraphRepository` (SQLite `codegraph_snapshots`).
+`CodeGraphRepository` (SQLite `codegraph_snapshots`, per-cluster
+`codegraph_narrative_shards`, and project-scoped `codegraph_labels`). Narrative
+shards are keyed by stable member composition plus cluster fingerprint; labels
+survive runs but a bounded startup sweep removes rows for missing local project
+paths. Payload paths are project-relative before optional provider egress, and
+the narrative reports section coverage and trimmed sections.
 
 Result payload lives under `data.result.codegraph` via `CodeGraphRunService.getResult()`
-(nodes, clusters, `flows[]`, hotspots, narrative — **no** raw edge list; `flows`
-default `[]` when absent from snapshot). Subgraph drill-down:
+(nodes, clusters, directories, `flows[]`, hotspots, cycles, orphans,
+layer violations, narrative — **no** raw edge list; `flows` default `[]` when
+absent from snapshot). Subgraph drill-down:
 `GET /api/v1/runs/:id/codegraph/subgraph`. File edges:
-`GET /api/v1/runs/:id/codegraph/edges`.
+`GET /api/v1/runs/:id/codegraph/edges`; bounded paths:
+`GET /api/v1/runs/:id/codegraph/paths`. The explorer offers cluster, layer,
+swimlane, and radial layouts. Cited-edge source windows use
+`GET /api/v1/runs/:id/codegraph/source`; paths are repository-relative,
+size/line bounded, and source text is not persisted. Git history remains local
+and degrades to structural-only when unavailable.
 
 ---
 
@@ -308,7 +333,7 @@ Modes: `full` (default), `working-tree`, `revision-diff`.
 | Phase | Service(s) | What happens |
 |---|---|---|
 | `indexing` | `RepositoryScannerService`, `GitRepositoryService` | Discover files for the selected mode; **skip counts** (`oversized`, `limit`, …) and `discoveryTruncated` persist on the run result, UI, export, and coverage assessment |
-| `architecture-index` | `ArchitectureIndexService`, `BoxLangParserService`, `CfmlParserService` | Build symbol/dependency graph for supported BoxLang and CFML sources |
+| `architecture-index` | `ArchitectureIndexService`, `BoxLangParserService`, `CfmlParserService`, `JavaScriptParserService` | Build symbol/dependency graph for supported BoxLang, CFML, and JavaScript sources |
 | `architecture-planning` | `ArchitectureModelService`, enrichment/diff, `CrewPlannerService`, `ReviewPlannerService`, `ContextPackService` | Architecture facts + plan + context budgets; deterministic roles get **`emphasizeFiles`** without LLM; context packs prefer **changed-line** ranges when Git supplies them (`symbol-range-artifact-refs-v3`) |
 | `deterministic-analysis` | `FindingService.deterministic` | **Language-scoped** rule packs (shared, JavaScript, CFML/BoxLang); no AI key required |
 | `specialist-review` | `SpecialistReviewService` → gateway → chat; or `AIReviewService` fallback | Optional LLM deepening |

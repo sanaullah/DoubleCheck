@@ -16,10 +16,13 @@ class threadsafe {
 	property name="maxFlows" inject="coldbox:setting:codegraphNarrativeMaxFlows";
 	property name="maxCycles" inject="coldbox:setting:codegraphNarrativeMaxCycles";
 	property name="maxPromptCharacters" inject="coldbox:setting:codegraphNarrativeMaxCharacters";
+	property name="sectionReserve" inject="coldbox:setting:codegraphNarrativeSectionReserve";
 	property name="log" inject="logbox:logger:{this}";
 	property name="secretRedactionService" inject="SecretRedactionService";
 	property name="promptCompiler" inject="PromptCompiler";
 	property name="promptOutputValidator" inject="PromptOutputValidator";
+	property name="codeGraphRepository" inject="CodeGraphRepository";
+	property name="narrativeNormalizer" inject="CodeGraphNarrativeNormalizer";
 
 	variables.narrativeVersion = "codegraph-narrative-v2";
 	variables.maxClusters = 24;
@@ -27,10 +30,16 @@ class threadsafe {
 	variables.maxFlows = 24;
 	variables.maxCycles = 12;
 	variables.maxPromptCharacters = 30000;
+	variables.sectionReserve = 1200;
 
 	boolean function isEnabled() {
 		var resolved = aiProviderResolver.resolve();
 		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	/** True when the repository can persist per-cluster narrative shards. */
+	boolean function usesShards() {
+		return hasShardRepository();
 	}
 
 	string function cacheKey( required struct snapshot, string projectPath = "" ) {
@@ -45,14 +54,15 @@ class threadsafe {
 	 * Produce an optional narrative blob for a deterministic snapshot.
 	 * Does not mutate arguments.snapshot.
 	 */
-	struct function narrate( required struct snapshot ) {
-		return enrich( arguments.snapshot );
+	struct function narrate( required struct snapshot, string projectPath = "", boolean reuseShards = true ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		if ( clusters.len() && len( trim( arguments.projectPath ) ) && hasShardRepository() ) {
+			return narrateSharded( arguments.snapshot, arguments.projectPath, arguments.reuseShards );
+		}
+		return narrateSingle( arguments.snapshot, arguments.projectPath );
 	}
 
-	/**
-	 * ArchitectureEnrichmentService-shaped entry point.
-	 */
-	struct function enrich( required struct snapshot ) {
+	private struct function narrateSingle( required struct snapshot, string projectPath = "" ) {
 		var resolved = aiProviderResolver.resolve();
 		var empty = disabledResult( resolved, "" );
 		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ) {
@@ -62,11 +72,11 @@ class threadsafe {
 		var evidence = {};
 		var payload = {};
 		try {
-			evidence = buildEvidenceContext( arguments.snapshot );
+			evidence = buildEvidenceContext( arguments.snapshot, arguments.projectPath );
 			if ( !evidence.hasEvidence ) {
 				return disabledResult( resolved, "" );
 			}
-			payload = buildPayload( resolved, arguments.snapshot, evidence );
+			payload = buildPayload( resolved, arguments.snapshot, evidence, arguments.projectPath );
 			evidence.validationContext = payload.validationContext;
 		} catch ( any compileError ) {
 			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
@@ -125,8 +135,14 @@ class threadsafe {
 					);
 				}
 			}
-			var normalized = normalize( response, evidence );
-			return mergeNarrativeResult( resolved, normalized, activePackage.provenance, attempts, true, "" );
+			var normalizer = isNull( variables.narrativeNormalizer ?: javacast( "null", "" ) )
+				? new app.models.services.CodeGraphNarrativeNormalizer()
+				: variables.narrativeNormalizer;
+			var normalized = normalizer.normalize( response, evidence );
+			return mergeNarrativeResult( resolved, normalized, activePackage.provenance, attempts, true, "", true, {
+				coverage       : payload.coverage ?: {},
+				trimmedSections: payload.trimmedSections ?: []
+			} );
 		} catch ( any error ) {
 			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
 				log.error(
@@ -148,6 +164,149 @@ class threadsafe {
 				false,
 				trim( toString( error.message ?: "CodeGraph narrative unavailable" ) )
 			);
+		}
+	}
+
+	/** Per-cluster narrative shards keep unchanged domain names stable across commits. */
+	private struct function narrateSharded( required struct snapshot, required string projectPath, boolean reuseShards = true ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var maxClusterCount = max( 1, int( numericSetting( variables.maxClusters, 24 ) ) );
+		var combined = {
+			used            : false,
+			enabled         : true,
+			version         : variables.narrativeVersion,
+			provider        : "",
+			model           : "",
+			error           : "",
+			pitch           : {},
+			domains         : [],
+			processes       : [],
+			onboarding      : [],
+			risk            : [],
+			summaries       : [],
+			promptProvenance: { shards: [] },
+			attempts        : 0,
+			coverage        : {
+				clusters: { included: 0, available: 0 },
+				hotspots: { included: 0, available: 0 },
+				flows   : { included: 0, available: 0 },
+				cycles  : { included: 0, available: 0 }
+			},
+			trimmedSections : []
+		};
+		var failures = [];
+		if ( clusters.len() > maxClusterCount ) combined.trimmedSections.append( "clusters" );
+		for ( var index = 1; index <= min( clusters.len(), maxClusterCount ); index++ ) {
+			var cluster = clusters[ index ];
+			if ( !isStruct( cluster ) ) continue;
+			var key = "";
+			var fingerprint = "";
+			try {
+				key = codeGraphRepository.clusterKey( cluster );
+				fingerprint = codeGraphRepository.clusterFingerprint( cluster );
+			} catch ( any shardContractError ) {
+				return narrateSingle( arguments.snapshot, arguments.projectPath );
+			}
+			var piece = javacast( "null", "" );
+			var reused = false;
+			if ( arguments.reuseShards ) {
+				try {
+					piece = codeGraphRepository.findNarrativeShard( arguments.projectPath, key, fingerprint );
+					reused = !isNull( piece ) && isStruct( piece ) && ( piece.used ?: false );
+				} catch ( any cacheError ) {
+					piece = javacast( "null", "" );
+				}
+			}
+			if ( !reused ) {
+				piece = narrateSingle( shardSnapshot( arguments.snapshot, cluster ), arguments.projectPath );
+				if ( isStruct( piece ) && ( piece.used ?: false ) ) {
+					try { codeGraphRepository.saveNarrativeShard( arguments.projectPath, key, fingerprint, piece ); } catch ( any saveError ) {}
+				}
+			}
+			if ( !isStruct( piece ) || !( piece.used ?: false ) ) {
+				if ( isStruct( piece ) && len( trim( toString( piece.error ?: "" ) ) ) ) failures.append( piece.error );
+				continue;
+			}
+			combined.used = true;
+			combined.provider = combined.provider ?: piece.provider ?: "";
+			combined.model = combined.model ?: piece.model ?: "";
+			combined.attempts += val( piece.attempts ?: 0 );
+			combined.promptProvenance.shards.append( { clusterKey: key, reused: reused, provenance: piece.promptProvenance ?: {} } );
+			appendNarrativeItems( combined.domains, piece.domains ?: [], "clusterId" );
+			appendNarrativeItems( combined.processes, piece.processes ?: [], "flowId" );
+			appendNarrativeItems( combined.onboarding, piece.onboarding ?: [], "refId" );
+			appendNarrativeItems( combined.risk, piece.risk ?: [], "refId" );
+			appendNarrativeItems( combined.summaries, piece.summaries ?: [], "clusterId" );
+			if ( !combined.pitch.count() && isStruct( piece.pitch ?: "" ) ) combined.pitch = duplicate( piece.pitch );
+			mergeCoverage( combined.coverage, piece.coverage ?: {} );
+			for ( var section in ( piece.trimmedSections ?: [] ) ) if ( !combined.trimmedSections.contains( section ) ) combined.trimmedSections.append( section );
+		}
+		combined.coverage.clusters.available = clusters.len();
+		combined.coverage.clusters.included = min( combined.coverage.clusters.included, clusters.len() );
+		for ( var section in [ "hotspots", "flows", "cycles" ] ) {
+			var available = isArray( arguments.snapshot[ section ] ?: "" ) ? arguments.snapshot[ section ].len() : 0;
+			combined.coverage[ section ].available = available;
+			combined.coverage[ section ].included = min( combined.coverage[ section ].included, available );
+		}
+		if ( failures.len() ) combined.error = "Some narrative shards were unavailable";
+		if ( !combined.used && !failures.len() ) return narrateSingle( arguments.snapshot, arguments.projectPath );
+		return combined;
+	}
+
+	private struct function shardSnapshot( required struct snapshot, required struct cluster ) {
+		var snapshotValue = arguments.snapshot;
+		var clusterValue = arguments.cluster;
+		var clusterIdValue = toString( clusterValue.id ?: "" );
+		var members = {};
+		for ( var path in ( isArray( clusterValue.filePaths ?: "" ) ? clusterValue.filePaths : [] ) ) members[ normalizePath( path ) ] = true;
+		var shard = duplicate( snapshotValue );
+		shard.clusters = [ clusterValue ];
+		shard.nodes = ( isArray( snapshotValue.nodes ?: "" ) ? snapshotValue.nodes : [] ).filter( ( node ) => isStruct( node ) && ( toString( node.clusterId ?: "" ) == clusterIdValue || members.keyExists( normalizePath( node.path ?: node.id ?: "" ) ) ) );
+		shard.hotspots = ( isArray( snapshotValue.hotspots ?: "" ) ? snapshotValue.hotspots : [] ).filter( ( item ) => isStruct( item ) && ( toString( item.clusterId ?: "" ) == clusterIdValue || members.keyExists( normalizePath( item.path ?: item.id ?: "" ) ) ) );
+		shard.flows = ( isArray( snapshotValue.flows ?: "" ) ? snapshotValue.flows : [] ).filter( ( flow ) => {
+			if ( !isStruct( flow ) ) return false;
+			for ( var step in ( isArray( flow.steps ?: "" ) ? flow.steps : [] ) ) if ( members.keyExists( normalizePath( step ) ) ) return true;
+			return false;
+		} );
+		shard.cycles = ( isArray( snapshotValue.cycles ?: "" ) ? snapshotValue.cycles : [] ).filter( ( cycle ) => {
+			if ( !isArray( cycle ) ) return false;
+			for ( var member in cycle ) if ( members.keyExists( normalizePath( member ) ) ) return true;
+			return false;
+		} );
+		return shard;
+	}
+
+	private void function appendNarrativeItems( required array target, required array items, required string idField ) {
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var id = trim( toString( item[ arguments.idField ] ?: "" ) );
+			var itemKey = id;
+			if ( arguments.idField == "refId" ) itemKey = lCase( trim( toString( item.refType ?: "" ) ) ) & ":" & id;
+			var alreadyPresent = false;
+			for ( var existing in arguments.target ) {
+				var existingId = trim( toString( existing[ arguments.idField ] ?: "" ) );
+				var existingKey = existingId;
+				if ( arguments.idField == "refId" ) existingKey = lCase( trim( toString( existing.refType ?: "" ) ) ) & ":" & existingId;
+				if ( existingKey == itemKey && len( id ) ) alreadyPresent = true;
+			}
+			if ( !alreadyPresent ) arguments.target.append( duplicate( item ) );
+		}
+	}
+
+	private void function mergeCoverage( required struct target, required struct source ) {
+		for ( var section in [ "clusters", "hotspots", "flows", "cycles" ] ) {
+			var row = isStruct( arguments.source[ section ] ?: "" ) ? arguments.source[ section ] : {};
+			arguments.target[ section ].included += val( row.included ?: 0 );
+			arguments.target[ section ].available += val( row.available ?: 0 );
+		}
+	}
+
+	private boolean function hasShardRepository() {
+		if ( isNull( variables.codeGraphRepository ?: javacast( "null", "" ) ) ) return false;
+		try {
+			return len( trim( toString( variables.codeGraphRepository.clusterKey( { id: "codegraph-shard-probe", filePaths: [] } ) ) ) ) > 0;
+		} catch ( any ignored ) {
+			return false;
 		}
 	}
 
@@ -173,7 +332,8 @@ class threadsafe {
 		required numeric attempts,
 		required boolean used,
 		required string error,
-		boolean enabled = true
+		boolean enabled = true,
+		struct metadata = {}
 	) {
 		return {
 			used             : arguments.used,
@@ -190,184 +350,12 @@ class threadsafe {
 			summaries        : isArray( arguments.content.summaries ?: "" ) ? arguments.content.summaries : [],
 			promptProvenance : arguments.promptProvenance,
 			attempts         : arguments.attempts
+			,coverage        : arguments.metadata.coverage ?: {}
+			,trimmedSections : arguments.metadata.trimmedSections ?: []
 		};
 	}
 
-	/**
-	 * Keep only v2 narrative items that cite ids present in the snapshot.
-	 */
-	private struct function normalize( required any response, required struct evidence ) {
-		var parsed = parseResponse( arguments.response );
-		if ( !isStruct( parsed ) ) return emptyNarrativeContent();
-
-		var allowedClusters = listToLookup( arguments.evidence.validationContext.allowedClusterIds ?: [] );
-		var allowedNodes = listToLookup( arguments.evidence.validationContext.allowedNodeIds ?: [] );
-		var allowedFlows = listToLookup( arguments.evidence.validationContext.allowedFlowIds ?: [] );
-		var allowedHotspots = listToLookup( arguments.evidence.validationContext.allowedHotspotIds ?: [] );
-		var allowedCycles = listToLookup( arguments.evidence.validationContext.allowedCycleIds ?: [] );
-
-		var pitch = {};
-		if ( isStruct( parsed.pitch ?: "" ) && len( trim( parsed.pitch.text ?: "" ) ) ) {
-			pitch = { text: left( trim( parsed.pitch.text ), 600 ) };
-		}
-
-		var domains = normalizeDomains( parsed.domains ?: [], allowedClusters );
-		var processes = normalizeProcesses( parsed.processes ?: [], allowedFlows );
-		var onboarding = normalizeOnboarding(
-			parsed.onboarding ?: [],
-			allowedClusters,
-			allowedNodes,
-			allowedFlows
-		);
-		var risk = normalizeRisk( parsed.risk ?: [], allowedHotspots, allowedCycles );
-		var summaries = [];
-		if ( domains.len() ) {
-			for ( var domain in domains ) {
-				summaries.append( {
-					clusterId : domain.clusterId,
-					title     : domain.title,
-					text      : domain.text
-				} );
-			}
-		}
-
-		return {
-			pitch      : pitch,
-			domains    : domains,
-			processes  : processes,
-			onboarding : onboarding,
-			risk       : risk,
-			summaries  : summaries
-		};
-	}
-
-	private any function parseResponse( required any response ) {
-		if ( isStruct( arguments.response ) ) return arguments.response;
-		if ( isSimpleValue( arguments.response ) ) {
-			try {
-				return jsonDeserialize( arguments.response );
-			} catch ( any ignored ) {
-				return {};
-			}
-		}
-		return {};
-	}
-
-	private array function normalizeDomains( required array items, required struct allowedClusters ) {
-		var out = [];
-		var seen = {};
-		for ( var candidate in arguments.items ) {
-			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
-			var clusterId = trim( toString( candidate.clusterId ?: "" ) );
-			if ( !len( clusterId ) || !arguments.allowedClusters.keyExists( clusterId ) ) continue;
-			if ( seen.keyExists( clusterId ) ) continue;
-			seen[ clusterId ] = true;
-			out.append( {
-				clusterId : clusterId,
-				title     : left( trim( candidate.title ?: "" ), 120 ),
-				text      : left( trim( candidate.text ), 800 )
-			} );
-		}
-		return out;
-	}
-
-	private array function normalizeProcesses( required array items, required struct allowedFlows ) {
-		var out = [];
-		var seen = {};
-		for ( var candidate in arguments.items ) {
-			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
-			var flowId = trim( toString( candidate.flowId ?: "" ) );
-			if ( !len( flowId ) || !arguments.allowedFlows.keyExists( flowId ) ) continue;
-			if ( seen.keyExists( flowId ) ) continue;
-			seen[ flowId ] = true;
-			out.append( {
-				flowId : flowId,
-				title  : left( trim( candidate.title ?: "" ), 120 ),
-				text   : left( trim( candidate.text ), 800 )
-			} );
-		}
-		return out;
-	}
-
-	private array function normalizeOnboarding(
-		required array items,
-		required struct allowedClusters,
-		required struct allowedNodes,
-		required struct allowedFlows
-	) {
-		var out = [];
-		var seen = {};
-		for ( var candidate in arguments.items ) {
-			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
-			var refType = lCase( trim( toString( candidate.refType ?: "" ) ) );
-			var refId = trim( toString( candidate.refId ?: "" ) );
-			if ( !len( refId ) ) continue;
-			if ( refType == "cluster" && !arguments.allowedClusters.keyExists( refId ) ) continue;
-			if ( refType == "node" && !arguments.allowedNodes.keyExists( refId ) ) continue;
-			if ( refType == "flow" && !arguments.allowedFlows.keyExists( refId ) ) continue;
-			if ( !listFindNoCase( "cluster,node,flow", refType ) ) continue;
-			var step = isNumeric( candidate.step ?: "" ) ? max( 1, min( 5, int( val( candidate.step ) ) ) ) : out.len() + 1;
-			var key = refType & ":" & refId & ":" & step;
-			if ( seen.keyExists( key ) ) continue;
-			seen[ key ] = true;
-			out.append( {
-				step    : step,
-				refType : refType,
-				refId   : refId,
-				text    : left( trim( candidate.text ), 400 )
-			} );
-		}
-		out.sort( ( a, b ) => a.step > b.step ? 1 : ( a.step < b.step ? -1 : 0 ) );
-		if ( out.len() > 5 ) out = out.slice( 1, 5 );
-		return out;
-	}
-
-	private array function normalizeRisk(
-		required array items,
-		required struct allowedHotspots,
-		required struct allowedCycles
-	) {
-		var out = [];
-		var seen = {};
-		for ( var candidate in arguments.items ) {
-			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
-			var refType = lCase( trim( toString( candidate.refType ?: "" ) ) );
-			var refId = trim( toString( candidate.refId ?: "" ) );
-			if ( !len( refId ) ) continue;
-			if ( refType == "hotspot" && !arguments.allowedHotspots.keyExists( refId ) ) continue;
-			if ( refType == "cycle" && !arguments.allowedCycles.keyExists( refId ) ) continue;
-			if ( !listFindNoCase( "hotspot,cycle", refType ) ) continue;
-			var key = refType & ":" & refId;
-			if ( seen.keyExists( key ) ) continue;
-			seen[ key ] = true;
-			out.append( {
-				refType : refType,
-				refId   : refId,
-				text    : left( trim( candidate.text ), 600 )
-			} );
-		}
-		return out;
-	}
-
-	private array function normalizeSummaries( required array items, required struct allowedClusters ) {
-		var out = [];
-		var seen = {};
-		for ( var candidate in arguments.items ) {
-			if ( !isStruct( candidate ) || !len( trim( candidate.text ?: "" ) ) ) continue;
-			var clusterId = trim( toString( candidate.clusterId ?: "" ) );
-			if ( !len( clusterId ) || !arguments.allowedClusters.keyExists( clusterId ) ) continue;
-			if ( seen.keyExists( clusterId ) ) continue;
-			seen[ clusterId ] = true;
-			out.append( {
-				clusterId : clusterId,
-				title     : left( trim( candidate.title ?: "" ), 120 ),
-				text      : left( trim( candidate.text ), 800 )
-			} );
-		}
-		return out;
-	}
-
-	private struct function buildEvidenceContext( required struct snapshot ) {
+	private struct function buildEvidenceContext( required struct snapshot, string projectPath = "" ) {
 		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
 		var nodes = isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [];
 		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
@@ -378,15 +366,18 @@ class threadsafe {
 		return {
 			hasEvidence  : clusters.len() || hotspots.len() || flows.len() || cycleRecords.len(),
 			cycleRecords : cycleRecords,
-			roleCounts   : roleCountsFromNodes( nodes )
+			roleCounts   : roleCountsFromNodes( nodes ),
+			projectPath  : arguments.projectPath
 		};
 	}
 
 	private struct function buildPayload(
 		required struct resolved,
 		required struct snapshot,
-		required struct evidence
+		required struct evidence,
+		string projectPath = ""
 	) {
+		var projectPathValue = arguments.projectPath;
 		var maxClusterCount = numericSetting( variables.maxClusters, 24 );
 		var maxHotspotCount = numericSetting( variables.maxHotspots, 20 );
 		var maxFlowCount = numericSetting( variables.maxFlows, 24 );
@@ -396,16 +387,22 @@ class threadsafe {
 			? max( 1024, int( val( arguments.resolved.contextWindow ) ) )
 			: 128000;
 		maximumCharacters = min( maximumCharacters, max( 1000, int( window * .75 * 2 ) ) );
+		var sectionBudgets = sectionBudgetMap( maximumCharacters );
 
 		var clusterRecords = [];
 		var hotspotRecords = [];
 		var flowRecords = [];
 		var cycleRecords = [];
-		var characters = 0;
+		var trimmedSections = [];
+		var sectionCharacters = { clusters: 0, hotspots: 0, flows: 0, cycles: 0 };
 
 		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
 		for ( var cluster in clusters ) {
-			if ( !isStruct( cluster ) || clusterRecords.len() >= maxClusterCount ) break;
+			if ( !isStruct( cluster ) ) continue;
+			if ( clusterRecords.len() >= maxClusterCount ) {
+				trimmedSections.append( "clusters" );
+				break;
+			}
 			var paths = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
 			var samplePaths = [];
 			for ( var pathIndex = 1; pathIndex <= min( 6, paths.len() ); pathIndex++ ) {
@@ -418,20 +415,27 @@ class threadsafe {
 				symbolCount  : val( cluster.symbolCount ?: 0 ),
 				cohesion     : cluster.cohesion ?: "",
 				crossingEdges: val( cluster.crossingEdges ?: 0 ),
-				filePaths    : samplePaths
+				filePaths    : samplePaths.map( ( path ) => relativePath( path, projectPathValue ) )
 			};
 			var encoded = jsonSerialize( record );
-			if ( characters + len( encoded ) > maximumCharacters ) break;
+			if ( sectionCharacters.clusters + len( encoded ) > sectionBudgets.clusters ) {
+				appendTrimmedSection( trimmedSections, "clusters" );
+				break;
+			}
 			clusterRecords.append( record );
-			characters += len( encoded );
+			sectionCharacters.clusters += len( encoded );
 		}
 
 		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
 		for ( var hotspot in hotspots ) {
-			if ( !isStruct( hotspot ) || hotspotRecords.len() >= maxHotspotCount ) break;
+			if ( !isStruct( hotspot ) ) continue;
+			if ( hotspotRecords.len() >= maxHotspotCount ) {
+				trimmedSections.append( "hotspots" );
+				break;
+			}
 			var record = {
-				id           : hotspot.id ?: hotspot.path ?: "",
-				path         : hotspot.path ?: hotspot.id ?: "",
+				id           : relativePath( hotspot.id ?: hotspot.path ?: "", projectPathValue ),
+				path         : relativePath( hotspot.path ?: hotspot.id ?: "", projectPathValue ),
 				hotspotScore : hotspot.hotspotScore ?: "",
 				fanIn        : val( hotspot.fanIn ?: 0 ),
 				fanOut       : val( hotspot.fanOut ?: 0 ),
@@ -439,47 +443,66 @@ class threadsafe {
 				inCycle      : hotspot.inCycle ?: false
 			};
 			var encoded = jsonSerialize( record );
-			if ( characters + len( encoded ) > maximumCharacters ) break;
+			if ( sectionCharacters.hotspots + len( encoded ) > sectionBudgets.hotspots ) {
+				appendTrimmedSection( trimmedSections, "hotspots" );
+				break;
+			}
 			hotspotRecords.append( record );
-			characters += len( encoded );
+			sectionCharacters.hotspots += len( encoded );
 		}
 
 		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
 		for ( var flow in flows ) {
-			if ( !isStruct( flow ) || flowRecords.len() >= maxFlowCount ) break;
+			if ( !isStruct( flow ) ) continue;
+			if ( flowRecords.len() >= maxFlowCount ) {
+				trimmedSections.append( "flows" );
+				break;
+			}
 			var steps = isArray( flow.steps ?: "" ) ? flow.steps : [];
 			var sampleSteps = [];
 			for ( var stepIndex = 1; stepIndex <= min( 8, steps.len() ); stepIndex++ ) {
-				sampleSteps.append( steps[ stepIndex ] );
+				sampleSteps.append( relativePath( steps[ stepIndex ], arguments.projectPath ) );
 			}
 			var record = {
 				id          : flow.id ?: "",
-				entryFile   : flow.entryFile ?: "",
+				entryFile   : relativePath( flow.entryFile ?: "", arguments.projectPath ),
 				entrySymbol : flow.entrySymbol ?: "",
-				sinkFile    : flow.sinkFile ?: "",
-				steps       : sampleSteps
+				sinkFile    : relativePath( flow.sinkFile ?: "", arguments.projectPath ),
+				steps       : sampleSteps,
+				stepSymbols : isArray( flow.stepSymbols ?: "" ) ? flow.stepSymbols : [],
+				sinkKind    : flow.sinkKind ?: "unknown",
+				routeId     : flow.routeId ?: ""
 			};
 			var encoded = jsonSerialize( record );
-			if ( characters + len( encoded ) > maximumCharacters ) break;
+			if ( sectionCharacters.flows + len( encoded ) > sectionBudgets.flows ) {
+				appendTrimmedSection( trimmedSections, "flows" );
+				break;
+			}
 			flowRecords.append( record );
-			characters += len( encoded );
+			sectionCharacters.flows += len( encoded );
 		}
 
 		for ( var cycle in ( arguments.evidence.cycleRecords ?: [] ) ) {
-			if ( cycleRecords.len() >= maxCycleCount ) break;
+			if ( cycleRecords.len() >= maxCycleCount ) {
+				trimmedSections.append( "cycles" );
+				break;
+			}
 			var members = isArray( cycle.members ?: "" ) ? cycle.members : [];
 			var sampleMembers = [];
 			for ( var memberIndex = 1; memberIndex <= min( 12, members.len() ); memberIndex++ ) {
-				sampleMembers.append( members[ memberIndex ] );
+				sampleMembers.append( relativePath( members[ memberIndex ], arguments.projectPath ) );
 			}
 			var record = {
 				id      : cycle.id ?: "",
 				members : sampleMembers
 			};
 			var encoded = jsonSerialize( record );
-			if ( characters + len( encoded ) > maximumCharacters ) break;
+			if ( sectionCharacters.cycles + len( encoded ) > sectionBudgets.cycles ) {
+				appendTrimmedSection( trimmedSections, "cycles" );
+				break;
+			}
 			cycleRecords.append( record );
-			characters += len( encoded );
+			sectionCharacters.cycles += len( encoded );
 		}
 
 		var compiled = getCompiler().compile(
@@ -506,6 +529,13 @@ class threadsafe {
 			messages           : compiled.messages,
 			provenance         : compiled.provenance,
 			promptPackage      : compiled,
+			coverage           : {
+				clusters: { included: clusterRecords.len(), available: clusters.len() },
+				hotspots: { included: hotspotRecords.len(), available: hotspots.len() },
+				flows   : { included: flowRecords.len(), available: flows.len() },
+				cycles  : { included: cycleRecords.len(), available: arguments.evidence.cycleRecords.len() }
+			},
+			trimmedSections   : trimmedSections,
 			validationContext  : validationContextFromRecords(
 				clusterRecords,
 				hotspotRecords,
@@ -592,6 +622,45 @@ class threadsafe {
 
 	private string function cycleId( required array members ) {
 		return "cycle-" & left( lCase( hash( arguments.members.toList( "|" ), "SHA-256" ) ), 8 );
+	}
+
+	private string function relativePath( required any path, string projectPath = "" ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		if ( !len( value ) ) return "";
+		var root = replace( trim( toString( arguments.projectPath ?: "" ) ), "\", "/", "all" );
+		while ( len( root ) > 1 && right( root, 1 ) == "/" ) root = left( root, len( root ) - 1 );
+		if ( len( root ) && ( lCase( value ) == lCase( root ) || left( lCase( value ), len( root ) + 1 ) == lCase( root & "/" ) ) ) {
+			return mid( value, len( root ) + 2, len( value ) );
+		}
+		if ( reFindNoCase( "^[A-Za-z]:/", value ) || left( value, 1 ) == "/" ) {
+			var markers = [ "app/", "public/", "tests/", "resources/", "config/", "modules/" ];
+			var best = 0;
+			for ( var marker in markers ) {
+				var found = findNoCase( "/" & marker, value );
+				if ( found && ( !best || found < best ) ) best = found + 1;
+			}
+			if ( best ) return mid( value, best, len( value ) );
+			return "<external>/" & listLast( value, "/" );
+		}
+		return value;
+	}
+
+	private struct function sectionBudgetMap( required numeric maximumCharacters ) {
+		var reserve = numericSetting( variables.sectionReserve, 1200 );
+		var sectionCount = 4;
+		var minimum = min( reserve, max( 1, int( arguments.maximumCharacters / sectionCount ) ) );
+		var remaining = max( 0, arguments.maximumCharacters - ( minimum * sectionCount ) );
+		var weights = { clusters: 0.35, hotspots: 0.2, flows: 0.3, cycles: 0.15 };
+		return {
+			clusters: int( minimum + ( remaining * weights.clusters ) ),
+			hotspots: int( minimum + ( remaining * weights.hotspots ) ),
+			flows   : int( minimum + ( remaining * weights.flows ) ),
+			cycles  : max( minimum, arguments.maximumCharacters - int( minimum + ( remaining * weights.clusters ) ) - int( minimum + ( remaining * weights.hotspots ) ) - int( minimum + ( remaining * weights.flows ) ) )
+		};
+	}
+
+	private void function appendTrimmedSection( required array sections, required string section ) {
+		if ( !arguments.sections.contains( arguments.section ) ) arguments.sections.append( arguments.section );
 	}
 
 	private struct function roleCountsFromNodes( required array nodes ) {

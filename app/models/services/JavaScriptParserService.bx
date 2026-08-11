@@ -1,0 +1,104 @@
+/**
+ * Bounded, dependency-free JavaScript parser for CodeGraph and Review's
+ * architecture index. It intentionally reads syntax we can cite with a line
+ * number; bundler/runtime resolution stays out of scope.
+ */
+@singleton
+class {
+	variables.parserVersion = "javascript-symbol-parser-v3";
+	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
+
+	string function getVersion() {
+		return variables.parserVersion;
+	}
+
+	boolean function supports( required struct file ) {
+		return arguments.file.language == "JavaScript";
+	}
+
+	struct function parse( required struct file ) {
+		var symbols = [];
+		var dependencies = [];
+		var lines = isArray( arguments.file.lines ?: "" ) ? arguments.file.lines : [];
+		for ( var lineNumber = 1; lineNumber <= lines.len(); lineNumber++ ) {
+			var sourceLine = toString( lines[ lineNumber ] ?: "" );
+			var trimmed = trim( sourceLine );
+			if ( !len( trimmed ) || reFind( "^(//|/\*|\*)", trimmed ) ) continue;
+
+			var importMatch = match( "^\s*import\s+(?:[^;]*?\s+from\s+)?[""']([^""']+)[""']", sourceLine );
+			if ( importMatch.find() ) {
+				dependencies.append( dependency( "imports", importMatch.group( 1 ), lineNumber, sourceLine ) );
+			}
+			var requireMatch = match( "\brequire\s*\(\s*[""']([^""']+)[""']", sourceLine );
+			while ( requireMatch.find() ) dependencies.append( dependency( "imports", requireMatch.group( 1 ), lineNumber, sourceLine ) );
+
+			var classMatch = match( "^\s*(?:export\s+default\s+|export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)", sourceLine );
+			if ( classMatch.find() ) symbols.append( symbol( "class", classMatch.group( 1 ), lineNumber, sourceLine ) );
+
+			var functionMatch = match( "^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(", sourceLine );
+			if ( functionMatch.find() ) symbols.append( symbol( "function", functionMatch.group( 1 ), lineNumber, sourceLine ) );
+			var constFunctionMatch = match( "^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:function|\([^)]*\)\s*=>)", sourceLine );
+			if ( constFunctionMatch.find() ) symbols.append( symbol( "function", constFunctionMatch.group( 1 ), lineNumber, sourceLine ) );
+
+			if ( reFindNoCase( "\b(?:fetch|request)\s*\(", sourceLine ) ) {
+				var matches = appendApiDependencies( dependencies, sourceLine, lineNumber );
+				if ( matches == 0 ) {
+					var requestWindow = sourceLine;
+					for ( var offset = 1; offset <= 2 && lineNumber + offset <= lines.len(); offset++ ) {
+						requestWindow &= " " & toString( lines[ lineNumber + offset ] ?: "" );
+					}
+					appendApiDependencies( dependencies, requestWindow, lineNumber );
+				}
+			}
+
+			var callMatch = match( "\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\(", sourceLine );
+			while ( callMatch.find() ) {
+				var target = callMatch.group( 1 );
+				if ( !listFindNoCase( "if,for,while,switch,catch,function,new,return,throw,fetch,request,require,describe,it,test", listLast( target, "." ) ) ) {
+					dependencies.append( dependency( "calls", target, lineNumber, sourceLine ) );
+				}
+			}
+		}
+
+		return {
+			parserVersion: variables.parserVersion,
+			parseStrategy: "regex",
+			symbols      : symbols,
+			dependencies : dependencies
+		};
+	}
+
+	private struct function symbol( required string kind, required string name, required numeric line, required string evidence ) {
+		return { kind: arguments.kind, name: arguments.name, line: arguments.line, endLine: arguments.line, evidence: left( trim( arguments.evidence ), 500 ) };
+	}
+
+	private struct function dependency( required string kind, required string target, required numeric line, required string evidence ) {
+		return { kind: arguments.kind, target: arguments.target, line: arguments.line, endLine: arguments.line, evidence: left( trim( arguments.evidence ), 500 ) };
+	}
+
+	/**
+	 * Record direct fetches plus DoubleCheck's request() wrapper. Template
+	 * expressions become the same :id token used by normalized server routes.
+	 */
+	private numeric function appendApiDependencies( required array dependencies, required string sourceLine, required numeric lineNumber ) {
+		var before = arguments.dependencies.len();
+		var literalMatch = match( "\b(?:fetch|request)\s*\(\s*[""']([^""']+)[""']", arguments.sourceLine );
+		while ( literalMatch.find() ) appendApiDependency( arguments.dependencies, literalMatch.group( 1 ), arguments.lineNumber, arguments.sourceLine );
+
+		var templateMatch = match( "\b(?:fetch|request)\s*\(\s*`([^`]*)`", arguments.sourceLine );
+		while ( templateMatch.find() ) appendApiDependency( arguments.dependencies, templateMatch.group( 1 ), arguments.lineNumber, arguments.sourceLine );
+		return arguments.dependencies.len() - before;
+	}
+
+	private void function appendApiDependency( required array dependencies, required string rawEndpoint, required numeric lineNumber, required string sourceLine ) {
+		var endpoint = reReplace( trim( arguments.rawEndpoint ), "\$\{[^}]+\}", ":id", "all" );
+		endpoint = reReplace( endpoint, "\?.*$", "" );
+		if ( left( endpoint, len( "/api/v1/" ) ) == "/api/v1/" ) {
+			arguments.dependencies.append( dependency( "calls-api", endpoint, arguments.lineNumber, arguments.sourceLine ) );
+		}
+	}
+
+	private any function match( required string expression, required string source ) {
+		return variables.sourceScanner.matcher( arguments.expression, arguments.source, false );
+	}
+}

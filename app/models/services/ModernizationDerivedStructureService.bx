@@ -58,12 +58,12 @@ class threadsafe {
 	 * When the provider roadmap is skipped (cost/time), still emit mapped phases
 	 * from retained target/route ids so the Solution Road is usable.
 	 */
-	public array function deriveClusters( required any graph, required array units, array scopePaths = [] ) {
+	public array function deriveClusters( required any graph, required array units, array scopePaths = [], struct coChangeWeights = {} ) {
 		var nodes = arguments.graph.getNodes();
 		if ( !nodes.len() ) return clusterUnitsForArchitecture( arguments.units, arguments.scopePaths );
 
 		// --- communities from weighted modularity ----------------------------
-		var affinity = buildAffinityGraph( arguments.graph, nodes );
+		var affinity = buildAffinityGraph( arguments.graph, nodes, arguments.coChangeWeights );
 		var community = louvainCommunities( affinity );
 		community = mergeCycleCommunities( arguments.graph, community );
 
@@ -351,7 +351,7 @@ class threadsafe {
 	 * utility call merges two unrelated domains. Weighting lets a single call
 	 * across a boundary be outvoted by dense coupling inside one.
 	 */
-	private struct function buildAffinityGraph( required any graph, required array nodes ) {
+	private struct function buildAffinityGraph( required any graph, required array nodes, struct coChangeWeights = {} ) {
 		var adjacency = {};
 		for ( var node in arguments.nodes ) adjacency[ node.id ] = {};
 
@@ -383,6 +383,20 @@ class threadsafe {
 			if ( touching.len() > variables.maxCoAccessFanout ) continue;
 			for ( var a = 1; a <= touching.len(); a++ ) {
 				for ( var b = a + 1; b <= touching.len(); b++ ) link( touching[ a ], touching[ b ], variables.sharedScopeWeight );
+			}
+		}
+
+		// Optional temporal evidence. Structural coupling remains the default;
+		// this term is deliberately small and normalized by commit fan-out so a
+		// sweeping commit cannot manufacture a domain boundary.
+		var nodeByKey = {};
+		for ( var node in arguments.nodes ) nodeByKey[ lCase( replace( trim( toString( node.id ?: "" ) ), "\\", "/", "all" ) ) ] = node.id;
+		for ( var sourceKey in arguments.coChangeWeights ) {
+			var sourceId = nodeByKey[ lCase( replace( sourceKey, "\\", "/", "all" ) ) ] ?: "";
+			if ( !len( sourceId ) ) continue;
+			for ( var targetKey in ( isStruct( arguments.coChangeWeights[ sourceKey ] ?: "" ) ? arguments.coChangeWeights[ sourceKey ] : {} ) ) {
+				var targetId = nodeByKey[ lCase( replace( targetKey, "\\", "/", "all" ) ) ] ?: "";
+				if ( len( targetId ) && sourceId != targetId ) link( sourceId, targetId, max( 0, val( arguments.coChangeWeights[ sourceKey ][ targetKey ] ?: 0 ) ) );
 			}
 		}
 

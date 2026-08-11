@@ -6,7 +6,7 @@ class extends="testbox.system.BaseSpec" {
 			it( "emits the phase/progress/event sequence and succeeds with clusters when narrative is disabled", () => {
 				var service = new app.models.services.CodeGraphRunService();
 				var indexed = { called: false, files: [] };
-				var saved = { called: false, narrative: {} };
+				var saved = { saveCount: 0, updateCount: 0, initialNarrative: {}, finalNarrative: {} };
 				var transitions = [];
 				var events = [];
 
@@ -40,9 +40,13 @@ class extends="testbox.system.BaseSpec" {
 				service.metricsService = new app.models.services.CodeGraphMetricsService();
 				service.codeGraphRepository = {
 					save: ( runId, snapshot, projectPath, repositoryRevision, narrativeCacheKey, narrative ) => {
-						saved.called = true;
+						saved.saveCount++;
 						saved.snapshot = snapshot;
-						saved.narrative = narrative;
+						saved.initialNarrative = narrative;
+					},
+					updateNarrative: ( runId, narrative, narrativeCacheKey, snapshot ) => {
+						saved.updateCount++;
+						saved.finalNarrative = narrative;
 					}
 				};
 				service.eventService = {
@@ -93,8 +97,10 @@ class extends="testbox.system.BaseSpec" {
 
 				expect( result.status ).toBe( "succeeded" );
 				expect( indexed.called ).toBeTrue();
-				expect( saved.called ).toBeTrue();
-				expect( saved.narrative.used ?: true ).toBeFalse();
+				expect( saved.saveCount ).toBe( 1 );
+				expect( saved.updateCount ).toBe( 1 );
+				expect( saved.initialNarrative.used ?: true ).toBeFalse();
+				expect( saved.finalNarrative.used ?: true ).toBeFalse();
 				expect( result.narrative.used ?: true ).toBeFalse();
 				expect( isArray( result.snapshot.clusters ?: "" ) ).toBeTrue();
 				expect( result.snapshot.clusters.len() ).toBeGTE( 1 );
@@ -120,6 +126,209 @@ class extends="testbox.system.BaseSpec" {
 					"codegraph.clusters",
 					"codegraph.narrative"
 				] );
+			} );
+
+			it( "reuses full-git snapshots before indexing", () => {
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+				var calls = { indexed: false, reuseKey: "" };
+				service.architectureIndexService = {
+					parserVersionFor: ( files ) => "boxlang-ast-parser-v3",
+					index: ( runId, files ) => {
+						calls.indexed = true;
+						return {};
+					}
+				};
+				service.codeGraphRepository.findReusableSnapshot = ( projectPath, revision, reuseKey ) => {
+					calls.reuseKey = reuseKey;
+					return {
+						runId: "source-codegraph-run",
+						snapshot: { version: "codegraph-snapshot-v1", fingerprint: "reused", totals: {}, nodes: [], clusters: [] },
+						narrative: { used: false }
+					};
+				};
+
+				var result = service.execute(
+					new tests.resources.ScriptedModernizationRun( "run-cg-reuse", "codegraph", getTempDirectory() ),
+					{ scope: "full-git", files: [ { filePath: "app/A.bx", language: "BoxLang" } ], repositoryRevision: "rev-reuse" },
+					{ checkCancellation: () => false }
+				);
+
+				expect( result.status ).toBe( "succeeded" );
+				expect( result.reused ).toBeTrue();
+				expect( result.snapshot.fingerprint ).toBe( "reused" );
+				expect( len( calls.reuseKey ) ).toBeGT( 0 );
+				expect( calls.indexed ).toBeFalse();
+				expect( persisted.saveCount ).toBe( 1 );
+			} );
+
+			it( "reuses a clean full project before repository scanning", () => {
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+				var adopted = {};
+				service.codegraphSnapshotReuseEnabled = true;
+				service.architectureIndexService = { parserVersionSignature: () => "all-parser-v1" };
+				service.gitRepositoryService = {
+					workingTreePaths: ( root, maxEntries ) => { return { available: true, paths: [], truncated: false }; },
+					inspect: ( root ) => { return { available: true, repositoryRevision: "clean-head" }; }
+				};
+				service.graphRepository.adoptRunGraph = ( sourceRunId, targetRunId ) => {
+					adopted.source = sourceRunId;
+					adopted.target = targetRunId;
+				};
+				service.codeGraphRepository.findReusableSnapshot = ( projectPath, revision, reuseKey ) => {
+					return {
+						runId: "source-run",
+						narrativeCacheKey: "narrative-key",
+						snapshot: { version: "codegraph-snapshot-v1", fingerprint: "pre-scan", totals: { files: 2 }, nodes: [], clusters: [] },
+						narrative: { used: false }
+					};
+				};
+				var run = {
+					getId: () => "target-run",
+					getMode: () => "full",
+					getInput: () => ( {} ),
+					getProjectPath: () => getTempDirectory()
+				};
+
+				var result = service.reuseBeforeScan( run );
+
+				expect( result.reused ).toBeTrue();
+				expect( result.repositoryRevision ).toBe( "clean-head" );
+				expect( adopted ).toBe( { source: "source-run", target: "target-run" } );
+				expect( persisted.saveCount ).toBe( 1 );
+			} );
+
+			it( "skips snapshot reuse when the working tree is dirty", () => {
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+				var reuseLookups = 0;
+				service.gitRepositoryService = {
+					workingTreePaths: ( root, maxEntries ) => { return { available: true, paths: [ root.getPath() & "/dirty.bx" ], truncated: false }; },
+					commitFilePairs: () => { return { available: false, commits: [], reason: "disabled" }; }
+				};
+				service.codeGraphRepository.findReusableSnapshot = () => { reuseLookups++; return javacast( "null", "" ); };
+
+				var result = service.execute(
+					new tests.resources.ScriptedModernizationRun( "run-cg-dirty", "codegraph", getTempDirectory() ),
+					{ scope: "full-git", files: [], repositoryRevision: "rev-dirty" },
+					{ checkCancellation: () => false }
+				);
+
+				expect( result.status ).toBe( "succeeded" );
+				expect( reuseLookups ).toBe( 0 );
+				expect( persisted.saveCount ).toBe( 1 );
+			} );
+
+			it( "changes the pre-scan reuse key when any parser version changes", () => {
+				var keys = [];
+				for ( var signature in [ "all-parser-v1", "all-parser-v2" ] ) {
+					var service = executableService( { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} } );
+					service.codegraphSnapshotReuseEnabled = true;
+					service.architectureIndexService = { parserVersionSignature: () => signature };
+					service.gitRepositoryService = {
+						workingTreePaths: () => { return { available: true, paths: [], truncated: false }; },
+						inspect: () => { return { available: true, repositoryRevision: "same-head" }; }
+					};
+					service.codeGraphRepository.findReusableSnapshot = ( projectPath, revision, reuseKey ) => {
+						keys.append( reuseKey );
+						return javacast( "null", "" );
+					};
+					service.reuseBeforeScan( {
+						getId: () => "target-#signature#",
+						getMode: () => "full",
+						getInput: () => ( {} ),
+						getProjectPath: () => getTempDirectory()
+					} );
+				}
+
+				expect( keys ).toHaveLength( 2 );
+				expect( keys[ 1 ] ).notToBe( keys[ 2 ] );
+			} );
+
+			it( "treats a non-git project as a normal cache miss", () => {
+				var service = executableService( { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} } );
+				var reuseLookups = 0;
+				service.codegraphSnapshotReuseEnabled = true;
+				service.gitRepositoryService = {
+					workingTreePaths: () => { return { available: false, paths: [], truncated: false }; },
+					inspect: () => { return { available: false, repositoryRevision: "" }; }
+				};
+				service.codeGraphRepository.findReusableSnapshot = () => { reuseLookups++; return javacast( "null", "" ); };
+
+				var result = service.reuseBeforeScan( {
+					getId: () => "non-git-run",
+					getMode: () => "full",
+					getInput: () => ( {} ),
+					getProjectPath: () => getTempDirectory()
+				} );
+
+				expect( result.reused ).toBeFalse();
+				expect( reuseLookups ).toBe( 0 );
+			} );
+
+			it( "keeps one complete structure row when narrative fails", () => {
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+				service.narrativeService = {
+					isEnabled: () => true,
+					usesShards: () => false,
+					cacheKey: ( snapshot, projectPath ) => "narrative-failure-key",
+					narrate: ( snapshot, projectPath ) => {
+						throw( type = "ProviderException", message = "provider down" );
+					}
+				};
+				service.codeGraphRepository.findReusableNarrative = () => javacast( "null", "" );
+
+				var result = service.execute(
+					new tests.resources.ScriptedModernizationRun( "run-cg-provider-fail", "codegraph", getTempDirectory() ),
+					{ scope: "working-tree", files: [], repositoryRevision: "" },
+					{ checkCancellation: () => false }
+				);
+
+				expect( result.status ).toBe( "succeeded" );
+				expect( persisted.saveCount ).toBe( 1 );
+				expect( persisted.updateCount ).toBe( 1 );
+				expect( persisted.snapshot.version ).toBe( "codegraph-snapshot-v1" );
+				expect( persisted.narrative.used ).toBeFalse();
+				expect( persisted.narrative.pending ).toBeFalse();
+				expect( persisted.narrative.error ).toInclude( "provider down" );
+			} );
+
+			it( "finalizes and serves structure when cancelled after phase one", () => {
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+				service.narrativeService = {
+					isEnabled: () => true,
+					usesShards: () => false,
+					cacheKey: ( snapshot, projectPath ) => "cancel-key",
+					narrate: ( snapshot, projectPath ) => { return { used: true }; }
+				};
+				service.codeGraphRepository.findReusableNarrative = () => javacast( "null", "" );
+				service.codeGraphRepository.get = ( runId ) => {
+					return {
+						version: persisted.snapshot.version,
+						fingerprint: persisted.snapshot.fingerprint,
+						truncated: false,
+						truncationReasons: [],
+						snapshot: persisted.snapshot,
+						narrative: persisted.narrative
+					};
+				};
+
+				var result = service.execute(
+					new tests.resources.ScriptedModernizationRun( "run-cg-cancel-after-structure", "codegraph", getTempDirectory() ),
+					{ scope: "working-tree", files: [], repositoryRevision: "" },
+					{ checkCancellation: () => persisted.saveCount > 0 }
+				);
+
+				expect( result.status ).toBe( "cancelled" );
+				expect( persisted.saveCount ).toBe( 1 );
+				expect( persisted.updateCount ).toBe( 1 );
+				expect( persisted.narrative.pending ).toBeFalse();
+				var loaded = service.getResult( "run-cg-cancel-after-structure" );
+				expect( loaded.codegraph.version ).toBe( "codegraph-snapshot-v1" );
+				expect( loaded.codegraph.narrative.error ).toInclude( "cancelled" );
 			} );
 
 			it( "cancels between stages before indexing when checkCancellation is true", () => {
@@ -271,6 +480,10 @@ class extends="testbox.system.BaseSpec" {
 				expect( limited.edges[ 1 ] ).toHaveKey( "from" );
 				expect( limited.edges[ 1 ] ).toHaveKey( "to" );
 				expect( limited.nodes[ 1 ].id ).toBe( lCase( limited.nodes[ 1 ].id ) );
+				var defaults = service.subgraph( "run-1", { focus: "app/A.cfc" } );
+				expect( defaults.depth ).toBe( 3 );
+				expect( defaults.nodes ).toHaveLength( 4 );
+				expect( defaults.edges ).toHaveLength( 3 );
 
 				expect( () => service.subgraph( "run-1", { focus: "app/A.cfc", limit: 9999 } ) )
 					.toThrow( type = "ValidationException" );
@@ -318,6 +531,9 @@ class extends="testbox.system.BaseSpec" {
 				expect( payload.edges[ 3 ].from ).toBe( "app/handlers/x.cfc" );
 				expect( payload.edges[ 3 ].to ).toBe( "app/b.cfc" );
 				expect( payload.truncated ).toBeFalse();
+				var defaultPayload = service.fileEdges( "run-1", { clusterId: "c1" } );
+				expect( defaultPayload.edges ).toHaveLength( 3 );
+				expect( defaultPayload.truncated ).toBeFalse();
 			} );
 
 			it( "refreshNarrative re-narrates stored snapshot and persists without re-index", () => {
@@ -368,6 +584,36 @@ class extends="testbox.system.BaseSpec" {
 				expect( calls.update ).toBe( 1 );
 			} );
 
+			it( "returns a bounded cited source window without allowing traversal", () => {
+				var sourceRoot = getTempDirectory() & "doublecheck-codegraph-source-" & replace( lCase( createUUID() ), "-", "", "all" );
+				directoryCreate( sourceRoot & "/src", true, true );
+				fileWrite( sourceRoot & "/src/Sample.bx", "one" & char( 10 ) & "focused" & char( 10 ) & "three" & char( 10 ) & "four" );
+				try {
+					var service = new app.models.services.CodeGraphRunService();
+					service.codeGraphRepository = {
+						get: ( runId ) => { return { projectPath: sourceRoot }; }
+					};
+					service.codegraphSourceMaxBytes = 1024 * 1024;
+					service.codegraphSourceBeforeLines = 1;
+					service.codegraphSourceAfterLines = 1;
+
+					var excerpt = service.sourceExcerpt( "run-source", { path: "src/Sample.bx", line: 2, before: 1, after: 1 } );
+					expect( excerpt.available ).toBeTrue();
+					expect( excerpt.path ).toBe( "src/Sample.bx" );
+					expect( excerpt.startLine ).toBe( 1 );
+					expect( excerpt.endLine ).toBe( 3 );
+					expect( excerpt.lines ).toHaveLength( 3 );
+					expect( excerpt.lines[ 2 ].text ).toBe( "focused" );
+					expect( excerpt.lines[ 2 ].focus ).toBeTrue();
+					expect( () => service.sourceExcerpt( "run-source", { path: "../outside.bx", line: 1 } ) )
+						.toThrow( type = "ValidationException" );
+					expect( () => service.sourceExcerpt( "run-source", { path: "src/Sample.bx", line: 99 } ) )
+						.toThrow( type = "ValidationException" );
+				} finally {
+					if ( directoryExists( sourceRoot ) ) directoryDelete( sourceRoot, true );
+				}
+			} );
+
 			it( "cancelRun is a no-op", () => {
 				var service = new app.models.services.CodeGraphRunService();
 				service.cancelRun( "any-id" );
@@ -375,6 +621,58 @@ class extends="testbox.system.BaseSpec" {
 			} );
 
 		} );
+	}
+
+	private any function executableService( required struct persisted ) {
+		var state = arguments.persisted;
+		var service = new app.models.services.CodeGraphRunService();
+		service.architectureIndexService = { index: ( runId, files ) => { return {}; } };
+		service.graphRepository = {
+			getGraph: ( runId, resultLimit ) => { return { symbols: [], dependencies: [], impacts: [], summary: {} }; },
+			adoptRunGraph: ( sourceRunId, targetRunId ) => {}
+		};
+		service.metricsService = {
+			assemble: ( reviewGraph, options ) => {
+				return {
+					version: "codegraph-snapshot-v1",
+					fingerprint: "structure-fingerprint",
+					truncated: false,
+					truncationReasons: [],
+					totals: { nodes: 0, edges: 0, clusters: 0, cycles: 0 },
+					nodes: [], clusters: [], flows: [], clusterEdges: [], cycles: [],
+					hotspots: [], orphans: [], layerViolations: [], directories: []
+				};
+			}
+		};
+		service.codeGraphRepository = {
+			save: ( runId, snapshot, projectPath, repositoryRevision, narrativeCacheKey, narrative ) => {
+				state.saveCount++;
+				state.snapshot = duplicate( snapshot );
+				state.narrative = duplicate( narrative );
+			},
+			updateNarrative: ( runId, narrative, narrativeCacheKey, snapshot ) => {
+				state.updateCount++;
+				state.narrative = duplicate( narrative );
+			}
+		};
+		service.eventService = { publish: () => {} };
+		service.codegraphMaxEdges = 20000;
+		service.codegraphMaxSymbols = 20000;
+		service.codegraphMaxNodes = 1500;
+		service.codegraphMaxClusters = 60;
+		service.codegraphMaxHotspots = 50;
+		service.codegraphMaxOrphans = 200;
+		service.codegraphMaxLayerViolations = 200;
+		service.codegraphFlowMaxDepth = 3;
+		service.codegraphMaxFlowsPerCluster = 4;
+		service.codegraphLayerPolicy = "application-models>http-handlers";
+		service.codegraphCoChangeEnabled = false;
+		service.codegraphScanMaxEntries = 30000;
+		service.gitRepositoryService = {
+			workingTreePaths: ( root, maxEntries ) => { return { available: true, paths: [], truncated: false }; },
+			commitFilePairs: () => { return { available: false, commits: [], reason: "disabled" }; }
+		};
+		return service;
 	}
 
 }

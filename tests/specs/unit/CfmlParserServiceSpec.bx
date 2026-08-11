@@ -5,6 +5,133 @@ class extends="testbox.system.BaseSpec" {
 			"CFML symbol parsing",
 			() => {
 				it(
+					"uses BoxAST positions and dependency evidence for a source-backed CFC",
+					() => {
+						var sourceRoot = getTempDirectory() & "doublecheck-cfml-ast-" & replace( lCase( createUUID() ), "-", "", "all" );
+						var sourcePath = sourceRoot & "/Legacy.cfc";
+						var lines = [
+							"<cfcomponent name=""Legacy"" extends=""Base"">",
+							"<cfproperty name=""service"" inject=""Service"">",
+							"<cffunction name=""run"">",
+							"<cfreturn queryExecute(""SELECT * FROM orders"")>",
+							"</cffunction>",
+							"</cfcomponent>"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						directoryCreate( sourceRoot, true, true );
+						fileWrite( sourcePath, content, "UTF-8" );
+						try {
+							var parser = new app.models.services.CfmlParserService();
+							var parsed = parser.parse(
+								{
+									filePath    : "app/Legacy.cfc",
+									absolutePath : sourcePath,
+									language    : "CFML",
+									contentHash : lCase( hash( content, "SHA-256" ) ),
+									content     : content,
+									lines      : lines
+								}
+							);
+							var functions = parsed.symbols.filter( ( item ) => item.kind == "function" );
+							var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+							expect( parsed.parseStrategy ).toBe( "ast" );
+						expect( functions.len() ).toBeGT( 0 );
+						expect( functions[ 1 ].endLine ).toBeGT( functions[ 1 ].line );
+							expect( dependencyKinds ).toInclude( "injects" );
+							expect( dependencyKinds ).toInclude( "table-query" );
+						} finally {
+							if ( directoryExists( sourceRoot ) ) directoryDelete( sourceRoot, true, true );
+						}
+					}
+				);
+
+				it(
+					"keeps corpus-wide AST symbols and dependencies as a superset of regex",
+					() => {
+						var repositoryRoot = new java:java.io.File(
+							getDirectoryFromPath( getCurrentTemplatePath() ),
+							"../../.."
+						).getCanonicalFile();
+						var roots = [
+							new java:java.io.File( repositoryRoot, "resources" ),
+							new java:java.io.File( repositoryRoot, "tests/fixtures" )
+						];
+						var paths = [];
+						for ( var root in roots ) {
+							if ( !root.exists() ) continue;
+							paths.append(
+								directoryList( root.getPath(), true, "path" )
+									.filter( ( path ) => reFindNoCase( "\.(?:cfc|cfm)$", path ) > 0 ),
+								true
+							);
+						}
+						paths.sort( "textnocase" );
+
+						var semanticSet = ( items ) => {
+							var out = {};
+							for ( var item in items ) {
+								var key = lCase( trim( toString( item.kind ?: "" ) ) & "|" & trim( toString( item.name ?: item.target ?: "" ) ) );
+								if ( len( key ) ) out[ key ] = true;
+							}
+							return out;
+						};
+						var parser = new app.models.services.CfmlParserService();
+						var regressions = [];
+						var fallbacks = [];
+						var regexMs = 0;
+						var astMs = 0;
+						for ( var path in paths ) {
+							var sourceFile = new java:java.io.File( path ).getCanonicalFile();
+							var content = fileRead( sourceFile.getPath(), "UTF-8" );
+							var lines = listToArray( replace( content, char( 13 ), "", "all" ), char( 10 ), true, true );
+							var relativePath = replace(
+								sourceFile.getPath().substring( repositoryRoot.getPath().len() + 1 ),
+								"\",
+								"/",
+								"all"
+							);
+							var started = getTickCount();
+							var regexParsed = parser.parse( {
+								filePath: relativePath,
+								language: "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								lines: lines
+							} );
+							regexMs += getTickCount() - started;
+							started = getTickCount();
+							var astParsed = parser.parse( {
+								filePath: relativePath,
+								absolutePath: sourceFile.getPath(),
+								language: "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								content: content,
+								lines: lines
+							} );
+							astMs += getTickCount() - started;
+							if ( astParsed.parseStrategy != "ast" ) fallbacks.append( relativePath );
+							var astSymbols = semanticSet( astParsed.symbols );
+							var astDependencies = semanticSet( astParsed.dependencies );
+							for ( var key in semanticSet( regexParsed.symbols ) ) {
+								if ( !astSymbols.keyExists( key ) ) regressions.append( "#relativePath# symbol #key#" );
+							}
+							for ( var key in semanticSet( regexParsed.dependencies ) ) {
+								if ( !astDependencies.keyExists( key ) ) regressions.append( "#relativePath# dependency #key#" );
+							}
+						}
+						fileWrite(
+							getTempDirectory() & "doublecheck-codegraph-cfml-parser-parity.json",
+							jsonSerialize( { files: paths.len(), regexMs: regexMs, astMs: astMs, fallbacks: fallbacks, regressions: regressions } ),
+							"UTF-8"
+						);
+
+						expect( paths.len() ).toBeGT( 0 );
+						expect( regressions ).toBe( [] );
+						expect( fallbacks ).toBe( [] );
+					}
+				);
+
+				it(
 					"extracts symbols and dependencies from a tag-based component",
 					() => {
 						var parser = new app.models.services.CfmlParserService();

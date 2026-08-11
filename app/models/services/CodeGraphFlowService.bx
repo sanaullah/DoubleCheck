@@ -1,0 +1,265 @@
+/** Deterministic request-flow extraction and reachability analysis. */
+@singleton
+class threadsafe {
+	property name="architectureModelService" inject="ArchitectureModelService";
+
+	function init() {
+		if ( isNull( variables.architectureModelService ?: javacast( "null", "" ) ) ) variables.architectureModelService = new app.models.services.ArchitectureModelService();
+		return this;
+	}
+
+	struct function reachability( required array nodes, required struct inventory, required array dependencies ) {
+		var nodePaths = {};
+		for ( var node in arguments.nodes ) {
+			if ( isSyntheticNode( node ) ) continue;
+			var path = normalizePath( node.id ?: node.path ?: "" );
+			if ( len( path ) ) nodePaths[ path ] = node;
+		}
+		var adjacency = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+			var to = normalizePath( dep.targetFile ?: "" );
+			if ( !len( from ) || !len( to ) || !nodePaths.keyExists( from ) || !nodePaths.keyExists( to ) ) continue;
+			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
+			if ( !adjacency[ from ].contains( to ) ) adjacency[ from ].append( to );
+		}
+		var entries = {};
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var path = normalizePath( unit.filePath ?: "" );
+			if ( nodePaths.keyExists( path ) && listFindNoCase( "handler-action,lifecycle-hook,route", lCase( toString( unit.unitType ?: "" ) ) ) ) entries[ path ] = true;
+		}
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "routes" && len( normalizePath( dep.targetFile ?: "" ) ) ) entries[ normalizePath( dep.targetFile ) ] = true;
+			if ( listFindNoCase( "calls-api,schedule", kind ) && nodePaths.keyExists( from ) ) entries[ from ] = true;
+		}
+		for ( var path in nodePaths ) if ( lCase( listLast( path, "/" ) ) == "application.bx" ) entries[ path ] = true;
+		if ( !entries.count() ) return { unreachable: [], summary: { available: false, reason: "no-entry-points", entryCount: 0, reachableCount: 0, unreachableCount: 0, testOnlyCount: 0 } };
+		var reachable = walk( entries, adjacency );
+		var testEntries = {};
+		for ( var path in nodePaths ) if ( isTestPath( path ) ) testEntries[ path ] = true;
+		var testReachable = walk( testEntries, adjacency );
+		var unreachable = [];
+		var testOnlyCount = 0;
+		for ( var path in nodePaths ) {
+			if ( isTestPath( path ) || reachable.keyExists( path ) ) continue;
+			var reason = testReachable.keyExists( path ) ? "test-only" : "unreachable";
+			if ( reason == "test-only" ) testOnlyCount++;
+			unreachable.append( { id: path, path: nodePaths[ path ].path ?: path, component: nodePaths[ path ].component ?: "other", role: nodePaths[ path ].role ?: "unknown", reason: reason } );
+		}
+		unreachable.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+		return { unreachable: unreachable, summary: { available: true, entryCount: entries.count(), reachableCount: reachable.count(), unreachableCount: unreachable.len(), testOnlyCount: testOnlyCount } };
+	}
+
+	array function extract(
+		required struct inventory,
+		required any graph,
+		required struct caps,
+		required struct reviewGraph,
+		required struct truncation,
+		struct visibleNodes = {},
+		struct clusterOf = {}
+	) {
+		var maxDepth = max( 1, val( arguments.caps.flowMaxDepth ?: 6 ) );
+		var adjacency = buildAdjacency( arguments.reviewGraph.dependencies ?: [] );
+		var candidates = [];
+		for ( var seed in collectSeeds( arguments.inventory, arguments.graph, arguments.reviewGraph.dependencies ?: [] ) ) {
+			for ( var path in topPaths( seed.fileId, adjacency, maxDepth, 3 ) ) {
+				if ( path.steps.len() < 2 ) continue;
+				var steps = duplicate( path.steps );
+				var kinds = duplicate( path.edgeKinds );
+				if ( len( seed.routeId ?: "" ) ) { steps.prepend( seed.routeId ); kinds.prepend( "routes" ); }
+				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds ), depth: kinds.len() } );
+			}
+		}
+		candidates.sort( ( a, b ) => {
+			var typed = ( a.sinkKind != "unknown" ? 1 : 0 ) - ( b.sinkKind != "unknown" ? 1 : 0 );
+			if ( typed != 0 ) return typed > 0 ? -1 : 1;
+			if ( a.depth != b.depth ) return a.depth > b.depth ? -1 : 1;
+			if ( a.steps.len() != b.steps.len() ) return a.steps.len() > b.steps.len() ? -1 : 1;
+			var byEntry = compareNoCase( a.entryFile, b.entryFile );
+			if ( byEntry != 0 ) return byEntry;
+			var bySymbol = compareNoCase( a.entrySymbol, b.entrySymbol );
+			return bySymbol != 0 ? bySymbol : compareNoCase( a.sinkFile, b.sinkFile );
+		} );
+		var flows = [];
+		var seen = {};
+		var perCluster = {};
+		for ( var candidate in candidates ) {
+			if ( arguments.visibleNodes.count() ) {
+				var visible = true;
+				for ( var step in candidate.steps ) if ( !arguments.visibleNodes.keyExists( normalizePath( step ) ) ) visible = false;
+				if ( !visible ) continue;
+			}
+			var signature = arrayToList( candidate.steps, "|" );
+			if ( seen.keyExists( signature ) ) continue;
+			var clusterKey = "__unclustered__";
+			for ( var step in candidate.steps ) {
+				var cluster = arguments.clusterOf[ normalizePath( step ) ] ?: "";
+				if ( len( cluster ) ) { clusterKey = cluster; break; }
+			}
+			var maxPerCluster = max( 1, val( arguments.caps.maxFlowsPerCluster ?: 4 ) );
+			if ( ( perCluster[ clusterKey ] ?: 0 ) >= maxPerCluster ) { markTruncated( arguments.truncation, "maxFlowsPerCluster" ); continue; }
+			seen[ signature ] = true;
+			perCluster[ clusterKey ] = ( perCluster[ clusterKey ] ?: 0 ) + 1;
+			flows.append( { id: flowId( candidate.entryFile, candidate.entrySymbol, signature ), entryFile: candidate.entryFile, entrySymbol: candidate.entrySymbol, steps: duplicate( candidate.steps ), stepSymbols: stepSymbolsFor( candidate.steps, arguments.inventory.units ?: [] ), sinkFile: candidate.sinkFile, edgeKinds: duplicate( candidate.edgeKinds ), sinkKind: candidate.sinkKind, routeId: candidate.routeId } );
+		}
+		return flows;
+	}
+
+	private struct function walk( required struct seeds, required struct adjacency ) {
+		var visited = {};
+		var queue = [];
+		for ( var seed in arguments.seeds ) { visited[ seed ] = true; queue.append( seed ); }
+		var index = 1;
+		while ( index <= queue.len() ) {
+			var current = queue[ index++ ];
+			for ( var next in ( arguments.adjacency[ current ] ?: [] ) ) if ( !visited.keyExists( next ) ) { visited[ next ] = true; queue.append( next ); }
+		}
+		return visited;
+	}
+
+	private struct function buildAdjacency( required array dependencies ) {
+		var adjacency = {};
+		var seen = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( !listFindNoCase( "routes,injects,calls,renders,table-query,table-read,table-write,http,schedule,calls-api", kind ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: dep.source_file ?: "" );
+			var to = normalizePath( dep.targetFile ?: dep.target_file ?: "" );
+			if ( kind == "routes" ) { var route = normalizeRoute( dep.target ?: "" ); from = len( route ) ? "route:" & route : ""; }
+			if ( kind == "calls-api" ) { var api = normalizeRoute( dep.target ?: "" ); to = len( api ) ? "route:" & api : ""; }
+			if ( !len( to ) && listFindNoCase( "table-query,table-read,table-write", kind ) ) to = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
+			if ( !len( to ) && listFindNoCase( "http,schedule", kind ) ) to = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+			if ( !len( from ) || !len( to ) || from == to || isTestPath( from ) || isTestPath( to ) ) continue;
+			var key = from & "\0" & to & "\0" & kind;
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
+			adjacency[ from ].append( { to: to, kind: kind } );
+		}
+		for ( var from in adjacency ) adjacency[ from ].sort( ( a, b ) => { var byTo = compareNoCase( a.to, b.to ); return byTo != 0 ? byTo : compareNoCase( a.kind, b.kind ); } );
+		return adjacency;
+	}
+
+	private array function collectSeeds( required struct inventory, required any graph, array dependencies = [] ) {
+		var seeds = [];
+		var seen = {};
+		var handlerFiles = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "routes" ) {
+				var handler = normalizePath( dep.targetFile ?: "" );
+				var route = normalizeRoute( dep.target ?: "" );
+				if ( len( handler ) && len( route ) ) { seeds.append( { fileId: handler, symbol: trim( toString( dep.action ?: dep.target ?: "" ) ), routeId: "route:" & route } ); handlerFiles[ handler ] = true; }
+			} else if ( kind == "calls-api" ) {
+				var client = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+				if ( len( client ) && !isTestPath( client ) ) seeds.append( { fileId: client, symbol: "" } );
+			}
+		}
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			if ( lCase( trim( toString( unit.unitType ?: "" ) ) ) != "handler-action" ) continue;
+			var file = normalizePath( unit.filePath ?: "" );
+			var symbol = trim( toString( unit.symbolName ?: "" ) );
+			var key = file & "\0" & symbol;
+			if ( !len( file ) || seen.keyExists( key ) ) continue;
+			seen[ key ] = true; handlerFiles[ file ] = true; seeds.append( { fileId: file, symbol: symbol } );
+		}
+		var canonical = arguments.inventory.canonicalPaths ?: {};
+		for ( var node in arguments.graph.getNodes() ) {
+			var file = normalizePath( node.id ?: node.filePath ?: "" );
+			if ( !len( file ) || handlerFiles.keyExists( file ) ) continue;
+			var path = canonical[ file ] ?: ( node.filePath ?: file );
+			if ( !listFindNoCase( "http-handlers,entry-points", architectureModelService.classifyFile( path ) ) ) continue;
+			var key = file & "\0";
+			if ( !seen.keyExists( key ) ) { seen[ key ] = true; seeds.append( { fileId: file, symbol: "" } ); }
+		}
+		seeds.sort( ( a, b ) => { var byFile = compareNoCase( a.fileId, b.fileId ); return byFile != 0 ? byFile : compareNoCase( a.symbol, b.symbol ); } );
+		return seeds;
+	}
+
+	private array function topPaths( required string startFile, required struct adjacency, required numeric maxDepth, numeric maxResults = 3 ) {
+		var results = [];
+		var steps = [ arguments.startFile ];
+		var edgeKinds = [];
+		var visited = { "#arguments.startFile#": true };
+		var explored = { count: 0 };
+		collectPaths( arguments.startFile, arguments.adjacency, arguments.maxDepth, steps, edgeKinds, visited, results, explored );
+		results.sort( ( a, b ) => {
+			var aTyped = sinkKind( a.edgeKinds ) != "unknown";
+			var bTyped = sinkKind( b.edgeKinds ) != "unknown";
+			if ( aTyped != bTyped ) return aTyped ? -1 : 1;
+			if ( a.edgeKinds.len() != b.edgeKinds.len() ) return a.edgeKinds.len() > b.edgeKinds.len() ? -1 : 1;
+			return compareNoCase( arrayToList( a.steps, "|" ), arrayToList( b.steps, "|" ) );
+		} );
+		var out = [];
+		var seen = {};
+		for ( var result in results ) { var key = arrayToList( result.steps, "|" ); if ( seen.keyExists( key ) ) continue; seen[ key ] = true; out.append( result ); if ( out.len() >= max( 1, val( arguments.maxResults ) ) ) break; }
+		return out;
+	}
+
+	private void function collectPaths(
+		required string current,
+		required struct adjacency,
+		required numeric maxDepth,
+		required array steps,
+		required array edgeKinds,
+		required struct visited,
+		required array results,
+		required struct explored
+	) {
+		if ( ++arguments.explored.count > 5000 ) return;
+		if ( arguments.edgeKinds.len() >= arguments.maxDepth ) {
+			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+			return;
+		}
+		var outbound = arguments.adjacency[ arguments.current ] ?: [];
+		if ( !outbound.len() ) {
+			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+			return;
+		}
+		var expanded = false;
+		for ( var edge in outbound ) {
+			if ( arguments.visited[ edge.to ] ?: false ) continue;
+			expanded = true;
+			arguments.visited[ edge.to ] = true;
+			arguments.steps.append( edge.to );
+			arguments.edgeKinds.append( edge.kind );
+			collectPaths( edge.to, arguments.adjacency, arguments.maxDepth, arguments.steps, arguments.edgeKinds, arguments.visited, arguments.results, arguments.explored );
+			arguments.edgeKinds.pop();
+			arguments.steps.pop();
+			arguments.visited.delete( edge.to );
+		}
+		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ) } );
+	}
+
+	private array function stepSymbolsFor( required array steps, required array units ) {
+		var byFile = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) || lCase( toString( unit.unitType ?: "" ) ) == "file" ) continue;
+			var key = normalizePath( unit.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			if ( !byFile.keyExists( key ) ) byFile[ key ] = [];
+			byFile[ key ].append( unit.symbolName ?: unit.id ?: "" );
+		}
+		return arguments.steps.map( ( step ) => { var symbols = byFile[ normalizePath( step ) ] ?: []; return isArray( symbols ) && symbols.len() ? symbols[ 1 ] : ""; } );
+	}
+
+	private string function sinkKind( required array kinds ) {
+		if ( !arguments.kinds.len() ) return "unknown";
+		return { "table-query": "table-read", "table-read": "table-read", "table-write": "table-write", "http": "http-call", "schedule": "event-publish", "renders": "view-render" }[ lCase( trim( toString( arguments.kinds[ arguments.kinds.len() ] ) ) ) ] ?: "unknown";
+	}
+
+	private string function flowId( required string file, required string symbol, required string signature ) { return "flow-" & lCase( hash( arguments.file & "|" & arguments.symbol & "|" & arguments.signature, "SHA-256" ) ); }
+	private boolean function isSyntheticNode( required struct node ) { return reFindNoCase( "^(route|table|http|schedule):", toString( arguments.node.id ?: "" ) ) > 0; }
+	private boolean function isTestPath( required string path ) { return reFind( "(^|/)(tests?|specs?)(/|$)", lCase( replace( arguments.path, "\", "/", "all" ) ) ) > 0; }
+	private string function normalizePath( required any path ) { var value = lCase( replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" ) ); while ( find( "//", value ) ) value = replace( value, "//", "/", "all" ); return value; }
+	private string function normalizeRoute( required any target ) { var value = reReplace( trim( toString( arguments.target ?: "" ) ), "\?.*$", "" ); value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" ); while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 ); return lCase( value ); }
+	private void function markTruncated( required struct truncation, required string reason ) { arguments.truncation.truncated = true; if ( !arguments.truncation.reasons.contains( arguments.reason ) ) arguments.truncation.reasons.append( arguments.reason ); }
+}

@@ -1,0 +1,564 @@
+/** Bounded read-only CodeGraph drill-down, source, and path queries. */
+@singleton
+class threadsafe {
+	property name="graphRepository" inject="AnalysisGraphRepository";
+	property name="codeGraphRepository" inject="CodeGraphRepository";
+	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
+	property name="codegraphMaxSymbols" inject="coldbox:setting:codegraphMaxSymbols";
+	property name="codegraphSubgraphMaxNodes" inject="coldbox:setting:codegraphSubgraphMaxNodes";
+	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
+	property name="codegraphPathMaxResults" inject="coldbox:setting:codegraphPathMaxResults";
+	property name="codegraphPathMaxExploredNodes" inject="coldbox:setting:codegraphPathMaxExploredNodes";
+	property name="codegraphPathMaxDepth" inject="coldbox:setting:codegraphPathMaxDepth";
+	property name="codegraphSourceMaxBytes" inject="coldbox:setting:codegraphSourceMaxBytes";
+	property name="codegraphSourceBeforeLines" inject="coldbox:setting:codegraphSourceBeforeLines";
+	property name="codegraphSourceAfterLines" inject="coldbox:setting:codegraphSourceAfterLines";
+
+	struct function subgraph( required string runId, required struct query ) {
+		var focus = replace( trim( toString( arguments.query.focus ?: "" ) ), "\", "/", "all" );
+		if ( !len( focus ) ) {
+			throw( type = "ValidationException", message = "focus is required" );
+		}
+		var maxDepthSetting = max( 1, val( variables.codegraphSubgraphMaxDepth ?: 3 ) );
+		var maxNodesSetting = max( 1, val( variables.codegraphSubgraphMaxNodes ?: 300 ) );
+		var requestedDepth = len( trim( toString( arguments.query.depth ?: "" ) ) )
+			? val( arguments.query.depth )
+			: maxDepthSetting;
+		var requestedLimit = len( trim( toString( arguments.query.limit ?: "" ) ) )
+			? val( arguments.query.limit )
+			: maxNodesSetting;
+		var depth = max( 1, min( maxDepthSetting, requestedDepth ) );
+		var limit = max( 1, min( maxNodesSetting, requestedLimit ) );
+		if ( val( arguments.query.limit ?: 0 ) > maxNodesSetting ) {
+			throw( type = "ValidationException", message = "limit must be between 1 and #maxNodesSetting#" );
+		}
+		if ( val( arguments.query.depth ?: 0 ) > maxDepthSetting ) {
+			throw( type = "ValidationException", message = "depth must be between 1 and #maxDepthSetting#" );
+		}
+
+		var kindFilter = normalizeKindFilter( arguments.query.kinds ?: "" );
+		var includeTests = isBoolean( arguments.query.includeTests ?: "" )
+			? arguments.query.includeTests
+			: listFindNoCase( "tests,1,true,yes", trim( toString( arguments.query.include ?: "" ) ) ) > 0;
+
+		var edgeLimit = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		var reviewGraph = loadGraph( arguments.runId, max( 1, val( variables.codegraphMaxSymbols ?: 20000 ) ), edgeLimit );
+		var adjacency = buildAdjacency( reviewGraph.dependencies ?: [], kindFilter, includeTests );
+
+		var focusKey = lCase( focus );
+		var visited = {};
+		var nodeDepth = {};
+		var queue = [];
+		visited[ focusKey ] = focus;
+		nodeDepth[ focusKey ] = 0;
+		queue.append( focus );
+
+		var qi = 1;
+		while ( qi <= queue.len() && visited.count() < limit ) {
+			var current = queue[ qi ];
+			qi++;
+			var currentKey = lCase( current );
+			var currentDepth = nodeDepth[ currentKey ] ?: 0;
+			if ( currentDepth >= depth ) continue;
+			var neighbors = adjacency[ currentKey ] ?: [];
+			for ( var neighbor in neighbors ) {
+				var neighborKey = lCase( neighbor );
+				if ( visited.keyExists( neighborKey ) ) continue;
+				if ( visited.count() >= limit ) break;
+				visited[ neighborKey ] = neighbor;
+				nodeDepth[ neighborKey ] = currentDepth + 1;
+				queue.append( neighbor );
+			}
+		}
+
+		var nodes = [];
+		var nodeKeys = visited.keyArray().sort( "textnocase" );
+		for ( var key in nodeKeys ) {
+			nodes.append( {
+				id    : key,
+				path  : visited[ key ],
+				depth : nodeDepth[ key ] ?: 0
+			} );
+		}
+
+		var edges = [];
+		var deps = isArray( reviewGraph.dependencies ?: "" ) ? reviewGraph.dependencies : [];
+		for ( var edge in deps ) {
+			if ( !isStruct( edge ) ) continue;
+			var kind = trim( toString( edge.kind ?: "" ) );
+			if ( !includeTests && lCase( kind ) == "tests" ) continue;
+			if ( kindFilter.len() && !kindFilter.contains( lCase( kind ) ) ) continue;
+			var source = replace( trim( toString( edge.sourceFile ?: "" ) ), "\", "/", "all" );
+			var target = replace( trim( toString( edge.targetFile ?: "" ) ), "\", "/", "all" );
+			if ( !len( source ) || !len( target ) ) continue;
+			if ( !visited.keyExists( lCase( source ) ) || !visited.keyExists( lCase( target ) ) ) continue;
+			edges.append( {
+				id         : edge.id ?: "",
+				from       : lCase( source ),
+				to         : lCase( target ),
+				sourceFile : source,
+				targetFile : target,
+				kind       : kind,
+				target     : edge.target ?: "",
+				line       : val( edge.line ?: 0 ),
+				evidence   : edge.evidence ?: ""
+			} );
+		}
+
+		var totalNodes = adjacency.count() ? adjacency.count() : nodes.len();
+		var truncated = visited.count() >= limit || nodes.len() < totalNodes;
+		return {
+			focus      : focus,
+			depth      : depth,
+			truncated  : truncated,
+			// totalNodes is retained for existing clients; graphNodes is the
+			// unbounded graph-size signal and returnedNodes is the visible slice.
+			totalNodes : nodes.len(),
+			graphNodes : totalNodes,
+			returnedNodes: nodes.len(),
+			totalEdges : edges.len(),
+			nodes      : nodes,
+			edges      : edges
+		};
+	}
+
+	/**
+	 * Bounded file-to-file edges for Files depth (optional cluster filter).
+	 * Returns from/to (lowercase ids) plus sourceFile/targetFile/kind/evidence.
+	 */
+	struct function fileEdges( required string runId, required struct query ) {
+		var clusterId = trim( toString( arguments.query.clusterId ?: "" ) );
+		var maxEdgesSetting = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		var requestedLimit = len( trim( toString( arguments.query.limit ?: "" ) ) )
+			? val( arguments.query.limit )
+			: min( 2000, maxEdgesSetting );
+		var limit = max( 1, min( maxEdgesSetting, requestedLimit ) );
+		if ( val( arguments.query.limit ?: 0 ) > maxEdgesSetting ) {
+			throw( type = "ValidationException", message = "limit must be between 1 and #maxEdgesSetting#" );
+		}
+
+		var kindFilter = normalizeKindFilter( arguments.query.kinds ?: "" );
+		var includeTests = isBoolean( arguments.query.includeTests ?: "" )
+			? arguments.query.includeTests
+			: listFindNoCase( "tests,1,true,yes", trim( toString( arguments.query.include ?: "" ) ) ) > 0;
+
+		var pathFilter = {};
+		var hasPathFilter = false;
+		if ( len( clusterId ) ) {
+			var stored = codeGraphRepository.get( arguments.runId );
+			var snap = !isNull( stored ) && isStruct( stored.snapshot ?: "" ) ? stored.snapshot : {};
+			var clusters = isArray( snap.clusters ?: "" ) ? snap.clusters : [];
+			var matched = false;
+			for ( var cluster in clusters ) {
+				if ( !isStruct( cluster ) ) continue;
+				if ( toString( cluster.id ?: "" ) != clusterId ) continue;
+				matched = true;
+				var filePaths = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
+				for ( var path in filePaths ) {
+					var pathKey = lCase( replace( trim( toString( path ) ), "\", "/", "all" ) );
+					if ( len( pathKey ) ) pathFilter[ pathKey ] = true;
+				}
+				break;
+			}
+			if ( matched && !pathFilter.count() ) {
+				var snapNodes = isArray( snap.nodes ?: "" ) ? snap.nodes : [];
+				for ( var node in snapNodes ) {
+					if ( !isStruct( node ) ) continue;
+					if ( toString( node.clusterId ?: "" ) != clusterId ) continue;
+					var nodeKey = lCase( replace( trim( toString( node.id ?: node.path ?: "" ) ), "\", "/", "all" ) );
+					if ( len( nodeKey ) ) pathFilter[ nodeKey ] = true;
+				}
+			}
+			hasPathFilter = pathFilter.count() > 0;
+			if ( matched && !hasPathFilter ) {
+				return {
+					clusterId  : clusterId,
+					truncated  : false,
+					totalEdges : 0,
+					edges      : []
+				};
+			}
+		}
+
+		var edgeLimit = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		var reviewGraph = loadGraph( arguments.runId, max( 1, val( variables.codegraphMaxSymbols ?: 20000 ) ), edgeLimit );
+		var deps = isArray( reviewGraph.dependencies ?: "" ) ? reviewGraph.dependencies : [];
+		var edges = [];
+		var totalMatched = 0;
+		for ( var edge in deps ) {
+			if ( !isStruct( edge ) ) continue;
+			var kind = trim( toString( edge.kind ?: "" ) );
+			if ( !includeTests && lCase( kind ) == "tests" ) continue;
+			if ( kindFilter.len() && !kindFilter.contains( lCase( kind ) ) ) continue;
+			var source = replace( trim( toString( edge.sourceFile ?: "" ) ), "\", "/", "all" );
+			var target = replace( trim( toString( edge.targetFile ?: "" ) ), "\", "/", "all" );
+			if ( !len( source ) || !len( target ) ) continue;
+			var sourceKey = lCase( source );
+			var targetKey = lCase( target );
+			var sourceIn = !hasPathFilter || pathFilter.keyExists( sourceKey );
+			var targetIn = !hasPathFilter || pathFilter.keyExists( targetKey );
+			// Cluster Files: include internal edges and crossing edges (callers/callees outside the module).
+			if ( hasPathFilter && !sourceIn && !targetIn ) {
+				continue;
+			}
+			totalMatched++;
+			if ( edges.len() >= limit ) continue;
+			edges.append( {
+				id         : edge.id ?: "",
+				from       : sourceKey,
+				to         : targetKey,
+				sourceFile : source,
+				targetFile : target,
+				kind       : kind,
+				target     : edge.target ?: "",
+				line       : val( edge.line ?: 0 ),
+				evidence   : edge.evidence ?: "",
+				crossing   : hasPathFilter && ( !sourceIn || !targetIn )
+			} );
+		}
+
+		return {
+			clusterId  : clusterId,
+			truncated  : totalMatched > edges.len(),
+			totalEdges : totalMatched,
+			edges      : edges
+		};
+	}
+
+	/**
+	 * Return a small local source window around persisted dependency evidence.
+	 * The path is repository-relative and is resolved beneath the run root;
+	 * source content never enters the snapshot or narrative payload.
+	 */
+	struct function sourceExcerpt( required string runId, required struct query ) {
+		var stored = codeGraphRepository.get( arguments.runId );
+		if ( isNull( stored ) || !len( trim( toString( stored.projectPath ?: "" ) ) ) ) {
+			throw( type = "NotFoundException", message = "CodeGraph source root not found" );
+		}
+		var relativePath = replace( trim( toString( arguments.query.path ?: "" ) ), "\\", "/", "all" );
+		if (
+			!len( relativePath ) || left( relativePath, 1 ) == "/" || reFind( "^[A-Za-z]:", relativePath ) ||
+			listToArray( relativePath, "/", true, true ).contains( ".." )
+		) {
+			throw( type = "ValidationException", message = "path must be a repository-relative file" );
+		}
+
+		var root = new java:java.io.File( stored.projectPath ).getCanonicalFile();
+		var candidate = new java:java.io.File( root, relativePath ).getCanonicalFile();
+		if ( !candidate.toPath().startsWith( root.toPath() ) || !candidate.isFile() ) {
+			throw( type = "NotFoundException", message = "Source file not found" );
+		}
+		var maxBytes = max( 1024, val( variables.codegraphSourceMaxBytes ?: 1048576 ) );
+		var fileInfo = getFileInfo( candidate.getPath() );
+		if ( val( fileInfo.size ?: 0 ) > maxBytes ) {
+			throw( type = "ValidationException", message = "Source file exceeds the excerpt size cap" );
+		}
+		// BoxLang runtimes before the file-lines BIF read UTF-8 content directly;
+		// normalize line endings while retaining empty source lines.
+		var lines = listToArray(
+			replace( fileRead( candidate.getPath(), "UTF-8" ), char( 13 ), "", "all" ),
+			char( 10 ),
+			true,
+			true
+		);
+		var focusLine = max( 1, val( arguments.query.line ?: 1 ) );
+		if ( focusLine > lines.len() ) {
+			throw( type = "ValidationException", message = "line is outside the source file" );
+		}
+		var requestedBefore = structKeyExists( arguments.query, "before" ) && len( trim( toString( arguments.query.before ) ) )
+			? arguments.query.before
+			: ( variables.codegraphSourceBeforeLines ?: 3 );
+		var requestedAfter = structKeyExists( arguments.query, "after" ) && len( trim( toString( arguments.query.after ) ) )
+			? arguments.query.after
+			: ( variables.codegraphSourceAfterLines ?: 12 );
+		var beforeLines = max( 0, min( 20, val( requestedBefore ) ) );
+		var afterLines = max( 0, min( 40, val( requestedAfter ) ) );
+		var startLine = max( 1, focusLine - beforeLines );
+		var endLine = min( lines.len(), focusLine + afterLines );
+		var excerpt = [];
+		for ( var lineNumber = startLine; lineNumber <= endLine; lineNumber++ ) {
+			excerpt.append( { number: lineNumber, text: toString( lines[ lineNumber ] ?: "" ), focus: lineNumber == focusLine } );
+		}
+		return {
+			available : true,
+			path      : relativePath,
+			focusLine : focusLine,
+			startLine : startLine,
+			endLine   : endLine,
+			lines     : excerpt
+		};
+	}
+
+	/**
+	 * Directed, bounded dependency paths. This is orientation only; Review owns
+	 * impact cones. Each returned hop retains the persisted evidence fields.
+	 */
+	struct function paths( required string runId, required struct query ) {
+		var from = normalizePath( arguments.query.from ?: "" );
+		var to = normalizePath( arguments.query.to ?: "" );
+		if ( !len( from ) || !len( to ) ) throw( type = "ValidationException", message = "from and to are required" );
+		var direction = lCase( trim( toString( arguments.query.direction ?: "forward" ) ) );
+		if ( !listFindNoCase( "forward,reverse,any", direction ) ) throw( type = "ValidationException", message = "direction must be forward, reverse, or any" );
+		var maxResults = max( 1, val( variables.codegraphPathMaxResults ?: 3 ) );
+		var maxExplored = max( 1, val( variables.codegraphPathMaxExploredNodes ?: 5000 ) );
+		var maxDepth = max( 1, val( variables.codegraphPathMaxDepth ?: 12 ) );
+		var requestedLimit = len( trim( toString( arguments.query.limit ?: "" ) ) )
+			? val( arguments.query.limit )
+			: maxResults;
+		if ( requestedLimit > maxResults ) throw( type = "ValidationException", message = "limit must be between 1 and #maxResults#" );
+		var requestedDepth = len( trim( toString( arguments.query.depth ?: "" ) ) )
+			? val( arguments.query.depth )
+			: maxDepth;
+		if ( requestedDepth > maxDepth ) throw( type = "ValidationException", message = "depth must be between 1 and #maxDepth#" );
+		var includeTests = isBoolean( arguments.query.includeTests ?: "" ) ? arguments.query.includeTests : false;
+		var edgeLimit = max( 1, val( variables.codegraphMaxEdges ?: 20000 ) );
+		var reviewGraph = loadGraph( arguments.runId, max( 1, val( variables.codegraphMaxSymbols ?: 20000 ) ), edgeLimit );
+		var adjacency = buildPathAdjacency( reviewGraph.dependencies ?: [], direction, includeTests );
+		var candidates = enumeratePaths( from, to, adjacency, requestedDepth, maxExplored, requestedLimit );
+		var completed = candidates.paths;
+		completed.sort( ( a, b ) => {
+			if ( a.weight != b.weight ) return a.weight < b.weight ? -1 : 1;
+			if ( a.hopCount != b.hopCount ) return a.hopCount < b.hopCount ? -1 : 1;
+			return compareNoCase( jsonSerialize( a.hops ), jsonSerialize( b.hops ) );
+		} );
+		var output = [];
+		for ( var candidate in completed ) {
+			output.append( candidate );
+			if ( output.len() >= max( 1, requestedLimit ) ) break;
+		}
+		var wasCapped = candidates.truncated || candidates.resultCapped || completed.len() > output.len();
+		return {
+			paths        : output,
+			truncated    : wasCapped,
+			reason       : candidates.truncated ? "explored-cap" : ( wasCapped ? "result-cap" : ( output.len() ? "" : "unreachable" ) ),
+			exploredNodes: candidates.explored
+		};
+	}
+
+	private struct function buildPathAdjacency( required array dependencies, required string direction, required boolean includeTests ) {
+		var adjacency = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "tests" && !arguments.includeTests ) continue;
+			var source = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+			var target = normalizePath( dep.targetFile ?: "" );
+			if ( kind == "routes" ) {
+				source = "route:" & normalizeRoute( dep.target ?: "" );
+			} else if ( kind == "calls-api" ) {
+				target = "route:" & normalizeRoute( dep.target ?: "" );
+			}
+			if ( !len( target ) && listFindNoCase( "table-query,table-read,table-write", kind ) ) target = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
+			if ( !len( target ) && listFindNoCase( "http,schedule", kind ) ) target = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+			if ( !len( source ) || !len( target ) || source == target ) continue;
+			var item = {
+				from       : source,
+				to         : target,
+				kind       : kind,
+				line       : val( dep.line ?: 0 ),
+				evidence   : dep.evidence ?: "",
+				resolution : dep.resolution ?: "path",
+				weight     : pathEdgeWeight( kind, dep.resolution ?: "path" )
+			};
+			if ( arguments.direction == "reverse" || arguments.direction == "any" ) {
+				addPathEdge( adjacency, { from: target, to: source, kind: kind, line: item.line, evidence: item.evidence, resolution: item.resolution, weight: item.weight } );
+			}
+			if ( arguments.direction == "forward" || arguments.direction == "any" ) addPathEdge( adjacency, item );
+		}
+		for ( var key in adjacency ) adjacency[ key ].sort( ( a, b ) => compareNoCase( a.to, b.to ) );
+		return adjacency;
+	}
+
+	private void function addPathEdge( required struct adjacency, required struct edge ) {
+		if ( !arguments.adjacency.keyExists( arguments.edge.from ) ) arguments.adjacency[ arguments.edge.from ] = [];
+		var duplicate = false;
+		for ( var existing in arguments.adjacency[ arguments.edge.from ] ) {
+			if ( existing.to == arguments.edge.to && existing.kind == arguments.edge.kind && existing.line == arguments.edge.line ) duplicate = true;
+		}
+		if ( !duplicate ) arguments.adjacency[ arguments.edge.from ].append( arguments.edge );
+	}
+
+	private struct function enumeratePaths(
+		required string from,
+		required string to,
+		required struct adjacency,
+		required numeric maxDepth,
+		required numeric maxExplored,
+		required numeric maxResults
+	) {
+		var frontier = [];
+		pushPathState( frontier, { node: arguments.from, hops: [], visited: { "#arguments.from#": true }, weight: 0 } );
+		var paths = [];
+		var explored = 0;
+		var truncated = false;
+		var resultCapped = false;
+		while ( frontier.len() ) {
+			var state = popPathState( frontier );
+			explored++;
+			if ( explored > arguments.maxExplored ) {
+				truncated = true;
+				break;
+			}
+			if ( state.node == arguments.to ) {
+				paths.append( { hops: state.hops, weight: roundPathWeight( state.weight ), hopCount: state.hops.len() } );
+				if ( paths.len() >= arguments.maxResults ) {
+					resultCapped = frontier.len() > 0;
+					break;
+				}
+				continue;
+			}
+			if ( state.hops.len() >= arguments.maxDepth ) continue;
+			for ( var edge in ( arguments.adjacency[ state.node ] ?: [] ) ) {
+				if ( state.visited.keyExists( edge.to ) ) continue;
+				var visited = duplicate( state.visited );
+				visited[ edge.to ] = true;
+				var hops = duplicate( state.hops );
+				hops.append( { from: edge.from, to: edge.to, kind: edge.kind, line: edge.line, evidence: edge.evidence, resolution: edge.resolution } );
+				pushPathState( frontier, { node: edge.to, hops: hops, visited: visited, weight: state.weight + edge.weight } );
+			}
+		}
+		return { paths: paths, explored: explored, truncated: truncated, resultCapped: resultCapped };
+	}
+
+	private void function pushPathState( required array frontier, required struct state ) {
+		arguments.frontier.append( arguments.state );
+		var child = arguments.frontier.len();
+		while ( child > 1 ) {
+			var parent = floor( child / 2 );
+			if ( !pathStateBefore( arguments.frontier[ child ], arguments.frontier[ parent ] ) ) break;
+			var swap = arguments.frontier[ parent ];
+			arguments.frontier[ parent ] = arguments.frontier[ child ];
+			arguments.frontier[ child ] = swap;
+			child = parent;
+		}
+	}
+
+	private struct function popPathState( required array frontier ) {
+		var first = arguments.frontier[ 1 ];
+		var last = arguments.frontier.pop();
+		if ( arguments.frontier.len() ) {
+			arguments.frontier[ 1 ] = last;
+			var parent = 1;
+			while ( true ) {
+				var left = parent * 2;
+				if ( left > arguments.frontier.len() ) break;
+				var right = left + 1;
+				var child = right <= arguments.frontier.len() && pathStateBefore( arguments.frontier[ right ], arguments.frontier[ left ] ) ? right : left;
+				if ( !pathStateBefore( arguments.frontier[ child ], arguments.frontier[ parent ] ) ) break;
+				var swap = arguments.frontier[ parent ];
+				arguments.frontier[ parent ] = arguments.frontier[ child ];
+				arguments.frontier[ child ] = swap;
+				parent = child;
+			}
+		}
+		return first;
+	}
+
+	private boolean function pathStateBefore( required struct left, required struct right ) {
+		if ( arguments.left.weight != arguments.right.weight ) return arguments.left.weight < arguments.right.weight;
+		if ( arguments.left.hops.len() != arguments.right.hops.len() ) return arguments.left.hops.len() < arguments.right.hops.len();
+		var byNode = compareNoCase( arguments.left.node, arguments.right.node );
+		if ( byNode != 0 ) return byNode < 0;
+		return compareNoCase( jsonSerialize( arguments.left.hops ), jsonSerialize( arguments.right.hops ) ) < 0;
+	}
+
+	private numeric function pathEdgeWeight( required string kind, required string resolution ) {
+		var base = {
+			"routes": 0.5,
+			"calls-api": 0.75,
+			// Explicit call edges are the stronger request-flow evidence. Keep
+			// injection wiring traversable, but rank it just behind calls so a
+			// bounded path result surfaces the executable route first.
+			"injects": 1.1,
+			"calls": 1,
+			"renders": 0.75,
+			"table-query": 1.25,
+			"table-read": 1.25,
+			"table-write": 1.25,
+			"http": 1.25,
+			"schedule": 1.25
+		}[ arguments.kind ] ?: 1;
+		var confidence = { path: 1, basename: 1.25, stem: 1.5, "dotted-path": 1.75 }[ lCase( arguments.resolution ) ] ?: 1;
+		return base * confidence;
+	}
+
+	private numeric function roundPathWeight( required numeric weight ) {
+		return round( arguments.weight * 10000 ) / 10000;
+	}
+
+	/**
+	 * Re-run optional LLM narrative for an existing CodeGraph snapshot (no re-index).
+	 * Always calls the model when enabled — does not reuse a prior cache hit.
+	 */	private struct function loadGraph( required string runId, required numeric symbolLimit, required numeric edgeLimit ) {
+		try {
+			return graphRepository.getGraph(
+				runId          = arguments.runId,
+				symbolLimit     = arguments.symbolLimit,
+				dependencyLimit = arguments.edgeLimit,
+				impactLimit     = arguments.edgeLimit
+			);
+		} catch ( any compatibilityError ) {
+			// Small unit-test doubles and older local services still expose the
+			// original two-argument contract. Preserve their deterministic path.
+			return graphRepository.getGraph( arguments.runId, arguments.edgeLimit );
+		}
+	}
+	private struct function buildAdjacency( required array dependencies, required array kindFilter, required boolean includeTests ) {
+		var adjacency = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( !isStruct( edge ) ) continue;
+			var kind = trim( toString( edge.kind ?: "" ) );
+			if ( !arguments.includeTests && lCase( kind ) == "tests" ) continue;
+			if ( arguments.kindFilter.len() && !arguments.kindFilter.contains( lCase( kind ) ) ) continue;
+			var source = replace( trim( toString( edge.sourceFile ?: "" ) ), "\", "/", "all" );
+			var target = replace( trim( toString( edge.targetFile ?: "" ) ), "\", "/", "all" );
+			if ( !len( source ) || !len( target ) ) continue;
+			var sourceKey = lCase( source );
+			var targetKey = lCase( target );
+			if ( !adjacency.keyExists( sourceKey ) ) adjacency[ sourceKey ] = [];
+			if ( !adjacency.keyExists( targetKey ) ) adjacency[ targetKey ] = [];
+			appendUniqueNeighbor( adjacency[ sourceKey ], target, targetKey );
+			appendUniqueNeighbor( adjacency[ targetKey ], source, sourceKey );
+		}
+		return adjacency;
+	}
+
+	private void function appendUniqueNeighbor( required array list, required string path, required string key ) {
+		for ( var item in arguments.list ) {
+			if ( lCase( item ) == arguments.key ) return;
+		}
+		arguments.list.append( arguments.path );
+	}
+
+	private array function normalizeKindFilter( required any kinds ) {
+		var raw = [];
+		if ( isArray( arguments.kinds ) ) {
+			raw = arguments.kinds;
+		} else if ( isSimpleValue( arguments.kinds ) && len( trim( toString( arguments.kinds ) ) ) ) {
+			raw = listToArray( toString( arguments.kinds ), "," );
+		}
+		var out = [];
+		var seen = {};
+		for ( var item in raw ) {
+			var kind = lCase( trim( toString( item ) ) );
+			if ( !len( kind ) || seen.keyExists( kind ) ) continue;
+			seen[ kind ] = true;
+			out.append( kind );
+		}
+		return out;
+	}
+
+	private string function normalizePath( required any path ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return lCase( value );
+	}
+
+	private string function normalizeRoute( required any target ) {
+		var value = trim( toString( arguments.target ?: "" ) );
+		value = reReplace( value, "\?.*$", "" );
+		value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" );
+		while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 );
+		return lCase( value );
+	}
+}

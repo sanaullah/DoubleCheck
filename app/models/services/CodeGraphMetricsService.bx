@@ -18,6 +18,7 @@ class threadsafe {
 	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
 	property name="architectureModelService" inject="ArchitectureModelService";
 	property name="inventoryAdapter" inject="CodeGraphInventoryAdapter";
+	property name="flowService" inject="CodeGraphFlowService";
 
 	variables.snapshotVersion = "codegraph-snapshot-v1";
 	variables.defaultCaps = {
@@ -27,7 +28,8 @@ class threadsafe {
 		maxLayerViolations  : 200,
 		maxNodes            : 1500,
 		maxEdges            : 20000,
-		maxFlows            : 24
+		flowMaxDepth        : 3,
+		maxFlowsPerCluster  : 4
 	};
 
 	function init() {
@@ -43,6 +45,9 @@ class threadsafe {
 		if ( isNull( variables.inventoryAdapter ?: javacast( "null", "" ) ) ) {
 			variables.inventoryAdapter = new app.models.services.CodeGraphInventoryAdapter();
 		}
+		if ( isNull( variables.flowService ?: javacast( "null", "" ) ) ) {
+			variables.flowService = new app.models.services.CodeGraphFlowService();
+		}
 		return this;
 	}
 
@@ -56,7 +61,16 @@ class threadsafe {
 	 */
 	struct function assemble( required struct reviewGraph, struct options = {} ) {
 		var caps = resolveCaps( arguments.options );
+		var coChange = isStruct( arguments.options.coChange ?: "" ) ? duplicate( arguments.options.coChange ) : {};
+		if ( !structKeyExists( coChange, "files" ) || !isStruct( coChange.files ?: "" ) ) coChange.files = {};
+		if ( !structKeyExists( coChange, "affinityWeights" ) || !isStruct( coChange.affinityWeights ?: "" ) ) coChange.affinityWeights = {};
 		var truncation = { truncated: false, reasons: [] };
+		if ( arguments.reviewGraph.truncated ?: false ) {
+			markTruncated( truncation, "graphLoad" );
+			for ( var loadReason in ( arguments.reviewGraph.truncationReasons ?: [] ) ) {
+				markTruncated( truncation, loadReason );
+			}
+		}
 
 		var inventory = inventoryAdapter.adapt( arguments.reviewGraph );
 		var graph = couplingGraphService.build( inventory );
@@ -67,25 +81,37 @@ class threadsafe {
 			}
 		}
 
-		var rawClusters = derivedStructureService.deriveClusters( graph, inventory.units ?: [] );
+		var rawClusters = derivedStructureService.deriveClusters( graph, inventory.units ?: [], [], coChange.affinityWeights );
 		var clusterOf = {};
 		var clusters = presentClusters( rawClusters, graph, caps, truncation, clusterOf );
+		clusters = appendCoChangeMetrics( clusters, coChange );
 
 		var clusterEdges = buildClusterEdges( graph, clusterOf, truncation );
 		var fileStats = indexFileStats( inventory, arguments.reviewGraph );
-		var nodes = buildNodes( graph, inventory, fileStats, clusterOf );
-		var cycles = graph.getMetrics().cycles ?: [];
-
-		var hotspots = selectHotspots( nodes, caps.maxHotspots, truncation );
-		var orphans = selectOrphans( nodes, caps.maxOrphans, truncation );
-		var layerViolations = selectLayerViolations( graph, inventory.canonicalPaths ?: {}, caps.maxLayerViolations, truncation );
-		var flows = extractFlows( inventory, graph, caps, arguments.reviewGraph, truncation );
-		var directories = directoryRollup( nodes );
-
+		var crossingCounts = indexCrossingEdges( graph, clusterOf );
+		var roleEvidence = indexRoleEvidence( inventory );
+		var nodes = buildNodes( graph, inventory, fileStats, clusterOf, crossingCounts, roleEvidence, coChange.files );
+		appendSyntheticNodes( nodes, arguments.reviewGraph.dependencies ?: [] );
+		var orphanCandidateCount = countOrphanCandidates( nodes );
 		if ( nodes.len() > caps.maxNodes ) {
 			markTruncated( truncation, "maxNodes" );
 			nodes = nodes.slice( 1, caps.maxNodes );
 		}
+		var visibleNodes = {};
+		for ( var visibleNode in nodes ) visibleNodes[ normalizePath( visibleNode.id ?: visibleNode.path ?: "" ) ] = true;
+		var cycles = graph.getMetrics().cycles ?: [];
+		// Measure presenter caps against the full deterministic node set even when
+		// maxNodes hides the candidate rows from the returned snapshot.
+		if ( orphanCandidateCount > caps.maxOrphans ) markTruncated( truncation, "maxOrphans" );
+
+		var hotspots = selectHotspots( nodes, caps.maxHotspots, truncation );
+		var orphans = selectOrphans( nodes, caps.maxOrphans, truncation );
+		var layerViolations = selectLayerViolations( graph, inventory.canonicalPaths ?: {}, caps.maxLayerViolations, truncation, visibleNodes, arguments.options.layerPolicy ?: "application-models>http-handlers" );
+		var flows = flowService.extract( inventory, graph, caps, arguments.reviewGraph, truncation, visibleNodes, clusterOf );
+		var directories = directoryRollup( nodes );
+		var roleCounts = countRoles( nodes );
+		var reachability = flowService.reachability( nodes, inventory, arguments.reviewGraph.dependencies ?: [] );
+
 		if ( graph.getEdges().len() > caps.maxEdges ) {
 			markTruncated( truncation, "maxEdges" );
 		}
@@ -104,7 +130,7 @@ class threadsafe {
 		};
 
 		var fingerprintPayload = {
-			nodes       : nodes,
+			nodes       : fingerprintNodes( nodes ),
 			clusters    : clusters,
 			clusterEdges: clusterEdges,
 			cycles      : cycles,
@@ -128,8 +154,24 @@ class threadsafe {
 			layerViolations    : layerViolations,
 			flows              : flows,
 			directories        : directories,
+			roleCounts         : roleCounts,
+			unreachable        : reachability.unreachable,
+			reachability       : reachability.summary,
+			coChange           : coChangeSummary( coChange ),
+			hotspotFormula     : hotspotFormula(),
 			canonicalPaths     : inventory.canonicalPaths ?: {}
 		};
+	}
+
+	/** Display-only source positions must not invalidate structural identity. */
+	private array function fingerprintNodes( required array nodes ) {
+		var records = [];
+		for ( var node in arguments.nodes ) {
+			var record = duplicate( node );
+			record.delete( "lineCount" );
+			records.append( record );
+		}
+		return records;
 	}
 
 	private struct function resolveCaps( required struct options ) {
@@ -158,6 +200,11 @@ class threadsafe {
 		}
 
 		var presented = [];
+		var symbolsByFile = {};
+		for ( var graphNode in arguments.graph.getNodes() ) {
+			var graphPath = normalizePath( graphNode.filePath ?: graphNode.id ?: "" );
+			if ( len( graphPath ) ) symbolsByFile[ graphPath ] = max( 0, val( graphNode.unitCount ?: 0 ) - 1 );
+		}
 		for ( var cluster in ordered ) {
 			var filePaths = isArray( cluster.filePaths ?: "" ) ? duplicate( cluster.filePaths ) : [];
 			filePaths.sort( ( a, b ) => compareNoCase( a, b ) );
@@ -167,25 +214,71 @@ class threadsafe {
 
 			var cohesion = couplingGraphService.cohesion( arguments.graph, filePaths );
 			var symbolCount = 0;
-			for ( var graphNode in arguments.graph.getNodes() ) {
-				if ( filePaths.contains( graphNode.id ) || filePaths.contains( graphNode.filePath ?: "" ) ) {
-					symbolCount += max( 0, val( graphNode.unitCount ?: 0 ) - 1 );
-				}
-			}
+			for ( var filePath in filePaths ) symbolCount += val( symbolsByFile[ normalizePath( filePath ) ] ?: 0 );
 
 			presented.append( {
 				id            : cluster.id,
 				key           : cluster.domainKey ?: "",
 				label         : cluster.name ?: ( cluster.domainKey ?: cluster.id ),
+				clusterKey    : lCase( hash( jsonSerialize( filePaths ), "SHA-256" ) ),
 				fileCount     : filePaths.len(),
 				symbolCount   : max( 0, symbolCount ),
 				internalEdges : cohesion.internalEdges,
 				crossingEdges : cohesion.crossingEdges,
 				cohesion      : cohesion.cohesion,
-				filePaths     : filePaths
+				filePaths     : filePaths,
+				clusterFingerprint: lCase( hash( jsonSerialize( {
+					members       : filePaths,
+					symbolCount   : max( 0, symbolCount ),
+					internalEdges : cohesion.internalEdges,
+					crossingEdges : cohesion.crossingEdges,
+					cohesion      : cohesion.cohesion
+				} ), "SHA-256" ) )
 			} );
 		}
 		return presented;
+	}
+
+	private array function appendCoChangeMetrics( required array clusters, required struct coChange ) {
+		for ( var cluster in arguments.clusters ) {
+			var authors = {};
+			var changeCount = 0;
+			var lastTouched = "";
+			for ( var path in ( cluster.filePaths ?: [] ) ) {
+				var key = lCase( replace( trim( toString( path ) ), "\\", "/", "all" ) );
+				var fileStats = arguments.coChange.files[ key ] ?: {};
+				changeCount += val( fileStats.changeCount ?: 0 );
+				for ( var author in ( fileStats.authors ?: [] ) ) {
+					var authorKey = trim( toString( author ) );
+					if ( len( authorKey ) ) authors[ authorKey ] = true;
+				}
+				var touched = trim( toString( fileStats.lastTouched ?: "" ) );
+				if ( len( touched ) && ( !len( lastTouched ) || compare( touched, lastTouched ) > 0 ) ) lastTouched = touched;
+			}
+			cluster.coChange = {
+				changeCount: changeCount,
+				authorCount: structKeyArray( authors ).len(),
+				lastTouched: lastTouched
+			};
+		}
+		return arguments.clusters;
+	}
+
+	private struct function coChangeSummary( required struct coChange ) {
+		return {
+			enabled   : arguments.coChange.enabled ?: false,
+			available : arguments.coChange.available ?: false,
+			degraded  : structKeyExists( arguments.coChange, "degraded" ) ? arguments.coChange.degraded : true,
+			reason    : arguments.coChange.reason ?: "git-history-unavailable",
+			truncated : arguments.coChange.truncated ?: false,
+			commits   : val( arguments.coChange.commits ?: 0 ),
+			files     : val( arguments.coChange.filesChanged ?: 0 ),
+			pairCount : val( arguments.coChange.pairCount ?: 0 )
+		};
+	}
+
+	private string function hotspotFormula() {
+		return "((max(1,fanIn) + 0.5*fanOut) * max(1,churnCount) * cycleMultiplier) + crossingEdges; churnCount=1 when Git history is unavailable";
 	}
 
 	private array function buildClusterEdges( required any graph, required struct clusterOf, required struct truncation ) {
@@ -200,16 +293,23 @@ class threadsafe {
 					from     : fromCluster,
 					to       : toCluster,
 					weight   : 0,
-					edgeCount: 0
+					edgeCount: 0,
+					kinds    : []
 				};
 			}
 			merged[ key ].edgeCount++;
+			for ( var edgeKind in ( isArray( edge.kinds ?: "" ) ? edge.kinds : [ edge.kind ?: "" ] ) ) {
+				if ( len( trim( toString( edgeKind ) ) ) && !merged[ key ].kinds.contains( edgeKind ) ) merged[ key ].kinds.append( edgeKind );
+			}
 			merged[ key ].weight = round4( merged[ key ].weight + val( edge.weight ?: 1 ) );
 		}
 
 		var keys = sortedKeys( merged );
 		var output = [];
-		for ( var key in keys ) output.append( merged[ key ] );
+		for ( var key in keys ) {
+			merged[ key ].kinds.sort( ( a, b ) => compareNoCase( a, b ) );
+			output.append( merged[ key ] );
+		}
 		output.sort( ( a, b ) => {
 			var byFrom = compareNoCase( a.from, b.from );
 			if ( byFrom != 0 ) return byFrom;
@@ -266,7 +366,10 @@ class threadsafe {
 		required any graph,
 		required struct inventory,
 		required struct fileStats,
-		required struct clusterOf
+		required struct clusterOf,
+		struct crossingCounts = {},
+		struct roleEvidence = {},
+		struct churnByFile = {}
 	) {
 		var canonical = arguments.inventory.canonicalPaths ?: {};
 		var nodes = [];
@@ -286,15 +389,18 @@ class threadsafe {
 			var fanInValue = arguments.graph.fanIn( key );
 			var fanOutValue = arguments.graph.fanOut( key );
 			var inCycle = arguments.graph.cycleMembersFor( key ).len() > 0;
-			var crossing = crossingEdgeCount( arguments.graph, key, arguments.clusterOf );
+			var crossing = val( arguments.crossingCounts[ key ] ?: 0 );
 			var component = architectureModelService.classifyFile( path );
 			var role = assignRole( {
 				path     : path,
 				component: component,
 				fanIn    : fanInValue,
-				fanOut   : fanOutValue
+				fanOut   : fanOutValue,
+				evidence : arguments.roleEvidence[ key ] ?: {}
 			} );
-			var score = hotspotScore( fanInValue, fanOutValue, stats.symbolCount, stats.lineCount, inCycle, crossing );
+			var churnStats = arguments.churnByFile[ key ] ?: {};
+			var churn = val( churnStats.changeCount ?: 0 );
+			var score = hotspotScore( fanInValue, fanOutValue, churn, inCycle, crossing );
 
 			nodes.append( {
 				id           : key,
@@ -308,6 +414,7 @@ class threadsafe {
 				lineCount    : stats.lineCount,
 				fanIn        : fanInValue,
 				fanOut       : fanOutValue,
+				churnCount   : churn,
 				clusterId    : clusterId,
 				hotspotScore : round4( score ),
 				inCycle      : inCycle
@@ -323,6 +430,13 @@ class threadsafe {
 		var path = lCase( replace( arguments.nodeMeta.path ?: "", "\", "/", "all" ) );
 		var fanIn = val( arguments.nodeMeta.fanIn ?: 0 );
 		var fanOut = val( arguments.nodeMeta.fanOut ?: 0 );
+		var evidence = isStruct( arguments.nodeMeta.evidence ?: "" ) ? arguments.nodeMeta.evidence : {};
+
+		if ( evidence.clientAsset ?: false ) return "client";
+		if ( evidence.integration ?: false ) return "integration";
+		if ( evidence.entryPoint ?: false ) return "entry";
+		if ( evidence.persistence ?: false ) return "persistence";
+		if ( evidence.orchestrator ?: false ) return "orchestrator";
 
 		if ( component == "tests" ) {
 			return "test";
@@ -330,6 +444,7 @@ class threadsafe {
 		if ( component == "http-handlers" || component == "entry-points" ) {
 			return "entry";
 		}
+		if ( component == "views" ) return "view";
 		if ( isPersistencePath( path ) ) {
 			return "persistence";
 		}
@@ -343,6 +458,45 @@ class threadsafe {
 			return "shared";
 		}
 		return "unknown";
+	}
+
+	private struct function indexRoleEvidence( required struct inventory ) {
+		var evidence = {};
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var key = normalizePath( unit.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			if ( !evidence.keyExists( key ) ) evidence[ key ] = { symbols: 0, injects: 0 };
+			if ( lCase( toString( unit.unitType ?: "" ) ) != "file" ) evidence[ key ].symbols++;
+			if ( lCase( toString( unit.unitType ?: "" ) ) == "handler-action" ) evidence[ key ].entryPoint = true;
+		}
+		for ( var dep in ( arguments.inventory.dependencies ?: [] ) ) {
+			if ( !isStruct( dep ) ) continue;
+			var key = normalizePath( dep.filePath ?: "" );
+			if ( !len( key ) ) continue;
+			if ( !evidence.keyExists( key ) ) evidence[ key ] = { symbols: 0, injects: 0 };
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "injects" ) evidence[ key ].injects++;
+			if ( listFindNoCase( "table-query,table-read,table-write,writes,datasource", kind ) ) evidence[ key ].persistence = true;
+			if ( listFindNoCase( "http,schedule,calls-api", kind ) ) evidence[ key ].integration = true;
+			if ( kind == "routes" ) evidence[ key ].entryPoint = true;
+			if ( kind == "extends" && reFindNoCase( "handler|resthandler|basespec", toString( dep.target ?: "" ) ) ) evidence[ key ].entryPoint = true;
+		}
+		for ( var key in evidence ) {
+			var path = lCase( key );
+			if ( reFind( "(^|/)public/assets?/", path ) || listFindNoCase( "js,jsx,mjs", listLast( path, "." ) ) ) evidence[ key ].clientAsset = true;
+			if ( ( evidence.injects ?: 0 ) >= 2 && ( evidence.symbols ?: 0 ) <= 12 ) evidence[ key ].orchestrator = true;
+		}
+		return evidence;
+	}
+
+	private struct function countRoles( required array nodes ) {
+		var counts = {};
+		for ( var node in arguments.nodes ) {
+			var role = trim( toString( node.role ?: "unknown" ) );
+			counts[ role ] = ( counts[ role ] ?: 0 ) + 1;
+		}
+		return counts;
 	}
 
 	private boolean function isPersistencePath( required string path ) {
@@ -362,39 +516,36 @@ class threadsafe {
 		return arguments.fanOut >= 2 && arguments.fanIn >= 1;
 	}
 
-	private numeric function crossingEdgeCount( required any graph, required string fileKey, required struct clusterOf ) {
-		var ownCluster = arguments.clusterOf[ arguments.fileKey ] ?: "";
-		if ( !len( ownCluster ) ) return 0;
-		var count = 0;
+	private struct function indexCrossingEdges( required any graph, required struct clusterOf ) {
+		var counts = {};
 		for ( var edge in arguments.graph.getEdges() ) {
-			var other = "";
-			if ( edge.fromFile == arguments.fileKey ) other = edge.toFile;
-			else if ( edge.toFile == arguments.fileKey ) other = edge.fromFile;
-			else continue;
-			var otherCluster = arguments.clusterOf[ other ] ?: "";
-			if ( len( otherCluster ) && otherCluster != ownCluster ) count++;
+			var from = normalizePath( edge.fromFile ?: "" );
+			var to = normalizePath( edge.toFile ?: "" );
+			var fromCluster = arguments.clusterOf[ from ] ?: "";
+			var toCluster = arguments.clusterOf[ to ] ?: "";
+			if ( !len( fromCluster ) || !len( toCluster ) || fromCluster == toCluster ) continue;
+			counts[ from ] = ( counts[ from ] ?: 0 ) + 1;
+			counts[ to ] = ( counts[ to ] ?: 0 ) + 1;
 		}
-		return count;
+		return counts;
 	}
 
 	private numeric function hotspotScore(
 		required numeric fanIn,
 		required numeric fanOut,
-		required numeric symbolCount,
-		required numeric lineCount,
+		required numeric churn,
 		required boolean inCycle,
 		required numeric crossingEdgeCount
 	) {
-		return ( 3 * arguments.fanIn ) +
-			( 2 * arguments.fanOut ) +
-			( 1 * arguments.symbolCount ) +
-			( 0.01 * arguments.lineCount ) +
-			( 5 * ( arguments.inCycle ? 1 : 0 ) ) +
-			( 2 * arguments.crossingEdgeCount );
+		return ( max( 1, arguments.fanIn ) + ( 0.5 * max( 0, arguments.fanOut ) ) ) *
+			max( 1, arguments.churn ) *
+			( arguments.inCycle ? 2 : 1 ) +
+			arguments.crossingEdgeCount;
 	}
 
 	private array function selectHotspots( required array nodes, required numeric limit, required struct truncation ) {
 		var ranked = duplicate( arguments.nodes );
+		ranked = ranked.filter( ( node ) => !isSyntheticNode( node ) );
 		ranked.sort( ( a, b ) => {
 			if ( a.hotspotScore != b.hotspotScore ) return a.hotspotScore > b.hotspotScore ? -1 : 1;
 			return compareNoCase( a.path, b.path );
@@ -410,6 +561,7 @@ class threadsafe {
 				hotspotScore : node.hotspotScore,
 				fanIn        : node.fanIn,
 				fanOut       : node.fanOut,
+				churnCount   : node.churnCount ?: 0,
 				symbolCount  : node.symbolCount,
 				lineCount    : node.lineCount,
 				inCycle      : node.inCycle,
@@ -423,6 +575,7 @@ class threadsafe {
 	private array function selectOrphans( required array nodes, required numeric limit, required struct truncation ) {
 		var orphans = [];
 		for ( var node in arguments.nodes ) {
+			if ( isSyntheticNode( node ) ) continue;
 			if ( node.fanIn != 0 || node.fanOut != 0 ) continue;
 			if ( node.component == "entry-points" || node.component == "tests" ) continue;
 			orphans.append( {
@@ -441,20 +594,35 @@ class threadsafe {
 		return orphans;
 	}
 
+	private numeric function countOrphanCandidates( required array nodes ) {
+		var count = 0;
+		for ( var node in arguments.nodes ) {
+			if ( isSyntheticNode( node ) ) continue;
+			if ( node.fanIn != 0 || node.fanOut != 0 ) continue;
+			if ( node.component == "entry-points" || node.component == "tests" ) continue;
+			count++;
+		}
+		return count;
+	}
+
 	private array function selectLayerViolations(
 		required any graph,
 		required struct canonicalPaths,
 		required numeric limit,
-		required struct truncation
+		required struct truncation,
+		struct visibleNodes = {},
+		any policy = "application-models>http-handlers"
 	) {
 		var violations = [];
+		var candidateCount = 0;
 		for ( var edge in arguments.graph.getEdges() ) {
 			var fromPath = arguments.canonicalPaths[ edge.fromFile ] ?: edge.fromFile;
 			var toPath = arguments.canonicalPaths[ edge.toFile ] ?: edge.toFile;
 			var fromLayer = architectureModelService.classifyFile( fromPath );
 			var toLayer = architectureModelService.classifyFile( toPath );
-			// models depending on handlers is the violation; reverse is allowed.
-			if ( fromLayer == "application-models" && toLayer == "http-handlers" ) {
+			if ( isLayerViolation( fromLayer, toLayer, arguments.policy ) ) {
+				candidateCount++;
+				if ( arguments.visibleNodes.count() && ( !arguments.visibleNodes.keyExists( normalizePath( edge.fromFile ) ) || !arguments.visibleNodes.keyExists( normalizePath( edge.toFile ) ) ) ) continue;
 				violations.append( {
 					from      : fromPath,
 					to        : toPath,
@@ -470,219 +638,35 @@ class threadsafe {
 			if ( byFrom != 0 ) return byFrom;
 			return compareNoCase( a.to, b.to );
 		} );
-		if ( violations.len() > arguments.limit ) {
+		if ( candidateCount > arguments.limit ) {
 			markTruncated( arguments.truncation, "maxLayerViolations" );
+		}
+		if ( violations.len() > arguments.limit ) {
 			violations = violations.slice( 1, arguments.limit );
 		}
 		return violations;
 	}
 
-	/**
-	 * Handler-seeded request flows via injects/calls edges only (depth ≤3).
-	 * Review-graph dependencies supply original edge kinds; coupling graph is
-	 * not used for adjacency because injects/calls map to component-construction.
-	 */
-	private array function extractFlows(
-		required struct inventory,
-		required any graph,
-		required struct caps,
-		required struct reviewGraph,
-		required struct truncation
-	) {
-		var maxFlows = max( 1, val( arguments.caps.maxFlows ?: 24 ) );
-		var maxDepth = 3;
-		var adjacency = buildFlowAdjacency( arguments.reviewGraph.dependencies ?: [] );
-		var seeds = collectFlowEntrySeeds( arguments.inventory, arguments.graph );
-		var candidates = [];
-
-		for ( var seed in seeds ) {
-			var path = longestFlowPath( seed.fileId, adjacency, maxDepth );
-			if ( path.steps.len() < 2 ) continue;
-			candidates.append( {
-				entryFile   : seed.fileId,
-				entrySymbol : seed.symbol,
-				steps       : path.steps,
-				sinkFile    : path.steps[ path.steps.len() ],
-				edgeKinds   : path.edgeKinds,
-				depth       : path.edgeKinds.len()
-			} );
+	private boolean function isLayerViolation( required string fromLayer, required string toLayer, required any policy ) {
+		var rules = [];
+		if ( isArray( arguments.policy ?: "" ) ) {
+			rules = arguments.policy;
+		} else {
+			var raw = trim( toString( arguments.policy ?: "" ) );
+			if ( !len( raw ) ) raw = "application-models>http-handlers";
+			for ( var rule in listToArray( raw, "," ) ) rules.append( trim( rule ) );
 		}
-
-		candidates.sort( ( a, b ) => {
-			if ( a.depth != b.depth ) return a.depth > b.depth ? -1 : 1;
-			if ( a.steps.len() != b.steps.len() ) return a.steps.len() > b.steps.len() ? -1 : 1;
-			var byEntry = compareNoCase( a.entryFile, b.entryFile );
-			if ( byEntry != 0 ) return byEntry;
-			var bySymbol = compareNoCase( a.entrySymbol, b.entrySymbol );
-			if ( bySymbol != 0 ) return bySymbol;
-			return compareNoCase( a.sinkFile, b.sinkFile );
-		} );
-
-		if ( candidates.len() > maxFlows ) {
-			markTruncated( arguments.truncation, "maxFlows" );
-			candidates = candidates.slice( 1, maxFlows );
-		}
-
-		var flows = [];
-		for ( var candidate in candidates ) {
-			flows.append( {
-				id          : flowId( candidate.entryFile, candidate.entrySymbol ),
-				entryFile   : candidate.entryFile,
-				entrySymbol : candidate.entrySymbol,
-				steps       : duplicate( candidate.steps ),
-				sinkFile    : candidate.sinkFile,
-				edgeKinds   : duplicate( candidate.edgeKinds )
-			} );
-		}
-		return flows;
-	}
-
-	private struct function buildFlowAdjacency( required array dependencies ) {
-		var adjacency = {};
-		var seen = {};
-		for ( var dep in arguments.dependencies ) {
-			if ( !isStruct( dep ) ) continue;
-			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
-			if ( kind != "injects" && kind != "calls" ) continue;
-
-			var fromFile = normalizePath( dep.sourceFile ?: dep.filePath ?: dep.source_file ?: "" );
-			var toFile = normalizePath( dep.targetFile ?: dep.target_file ?: "" );
-			if ( !len( fromFile ) || !len( toFile ) || fromFile == toFile ) continue;
-			if ( isTestPath( fromFile ) || isTestPath( toFile ) ) continue;
-
-			var edgeKey = fromFile & "\0" & toFile & "\0" & kind;
-			if ( seen.keyExists( edgeKey ) ) continue;
-			seen[ edgeKey ] = true;
-
-			if ( !adjacency.keyExists( fromFile ) ) adjacency[ fromFile ] = [];
-			adjacency[ fromFile ].append( { to: toFile, kind: kind } );
-		}
-
-		for ( var fromKey in adjacency ) {
-			adjacency[ fromKey ].sort( ( a, b ) => {
-				var byTo = compareNoCase( a.to, b.to );
-				if ( byTo != 0 ) return byTo;
-				return compareNoCase( a.kind, b.kind );
-			} );
-		}
-		return adjacency;
-	}
-
-	private array function collectFlowEntrySeeds( required struct inventory, required any graph ) {
-		var seeds = [];
-		var seen = {};
-		var handlerActionFiles = {};
-
-		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
-			if ( lCase( trim( toString( unit.unitType ?: "" ) ) ) != "handler-action" ) continue;
-			var fileId = normalizePath( unit.filePath ?: "" );
-			if ( !len( fileId ) ) continue;
-			var symbol = trim( toString( unit.symbolName ?: "" ) );
-			var key = fileId & "\0" & symbol;
-			if ( seen.keyExists( key ) ) continue;
-			seen[ key ] = true;
-			handlerActionFiles[ fileId ] = true;
-			seeds.append( { fileId: fileId, symbol: symbol } );
-		}
-
-		var canonical = arguments.inventory.canonicalPaths ?: {};
-		for ( var graphNode in arguments.graph.getNodes() ) {
-			var fileId = normalizePath( graphNode.id ?: graphNode.filePath ?: "" );
-			if ( !len( fileId ) || handlerActionFiles.keyExists( fileId ) ) continue;
-			var path = canonical.keyExists( fileId ) ? canonical[ fileId ] : ( graphNode.filePath ?: fileId );
-			var component = architectureModelService.classifyFile( path );
-			if ( component != "http-handlers" && component != "entry-points" ) continue;
-			var key = fileId & "\0";
-			if ( seen.keyExists( key ) ) continue;
-			seen[ key ] = true;
-			seeds.append( { fileId: fileId, symbol: "" } );
-		}
-
-		seeds.sort( ( a, b ) => {
-			var byFile = compareNoCase( a.fileId, b.fileId );
-			if ( byFile != 0 ) return byFile;
-			return compareNoCase( a.symbol, b.symbol );
-		} );
-		return seeds;
-	}
-
-	private struct function longestFlowPath( required string startFile, required struct adjacency, required numeric maxDepth ) {
-		var best = { steps: [ arguments.startFile ], edgeKinds: [] };
-		var startVisited = {};
-		startVisited[ arguments.startFile ] = true;
-		var stack = [ {
-			file     : arguments.startFile,
-			steps    : [ arguments.startFile ],
-			edgeKinds: [],
-			visited  : startVisited
-		} ];
-
-		while ( stack.len() ) {
-			var state = stack.pop();
-			if ( state.edgeKinds.len() >= arguments.maxDepth ) {
-				if ( isBetterFlowPath( state, best ) ) best = state;
-				continue;
-			}
-
-			var outbound = arguments.adjacency[ state.file ] ?: [];
-			if ( !outbound.len() ) {
-				if ( isBetterFlowPath( state, best ) ) best = state;
-				continue;
-			}
-
-			var expanded = false;
-			for ( var edgeIndex = outbound.len(); edgeIndex >= 1; edgeIndex-- ) {
-				var edge = outbound[ edgeIndex ];
-				if ( state.visited[ edge.to ] ?: false ) continue;
-				expanded = true;
-				var visited = duplicate( state.visited );
-				visited[ edge.to ] = true;
-				var steps = duplicate( state.steps );
-				steps.append( edge.to );
-				var edgeKinds = duplicate( state.edgeKinds );
-				edgeKinds.append( edge.kind );
-				stack.append( {
-					file     : edge.to,
-					steps    : steps,
-					edgeKinds: edgeKinds,
-					visited  : visited
-				} );
-			}
-
-			if ( !expanded ) {
-				if ( isBetterFlowPath( state, best ) ) best = state;
-			}
-		}
-
-		return best;
-	}
-
-	private boolean function isBetterFlowPath( required struct candidate, required struct incumbent ) {
-		if ( arguments.candidate.steps.len() != arguments.incumbent.steps.len() ) {
-			return arguments.candidate.steps.len() > arguments.incumbent.steps.len();
-		}
-		if ( arguments.candidate.edgeKinds.len() != arguments.incumbent.edgeKinds.len() ) {
-			return arguments.candidate.edgeKinds.len() > arguments.incumbent.edgeKinds.len();
-		}
-		for ( var i = 1; i <= arguments.candidate.steps.len(); i++ ) {
-			var byStep = compareNoCase( arguments.candidate.steps[ i ], arguments.incumbent.steps[ i ] );
-			if ( byStep != 0 ) return byStep < 0;
+		for ( var rule in rules ) {
+			var parts = listToArray( toString( rule ), ">" );
+			if ( parts.len() == 2 && lCase( trim( parts[ 1 ] ) ) == lCase( arguments.fromLayer ) && lCase( trim( parts[ 2 ] ) ) == lCase( arguments.toLayer ) ) return true;
 		}
 		return false;
-	}
-
-	private string function flowId( required string entryFile, required string entrySymbol ) {
-		return "flow-" & stableHash( arguments.entryFile & "|" & arguments.entrySymbol );
-	}
-
-	private boolean function isTestPath( required string path ) {
-		var normalized = lCase( replace( arguments.path, "\", "/", "all" ) );
-		return reFind( "(^|/)(tests?|specs?)(/|$)", normalized ) > 0;
 	}
 
 	private array function directoryRollup( required array nodes ) {
 		var dirs = {};
 		for ( var node in arguments.nodes ) {
+			if ( isSyntheticNode( node ) ) continue;
 			var dir = node.dir ?: "";
 			if ( !len( dir ) ) dir = ".";
 			if ( !dirs.keyExists( dir ) ) {
@@ -705,10 +689,68 @@ class threadsafe {
 		return output;
 	}
 
+	private void function appendSyntheticNodes( required array nodes, required array dependencies ) {
+		var seen = {};
+		for ( var node in arguments.nodes ) seen[ normalizePath( node.id ?: "" ) ] = true;
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			var id = "";
+			var role = "shared";
+			var component = "other";
+			if ( kind == "routes" || kind == "calls-api" ) {
+				var routePath = normalizeRoute( dep.target ?: "" );
+				id = len( routePath ) ? "route:" & routePath : "";
+				role = "entry";
+				component = "http-handlers";
+			} else if ( listFindNoCase( "table-query,table-read,table-write", kind ) ) {
+				id = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
+				role = "persistence";
+				component = "application-models";
+			} else if ( listFindNoCase( "http,schedule", kind ) ) {
+				id = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+				role = "integration";
+				component = "other";
+			}
+			if ( !len( id ) || id == "route:" || seen.keyExists( normalizePath( id ) ) ) continue;
+			seen[ normalizePath( id ) ] = true;
+			arguments.nodes.append( {
+				id          : id,
+				path        : id,
+				dir         : "",
+				component   : component,
+				layer       : component,
+				role        : role,
+				language    : "",
+				symbolCount : 0,
+				lineCount   : 0,
+				fanIn       : 0,
+				fanOut      : 0,
+				clusterId   : "",
+				hotspotScore: 0,
+				inCycle     : false
+			} );
+		}
+		arguments.nodes.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+	}
+
+	private boolean function isSyntheticNode( required struct node ) {
+		return reFindNoCase( "^(route|table|http|schedule):", toString( arguments.node.id ?: "" ) ) > 0;
+	}
+
+	private string function normalizeRoute( required any target ) {
+		var value = trim( toString( arguments.target ?: "" ) );
+		value = reReplace( value, "\?.*$", "" );
+		value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" );
+		while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 );
+		return lCase( value );
+	}
+
 	private string function languageFor( required string filePath ) {
 		var extension = lCase( listLast( arguments.filePath, "." ) );
 		if ( listFindNoCase( "bx,bxm,bxs", extension ) ) return "BoxLang";
 		if ( listFindNoCase( "cfc,cfm,cfml", extension ) ) return "CFML";
+		if ( listFindNoCase( "js,jsx", extension ) ) return "JavaScript";
 		return "";
 	}
 

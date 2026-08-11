@@ -105,6 +105,84 @@ class {
 		};
 	}
 
+	/**
+	 * Bounded commit history for CodeGraph's optional temporal signal. Each
+	 * commit is returned as `{ id, author, authoredAt, files[] }`; callers can
+	 * degrade to structural-only when Git is absent or the history is shallow.
+	 */
+	struct function commitFilePairs(
+		required any root,
+		numeric maxCommits = 500,
+		numeric maxEntries = 20000
+	) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return { available: false, commits: [], truncated: false, repositoryRevision: "", reason: "git-unavailable" };
+		}
+		var commitLimit = max( 1, int( arguments.maxCommits ) );
+		var entryLimit = max( 1, int( arguments.maxEntries ) );
+		var tokenLimit = max( 100, entryLimit + ( commitLimit * 3 ) );
+		var result = executeTokens(
+			arguments.root,
+			[ "log", "--no-renames", "--format=%H%x00%an%x00%aI", "--name-only", "-z", "--max-count=#commitLimit#" ],
+			tokenLimit
+		);
+		if ( result.exitCode != 0 ) {
+			return {
+				available         : false,
+				commits           : [],
+				truncated         : result.truncated,
+				repositoryRevision: repository.repositoryRevision,
+				reason            : "git-history-failed"
+			};
+		}
+
+		var commits = [];
+		var current = {};
+		var metadataIndex = 0;
+		var entryCount = 0;
+		var entryBoundReached = false;
+		for ( var token in result.tokens ) {
+			if ( reFind( "^[a-fA-F0-9]{40,64}$", token ) ) {
+				if ( current.keyExists( "id" ) ) commits.append( current );
+				if ( commits.len() >= commitLimit ) break;
+				current = { id: lCase( token ), author: "", authoredAt: "", files: [] };
+				metadataIndex = 0;
+				continue;
+			}
+			if ( !current.keyExists( "id" ) ) continue;
+			if ( metadataIndex == 0 ) {
+				current.author = token;
+				metadataIndex++;
+				continue;
+			}
+			if ( metadataIndex == 1 ) {
+				current.authoredAt = token;
+				metadataIndex++;
+				continue;
+			}
+			if ( len( token ) ) {
+				var filePath = trim( replace( token, "\\", "/", "all" ) );
+				if ( !len( filePath ) ) continue;
+				if ( current.files.contains( filePath ) ) continue;
+				if ( entryCount >= entryLimit ) {
+					entryBoundReached = true;
+					break;
+				}
+				current.files.append( filePath );
+				entryCount++;
+			}
+		}
+		if ( current.keyExists( "id" ) && commits.len() < commitLimit ) commits.append( current );
+		return {
+			available         : true,
+			commits           : commits,
+			truncated         : result.truncated || entryBoundReached,
+			repositoryRevision: repository.repositoryRevision,
+			reason            : ( result.truncated || entryBoundReached ) ? "history-cap" : ""
+		};
+	}
+
 	struct function revisionPaths(
 		required any root,
 		required string baseRevision,
@@ -323,7 +401,7 @@ class {
 	private struct function executeText( required any root, required array gitArguments ) {
 		var process = startGit( arguments.root, arguments.gitArguments );
 		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( "\\A" );
-		var output = scanner.hasNext() ? trim( scanner.next() ) : "";
+		var output = scanner.hasNext() ? cleanOutput( scanner.next() ) : "";
 		scanner.close();
 		var exitCode = process.waitFor();
 		return { exitCode: exitCode, output: output };
@@ -340,7 +418,7 @@ class {
 				process.destroyForcibly();
 				break;
 			}
-			var token = scanner.next();
+			var token = cleanOutput( scanner.next(), false );
 			if ( len( token ) ) {
 				tokens.append( token );
 			}
@@ -352,6 +430,13 @@ class {
 			tokens   : tokens,
 			truncated: truncated
 		};
+	}
+
+	/** Git stderr is merged to avoid process deadlocks; remove warning lines so
+	 * local config warnings cannot corrupt revision ids or NUL-delimited paths. */
+	private string function cleanOutput( required string output, boolean trimValue = true ) {
+		var cleaned = reReplace( arguments.output, "(?m)^warning:.*(?:\\r?\\n|$)", "", "all" );
+		return arguments.trimValue ? trim( cleaned ) : cleaned;
 	}
 
 	private any function startGit( required any root, required array gitArguments ) {

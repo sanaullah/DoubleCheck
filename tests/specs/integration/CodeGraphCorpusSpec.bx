@@ -1,0 +1,175 @@
+/**
+ * CodeGraph's small, deterministic acceptance corpus.
+ *
+ * The fixture is intentionally source-backed: parser dispatch, target
+ * resolution, metrics/flow assembly, and bounded path traversal all run before
+ * the thresholds are scored. It must not promote a language tier.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraph corpus — deterministic tier", () => {
+			var corpusRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1" );
+			var manifest = jsonDeserialize( fileRead( corpusRoot & "/manifest.json", "UTF-8" ) );
+			var corpusCase = manifest.cases[ 1 ];
+
+			it( "loads a source-backed case and meets flow/path/domain thresholds", () => {
+				expect( manifest.version ).toBe( "codegraph-corpus-v1" );
+				expect( manifest.corpusKind ).toBe( "codegraph" );
+				expect( manifest.promotesLanguageTier ).toBeFalse();
+
+				var first = evaluateCase( corpusRoot, corpusCase );
+				var second = evaluateCase( corpusRoot, corpusCase );
+				var expected = corpusCase.expected;
+
+				expect( first.routes ).toInclude( "/api/v1/orders" );
+				expect( first.tables ).toInclude( "orders" );
+				expect( first.tables ).toInclude( "order_items" );
+				var expectedDomains = duplicate( expected.domains );
+				expectedDomains.sort( ( a, b ) => compareNoCase( a, b ) );
+				expect( first.domains ).toBe( expectedDomains );
+				var domainStability = first.domainSignature == second.domainSignature ? 1 : 0;
+
+				var flowThreshold = val( manifest.thresholds.flowRecall ?: 1 );
+				var pathThreshold = val( manifest.thresholds.pathRecall ?: 1 );
+				var domainThreshold = val( manifest.thresholds.domainStability ?: 1 );
+				expect( first.flowRecall ).toBeGTE( flowThreshold, "CodeGraph flow recall below corpus threshold" );
+				expect( first.pathRecall ).toBeGTE( pathThreshold, "CodeGraph path recall below corpus threshold" );
+				expect( domainStability ).toBeGTE( domainThreshold, "CodeGraph domain labels changed between repeated runs" );
+				expect( first.fingerprint ).toBe( second.fingerprint, "repeated source indexing must remain deterministic" );
+			} );
+
+			it( "keeps the corpus honest about language-tier measurement", () => {
+				expect( manifest.promotesLanguageTier ).toBeFalse();
+				expect( manifest.thresholds.flowRecall ).toBeGTE( 1 );
+				expect( manifest.thresholds.pathRecall ).toBeGTE( 1 );
+				expect( manifest.thresholds.domainStability ).toBeGTE( 1 );
+			} );
+		} );
+	}
+
+	private struct function evaluateCase( required string corpusRoot, required struct corpusCase ) {
+		var caseRoot = new java:java.io.File( arguments.corpusRoot & "/" & arguments.corpusCase.root ).getCanonicalFile();
+		var files = [];
+		var listing = directoryList( caseRoot.getPath(), true, "query" );
+		for ( var row = 1; row <= listing.recordCount; row++ ) {
+			if ( lCase( listing.type[ row ] ?: "" ) != "file" ) continue;
+			var absoluteFile = new java:java.io.File( listing.directory[ row ] & new java:java.io.File( "" ).separator & listing.name[ row ] ).getCanonicalFile();
+			var relativePath = replace( caseRoot.toPath().relativize( absoluteFile.toPath() ).toString(), "\", "/", "all" );
+			var content = fileRead( absoluteFile.getPath(), "UTF-8" );
+			var extension = lCase( listLast( relativePath, "." ) );
+			if ( !listFindNoCase( "bx,bxm,bxs,cfm,cfc,js,jsx", extension ) ) continue;
+			var lines = listToArray( replace( content, char( 13 ), "", "all" ), char( 10 ), true, true );
+			files.append( {
+				filePath   : relativePath,
+				language   : languageFor( extension ),
+				lines      : lines,
+				lineCount  : lines.len(),
+				content    : content,
+				contentHash: lCase( hash( content, "SHA-256" ) )
+			} );
+		}
+		files.sort( ( a, b ) => compareNoCase( a.filePath, b.filePath ) );
+
+		var capture = { files: [] };
+		var indexer = new app.models.services.ArchitectureIndexService();
+		indexer.boxLangParserService = new app.models.services.BoxLangParserService();
+		indexer.boxLangParserService.codegraphParserStrategy = "regex";
+		indexer.cfmlParserService = new app.models.services.CfmlParserService();
+		indexer.javaScriptParserService = new app.models.services.JavaScriptParserService();
+		indexer.graphRepository = {
+			findCached: ( contentHash, parserVersion ) => javacast( "null", "" ),
+			saveCached: ( contentHash, parserVersion, language, parsed ) => {},
+			findBaselineGraph: ( runId, limit ) => { return { runId: "", symbols: [], dependencies: [] }; },
+			replaceRunGraph: ( runId, parsedFiles, impacts, metrics ) => { capture.files = parsedFiles; }
+		};
+		indexer.index( "codegraph-corpus", files );
+
+		var symbols = [];
+		var dependencies = [];
+		for ( var parsedFile in capture.files ) {
+			for ( var symbol in parsedFile.symbols ) {
+				var symbolCopy = duplicate( symbol );
+				symbolCopy.filePath = parsedFile.filePath;
+				symbols.append( symbolCopy );
+			}
+			for ( var dependency in parsedFile.dependencies ) {
+				var dependencyCopy = duplicate( dependency );
+				dependencyCopy.sourceFile = parsedFile.filePath;
+				dependencies.append( dependencyCopy );
+			}
+		}
+		var reviewGraph = { files: files, symbols: symbols, dependencies: dependencies };
+		var metrics = new app.models.services.CodeGraphMetricsService();
+		var snapshot = metrics.assemble( reviewGraph, { maxFlowsPerCluster: 8, flowMaxDepth: 6 } );
+		var domains = [];
+		for ( var cluster in snapshot.clusters ?: [] ) domains.append( cluster.label ?: cluster.id );
+		domains.sort( ( a, b ) => compareNoCase( a, b ) );
+
+		var routeSet = [];
+		var tableSet = [];
+		for ( var node in snapshot.nodes ?: [] ) {
+			var nodeId = lCase( toString( node.id ?: "" ) );
+			if ( left( nodeId, 6 ) == "route:" ) routeSet.append( replace( nodeId, "route:", "", "one" ) );
+			if ( left( nodeId, 6 ) == "table:" ) tableSet.append( replace( nodeId, "table:", "", "one" ) );
+		}
+
+		var flowMatches = 0;
+		for ( var expectedFlow in arguments.corpusCase.expected.flows ?: [] ) {
+			for ( var flow in snapshot.flows ?: [] ) {
+				var steps = duplicate( flow.steps ?: [] );
+				steps.insertAt( 1, flow.entryFile ?: "" );
+				if ( steps.map( ( item ) => lCase( toString( item ) ) ).contains( lCase( expectedFlow.from ) ) && steps.map( ( item ) => lCase( toString( item ) ) ).contains( lCase( expectedFlow.to ) ) ) {
+					flowMatches++;
+					break;
+				}
+			}
+		}
+
+		var pathService = new app.models.services.CodeGraphRunService();
+		pathService.graphRepository = { getGraph: ( runId, resultLimit ) => reviewGraph };
+		pathService.codegraphMaxEdges = 20000;
+		pathService.codegraphMaxSymbols = 20000;
+		pathService.codegraphPathMaxResults = 3;
+		pathService.codegraphPathMaxExploredNodes = 5000;
+		pathService.codegraphPathMaxDepth = 12;
+		var pathMatches = 0;
+		for ( var expectedPath in arguments.corpusCase.expected.paths ?: [] ) {
+			var pathResult = pathService.paths( "codegraph-corpus", { from: expectedPath.from, to: expectedPath.to, limit: 3, depth: 12 } );
+			for ( var candidate in pathResult.paths ?: [] ) {
+				var kinds = candidate.hops.map( ( hop ) => lCase( toString( hop.kind ?: "" ) ) );
+				var endpointsMatch = candidate.hops.len() && lCase( candidate.hops[ 1 ].from ) == lCase( expectedPath.from ) && lCase( candidate.hops[ candidate.hops.len() ].to ) == lCase( expectedPath.to );
+				if ( endpointsMatch && arrayContainsInOrder( kinds, expectedPath.requiredKinds ?: [] ) ) {
+					pathMatches++;
+					break;
+				}
+			}
+		}
+
+		var flowCount = max( 1, arguments.corpusCase.expected.flows.len() );
+		var pathCount = max( 1, arguments.corpusCase.expected.paths.len() );
+		return {
+			fingerprint     : snapshot.fingerprint,
+			domains         : domains,
+			domainSignature : jsonSerialize( domains ),
+			routes          : routeSet,
+			tables          : tableSet,
+			flowRecall      : flowMatches / flowCount,
+			pathRecall      : pathMatches / pathCount
+		};
+	}
+
+	private string function languageFor( required string extension ) {
+		if ( listFindNoCase( "bx,bxm,bxs", arguments.extension ) ) return "BoxLang";
+		if ( listFindNoCase( "js,jsx", arguments.extension ) ) return "JavaScript";
+		return "CFML";
+	}
+
+	private boolean function arrayContainsInOrder( required array actual, required array expected ) {
+		if ( arguments.expected.len() > arguments.actual.len() ) return false;
+		for ( var index = 1; index <= arguments.expected.len(); index++ ) {
+			if ( lCase( toString( arguments.actual[ index ] ?: "" ) ) != lCase( toString( arguments.expected[ index ] ?: "" ) ) ) return false;
+		}
+		return true;
+	}
+}

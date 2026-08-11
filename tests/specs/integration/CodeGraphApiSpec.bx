@@ -61,10 +61,11 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: body.data.id } );
 			} );
 
-			it( "returns codegraph result totals without a raw edge list, subgraph caps and validates, history lists, and export is unsupported", () => {
+			it( "returns codegraph result totals without raw edges, bounded drill-down, history, paths, and export formats", () => {
 				var marker = lCase( createUUID() );
 				var runId = "codegraph-api-#marker#";
 				var nowValue = dateTimeFormat( now(), "iso" );
+				var fixtureRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1/cases/order-flow" );
 				var runRepository = getInstance( "ReviewRunRepository" );
 				var codeGraphRepository = getInstance( "CodeGraphRepository" );
 				var paths = [
@@ -82,7 +83,7 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 						id           : runId,
 						tenantId     : "default",
 						projectId    : "default",
-						projectPath  : "C:/codegraph-api/#marker#",
+						projectPath  : fixtureRoot,
 						mode         : "full",
 						runKind      : "codegraph",
 						input        : { version: "codegraph-input-v1" },
@@ -123,13 +124,14 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 							nodes             : nodes,
 							clusters          : [ { id: "c1", label: "app", fileCount: paths.len() } ],
 							flows             : [ { id: "f1", entryFile: "app/A.bx", steps: [ "app/a.bx" ] } ],
+							directories       : [ { path: "app", fileCount: paths.len(), symbolCount: paths.len() } ],
 							clusterEdges      : [ { source: "c1", target: "c1", weight: 1 } ],
 							cycles            : [],
 							hotspots          : [],
 							orphans           : [],
 							layerViolations   : []
 						},
-						projectPath        = "C:/codegraph-api/#marker#",
+						projectPath        = fixtureRoot,
 						repositoryRevision = "deadbeef",
 						narrativeCacheKey  = "",
 						narrative          = { used: false }
@@ -178,6 +180,9 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					expect( resultBody.data.result.codegraph.clusterEdges ).toBeArray();
 					expect( resultBody.data.result.codegraph.flows ).toBeArray();
 					expect( resultBody.data.result.codegraph.flows ).toHaveLength( 1 );
+					expect( resultBody.data.result.codegraph.directories ).toHaveLength( 1 );
+					expect( resultBody.data.result.codegraph.coChange ).toBeStruct();
+					expect( resultBody.data.result.codegraph.hotspotFormula ).toBeString();
 
 					var subgraphEvent = this.get(
 							"/api/v1/runs/#runId#/codegraph/subgraph",
@@ -191,6 +196,8 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					expect( subgraph.edges.len() ).toBeGTE( 1 );
 					expect( subgraph.edges[ 1 ] ).toHaveKey( "from" );
 					expect( subgraph.edges[ 1 ] ).toHaveKey( "to" );
+					expect( subgraph.returnedNodes ).toBe( subgraph.nodes.len() );
+					expect( subgraph.graphNodes ).toBeGTE( subgraph.returnedNodes );
 
 					var edgesEvent = this.get(
 							"/api/v1/runs/#runId#/codegraph/edges",
@@ -202,6 +209,76 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					expect( edgesBody.edges.len() ).toBeGTE( 1 );
 					expect( edgesBody.edges[ 1 ] ).toHaveKey( "from" );
 					expect( edgesBody.edges[ 1 ] ).toHaveKey( "kind" );
+
+					var pathsEvent = this.get(
+							"/api/v1/runs/#runId#/codegraph/paths",
+							{ from: "app/A.bx", to: "app/C.bx", direction: "forward", limit: 3 }
+						);
+					expect( pathsEvent.getResponse() ).toHaveStatus( 200 );
+					var pathsBody = jsonDeserialize( pathsEvent.getRenderedContent() ).data;
+					expect( pathsBody.paths ).toBeArray();
+					expect( pathsBody.paths[ 1 ].hops ).toHaveLength( 2 );
+					expect( pathsBody.paths[ 1 ].hops[ 1 ].evidence ).toBe( "fixture" );
+
+					var forwardMissingEvent = this.get(
+						"/api/v1/runs/#runId#/codegraph/paths",
+						{ from: "app/C.bx", to: "app/A.bx", direction: "forward" }
+					);
+					var forwardMissing = jsonDeserialize( forwardMissingEvent.getRenderedContent() ).data;
+					expect( forwardMissing.paths ).toBe( [] );
+					expect( forwardMissing.truncated ).toBeFalse();
+					expect( forwardMissing.reason ).toBe( "unreachable" );
+
+					var reverseEvent = this.get(
+						"/api/v1/runs/#runId#/codegraph/paths",
+						{ from: "app/C.bx", to: "app/A.bx", direction: "reverse" }
+					);
+					var reverseBody = jsonDeserialize( reverseEvent.getRenderedContent() ).data;
+					expect( reverseBody.paths[ 1 ].hops ).toHaveLength( 2 );
+
+					var queryService = getInstance( "CodeGraphQueryService" );
+					queryService.codegraphPathMaxExploredNodes = 1;
+					var runServiceForCap = getInstance( "CodeGraphRunService" );
+					prepareMock( runServiceForCap ).$property( "codeGraphQueryService", "variables", queryService );
+					prepareMock( runServiceForCap ).$property( "codegraphPathMaxExploredNodes", "variables", 1 );
+					var cappedEvent = this.get(
+						"/api/v1/runs/#runId#/codegraph/paths",
+						{ from: "app/A.bx", to: "app/C.bx", direction: "forward" }
+					);
+					var cappedBody = jsonDeserialize( cappedEvent.getRenderedContent() ).data;
+					expect( cappedBody.paths ).toBe( [], "explored-node cap must not return the uncapped path" );
+					expect( cappedBody.truncated ).toBeTrue();
+					expect( cappedBody.reason ).toBe( "explored-cap" );
+					queryService.codegraphPathMaxExploredNodes = 5000;
+					prepareMock( runServiceForCap ).$property( "codegraphPathMaxExploredNodes", "variables", 5000 );
+
+					var pathOverLimit = this.get(
+						"/api/v1/runs/#runId#/codegraph/paths",
+						{ from: "app/A.bx", to: "app/C.bx", limit: 9999 }
+					);
+					var pathOverStatus = pathOverLimit.getRenderData().statusCode ?: 0;
+					if ( !pathOverStatus ) pathOverStatus = pathOverLimit.getResponse().getStatusCode();
+					expect( pathOverStatus ).toBe( 422 );
+
+					var sourceEvent = this.get(
+							"/api/v1/runs/#runId#/codegraph/source",
+							{ path: "app/config/Router.bx", line: 3, before: 0, after: 0 }
+						);
+					expect( sourceEvent.getResponse() ).toHaveStatus( 200 );
+					var sourceBody = jsonDeserialize( sourceEvent.getRenderedContent() ).data;
+					expect( sourceBody.available ).toBeTrue();
+					expect( sourceBody.path ).toBe( "app/config/Router.bx" );
+					expect( sourceBody.focusLine ).toBe( 3 );
+					expect( sourceBody.lines ).toHaveLength( 1 );
+					expect( sourceBody.lines[ 1 ].focus ).toBeTrue();
+
+					var sourceTraversal = this.get(
+							"/api/v1/runs/#runId#/codegraph/source",
+							{ path: "../manifest.json", line: 1 }
+					);
+					var sourceTraversalStatus = sourceTraversal.getRenderData().statusCode ?: 0;
+					if ( !sourceTraversalStatus ) sourceTraversalStatus = sourceTraversal.getResponse().getStatusCode();
+					expect( sourceTraversalStatus ).toBe( 422 );
 
 					var overLimit = this.get(
 							"/api/v1/runs/#runId#/codegraph/subgraph",
@@ -220,7 +297,12 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					if ( !missingStatus ) missingStatus = missing.getResponse().getStatusCode();
 					expect( missingStatus ).toBe( 404 );
 
-					var history = this.get( "/api/v1/history?runKind=codegraph&q=#marker#" );
+					// BaseTestCase reuses rc within a spec; clear the earlier path query's
+					// from/to values so this request models a fresh HTTP request.
+					var history = this.get(
+						"/api/v1/history",
+						{ runKind: "codegraph", q: marker, from: "", to: "" }
+					);
 					expect( history.getResponse() ).toHaveStatus( 200 );
 					var historyBody = jsonDeserialize( history.getRenderedContent() );
 					expect( historyBody.data ).toHaveLength( 1 );
@@ -232,8 +314,20 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					var exportEvent = this.get( "/api/v1/runs/#runId#/export", { exportFormat: "markdown" } );
 					var exportStatus = exportEvent.getRenderData().statusCode ?: 0;
 					if ( !exportStatus ) exportStatus = exportEvent.getResponse().getStatusCode();
-					expect( exportStatus ).toBe( 422 );
-					expect( jsonDeserialize( exportEvent.getRenderedContent() ).error.code ).toBe( "export_unsupported" );
+					expect( exportStatus ).toBe( 200 );
+					expect( exportEvent.getRenderedContent() ).toInclude( "DoubleCheck CodeGraph" );
+
+					var mermaidEvent = this.get( "/api/v1/runs/#runId#/export", { format: "mermaid", exportFormat: "mermaid" } );
+					var mermaidStatus = mermaidEvent.getRenderData().statusCode ?: 0;
+					if ( !mermaidStatus ) mermaidStatus = mermaidEvent.getResponse().getStatusCode();
+					expect( mermaidStatus ).toBe( 200 );
+					expect( mermaidEvent.getRenderedContent() ).toInclude( "flowchart LR" );
+
+					var svgEvent = this.get( "/api/v1/runs/#runId#/export", { format: "svg", exportFormat: "svg" } );
+					var svgStatus = svgEvent.getRenderData().statusCode ?: 0;
+					if ( !svgStatus ) svgStatus = svgEvent.getResponse().getStatusCode();
+					expect( svgStatus ).toBe( 200 );
+					expect( svgEvent.getRenderedContent() ).toInclude( "<svg" );
 
 					var codeGraphRunService = getInstance( "CodeGraphRunService" );
 					prepareMock( codeGraphRunService ).$property(
@@ -267,7 +361,27 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					var stored = codeGraphRepository.get( runId );
 					expect( stored.narrative.used ).toBeTrue();
 					expect( stored.narrative.pitch.text ).toBe( "Retried pitch" );
+
+					var projectEntry = this.get( "/api/v1/codegraph", { projectPath: fixtureRoot } );
+					expect( projectEntry.getResponse() ).toHaveStatus( 200 );
+					var projectBody = jsonDeserialize( projectEntry.getRenderedContent() );
+					expect( projectBody.data.projectPath ).toBe( fixtureRoot );
+					expect( projectBody.data.run.id ).toBe( runId );
+
+					var labelEvent = this.put(
+						route   = "/api/v1/runs/#runId#/codegraph/label",
+						headers = { "Content-Type": "application/json", "Accept": "application/json" },
+						body    = { clusterId: "c1", label: "Orders module" }
+					);
+					expect( labelEvent.getResponse() ).toHaveStatus( 200 );
+					expect( jsonDeserialize( labelEvent.getRenderedContent() ).data.provenance ).toBe( "user" );
+					expect( codeGraphRepository.get( runId ).snapshot.clusters[ 1 ].label ).toBe( "Orders module" );
+
+					var clearLabelEvent = this.delete( "/api/v1/runs/#runId#/codegraph/label", { clusterId: "c1" } );
+					expect( clearLabelEvent.getResponse() ).toHaveStatus( 200 );
 				} finally {
+					queryExecute( "DELETE FROM codegraph_labels WHERE project_path = :projectPath", { projectPath: fixtureRoot } );
+					queryExecute( "DELETE FROM codegraph_narrative_shards WHERE project_path = :projectPath", { projectPath: fixtureRoot } );
 					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
 				}
 			} );
@@ -284,6 +398,69 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				expect( body.data.codegraph.meaningRequiresLlm ).toBeTrue();
 				expect( body.data.codegraph.schemaVersion ).toBe( "codegraph-snapshot-v1" );
 				expect( body.data.codegraph.narrativeVersion ).toBe( "codegraph-narrative-v2" );
+			} );
+
+			it( "allows structural drill-down for an indexed Review run but keeps narrative CodeGraph-only", () => {
+				var marker = lCase( createUUID() );
+				var runId = "review-graph-api-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var fixtureRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1/cases/order-flow" );
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id: runId,
+						tenantId: "default",
+						projectId: "default",
+						projectPath: fixtureRoot,
+						mode: "full",
+						runKind: "review",
+						input: {},
+						baseRevision: "",
+						headRevision: "HEAD",
+						status: "succeeded",
+						progress: 100,
+						currentPhase: "completed",
+						message: "Indexed Review fixture",
+						policy: {},
+						budgets: {},
+						createdAt: nowValue,
+						updatedAt: nowValue
+					} );
+					getInstance( "AnalysisGraphRepository" ).replaceRunGraph(
+						runId,
+						[
+							{
+								filePath: "app/A.bx",
+								contentHash: "review-a",
+								parserVersion: "test-v1",
+								symbols: [ { id: "review-a-symbol", kind: "class", name: "A", line: 1, evidence: "class A" } ],
+								dependencies: [ { id: "review-dep", kind: "constructs", target: "B", targetFile: "app/B.bx", line: 2, evidence: "new B()" } ]
+							},
+							{
+								filePath: "app/B.bx",
+								contentHash: "review-b",
+								parserVersion: "test-v1",
+								symbols: [ { id: "review-b-symbol", kind: "class", name: "B", line: 1, evidence: "class B" } ],
+								dependencies: []
+							}
+						],
+						[],
+						{ parserVersion: "test-v1", filesAnalyzed: 2, parserExecutions: 2, cacheHits: 0, symbolCount: 2, dependencyCount: 1, impactCount: 0, baselineRunId: "" }
+					);
+
+					var subgraph = this.get( "/api/v1/runs/#runId#/codegraph/subgraph", { focus: "app/A.bx" } );
+					expect( subgraph.getResponse() ).toHaveStatus( 200 );
+					var subgraphBody = jsonDeserialize( subgraph.getRenderedContent() ).data;
+					expect( subgraphBody.edges ).toHaveLength( 1, jsonSerialize( subgraphBody ) );
+					var edges = this.get( "/api/v1/runs/#runId#/codegraph/edges" );
+					expect( edges.getResponse() ).toHaveStatus( 200 );
+					expect( jsonDeserialize( edges.getRenderedContent() ).data.edges ).toHaveLength( 1 );
+					var narrative = this.post( "/api/v1/runs/#runId#/codegraph/narrative" );
+					var narrativeStatus = narrative.getRenderData().statusCode ?: 0;
+					if ( !narrativeStatus ) narrativeStatus = narrative.getResponse().getStatusCode();
+					expect( narrativeStatus ).toBe( 404 );
+				} finally {
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
 			} );
 		} );
 	}

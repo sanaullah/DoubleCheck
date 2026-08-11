@@ -37,6 +37,7 @@ class threadsafe {
 		dropLegacyMigrationTables( definition );
 		applySchema( definition );
 		repairOrphanedRows( definition );
+		repairOrphanedLabels( 100 );
 		validateSchema( definition );
 
 		log.info( "DoubleCheck SQLite schema is ready" );
@@ -56,6 +57,7 @@ class threadsafe {
 		dropLegacyMigrationTables( definition );
 		applySchema( definition );
 		repairOrphanedRows( definition );
+		repairOrphanedLabels( 100 );
 		validateSchema( definition );
 
 		log.warn( "DoubleCheck SQLite schema was rebuilt; local review data was removed" );
@@ -218,6 +220,41 @@ class threadsafe {
 		if ( removed ) {
 			log.warn( "Removed #removed# orphaned SQLite child rows" );
 		}
+		return removed;
+	}
+
+	/**
+	 * Labels intentionally outlive run rows, but a moved/deleted local project
+	 * must not make the table grow without bound. Inspect at most 100 project
+	 * paths per startup and remove labels only when the directory is gone.
+	 */
+	private numeric function repairOrphanedLabels( numeric maxProjects = 100 ) {
+		var removed = 0;
+		var limit = max( 1, int( arguments.maxProjects ) );
+		var records = queryExecute(
+			"SELECT project_path FROM ( SELECT project_path FROM codegraph_labels UNION SELECT project_path FROM codegraph_narrative_shards ) ORDER BY project_path LIMIT :limit",
+			{ limit: { value: limit, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var projectPath = trim( toString( records.project_path[ row ] ?: "" ) );
+			if ( !len( projectPath ) || directoryExists( projectPath ) ) continue;
+			var deleted = queryExecute(
+				"DELETE FROM codegraph_labels WHERE project_path = :projectPath",
+				{ projectPath: projectPath },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"DELETE FROM codegraph_narrative_shards WHERE project_path = :projectPath",
+				{ projectPath: projectPath },
+				{ datasource: datasource }
+			);
+			try {
+				var changes = queryExecute( "SELECT changes() AS changed", {}, { datasource: datasource } );
+				removed += val( changes.changed[ 1 ] ?: 0 );
+			} catch ( any ignored ) {}
+		}
+		if ( removed ) log.info( "Removed #removed# CodeGraph labels for missing local project paths" );
 		return removed;
 	}
 
@@ -477,6 +514,7 @@ class threadsafe {
 							kind TEXT NOT NULL,
 							name TEXT NOT NULL,
 							line INTEGER NOT NULL,
+							end_line INTEGER NOT NULL DEFAULT 0,
 							evidence TEXT NOT NULL,
 							PRIMARY KEY ( run_id, id ),
 							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
@@ -496,6 +534,7 @@ class threadsafe {
 							target TEXT NOT NULL,
 							target_file TEXT NOT NULL DEFAULT '',
 							line INTEGER NOT NULL,
+							end_line INTEGER NOT NULL DEFAULT 0,
 							evidence TEXT NOT NULL,
 							PRIMARY KEY ( run_id, id ),
 							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
@@ -553,10 +592,38 @@ class threadsafe {
 							truncated INTEGER,
 							truncation_reasons_json TEXT,
 							snapshot_json TEXT,
+							snapshot_reuse_key TEXT NOT NULL DEFAULT '',
 							narrative_cache_key TEXT,
 							narrative_json TEXT,
 							created_at TEXT,
 							FOREIGN KEY ( run_id ) REFERENCES review_runs( id ) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "codegraph_labels",
+					sql : "
+						CREATE TABLE IF NOT EXISTS codegraph_labels (
+							project_path TEXT NOT NULL,
+							cluster_key TEXT NOT NULL,
+							label TEXT NOT NULL,
+							provenance TEXT NOT NULL CHECK ( provenance IN ( 'ai', 'user' ) ),
+							cluster_fingerprint TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							PRIMARY KEY ( project_path, cluster_key )
+						)
+					"
+				},
+				{
+					name: "codegraph_narrative_shards",
+					sql : "
+						CREATE TABLE IF NOT EXISTS codegraph_narrative_shards (
+							project_path TEXT NOT NULL,
+							cluster_key TEXT NOT NULL,
+							cluster_fingerprint TEXT NOT NULL,
+							narrative_json TEXT NOT NULL,
+							created_at TEXT NOT NULL,
+							PRIMARY KEY ( project_path, cluster_key, cluster_fingerprint )
 						)
 					"
 				},
@@ -870,6 +937,10 @@ class threadsafe {
 				{ tableName: "review_summaries", columnName: "ai_retries", definition: "INTEGER" },
 				{ tableName: "review_summaries", columnName: "ai_observation_count", definition: "INTEGER" },
 				{ tableName: "review_dependencies", columnName: "target_file", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "review_symbols", columnName: "end_line", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "review_dependencies", columnName: "end_line", definition: "INTEGER NOT NULL DEFAULT 0" },
+				{ tableName: "codegraph_snapshots", columnName: "snapshot_reuse_key", definition: "TEXT NOT NULL DEFAULT ''" },
+				{ tableName: "codegraph_labels", columnName: "cluster_fingerprint", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "review_graph_summaries", columnName: "impact_count", definition: "INTEGER NOT NULL DEFAULT 0" },
 				{ tableName: "review_graph_summaries", columnName: "baseline_run_id", definition: "TEXT NOT NULL DEFAULT ''" },
 				{ tableName: "review_architecture_models", columnName: "repository_revision", definition: "TEXT NOT NULL DEFAULT ''" },
@@ -897,6 +968,9 @@ class threadsafe {
 				{ name: "idx_review_impacts_run_changed", sql: "CREATE INDEX idx_review_impacts_run_changed ON review_impacts ( run_id, changed_file, depth )" },
 				{ name: "idx_codegraph_snapshots_narrative_reuse", sql: "CREATE INDEX idx_codegraph_snapshots_narrative_reuse ON codegraph_snapshots ( project_path, repository_revision, narrative_cache_key )" },
 				{ name: "idx_codegraph_snapshots_fingerprint", sql: "CREATE INDEX idx_codegraph_snapshots_fingerprint ON codegraph_snapshots ( fingerprint )" },
+				{ name: "idx_codegraph_snapshots_project_revision", sql: "CREATE INDEX idx_codegraph_snapshots_project_revision ON codegraph_snapshots ( project_path, repository_revision, snapshot_reuse_key, created_at DESC )" },
+				{ name: "idx_codegraph_labels_project_cluster", sql: "CREATE INDEX idx_codegraph_labels_project_cluster ON codegraph_labels ( project_path, cluster_key )" },
+				{ name: "idx_codegraph_shards_project_cluster", sql: "CREATE INDEX idx_codegraph_shards_project_cluster ON codegraph_narrative_shards ( project_path, cluster_key, created_at DESC )" },
 				{ name: "idx_review_architecture_revision", sql: "CREATE INDEX idx_review_architecture_revision ON review_architecture_models ( repository_revision, model_version )" },
 				{ name: "idx_architecture_cache_revision", sql: "CREATE INDEX idx_architecture_cache_revision ON architecture_model_cache ( project_path, repository_revision, model_version )" },
 				{ name: "idx_specialist_results_run_status", sql: "CREATE INDEX idx_specialist_results_run_status ON review_specialist_results ( run_id, status )" },

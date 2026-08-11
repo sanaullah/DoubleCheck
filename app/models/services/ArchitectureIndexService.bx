@@ -1,6 +1,6 @@
 /**
  * Builds and stores the content-addressed symbol/dependency graph for a run,
- * dispatching each file to whichever parser (BoxLang, CFML) supports it.
+ * dispatching each file to whichever parser (BoxLang, CFML, JavaScript) supports it.
  *
  * @see BoxLangParserService
  * @see CfmlParserService
@@ -12,6 +12,8 @@ class threadsafe {
 	property name="boxLangParserService" inject="BoxLangParserService";
 
 	property name="cfmlParserService" inject="CfmlParserService";
+
+	property name="javaScriptParserService" inject="JavaScriptParserService";
 
 	property name="graphRepository" inject="AnalysisGraphRepository";
 
@@ -26,7 +28,10 @@ class threadsafe {
 	 * the run graph, and calculates bounded impact data against the baseline.
 	 */
 	struct function index( required string runId, required array files ) {
-		var parsers = [ boxLangParserService, cfmlParserService ];
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
 		var parsedFiles = [];
 		var usedParserVersions = [];
 		var metrics = {
@@ -83,7 +88,7 @@ class threadsafe {
 		var allDependencies = baseline.dependencies.duplicate();
 		allDependencies.append( currentDependencies, true );
 
-		resolveTargets( allSymbols, allDependencies );
+		resolveTargets( allSymbols, allDependencies, arguments.files );
 		var derivedTestEdges = deriveTestEdges( allDependencies );
 		allDependencies.append( derivedTestEdges, true );
 		persistCurrentResolution(
@@ -110,6 +115,36 @@ class threadsafe {
 				metrics
 			);
 		return metrics;
+	}
+
+	/** Parser-version contract used by a caller deciding whether a stored graph is adoptable. */
+	string function parserVersionFor( required array files ) {
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
+		var versions = [];
+		for ( var file in arguments.files ) {
+			var parser = resolveParser( parsers, file );
+			if ( isNull( parser ) ) continue;
+			var version = parser.getVersion();
+			if ( !versions.contains( version ) ) versions.append( version );
+		}
+		return versions.sort( "text" ).toList( "+" );
+	}
+
+	/** Stable all-parser signature for pre-scan snapshot reuse. */
+	string function parserVersionSignature() {
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
+		var versions = [];
+		for ( var parser in parsers ) {
+			var version = parser.getVersion();
+			if ( !versions.contains( version ) ) versions.append( version );
+		}
+		return versions.sort( "text" ).toList( "+" );
 	}
 
 	array function buildImpactCone(
@@ -203,15 +238,29 @@ class threadsafe {
 		return javacast( "null", "" );
 	}
 
-	private void function resolveTargets( required array symbols, required array dependencies ) {
+	private void function resolveTargets( required array symbols, required array dependencies, array files = [] ) {
 		var typeFiles = {};
 		var propertiesByLocation = {};
+		var routeFiles = {};
+		var viewFiles = {};
 		for ( var item in arguments.symbols ) {
 			if ( listFindNoCase( "class,interface", item.kind ) ) {
 				typeFiles[ normalizeTarget( item.name ) ] = item.filePath;
 			}
 			if ( item.kind == "property" ) {
 				propertiesByLocation[ "#item.filePath#:#item.line#" ] = item.name;
+			}
+			if ( item.kind == "route" ) {
+				routeFiles[ normalizeRoute( item.name ) ] = item.filePath;
+			}
+		}
+		for ( var file in arguments.files ) {
+			if ( !isStruct( file ) ) continue;
+			var viewPath = replace( trim( toString( file.filePath ?: "" ) ), "\", "/", "all" );
+			if ( reFindNoCase( "(^|/)views?/.*\.bxm$", viewPath ) ) {
+				var viewKey = reReplaceNoCase( viewPath, "^.*?/views?/", "" );
+				viewKey = reReplaceNoCase( viewKey, "\.bxm$", "" );
+				viewFiles[ lCase( viewKey ) ] = viewPath;
 			}
 		}
 
@@ -229,6 +278,17 @@ class threadsafe {
 
 		for ( var edge in arguments.dependencies ) {
 			var targetFile = edge.keyExists( "targetFile" ) ? edge.targetFile : "";
+			if ( edge.kind == "renders" && !len( targetFile ) ) {
+				var viewKey = lCase( reReplaceNoCase( trim( toString( edge.target ?: "" ) ), "^/", "" ) );
+				viewKey = reReplace( viewKey, "\.", "/", "all" );
+				viewKey = reReplaceNoCase( viewKey, "\.bxm$", "" );
+				if ( viewFiles.keyExists( viewKey ) ) targetFile = viewFiles[ viewKey ];
+			}
+			if ( edge.kind == "calls-api" && !len( targetFile ) ) {
+				var routeKey = normalizeRoute( edge.target ?: "" );
+				if ( routeFiles.keyExists( routeKey ) ) targetFile = routeFiles[ routeKey ];
+			}
+			if ( edge.kind == "routes" && !len( targetFile ) ) targetFile = resolveTypeFile( edge.handler ?: edge.target, typeFiles );
 			if ( !len( targetFile ) && edge.kind == "calls" ) {
 				var receiver = listFirst( edge.target, "." );
 				var aliasKey = "#edge.sourceFile#:#lCase( receiver )#";
@@ -267,7 +327,7 @@ class threadsafe {
 							"dependency",
 							"tests",
 							edge.targetFile,
-							edge.line
+							0
 						),
 						sourceFile: edge.sourceFile,
 						kind      : "tests",
@@ -345,14 +405,17 @@ class threadsafe {
 	private struct function materialize( required struct file, required struct parsed, required string parserVersion ) {
 		var symbols = [];
 		var seenSymbolIds = {};
+		var symbolOccurrences = {};
 		for ( var item in arguments.parsed.symbols ) {
 			var symbolItem = duplicate( item );
+			var symbolKey = lCase( trim( toString( item.kind ?: "symbol" ) ) & "|" & trim( toString( item.name ?: "" ) ) );
+			symbolOccurrences[ symbolKey ] = ( symbolOccurrences[ symbolKey ] ?: 0 ) + 1;
 			symbolItem.id = stableId(
 				arguments.file.filePath,
 				"symbol",
 				item.kind,
 				item.name,
-				item.line
+				symbolOccurrences[ symbolKey ]
 			);
 			if ( seenSymbolIds.keyExists( symbolItem.id ) ) {
 				continue;
@@ -362,14 +425,17 @@ class threadsafe {
 		}
 		var dependencies = [];
 		var seenDependencyIds = {};
+		var dependencyOccurrences = {};
 		for ( var item in arguments.parsed.dependencies ) {
 			var dependencyItem = duplicate( item );
+			var dependencyKey = lCase( trim( toString( item.kind ?: "dependency" ) ) & "|" & trim( toString( item.target ?: "" ) ) );
+			dependencyOccurrences[ dependencyKey ] = ( dependencyOccurrences[ dependencyKey ] ?: 0 ) + 1;
 			dependencyItem.id = stableId(
 				arguments.file.filePath,
 				"dependency",
 				item.kind,
 				item.target,
-				item.line
+				dependencyOccurrences[ dependencyKey ]
 			);
 			if ( seenDependencyIds.keyExists( dependencyItem.id ) ) {
 				continue;
@@ -382,6 +448,7 @@ class threadsafe {
 			filePath     : arguments.file.filePath,
 			contentHash  : arguments.file.contentHash,
 			parserVersion: arguments.parserVersion,
+			parseStrategy: arguments.parsed.parseStrategy ?: "",
 			symbols      : symbols,
 			dependencies : dependencies
 		};
@@ -395,6 +462,14 @@ class threadsafe {
 	private string function normalizeTarget( required string target ) {
 		var withoutModule = listFirst( trim( arguments.target ), "@" );
 		return lCase( listLast( withoutModule, "." ) );
+	}
+
+	private string function normalizeRoute( required any target ) {
+		var value = trim( toString( arguments.target ?: "" ) );
+		value = reReplace( value, "\?.*$", "" );
+		value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" );
+		while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 );
+		return lCase( value );
 	}
 
 	private boolean function isTestFile( required string filePath ) {
@@ -433,11 +508,11 @@ class threadsafe {
 		required string recordType,
 		required string kind,
 		required string name,
-		required numeric line
+		numeric occurrence = 0
 	) {
 		return lCase(
 			hash(
-				"#arguments.filePath#:#arguments.recordType#:#arguments.kind#:#arguments.name#:#arguments.line#",
+				"#arguments.filePath#:#arguments.recordType#:#arguments.kind#:#arguments.name#:#arguments.occurrence#",
 				"SHA-256"
 			)
 		);

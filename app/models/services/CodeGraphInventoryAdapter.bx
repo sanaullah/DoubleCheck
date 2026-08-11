@@ -56,8 +56,9 @@ class threadsafe {
 		var edges = isArray( arguments.reviewGraph.dependencies ?: "" ) ? arguments.reviewGraph.dependencies : [];
 		for ( var edge in edges ) {
 			if ( !isStruct( edge ) ) continue;
-			var mappedKind = mapKind( edge.kind ?: "" );
-			if ( !len( mappedKind ) ) continue;
+			var mapped = mapKind( edge.kind ?: "" );
+			if ( !isStruct( mapped ) || !( mapped.accepted ?: false ) ) continue;
+			var mappedKind = mapped.group;
 
 			var sourceFile = rememberPath( edge.sourceFile ?: edge.filePath ?: edge.source_file ?: "", canonicalPaths );
 			if ( !len( sourceFile ) ) continue;
@@ -72,6 +73,8 @@ class threadsafe {
 			var record = {
 				id       : trim( toString( edge.id ?: "" ) ),
 				kind     : mappedKind,
+				specificKind: mapped.kind,
+				kinds    : [ mapped.kind ],
 				target   : trim( toString( edge.target ?: "" ) ),
 				filePath : sourceFile,
 				startLine: startLine,
@@ -85,7 +88,10 @@ class threadsafe {
 				record.resolution = "path";
 			}
 			if ( len( trim( toString( edge.evidence ?: "" ) ) ) ) {
-				record.evidence = edge.evidence;
+					record.evidence = edge.evidence;
+			}
+			for ( var metadataKey in [ "handler", "pattern", "action", "verb" ] ) {
+				if ( structKeyExists( edge, metadataKey ) ) record[ metadataKey ] = edge[ metadataKey ];
 			}
 			dependencies.append( record );
 		}
@@ -138,14 +144,14 @@ class threadsafe {
 	}
 
 	/**
-	 * Review edge kind → coupling structuralKinds vocabulary.
-	 * Returns "" for kinds that must be dropped (`tests`) or unrecognized.
+	 * Review edge kind → coupling structuralKinds vocabulary. The group remains
+	 * the graph identity; the specific kind survives as an attribute.
 	 */
-	string function mapKind( required any kind ) {
+	struct function mapKind( required any kind ) {
 		var value = lCase( trim( toString( arguments.kind ?: "" ) ) );
-		if ( !len( value ) || value == "tests" ) return "";
-		if ( value == "includes" || value == "include" ) return "include";
-		if ( value == "extends" || value == "implements" ) return value;
+		if ( !len( value ) || value == "tests" ) return { accepted: false, group: "", kind: value };
+		if ( value == "includes" || value == "include" ) return { accepted: true, group: "include", kind: value };
+		if ( value == "extends" || value == "implements" ) return { accepted: true, group: value, kind: value };
 		if (
 			value == "constructs" ||
 			value == "injects" ||
@@ -154,9 +160,9 @@ class threadsafe {
 			value == "type-reference" ||
 			value == "component-construction"
 		) {
-			return "component-construction";
+			return { accepted: true, group: "component-construction", kind: value };
 		}
-		return "";
+		return { accepted: true, group: value, kind: value };
 	}
 
 	private void function collectFiles( required struct reviewGraph, required struct fileMeta, required struct canonicalPaths ) {

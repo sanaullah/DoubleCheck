@@ -3,8 +3,8 @@
 Public technical docs for the local desktop review helper.
 
 **This folder is the single documentation source of truth.** It is committed.
-There is no `.docs/` tree and no `.superpowers/` tree — both were removed. Do not
-recreate them; one documentation tree, in version control.
+There is no `.docs/` tree. Do not recreate it; `resources/docs/` is the one
+documentation tree in version control. `.superpowers/` is local scratch.
 
 ## Start here
 
@@ -13,7 +13,7 @@ recreate them; one documentation tree, in version control.
 | [application-features.md](application-features.md) | Purpose, shipped features, AI contract, out of scope, **known gaps**, measured language tiers |
 | [technical-flow.md](technical-flow.md) | Technical implementation, project flow, Mermaid diagrams |
 | [plans/codegraph-domain-lens-design.md](plans/codegraph-domain-lens-design.md) | **Approved design** — CodeGraph meaning / Domain lens (LLM-required briefing) |
-| [plans/codegraph-depth-plan.md](plans/codegraph-depth-plan.md) | **Live plan** — CodeGraph depth: AST parsing, route/view/table edges, JS, flows v2 |
+| [plans/codegraph-depth-plan.md](plans/codegraph-depth-plan.md) | **Live plan** — CodeGraph depth: shared defects, AST parsing, route/view/table edges, JS, flows, explorer, path finder |
 | [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | Prior Modernize inversion notes (kept for Part 2 evidence); not the active plan |
 
 ## Reference — open only when the task needs it

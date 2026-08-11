@@ -1,0 +1,115 @@
+/** Validates provider narrative references against deterministic snapshot ids. */
+@singleton
+class threadsafe {
+
+	struct function normalize( required any response, required struct evidence ) {
+		var parsed = parseResponse( arguments.response );
+		if ( !isStruct( parsed ) ) return emptyContent();
+		var context = arguments.evidence.validationContext ?: {};
+		var allowedClusters = listToLookup( context.allowedClusterIds ?: [] );
+		var allowedNodes = listToLookup( context.allowedNodeIds ?: [] );
+		var allowedFlows = listToLookup( context.allowedFlowIds ?: [] );
+		var allowedHotspots = listToLookup( context.allowedHotspotIds ?: [] );
+		var allowedCycles = listToLookup( context.allowedCycleIds ?: [] );
+		var pitch = {};
+		if ( isStruct( parsed.pitch ?: "" ) && len( trim( parsed.pitch.text ?: "" ) ) ) pitch = { text: left( trim( parsed.pitch.text ), 600 ) };
+		var domains = normalizeDomains( parsed.domains ?: [], allowedClusters );
+		var summaries = domains.map( ( domain ) => { return { clusterId: domain.clusterId, title: domain.title, text: domain.text }; } );
+		return {
+			pitch: pitch,
+			domains: domains,
+			processes: normalizeProcesses( parsed.processes ?: [], allowedFlows ),
+			onboarding: normalizeOnboarding( parsed.onboarding ?: [], allowedClusters, allowedNodes, allowedFlows ),
+			risk: normalizeRisk( parsed.risk ?: [], allowedHotspots, allowedCycles ),
+			summaries: summaries
+		};
+	}
+
+	private any function parseResponse( required any response ) {
+		if ( isStruct( arguments.response ) ) return arguments.response;
+		if ( isSimpleValue( arguments.response ) ) {
+			try { return jsonDeserialize( arguments.response ); } catch ( any ignored ) { return {}; }
+		}
+		return {};
+	}
+
+	private array function normalizeDomains( required array items, required struct allowed ) {
+		var out = [];
+		var seen = {};
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) || !len( trim( item.text ?: "" ) ) ) continue;
+			var id = trim( toString( item.clusterId ?: "" ) );
+			if ( !len( id ) || !arguments.allowed.keyExists( id ) || seen.keyExists( id ) ) continue;
+			seen[ id ] = true;
+			out.append( { clusterId: id, title: left( trim( item.title ?: "" ), 120 ), text: left( trim( item.text ), 800 ) } );
+		}
+		return out;
+	}
+
+	private array function normalizeProcesses( required array items, required struct allowed ) {
+		var out = [];
+		var seen = {};
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) || !len( trim( item.text ?: "" ) ) ) continue;
+			var id = trim( toString( item.flowId ?: "" ) );
+			if ( !len( id ) || !arguments.allowed.keyExists( id ) || seen.keyExists( id ) ) continue;
+			seen[ id ] = true;
+			out.append( { flowId: id, title: left( trim( item.title ?: "" ), 120 ), text: left( trim( item.text ), 800 ) } );
+		}
+		return out;
+	}
+
+	private array function normalizeOnboarding(
+		required array items,
+		required struct allowedClusters,
+		required struct allowedNodes,
+		required struct allowedFlows
+	) {
+		var out = [];
+		var seen = {};
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) || !len( trim( item.text ?: "" ) ) ) continue;
+			var type = lCase( trim( toString( item.refType ?: "" ) ) );
+			var id = trim( toString( item.refId ?: "" ) );
+			if ( !len( id ) || !listFindNoCase( "cluster,node,flow", type ) ) continue;
+			if ( type == "cluster" && !arguments.allowedClusters.keyExists( id ) ) continue;
+			if ( type == "node" && !arguments.allowedNodes.keyExists( id ) ) continue;
+			if ( type == "flow" && !arguments.allowedFlows.keyExists( id ) ) continue;
+			var step = isNumeric( item.step ?: "" ) ? max( 1, min( 5, int( val( item.step ) ) ) ) : out.len() + 1;
+			var key = type & ":" & id & ":" & step;
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			out.append( { step: step, refType: type, refId: id, text: left( trim( item.text ), 400 ) } );
+		}
+		out.sort( ( a, b ) => a.step > b.step ? 1 : ( a.step < b.step ? -1 : 0 ) );
+		return out.len() > 5 ? out.slice( 1, 5 ) : out;
+	}
+
+	private array function normalizeRisk( required array items, required struct allowedHotspots, required struct allowedCycles ) {
+		var out = [];
+		var seen = {};
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) || !len( trim( item.text ?: "" ) ) ) continue;
+			var type = lCase( trim( toString( item.refType ?: "" ) ) );
+			var id = trim( toString( item.refId ?: "" ) );
+			if ( !len( id ) || !listFindNoCase( "hotspot,cycle", type ) ) continue;
+			if ( type == "hotspot" && !arguments.allowedHotspots.keyExists( id ) ) continue;
+			if ( type == "cycle" && !arguments.allowedCycles.keyExists( id ) ) continue;
+			var key = type & ":" & id;
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			out.append( { refType: type, refId: id, text: left( trim( item.text ), 600 ) } );
+		}
+		return out;
+	}
+
+	private struct function listToLookup( required array values ) {
+		var out = {};
+		for ( var value in arguments.values ) out[ toString( value ) ] = true;
+		return out;
+	}
+
+	private struct function emptyContent() {
+		return { pitch: {}, domains: [], processes: [], onboarding: [], risk: [], summaries: [] };
+	}
+}

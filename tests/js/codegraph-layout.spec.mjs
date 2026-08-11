@@ -1,9 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const layout = require("../../public/assets/codegraph-layout.js");
+
+test("CodeGraph UI wires path selection, bounded path API, highlight reuse, and exports", () => {
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const view = readFileSync(new URL("../../app/views/main/codegraph.bxm", import.meta.url), "utf8");
+	assert.match(ui, /codegraph\/paths\?/);
+	assert.match(ui, /codeGraphPathHighlight/);
+	assert.match(ui, /flowStepSet/);
+	assert.match(ui, /data-codegraph-path-endpoint/);
+	assert.match(ui, /codeGraphSymbolsForFile/);
+	assert.match(ui, /flow\.stepSymbols/);
+	assert.match(ui, /Flow symbols/);
+	assert.match(view, /id="codegraph-pathfinder"/);
+	assert.match(view, /data-codegraph-export="markdown"/);
+	assert.match(view, /data-codegraph-export="mermaid"/);
+	assert.match(view, /data-codegraph-export="svg"/);
+});
 
 const sample = {
 	nodes: [
@@ -85,6 +102,30 @@ test("layoutLayered finite coords ordered by layer", () => {
 	assert.ok(byId.a.x < byId.b.x);
 	assert.ok(byId.b.x < byId.c.x);
 	assert.equal(byId.b.x, byId.d.x);
+});
+
+test("layoutSwimlane orders nodes by role and keeps flow steps stable", () => {
+	const positioned = layout.layoutSwimlane(
+		{
+			nodes: [
+				{ id: "table:orders", label: "orders", role: "persistence" },
+				{ id: "app/models/OrderService.cfc", label: "service", role: "domain" },
+				{ id: "route:/orders", label: "orders route", role: "entry" },
+				{ id: "app/public/app.js", label: "client", role: "client" }
+			],
+			edges: [{ from: "route:/orders", to: "app/models/OrderService.cfc" }]
+		},
+		{ flowStepSet: ["route:/orders", "app/models/OrderService.cfc", "table:orders"] }
+	);
+	assert.equal(positioned.mode, "swimlane");
+	assert.equal(positioned.lanes[0].key, "client");
+	assert.ok(positioned.nodes.every((node) => Number.isFinite(node.x) && Number.isFinite(node.y)));
+	const byId = Object.fromEntries(positioned.nodes.map((node) => [node.id, node]));
+	assert.equal(byId["route:/orders"].lane, "entry");
+	assert.ok(byId["route:/orders"].x < byId["app/models/OrderService.cfc"].x);
+	assert.ok(byId["app/models/OrderService.cfc"].x < byId["table:orders"].x);
+	const svg = layout.buildSvg(positioned);
+	assert.ok(svg.includes("cg-swimlane"));
 });
 
 test("zoomAt keeps cursor point fixed and respects min/max", () => {

@@ -225,7 +225,132 @@ class extends="testbox.system.BaseSpec" {
 				expect( len( a ) ).toBe( 64 );
 			} );
 
+			it( "budgets each evidence section and relativizes provider paths", () => {
+				var captured = {};
+				var service = narrativeServiceForTests( true );
+				var compiler = stubCompiler();
+				compiler.compile = ( contractId, data, options ) => {
+					captured.data = duplicate( arguments.data );
+					return { messages: [ { role: "user", content: "test" } ], provenance: { contractId: contractId } };
+				};
+				service.promptCompiler = compiler;
+				service.promptOutputValidator = stubPassThroughValidator();
+				service.sectionReserve = 100;
+				service.maxPromptCharacters = 12000;
+
+				var result = service.narrate( payloadSnapshot(), "C:/Users/Sana/clients/orders" );
+
+				expect( result.used ).toBeTrue();
+				expect( captured.data.evidence.clusters[ 1 ].filePaths[ 1 ] ).toBe( "app/services/OrderService.bx" );
+				expect( captured.data.evidence.flows[ 1 ].entryFile ).toBe( "app/handlers/OrderHandler.bx" );
+				expect( captured.data.evidence.cycles[ 1 ].members[ 1 ] ).toBe( "app/services/OrderService.bx" );
+				expect( jsonSerialize( captured.data ) ).notToInclude( "C:/Users/Sana/clients/orders" );
+			} );
+
+			it( "reuses unchanged shards and only calls the provider for a changed cluster", () => {
+				var calls = { chat: 0, find: 0, save: 0 };
+				var service = narrativeServiceForTests( true );
+				service.codeGraphRepository = {
+					clusterKey: ( cluster ) => cluster.id,
+					clusterFingerprint: ( cluster ) => "fp-" & cluster.id,
+					findNarrativeShard: ( projectPath, clusterKey, fingerprint ) => {
+						calls.find++;
+						return clusterKey == "cluster-first" ? cachedShard( "cluster-first", "First module" ) : javacast( "null", "" );
+					},
+					saveNarrativeShard: ( projectPath, clusterKey, fingerprint, narrative ) => { calls.save++; }
+				};
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => {
+						calls.chat++;
+						return { pitch: {}, domains: [ { clusterId: "cluster-second", title: "Second module", text: "Changed" } ], processes: [], onboarding: [], risk: [], summaries: [] };
+					}
+				};
+				service.promptCompiler = stubCompiler();
+				service.promptOutputValidator = stubPassThroughValidator();
+
+				var result = service.narrate( shardedSnapshot(), "C:/Projects/orders" );
+
+				expect( result.used ).toBeTrue();
+				expect( calls.find ).toBe( 2 );
+				expect( calls.chat ).toBe( 1 );
+				expect( calls.save ).toBe( 1 );
+				expect( result.domains.map( ( item ) => item.clusterId ) ).toInclude( "cluster-first" );
+				expect( result.domains.map( ( item ) => item.clusterId ) ).toInclude( "cluster-second" );
+			} );
+
+			it( "reuses the cluster shard when the graph has only one cluster", () => {
+				var calls = { chat: 0, find: 0 };
+				var service = narrativeServiceForTests( true );
+				service.codeGraphRepository = {
+					clusterKey: ( cluster ) => cluster.id,
+					clusterFingerprint: ( cluster ) => "fp-" & cluster.id,
+					findNarrativeShard: ( projectPath, clusterKey, fingerprint ) => {
+						calls.find++;
+						return cachedShard( clusterKey, "Orders module" );
+					},
+					saveNarrativeShard: ( projectPath, clusterKey, fingerprint, narrative ) => {}
+				};
+				service.chatGateway = {
+					isEnabled: ( apiKey, isLocal ) => true,
+					chat: ( messages, params, options ) => { calls.chat++; return v2FixtureResponse(); }
+				};
+
+				var result = service.narrate( payloadSnapshot(), "C:/Projects/orders" );
+
+				expect( result.used ).toBeTrue();
+				expect( calls.find ).toBe( 1 );
+				expect( calls.chat ).toBe( 0 );
+			} );
+
 		} );
+	}
+
+	private struct function narrativeServiceForTests( required boolean enabled ) {
+		var service = new app.models.services.CodeGraphNarrativeService();
+		var providerEnabled = arguments.enabled;
+		service.chatGateway = {
+			isEnabled: ( apiKey, isLocal ) => providerEnabled,
+			chat: ( messages, params, options ) => v2FixtureResponse()
+		};
+		service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+			provider: "deterministic-fake", apiKey: arguments.enabled ? "test-key" : "", model: "corpus-v1", isLocal: false, timeout: 1, contextWindow: 8000
+		} );
+		service.secretRedactionService = { redactText: ( text ) => text };
+		service.maxClusters = 24;
+		service.maxHotspots = 20;
+		service.maxFlows = 24;
+		service.maxCycles = 12;
+		service.maxPromptCharacters = 30000;
+		return service;
+	}
+
+	private struct function payloadSnapshot() {
+		return {
+			fingerprint: "payload-fingerprint",
+			clusters: [ { id: "cluster-real", label: "orders", filePaths: [ "C:/Users/Sana/clients/orders/app/services/OrderService.bx" ], fileCount: 1, symbolCount: 3 } ],
+			nodes: [ { id: "C:/Users/Sana/clients/orders/app/services/OrderService.bx", path: "C:/Users/Sana/clients/orders/app/services/OrderService.bx", role: "domain" } ],
+			hotspots: [ { id: "C:/Users/Sana/clients/orders/app/services/OrderService.bx", path: "C:/Users/Sana/clients/orders/app/services/OrderService.bx", hotspotScore: 1 } ],
+			flows: [ { id: "flow-real", entryFile: "C:/Users/Sana/clients/orders/app/handlers/OrderHandler.bx", entrySymbol: "create", steps: [ "C:/Users/Sana/clients/orders/app/handlers/OrderHandler.bx" ], sinkFile: "C:/Users/Sana/clients/orders/app/services/OrderService.bx" } ],
+			cycles: [ [ "C:/Users/Sana/clients/orders/app/services/OrderService.bx" ] ]
+		};
+	}
+
+	private struct function shardedSnapshot() {
+		var snapshot = payloadSnapshot();
+		snapshot.clusters = [
+			{ id: "cluster-first", label: "first", filePaths: [ "app/first.bx" ], fileCount: 1, symbolCount: 1 },
+			{ id: "cluster-second", label: "second", filePaths: [ "app/second.bx" ], fileCount: 1, symbolCount: 1 }
+		];
+		snapshot.nodes = [
+			{ id: "app/first.bx", path: "app/first.bx", clusterId: "cluster-first", role: "domain" },
+			{ id: "app/second.bx", path: "app/second.bx", clusterId: "cluster-second", role: "domain" }
+		];
+		return snapshot;
+	}
+
+	private struct function cachedShard( required string clusterId, required string title ) {
+		return { used: true, enabled: true, version: "codegraph-narrative-v2", provider: "cache", model: "cache", pitch: {}, domains: [ { clusterId: arguments.clusterId, title: arguments.title, text: "Cached" } ], processes: [], onboarding: [], risk: [], summaries: [], coverage: {}, trimmedSections: [] };
 	}
 
 	private struct function sampleSnapshot() {

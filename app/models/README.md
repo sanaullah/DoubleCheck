@@ -111,10 +111,10 @@ deterministic rules behind those public methods.
 | File | Responsibility | Public API |
 | --- | --- | --- |
 | [AIProviderProfileRepository.bx](repositories/AIProviderProfileRepository.bx) | Stores user-managed provider profiles and the active-profile flag. | `list`, `countForTenant`, `get`, `getActive`, `create`, `update`, `delete`, `setActive` |
-| [AnalysisGraphRepository.bx](repositories/AnalysisGraphRepository.bx) | Stores content-addressed parser caches and per-run symbols, dependencies, and graph lookup results. | `findCached`, `saveCached`, `replaceRunGraph`, `findBaselineGraph`, `getGraph` |
+| [AnalysisGraphRepository.bx](repositories/AnalysisGraphRepository.bx) | Stores content-addressed parser caches and per-run symbols, dependencies, and graph lookup results with independent bounded loads; adopts a parser-compatible Review graph for a full CodeGraph run. | `findCached`, `saveCached`, `replaceRunGraph`, `findBaselineGraph`, `findIndexedRun`, `adoptRunGraph`, `getGraph` |
 | [AppSettingsRepository.bx](repositories/AppSettingsRepository.bx) | Persists flat setting overrides by local tenant/project scope. | `getAll`, `set`, `setMany` |
 | [ArchitectureRepository.bx](repositories/ArchitectureRepository.bx) | Persists architecture snapshots, plans, diffs, baselines, and reusable architecture caches. | `save`, `get`, `findReusable`, `saveReusable`, `findBaseline` |
-| [CodeGraphRepository.bx](repositories/CodeGraphRepository.bx) | Persists CodeGraph snapshots and reusable narrative blobs by project/revision/cache key. | `save`, `get`, `findReusableNarrative` |
+| [CodeGraphRepository.bx](repositories/CodeGraphRepository.bx) | Persists CodeGraph snapshots, per-cluster narrative shards, and project-scoped AI/user labels keyed by stable member composition. | `save`, `get`, `findLatestProjectSnapshot`, `findReusableNarrative`, `findReusableSnapshot`, `findNarrativeShard`, `saveNarrativeShard`, `saveUserLabel`, `clearUserLabel`, `updateNarrative` |
 | [FindingReviewRepository.bx](repositories/FindingReviewRepository.bx) | Stores fingerprint-level finding decisions and append-only review transitions. | `listForProject`, `setState` |
 | [ModernizationRepository.bx](repositories/ModernizationRepository.bx) | Stores sanitized schema packs, checkpoints, plans, human decisions, and decision events. | `saveSchemaPack`, `getSchemaPack`, `saveCheckpoint`, `getCheckpoints`, `savePlan`, `getPlan`, `upsertDecision`, `findDecision`, `deleteDecision`, `listDecisions`, `appendDecisionEvent`, `listDecisionEvents` |
 | [ReviewEventRepository.bx](repositories/ReviewEventRepository.bx) | Appends and replays the ordered run-event stream used by SSE and observability. | `append`, `after` |
@@ -130,7 +130,7 @@ deterministic rules behind those public methods.
 | --- | --- | --- |
 | [ReviewRunService.bx](services/ReviewRunService.bx) | Coordinates run creation, queueing, leases, phase execution, cancellation, result assembly, reruns, follow-ups, and Modernize continuation. | `create`, `rerunScoped`, `followUpScoped`, `continueModernizeScoped`, `recoverPendingRuns`, `get`, `getScoped`, `getResult`, `getResultScoped`, `list`, `listScoped`, `cancel`, `cancelScoped`, `isTerminal` |
 | [RepositoryScannerService.bx](services/RepositoryScannerService.bx) | Discovers bounded source files for working-tree, revision-diff, or full scans and reads file metadata/content. | `scan`, `listSourceFiles`, `prioritizeCandidatePaths` |
-| [GitRepositoryService.bx](services/GitRepositoryService.bx) | Provides read-only Git inspection, file lists, blobs, and changed line ranges. | `inspect`, `workingTreePaths`, `fullPaths`, `revisionPaths`, `readBlob`, `changedLineRanges` |
+| [GitRepositoryService.bx](services/GitRepositoryService.bx) | Provides read-only Git inspection, file lists, bounded commit/file history, blobs, and changed line ranges. | `inspect`, `workingTreePaths`, `fullPaths`, `commitFilePairs`, `revisionPaths`, `readBlob`, `changedLineRanges` |
 | [ReviewPolicyService.bx](services/ReviewPolicyService.bx) | Validates the create payload, allowlisted roles, budgets, and stable policy fingerprint. | `normalize` |
 | [ReviewPlannerService.bx](services/ReviewPlannerService.bx) | Builds a bounded immutable specialist plan from architecture and context evidence. | `plan` |
 | [ContextPackService.bx](services/ContextPackService.bx) | Selects authorized file/line ranges within file and character budgets. | `build` |
@@ -143,7 +143,7 @@ deterministic rules behind those public methods.
 | [ReviewHistoryService.bx](services/ReviewHistoryService.bx) | Reads historical run summaries and compares fingerprints; it does not persist derived history. | `listScoped`, `compareScoped` |
 | [CoverageAssessmentService.bx](services/CoverageAssessmentService.bx) | Calculates explicit specialist task coverage and remaining review gaps. | `assess` |
 | [ObservabilityTraceService.bx](services/ObservabilityTraceService.bx) | Projects persisted run events into local Langfuse-inspired trace artifacts. | `exportTraces` |
-| [ReportExportService.bx](services/ReportExportService.bx) | Exports review results as JSON, Markdown, or SARIF. | `export`, `supportedFormats`, `toJson`, `toMarkdown`, `toSarif` |
+| [ReportExportService.bx](services/ReportExportService.bx) | Exports Review results as JSON/Markdown/SARIF and CodeGraph snapshots as JSON/Markdown/Mermaid/SVG. | `export`, `supportedFormats`, `toJson`, `toMarkdown`, `toSarif` |
 | [QualityGateService.bx](services/QualityGateService.bx) | Runs seeded evaluation gates and reports configured quality status. | `runSeededGate`, `status`, `advertisedLanguages` |
 | [EvaluationService.bx](services/EvaluationService.bx) | Loads an evaluation corpus, executes review cases, and checks citation/threshold metrics. | `loadCorpus`, `evaluate` |
 
@@ -151,9 +151,10 @@ deterministic rules behind those public methods.
 
 | File | Responsibility | Public API |
 | --- | --- | --- |
-| [ArchitectureIndexService.bx](services/ArchitectureIndexService.bx) | Builds a content-addressed graph for a run and dispatches supported files to the matching parser. | `index`, `buildImpactCone` |
+| [ArchitectureIndexService.bx](services/ArchitectureIndexService.bx) | Builds a content-addressed graph for a run and dispatches BoxLang, CFML, and JavaScript files to the matching parser; exposes the parser-version contract for graph adoption. | `index`, `parserVersionFor`, `buildImpactCone` |
 | [BoxLangParserService.bx](services/BoxLangParserService.bx) | Extracts BoxLang symbols, calls, dependencies, and impact edges. | `getVersion`, `supports`, `parse` |
 | [CfmlParserService.bx](services/CfmlParserService.bx) | Extracts CFML symbols, calls, dependencies, and impact edges under the same parser contract. | `getVersion`, `supports`, `parse` |
+| [JavaScriptParserService.bx](services/JavaScriptParserService.bx) | Extracts bounded JavaScript imports, declarations, calls, and `/api/v1` fetch/request-wrapper edges without bundler/runtime resolution. | `getVersion`, `supports`, `parse` |
 | [ArchitectureModelService.bx](services/ArchitectureModelService.bx) | Derives bounded deterministic architecture facts from graph data and scanned files. | `build` |
 | [ArchitectureEnrichmentService.bx](services/ArchitectureEnrichmentService.bx) | Optionally enriches deterministic facts with cited AI observations and caches safe results. | `isEnabled`, `cacheKey`, `enrich` |
 | [ArchitectureDiffService.bx](services/ArchitectureDiffService.bx) | Compares current architecture facts with a baseline using stable set differences. | `compare` |
@@ -167,10 +168,13 @@ it must not declare a second copy of those algorithms
 
 | File | Responsibility | Public API |
 | --- | --- | --- |
-| [CodeGraphInventoryAdapter.bx](services/CodeGraphInventoryAdapter.bx) | Maps review-graph symbols/dependencies into the coupling-inventory shape (synthetic per-file units; drops `tests` edges). | `adapt` |
-| [CodeGraphMetricsService.bx](services/CodeGraphMetricsService.bx) | Assembles the deterministic snapshot: hotspots, orphans, layer violations, directories, fingerprint. Reads fan-in/cycles from CouplingGraph. | `assemble`, `snapshotVersion` |
-| [CodeGraphNarrativeService.bx](services/CodeGraphNarrativeService.bx) | Optional LLM cluster/hotspot summaries; never mutates the snapshot; failures return `{used:false}`. | `isEnabled`, `cacheKey`, `narrate`, `enrich` |
-| [CodeGraphRunService.bx](services/CodeGraphRunService.bx) | Owns the CodeGraph pipeline after shared scan: index → metrics → optional narrative → persist; subgraph drill-down. | `execute`, `getResult`, `subgraph`, `cancelRun` |
+| [CodeGraphInventoryAdapter.bx](services/CodeGraphInventoryAdapter.bx) | Maps review-graph symbols/dependencies into the coupling-inventory shape (synthetic per-file units; drops `tests` edges while preserving edge kinds). | `adapt`, `mapKind` |
+| [CodeGraphMetricsService.bx](services/CodeGraphMetricsService.bx) | Assembles the deterministic snapshot: routes/resources, roles, bounded co-change/churn hotspots, orphans, layer violations, directories, and fingerprint. Reads fan-in/cycles from CouplingGraph. | `assemble`, `snapshotVersion` |
+| [CodeGraphFlowService.bx](services/CodeGraphFlowService.bx) | Derives bounded typed request flows and production/test reachability from the deterministic inventory. | `extract`, `reachability` |
+| [CodeGraphNarrativeService.bx](services/CodeGraphNarrativeService.bx) | Optional LLM cluster/hotspot summaries; per-cluster shards, bounded evidence sections, relative paths, coverage, and risk; never mutates the snapshot. | `isEnabled`, `usesShards`, `cacheKey`, `narrate` |
+| [CodeGraphNarrativeNormalizer.bx](services/CodeGraphNarrativeNormalizer.bx) | Validates provider narrative references against the deterministic snapshot and bounds returned text. | `normalize` |
+| [CodeGraphQueryService.bx](services/CodeGraphQueryService.bx) | Owns read-only subgraph, edge, bounded path, and cited-source drill-down queries. | `subgraph`, `fileEdges`, `paths`, `sourceExcerpt` |
+| [CodeGraphRunService.bx](services/CodeGraphRunService.bx) | Owns the CodeGraph pipeline after shared scan: index → metrics → persist structure → optional narrative; delegates read-only drill-down queries. | `execute`, `getResult`, `subgraph`, `fileEdges`, `paths`, `sourceExcerpt`, `cancelRun` |
 
 ### AI providers and specialist execution
 
@@ -225,7 +229,7 @@ it must not declare a second copy of those algorithms
 | File | Responsibility | Public API |
 | --- | --- | --- |
 | [AppSettingsService.bx](services/AppSettingsService.bx) | Reads fresh SQLite setting overrides and falls back to injected defaults; writes settings-panel changes. | `get`, `getAll`, `set`, `setMany` |
-| [SchemaService.bx](services/SchemaService.bx) | Owns, applies, repairs, validates, reports, and deliberately rebuilds the complete main SQLite schema. | `getDatabaseStatus`, `ensureSchema`, `rebuildSchema` |
+| [SchemaService.bx](services/SchemaService.bx) | Owns, applies, repairs, validates, reports, and deliberately rebuilds the complete main SQLite schema, including CodeGraph reuse, label, and narrative-shard tables with bounded missing-project cleanup. | `getDatabaseStatus`, `ensureSchema`, `rebuildSchema` |
 | [SecretRedactionService.bx](services/SecretRedactionService.bx) | Redacts credential-like text, structured values, and line collections. | `redactText`, `redactStructured`, `redactLine`, `redactLines` |
 | [SecurityContextService.bx](services/SecurityContextService.bx) | Resolves the local identity/project and authorizes safe project paths and operations. | `authenticate`, `authorize`, `projectFor`, `authorizeProjectPath`, `projectsFor`, `defaultContext` |
 | [SupportedLanguageService.bx](services/SupportedLanguageService.bx) | Canonical registry for BoxLang, CFML, and JavaScript review support. | `definitions`, `extensionMap` |

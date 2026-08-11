@@ -185,6 +185,72 @@ class extends="testbox.system.BaseSpec" {
 				);
 
 				it(
+					"returns bounded commit-to-file pairs for local history",
+					() => {
+						var fixture = createFixture();
+						try {
+							fileWrite( fixture.path & "/src/second.bx", "second" );
+							fileWrite( fixture.path & "/src/main.bx", "version three" );
+							runGit( fixture.path, [ "add", "."] );
+							runGit( fixture.path, [ "commit", "--quiet", "-m", "co-change"] );
+							var result = new app.models.services.GitRepositoryService().commitFilePairs(
+								root       = fixture.root,
+								maxCommits = 3,
+								maxEntries = 20
+							);
+
+							expect( result.available ).toBeTrue();
+							expect( result.commits.len() ).toBeGTE( 1 );
+							expect( result.commits[ 1 ].files ).toInclude( "src/main.bx" );
+							expect( result.commits[ 1 ].files ).toInclude( "src/second.bx" );
+							expect( result.commits[ 1 ].author ).toBe( "DoubleCheck Tests" );
+						} finally {
+							removeFixture( fixture.path );
+						}
+					}
+				);
+
+				it(
+					"detects a clean nested repository used by snapshot reuse",
+					() => {
+						var workspaceRoot = new java:java.io.File(
+							getDirectoryFromPath( getCurrentTemplatePath() ),
+							"../../.."
+						).getCanonicalFile();
+						var fixturePath = workspaceRoot.getPath() & "/.tmp/doublecheck-git-nested-" & replace( lCase( createUUID() ), "-", "", "all" );
+						directoryCreate( fixturePath, true, true );
+						try {
+							runGit( fixturePath, [ "init", "--quiet" ] );
+							runGit( fixturePath, [ "config", "user.email", "tests@doublecheck.local" ] );
+							runGit( fixturePath, [ "config", "user.name", "DoubleCheck Tests" ] );
+							fileWrite( fixturePath & "/Sample.bx", "class {}" );
+							runGit( fixturePath, [ "add", "." ] );
+							runGit( fixturePath, [ "commit", "--quiet", "-m", "fixture" ] );
+							var root = new java:java.io.File( fixturePath ).getCanonicalFile();
+							var service = new app.models.services.GitRepositoryService();
+							var inspected = service.inspect( root );
+							var status = service.workingTreePaths( root, 100 );
+
+							expect( inspected.available ).toBeTrue( jsonSerialize( inspected ) );
+							expect( len( inspected.repositoryRevision ) ).toBe( 40 );
+							expect( status.available ).toBeTrue( jsonSerialize( status ) );
+							expect( status.paths ).toBe( [] );
+						} finally {
+							var canonical = new java:java.io.File( fixturePath ).getCanonicalFile();
+							var safeRoot = new java:java.io.File( workspaceRoot, ".tmp" ).getCanonicalFile();
+							if ( canonical.toPath().startsWith( safeRoot.toPath() ) && findNoCase( "doublecheck-git-nested-", canonical.getName() ) == 1 && directoryExists( canonical.getPath() ) ) {
+								var entries = directoryList( canonical.getPath(), true, "query" );
+								for ( var row = 1; row <= entries.recordCount; row++ ) {
+									new java:java.io.File( entries.directory[ row ] & "/" & entries.name[ row ] ).setWritable( true, false );
+								}
+								canonical.setWritable( true, false );
+								directoryDelete( canonical.getPath(), true );
+							}
+						}
+					}
+				);
+
+				it(
 					"scans a historical head without reading checked-out source",
 					() => {
 						var fixture = createFixture();

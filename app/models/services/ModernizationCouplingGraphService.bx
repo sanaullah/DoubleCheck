@@ -45,7 +45,10 @@ class threadsafe {
 		"dotted-path": 0.4
 	};
 
-	variables.structuralKinds = [ "extends", "implements", "include", "component-construction" ];
+	variables.structuralKinds = [
+		"extends", "implements", "include", "component-construction", "routes", "renders",
+		"calls-api", "http", "schedule", "table-query", "datasource"
+	];
 
 	// Only kinds whose `target` is a real resource NAME belong here.
 	// `query` and `sql-proc-call` carry constant targets ("sql",
@@ -233,7 +236,7 @@ class threadsafe {
 		for ( var dep in arguments.dependencies ) {
 			if ( !isStruct( dep ) ) continue;
 			var kind = lCase( trim( dep.kind ?: "" ) );
-			if ( !variables.structuralKinds.contains( kind ) ) continue;
+			if ( !isStructuralKind( kind ) ) continue;
 
 			var from = normalizePath( dep.filePath ?: "" );
 			var to = normalizePath( dep.targetFile ?: "" );
@@ -242,9 +245,13 @@ class threadsafe {
 			if ( !arguments.nodes.keyExists( from ) || !arguments.nodes.keyExists( to ) ) continue;
 
 			var resolution = lCase( trim( dep.resolution ?: "path" ) );
-			var edgeKey = from & "|" & to & "|" & kind;
+			// Keep kind as detail, not identity. Multiple observed kinds between
+			// the same files still produce one weighted edge for Modernize.
+			var group = dep.group ?: kind;
+			var edgeKey = from & "|" & to & "|" & group;
 			if ( merged.keyExists( edgeKey ) ) {
 				merged[ edgeKey ].occurrences++;
+				appendKind( merged[ edgeKey ].kinds, dep.specificKind ?: kind );
 				appendUnique( merged[ edgeKey ].sourceUnitIds, unitIdsForLine( arguments.unitsByFile, from, val( dep.startLine ?: 0 ) ) );
 				// Keep the strongest provenance seen for this edge.
 				if ( weightFor( resolution ) > merged[ edgeKey ].weight ) {
@@ -267,7 +274,8 @@ class threadsafe {
 			merged[ edgeKey ] = {
 				fromFile     : from,
 				toFile       : to,
-				kind         : kind,
+				kind         : group,
+				kinds        : [ dep.specificKind ?: kind ],
 				resolution   : resolution,
 				weight       : weightFor( resolution ),
 				occurrences  : 1,
@@ -276,8 +284,21 @@ class threadsafe {
 		}
 
 		var edges = [];
-		for ( var key in sortedKeys( merged ) ) edges.append( merged[ key ] );
+		for ( var key in sortedKeys( merged ) ) {
+			merged[ key ].kinds.sort( ( a, b ) => compareNoCase( a, b ) );
+			edges.append( merged[ key ] );
+		}
 		return edges;
+	}
+
+	private boolean function isStructuralKind( required string kind ) {
+		if ( variables.structuralKinds.contains( arguments.kind ) ) return true;
+		return len( arguments.kind ) && !variables.resourceKinds.contains( arguments.kind ) && !variables.sharedStateKinds.contains( arguments.kind ) && !variables.externalIntegrationKinds.contains( arguments.kind );
+	}
+
+	private void function appendKind( required array kinds, required any value ) {
+		var normalized = lCase( trim( toString( arguments.value ?: "" ) ) );
+		if ( len( normalized ) && !arguments.kinds.contains( normalized ) ) arguments.kinds.append( normalized );
 	}
 
 	/**

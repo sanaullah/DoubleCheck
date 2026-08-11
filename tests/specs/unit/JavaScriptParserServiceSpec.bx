@@ -1,0 +1,60 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "JavaScript symbol parsing", () => {
+			it( "maps fetch and request wrapper literals onto normalized API routes", () => {
+				var parser = new app.models.services.JavaScriptParserService();
+				var lines = [
+					"const direct = fetch( ""/api/v1/capabilities"" );",
+					"const graph = await request( `/api/v1/runs/${encodeURIComponent( runId )}/codegraph/paths?limit=3` );",
+					"const external = fetch( ""https://example.test/api/v1/nope"" );"
+				];
+				var parsed = parser.parse( {
+					filePath   : "public/assets/app.js",
+					language   : "JavaScript",
+					contentHash: lCase( hash( arrayToList( lines, char( 10 ) ), "SHA-256" ) ),
+					content    : arrayToList( lines, char( 10 ) ),
+					lines      : lines
+				} );
+				var apiEdges = parsed.dependencies.filter( ( item ) => item.kind == "calls-api" );
+				var targets = apiEdges.map( ( item ) => item.target );
+
+				expect( parser.getVersion() ).toBe( "javascript-symbol-parser-v3" );
+				expect( targets ).toInclude( "/api/v1/capabilities" );
+				expect( targets ).toInclude( "/api/v1/runs/:id/codegraph/paths" );
+				expect( targets.len() ).toBe( 2 );
+				expect( apiEdges[ 2 ].line ).toBe( 2 );
+				expect( apiEdges[ 2 ].evidence ).toInclude( "codegraph/paths" );
+			} );
+
+			it( "maps request wrapper templates split across lines", () => {
+				var parser = new app.models.services.JavaScriptParserService();
+				var lines = [
+					"const payload = await request(",
+					"  `/api/v1/runs/${encodeURIComponent( runId )}/codegraph/subgraph?depth=2`",
+					");"
+				];
+				var parsed = parser.parse( {
+					filePath   : "public/assets/app.js",
+					language   : "JavaScript",
+					contentHash: lCase( hash( arrayToList( lines, char( 10 ) ), "SHA-256" ) ),
+					content    : arrayToList( lines, char( 10 ) ),
+					lines      : lines
+				} );
+
+				var apiEdges = parsed.dependencies.filter( ( item ) => item.kind == "calls-api" );
+				expect( apiEdges.len() ).toBe( 1 );
+				expect( apiEdges[ 1 ].target ).toBe( "/api/v1/runs/:id/codegraph/subgraph" );
+				expect( apiEdges[ 1 ].line ).toBe( 1 );
+			} );
+
+			it( "only supports JavaScript files", () => {
+				var parser = new app.models.services.JavaScriptParserService();
+				expect( parser.supports( { language: "JavaScript" } ) ).toBeTrue();
+				expect( parser.supports( { language: "BoxLang" } ) ).toBeFalse();
+				expect( parser.supports( { language: "CFML" } ) ).toBeFalse();
+			} );
+		} );
+	}
+
+}

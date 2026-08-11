@@ -21,9 +21,13 @@ class threadsafe {
 	 * @result Aggregated result from ReviewRunService.getResult()
 	 * @format One of json, markdown, sarif
 	 */
-	struct function export( required struct run, required struct result, string format = "markdown" ) {
-		if ( lCase( arguments.run.runKind ?: "review" ) == "modernize" ) {
+	struct function export( required struct run, required struct result, string format = "markdown", struct options = {} ) {
+		var runKind = lCase( arguments.run.runKind ?: "review" );
+		if ( runKind == "modernize" ) {
 			return modernizationExportService.export( arguments.run, arguments.result, arguments.format );
+		}
+		if ( runKind == "codegraph" ) {
+			return exportCodeGraph( arguments.run, arguments.result, arguments.format, arguments.options );
 		}
 		var normalized = lCase( trim( arguments.format ) );
 		if ( !variables.supportedFormats.contains( normalized ) ) {
@@ -73,6 +77,208 @@ class threadsafe {
 
 	array function supportedFormats() {
 		return duplicate( variables.supportedFormats );
+	}
+
+	/**
+	 * CodeGraph exports are structural and local. The selected flow is optional;
+	 * without one the first bounded flow is used for Mermaid/SVG.
+	 */
+	private struct function exportCodeGraph(
+		required struct run,
+		required struct result,
+		required string format,
+		struct options = {}
+	) {
+		var normalized = lCase( trim( arguments.format ) );
+		if ( normalized == "md" ) normalized = "markdown";
+		if ( !listFindNoCase( "markdown,json,mermaid,svg", normalized ) ) {
+			throw(
+				type    = "ValidationException",
+				message = "Unsupported CodeGraph export format. Use markdown, json, mermaid, or svg."
+			);
+		}
+
+		var snapshot = isStruct( arguments.result.codegraph ?: "" )
+			? arguments.result.codegraph
+			: arguments.result;
+		var runToken = left(
+			reReplace( arguments.run.id ?: "codegraph", "[^a-zA-Z0-9]", "", "all" ),
+			12
+		);
+		if ( !len( runToken ) ) runToken = "codegraph";
+
+		if ( normalized == "json" ) {
+			return package(
+				normalized,
+				"application/json",
+				"doublecheck-codegraph-#runToken#.json",
+				toCodeGraphJson( arguments.run, snapshot, arguments.result )
+			);
+		}
+		if ( normalized == "mermaid" ) {
+			return package(
+				normalized,
+				"text/plain; charset=utf-8",
+				"doublecheck-codegraph-#runToken#.mmd",
+				toCodeGraphMermaid( snapshot, arguments.options )
+			);
+		}
+		if ( normalized == "svg" ) {
+			return package(
+				normalized,
+				"image/svg+xml; charset=utf-8",
+				"doublecheck-codegraph-#runToken#.svg",
+				toCodeGraphSvg( snapshot )
+			);
+		}
+		return package(
+			normalized,
+			"text/markdown; charset=utf-8",
+			"doublecheck-codegraph-#runToken#.md",
+			toCodeGraphMarkdown( arguments.run, snapshot )
+		);
+	}
+
+	private string function toCodeGraphJson(
+		required struct run,
+		required struct snapshot,
+		required struct result
+	) {
+		return jsonSerialize(
+			{
+				schemaVersion: "codegraph-export-v1",
+				generatedAt  : dateTimeFormat( now(), "iso" ),
+				run          : {
+					id          : arguments.run.id ?: "",
+					projectPath : arguments.run.projectPath ?: "",
+					runKind     : "codegraph",
+					status      : arguments.run.status ?: "",
+					createdAt   : arguments.run.createdAt ?: "",
+					completedAt : arguments.run.completedAt ?: ""
+				},
+				codegraph: duplicate( arguments.snapshot ),
+				narrative: isStruct( arguments.result.narrative ?: "" )
+					? duplicate( arguments.result.narrative )
+					: { used: false }
+			}
+		);
+	}
+
+	private string function toCodeGraphMarkdown( required struct run, required struct snapshot ) {
+		var totals = isStruct( arguments.snapshot.totals ?: "" ) ? arguments.snapshot.totals : {};
+		var lines = [
+			"## DoubleCheck CodeGraph",
+			"",
+			"- **Run:** `#escapeMarkdown( arguments.run.id ?: "" )#`",
+			"- **Repository:** `#escapeMarkdown( arguments.run.projectPath ?: "" )#`",
+			"- **Status:** `#escapeMarkdown( arguments.run.status ?: "" )#`",
+			"- **Files:** `#val( totals.files ?: 0 )#`",
+			"- **Symbols:** `#val( totals.symbols ?: 0 )#`",
+			"- **Dependencies:** `#val( totals.dependencies ?: 0 )#`",
+			"- **Clusters:** `#val( totals.clusters ?: 0 )#`",
+			"",
+			"Structure is deterministic and computed locally."
+		];
+		if ( arguments.snapshot.truncated ?: false ) {
+			var reasonText = arrayToList( arguments.snapshot.truncationReasons ?: [], ", " );
+			lines.append( "Coverage is truncated: `" & reasonText & "`." );
+		}
+
+		var roles = isStruct( arguments.snapshot.roleCounts ?: "" ) ? arguments.snapshot.roleCounts : {};
+		if ( roles.count() ) {
+			lines.append( "" );
+			lines.append( mdHeading( 3, "Roles" ) );
+			for ( var role in roles.keyArray().sort( "textnocase" ) ) {
+				lines.append( "- `" & escapeMarkdown( role ) & "`: " & val( roles[ role ] ?: 0 ) );
+			}
+		}
+
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		if ( clusters.len() ) {
+			lines.append( "" );
+			lines.append( mdHeading( 3, "Clusters" ) );
+			for ( var cluster in clusters ) {
+				if ( !isStruct( cluster ) ) continue;
+				var clusterLabel = escapeMarkdown( cluster.label ?: ( cluster.id ?: "cluster" ) );
+				lines.append( "- **" & clusterLabel & "** — " & val( cluster.fileCount ?: 0 ) & " files, cohesion `" & ( cluster.cohesion ?: 0 ) & "`" );
+			}
+		}
+
+		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
+		if ( flows.len() ) {
+			lines.append( "" );
+			lines.append( mdHeading( 3, "Flows" ) );
+			for ( var flow in flows ) {
+				if ( !isStruct( flow ) ) continue;
+				var steps = isArray( flow.steps ?: "" ) ? flow.steps : [];
+				var flowId = escapeMarkdown( flow.id ?: "flow" );
+				var flowSteps = escapeMarkdown( arrayToList( steps, " → " ) );
+				lines.append( "- `" & flowId & "`: " & flowSteps );
+			}
+		} else {
+			lines.append( "" );
+			lines.append( "No bounded flows were found." );
+		}
+		return arrayToList( lines, char( 10 ) ) & char( 10 );
+	}
+
+	private string function toCodeGraphMermaid( required struct snapshot, struct options = {} ) {
+		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
+		var selected = {};
+		var requested = trim( toString( arguments.options.flowId ?: arguments.options.flow ?: "" ) );
+		for ( var flow in flows ) {
+			if ( !isStruct( flow ) ) continue;
+			if ( !len( requested ) || requested == toString( flow.id ?: "" ) ) {
+				selected = flow;
+				break;
+			}
+		}
+		var lines = [ "flowchart LR" ];
+		var steps = isArray( selected.steps ?: "" ) ? selected.steps : [];
+		if ( !steps.len() ) {
+			lines.append( "  empty[No bounded flow found]" );
+			return arrayToList( lines, char( 10 ) ) & char( 10 );
+		}
+		for ( var index = 1; index <= steps.len(); index++ ) {
+			var nodeId = "n" & index;
+			var label = mermaidLabel( steps[ index ] );
+			lines.append( "  " & nodeId & "[" & char( 34 ) & label & char( 34 ) & "]" );
+			if ( index > 1 ) lines.append( "  n" & ( index - 1 ) & " --> " & nodeId );
+		}
+		return arrayToList( lines, char( 10 ) ) & char( 10 );
+	}
+
+	private string function toCodeGraphSvg( required struct snapshot ) {
+		var nodes = isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [];
+		var svgHeight = max( 140, min( 900, 80 + nodes.len() * 24 ) );
+		var hash = char( 35 );
+		var lines = [
+			'<svg xmlns="http://www.w3.org/2000/svg" width="960" height="' & svgHeight & '" role="img" aria-label="DoubleCheck CodeGraph">',
+			'<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>',
+			'<text x="24" y="32" font-family="sans-serif" font-size="18" fill="' & hash & '1f2937">DoubleCheck CodeGraph</text>'
+		];
+		var visible = min( 32, nodes.len() );
+		for ( var index = 1; index <= visible; index++ ) {
+			var node = nodes[ index ];
+			var label = xmlEscape( node.path ?: node.id ?: "node" );
+			lines.append( '<text x="32" y="' & ( 60 + index * 22 ) & '" font-family="monospace" font-size="12" fill="' & hash & '374151">' & label & '</text>' );
+		}
+		if ( nodes.len() > visible ) lines.append( '<text x="32" y="' & ( 82 + visible * 22 ) & '" font-family="sans-serif" font-size="12" fill="' & hash & '6b7280">+' & ( nodes.len() - visible ) & ' more nodes</text>' );
+		lines.append( "</svg>" );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	private string function mermaidLabel( required any value ) {
+		var label = replace( trim( toString( arguments.value ?: "" ) ), char( 34 ), "'", "all" );
+		return replace( label, char( 10 ), " ", "all" );
+	}
+
+	private string function xmlEscape( required any value ) {
+		var escaped = replace( toString( arguments.value ?: "" ), "&", "&amp;", "all" );
+		escaped = replace( escaped, "<", "&lt;", "all" );
+		escaped = replace( escaped, ">", "&gt;", "all" );
+		escaped = replace( escaped, char( 34 ), "&quot;", "all" );
+		return escaped;
 	}
 
 	string function toJson( required struct run, required struct result ) {

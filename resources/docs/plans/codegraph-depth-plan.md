@@ -1,174 +1,171 @@
 # CodeGraph depth — implementation plan
 
-Committed. **The single live plan for CodeGraph — there is no other.** It
-supersedes `codegraph-plan.md` — every task in that file shipped (§0.1); it is
-deleted in Step 0.
-Product stance stays in
-[`codegraph-domain-lens-design.md`](codegraph-domain-lens-design.md); product
-truth and Known gaps in [`../application-features.md`](../application-features.md).
+**The single live plan for CodeGraph.** Product truth and Known gaps live in
+[`../application-features.md`](../application-features.md); product stance in
+[`codegraph-domain-lens-design.md`](codegraph-domain-lens-design.md).
+
+**Status of this document:** implementation underway in the working tree.
+P0/P1 substrate and explorer work, plus Step 15's optional co-change signal,
+are implemented; gates below are recorded without a commit SHA. Step 17's
+source-backed corpus and contract/docs work are implemented. Full TestBox,
+compile, no-provider browser, path, export, and reuse gates are green; provider
+timing/manual and app-wide timed AST parity remain pending.
+
+**Verified:** 2026-08-07 against this working tree (branch `dev3`). Every
+`file:line` in Part 2 was re-checked on that date. Re-check before trusting after
+a gap — see §2.0 for what "verified" means here.
 
 ## How to use this document
 
-Read Part 0 (what is done), then Part 1 (why this plan exists), then Part 2
-(verified facts). Execute Part 4 **in the order of §4.0's graph**, not document
-order. Every step is self-contained: goal, preconditions, do, don't, gate.
+1. Read Part 0 (status), Part 1 (what CodeGraph is for), Part 3 (constraints).
+2. Read Part 2 once. **A claim not in Part 2 is not a fact.** If a step depends
+   on something unverified, verify it and add it.
+3. Execute Part 4 in §4.0's order, not document order.
 
-Rules that override anything you infer:
+Five rules that override anything you infer:
 
-1. **A claim not in Part 2 is not a fact.** Part 2 entries carry `file:line`.
-   If a step depends on something unverified, verify it and add it to Part 2.
+1. **No step begins until the previous step's gate is green**, and the gate
+   result goes in Part 0's ledger in the same commit. A step marked done without
+   a recorded gate result is a claim, not a result.
 2. **BoxLang caches compiled classes.** `box server restart` before every test
    run. Editing a `.bx` and re-running without a restart silently tests old code.
-3. **No step begins until the previous step's gate is green.**
-4. **Parser changes bump `parserVersion`.** That is the whole migration
-   mechanism (E7) — never hand-migrate the cache table.
-5. **Deterministic first, LLM second.** Every step must leave the no-key path
+3. **Parser changes bump `parserVersion`.** That is the entire migration
+   mechanism (E7) — never hand-migrate `analysis_parse_cache`.
+4. **Deterministic first, LLM second.** Every step leaves the no-key path
    working. Meaning may degrade without a provider; structure may not.
-6. **Three documents travel with behaviour changes**, in the same commit:
-   `app/models/README.md` (model-layer ownership), `resources/apidocs/openapi.yaml`
-   + `.json` (when `/api/v1/*` contracts move), and `../application-features.md`
-   (feature rows + Known gaps).
+5. **Shared code is shared** (§2.10). Additive by default; behaviour changes for
+   Review or Modernize are opt-in at the call site and run that product's suite
+   in the same commit.
 
 ---
 
 # Part 0 — Status ledger
 
-**This table is the answer to "what is done?".** Move it in the same commit as
-the work. A step marked done without a recorded gate result is a claim, not a
-result.
+Status values: `todo` · `wip` · `blocked` · `done <sha>`. `Owns` is the blast
+radius: a shared step is not done until the other product's suite is green.
 
-`Shared` names the other product whose behaviour the step can move (E31). A
-shared step is not done until **that** product's suite is green too.
-
-| Step | Title | Priority | Shared | Status | Gate result |
+| # | Step | Pri | Owns | Status | Gate result |
 |---|---|---|---|---|---|
-| 0 | Hygiene: plan supersession, doc links | P0 | — | ☐ | — |
-| 1 | Defects: `LIMIT 0`, budgets, truncation, ids, O(n×m) | P0 | **Review (live defects)** | ☐ | — |
-| 2 | BoxAST parser for BoxLang | P0 | **Review + capabilities API** | ☐ | — |
-| 3 | Position-independent symbol ids | P0 | **Review** | ☐ | — |
-| 4 | Edge-kind fidelity + route / view / table edges | P0 | **Modernize** | ☐ | — |
-| 5 | JavaScript parser + `fetch` → route edge | P0 | Review (scan) | ☐ | — |
-| 6 | Roles v2 from evidence; legend from snapshot | P1 | Review | ☐ | — |
-| 7 | Flows v2: symbol-level, branching, typed sinks | P1 | — | ☐ | — |
-| 8 | Reachability, dead code, layer policy | P1 | — | ☐ | — |
-| 9 | Git co-change and churn risk | P1 | **Modernize (CI-gated)** | ☐ | — |
-| 10 | Narrative sharding, labels, budget fairness, path egress | P1 | — | ☐ | — |
-| 11 | Interactive knowledge graph: hierarchy, smart layout, search | P1 | — | ☐ | — |
-| 12 | Dependency path finder | P1 | — | ☐ | — |
-| 13 | **The lens** — explorer on any run; findings on the graph | P1 | Review (surface) | ☐ | — |
-| 14 | Flow swimlane + export | P2 | — | ☐ | — |
-| 15 | Evaluation corpus + docs truth | P2 | — | ☐ | — |
+| 0 | Doc hygiene | P0 | — | wip | one live plan; stale-reference gate 0 |
+| 1 | Shared graph-loading + metrics defects | P0 | **Review** | wip | app compile 169/169; tests compile 122/122; full TestBox 657 pass, 0 fail, 1 skip; assemble timing not recorded |
+| 2 | Structure before meaning (two-phase persist) | P0 | — | wip | lifecycle units + persistence/API/corpus green; one-row/cancel/failure covered; no-provider browser green; provider timing pending |
+| 3 | BoxAST parser — BoxLang | P0 | **Review, capabilities API** | wip | app-wide 169-file superset parity: 0 regressions/fallbacks; regex 7.129s, AST 52.255s; full TestBox green |
+| 4 | Position-independent symbol ids | P0 | **Review** | wip | blank-line ids/fingerprint/cache-key/impact regression green |
+| 5a | Edge-kind pass-through (kind as attribute — E59) | P0 | **Modernize** | wip | coupling invariance/fidelity units green; full TestBox green |
+| 5b | Route, view, table, scope, http edges | P0 | **Modernize** | wip | source-backed corpus + full TestBox green |
+| 6 | JavaScript parser + `fetch`→route | P0 | Review (scan) | wip | JS parser v3 handles direct/multiline `fetch` + `request`; real client→route path green; JS 25/25 |
+| 7 | CFML parity — DI edges, AST | P1 | **Review** | wip | CFML parser units 6/6; source-backed corpus; full TestBox green |
+| 8 | Roles from evidence; legend from snapshot | P1 | Review | wip | real-repo unknown share 2.91%; JS 25/25; full TestBox green |
+| 9 | Flows v2 | P1 | — | wip | corpus + API contract green; full TestBox green |
+| 10 | Reachability, dead code, layer policy | P1 | — | wip | fixture/unit coverage; full TestBox green |
+| 11 | Narrative: shard, budget, egress, risk UI | P1 | — | wip | narrative units 9/9; no-provider browser path green; provider/manual gate pending |
+| 12a | Explorer: directories + hierarchy + search | P1 | — | wip | JS 25/25; API contract green; browser file drill passed in two interactions; contrast visually verified |
+| 12b | Explorer: layout that reads connectivity | P1 | — | wip | JS 25/25 incl deterministic layout/swimlane; 1600×1000 browser visual green |
+| 13 | Dependency path finder | P1 | — | wip | API/corpus green; real repo resolves client → route → handler → repository in 3 evidence-bearing hops; browser highlight green |
+| 14 | Snapshot reuse + project-keyed map | P1 | — | wip | full-git reuse fixed; 64-char reuse key persisted; next run returned `CodeGraph snapshot reused` |
+| 15 | Git co-change and churn | P2 | **Modernize (CI-gated)** | wip | Git units 8/8; coupling units green; full TestBox green |
+| 16 | Swimlane + export | P2 | — | wip | JS 25/25; browser swimlane/path highlight green; Markdown/Mermaid/SVG exports 200 with attachment types |
+| 17 | Evaluation corpus + docs/OpenAPI truth | P2 | — | wip | corpus in full TestBox 657/0/1; 7/7 CodeGraph route parity; OpenAPI JSON valid; compile 169/169 + 122/122 |
+
+**Deferred** (not scheduled, reasons in Part 5): run-over-run diff, impact-as-story,
+editable vocabulary beyond Step 11's label override, saved path queries,
+symbol-level explorer, storage split into node/edge tables.
+
+**Blocked:** none.
+
+**Unverified** (do not build on without checking first): whether
+`ModernizationCouplingGraphService.build()` tolerates new structural kinds
+without weighting changes (§2.10, affects Step 5a); whether bx-ai middleware
+supersedes hand-rolled resilience (`open-issues.md`, unrelated to this plan but
+adjacent).
 
 ## 0.1 Already shipped — do not rebuild
 
-The predecessor plan's Tasks 1–8 are **complete in code** while its checkboxes
-all read `- [ ]`. That drift is why it is deleted rather than continued.
+The predecessor plan (`codegraph-plan.md`) completed all eight of its tasks while
+its checkboxes still read `- [ ]`. That drift is why Step 0 deletes it.
 
 | Shipped | Evidence |
 |---|---|
 | Node `role` | `CodeGraphMetricsService.bx:321` `assignRole` |
 | `flows[]` in snapshot | `CodeGraphMetricsService.bx:485` `extractFlows` |
 | Narrative v2 role + schemas | `resources/prompts/roles/codegraph-narrative-v2.json` |
-| v2 normalize with id-dropping | `CodeGraphNarrativeService.bx:199`–`368` |
+| v2 normalize, id-dropping | `CodeGraphNarrativeService.bx:199` |
 | Meaning banner + role legend | `app/views/main/codegraph.bxm:195`, `:197` |
-| Process chips + flow highlight | `public/assets/app.js:4196`, `:4217`; `codegraph-layout.js:1197` |
-| Capability + docs honesty | `application-features.md:214`, `:220`, `:236` |
+| Process chips + flow highlight | `public/assets/app.js:4196`, `:4217` |
+| Edges API (undocumented — Step 17) | `ApiCodeGraph.bx:102` |
+| Narrative refresh endpoint | `ApiCodeGraph.bx:144` |
 
-The predecessor's own record agrees: `.superpowers/sdd/progress.md` marks all
-eight tasks complete, notes the work was deliberately left **uncommitted** per
-its "do not commit unless the user asks" constraint, and reports "suites 21
-TestBox + 15 JS green" with the provider UI unverified. Treat that as the last
-known state, not as a gate result for this plan.
-
----
-
-# Part 1 — Why this plan exists
-
-CodeGraph ships structure and a Domain-lens briefing over it. The briefing is
-only as good as the substrate it cites, and the substrate has three structural
-ceilings that no amount of prompt work removes.
-
-**What is not wrong, so nobody rebuilds it.** The analysis layer is stronger
-than it looks from the UI. Clustering is Louvain community detection over a
-weighted affinity graph, with cycle merging — genuinely coupling-derived, not
-folder-derived (E18). Edge targets carry resolution provenance and are weighted
-by how confidently they resolved (E36). A datasource/table co-access matrix, a
-shared-state overlay and external-integration detection are all implemented and
-waiting on input (E34, E35) — and the extractor for that input exists too, in the
-Modernize inventory, complete with dynamic-SQL detection (E45). The gap is at the
-**edges of the pipeline** — what goes in, and what comes out — and in the
-**routing between existing parts**, not in the middle.
-
-That reframes the largest step. Step 4 was scoped as "write table and scope
-extraction"; it is actually "lift an existing extractor into a shared mechanic,
-following the rule the codebase already wrote down for exactly this situation"
-(E46).
-
-**Ceiling 1 — the BoxLang parser reads one line at a time.** It loops lines and
-regex-matches each in isolation (E2), so anything expressed across lines is
-invisible. The clearest casualty is in this repo's own router: a route
-declaration spans five lines, so the parser records the URL as a bare symbol and
-can never learn which handler serves it (E5).
-
-Note the asymmetry, because it is backwards: the **CFML** parser already joins
-multi-line constructs and caches compiled patterns through `CfmlSourceScanner`
-(E44). The tier-1 language has the weaker parser, and the fix for its hottest
-defect is an existing shared mechanic it simply does not call.
-
-**Ceiling 2 — the graph has no front end and no back end.** JavaScript is
-excluded from CodeGraph scans by an explicit allowlist (E3), so 8,031 lines of
-UI are absent. At the other end, no edge reaches a database table (E7). A "flow"
-therefore starts at a handler file and stops at whatever service the walk
-happened to exhaust — never at a URL, never at a table.
-
-The product promise is business meaning and end-to-end flow. Today the widest
-truthful flow is *handler → service → service*. The target is
-**click → `fetch` → route → handler action → service → repository → table**, with
-each hop carrying a real edge kind and a citable position.
-
-**Ceiling 3 — the explorer cannot show what is already computed.** The canvas
-renders at most 120 nodes of a snapshot holding up to 1500, with no search to
-reach the rest (E26, E21). Worse, no layout algorithm consults an edge: positions
-come from array index and alphabetical sort, so a graph whose entire purpose is
-showing connection is laid out as though connection did not exist (E24). And the
-directory rollup that would make a large repo navigable is computed on every run,
-persisted, and then dropped before the API responds (E25).
-
-All three are liftable now, and cheaper than they look. BoxLang exposes a real
-AST as a public BIF that parses BoxLang, `.bxm` templates and CFML in both
-dialects — verified against this repo's own runtime (E1). The scanner already
-reads JavaScript content for Review runs; only CodeGraph filters it out, by one
-line (E3, E23). The table and integration analysis already exists and only needs
-feeding (E34, E35). And the hierarchy the explorer needs is already in the
-snapshot, one payload field away (E25).
-
-Steps 2–10 widen and correct the substrate. **Steps 11 and 12 — the interactive
-knowledge graph and the dependency path finder — are what a person actually
-touches**, and they are where the substrate work becomes visible.
-
-**One caution that shapes every step.** Almost none of this code is CodeGraph's
-alone: the parsers and index feed Review, the coupling and clustering services
-feed Modernize, and Modernize's correctness is CI-gated against clustering
-behaviour (E31, E33). §2.10 is the consumer map and §3.2 the coordination
-rules. Read both before editing a shared service — an earlier draft of this plan
-treated five of these steps as local changes, and they are not.
-
-**And a floor before any of it.** §2.11 records five live defects found while
-verifying the above, three of them in shared graph loading. The sharpest:
-`ReviewRunQueryService` and `ReviewRunService` ask for a run's graph without a
-limit, and a mis-scoped bind variable turns that into `LIMIT 0` — **those two
-paths have been returning zero impacts** (E37). Separately, truncation that
-happens at the SQL boundary is computed, returned, and then ignored, so a
-snapshot missing thousands of symbols reports itself complete (E39). Step 1 fixes
-these first: every measurement this plan takes afterwards is otherwise taken on a
-broken base.
+`.superpowers/sdd/progress.md` records that work as complete and deliberately
+uncommitted, with "21 TestBox + 15 JS green" and the provider UI unverified.
+Treat it as the last known state, not as a gate result for this plan.
 
 ---
 
-# Part 2 — Verified evidence base
+# Part 1 — What CodeGraph is for
 
-Every claim carries `file:line`, checked on branch `dev3` on 2026-08-07. Re-check
-before trusting after a gap.
+## 1.1 Three products, three moments
+
+| Product | Purpose | When | User's question |
+|---|---|---|---|
+| **CodeGraph** | Quickly know the project and the **flow between components** | **Before** work | "What is this? How does a request move?" |
+| **Review** | What's missing — security, performance, correctness | **After** developing | "What did I miss?" |
+| **Modernize** | Legacy → modern MVC, modules, microservices | **Its own project** | "Where are the seams?" |
+
+These are three users, or one user in three states of mind. **CodeGraph's user
+does not know the codebase yet. Review's user just wrote part of it.**
+
+**Rule: share the substrate, keep the surfaces distinct.** A Review run already
+builds the same index (E47), which is an argument against recomputing it — not an
+argument for drawing Review's answers on CodeGraph's canvas. Findings badges are
+not CodeGraph chrome; impact analysis stays Review's, where
+`buildImpactCone` already answers it (`ArchitectureIndexService.bx:115`).
+
+## 1.2 CodeGraph's two promises, and what blocks each
+
+**Promise 1 — flow between components.** Today the widest truthful flow is
+*handler → service → service*. The target is
+**`fetch` → route → handler action → service → repository → table**, every hop a
+real typed edge with a citable position.
+
+Blocked by: the BoxLang parser reading one line at a time so multi-line route
+declarations are unreachable (E2, E5); JavaScript excluded from CodeGraph scans
+(E3); no route, view, or table edges in any parser (E5, E6b, E7b); CFML emitting
+no DI edges at all (E9); five edge kinds collapsed to one and unknown kinds
+dropped entirely (E4, E32a).
+
+**Promise 2 — quickly.** Blocked by: the deterministic snapshot being complete at
+~60% of the run and then withheld behind an LLM call (E50); no snapshot reuse, on
+a key that requires computing the snapshot first (E51); everything keyed on a run
+id when "know this project" is not a run-shaped question (E52).
+
+**Both promises are cheap to serve relative to their value.** BoxLang ships a
+real AST (E1). The scanner already reads JavaScript for Review runs (E23). The
+SQL extractor, the table co-access matrix, the shared-state overlay and the
+two-phase narrative write all already exist (E46, E47, E50). The gap is
+**plumbing between existing parts**, plus defects.
+
+## 1.3 What is not wrong — do not rebuild it
+
+Clustering is Louvain community detection over a weighted affinity graph with
+cycle merging; membership is coupling-derived and only the *label* is folder-shaped
+(E18). Edge targets carry resolution provenance and are weighted by confidence
+(E36). Parse results are content-addressed and cache-invalidated by parser
+version (E7). Narrative is optional, drops uncited ids, and has a refresh
+endpoint (0.1).
+
+---
+
+# Part 2 — Verified evidence
+
+## 2.0 What "verified" means
+
+Each entry was checked against this tree on 2026-08-07 by reading the cited
+lines. Entries marked **corrected** replace an earlier claim in this plan's
+history that was wrong or overstated; the correction is stated so nobody
+re-derives the original error.
+
+Line numbers drift. If a citation does not match, re-verify before acting — do
+not assume the surrounding claim is false.
 
 ## 2.1 The AST is available
 
@@ -182,291 +179,326 @@ before trusting after a gap.
 | `BoxAST( source: "<cfcomponent>…", sourceType: "cftemplate" )` | `ASTType = BoxTemplate` |
 | `BoxAST( source: "component { … }", sourceType: "cfscript" )` | `ASTType = BoxScript` |
 
-**E6 — `BoxAST` gotcha, cost one debugging cycle already.** Passing a class body
-as `source` with the default `sourceType: "script"` throws
-`NullPointerException: Cannot invoke "BoxNode.toJSON()" because "root" is null`
-— not a parse error. Always pass `filepath`, or set `sourceType` explicitly.
+**E6 — `BoxAST` gotcha.** A class body passed as `source` under the default
+`sourceType: "script"` throws
+`NullPointerException: … "root" is null` — not a parse error. Always pass
+`filepath`, or set `sourceType` explicitly.
 
 **E7 — parser swaps need no migration.** `ArchitectureIndexService.bx:53` looks
 up cached parse results by `( contentHash, parserVersion )`. Bumping
-`variables.parserVersion` (`BoxLangParserService.bx:7`) invalidates every stale
-entry by construction.
+`variables.parserVersion` invalidates every stale entry by construction.
 
 ## 2.2 What the parsers cannot see
 
-**E2 — line-scoped regex, in the BoxLang parser specifically.**
-`BoxLangParserService.bx:30` iterates `file.lines`; every rule matches a single
-`sourceLine`. `match()` at `:380` builds the pattern with
-`createObject( "java", "java.util.regex.Pattern" )` **twice per call, per line,
-per file** — both a hot-path cost and a violation of the `import java:` rule in
-AGENTS.md / `.cursor/rules/boxlang-java-interop.mdc`.
-
-**E44 — correction: this is not true of the CFML parser, and the asymmetry is
-backwards.** An earlier draft said "the parsers read one line at a time". Only
-the BoxLang one does.
-
-`CfmlParserService` delegates to `CfmlSourceScanner` (77 lines) for two
-mechanics the BoxLang parser lacks entirely:
-
-| Mechanic | CFML | BoxLang |
-|---|---|---|
-| Multi-line construct joining | `joinTagLines( lines, start, maxLookahead = 5 )` (`:449`) — joins a wrapped tag, stops at `>` or 5 lines, reports `endLine` | none |
-| Compiled-pattern cache | `compiledPattern()` (`:456`) over `CfmlSourceScanner.patternCache` | none — `createObject` twice per match |
-
-So **the tier-1 language has the weaker parser**, and the `discovery-only`
-language has the better machinery. Two consequences: E2's "invisible across
-lines" claim applies to BoxLang only, and the pattern-cache fix for BoxLang is
-available **today**, independent of the AST work — the shared cache already
-exists and is already used by a sibling parser.
+**E2 — the BoxLang parser is line-scoped.** `BoxLangParserService.bx:30`
+iterates `file.lines`; every rule matches one `sourceLine`. `match()` at `:380`
+builds the pattern with `createObject( "java", "java.util.regex.Pattern" )`
+**twice per call, per line, per file** — a hot-path cost and a violation of the
+`import java:` rule in AGENTS.md.
 
 **E5 — routes are dead-end symbols.** `BoxLangParserService.bx:173` captures
-`route( "…" )` as a symbol of kind `route`. The target is on other lines —
+`route( "…" )` as a symbol of kind `route`. The target sits on other lines:
 `Router.bx:111`–`115` spans `route(…)` / `.withVerbs(…)` / `.withAction(…)` /
 `.toHandler(…)` / `.end()`. No route→handler edge is emitted anywhere.
 
 **E6b — handler → view is never captured.** `Main.bx:29`
 `event.setView( "main/dashboard" )`. No parser rule matches `setView`.
 
-**E7b — no edge reaches a table.** `queryExecute` appears in 10+ repositories
-(`CodeGraphRepository.bx:18`, `:69`, `:120`, `:158`). No rule extracts table
-names; there is no table node kind.
+**E7b — no parser edge reaches a table.** `queryExecute` appears in 10+
+repositories. No parser extracts table names.
 
-**E23 — Review sees JS, CodeGraph does not.** `ReviewRunService.bx:392`–`408`
-sets scan options per run kind. The `codegraph` branch sets
-`allowedExtensions: [ "cfc", "cfm", "bx", "bxm", "bxs" ]` (`:402`); the review
-path sets none, so Review scans `.js`/`.jsx`. Either way no parser claims them:
-`ArchitectureIndexService.bx:29` holds `[ boxLangParserService, cfmlParserService ]`
-and `:45` skips a file when none supports it.
+**E8 — CFML parity, corrected.** An earlier draft called `CfmlParserService`
+"the better parser". That was **overstated in one direction and wrong in
+another**:
 
-**E3 — JavaScript is a declared supported language with zero implementation.**
+| Aspect | CFML | BoxLang |
+|---|---|---|
+| Multi-line tag joining | `joinTagLines( lines, start, maxLookahead=5 )` via `CfmlSourceScanner` (`CfmlParserService.bx:449`) | none |
+| Compiled-pattern cache | `compiledPattern()` (`:456`) | none (E2) |
+| **Script-body parsing** | **still a line loop** (`:36`) | line loop |
+| **DI (`inject`) extraction** | **none — zero matches for `inject` in the whole file** | `"injects"` emitted at `BoxLangParserService.bx:150` |
+
+**E9 — CFML apps produce no DI edges (new).** `CfmlParserService` never emits
+`injects`. A ColdBox/WireBox ColdFusion application — the exact legacy target
+this product serves — gets a graph with its dependency-injection wiring missing
+entirely. Flows in CFML repos are therefore structurally weaker than in BoxLang
+repos, and the deficit is invisible in the UI.
+
+**E3 — JavaScript is a declared supported language with no implementation.**
 `SupportedLanguageService.bx:19` lists `js`, `jsx` at tier `discovery-only`.
-`public/assets/app.js` is 8,031 lines.
+`ArchitectureIndexService.bx:29` holds `[ boxLangParserService, cfmlParserService ]`
+and `:45` skips a file when no parser claims it. `public/assets/app.js` is 8,031
+lines.
+
+**E23 — Review scans JS; CodeGraph does not.** `ReviewRunService.bx:398`–`:408`
+sets scan options per run kind; the `codegraph` branch sets
+`allowedExtensions: [ "cfc", "cfm", "bx", "bxm", "bxs" ]` (`:402`). The review
+path sets none. Either way no parser claims `.js`.
 
 ## 2.3 Fidelity lost after parsing
 
-**E4 — five edge kinds collapse into one.** `CodeGraphInventoryAdapter.bx:149`–`157`
+**E4 — five edge kinds collapse into one.** `CodeGraphInventoryAdapter.bx:149`–`:157`
 maps `constructs`, `injects`, `imports`, `calls`, `type-reference` all to
-`component-construction`; `:146` drops `tests`. Downstream clustering, cohesion
-and flow weighting cannot distinguish an injected dependency from an import.
+`component-construction`; `:146` drops `tests`.
+
+**E32a — the adapter drops unknown kinds entirely (new, critical).**
+`mapKind` ends `return "";` at `:159`, and `:60` skips any edge whose mapped kind
+is empty. So a parser emitting `table-query`, `datasource`, `scope.application`
+or `http` today would have those edges **silently discarded before they reach the
+coupling service**.
+
+**E32b — and the coupling service has its own allowlist.**
+`ModernizationCouplingGraphService.bx:48` declares
+`structuralKinds = [ "extends", "implements", "include", "component-construction" ]`,
+and `buildStructuralEdges:236` does `if ( !structuralKinds.contains( kind ) ) continue`.
+
+**Together these are three filters in series** — parser → `mapKind` →
+`structuralKinds`. Changing any one alone loses data silently. Step 5a commits
+all three together.
 
 **E12 — symbol ids move when unrelated lines move.**
-`ArchitectureIndexService.bx:431`–`444` hashes
+`ArchitectureIndexService.bx:431`–`:444` hashes
 `filePath:recordType:kind:name:line`. Inserting a line near the top of a file
 changes the id of every symbol below it. Those ids flow into unit ids
 (`CodeGraphInventoryAdapter.bx:37`), the snapshot fingerprint
 (`CodeGraphMetricsService.bx:114`) and the narrative cache key
-(`CodeGraphRunService.bx:71`). Result: cosmetic edits invalidate baseline reuse,
-impact diffs and the whole briefing.
+(`CodeGraphRunService.bx:71`). Cosmetic edits invalidate baseline reuse, Review's
+impact diffs, and the whole briefing.
 
 **E17 — narrative caching is all-or-nothing.** The fingerprint covers
 `nodes, clusters, clusterEdges, cycles, flows, totals`
-(`CodeGraphMetricsService.bx:106`–`114`). Any single file change produces a new
-fingerprint, so the entire briefing is regenerated and **domain names change
-between runs on unrelated edits**.
+(`CodeGraphMetricsService.bx:106`–`:114`). Any single file change produces a new
+fingerprint, so the entire briefing regenerates and **domain names change between
+runs on unrelated edits**.
 
-**E18 — cluster *naming* is folder-shaped; cluster *membership* is not.**
-Read this one carefully — an earlier draft of this plan got it wrong and would
-have sent an implementer to replace an algorithm that is already correct.
-
-`deriveClusters` (`ModernizationDerivedStructureService.bx:61`) runs **Louvain
-community detection over a weighted affinity graph** (`:66`–`:68`:
-`buildAffinityGraph` → `louvainCommunities` → `mergeCycleCommunities`).
-Membership is genuinely coupling-derived.
-
-Only the **label** is folder-shaped (`:102`–`:105`: `featureDomainKey` →
-`featureFolderFromPath` → `sanitizeDomainToken( listLast( path, "/" ) )` →
-fallback `"main-app"`), and the code says so deliberately at `:100`:
-
-> Membership is derived; naming stays folder-shaped, which is what folders are
-> actually good for.
-
-So the "map with no legend" problem is a **naming** problem, not a clustering
-problem. Step 10 fixes naming. Step 9 adds a signal to affinity — it does not
-replace Louvain.
+**E18 — cluster *naming* is folder-shaped; *membership* is not (corrected).**
+`deriveClusters` (`ModernizationDerivedStructureService.bx:61`) runs Louvain
+community detection over a weighted affinity graph (`:66`–`:68`:
+`buildAffinityGraph` → `louvainCommunities` → `mergeCycleCommunities`). Only the
+label is folder-derived (`:102`–`:105`), and `:100` says so deliberately:
+"Membership is derived; naming stays folder-shaped, which is what folders are
+actually good for." **The "map with no legend" problem is a naming problem.**
 
 ## 2.4 Classification and roles
 
-**E8 — `public/` outranks everything.** `ArchitectureModelService.bx:238` maps
+**E4b — views classify as `other`.** `ArchitectureModelService.classifyFile`
+(`:206`–`:242`) branches on tests, handlers, models, config, docs, manifests,
+public — **no `views/`**. So `app/views/main/codegraph.bxm` → `other` →
+`assignRole` falls through to `unknown` (`CodeGraphMetricsService.bx:345`).
+
+**E8b — `public/` outranks everything.** `ArchitectureModelService.bx:238` maps
 `(^|/)public/` to `entry-points`, which `CodeGraphMetricsService.bx:330` turns
-into role `entry`. When JS lands (Step 5), every asset becomes a false entry
+into role `entry`. When JS lands (Step 6), every asset becomes a false entry
 point unless a `client` role exists first.
 
-**E4b — views classify as `other`.** `classifyFile`
-(`ArchitectureModelService.bx:206`–`242`) has branches for tests, handlers,
-models, config, docs, manifests, public — **no `views/`**. So
-`app/views/main/codegraph.bxm` → `other` → `assignRole` falls through to
-`unknown` (`CodeGraphMetricsService.bx:345`).
-
 **E13 — JS nodes would carry a blank language.**
-`CodeGraphMetricsService.bx:708`–`713` returns `""` for anything not
+`CodeGraphMetricsService.bx:708`–`:713` returns `""` for anything not
 `bx|bxm|bxs|cfc|cfm|cfml`.
 
-**E11b — the legend is hardcoded.** `codegraph.bxm:197`–`203` hardcodes six role
-chips; they will drift from `assignRole`'s enum on the next change.
+**E11b — the legend is hardcoded.** `codegraph.bxm:197`–`:203` hardcodes six role
+chips; they drift from `assignRole`'s enum on the next change.
 
 ## 2.5 Flows
 
-**E9 — flow extraction, as built** (`CodeGraphMetricsService.bx:485`):
+**E14 — flow extraction as built** (`CodeGraphMetricsService.bx:485`):
 
 | Property | Where | Consequence |
 |---|---|---|
 | Only `injects` / `calls` kinds | `:546` | Route, view, table and event hops invisible |
 | `maxDepth = 3`, hardcoded | `:493` | Deeper request paths truncate silently |
-| **One path per seed** — `longestFlowPath` keeps a single `best` | `:609`–`658` | A handler calling four services yields **one** flow |
-| Steps are file ids | `:530`–`535` | A process story cannot name the method |
-| No sink typing | `:505` | Flow ends where the walk exhausted, not at a meaningful terminus |
-| `maxFlows` default 24, sorted by depth | `:30`, `:511` | Large repos show an arbitrary 24 |
+| **One path per seed** (`longestFlowPath` keeps a single `best`) | `:609`–`:658` | A handler calling four services yields **one** flow |
+| Steps are file ids | `:530`–`:535` | A process story cannot name the method |
+| No sink typing | `:505` | Flow ends where the walk exhausted |
+| `maxFlows` 24, sorted by depth | `:30`, `:511` | Large repos show an arbitrary 24 |
 | `duplicate( state.visited )` per branch | `:638` | Cost grows with fan-out |
 
-## 2.6 Defects and performance
+**E14b — flows read the pre-collapse review dependencies**, not the coupling
+graph (`:494` builds adjacency from `reviewGraph.dependencies`). This is why
+flows still distinguish `injects` from `calls` despite E4 — and it means Step 9
+is not blocked on Step 5a, though it benefits from it.
+
+## 2.6 Defects — metrics and graph loading
 
 **E10 — snapshots can cite nodes they do not contain.** `assemble` computes
 hotspots (`:79`), orphans (`:80`), layer violations (`:81`) and flows (`:82`)
-from the **full** node array, then truncates `nodes` to `maxNodes` at `:85`–`88`.
-Any referenced node beyond the cap becomes a dead drill-down target.
+from the **full** node array, then truncates `nodes` to `maxNodes` at `:85`–`:88`.
+Any referenced node beyond the cap is a dead drill-down target.
 
-**E11 — two quadratic loops per run.** `crossingEdgeCount` (`:365`–`378`) walks
-every edge and is called once per node from `buildNodes` (`:289`) — at the
-configured caps (`Coldbox.bx:116`–`117`: 1500 nodes, 20000 edges) that is up to
-30M iterations. `presentClusters` (`:170`–`174`) loops all graph nodes per
-cluster with `filePaths.contains()` inside.
-
-**E14 — one layer rule exists.** `:457` flags only
-`application-models → http-handlers`. No policy configuration; no view→model,
-repository→handler, or cross-domain-persistence rule.
+**E11 — two quadratic loops per run.** `crossingEdgeCount` (`:365`–`:378`) walks
+every edge and is called once per node from `buildNodes` (`:289`) — at configured
+caps (1500 nodes, 20000 edges) up to 30M iterations. `presentClusters`
+(`:170`–`:174`) loops all graph nodes per cluster with `filePaths.contains()`
+inside.
 
 **E15 — orphan detection misses the common case.** `:426` requires
-`fanIn == 0 && fanOut == 0`. A file nothing calls but which calls five things
-(`fanIn 0, fanOut 5`) — the usual shape of dead code — is not reported.
+`fanIn == 0 && fanOut == 0`. A file nothing calls but which calls five things —
+the usual shape of dead code — is not reported.
+
+**E16 — one layer rule exists.** `:457` flags only
+`application-models → http-handlers`. No policy configuration.
+
+**E37 — the impacts query is limited to zero rows for two callers.**
+`AnalysisGraphRepository.getGraph:249` computes
+`effectiveLimit = val( arguments.resultLimit ) > 0 ? … : variables.resultLimit`,
+uses `effectiveLimit` for symbols (`:266`) and dependencies (`:280`), but binds
+**unscoped `resultLimit`** for impacts at `:295` — which resolves to
+`arguments.resultLimit`, default `0`.
+
+`ReviewRunQueryService.bx:54` and `ReviewRunService.bx:617` both call
+`getGraph( id )` with no limit. SQLite treats `LIMIT 0` as no rows. **Those two
+paths return zero impacts, always.** CodeGraph is unaffected only because it
+passes an explicit limit (`CodeGraphRunService.bx:46`, `:201`, `:333`).
+
+**E38 — one limit governs two entities.** `getGraph` applies the same `LIMIT` to
+symbols and dependencies. CodeGraph passes `codegraphMaxEdges` (20000,
+`Coldbox.bx:117`) — an **edge** budget — as the **symbol** budget. Both queries
+order by `file_path`, so truncation is alphabetical: whole late-alphabet
+directories vanish rather than a representative sample. Review's default is
+`graphResultLimit` = 1000 (`Coldbox.bx:110`).
+
+**E39 — truncation is computed, returned, and dropped.** `getGraph` returns a
+correct `truncated` flag at `:365`. `CodeGraphMetricsService.assemble` never
+reads it. A run that lost 5,000 symbols at the SQL boundary reports
+`truncated: false` with empty `truncationReasons`.
 
 ## 2.7 Storage and surface
 
-**E16 — one JSON blob per run.** `SchemaService.bx:543`: `codegraph_snapshots`
-is keyed on `run_id` with `snapshot_json` and `narrative_json` as TEXT; indexes
-at `:898`–`899` cover narrative reuse and fingerprint only. There are no node,
-edge, flow or label tables — so server-side search, run-over-run diff and
-per-cluster narrative caching all require loading and re-parsing whole blobs.
+**E20 — snapshots are one JSON blob per run.** `SchemaService.bx:543`:
+`codegraph_snapshots` keyed on `run_id` with `snapshot_json` and
+`narrative_json` as TEXT; indexes at `:898`–`:899` cover narrative reuse and
+fingerprint only. No node, edge, flow or label tables.
 
-**E20 — no co-change API.** `GitRepositoryService` exposes `inspect`,
+**E21 — no co-change API.** `GitRepositoryService` exposes `inspect`,
 `workingTreePaths`, `fullPaths`, `revisionPaths`, `readBlob`,
 `changedLineRanges` (`:225`), with `executeText` / `executeTokens` private
-(`:323`, `:332`). Commit-pair extraction is a new public method, not a
-new dependency.
+(`:323`, `:332`). Commit-pair extraction is a new public method on an existing
+service, not a new dependency.
 
-**E21 — no search, no export.** No `codegraph-search` handle exists in `app.js`.
-Export returns 422 (`application-features.md:222`).
-
-**E22 — three layouts.** `codegraph-layout.js` implements cluster (`:720`),
-layer (`:750`) and radial (`:795`), rendered by `buildSvg` (`:1197`). No
-sequence or swimlane layout.
-
-## 2.9 Explorer: navigation and layout
-
-**E24 — no layout algorithm reads an edge.** This is the headline finding for
-Step 11. All three layouts position nodes without consulting connectivity:
-
-| Layout | Positioning rule | Consequence |
-|---|---|---|
-| `layoutClusters` `:714` | Grid by array index — `col = i % cols` (`:721`) | Placement is alphabetical accident; edges cross arbitrarily |
-| `layoutLayered` `:744` | Columns by layer; **rows sorted alphabetically** (`:761`) | No barycenter ordering, so crossings are unbounded |
-| `layoutRadial` `:790` | BFS rings from focus (`:812`–`:822`), then **even angles by array index** (`:849`) | Connected nodes are not placed near each other |
-
-`edges` are copied through untouched in every case
-(`edges.map((e) => Object.assign({}, e))`). There is no crossing minimisation,
-no overlap avoidance, no force simulation, and no edge bundling.
-
-**E28 — edge routing assumes left-to-right.** `edgePath` (`:897`) always exits
-the source's **right** face (`x1 = a.x + aw`) and enters the target's **left**
-face (`x2 = b.x`), regardless of relative position. Any edge pointing leftward
-or vertically renders as a backwards curve through intervening nodes.
-
-**E26 — the canvas shows a fraction of the snapshot.** `app.js:4888` and `:4909`
-request `maxNodes: 120`; `:4912` requests `60` for overview. The server snapshot
-carries up to `codegraphMaxNodes` = 1500 (`Coldbox.bx:116`). On a large repo the
-explorer renders under 10% of what was computed — **and there is no search to
-reach the remainder** (E21). Navigation, not rendering, is the binding
-constraint.
+**E22 — no search, no export.** No `codegraph-search` handle in `app.js`. Export
+returns 422 (`application-features.md:222`).
 
 **E25 — the directory rollup is computed and thrown away.**
 `CodeGraphMetricsService.bx:83` builds `directories` (path, fileCount,
 symbolCount, fanInSum, fanOutSum) and returns it at `:130`, so it is persisted
-inside `snapshot_json`. But `CodeGraphRunService.getResult` (`:154`–`171`) does
-not include `directories` in the payload, and `app.js` never references it. The
-hierarchical spine Step 11 needs is already being calculated — it just never
-leaves the service.
+inside `snapshot_json`. `CodeGraphRunService.getResult` (`:154`–`:171`) does not
+include it in the payload, and `app.js` never references it.
+
+**E26 — the canvas shows a fraction of the snapshot.** `app.js:4888` and `:4909`
+request `maxNodes: 120`; `:4912` requests `60` for overview. The server snapshot
+carries up to 1500 (`Coldbox.bx:116`). Under 10% renders, **and there is no
+search to reach the rest** (E22).
 
 **E27 — the only adjacency builder is undirected.**
-`CodeGraphRunService.buildAdjacency` (`:469`–`487`) appends **both** directions
-for every edge (`:483`–`:484`). Correct for neighbourhood BFS; wrong for a path
-finder, where "A depends on B" and "B depends on A" are different answers. Step
-12 needs directed traversal with undirected as an explicit mode.
+`CodeGraphRunService.buildAdjacency` (`:469`–`:487`) appends both directions
+(`:483`–`:484`). Correct for neighbourhood BFS; wrong for a path finder.
 
-**E29 — drill-down is three fixed lenses, not a hierarchy.**
-`state.codegraph` holds `mode` / `clusterId` / `focusId` / `focusSubgraph`
-(`app.js:109`–`111`), driving cluster → file → focus with a breadcrumb
-(`:4769`–`:4778`) and depth buttons gated on `hasCluster` / `hasFocus`
-(`:4753`–`:4761`). It works, but each level is flat: there is no directory tree
-above clusters and no symbol level below files — so Step 7's `stepSymbols[]`
-would have no consumer until Step 11 lands.
+**E28 — subgraph `totalNodes` is the returned count, not the graph size (new).**
+`CodeGraphRunService.bx:264` computes `totalNodes = adjacency.count()` — the real
+graph size — uses it only for the `truncated` flag at `:265`, then returns
+`totalNodes: nodes.len()` at `:270`. The API field always equals the returned
+node count, so a client cannot tell how much was left out.
 
-**E30 — path-finding primitives already exist, in the wrong places.**
-`layoutRadial` runs a client-side BFS over an adjacency map (`:806`–`:822`), and
-`ArchitectureIndexService.buildImpactCone` (`:115`) runs a bounded reverse-edge
-BFS server-side. Step 12 is a new endpoint plus UI, not a new algorithm family.
+## 2.8 Explorer navigation and layout
 
-## 2.10 Shared ownership — the blast radius this plan sits inside
+**E24 — layouts largely ignore connectivity (corrected).** An earlier draft
+claimed "no layout algorithm reads an edge". That is **overstated** — the radial
+layout does:
 
-**Almost nothing this plan touches is CodeGraph's alone.** An earlier draft
-treated Steps 2, 3, 4, 6 and 9 as local changes. They are not. This section is
-the correction, and Part 3's shared-service rule follows from it.
-
-**E31 — consumer map**, from `inject=` and direct-construction sites:
-
-| Service | Also used by | Steps that touch it |
+| Layout | Positioning rule | Reads edges? |
 |---|---|---|
-| `BoxLangParserService`, `CfmlParserService` | `ArchitectureIndexService`, **`ApiCapabilities.bx:45`–`46`** (publishes `getVersion()` in the capabilities contract) | 2, 2b |
-| `ArchitectureIndexService` | **`ReviewRunService`** | 3, 4 |
-| `AnalysisGraphRepository` | `ReviewRunService`, `ReviewRunQueryService` | 3, 4 |
-| `ArchitectureModelService` | **`ReviewRunService`** | 1, 6 |
-| `ModernizationCouplingGraphService` | **`ModernizationRunService`** | 4 |
-| `ModernizationDerivedStructureService` | **six Modernize services** — `FragmentMerger`, `ProposalService`, `RoadmapShardService`, `RoadmapSynthesisService`, `RunService`, `ShardExecutor` | 9 |
+| `layoutClusters` `:714` | Grid by array index — `col = i % cols` (`:721`) | No |
+| `layoutLayered` `:744` | Columns by layer; rows sorted **alphabetically** (`:761`) | No |
+| `layoutRadial` `:790` | BFS over an edge-built adjacency for ring distance (`:804`–`:821`), then **even angles by array index** within each ring (`:849`) | **For rings only** |
 
-Consequences that must shape the work:
+Accurate statement: **cluster and layered ignore connectivity entirely for
+placement; radial uses it for ring assignment but not for position within a
+ring.** No layout performs crossing minimisation, overlap avoidance or bundling.
 
-- **Step 2's `parserVersion` bump is a published contract change.**
-  `ApiCapabilities` exposes parser versions; OpenAPI moves with it.
-- **Step 3's id change alters Review's impact cones**, which are keyed on the
-  same `stableId`. Review specs must be run, not assumed.
-- **Step 9 is gated by Modernize's corpus** — see E33.
+**E29 — edge routing assumes left-to-right.** `edgePath` (`:897`) always exits
+the source's right face (`x1 = a.x + aw`) and enters the target's left face
+(`x2 = b.x`) regardless of relative position. Leftward and vertical edges curve
+backwards through intervening nodes.
 
-**E32 — `structuralKinds` is a four-item allowlist, and un-collapsing drops
-edges.** `ModernizationCouplingGraphService.bx:48` declares
-`[ "extends", "implements", "include", "component-construction" ]`, and
-`buildStructuralEdges:236` does `if ( !structuralKinds.contains( kind ) ) continue`.
+**E30 — drill-down is three fixed lenses, not a hierarchy.** `state.codegraph`
+holds `mode` / `clusterId` / `focusId` / `focusSubgraph` (`app.js:109`–`:111`),
+driving cluster → file → focus with a breadcrumb (`:4769`–`:4778`) and depth
+buttons gated on `hasCluster` / `hasFocus` (`:4753`–`:4761`). Each level is flat:
+no directory tree above clusters, no symbol level below files.
 
-So Step 4's "stop collapsing kinds in `mapKind`" (E4) **silently deletes every
-`injects` / `calls` / `imports` / `constructs` / `type-reference` edge** unless
-the vocabulary is extended in the same commit. This is not a risk to watch for;
-it is the guaranteed outcome of doing half the change. The two edits ship
-together or neither ships.
+**E31 — path-finding primitives exist already.** `layoutRadial` runs a
+client-side BFS (`:804`–`:821`); `ArchitectureIndexService.buildImpactCone`
+(`:115`) runs a bounded reverse-edge BFS server-side. Step 13 is an endpoint plus
+UI, not a new algorithm family.
 
-**E33 — Modernize's correctness is measured against clustering behaviour.**
-`modernize-inversion-plan.md` Step 3 defines five committed stop conditions
-asserted in CI by `ModernizationCorpusSpec` → "Step 3b stop conditions",
-including `seamPrecision ≥ baseline` and `seamRecall > baseline` against
-`baseline-llm-path.json`. Those gates read clusters out of
-`deriveClusters`. **Any change to affinity or community detection moves
-Modernize's measured seam quality.** Step 9 must therefore be opt-in per caller,
-not a change to the default path.
+## 2.9 Narrative
 
-**E34 — table and datasource edges already have a consumer.** I specified Step 4
-as though `table:` nodes had to be invented. They do not.
-`ModernizationCouplingGraphService.bx:55` declares
-`resourceKinds = [ "datasource", "table-query" ]`, and `:328`–`:333` builds a
-resource co-access matrix keyed `"table:" & resource` / `"datasource:" & resource`.
-The consumer and the id convention exist; **only the parser side is missing.**
+**E40 — the budget starves whichever section is last.**
+`CodeGraphNarrativeService.buildPayload:385` spends one shared
+`maximumCharacters` budget **sequentially with `break`**: clusters (`:424`),
+hotspots (`:442`), flows (`:463`), cycles (`:480`). Exhausting it inside clusters
+sends **zero flows and zero cycles** to the model — process stories and risk, the
+two sections the Domain lens exists for, starve first and silently.
 
-That block also carries a design warning to honour verbatim (`:50`–`:54`):
+**E41 — absolute paths reach the provider unredacted.**
+`secretRedactionService` is injected (`:20`) but applied only to error messages
+and stack traces (`:77`, `:80`, `:136`, `:139`). The payload ships raw
+`filePaths`, `entryFile`, `sinkFile` and `steps` (`:420`–`:466`).
+
+**E42 — risk is computed and never rendered (new).** `normalize` produces a
+`risk[]` array citing hotspot and cycle ids (`:222`–`:239`) and it is persisted
+in `narrative_json`. `app.js` contains **no read of CodeGraph's `narrative.risk`**.
+`application-features.md:195` and `:220` claim a risk briefing ships. It does
+not — the data exists, the UI never shows it.
+
+**E43 — two public entry points for one behaviour.**
+`CodeGraphNarrativeService.narrate:48` is a one-line
+`return enrich( arguments.snapshot );`. `enrich:55` has no caller outside the
+class. Two public methods, one path.
+
+## 2.10 Shared ownership — blast radius
+
+**E44 — consumer map**, from `inject=` and direct-construction sites:
+
+| Service | Also used by | Steps |
+|---|---|---|
+| `BoxLangParserService`, `CfmlParserService` | `ArchitectureIndexService`, **`ApiCapabilities.bx:45`–`:46`** (publishes `getVersion()`) | 3, 7 |
+| `ArchitectureIndexService` | **`ReviewRunService`** | 4, 5 |
+| `AnalysisGraphRepository` | `ReviewRunService`, `ReviewRunQueryService` | 1 |
+| `ArchitectureModelService` | **`ReviewRunService`** | 1, 8 |
+| `ModernizationCouplingGraphService` | **`ModernizationRunService`** | 5a |
+| `ModernizationDerivedStructureService` | **six Modernize services** — `FragmentMerger`, `ProposalService`, `RoadmapShardService`, `RoadmapSynthesisService`, `RunService`, `ShardExecutor` | 15 |
+
+**E45 — Modernize's correctness is CI-gated against clustering.**
+`modernize-inversion-plan.md` Step 3 defines five stop conditions asserted by
+`ModernizationCorpusSpec` → "Step 3b stop conditions", including
+`seamPrecision ≥ baseline` and `seamRecall > baseline` against
+`baseline-llm-path.json`. Those read clusters from `deriveClusters`. **Any change
+to affinity or community detection moves Modernize's measured seam quality.**
+
+**E46 — table and scope extraction already exists, in Modernize's inventory.**
+
+| Emitted | Where |
+|---|---|
+| `datasource` | `ModernizationInventoryService.bx:175` |
+| `table-query` per table | `:190`, from `sqlReferences( sourceLine )` |
+| `column-query` | `:191` |
+| `scope.#scope#` | `:197` |
+
+The extractor is `sqlReferences` (`:654`–`:667`), returning
+`{ tables, columns, unparameterized, parameterMismatch, dynamicIdentifier }` —
+**dynamic-SQL detection included**. Downstream:
+`ModernizationSignalService.bx:22`–`:30` maps these to signals;
+`ModernizationRiskService.bx:29`–`:30` weights them.
+
+**E47 — the coupling service already consumes these kinds.**
+`ModernizationCouplingGraphService.bx:55`
+`resourceKinds = [ "datasource", "table-query" ]`, with `:328`–`:333` building a
+co-access matrix keyed `"table:" & resource`. Also `:56`
+`sharedStateKinds = [ "scope.application", "scope.session", "scope.client",
+"security-session-gate" ]` and `:61`
+`externalIntegrationKinds = [ "http", "schedule" ]`. None is fed by the parsers.
+
+Its `:50`–`:54` warning must be honoured verbatim:
 
 > Only kinds whose `target` is a real resource NAME belong here. `query` and
 > `sql-proc-call` carry constant targets, so including them would key every
@@ -474,1163 +506,1276 @@ That block also carries a design warning to honour verbatim (`:50`–`:54`):
 > between files that share nothing — which would defeat false-seam detection
 > outright.
 
-Emit `table-query` with the **table name** as target. Never emit a kind whose
-target is a constant.
+**E48 — and there is a documented rule for sharing extractors.**
+`CfmlSourceScanner`'s docblock records the decision from the last time two
+extractors overlapped: it holds mechanics only, and *"the extractors are not
+merged. Their taxonomies and evidence contracts legitimately differ, and folding
+them together would silently change what each one reports."* It names two
+differences preserved rather than flattened: backslash normalization is a
+parameter **and** part of the cache key; the shared tag joiner always reports
+`endLine`.
 
-**E35 — two more vocabularies are waiting on parser input.**
-`sharedStateKinds = [ "scope.application", "scope.session", "scope.client",
-"security-session-gate" ]` (`:56`) and
-`externalIntegrationKinds = [ "http", "schedule" ]` (`:61`). Both are consumed by
-`build()` for the shared-state overlay and integration detection. No parser emits
-any of them today. These are free capability once Step 2's AST lands — and
-`http` is exactly the sink type Step 7 needs.
+**E36 — edge provenance is already weighted.**
+`ModernizationCouplingGraphService.bx:41` `resolutionWeights`: `path` 1.0 >
+`basename` 0.75 > `stem` 0.5 > `dotted-path` 0.4.
 
-**E36 — edge provenance is already weighted.** `resolutionWeights` (`:41`):
-`path` 1.0 > `basename` 0.75 > `stem` 0.5 > `dotted-path` 0.4, reflecting how
-confidently a target resolved. Step 12's path ranking should compose with this
-rather than invent a second confidence scale — a path through four guessed
-targets is weaker evidence than a path through two resolved ones, and the graph
-already knows.
+**E59 — edge *identity* includes kind, so un-collapsing changes the graph
+(new, and it corrects this plan).** An earlier draft called Step 5a "additive"
+and safe for Modernize. **It is not.**
 
-## 2.8 Repository hygiene
+`buildStructuralEdges:245` dedups on `edgeKey = from & "|" & to & "|" & kind`.
+Today `mapKind` collapses five kinds into `component-construction`, so
+`A → B` via `injects` **and** `A → B` via `calls` produce the *same* key and
+merge into **one** edge with `occurrences++` (`:246`–`:255`). Un-collapse them and
+the same source produces **two** edges.
 
-**E19 — corrected: `.superpowers/` is untracked scratch, not a stale doc tree.**
-An earlier draft of this plan told the implementer to delete it, citing an
-AGENTS.md rule that **no longer exists** — that guidance was wrong and has been
-removed from AGENTS.md by the maintainer.
+That is not a labelling change; it changes the graph:
 
-The facts: `.gitignore:59` ignores `.superpowers/**`, so nothing in it is
-committed and it is not a documentation tree. It holds the previous plan's
-working record — task briefs, reports, review packages, and pre-change baselines
-of the three files that plan modified. **Do not delete it as hygiene.** It is
-the maintainer's scratch space; disposing of it is their call, not a step in this
-plan.
-
-Its `sdd/progress.md` is in fact useful evidence for §0.1: it records all eight
-tasks complete, notes the work was deliberately left uncommitted, and reports
-"suites 21 TestBox + 15 JS green" with the provider UI unverified.
-
-Two loose ends remain, both trivial: `codegraph-plan.md:3` requires a
-`superpowers:subagent-driven-development` skill that is not available in this
-environment (moot once that file is deleted), and `.gitignore:65` still carries a
-comment about not recreating `.docs/` or `.superpowers/` that now has no
-counterpart in AGENTS.md.
-
-## 2.11 Defects in shared graph loading and narrative budgeting
-
-Five live defects found on the fourth pass, none CodeGraph-only. **D1 and D3
-affect shipped Review behaviour**, so they are not "while we are in here" work.
-
-**E37 (D1) — the impacts query is limited to zero rows for two callers.**
-`AnalysisGraphRepository.getGraph:249` computes
-`effectiveLimit = val( arguments.resultLimit ) > 0 ? … : variables.resultLimit`,
-then uses `effectiveLimit` for symbols (`:266`) and dependencies (`:280`) — but
-the impacts query at `:295` binds **unscoped `resultLimit`**, which resolves to
-`arguments.resultLimit`, defaulting to `0`.
-
-`ReviewRunQueryService:54` and `ReviewRunService:617` both call `getGraph( id )`
-with no limit. SQLite treats `LIMIT 0` as "no rows". **Those two paths return
-zero impacts, always.** CodeGraph is unaffected only by accident — it passes an
-explicit limit at `CodeGraphRunService.bx:46`, `:201`, `:333`.
-
-**E38 (D2) — one limit governs two different entities.** `getGraph` applies the
-same `LIMIT` to symbols and to dependencies. CodeGraph passes
-`codegraphMaxEdges` (20000, `Coldbox.bx:117`) — an **edge** budget — as the
-**symbol** budget. Both queries order by `file_path`, so truncation is
-alphabetical: a repo over the limit loses whole late-alphabet directories rather
-than a representative sample. Review's default is `graphResultLimit` = 1000
-(`Coldbox.bx:110`) for both.
-
-**E39 (D3) — truncation is computed, returned, and dropped.** `getGraph` returns
-a correct `truncated` flag at `:365`, comparing summary counts against returned
-lengths. `CodeGraphMetricsService.assemble` never reads it — it consumes
-`dependencies`, `files`, `scannedFiles` and `symbols` only. So a run that lost
-5,000 symbols at the SQL boundary reports `truncated: false` with an empty
-`truncationReasons`. The snapshot asserts a completeness it does not have, which
-is precisely what the claim rule forbids.
-
-**E40 (D4) — the narrative budget starves whichever section is last.**
-`CodeGraphNarrativeService.buildPayload` spends one shared `maximumCharacters`
-budget **sequentially with `break`**: clusters (`:424`), then hotspots (`:442`),
-then flows (`:463`), then cycles (`:480`). Exhausting the budget inside clusters
-means **zero flows and zero cycles reach the model** — so process stories and
-risk briefing, the two sections the Domain lens exists for, are the first to
-vanish and do so silently. Section order decides survival.
-
-**E41 (D5) — absolute paths reach the provider unredacted.**
-`secretRedactionService` is injected (`:20`) but applied only to error messages
-and stack traces (`:77`, `:80`, `:136`, `:139`). The payload itself ships raw
-`filePaths`, `entryFile`, `sinkFile` and `steps` (`:420`–`:466`). For a
-local-only product with an explicit remote-egress acknowledgement, sending
-`C:\Users\…\clients\<name>\…` to a remote model is a real disclosure, and the
-model needs none of it.
-
-## 2.12 Step 4's extraction is written — in a service that does not feed CodeGraph
-
-**E45 — `table-query`, `datasource` and `scope.*` are already extracted and
-already emitted.** I specified Step 4 items 4 and 5 as new parser work. They are
-not new; they exist in the Modernize inventory path:
-
-| Emitted | Where |
+| Affected | Mechanism |
 |---|---|
-| `datasource` | `ModernizationInventoryService:175` |
-| `table-query` (per table) | `:190`, from `sqlReferences( sourceLine )` |
-| `column-query` | `:191` |
-| `scope.#scope#` | `:197` |
+| Edge count | One merged edge becomes several |
+| `maxEdges` / `maxEdgesPerNode` caps | `:257`, `:262` bite earlier, truncating edges that previously survived |
+| Affinity weights | `buildAffinityGraph` sums edge contributions per pair |
+| **Louvain communities** | Different affinity → different clusters |
+| **Modernize's CI gates** | `seamPrecision` / `seamRecall` read those clusters (E45) |
+| Cohesion ratios | `cohesion()` counts internal vs crossing edges |
 
-The extractor is `sqlReferences` (`:654`–`:667`), returning
-`{ tables, columns, unparameterized, parameterMismatch, dynamicIdentifier }`.
-Note the last field — **dynamic-SQL detection already exists**, which is exactly
-the "skip dynamic SQL rather than guess" guard Step 4 calls for.
+**Architectural consequence.** Kind must stop being part of edge *identity* and
+become an edge *attribute*. Dedup on a canonical group so edge identity, counts,
+weights, caps and Louvain output stay byte-identical, and carry the specific
+kinds alongside as `kinds[]` for consumers that want fidelity. That is the design
+Step 5a now specifies — it is the only version that is genuinely additive.
 
-The downstream chain is complete too: `ModernizationSignalService:22`–`:30` maps
-`datasource` → `datasource.named`, `table-query` → `sql.table-ref`,
-`scope.session` → `scope.session-heavy`, `scope.application` →
-`scope.application-state`; `ModernizationRiskService:29`–`:30` weights them.
+**E49 — a Review run already builds the CodeGraph substrate.**
+`ReviewRunService.bx:602` calls `architectureIndexService.index( runId, scan.files )`
+— the same call `CodeGraphRunService.bx:40` makes.
 
-So the gap is **routing, not capability**: these kinds are produced by the
-Modernize inventory and consumed by the coupling service, while the parsers that
-feed CodeGraph and Review produce none of them. Step 4 lifts mechanics, it does
-not write a SQL parser.
+**E50b — one gate keeps the explorer off other runs.** `ApiCodeGraph.bx:49`,
+`:108`, `:150` each test `lCase( run.getRunKind() ?: "" ) != "codegraph"` and
+return 404.
 
-**E46 — and there is a documented rule for how to lift it.**
-`CfmlSourceScanner`'s docblock records the decision made the last time two
-extractors overlapped:
+## 2.11 Speed and freshness
 
-> It deliberately holds mechanics only — **the extractors are not merged**. Their
-> taxonomies and evidence contracts legitimately differ, and folding them
-> together would silently change what each one reports.
+**E50 — nothing renders until the run finishes, including the LLM call.**
+`CodeGraphRunService.execute` persists once, at 90% (`:76`–`:84`), *after*
+narrative resolution at 75% (`:66`–`:69`). The deterministic snapshot is complete
+at the 60% clustering mark and withheld behind a network call.
 
-It then names two behaviour differences preserved rather than flattened: the
-inventory's pattern compiler normalizes doubled backslashes and the parser's does
-not (so normalization is a parameter *and* part of the cache key), and the
-parser's tag joiner reports `endLine` where the inventory's did not (so the
-shared one always reports it).
-
-**Follow this exactly.** Share `sqlReferences` as a mechanic; let each caller
-keep its own taxonomy and evidence contract. Merging the extractors would move
-Modernize's signals, and Modernize's signals are CI-gated (E33).
-
-**E43 — two public entry points for one behaviour.**
-`CodeGraphNarrativeService.narrate:48` is a one-line delegate:
-`return enrich( arguments.snapshot );`. `enrich:55` is annotated
-"ArchitectureEnrichmentService-shaped entry point", but **no caller outside the
-class invokes it** — the only `.enrich(` call sites belong to
-`findingSolutionService`, `modernizationRiskService` and
-`architectureEnrichmentService`. `CodeGraphRunService` calls `narrate` only
-(`:400`, `:438`). Two public methods, one path, one of them unreferenced — the
-parallel-path shape AGENTS.md's "one clear implementation path per feature" rule
-exists to prevent. Collapse it in Step 10, which rewrites this service anyway.
-
-## 2.13 CodeGraph is a run kind; the substrate says it should be a lens
-
-**E47 — a Review run already builds the CodeGraph substrate.**
-`ReviewRunService:602` calls `architectureIndexService.index( runId, scan.files )`
-— the same call `CodeGraphRunService:40` makes. Every Review run therefore
-already pays for symbols, dependencies, resolution and impact cones, and persists
-them to the same `review_symbols` / `review_dependencies` tables. What CodeGraph
-adds on top is metrics assembly, the snapshot, the optional narrative, and the
-explorer UI. **The graph is not CodeGraph's; it is the application's.**
-
-**E48 — one gate keeps the explorer off every other run.** All three
-`ApiCodeGraph` actions reject anything that is not a CodeGraph run:
-`subgraph:49`, `edges:108`, `narrative:150` each test
-`lCase( run.getRunKind() ?: "" ) != "codegraph"` and return 404. Nothing else
-prevents drilling the graph of a review run — the data is present and
-`getGraph( runId )` would return it.
-
-The product docs already record the consequence as a known gap
-(`application-features.md:287`): *"Coupling graph UI is CodeGraph-only —
-Review/Modernize still compute coupling signals; the interactive explorer ships
-on `/codegraph` only."* It is listed under **Visibility — computed but not
-surfaced**, with owner "CodeGraph". This plan is where it gets answered.
-
-**E49 — the hierarchy tree has a second customer.**
-`open-issues.md` item 8 asks for a file picker tree on `/review`: *"should show a
-directory tree on the right after a directory is added, allowing files to be
-selected or excluded before scanning."* That is the same component Step 11a
-builds for hierarchical drill-down, over the same directory rollup (E25). Build
-it once.
-
-Related, and relevant to Step 11: `open-issues.md` items 4 and 5 report the front
-end over-polling (`app.js` "makes excessive backend calls"). Step 11 adds canvas
-interaction and search; it should not add polling.
-
-## 2.14 "Quickly" — the dimension the plan never measured
-
-CodeGraph's purpose is *quickly* knowing a project and the flow between its
-components. Every finding below is a latency or freshness defect against that
-purpose, and none of them appeared in the first four passes because the plan was
-scoped around fidelity, not time-to-answer.
-
-**E50 — nothing renders until the run is completely finished, including the LLM
-call.** `CodeGraphRunService.execute` persists exactly once, at 90%
-(`:76`–`:84`), *after* narrative resolution at 75% (`:66`–`:69`). The
-deterministic snapshot — nodes, roles, clusters, flows, cycles, hotspots — is
-fully assembled at the 60% "codegraph-clusters" mark and then **withheld behind a
-network call to a language model**.
-
-For a product whose promise is speed of orientation, the structure a user could
-have read in seconds waits on the slowest, most failure-prone stage in the
-pipeline.
-
-**The two-phase write already exists and is already used elsewhere.**
-`CodeGraphRepository.updateNarrative:153` writes narrative alone against an
-existing snapshot row, and `CodeGraphRunService.refreshNarrative:381` drives
-exactly that flow from `POST /runs/:id/codegraph/narrative`. The pipeline simply
-does not use its own mechanism.
+**The two-phase write already exists.** `CodeGraphRepository.updateNarrative:153`
+writes narrative alone against an existing row, and
+`CodeGraphRunService.refreshNarrative:381` drives exactly that flow from
+`POST /runs/:id/codegraph/narrative`.
 
 **E51 — the snapshot is never reused; only the narrative is.**
-`findReusableNarrative:108` matches on `projectPath + repositoryRevision +
-narrativeCacheKey`. There is no equivalent for the snapshot. Re-opening a project
-examined yesterday re-scans, re-indexes, re-runs Louvain clustering, re-extracts
-flows and re-assembles from scratch.
+`CodeGraphRepository.findReusableNarrative:108` matches on
+`projectPath + repositoryRevision + narrativeCacheKey`. No snapshot equivalent
+exists. And it is circular: `narrativeCacheKey` derives from the snapshot
+fingerprint (`CodeGraphRunService.bx:71`), so the whole snapshot must be computed
+before the system can discover the narrative was reusable.
 
-Worse, it is circular: `narrativeCacheKey` derives from the snapshot fingerprint
-(`CodeGraphRunService:71`), so **the entire snapshot must be computed before the
-system can discover the narrative was reusable**. The cheap half is gated on the
-expensive half.
-
-**E52 — CodeGraph is run-centric; its purpose is project-centric.** Every surface
-is keyed on a run: `codegraph_snapshots` has `run_id` as PRIMARY KEY
-(`SchemaService:543`), results come from `GET /runs/:id/result`, and history is
-`/api/v1/history?runKind=codegraph`. There is no "current map of this project"
-concept — the closest a user gets is finding their last run in a history list.
-"Know about the project" is not a run-shaped question.
+**E52 — run-centric, for a project-centric question.** `codegraph_snapshots` has
+`run_id` as PRIMARY KEY (`SchemaService.bx:543`); results come from
+`GET /runs/:id/result`; history is `/api/v1/history?runKind=codegraph`. There is
+no "current map of this project".
 
 **E53 — meaning expires on every commit.** `repositoryRevision` is part of the
-narrative reuse key (`findReusableNarrative:125`). On an actively developed repo
-every commit invalidates the briefing, compounding E17's whole-graph fingerprint
-problem: not only does one file's change re-narrate everything, one *commit* does
-too, and domain names churn with it (Step 10).
+narrative reuse key (`CodeGraphRepository.bx:125`).
 
-**E42 — test footprint, for gate realism.** 73 unit suites, 27 integration
-suites; CodeGraph specifically covered by 2,018 lines across
-`CodeGraphInventoryAdapterSpec` (93), `CodeGraphMetricsServiceSpec` (306),
-`CodeGraphNarrativeServiceSpec` (312), `CodeGraphRunServiceSpec` (380),
-`CodeGraphApiSpec` (291), `CodeGraphPersistenceSpec` (174) and
-`tests/js/codegraph-layout.spec.mjs` (462). The gates in Part 4 extend existing
-suites rather than inventing a harness.
+## 2.12 Contract and docs drift
+
+**E54 — the edges endpoint is undocumented.** `GET /runs/:id/codegraph/edges`
+ships (`ApiCodeGraph.bx:102`), is used by the UI
+(`app.js:3946`–`:3967`) and is covered by `CodeGraphApiSpec`. `resources/apidocs/`
+contains `codegraph/subgraph` and `codegraph/narrative` — **not `codegraph/edges`**.
+This violates the AGENTS.md rule that `/api/v1/*` changes update OpenAPI.
+
+**E55 — the run form carries Review wording.** `codegraph.bxm:38` states
+"ColdFusion and BoxLang only — JavaScript files are skipped silently" (true
+today, false after Step 6), and the pipeline step list at `:121`–`:128` names
+Review stages — "Crew planning", "Specialist analysis" — that no CodeGraph run
+executes. `app.js` rewrites these at runtime; the served HTML is wrong until it
+does.
+
+**E56 — test footprint, for gate realism.** 73 unit suites, 27 integration
+suites. CodeGraph: `CodeGraphInventoryAdapterSpec` (93 lines),
+`CodeGraphMetricsServiceSpec` (306), `CodeGraphNarrativeServiceSpec` (312),
+`CodeGraphRunServiceSpec` (380), `CodeGraphApiSpec` (291),
+`CodeGraphPersistenceSpec` (174), `tests/js/codegraph-layout.spec.mjs` (462).
+Gates below extend these suites; none needs a new harness.
+
+**E57 — repository hygiene.** `.gitignore:59` ignores `.superpowers/**` — it is
+untracked scratch holding the previous plan's briefs and baselines, **not a stale
+doc tree, and not this plan's to delete**. `.gitignore:65` carries a comment
+about not recreating `.docs/` or `.superpowers/` that no longer matches
+AGENTS.md. `codegraph-depth-plan-backup.md` and `codegraph-deep-dive.md` both
+exist alongside this file, against the one-live-plan rule.
+
+**E58 — adjacent open issues that constrain UI work.** `open-issues.md` item 4:
+`app.js` "makes excessive backend calls". Item 8: `/review` wants a directory
+tree for file selection — the same component Step 12a builds. Item 3: run inputs
+are not persisted, so history cannot show what was submitted.
 
 ---
 
-# Part 3 — Direction, stance, constraints
+# Part 3 — Constraints
 
-## 3.0 Where CodeGraph is going
+## 3.1 Product boundaries (non-negotiable)
 
-The README sells four desktop workspaces — Dashboard, Review, Modernize,
-CodeGraph — and lists CodeGraph third among "what you get". That framing is
-accurate about today and, on the evidence, wrong about the destination.
+- **Local-only.** SQLite and analysis on the user's machine. No SaaS, accounts,
+  login walls, tenant auth, billing, quotas, hosted retention, or PR-bot platform.
+- **Desktop-only.** No mobile navigation, phone layouts, or responsive
+  breakpoint redesigns. Narrow-window breakage is preferable.
+  `prefers-reduced-motion` and ordinary desktop accessibility stay in scope.
+- **BoxLang, ColdFusion, JavaScript only.** No fourth language, including
+  TypeScript.
+- **Structure works with no AI key.** Every step leaves the no-key path intact.
+  LLM is optional and additive; meaning may degrade, structure may not.
+- **No automatic source migration.** CodeGraph reads; it never rewrites source.
+- **Capability claims must be measured** (Step 17).
+- **One implementation path per feature.** Extend existing services, handlers,
+  views and test patterns before creating abstractions.
 
-**Three purposes, three moments, three users.** As stated by the maintainer:
+## 3.2 Shared-service rules
 
-| Product | Purpose | When |
-|---|---|---|
-| **CodeGraph** | Quickly know the project, and the flow between its components | **Before** you work — orientation, onboarding, unfamiliar code |
-| **Review** | Find what's missing — security, performance, correctness | **After** you develop — a check on work just done |
-| **Modernize** | Upgrade a legacy app to modern MVC — modules, microservices | **A project of its own** — migration planning |
+Most of what this plan touches is used by Review or Modernize (E44).
 
-These are not three views of one moment. They are three different users, or one
-user in three different states of mind. **CodeGraph's user does not yet know the
-codebase. Review's user just wrote part of it.**
+1. **Additive by default.** Extend a vocabulary, add a parameter, add a kind —
+   do not change a default another product reads.
+2. **Behaviour changes for another product are opt-in at the call site**, and
+   that product's suite runs in the same commit. Step 15 is the live case:
+   Modernize's seam metrics are CI-gated (E45), so co-change affinity arrives as
+   a caller-supplied option, never a new default.
+3. **Never fork a shared service to avoid the conversation.** A parallel
+   CodeGraph copy of the coupling or clustering service is the duplicate product
+   path AGENTS.md forbids.
+4. **Share mechanics, never taxonomies** (E48). `CfmlSourceScanner` is the
+   precedent and the pattern.
 
-**Correction to an earlier draft of this section.** A previous pass concluded
-"CodeGraph becomes a lens, not a silo" and proposed mounting the explorer inside
-Review, surfacing finding counts on graph nodes, and offering path finding beside
-a finding. **That over-reached, and the purposes above are why.** Putting "what's
-wrong" onto a surface whose job is "what is this" dilutes both: it hands
-orientation to a user who is not oriented yet, and it duplicates work Review
-already does properly — `buildImpactCone` (`ArchitectureIndexService:115`) is
-already Review's "what breaks if I change this". That answer belongs on Review's
-surface, computed by Review's machinery.
+## 3.3 Coordination with the Modernize plan
 
-**What survives, and it is the part that was actually load-bearing:**
-
-1. **Share the substrate; keep the surfaces distinct.** A Review run already
-   builds the same graph (E47). That is an argument against *recomputing* it,
-   not an argument for merging what is drawn on top. Step 13 is scoped to reuse
-   only.
-2. **Modernize consumes what Step 4 adds.** Table and scope edges feed the
-   co-access matrix and shared-state overlay Modernize's seam detection already
-   reads (E34, E35, E45). CodeGraph work improves Modernize's answers as a side
-   effect — the clearest evidence the substrate, not the surface, is shared.
-3. **Key the explorer on a run id, not a snapshot object** (Step 11d). This
-   remains right for a plain engineering reason — it is what lets Step 13 reuse a
-   Review run's index without a rewrite — and it costs nothing to do now.
-
-## 3.0.1 What "quickly" demands, and what currently prevents it
-
-CodeGraph's purpose leads with **quickly**. §2.14 says the product is not built
-for it, and the fixes are cheap:
-
-- **Show structure before meaning.** The deterministic snapshot is complete at
-  60% and then withheld behind an LLM call (E50). Persist and render it at 60%;
-  let meaning arrive after. The two-phase write already exists and is already
-  used by the narrative-refresh endpoint.
-- **Answer instantly for a project already seen.** Only the narrative is reusable
-  today, and its cache key requires computing the whole snapshot first (E51).
-  A project-keyed snapshot lookup turns "what is this project" from a full
-  pipeline run into a read.
-- **Be project-centric, not run-centric** (E52). "Know about the project" is not
-  a run-shaped question, but every surface is keyed on a run id.
-- **Do not expire meaning on every commit** (E53). `repositoryRevision` in the
-  narrative key means an active repo re-narrates constantly and domain names
-  churn — the same failure Step 10 fixes for file edits, one level up.
-
-**Lead with flow.** The purpose names *"flow between different parts of
-components"* explicitly. Flows are currently a chip strip beneath the domain
-cards. On the evidence of the stated purpose they are not a secondary feature —
-they are the headline, and Steps 7, 11 and 14 should be read in that light.
-
-## 3.1 Stance
-
-Carried forward from the approved design; unchanged unless noted.
-
-- **One graph.** Domain lens over the existing graph. No second graph product.
-- **The LLM never invents nodes or edges.** Every narrative claim cites a
-  computed id; unknown ids are dropped (`CodeGraphNarrativeService.bx:199`).
-- **Meaning needs AI; structure does not.** No key → structure, roles, flows,
-  and an honest banner. Never present folder tokens as business meaning.
-- **Local-only, desktop-only.** No SaaS, accounts, hosted retention, or mobile
-  layouts.
-- **Supported languages: BoxLang, ColdFusion, JavaScript.** JavaScript is
-  already declared (E3); this plan makes the declaration true. No fourth
-  language.
-- **Not an automatic migrator.** CodeGraph reads; it does not rewrite source.
-- **Shared services stay shared.** Most of what this plan touches is used by
-  Review or Modernize too (E31). Three rules follow:
-  1. **Additive by default.** Extend a vocabulary, add a parameter, add a kind —
-     do not change an existing default that another product reads.
-  2. **A behaviour change for another product is opt-in at the call site**, and
-     that product's suite runs in the same commit. Step 9 is the live example:
-     Modernize's seam precision and recall are CI-gated against a committed
-     baseline (E33), so co-change affinity arrives as a caller-supplied option,
-     never as a new default.
-  3. **Never fork a shared service to avoid the conversation.** A parallel
-     CodeGraph copy of the coupling or clustering service is exactly the
-     duplicate product path AGENTS.md forbids.
-- **Capability claims must be measured.** Step 15 exists because
-  `application-features.md:294` records CodeGraph quality as unmeasured with no
-  owner.
-
-## 3.2 Two live plans — coordination
-
-AGENTS.md says one live plan at a time, and names
-[`modernize-inversion-plan.md`](modernize-inversion-plan.md) as the Modernize
-index. In practice there are two tracks, and **they edit the same files.**
+AGENTS.md names [`modernize-inversion-plan.md`](modernize-inversion-plan.md) for
+Modernize work. Both plans are live and they edit the same files.
 
 | Overlap | Modernize plan | This plan |
 |---|---|---|
-| `ModernizationCouplingGraphService` | Step 1 — creates and owns it, incl. the datasource/table co-access matrix | Step 4 — extends `structuralKinds`; feeds it `table-query` (E32, E34) |
-| `ModernizationDerivedStructureService` | Steps 3 / 3a / 3b — the derived-structure path is *the* inversion, CI-gated | Step 9 — adds co-change affinity (E33) |
-| Corpus and thresholds | Steps 2a / 6 — deterministic, LLM and judge tiers | Step 15 — CodeGraph corpus, separate fixtures |
+| `ModernizationCouplingGraphService` | Step 1 — owns it | Step 5a — extends `structuralKinds` |
+| `ModernizationDerivedStructureService` | Steps 3 / 3a / 3b — CI-gated inversion | Step 15 — opt-in co-change affinity |
+| Corpus and thresholds | Steps 2a / 6 | Step 17 — separate CodeGraph fixtures |
 
-Rules where they meet:
-
-1. **The Modernize plan wins on files it owns.** If its Step 1 or Step 3 is in
-   flight, this plan's Steps 4 and 9 wait or rebase. Read that plan's Part 0
-   ledger before starting either.
-2. **Vocabulary additions are safe to land either way** — extending
-   `structuralKinds` or `resourceKinds` is additive (Part 3, rule 1). Changing
-   affinity or community detection is not.
+1. **The Modernize plan wins on files it owns.** If its Step 1 or 3 is in flight,
+   Steps 5a and 15 wait or rebase. Read its Part 0 ledger first.
+2. **Vocabulary additions are safe either way**; affinity and community-detection
+   changes are not.
 3. **Run both corpora on any commit touching either service.**
-   `ModernizationCorpusSpec`'s Step 3b stop conditions are the tripwire, and a
-   green CodeGraph suite says nothing about them.
-4. If the two plans genuinely conflict on a design point, resolve it in the
-   Modernize plan and reference the outcome here — do not fork the answer.
-
-**Scope correction to the design doc:** its out-of-scope list says "JS remains
-skipped" and defers a glossary. Steps 5 and 10 supersede both lines. Everything
-else in that document stands.
+4. Resolve genuine design conflicts in the Modernize plan and reference the
+   outcome here — do not fork the answer.
 
 ---
 
 # Part 4 — Execution
 
-## 4.0 Execution graph
-
-Execute in this order. Parallel branches are marked; everything else is serial.
+## 4.0 Order
 
 ```
-0 ──► 1 ──► 2 ──► 3 ──► 4 ──┬──► 5 ──┬──► 7 ──► 8 ──┬──► 14 ──► 15
-                            │        │              │
-                            └──► 6 ──┘              ├──► 11 ──► 12 ──► 13
-                                                    │              (the lens)
-9 ───────────────────────────────► 10 ──────────────┘
-(9 may start any time after 1; 10 needs 4 + 9; 11 needs 8's reachability
- for tree pruning; 12 needs 11's canvas to render a path onto; 13 needs both)
+0 ─► 1 ─┬─► 2 ──────────────────────────────────────────────► 14 ─► 17
+        │                                                      ▲
+        ├─► 3 ─► 4 ─► 5a ─► 5b ─┬─► 6 ─► 9 ─┬─► 10 ─┬─► 12a ─► 12b ─► 13 ─► 16
+        │                       ├─► 7       └─► 11 ──┘
+        │                       └─► 8 ──────────────┘
+        └─► 15
 ```
 
-Hard orderings and why:
+| Ordering | Why |
+|---|---|
+| 1 before everything | Its defects poison any measurement taken afterwards (E37–E39) |
+| 2 independent of 3–13 | Two-phase persist touches only `CodeGraphRunService` + UI |
+| 4 before 5a | Stable ids first, or every kind change also churns ids (E12) |
+| 5a before 5b | New kinds are dropped by three filters until pass-through lands (E32a/b) |
+| 5b before 6 | A `fetch` edge needs route nodes to target |
+| 5b + 6 before 9 | Typed sinks and full-stack flows need table and client edges |
+| 8 before 12a | `client` role must exist before JS nodes surface, or `public/` makes every asset an entry point (E8b) |
+| 9 before 11 | The narrative payload carries flows; build it after `flows[]` changes shape |
+| 9 + 10 before 12a | Symbol steps and reachability are what the hierarchy shows |
+| 12a before 12b | Fix what is drawn before how it is drawn |
+| 12b before 13 | A path needs a legible canvas (E24) |
+| 2 before 14 | Reuse must know about `narrative.pending`, which Step 2 introduces |
+| 15 independent | Opt-in affinity; nothing else waits on it |
+| 17 last | It documents and measures whatever actually shipped, so it closes the plan rather than sitting mid-stream |
 
-- **4 before 5** — a `fetch` edge needs route nodes to point at.
-- **4 and 5 before 7** — typed sinks and full-stack flows need table and client
-  edges to exist.
-- **7 before 11** — Step 7 emits `stepSymbols[]`, which has no consumer until
-  the explorer gains a symbol level (E29). Landing them in the wrong order ships
-  a payload nothing reads.
-- **11 before 12** — a path finder needs somewhere to draw the path. Step 11's
-  smart layout is what makes a returned path legible rather than a tangle (E24).
-- **11 and 12 before 13** — the lens is worth opening on a Review run only once
-  there is something worth seeing there.
+**If effort is short:** Steps 1, 2, 3, 5a, 5b, 6 deliver both promises' floor.
+Cut from 15–17 first, then 16.
 
-**Steps 11–13 are the user-visible payoff of Steps 2–8**, and **Step 13 is the
-one that changes what the product is** (§3.0). Everything before them widens and
-corrects the substrate; these three are what a person actually touches. If the
-plan has to be cut short, cut from Step 14, not from here.
+## 4.1 Where this plan is most likely to go wrong
 
-**Even if Steps 11–13 are never built, 11d still applies.** Keying the explorer
-on a run id rather than a snapshot costs nothing and is the difference between
-Step 13 being a gate relaxation and being a rewrite.
+An architectural read of the plan itself. These are not steps; they are the
+failure modes to watch while executing.
+
+| Risk | Step | Mitigation already in the plan |
+|---|---|---|
+| **Silently changing Modernize's clusters.** The single largest risk. Edge identity, affinity weights and Louvain are load-bearing for a CI-gated product (E59, E45) | 5a, 15 | 5a's gate asserts graph *and* cluster invariance; 15 is opt-in with a byte-identical default |
+| **Serving a stale snapshot.** A reuse key that omits an input is a correctness bug that looks like a cache hit | 14 | Key includes settings hash and `parserVersion`; dirty tree and `pending` narrative both skip reuse |
+| **A systematically worse parser with no way back.** Per-file fallback does not cover a bad release on an unfamiliar dialect | 3, 7 | `codegraphParserStrategy` kill switch for one release cycle |
+| **New partial states.** Two-phase persist makes "run failed, snapshot valid" reachable for the first time | 2 | State table enumerated and specced, one row per case |
+| **Breaking a documented API by redefining a field** rather than adding one | 12a | `graphNodes` added; `totalNodes` deprecated, not redefined |
+| **Cost blowout on first run after a version bump** — every parse cache entry invalidates at once | 3, 5b, 6, 7 | Called out in each step; estimate before deploy (§5.3) |
+| **Scope drift back toward Review's questions** — findings on the graph, impact analysis in CodeGraph | 13, 14 | §1.1 states the boundary; both steps carry explicit "do not" |
+
+**The two steps to review most carefully in code review are 5a and 14** — both
+are quiet, both are easy to get subtly wrong, and both fail in ways that look
+like success.
 
 ---
 
-## Step 0 — Hygiene
+## Step 0 — Doc hygiene
 
-**Priority:** P0 · **Preconditions:** none
+**Status** wip · **Pri** P0 · **Preconditions** none · **Owns** — (docs only)
 
-**Goal.** Remove the one document that will misinform the next agent, and fix the
-links that point at it.
+**Goal & scope.** Remove documents that will misinform the next agent. Docs only;
+no code.
 
-**Do.**
-1. Delete `resources/docs/plans/codegraph-plan.md` — superseded, every task in it
-   shipped (§0.1), its checkboxes all read `- [ ]`, and it directs agents to a
-   `superpowers:` skill that is not available.
-2. Retarget inbound links to this file: `application-features.md:263`, `:322`;
+**Behaviour.**
+1. Delete `resources/docs/plans/codegraph-plan.md` — superseded, all tasks
+   shipped (§0.1), checkboxes all unchecked, and it directs agents to a
+   `superpowers:` skill that does not exist.
+2. Delete `resources/docs/plans/codegraph-depth-plan-backup.md` and
+   `resources/docs/plans/codegraph-deep-dive.md` — their content is absorbed
+   here. Two readable near-copies of a plan is the failure the one-live-plan rule
+   exists to prevent (E57).
+3. Retarget inbound links: `application-features.md:263`, `:322`;
    `resources/docs/README.md:16`; `codegraph-domain-lens-design.md:4`.
-   **(Done — these four edits already landed with this plan.)**
-3. In `codegraph-domain-lens-design.md`, correct the scope lines superseded by
-   Steps 5 and 10 (JS skipped; glossary deferred). **(Done.)**
-4. Optional tidy: `.gitignore:65` still comments on not recreating `.docs/` or
-   `.superpowers/`, which no longer matches AGENTS.md (E19). One line.
+4. Correct `.gitignore:65`'s comment, which no longer matches AGENTS.md (E57).
 
-**Don't.** **Do not delete `.superpowers/`** — an earlier draft of this step said
-to, on the strength of an AGENTS.md rule that has since been removed as
-incorrect. It is gitignored scratch holding the previous plan's briefs, reports
-and pre-change baselines (E19), and disposing of it is the maintainer's call.
-Don't archive the superseded plan "just in case" — git history is the archive.
+**Do not.** Do not delete `.superpowers/` — gitignored scratch, the maintainer's
+call, not hygiene (E57). Do not archive superseded plans; git history is the
+archive.
 
-**Gate.** `plans/codegraph-plan.md` is gone, and
-`rg -n "codegraph-plan" resources/docs --glob '!codegraph-depth-plan.md'`
-returns nothing — this plan's own references to the deleted file are expected.
+**Contract / settings / schema / parser.** None.
 
----
+**Degradation.** N/A.
 
-## Step 1 — Correctness and cost
+**Gate.** `rg -n "codegraph-plan|codegraph-deep-dive|depth-plan-backup" resources/docs --glob '!codegraph-depth-plan.md'`
+returns nothing. `resources/docs/README.md` lists exactly one live CodeGraph plan.
 
-**Priority:** P0 · **Preconditions:** Step 0
-
-**Goal.** Fix seven defects that are wrong today regardless of everything else in
-this plan. **Three of them (1a–1c) are Review defects**, not CodeGraph ones —
-they surfaced here but they ship in the product now.
-
-**Do — shared graph loading.**
-
-1a. **`LIMIT 0` on impacts (E37).** `AnalysisGraphRepository:295` binds unscoped
-`resultLimit` where every sibling query binds `effectiveLimit`. Change it to
-`effectiveLimit`. This restores impact data to `ReviewRunQueryService:54` and
-`ReviewRunService:617`, which currently receive none. Add a spec that calls
-`getGraph( runId )` with **no** limit argument and asserts impacts are returned —
-the absence of that case is why this survived.
-
-1b. **Separate symbol and edge budgets (E38).** Give `getGraph` distinct symbol
-and dependency limits rather than one shared `LIMIT`. CodeGraph is passing
-`codegraphMaxEdges` as a symbol budget, which is a category error. Add
-`codegraphMaxSymbols` alongside the other `codegraph*` settings
-(`Coldbox.bx:113`–`128`). Where truncation is unavoidable, note that ordering by
-`file_path` truncates alphabetically — whole directories vanish rather than a
-representative sample; at minimum say so in the truncation reason.
-
-1c. **Propagate SQL-level truncation (E39).** `getGraph` already returns a correct
-`truncated` flag; `assemble` ignores it. Read it and add a
-`graphResultLimit` truncation reason. A snapshot must never report
-`truncated: false` while rows were dropped at the database boundary.
-
-**Do — CodeGraph-local.**
-
-1d. **Dangling ids (E10).** In `CodeGraphMetricsService.assemble`, apply the
-`maxNodes` cap **before** deriving hotspots / orphans / layer violations /
-flows — or retain any node id those arrays reference. Invariant to assert: every
-id in `hotspots`, `orphans`, `flows[].steps` and `layerViolations` resolves in
-`nodes[]`.
-
-1e. **Quadratic loops (E11).** Replace `crossingEdgeCount`'s per-node edge walk
-with one edge pass building a `fileKey → crossingCount` map. Same for
-`presentClusters`' symbol count: build `fileKey → symbolCount` once.
-
-1f. **Blank language (E13).** `languageFor` returns `JavaScript` for `js`/`jsx`.
-
-1g. **Views unclassified (E4b).** Add a `views?/` branch to
-`ArchitectureModelService.classifyFile` returning a `views` component, and map it
-to a `view` role in `assignRole`.
-
-1h. **BoxLang parser pattern cache (E2, E44).** `BoxLangParserService.match:380`
-compiles a `Pattern` via `createObject( "java", … )` **twice per call, per line,
-per file**. `CfmlSourceScanner.compiledPattern` is an existing, cached, shared
-mechanic that `CfmlParserService` already uses. Point the BoxLang parser at it.
-This is available **today**, needs no AST, fixes the `import java:` violation,
-and removes the hottest allocation in indexing. Mind the documented
-backslash-normalization parameter (E46) — the BoxLang parser writes patterns for
-the Java bridge directly, same as the CFML parser, so pass `false`.
-
-**Don't.** Don't change `hotspotScore`'s weights here — that is Step 9, where
-churn gives a defensible basis. Don't touch `classifyFile`'s `public/` branch
-yet; Step 6 owns the `client` role. Don't fold 1a–1c into a later step because
-they are "not CodeGraph" — they are one-line fixes to code this plan builds on,
-and leaving them means every measurement taken afterwards is taken on a broken
-base.
-
-**Gate.** `box testbox run reporter=Min` — the **full** suite, because 1a–1c
-touch Review (E31). New specs: the no-limit `getGraph` impacts case (1a); a
-snapshot whose `truncationReasons` includes the SQL-level reason when the limit
-bites (1c); the id invariant with `maxNodes` forced below the hotspot count (1d).
-Record before/after `assemble` wall time on this repo.
+**Docs.** This step *is* the docs change.
 
 ---
 
-## Step 2 — BoxAST parser for BoxLang
+## Step 1 — Shared graph-loading and metrics defects
 
-**Priority:** P0 · **Preconditions:** Step 1
+**Status** wip · **Pri** P0 · **Preconditions** Step 0 · **Owns** **Review** —
+1a–1c are live Review defects
 
-**Goal.** Replace line-regex extraction with AST traversal for `.bx` / `.bxm` /
-`.bxs`, keeping the parser's public contract (`getVersion`, `supports`, `parse`)
-byte-identical in shape.
+**Goal & scope.** Fix eight defects that are wrong today independent of this
+plan. Bounded to `AnalysisGraphRepository`, `CodeGraphMetricsService`,
+`ArchitectureModelService`, `BoxLangParserService.match`. No feature work.
 
-**Do.**
-1. Parse with `BoxAST( filepath: … , returnType: "struct" )`. Heed E6: never
-   pass a class body as `source` under the default `sourceType`.
-2. Walk the AST for the symbols and dependencies the regex path produced today,
-   at minimum: class / interface, function, property, `extends`, `implements`,
-   `inject`, `import`, `new`, calls, parameter and return types, handler
-   actions, TestBox suites (`BoxLangParserService.bx:26`–`211`).
-3. Emit `position` from the AST rather than the loop counter — accurate start
-   **and** end lines, which `CodeGraphInventoryAdapter.bx:47` currently fakes as
-   `max( startLine, startLine )`.
-4. Bump `parserVersion` to `boxlang-ast-parser-v3` (E7).
+**Behaviour.**
+
+| # | Fix | Evidence |
+|---|---|---|
+| 1a | Bind `effectiveLimit`, not unscoped `resultLimit`, in the impacts query (`AnalysisGraphRepository.bx:295`) | E37 |
+| 1b | Separate symbol and dependency limits in `getGraph`; stop passing an edge budget as a symbol budget | E38 |
+| 1c | Read `getGraph`'s `truncated` flag in `assemble` and add a truncation reason | E39 |
+| 1d | Apply the `maxNodes` cap **before** deriving hotspots/orphans/violations/flows, or retain referenced ids | E10 |
+| 1e | Replace `crossingEdgeCount`'s per-node edge walk with one edge pass; same for `presentClusters` symbol counts | E11 |
+| 1f | `languageFor` returns `JavaScript` for `js`/`jsx` | E13 |
+| 1g | Add a `views?/` branch to `classifyFile` → `views` component → `view` role | E4b |
+| 1h | Point `BoxLangParserService.match` at `CfmlSourceScanner.compiledPattern( expr, false )` | E2 |
+
+**Do not.** Do not change `hotspotScore` weights (Step 15 gives a defensible
+basis). Do not touch `classifyFile`'s `public/` branch (Step 8 owns `client`).
+Do not defer 1a–1c as "not CodeGraph" — they are one-line fixes to the base every
+later measurement rests on.
+
+**Contract.** No API shape change. Snapshot gains a truncation reason value
+(additive; clients ignore unknown reasons — `app.js:4468` maps known codes and
+falls through).
+
+**Settings / schema.** New setting `codegraphMaxSymbols` beside the other
+`codegraph*` keys (`Coldbox.bx:113`–`:128`), env
+`DOUBLECHECK_CODEGRAPH_MAX_SYMBOLS`, default 20000. No schema change.
+
+**Parser version.** 1h changes pattern *compilation*, not pattern *semantics* —
+**no version bump**, and the parity assertion in the gate proves it.
+
+**Degradation.** Truncation now reported rather than hidden; no-key path
+unaffected; non-git unaffected; no egress.
+
+**Gate.**
+```bash
+box server restart && box testbox run reporter=Min
+```
+Full suite, not a bundle — 1a–1c touch Review. New specs: `getGraph( runId )`
+with **no** limit argument returns impacts (1a); snapshot `truncationReasons`
+contains the SQL-level reason when the limit bites (1c); every id in `hotspots`,
+`orphans`, `flows[].steps`, `layerViolations` resolves in `nodes[]` with
+`maxNodes` forced below the hotspot count (1d); BoxLang parser output is
+**byte-identical** before and after 1h on `app/**`. Record before/after
+`assemble` wall time on this repo in the ledger.
+
+**Docs.** `application-features.md` Known gaps — add and immediately close rows
+for 1a and 1c, so the defect history is visible.
+
+---
+
+## Step 2 — Structure before meaning
+
+**Status** wip · **Pri** P0 · **Preconditions** Step 1 · **Owns** — (CodeGraph-local)
+
+**Goal & scope.** Serve the word the purpose leads with. The deterministic
+snapshot is complete at ~60% and withheld behind an LLM call (E50). Split the
+write. Scope: `CodeGraphRunService.execute`, `app.js` render path. **No new
+service, no new table** — the two-phase mechanism already exists.
+
+**Behaviour.**
+1. `save()` the snapshot as soon as `assemble` returns, with
+   `narrative = { used: false, pending: true }` and empty cache key.
+2. Emit the existing `codegraph.clusters` progress event so the UI can render.
+3. Resolve narrative, then finish with `updateNarrative`
+   (`CodeGraphRepository.bx:153`) — the same call `refreshNarrative:381` already
+   makes.
+4. UI renders structure on the event; meaning sections show a third state,
+   "meaning arriving", beside the existing "unavailable" and "present".
+
+**Do not.** Do not stream partial *structure* — a half-built graph misleads in a
+way a missing briefing does not. Render once `assemble` completes. Do not add
+polling; run events already arrive over the existing SSE stream (E58 item 4). Do
+not make a Review run pay for narrative.
+
+**Contract.** `GET /runs/:id/result` may now return a snapshot with
+`narrative.used = false, narrative.pending = true`. Additive field; existing
+clients that check `used` behave unchanged. OpenAPI: document `pending`.
+
+**Settings / schema / parser.** None.
+
+**Degradation — and the state question this step creates.** Splitting one write
+into two means a run can now **fail or be cancelled while a valid snapshot
+exists**, which could not happen before. Decide these explicitly rather than
+discovering them:
+
+| Situation | Required behaviour |
+|---|---|
+| Narrative throws | Snapshot stands; `narrative.used = false` + error. Strictly better than today, where a 75% failure still blocks the write until 90% |
+| Run cancelled after phase 1 | Snapshot stands, run status `cancelled`. `getResult` **must** serve the structure — a cancelled run with usable structure is a feature, not a leak |
+| Run cancelled before phase 1 | No row, as today |
+| Lease lost between phases | Rethrown as today; the orphaned structure row is valid and re-adoptable by the next run for that project (Step 14) |
+| Another run reads mid-write | Must not treat `pending` as a finished narrative — see Step 14's concurrency note |
+
+`narrative.pending` is the flag that distinguishes "meaning is coming" from
+"meaning failed", and both from "no provider configured". Three states, one
+field plus `used`; do not overload `used`.
+
+No-key: structure persists and renders, banner as today, `pending` never set.
+Non-git: unaffected. Egress: unchanged.
+
+**Gate.** Measured and recorded in the ledger: wall time from run start to
+**structure visible**, before and after, on this repo — the number must drop below
+time-to-narrative. New specs, one per row of the state table above; at minimum:
+stubbed narrative that throws leaves a complete snapshot row; cancellation after
+phase 1 leaves a snapshot that `getResult` serves; the two-phase write leaves
+**one** row, not two.
+`box server restart && box testbox run bundles=tests.specs.unit.CodeGraphRunServiceSpec,tests.specs.integration.CodeGraphPersistenceSpec reporter=Min`
+
+**Docs.** `technical-flow.md` CodeGraph pipeline — persist now precedes narrative.
+`application-features.md` — structure appears before meaning.
+
+---
+
+## Step 3 — BoxAST parser for BoxLang
+
+**Status** wip · **Pri** P0 · **Preconditions** Step 1 · **Owns** **Review**,
+**capabilities API**
+
+**Goal & scope.** Replace line-regex extraction with AST traversal for
+`.bx` / `.bxm` / `.bxs`, keeping `getVersion` / `supports` / `parse` identical in
+shape. Extraction taxonomy unchanged — new edge kinds are Step 5b.
+
+**Behaviour.**
+1. Parse with `BoxAST( filepath: …, returnType: "struct" )`. Heed E6: never pass
+   a class body as `source` under the default `sourceType`.
+2. Walk for what the regex path produces today: class/interface, function,
+   property, `extends`, `implements`, `inject`, `import`, `new`, calls, parameter
+   and return types, handler actions, TestBox suites.
+3. Emit real `position` start **and** end lines, replacing the
+   `max( startLine, startLine )` placeholder at `CodeGraphInventoryAdapter.bx:47`.
+4. Multi-line constructs — function signatures, fluent route chains, wrapped
+   property declarations — must resolve. Call these out explicitly in the parity
+   harness; they are the class of thing E5 is about.
 5. Fall back to the regex path on parse failure, recording a per-file
-   `parseStrategy` so partial-parse repos degrade instead of emptying.
-6. Where regex remains (CFML, until Step 2b), precompile patterns as statics via
-   `import java:java.util.regex.Pattern` — not `createObject` per call (E2).
+   `parseStrategy`, so a partially-unparseable repo degrades rather than empties.
+6. **Global kill switch.** Per-file fallback handles a bad *file*; it does not
+   handle a bad *release*. This swap sits under Review as well as CodeGraph
+   (E44), on the hottest path in the product, and a systematic AST regression on
+   an unfamiliar dialect would have no remedy but a rollback. Ship
+   `codegraphParserStrategy = ast | regex | auto` (default `auto`), so the regex
+   path stays reachable by configuration for one release cycle.
 
-**Don't.** Don't add new edge kinds here — Step 4 owns that, and mixing the two
-makes the parity gate unreadable. Don't delete `BoxLangParserService`'s regex
-helpers until the gate passes.
+**Do not.** Do not add edge kinds here — Step 5b owns that, and mixing them makes
+the parity gate unreadable. Do not delete the regex helpers until the gate passes
+**and** the kill switch is retired in a later release.
 
-**Blast radius (E31).** The parsers feed `ArchitectureIndexService`, which
-**Review** uses as well as CodeGraph — a parser that finds more symbols changes
-Review's graph, architecture model and impact cones. And `ApiCapabilities.bx:45`–`46`
-publishes `getVersion()` in the capabilities contract, so the version bump is a
-**published API change**: move `resources/apidocs/` in the same commit.
+**Contract.** `ApiCapabilities.bx:45`–`:46` publishes `getVersion()`, so the
+version bump is a **published contract change** — move `resources/apidocs/` in the
+same commit. Note that `strategy` changes the reported version, so it must be
+part of the published value, not a hidden modifier.
 
-**Gate.** Parity harness: run both parsers over `app/**` and diff symbol and
-dependency sets. AST output must be a **superset** for every file; every
-regression is either fixed or recorded here with a reason. Then
-`box server restart` (Rule 2) and the **full** suite —
-`box testbox run reporter=Min` — not just the unit bundle, because Review shares
-this path.
+**Settings.** `codegraphParserStrategy` (env `DOUBLECHECK_CODEGRAPH_PARSER_STRATEGY`,
+default `auto`). It participates in `parserVersion`, and therefore in the parse
+cache key and Step 14's reuse key — flipping it must invalidate both, not serve
+mixed-strategy results.
 
-**Step 2b (same shape, after 2's gate).** CFML via `sourceType: "cfscript"` /
-`"cftemplate"` (E1). Held separate because the CFML tier is `discovery-only` and
-its blast radius is different — **and because it is the less urgent of the two**.
-`CfmlParserService` already joins multi-line tags and caches patterns (E44), so
-it is not suffering the failure mode that makes Step 2 urgent for BoxLang. Take
-2b for the fidelity gain, not as a rescue; if effort is short, it is the safest
-thing in this plan to defer.
+**Schema.** None.
+
+**Parser version.** `boxlang-symbol-parser-v2` → `boxlang-ast-parser-v3`. This
+invalidates `analysis_parse_cache` by construction (E7) — do not hand-migrate.
+First run after deploy re-parses everything; note the expected one-time cost.
+
+**Degradation.** Parse failure → per-file regex fallback, recorded. No-key
+unaffected. Non-git unaffected. No egress.
+
+**Gate.** Parity harness over `app/**`: AST symbol and dependency sets must be a
+**superset** of regex output for every file; each regression is fixed or recorded
+here with a reason. Then
+`box server restart && box testbox run reporter=Min` — full suite, because Review
+shares this path (E44). Record parse wall time before/after.
+
+**Docs.** `technical-flow.md` parser section; `application-features.md` language
+tier row stays unchanged until Step 17 measures it.
 
 ---
 
-## Step 3 — Position-independent symbol ids
+## Step 4 — Position-independent symbol ids
 
-**Priority:** P0 · **Preconditions:** Step 2
+**Status** wip · **Pri** P0 · **Preconditions** Step 3 · **Owns** **Review**
 
-**Goal.** Stop cosmetic edits from invalidating baselines, impact cones and the
-entire briefing (E12).
+**Goal & scope.** Stop cosmetic edits invalidating baselines, Review impact cones
+and the entire briefing (E12). Scope: `ArchitectureIndexService.stableId` and its
+consumers.
 
-**Do.**
-1. Re-key `stableId` on structural identity — `filePath:recordType:kind:qualifiedName`
-   plus an occurrence ordinal for genuine same-name siblings — not `line`.
-2. Keep `line` as an **attribute** for evidence display; it must not enter the
-   id hash.
-3. Confirm the id change propagates cleanly to unit ids
-   (`CodeGraphInventoryAdapter.bx:37`), snapshot fingerprint and narrative cache
-   key. A stable-name repo edit must now yield an unchanged fingerprint.
+**Behaviour.**
+1. Re-key `stableId` on structural identity —
+   `filePath:recordType:kind:qualifiedName` plus an occurrence ordinal for genuine
+   same-name siblings — not `line`.
+2. Keep `line` as a display attribute; it must not enter the hash.
+3. Verify propagation to unit ids (`CodeGraphInventoryAdapter.bx:37`), snapshot
+   fingerprint, and narrative cache key.
 
-**Don't.** Don't reuse `contentHash` as the id basis — it changes on every edit,
-which is the same failure in a different coordinate system.
+**Do not.** Do not use `contentHash` as the id basis — it changes on every edit,
+the same failure in different coordinates.
 
-**Blast radius (E31).** `stableId` is `ArchitectureIndexService`'s, and
-**Review's impact cones are keyed on it** (`buildImpactCone:115` seeds from
-symbol ids). Improving id stability improves Review's baseline reuse too — but
-it is a behaviour change there, not only here. Run Review's suite.
+**Contract.** Symbol and dependency ids change shape once. They are opaque to
+clients, but any persisted baseline keyed on them is invalidated — treat the
+first run after deploy as a baseline rebuild and say so in the release note.
 
-**Gate.** Insert a blank line at the top of a fixture file, re-run, and assert:
+**Settings / schema.** None. Existing rows are re-derived per run.
+
+**Parser version.** No parser change; ids are assigned in
+`ArchitectureIndexService.materialize`, downstream of parsing.
+
+**Degradation.** No-key, non-git, egress unaffected.
+
+**Gate.** Insert a blank line at the top of a fixture file, re-run, assert:
 symbol ids unchanged, snapshot fingerprint unchanged, narrative reused
-(`CodeGraphRunService.bx:428` `findReusableNarrative` hits). Add this as a spec,
-and assert a Review impact cone over the same edit is likewise unchanged.
+(`findReusableNarrative` hits), **and** a Review impact cone over the same edit is
+unchanged. Add as specs.
+`box server restart && box testbox run reporter=Min`
+
+**Docs.** `app/models/README.md` — `ArchitectureIndexService` id contract.
 
 ---
 
-## Step 4 — Edge-kind fidelity and the missing hops
+## Step 5a — Edge-kind pass-through
 
-**Priority:** P0 · **Preconditions:** Step 3
+**Status** wip · **Pri** P0 · **Preconditions** Step 4 · **Owns** **Modernize**
 
-**Goal.** Stop discarding edge semantics, and add the three hops that turn a
-call chain into a business process.
+**Goal & scope.** Stop discarding edge semantics **without changing the graph's
+shape**. No new kinds are produced here; this step only stops existing and future
+kinds being destroyed.
 
-**Read E32, E34 and E35 before starting.** Three facts change the shape of this
-step from what an earlier draft assumed: the structural vocabulary is a
-four-item **allowlist**, table and datasource edges already have a consumer, and
-two further vocabularies sit unfed.
+**Read E59 first.** The naive version of this step — un-collapse `mapKind`,
+extend `structuralKinds` — changes edge identity, and therefore edge counts, cap
+behaviour, affinity weights, Louvain communities and Modernize's CI-gated seam
+metrics. The design below avoids all of that.
 
-**Do.**
-1. **Un-collapse and extend, in one commit (E4 + E32).**
-   `CodeGraphInventoryAdapter.mapKind` preserves `injects`, `imports`,
-   `constructs`, `calls`, `type-reference` as distinct kinds — **and**
-   `ModernizationCouplingGraphService.structuralKinds` (`:48`) gains them in the
-   same change. Doing only the first silently deletes every one of those edges at
-   `buildStructuralEdges:236`. Land both or neither.
-2. **route → handler.action (E5).** Read the router AST: follow the fluent chain
-   from `route( pattern )` through `.withAction()` / `.toHandler()` to emit a
-   `routes` edge from a `route:` node to the handler file, carrying verb and
-   pattern. This is the hop the line parser structurally could not see.
-3. **handler → view (E6b).** `event.setView( "main/x" )` → `renders` edge to the
-   resolved `.bxm`. Views stop being islands.
-4. **Tables — lift the extractor that exists; do not write one (E45).**
-   `ModernizationInventoryService.sqlReferences:654` already returns
-   `{ tables, columns, unparameterized, parameterMismatch, dynamicIdentifier }`,
-   and `:190` already emits `table-query` per table. The consumer exists too:
-   `ModernizationCouplingGraphService:328`–`:333` keys `"table:" & resource` and
-   builds the co-access matrix (E34).
+**Design: kind becomes an attribute, not an identity.**
 
-   **Move `sqlReferences` into a shared scanner mechanic**, following
-   `CfmlSourceScanner` exactly (E46): share the mechanics, **never merge the
-   taxonomies**. Modernize keeps emitting its vocabulary unchanged; the parsers
-   gain the ability to emit theirs. Honour E34's warning verbatim — never emit a
-   kind whose target is a constant such as `"sql"` — and use the existing
-   `dynamicIdentifier` flag as the skip-dynamic-SQL guard rather than inventing
-   one.
-5. **Feed the two unfed vocabularies (E35, E45).** `scope.application`,
-   `scope.session`, `scope.client` for shared-state access, and `http` /
-   `schedule` for outbound integration. `ModernizationInventoryService:197`
-   already emits `scope.#scope#`, so this is the same lift as item 4.
-   `build()` already consumes them, and `http` is the sink type Step 7 needs.
-6. **Framework pseudo-targets.** Classify `inject="coldbox:setting:x"` and
-   `logbox:logger:{this}` as framework/config edges instead of letting them land
-   in the structural vocabulary as junk (`CodeGraphRunService.bx:18`–`26` is full
-   of these).
-7. **Event edges.** `eventService.publish( "codegraph.index" )` and its
-   listeners → `emits` / `listens`. Async coupling is currently invisible.
+1. `CodeGraphInventoryAdapter.mapKind` returns **both** a canonical group and the
+   specific kind — `{ group: "component-construction", kind: "injects" }` — rather
+   than flattening to the group (E4). Keep `tests` dropped deliberately.
+2. `mapKind` stops returning `""` for unrecognised kinds (`:159`), which is the
+   filter that would silently discard everything Step 5b adds (E32a). Unknown
+   kinds pass through with a group of their own.
+3. `ModernizationCouplingGraphService.buildStructuralEdges` keeps deduping on
+   `from | to | group` — **identity unchanged** — and accumulates the observed
+   specific kinds into a new `kinds[]` array on the merged edge, alongside the
+   existing `occurrences` counter.
+4. `structuralKinds` (`:48`) gains the new **groups** only, so `:236`'s allowlist
+   keeps working as written.
 
-**Don't.** Don't attempt SQL parsing beyond table-name extraction. Don't create
-table nodes for dynamic SQL — an unproven node is worse than a missing one, and
-violates the evidence rule in Part 3. Don't re-collapse at the adapter to dodge
-the vocabulary change; that is the shortcut E32 exists to prevent.
+Everything downstream that reads `edge.kind` keeps reading the group and behaves
+identically. CodeGraph reads `edge.kinds[]` where it wants fidelity — flows
+already bypass this path entirely (E14b), so the fidelity gain lands in cluster
+edges, the inspector and Step 13's path weighting.
 
-**Gate.** On this repo: ≥1 `routes` edge for every route in `Router.bx`; a
+**Do not.** Do not land any subset — all four edits ship together or none does.
+Do not make kind part of the dedup key (E59). Do not change `resolutionWeights`,
+cohesion maths, or the caps.
+
+**Contract.** Edges gain `kinds[]` in the snapshot and in `/codegraph/edges`.
+`kind` keeps its current meaning and values. Purely additive. Verify the UI edge
+filter has no hardcoded kind list before shipping.
+
+**Settings / schema / parser.** None.
+
+**Degradation.** Unchanged paths. No-key, non-git, egress unaffected.
+
+**Gate — three assertions, the first two non-negotiable:**
+
+1. **Graph invariance.** On a fixture and on this repo, `graph.getEdges()` is
+   **byte-identical** before and after, ignoring the new `kinds[]` field: same
+   count, same keys, same weights, same `occurrences`, same truncation reasons.
+2. **Cluster invariance.** `deriveClusters` output is byte-identical, and
+   `ModernizationCorpusSpec` "Step 3b stop conditions" still pass —
+   `seamPrecision ≥ baseline`, `seamRecall > baseline`. If either moves, the
+   design in E59 was not followed.
+3. **Fidelity gained.** An `A → B` pair carrying both `injects` and `calls`
+   reports `kinds: [ "calls", "injects" ]` on one edge — proving detail survived
+   without a second edge appearing.
+
+```bash
+box server restart && box testbox run reporter=Min
+```
+
+**Docs.** `app/models/README.md` — `CodeGraphInventoryAdapter.mapKind` and the
+`CouplingGraph` edge contract; `technical-flow.md` edge vocabulary.
+
+---
+
+## Step 5b — Route, view, table, scope and integration edges
+
+**Status** wip · **Pri** P0 · **Preconditions** Step 5a · **Owns** **Modernize**
+(shared extractor)
+
+**Goal & scope.** Add the hops that turn a call chain into a request flow.
+**Lift existing extraction; do not write a SQL parser** (E46).
+
+**Behaviour.**
+1. **route → handler.action.** From the router AST, follow the fluent chain
+   `route( pattern )` → `.withAction()` / `.toHandler()` and emit a `routes` edge
+   from a `route:` node, carrying verb and pattern (E5).
+2. **handler → view.** `event.setView( "main/x" )` → `renders` edge to the
+   resolved `.bxm` (E6b).
+3. **Tables.** Move `ModernizationInventoryService.sqlReferences:654` into a
+   shared scanner mechanic following `CfmlSourceScanner` exactly (E48): **share
+   mechanics, never merge taxonomies.** Modernize keeps emitting its vocabulary
+   unchanged; the parsers gain the ability to emit `table-query` with the table
+   **name** as target. Use the existing `dynamicIdentifier` flag as the
+   skip-dynamic-SQL guard. Honour E47's warning verbatim — never emit a kind
+   whose target is a constant.
+4. **Scope and integration.** `scope.application` / `scope.session` /
+   `scope.client`, and `http` / `schedule` — same lift, same rule (E46, E47).
+   `http` is the sink type Step 9 needs.
+5. **Framework pseudo-targets.** Classify `inject="coldbox:setting:x"` and
+   `logbox:logger:{this}` as framework/config rather than structural.
+
+**Do not.** Do not merge the extractors (E48) — it moves Modernize's signals,
+which are CI-gated. Do not extend SQL parsing beyond table names. Do not create
+table nodes for dynamic SQL.
+
+**Contract.** New edge kinds in snapshot and `/codegraph/edges`. New `route:` and
+`table:` node id prefixes — the `table:` convention already exists in the coupling
+service (E47); reuse it, do not invent one. Document new kinds in OpenAPI
+alongside Step 17's edges-endpoint fix.
+
+**Settings / schema / parser.** No settings, no schema. **Parser version bump** —
+new dependency kinds mean new parse output.
+
+**Degradation.** Dynamic SQL is skipped, not guessed, and the skip is recorded.
+Unresolvable route targets emit no edge rather than a guessed one. No-key,
+non-git unaffected. No egress.
+
+**Gate.** On this repo: a `routes` edge for every route in `Router.bx`; a
 `renders` edge for each `event.setView` in `Main.bx`; `table:` resources for the
-tables in `SchemaService`; and an assertion that **no structural edge is dropped**
-by the allowlist — count edges in versus edges out of `buildStructuralEdges`.
-New specs per edge kind, plus `ModernizationCorpusSpec` (§3.2 rule 3).
-`box testbox run bundles=tests.specs.unit,tests.specs.integration reporter=Min`.
+tables in `SchemaService`. Modernize's inventory output must be **byte-identical**
+before and after the extractor move — assert it. Both corpora green.
+`box server restart && box testbox run reporter=Min`
+
+**Docs.** `technical-flow.md` edge vocabulary; OpenAPI edge-kind enum;
+`app/models/README.md` for the new shared mechanic.
 
 ---
 
-## Step 5 — JavaScript parser and the full-stack edge
+## Step 6 — JavaScript parser and the full-stack edge
 
-**Priority:** P0 · **Preconditions:** Step 4 (needs route nodes to target)
+**Status** wip · **Pri** P0 · **Preconditions** Step 5b · **Owns** Review (scan
+scope only)
 
-**Goal.** Make the declared JavaScript support real, and close
+**Goal & scope.** Make the declared JavaScript support real and close
 browser → API → service → repository → table.
 
-**Do.**
-1. New `JavaScriptParserService` implementing the same contract
-   (`getVersion` / `supports` / `parse`). Register it in
+**Behaviour.**
+1. New `JavaScriptParserService` implementing the same contract; register in
    `ArchitectureIndexService.bx:29`.
-2. Extract: ESM `import` / `export`, `require`, function and class declarations,
-   `const fn = …` assignments, and — the payload — **`fetch( "/api/v1/…" )` call
-   sites**.
-3. Emit a `calls-api` edge from the JS file to the matching `route:` node from
-   Step 4. Match on pattern with parameter placeholders normalised
+2. Extract ESM `import`/`export`, `require`, function and class declarations,
+   `const fn = …`, and **`fetch( "/api/v1/…" )` call sites**.
+3. Emit `calls-api` from the JS file to the matching `route:` node from Step 5b,
+   matching with parameter placeholders normalised
    (`/api/v1/runs/:id/codegraph/edges`).
 4. Add `js`, `jsx` to the CodeGraph allowlist at `ReviewRunService.bx:402` (E3).
-   Review already ingests JS content (E23), so this benefits both run kinds.
-5. Optional, cheap, high value: `.bxm` `<script src>` → asset edge, and
-   `getElementById( "x" )` ↔ view `id="x"` binding, which ties the UI layer to
-   its markup.
-6. Raise `SupportedLanguageService`'s JS tier only when Step 15 measures it —
-   not here.
 
-**Don't.** Don't add a JS framework runtime, bundler resolution, or `node_modules`
-traversal. Don't parse TypeScript — not a supported language.
+**Do not.** No bundler resolution, no `node_modules` traversal, no framework
+runtime, no TypeScript (§3.1). Do not raise the JS tier here — Step 17 measures it.
 
-**Gate.** Run CodeGraph on `C:\Box\DoubleCheck`: `public/assets/app.js` appears
-as a node with `language: "JavaScript"`; at least one flow starts in JS and
-reaches a `table:` node. `node --test tests/js/*.spec.mjs` and the BoxLang
-suites green.
+**Contract.** New `calls-api` kind; JS nodes appear in snapshots. Scan language
+counts change for CodeGraph runs (visible in run metadata).
+
+**Settings.** Consider a `codegraphMaxJavaScriptFiles` cap mirroring the
+modernize path if `public/assets` dominates; decide from the first measured run,
+not in advance.
+
+**Schema.** None. **Parser version:** new parser, own version string; it joins
+`ApiCapabilities`' published map (E44) — OpenAPI moves with it.
+
+**Degradation.** A JS file that fails to parse is skipped and recorded, as with
+Step 3's fallback. No-key, non-git unaffected. No egress.
+
+**Gate.** CodeGraph run on `C:\Box\DoubleCheck`: `public/assets/app.js` appears
+with `language: "JavaScript"`; at least one flow starts in JS and reaches a
+`table:` node. `node --test tests/js/*.spec.mjs` and
+`box server restart && box testbox run reporter=Min` green.
+
+**Docs.** `application-features.md:201` and `:212` (JS no longer "skipped");
+`codegraph.bxm:38` field hint (E55); `technical-flow.md`; OpenAPI parser map.
 
 ---
 
-## Step 6 — Roles from evidence
+## Step 7 — CFML parity
 
-**Priority:** P1 · **Preconditions:** Step 4 (may run parallel to Step 5)
+**Status** wip · **Pri** P1 · **Preconditions** Step 5b · **Owns** **Review**
 
-**Goal.** Replace filename guessing with graph evidence, and stop the legend
+**Goal & scope.** Close the CFML deficit. **Two independent pieces — 7a is the
+urgent one and does not depend on 7b.**
+
+**7a — DI edges (E9).** `CfmlParserService` emits no `injects` at all, so
+ColdBox/WireBox ColdFusion applications — this product's core legacy target —
+produce graphs with dependency wiring missing. Add `inject` attribute extraction
+to the property handling, mirroring `BoxLangParserService.bx:150`. This is a
+regex-level fix; it does **not** require the AST.
+
+**7b — AST for CFML.** `BoxAST` with `sourceType: "cfscript"` / `"cftemplate"`
+(E1). The script path is still a line loop (`:36`); tag handling already joins
+lines (E8). Take this for fidelity, not rescue — it is the safest thing in the
+plan to defer.
+
+**Do not.** Do not merge the CFML and BoxLang parsers; their taxonomies differ
+(E48). Do not raise the CFML tier — Step 17 measures it.
+
+**Contract.** CFML repos gain `injects` edges. Review's CFML graphs change too —
+this is a fidelity improvement, but it is a behaviour change (E44).
+
+**Parser version.** Bump `cfml-symbol-parser-v1` for each of 7a and 7b.
+
+**Degradation.** Unchanged. No-key, non-git, egress unaffected.
+
+**Gate.** A CFML fixture with `property name="x" inject="Y";` yields an `injects`
+dependency resolving to `Y`'s file. Parity harness for 7b as in Step 3.
+`box server restart && box testbox run reporter=Min`
+
+**Docs.** `application-features.md` measured language tiers — note the CFML
+graph was DI-blind before 7a, since that changes what past runs meant.
+
+---
+
+## Step 8 — Roles from evidence
+
+**Status** wip · **Pri** P1 · **Preconditions** Step 5b · **Owns** Review
+(`classifyFile`)
+
+**Goal & scope.** Replace filename guessing with graph evidence; stop the legend
 drifting from the enum.
 
-**Do.**
-1. Extend the enum with `view`, `client`, `config`, `integration`. **`client`
-   must land before Step 5's JS nodes are surfaced**, or `public/` sends every
-   asset to `entry` (E8).
-2. Derive from evidence, not path: owns a handler-action symbol → `entry`; issues
-   `queryExecute` or holds `writes` edges → `persistence`; extends a framework
-   base → its framework role; high fan-out over `injects` with low own-symbol
-   count → `orchestrator`. Keep path heuristics as the tiebreak, not the rule.
-3. Render the legend from snapshot role counts instead of the hardcoded six
-   (`codegraph.bxm:197`–`203`), so it shows what the run actually found.
+**Behaviour.**
+1. Extend the enum with `view` (Step 1g adds the component), `client`, `config`,
+   `integration`. **`client` must land before Step 6's JS nodes surface** or
+   `public/` makes every asset an entry point (E8b).
+2. Derive from evidence: owns a handler-action symbol → `entry`; emits
+   `table-query` or `writes` → `persistence`; extends a framework base → that
+   role; high `injects` fan-out with low own-symbol count → `orchestrator`. Keep
+   path heuristics as tiebreak, not rule.
+3. Render the legend from snapshot role counts, replacing the six hardcoded chips
+   (E11b).
 
-**Don't.** Don't drop `unknown` — an honest unknown beats a confident wrong role,
-and its share is a useful quality signal for Step 15.
+**Do not.** Do not drop `unknown` — an honest unknown beats a confident wrong
+role, and its share is a quality signal for Step 17.
 
-**Gate.** On this repo, `unknown` falls below 5% of nodes, and no file under
-`public/assets/` carries role `entry`. Spec the JS-asset case explicitly.
+**Contract.** `role` gains enum members; the legend becomes data-driven. Additive.
+
+**Settings / schema / parser.** None.
+
+**Degradation.** No-key, non-git, egress unaffected.
+
+**Gate.** On this repo, `unknown` below 5% of nodes and **no file under
+`public/assets/` carries role `entry`** — spec that case explicitly.
+`box server restart && box testbox run bundles=tests.specs.unit.CodeGraphMetricsServiceSpec reporter=Min`
+
+**Docs.** `application-features.md` roles row.
 
 ---
 
-## Step 7 — Flows v2
+## Step 9 — Flows v2
 
-**Priority:** P1 · **Preconditions:** Steps 5 and 6
+**Status** wip · **Pri** P1 · **Preconditions** Steps 6 and 8 · **Owns** —
 
-**Goal.** Make a flow a business process — symbol-level, branch-preserving, and
-terminating somewhere meaningful.
+**Goal & scope.** Make a flow a business process: symbol-level, branch-preserving,
+terminating somewhere meaningful. This is CodeGraph's headline promise (§1.2).
 
-**Do.**
-1. **Branches (E9).** Replace `longestFlowPath`'s single `best` with top-K
-   distinct paths per seed, deduplicated by step signature. A handler calling
-   four services must yield four flows, not one.
-2. **Symbol-level steps.** Each step carries file **and** symbol, so a process
-   story can say which method. Keep `steps[]` file ids for UI compatibility;
-   add `stepSymbols[]` alongside. **Note the consumer**: nothing renders symbols
-   until Step 11a adds a symbol level to the drill-down (E29). The narrative
-   (Step 10) uses them immediately; the explorer does not.
-3. **Typed sinks.** Classify the terminus: `table-write`, `table-read`,
-   `http-call`, `event-publish`, `view-render`, `unknown`. Derive these from
-   Step 4's edge kinds — `table-query` (E34) and `http` (E35) already carry the
-   information, so sink typing is a mapping, not a second analysis. Rank flows
-   that reach a typed sink above those that merely ran out of depth.
+**Behaviour.**
+1. **Branches** — replace `longestFlowPath`'s single `best` with top-K distinct
+   paths per seed, deduplicated by step signature (E14).
+2. **Symbol-level steps** — keep `steps[]` file ids for compatibility; add
+   `stepSymbols[]` alongside.
+3. **Typed sinks** — `table-write`, `table-read`, `http-call`, `event-publish`,
+   `view-render`, `unknown`, derived by **mapping** Step 5b's edge kinds, not a
+   second analysis. Rank typed-sink flows above depth-exhausted ones.
 4. **Seed from routes**, not handler files — a process starts at a URL.
-5. **Cap per cluster**, not globally, so a large repo shows breadth rather than
-   an arbitrary global 24.
-6. Replace `duplicate( state.visited )` per branch with a path-set that unwinds
-   on backtrack.
-7. Raise `maxDepth` past 3 now that hops are typed, and make it a setting
-   alongside the other `codegraph*` keys in `Coldbox.bx:113`–`128`.
+5. **Cap per cluster**, not globally.
+6. Replace `duplicate( state.visited )` per branch with an unwinding path set.
+7. Make `maxDepth` a setting.
 
-**Don't.** Don't let flow count grow unbounded — the narrative input budget is
-capped at `codegraphNarrativeMaxFlows` (`Coldbox.bx:126`) and blowing it silently
-truncates the briefing.
+**Do not.** Do not let flow count grow unbounded — the narrative input is capped
+at `codegraphNarrativeMaxFlows` and overflowing it silently truncates the briefing
+(E40). Note `stepSymbols[]` has no UI consumer until Step 12a; Step 11 uses it
+immediately.
 
-**Gate.** On this repo, at least one flow reads end to end
+**Contract.** `flows[]` gains `stepSymbols[]`, `sinkKind`, `routeId`. Additive.
+
+**Settings.** `codegraphFlowMaxDepth` (default 6 now that request and table hops are typed),
+`codegraphMaxFlowsPerCluster`. Env-backed like siblings.
+
+**Schema / parser.** None.
+
+**Degradation.** A flow with no typed sink is still returned, marked `unknown` —
+do not hide it. No-key, non-git, egress unaffected.
+
+**Gate.** On this repo, one flow reads end to end:
 `app.js → route → ApiCodeGraph.subgraph → CodeGraphRunService → AnalysisGraphRepository → table:review_dependencies`,
-with every hop carrying a real edge kind. Spec it as a fixture.
+every hop a real kind. Spec it as a fixture.
+`box server restart && box testbox run bundles=tests.specs.unit.CodeGraphMetricsServiceSpec reporter=Min`
+
+**Docs.** `application-features.md` flows row; `technical-flow.md`.
 
 ---
 
-## Step 8 — Reachability, dead code, layer policy
+## Step 10 — Reachability, dead code, layer policy
 
-**Priority:** P1 · **Preconditions:** Step 7
+**Status** wip · **Pri** P1 · **Preconditions** Step 9 · **Owns** —
 
-**Goal.** Answer "what is actually live?" and make layer rules configurable.
+**Goal & scope.** Answer "what is actually live?" and make layer rules
+configurable.
 
-**Do.**
+**Behaviour.**
 1. Compute reachability from the true entry set — routes, `Application.bx`
    lifecycle, scheduled tasks — and report unreachable files. This is the real
-   dead-code answer that `fanIn == 0 && fanOut == 0` misses (E15).
+   dead-code answer `fanIn == 0 && fanOut == 0` misses (E15).
 2. Keep the existing orphan list as a separate, narrower signal; do not conflate.
-3. Move layer rules into configuration (E14) with a default set beyond the single
+3. Move layer rules into configuration (E16), defaulting beyond the single
    `models → handlers` rule: `view → model`, `repository → handler`,
-   cross-domain persistence access.
+   cross-domain persistence.
 
-**Don't.** Don't report test-only-reachable files as dead — flag them as
-`test-only`, which is a different conversation.
+**Do not.** Do not report test-only-reachable files as dead — label them
+`test-only`.
 
-**Gate.** Seed a fixture with a known-unreachable file and assert it is reported;
-assert a test-only-reachable file is labelled, not condemned.
+**Contract.** Snapshot gains `unreachable[]` and `reachability` totals. Additive.
 
----
+**Settings.** `codegraphLayerPolicy` as a structured setting; ship today's single
+rule as the default so behaviour is unchanged until configured.
 
-## Step 9 — Git co-change and churn
+**Schema / parser.** None.
 
-**Priority:** P1 · **Preconditions:** Step 1 (independent of 2–8; may run parallel)
+**Degradation.** With no identifiable entry set (a library, say), reachability is
+skipped and flagged, not reported as "everything dead". No-key, non-git, egress
+unaffected.
 
-**Goal.** Add the temporal signal. Files that change together are strong
-evidence of a domain boundary, and it is evidence static analysis cannot see.
+**Gate.** Fixture with a known-unreachable file reports it; a
+test-only-reachable file is labelled, not condemned; default layer policy
+reproduces today's violations exactly.
+`box server restart && box testbox run bundles=tests.specs.unit.CodeGraphMetricsServiceSpec reporter=Min`
 
-**Correction — read E18 first.** An earlier draft said clusters were folder-shaped
-and proposed replacing that with co-change. That was wrong. `deriveClusters`
-already runs Louvain community detection over a weighted affinity graph
-(`ModernizationDerivedStructureService.bx:66`–`:68`); membership is coupling-derived.
-Only the **label** is folder-shaped, and Step 10 owns naming. **This step adds one
-more signal to affinity. It does not replace the algorithm.**
-
-**And read E33.** `deriveClusters` is consumed by six Modernize services, and
-Modernize's seam precision and recall are CI-gated against a committed baseline.
-Changing default affinity moves those gates.
-
-**Do.**
-1. New public method on `GitRepositoryService` for commit→files pairs via
-   `git log --name-only`, bounded by commit count and entry count, following the
-   existing `executeTokens` pattern (E20).
-2. **Add co-change as an opt-in affinity term.** `buildAffinityGraph`
-   (`:354`) gains an optional caller-supplied weight map; `deriveClusters` gains
-   an optional parameter to pass it. **Absent the parameter, behaviour is
-   byte-identical to today** — that is the contract with Modernize (Part 3,
-   rule 2). CodeGraph passes it; Modernize does not, until its own plan decides
-   to.
-3. Replace `hotspotScore`'s hand-tuned constants
-   (`CodeGraphMetricsService.bx:388`) with churn × fan-in × cycle membership, and
-   record the formula in the snapshot so the ranking is auditable. This one is
-   CodeGraph-local — `hotspotScore` is private to `CodeGraphMetricsService`.
-4. Surface author count and last-touched per cluster — "this domain is active /
-   this one has not moved in two years" is the risk answer people actually want.
-
-**Don't.** Don't fail the run when the project is not a git repository, has no
-history, or is a shallow clone — degrade to structural-only and say so in the
-snapshot. Don't change the default affinity weighting. Don't let co-change
-override structural coupling; it is a term, not a veto, and two files edited in
-one sweeping commit are not a domain.
-
-**Gate.** Three parts. (a) With no co-change parameter, `deriveClusters` output
-is **byte-identical** to the pre-change build on a fixture — assert it. (b)
-`ModernizationCorpusSpec` Step 3b stop conditions still pass (§3.2 rule 3).
-(c) Runs on this repo and on a non-git directory; the second produces a snapshot
-with co-change absent and flagged, not an error.
+**Docs.** `application-features.md` issues row.
 
 ---
 
-## Step 10 — Narrative sharding, labels, budget fairness, path egress
+## Step 11 — Narrative: sharding, budget, egress, risk
 
-**Priority:** P1 · **Preconditions:** Steps 4 and 9
+**Status** wip · **Pri** P1 · **Preconditions** Step 9 · **Owns** —
 
-**Goal.** Stop domain names churning on unrelated edits, and let a correct name
-stay correct.
+**Precondition corrected.** An earlier draft gated this on Step 15 (co-change),
+reasoning that sharding "wants stable cluster keys". That was wrong twice: a P1
+step was gated on a P2 step, and stable cluster keys come from **member
+composition** (item 2 below), not from co-change affinity. The real dependency is
+**Step 9** — the narrative payload carries flows, so it must be built after
+`flows[]` gains `stepSymbols[]` and `sinkKind`, or the briefing describes a shape
+that no longer exists.
 
-**Do.**
-1. **Shard by cluster.** Cache each cluster's narrative on a per-cluster
+**Goal & scope.** Stop domain names churning, stop sections starving, stop paths
+leaking, and render what is already computed.
+
+**Behaviour.**
+1. **Shard by cluster** — cache each cluster's narrative on a per-cluster
    fingerprint instead of the whole-graph one (E17). Only changed domains
-   re-narrate. `ModernizationRoadmapShardService` is the in-house precedent —
-   follow it rather than inventing a second sharding style.
-2. **New `codegraph_labels` table** in `SchemaService` (single source of truth,
-   AGENTS.md): `project_path`, `cluster_key`, `label`, `provenance`
-   (`ai` | `user`), `created_at`. Reuse the stored label across runs; `user`
-   always outranks `ai`.
-3. Key labels on a **stable cluster key** — derived from member composition, not
-   the ordinal `clusterId`, which shifts when clusters resort.
-4. **Ground the briefing in data.** Feed each domain's tables (Step 4), routes
-   (Step 4) and typed sinks (Step 7) into the narrative input. "Owns
-   `review_runs`, `review_findings`; entered via `POST /api/v1/runs`" is more
-   meaningful than any prose, and it is deterministic.
-5. **Fix section starvation (E40).** `buildPayload` spends one budget
-   sequentially with `break`, so exhausting it inside clusters sends **zero flows
-   and zero cycles** to the model — process stories and risk briefing, the two
-   sections the Domain lens exists for, starve first and silently. Allocate the
-   budget **per section** (proportional or reserved-minimum), and return which
-   sections were trimmed. Without this, item 6's coverage number is measuring the
-   wrong thing.
-6. **Relativize paths before egress (E41).** `secretRedactionService` is injected
-   but touches only error text; the payload ships raw absolute paths. Make paths
-   project-relative before they leave the machine. The model needs
-   `app/models/services/X.bx`, never `C:\Users\…\clients\<name>\…`, and this is a
-   local-only product with an explicit remote-egress acknowledgement.
-7. **Report coverage.** Surface "N of M clusters named", plus which payload
-   sections were trimmed (item 5), so an incomplete briefing is visible rather
-   than silently partial.
-8. **Collapse the duplicate entry point (E43).** `narrate()` is a one-line
-   delegate to `enrich()`, and `enrich()` has no caller outside the class. Keep
-   `narrate` — it is what `CodeGraphRunService` calls and what the name means
-   here — and make `enrich` private or delete it. One path per feature.
+   re-narrate. Follow `ModernizationRoadmapShardService`; do not invent a second
+   sharding style.
+2. **`codegraph_labels` table** in `SchemaService`: `project_path`,
+   `cluster_key`, `label`, `provenance` (`ai` | `user`), `created_at`. Reuse
+   across runs; `user` outranks `ai`. Key on a **stable cluster key** derived from
+   member composition, not the ordinal `clusterId`.
+3. **Per-section budget** — allocate proportionally or with reserved minimums,
+   and return which sections were trimmed. Today's sequential `break` starves
+   flows and cycles (E40).
+4. **Relativize paths before egress** (E41). The model needs
+   `app/models/services/X.bx`, never `C:\Users\…\clients\<name>\…`.
+5. **Render `risk[]`** (E42) — computed, persisted, never shown, while
+   `application-features.md:195` claims it ships. Cheapest honesty win available.
+6. **Report coverage** — "N of M clusters named", plus trimmed sections.
+7. **Collapse `narrate`/`enrich`** to one public entry point (E43).
+8. Drop `repositoryRevision` from the reuse key once shards are per-cluster
+   (E53) — a commit that does not touch a domain must not rename it.
 
-**Don't.** Don't let a stored label survive a cluster whose membership has
-materially changed — re-narrate and mark it superseded. A stale confident name is
-the failure mode this step exists to prevent.
+**Do not.** Do not let a stored label survive a cluster whose membership
+materially changed — re-narrate and mark superseded. A stale confident name is
+the failure this step prevents.
+
+**Contract.** Narrative payload gains `coverage` and `trimmedSections`; `risk[]`
+becomes UI-visible. `POST /runs/:id/codegraph/narrative` unchanged in shape.
+
+**Settings.** Existing `codegraphNarrativeMax*` keys stay; add
+`codegraphNarrativeSectionReserve`.
+
+**Schema.** New table `codegraph_labels` + index on
+`( project_path, cluster_key )`, in `SchemaService` (single source of truth; no
+`resources/database/migrations`).
+
+**This table outlives runs, which every other CodeGraph table does not.**
+`codegraph_snapshots` cascades on `review_runs` delete and has an orphan sweep
+(`SchemaService.bx:330`). Labels deliberately survive — that is the point — so
+they need their own retention answer: no foreign key, and a bounded sweep for
+projects whose path no longer exists on disk. **Decide it in this step**, or the
+table grows forever and the next person to notice will delete it wholesale.
+`project_path` is also the weak part of the key: a moved or renamed directory
+orphans its labels. Accept that (labels are cheap to regenerate) and record it —
+do not build path-following.
+
+**Consumes Step 9.** Feed `stepSymbols[]` and `sinkKind` into the process-story
+payload, and each domain's tables and routes from Step 5b. "Owns `review_runs`,
+entered via `POST /api/v1/runs`" is deterministic grounding that beats prose.
+
+**Parser.** None.
+
+**Degradation.** No-key: unchanged — banner, no labels, no risk. Provider
+failure: per-shard, so a partial briefing is possible and its coverage number
+says so. Non-git: unaffected. **Egress: strictly reduced** by item 4.
 
 **Gate.** Edit one file in one cluster; assert only that cluster re-narrates and
 every other domain name is byte-identical. Assert a `user` label survives a
-re-run.
+re-run. Assert no absolute path appears in the built payload — spec it against a
+fixture with a Windows project path. Assert `risk[]` renders when present.
+`box server restart && box testbox run bundles=tests.specs.unit.CodeGraphNarrativeServiceSpec reporter=Min`
+
+**Docs.** `application-features.md:195`, `:220` — risk claim becomes true;
+`prompt-system.md`; OpenAPI narrative response.
 
 ---
 
-## Step 11 — Interactive knowledge graph
+## Step 12a — Explorer: hierarchy and search
 
-**Priority:** P1 · **Preconditions:** Steps 7 and 8
+**Status** wip · **Pri** P1 · **Preconditions** Steps 9 and 10 · **Owns** —
 
-**Goal.** Make the explorer navigable at real repository scale: a genuine
-hierarchy from directory down to symbol, a layout that reads connectivity, and
-search to reach what the canvas cannot show.
+**Goal & scope.** Make the explorer navigable at real scale. **What is shown**,
+not how it is drawn (12b).
 
-Three separable pieces. Ship 11a first — it is the one that changes what a
-person can find.
+**Behaviour.**
+1. **Surface `directories` in `getResult`** — already computed and persisted,
+   simply never returned (E25). Cheapest win in the plan.
+2. **Directory tree above clusters**, collapsible, using the existing rollup
+   counts. Build it as a component `/review` can also mount (E58 item 8) — one
+   component, two hosts.
+3. **Symbol level below files**, consuming Step 9's `stepSymbols[]`.
+4. **Persist drill state in the URL**, keyed on **run id**, so views are linkable
+   and the back button works. Keying on run id rather than a snapshot object is
+   what makes Step 14 cheap.
+5. **Search** nodes, clusters, flows and symbols by path, label and role, drilling
+   straight to the right level. **Client-side over the loaded snapshot** — this
+   is the shipped scope. Server-side search is deferred (Part 5), because it needs
+   the storage split (E20) which this plan does not schedule.
+6. Show "showing N of M" wherever a cap bites (E26). For subgraph's misleading
+   `totalNodes` (E28), **add `graphNodes` rather than redefining `totalNodes`** —
+   `subgraph` is a shipped, documented endpoint, and silently changing a field's
+   meaning breaks any client that already reads it. Deprecate `totalNodes` in
+   OpenAPI; remove it only in a later, announced change.
 
-### 11a — Hierarchical drill-down
+**Do not.** Do not add a graph library — hand-rolled UMD, local and offline
+(§3.1). Do not add polling (E58 item 4). Do not add responsive breakpoints.
 
-Today's drill is three fixed lenses (cluster → file → focus) with a flat list at
-each level (E29), and the canvas renders at most 120 of up to 1500 nodes with no
-way to reach the rest (E26).
+**Contract.** `getResult` gains `directories[]`. Subgraph `totalNodes` changes
+meaning to the true graph size, with `returnedNodes` added — **this is a
+behaviour change to a documented field**; version the response note in OpenAPI
+and update the UI read in the same commit.
 
-**Do.**
-1. **Surface `directories` in the API.** It is already computed and persisted and
-   simply never returned (E25) — add it to `CodeGraphRunService.getResult`'s
-   payload. This is the cheapest win in the entire plan.
-2. **Add a level above clusters:** a directory tree, collapsible, with the
-   rollup counts already computed (fileCount, symbolCount, fanIn/fanOut sums).
-   Large repos become navigable by structure even when the canvas is capped.
-3. **Add a level below files:** symbols, consuming Step 7's `stepSymbols[]`.
-   The hierarchy becomes directory → module → file → symbol.
-4. **Persist the drill path in the URL** so a view is linkable and the browser
-   back button works. Extend the breadcrumb (`app.js:4769`) rather than
-   replacing it.
-5. **Expand-in-place** on the canvas: expanding a cluster reveals its files
-   nested inside the cluster's hull instead of replacing the view. Keep the
-   existing replace-view drill as the alternative — hierarchy is for orientation,
-   replacement is for focus.
-6. Show **"showing N of M"** wherever a cap bites, linked to search.
+**Settings / schema / parser.** None.
 
-### 11b — Smart layout
+**Degradation.** No-key: full function; hierarchy and search are deterministic.
+Non-git: unaffected. Egress: none.
 
-E24 is the finding: **no current layout reads an edge.** Positions come from
-array index and alphabetical sort, so crossings are unbounded and connectivity is
-invisible.
+**Gate.** Reach any file in this repo in ≤3 interactions from the overview.
+Search finds a file outside the 120-node render cap and drills to it.
+`node --test tests/js/*.spec.mjs`; new `CodeGraphApiSpec` case for
+`directories[]` and for `totalNodes` / `returnedNodes`.
+`box server restart && box testbox run bundles=tests.specs.integration.CodeGraphApiSpec reporter=Min`
 
-**Do.**
-1. **Barycenter ordering** for `layoutLayered` — iteratively order each column by
-   the mean position of its neighbours in the adjacent column. This is the
-   standard Sugiyama crossing-reduction sweep and is the highest
-   improvement-per-line change available in `codegraph-layout.js`.
+**Docs.** OpenAPI `getResult` and `subgraph` responses;
+`application-features.md:218` explorer row.
+
+---
+
+## Step 12b — Explorer: layout that reads connectivity
+
+**Status** wip · **Pri** P1 · **Preconditions** Step 12a · **Owns** —
+
+**Goal & scope.** Cluster and layered layouts position by array index and
+alphabetical sort; radial uses edges for ring distance but places by index within
+a ring (E24). Make placement reflect connection.
+
+**Behaviour.**
+1. **Barycenter ordering** for `layoutLayered` — order each column by the mean
+   position of neighbours in the adjacent column. Standard Sugiyama crossing
+   reduction; highest improvement per line in this file.
 2. **Force-directed relaxation** for `layoutClusters`, seeded from the current
-   grid so results stay deterministic, with a fixed iteration count and a fixed
-   seed. Determinism is not optional — snapshots are fingerprinted and specs
-   compare output.
-3. **Connectivity-aware angles** in `layoutRadial`: order each ring so neighbours
-   sit adjacent instead of at even angles by array index (`:849`).
-4. **Fix edge routing (E28).** Choose exit and entry faces from relative node
-   position instead of always right→left. Backwards edges currently curve through
-   whatever sits between.
-5. **Overlap avoidance** after positioning, and **edge bundling** for parallel
-   runs between the same pair of clusters.
-6. Keep every layout **pure and deterministic** — same input, same output, no
-   time-based animation in the geometry.
+   grid, fixed iteration count, fixed seed.
+3. **Connectivity-aware ring ordering** in `layoutRadial` — order each ring so
+   neighbours sit adjacent, replacing even-angle-by-index (`:849`).
+4. **Fix edge routing** (E29) — choose faces from relative position instead of
+   always right→left.
+5. Overlap avoidance after positioning; bundling for parallel cluster runs.
 
-### 11c — Search
+**Do not.** Do not introduce non-determinism. Snapshots are fingerprinted and
+specs compare output — same input must give byte-identical output. Do not animate
+without honouring `prefers-reduced-motion`.
 
-**Do.** Search nodes, clusters, flows and symbols by path, label and role, with
-results that drill straight to the right level of 11a's hierarchy. Server-side
-once E16's storage gains node rows; client-side over the loaded snapshot until
-then.
+**Contract / settings / schema / parser.** None — pure client geometry.
 
-### 11d — Build it as a view over a run, not over a snapshot
+**Degradation.** No-key, non-git, egress unaffected.
 
-**This is §3.0's sequencing consequence, and it belongs in this step or nowhere.**
-
-**Do.** Key every explorer surface — state, URL, API calls — on a **run id**,
-with the CodeGraph snapshot as one possible source of its data. Do not thread
-`snapshot` through the component tree as the identity of the view. The
-distinction costs nothing today and is what makes Step 13 a gate relaxation
-instead of a rewrite (E48).
-
-Reuse note: 11a's directory tree is the same component `open-issues.md` item 8
-asks for on `/review` (E49). Build it once, in a form both surfaces can mount.
-And per `open-issues.md` items 4–5, the front end already over-polls — **add no
-new polling here**; the explorer is request-on-interaction.
-
-**Don't.** Don't add a graph rendering library — `codegraph-layout.js` is a
-hand-rolled UMD with node tests (`tests/js/codegraph-layout.spec.mjs`), and the
-product is local-only and offline. Don't animate layout transitions without
-honouring `prefers-reduced-motion`. Don't add responsive breakpoints or mobile
-navigation — explicitly out of scope; keep the wide desktop composition.
-
-**Gate.** `node --test tests/js/codegraph-layout.spec.mjs` green with new specs
-asserting: (a) layout output is byte-identical across two runs on the same input;
+**Gate.** `node --test tests/js/codegraph-layout.spec.mjs` with new specs:
+(a) layout output byte-identical across two runs on the same input;
 (b) barycenter ordering strictly reduces a counted crossing metric on a fixture
 with known crossings; (c) an edge to a node positioned left of its source does
-not exit the right face. Manual pass on this repo: reach any file in ≤3
-interactions from the overview.
+not exit the right face.
+
+**Docs.** `application-features.md:218` layout row.
 
 ---
 
-## Step 12 — Dependency path finder
+## Step 13 — Dependency path finder
 
-**Priority:** P1 · **Preconditions:** Step 11
+**Status** wip · **Pri** P1 · **Preconditions** Step 12b · **Owns** —
 
-**Goal.** Answer "how does A connect to B?" — the question a developer actually
-asks before changing something. Absent today in every form (E30).
+**Goal & scope.** Answer "how does A connect to B?" — orientation, not impact
+analysis. **Blast radius stays Review's** (§1.1).
 
-**Do.**
-1. **New endpoint** `GET /api/v1/runs/:id/codegraph/paths?from=&to=` under
-   `/api/v1/*`, following `ApiCodeGraph`'s existing shape: `getScoped` +
-   `runKind` check, `ValidationException` → 422, caps validated against settings
-   (`ApiCodeGraph.bx:43`–`87` is the template). Update `resources/apidocs/`
-   in the same commit.
-2. **Directed by default.** `CodeGraphRunService.buildAdjacency` is undirected
-   (E27) — it appends both directions. The path finder needs
-   `direction=forward|reverse|any`: forward answers "what does A pull in?",
-   reverse answers "what reaches B?" (the impact question), `any` answers "are
-   these related at all?". Do not reuse `buildAdjacency` unmodified.
-3. **K shortest paths, not one.** One path is a trivia answer; three show whether
-   the coupling is a single thread or a thicket. Cap K and total explored nodes
-   from settings alongside the other `codegraph*` keys (`Coldbox.bx:113`–`128`).
-4. **Weight by edge kind and by resolution confidence.** Now that Step 4
-   preserves kinds, an `injects` hop is stronger evidence than a
-   `type-reference`. Compose that with the **existing** `resolutionWeights`
-   (E36: `path` 1.0 > `basename` 0.75 > `stem` 0.5 > `dotted-path` 0.4) rather
-   than inventing a second confidence scale — a path through four guessed
-   targets is weaker evidence than one through two resolved targets, and the
-   graph already knows which is which. Surface the weakest hop's provenance on
-   the path so a shaky answer looks shaky. Return the unweighted hop count too —
-   a shortest path that is *long* is itself the finding.
-5. **Return full evidence per hop** — edge kind, source line, evidence snippet —
-   so a path is inspectable, not asserted. The `fileEdges` payload
-   (`CodeGraphRunService.bx:355`–`366`) already carries the right fields.
-6. **Answer "no path" clearly.** Distinguish *unreachable* from *cap exceeded*.
-   Silently returning empty for a truncated search is the failure mode here.
-7. **UI**: pick two nodes (from search, inspector, or the canvas), render the
-   path highlighted over Step 11's layout, reusing the flow-highlight machinery
-   that already exists (`buildFlowHighlightContext`,
-   `codegraph-layout.js:914`). A path is shaped exactly like a flow — do not
-   build a second highlight path.
-8. **Seed the endpoints from context**: right-click a node → "find path from
-   here", then pick the second. Also offer cluster→cluster, which answers the
-   architectural question ("why does Billing touch Auth at all?").
+**Behaviour.**
+1. **New endpoint** `GET /api/v1/runs/:id/codegraph/paths?from=&to=`, following
+   `ApiCodeGraph`'s existing shape: `getScoped` + runKind check,
+   `ValidationException` → 422, caps validated against settings.
+2. **Directed by default** — `direction=forward|reverse|any`.
+   `CodeGraphRunService.buildAdjacency` is undirected (E27); do not reuse it
+   unmodified.
+3. **K shortest paths**, capped. One path is trivia; three show whether coupling
+   is a thread or a thicket.
+4. **Weight by edge kind and resolution provenance**, composing with the existing
+   `resolutionWeights` (E36) rather than inventing a second confidence scale.
+   Surface the weakest hop's provenance. Return unweighted hop count too.
+5. **Full per-hop evidence** — kind, source line, snippet — reusing the
+   `fileEdges` payload fields.
+6. **Distinguish unreachable from cap-exceeded.** Silently returning empty for a
+   truncated search is the failure mode here.
+7. **UI**: pick two nodes from search, inspector or canvas; render the path with
+   the existing `buildFlowHighlightContext` machinery — a path is shaped like a
+   flow, so do not build a second highlight path.
 
-**Don't.** Don't run unbounded search on a 20000-edge graph — bound explored
-nodes and return `truncated: true`. Don't include `tests` edges by default; make
-it a flag, matching `fileEdges`' existing `includeTests` handling
-(`:290`–`:292`). Don't invent a transitive edge to shorten a path — every hop
-must be a real, citable edge.
+**Do not.** Do not run unbounded search on a 20000-edge graph. Do not include
+`tests` edges by default — flag it, matching `fileEdges`' `includeTests`
+handling. Do not invent a transitive edge to shorten a path.
 
-**Gate.** New `tests/specs/integration/CodeGraphApiSpec.bx` cases: a known
-two-hop path on a fixture returns exactly those hops with evidence; reverse
-direction returns a different result than forward on an asymmetric fixture;
-unreachable returns an explicit no-path result distinct from a cap-exceeded one.
-Manual: on this repo, path from `public/assets/app.js` to
-`AnalysisGraphRepository` resolves through route and handler hops.
+**Contract.** New endpoint under `/api/v1/*`; **OpenAPI in the same commit**
+(AGENTS.md). Response: `{ paths: [ { hops: [ { from, to, kind, line, evidence,
+resolution } ], weight, hopCount } ], truncated, reason }`.
 
----
+**Settings.** `codegraphPathMaxResults` (default 3),
+`codegraphPathMaxExploredNodes` (default 5000), `codegraphPathMaxDepth`.
+Env-backed like siblings; validated in the handler with 422 on excess.
 
-## Step 13 — The lens: explorer on any run, findings on the graph
+**Schema / parser.** None.
 
-**Priority:** P1 · **Preconditions:** Steps 11 and 12
+**Degradation.** Cap exceeded → `truncated: true` with `reason`. No path →
+explicit empty result distinct from truncation. No-key: full function.
+Non-git: unaffected. Egress: none.
 
-**Goal.** Deliver §3.0's direction: stop CodeGraph being a fourth silo over a
-graph the whole application already builds. Closes the known gap at
-`application-features.md:287`, which has carried owner "CodeGraph" and no step.
+**Gate.** New `CodeGraphApiSpec` cases: a known two-hop path returns exactly
+those hops with evidence; reverse returns a different result than forward on an
+asymmetric fixture; unreachable and cap-exceeded return distinguishable results;
+`limit` above the setting returns 422. Manual: on this repo, path from
+`public/assets/app.js` to `AnalysisGraphRepository` resolves through route and
+handler hops.
+`box server restart && box testbox run bundles=tests.specs.integration.CodeGraphApiSpec reporter=Min`
 
-**Do.**
-1. **Relax the `runKind` gate (E48).** `ApiCodeGraph.subgraph:49`, `edges:108`
-   and `narrative:150` reject any run that is not `runKind=codegraph`. Change the
-   test from "is a CodeGraph run" to "has an indexed graph" — a Review run has
-   one (E47). Keep `narrative` gated on a CodeGraph snapshot existing, since
-   meaning is assembled there; structure needs no such gate.
-2. **Assemble a snapshot on demand for non-CodeGraph runs**, or persist a light
-   one at the end of a Review run. Prefer on-demand first: it proves the lens
-   without adding a pipeline stage or a second write path.
-3. **Link findings and nodes, both ways.** A finding cites a file and line; a
-   node *is* that file. Surface `findingCount` per node and per cluster, and let
-   the inspector list a file's findings. **This is the strongest meaning signal
-   available with no provider at all** — "17 findings, 3 high, all in one
-   cluster" is business meaning that no LLM had to assert.
-4. **Offer the path finder next to a finding** (Step 12): "what breaks if I
-   change this?" is the reverse path query, and it is more useful beside a
-   finding than in a separate workspace.
-5. **Mount the explorer in the Review workspace** behind the same drill spine.
-   Do not duplicate the component; §3.0 is explicit that this is a view, not a
-   merge.
-
-**Don't.** Don't merge the workspaces or the run kinds — the three questions are
-genuinely different (§3.0). Don't move Review's findings engine or Modernize's
-planner. Don't let a Review run start paying for narrative generation: meaning
-stays opt-in and CodeGraph-initiated.
-
-**Gate.** On a completed **Review** run: the explorer opens, drills, and finds
-paths, with no CodeGraph run performed. Node inspector shows that file's
-findings. `application-features.md:287`'s gap row is closed and cites this step.
-Full suite green.
+**Docs.** OpenAPI (`.yaml` and `.json`); `technical-flow.md` HTTP surface;
+`application-features.md` features table.
 
 ---
 
-## Step 14 — Flow swimlane and export
+## Step 14 — Snapshot reuse and the project map
 
-**Priority:** P2 · **Preconditions:** Step 12
+**Status** wip · **Pri** P1 · **Preconditions** Step 2 · **Owns** —
 
-**Goal.** Show a flow as a flow, and let the graph leave the app.
+**Goal & scope.** Serve "quickly" for a project already seen. Complements Step 2:
+Step 2 makes the first run feel fast, Step 14 makes the second run instant.
 
-**Do.**
-1. **Swimlane / sequence layout** in `codegraph-layout.js` — role lanes
-   (client → entry → orchestrator → domain → persistence → table) with the
-   selected flow drawn left to right. This is the "watch your code become flows"
-   promise; today a flow is a highlight over a cluster blob (E22). It reuses
-   Step 11b's routing fixes and Step 12's path rendering.
-2. **Export** — Markdown briefing, Mermaid flow diagram, SVG canvas. `export`
-   returns 422 today (`application-features.md:222`) while the graph *is* the
-   deliverable. `ReportExportService` is the precedent. Mermaid for a single flow
-   or a single path is the cheapest high-value export and pastes into any PR.
-3. Inspector: source excerpt at the cited line, and an open-in-editor link.
+**Behaviour.**
+1. **Project-keyed snapshot reuse** (E51) — look up **before scanning**,
+   mirroring `findReusableNarrative`. This breaks the circularity where the cheap
+   half is gated behind computing the expensive half.
 
-**Don't.** Don't add responsive breakpoints or mobile navigation.
+   **The key must cover every input the snapshot depends on**, not just the
+   obvious three. A snapshot is a function of source **and configuration**:
+   `projectPath` + `repositoryRevision` + `parserVersion` + `snapshotVersion` +
+   a hash of the effective `codegraph*` settings — caps (`maxNodes`, `maxEdges`,
+   `maxClusters`, `maxHotspots`, `maxOrphans`, `maxLayerViolations`), plus
+   whatever Steps 9, 10 and 15 add (`codegraphFlowMaxDepth`,
+   `codegraphMaxFlowsPerCluster`, `codegraphLayerPolicy`,
+   `codegraphCoChangeEnabled`). Lowering `maxNodes` and getting yesterday's
+   larger snapshot back is a silent correctness failure, and it is exactly the
+   shape of bug a reuse key invites. Build the settings hash from one named list
+   so adding a setting later fails loudly rather than silently widening the key.
+2. **A project-scoped entry point** (E52) that opens the newest usable snapshot
+   immediately and offers refresh, instead of starting orientation with "configure
+   a run".
+3. **Adopt a fresh index from any run kind.** A Review run has already indexed
+   this project at this revision (E49) — reuse that index rather than re-indexing.
+   Structure only; a Review run must never trigger narrative generation.
+4. Relax `ApiCodeGraph`'s `runKind` gate on `subgraph` and `edges` from "is a
+   CodeGraph run" to "has an indexed graph" (E50b). **Leave `narrative` gated** —
+   meaning is CodeGraph's.
 
-**Gate.** Manual pass on this repo with a provider configured and again with
-none — both must render, drill and export. `node --test tests/js/*.spec.mjs`
-green, with a layout spec for the swimlane.
+**Do not.** **Do not mount the explorer inside Review and do not put findings on
+the graph** (§1.1). Do not add a stage to the Review pipeline — Review's cost must
+not rise to serve CodeGraph.
+
+**Contract.** `subgraph` and `edges` accept non-CodeGraph run ids. Response
+shapes unchanged. OpenAPI: note the relaxed precondition.
+
+**Settings.** `codegraphSnapshotReuseEnabled` (default true) so reuse can be
+switched off when debugging staleness. **Excluded from the reuse key** — toggling
+it must not itself invalidate cached snapshots.
+
+**Concurrency.** Reuse reads a row another run may be writing (Step 2 now writes
+in two phases). Read through `SqliteContentionRetry` as the sibling repositories
+do, and **never reuse a snapshot whose narrative is `pending`** — that row is
+mid-write, and adopting it would strand a run waiting for a narrative nobody is
+generating.
+
+**Schema.** Index on `codegraph_snapshots( project_path, repository_revision )`
+in `SchemaService`, beside the existing narrative-reuse index (`:898`).
+
+**Parser version.** Reuse key **includes** `parserVersion` — a parser change must
+invalidate reused snapshots, or Steps 3/5b/6/7 silently serve stale graphs.
+
+**Degradation.** Cache miss → normal run. Dirty working tree or no revision →
+skip reuse (do not serve a snapshot that does not match what is on disk).
+Non-git: no `repositoryRevision`, so reuse is skipped and flagged, not faked.
+No-key: unaffected. Egress: none.
+
+**Gate.** Second run on an unchanged revision returns a reused snapshot without
+re-scanning, with a **byte-identical fingerprint** to a from-scratch build. Bump
+`parserVersion` and assert the cache misses. Dirty tree assert-skips. Non-git
+directory produces a normal run, not an error.
+`box server restart && box testbox run bundles=tests.specs.integration.CodeGraphPersistenceSpec,tests.specs.integration.CodeGraphApiSpec reporter=Min`
+
+**Docs.** `application-features.md` — `:287`'s "coupling graph UI is
+CodeGraph-only" gap: **rewrite it as a deliberate boundary** per §1.1, do not
+silently close it. `technical-flow.md` reuse path.
 
 ---
 
-## Step 15 — Evaluation corpus and docs truth
+## Step 15 — Git co-change and churn
 
-**Priority:** P2 · **Preconditions:** Step 10
+**Status** wip · **Pri** P2 · **Preconditions** Step 1 · **Owns**
+**Modernize (CI-gated)**
 
-**Goal.** Close the Known gap that says CodeGraph quality is unmeasured
-(`application-features.md:294`, owner `—`), and make the feature rows true.
+**Goal & scope.** Add the temporal signal. **Read E18 and E45 first** — clustering
+is already Louvain over weighted affinity; this adds a term, it does not replace
+an algorithm, and Modernize's seam metrics are gated on the result.
 
-**Do.**
-1. Build a fixture repository with known-correct expected domains, routes, flows,
-   tables **and paths**. Score each run: are the expected flows found end to end?
-   Does the path finder return the known path between two known endpoints? Are
-   domains labelled consistently across two runs?
-2. Wire it into `box run-script test` next to the Review corpus, with thresholds
-   that fail the build.
-3. Update `application-features.md`: the JS row (`:201`, `:212`) becomes true
-   rather than "skipped"; the Explorer row (`:218`) gains hierarchy, smart layout
-   and search; add rows for route / view / table edges, reachability, the path
-   finder endpoint and export; **close the "Coupling graph UI is CodeGraph-only"
-   gap (`:287`) and cite Step 13**; claim the other Known-gap rows this plan
-   closes and set their owning step.
-4. **Update the README's product framing (§3.0).** It lists CodeGraph third among
-   four workspaces — accurate for today, wrong once Step 13 lands. Say plainly
-   that the graph is the application's and the explorer opens on any indexed run.
-4. Revisit the JS tier in `SupportedLanguageService.bx:19` **only** on measured
-   evidence.
-5. Update `technical-flow.md` for the new parser, edge kinds and label table, and
-   `app/models/README.md` for every new or changed service.
+**Behaviour.**
+1. New public method on `GitRepositoryService` for commit→files pairs via
+   `git log --name-only`, bounded by commit and entry count, following the
+   existing `executeTokens` pattern (E21).
+2. **Opt-in affinity term** — `buildAffinityGraph` (`:354`) gains an optional
+   caller-supplied weight map; `deriveClusters` gains an optional parameter.
+   **Absent the parameter, behaviour is byte-identical.** CodeGraph passes it;
+   Modernize does not, until its own plan decides to.
+3. Replace `hotspotScore`'s hand-tuned constants
+   (`CodeGraphMetricsService.bx:388`) with churn × fan-in × cycle membership,
+   recording the formula in the snapshot. CodeGraph-local — `hotspotScore` is
+   private.
+4. Surface author count and last-touched per cluster.
 
-**Don't.** Don't raise a language tier or add a feature row for anything the
-corpus does not measure. That is the claim rule, and it is why this step is in
-the plan rather than assumed.
+**Do not.** Do not change default affinity. Do not let co-change override
+structural coupling — it is a term, not a veto; two files in one sweeping commit
+are not a domain.
 
-**Gate.** `box run-script test` includes CodeGraph scoring and fails when a
-threshold regresses. No feature row lacks a pointer to code or a measured result.
+**Contract.** Snapshot gains `coChange` metrics and a `hotspotFormula` string.
+Additive.
+
+**Settings.** `codegraphCoChangeMaxCommits` (default 500),
+`codegraphCoChangeEnabled` (default true).
+
+**Schema / parser.** None.
+
+**Degradation.** **Non-git, no history, or shallow clone → degrade to
+structural-only and say so in the snapshot; never fail the run.** No-key
+unaffected. No egress — git data stays local and is not sent to a provider.
+
+**Gate.** Three parts: (a) with no co-change parameter, `deriveClusters` output is
+**byte-identical** to the pre-change build on a fixture; (b)
+`ModernizationCorpusSpec` Step 3b stop conditions still pass (§3.3 rule 3); (c)
+runs on this repo and on a non-git directory, the second producing a snapshot with
+co-change absent and flagged.
+`box server restart && box testbox run reporter=Min`
+
+**Docs.** `application-features.md` hotspot ranking; `app/models/README.md`
+`GitRepositoryService` public API.
 
 ---
 
-# Part 5 — Deferred and out of scope
+## Step 16 — Swimlane and export
 
-**Deferred — real, not now.** Run-over-run snapshot diff ("this domain is new,
-this flow now touches persistence"). Two fingerprints now exist, so it is
-unblocked, but it wants Step 10's stable labels first or the diff is dominated by
-renames. Impact-as-story ("if you change X…") — note this is Step 12's reverse
-path finder plus prose, so it becomes cheap once Step 12 lands. Editable local
-vocabulary beyond Step 10's label override. Saved / named path queries.
-Server-side search over node rows, which needs E16's storage split first.
+**Status** wip · **Pri** P2 · **Preconditions** Step 13 · **Owns** —
 
-**Out of scope — do not build.** A second Domain/Structural graph product.
-Semantic search or an embeddings corpus. Chat Q&A over the graph. A generated
-wiki. Languages beyond BoxLang, ColdFusion and JavaScript — including
-TypeScript. Automatic migration or any source rewrite. SaaS, accounts, hosted
-retention, mobile layouts.
+**Goal & scope.** Show a flow as a flow, and let the graph leave the app.
+
+**Behaviour.**
+1. **Swimlane layout** in `codegraph-layout.js` — role lanes
+   (client → entry → orchestrator → domain → persistence → table), selected flow
+   left to right. Reuses 12b's routing fixes and 13's path rendering.
+2. **Export** — Markdown briefing, Mermaid flow/path diagram, SVG canvas.
+   `export` returns 422 today (`application-features.md:222`).
+   `ReportExportService` is the precedent. Mermaid for one flow or one path is the
+   cheapest high-value export and pastes into any PR.
+3. Inspector: source excerpt at the cited line.
+
+**Do not.** No responsive breakpoints. Do not invent an export service — extend
+the existing one.
+
+**Contract.** `GET /runs/:id/export` starts succeeding for `runKind=codegraph`
+with `format=md|mermaid|svg`. OpenAPI in the same commit.
+
+**Settings / schema / parser.** None.
+
+**Degradation.** Export with no narrative produces the structural sections and
+says meaning was unavailable — it must not fail. Egress: export writes locally
+only.
+
+**Gate.** Manual pass with a provider and without — both render, drill and
+export. `node --test tests/js/*.spec.mjs` with a swimlane layout spec.
+`box server restart && box testbox run bundles=tests.specs.integration.CodeGraphApiSpec reporter=Min`
+
+**Docs.** OpenAPI export; `application-features.md:222`.
+
+---
+
+## Step 17 — Evaluation corpus and contract truth
+
+**Status** wip · **Pri** P2 · **Preconditions** all shipped steps · **Owns** —
+
+**Goal & scope.** Close the Known gap recording CodeGraph quality as unmeasured
+(`application-features.md:294`, owner `—`), and make every claim true.
+
+**Behaviour.**
+1. Fixture repository with known-correct expected domains, routes, flows, tables
+   **and paths**. Score each run: are expected flows found end to end? Does the
+   path finder return the known path? Are domain names stable across two runs?
+2. Wire into `box run-script test` beside the Review corpus, with thresholds that
+   fail the build.
+3. **OpenAPI truth** — add the missing `GET /runs/:id/codegraph/edges` (E54),
+   plus every endpoint and field this plan added.
+4. **Feature truth** in `application-features.md` — JS rows `:201`/`:212`;
+   explorer row `:218`; risk briefing `:195`/`:220` (true only after Step 11);
+   export `:222`; the `:287` boundary rewrite from Step 14; close the Known-gap
+   rows this plan closes and name their owning step.
+5. **View truth** — `codegraph.bxm:38` JS hint and the Review-worded pipeline
+   list at `:121`–`:128` (E55), so the served HTML is right before JS rewrites it.
+6. Revisit JS and CFML tiers in `SupportedLanguageService.bx:19` **only** on
+   measured evidence.
+7. `technical-flow.md` for the parser, edge kinds, label table, reuse path and
+   two-phase persist; `app/models/README.md` for every new or changed service.
+
+**Do not.** Do not raise a language tier or add a feature row for anything the
+corpus does not measure. That is the claim rule.
+
+**Contract.** OpenAPI becomes complete for the CodeGraph surface. No runtime
+change.
+
+**Settings / schema / parser.** None.
+
+**Degradation.** N/A.
+
+**Gate.** `box run-script test` includes CodeGraph scoring and fails on
+regression. Every `/api/v1/*` CodeGraph route appears in `resources/apidocs/`.
+No feature row lacks a pointer to code or a measured result.
+
+**Docs.** This step *is* the docs work.
+
+**Working-tree implementation.** `resources/evaluation-corpus/codegraph-v1/`
+contains a source-backed route → handler → service → repository → table case;
+`tests/specs/integration/CodeGraphCorpusSpec.bx` scores route/table presence,
+end-to-end flow recall, bounded path recall, repeated-run fingerprint/domain
+stability, and explicitly leaves language tiers unchanged. The source inspector
+contract is covered by `CodeGraphRunServiceSpec` and `CodeGraphApiSpec`.
+
+---
+
+# Part 5 — Deferred, out of scope, unverified
+
+## 5.1 Deferred — real, not scheduled
+
+| Item | Why deferred |
+|---|---|
+| Run-over-run snapshot diff | Unblocked (two fingerprints exist) but wants Step 11's stable labels first, or the diff is dominated by renames |
+| Impact-as-story ("if you change X…") | Becomes cheap once Step 13 lands — it is the reverse path query plus prose. But framing must respect §1.1: impact is Review's question |
+| Storage split into node/edge/flow tables | Needed for server-side search and cheap diff (E20). Large, and Steps 12a/14 work without it |
+| Server-side search | Depends on the storage split above. Step 12a ships client-side search over the loaded snapshot |
+| Editable vocabulary beyond Step 11's label override | Step 11's `codegraph_labels` with `user` provenance covers the real need |
+| Saved / named path queries | After Step 13 proves the shape |
+| Symbol-level explorer as a first-class mode | Step 12a adds a symbol level inside the existing drill; a separate mode is more |
+
+## 5.2 Out of scope — do not build
+
+SaaS, hosted multi-tenant, accounts, login walls, billing, quotas, hosted
+retention, PR-bot platform. Automatic migration or any source rewrite. Languages
+beyond BoxLang, ColdFusion and JavaScript, including TypeScript. Mobile
+navigation, phone layouts, responsive breakpoint redesigns. A second
+Domain/Structural graph product. Semantic search, embeddings corpus, chat Q&A
+over the graph, generated wiki. Runtime tracing. Hosted graph database.
+**Findings badges as CodeGraph's primary chrome** (§1.1).
+
+## 5.3 Unverified — check before relying on
+
+1. Whether `ModernizationCouplingGraphService.build()` weights new structural
+   kinds sensibly without further change (affects Step 5a's blast radius).
+   Verify by running the Modernize corpus with the extended vocabulary before
+   assuming additive-is-safe.
+2. Whether `bx-ai` middleware supersedes hand-rolled resilience and telemetry
+   (`open-issues.md`). Adjacent, not this plan's, but it would change Step 11's
+   gateway assumptions if adopted.
+3. Expected one-time re-parse cost after Step 3's version bump on a large repo —
+   estimate before deploying, so the first run's latency is not a surprise.

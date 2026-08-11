@@ -5,6 +5,7 @@
 @singleton
 class threadsafe {
 	property name="datasource" inject="coldbox:setting:datasource";
+	property name="sqliteContentionRetry" inject="SqliteContentionRetry";
 
 	void function save(
 		required string runId,
@@ -12,7 +13,8 @@ class threadsafe {
 		string projectPath           = "",
 		string repositoryRevision    = "",
 		string narrativeCacheKey     = "",
-		struct narrative             = {}
+		struct narrative             = {},
+		string snapshotReuseKey      = ""
 	) {
 		var truncated = arguments.snapshot.truncated ?: false;
 		queryExecute(
@@ -21,12 +23,12 @@ class threadsafe {
 					run_id, snapshot_version, project_path, repository_revision,
 					fingerprint, node_count, edge_count, cluster_count, cycle_count,
 					truncated, truncation_reasons_json, snapshot_json,
-					narrative_cache_key, narrative_json, created_at
+					snapshot_reuse_key, narrative_cache_key, narrative_json, created_at
 				) VALUES (
 					:runId, :snapshotVersion, :projectPath, :repositoryRevision,
 					:fingerprint, :nodeCount, :edgeCount, :clusterCount, :cycleCount,
 					:truncated, :truncationReasonsJson, :snapshotJson,
-					:narrativeCacheKey, :narrativeJson, :createdAt
+					:snapshotReuseKey, :narrativeCacheKey, :narrativeJson, :createdAt
 				)
 				ON CONFLICT ( run_id ) DO UPDATE SET
 					snapshot_version = excluded.snapshot_version,
@@ -40,6 +42,7 @@ class threadsafe {
 					truncated = excluded.truncated,
 					truncation_reasons_json = excluded.truncation_reasons_json,
 					snapshot_json = excluded.snapshot_json,
+					snapshot_reuse_key = excluded.snapshot_reuse_key,
 					narrative_cache_key = excluded.narrative_cache_key,
 					narrative_json = excluded.narrative_json,
 					created_at = excluded.created_at
@@ -57,6 +60,7 @@ class threadsafe {
 				truncated             : truncated ? 1 : 0,
 				truncationReasonsJson : jsonSerialize( arguments.snapshot.truncationReasons ?: [] ),
 				snapshotJson          : jsonSerialize( arguments.snapshot ),
+				snapshotReuseKey      : arguments.snapshotReuseKey,
 				narrativeCacheKey     : arguments.narrativeCacheKey,
 				narrativeJson         : jsonSerialize( arguments.narrative.count() ? arguments.narrative : { used: false } ),
 				createdAt             : timestamp()
@@ -68,7 +72,7 @@ class threadsafe {
 	any function get( required string runId ) {
 		var record = queryExecute(
 			"
-				SELECT snapshot_json, narrative_json, narrative_cache_key,
+				SELECT snapshot_json, narrative_json, narrative_cache_key, snapshot_reuse_key,
 					truncated, truncation_reasons_json, fingerprint,
 					snapshot_version, project_path, repository_revision
 				FROM codegraph_snapshots
@@ -86,8 +90,9 @@ class threadsafe {
 		}
 		var narrative = jsonDeserialize( record.narrative_json[ 1 ] ?: "{}" );
 		if ( !isStruct( narrative ) ) {
-			narrative = { used: false };
+			 narrative = { used: false };
 		}
+		applyStoredLabels( snapshot, narrative, record.project_path[ 1 ] ?: "" );
 		return {
 			version            : record.snapshot_version[ 1 ] ?: ( snapshot.version ?: "codegraph-snapshot-v1" ),
 			fingerprint        : record.fingerprint[ 1 ] ?: ( snapshot.fingerprint ?: "" ),
@@ -95,10 +100,86 @@ class threadsafe {
 			repositoryRevision : record.repository_revision[ 1 ] ?: "",
 			truncated          : ( record.truncated[ 1 ] ?: 0 ) == 1 || ( snapshot.truncated ?: false ),
 			truncationReasons  : jsonDeserialize( record.truncation_reasons_json[ 1 ] ?: "[]" ),
-			narrativeCacheKey  : record.narrative_cache_key[ 1 ] ?: "",
+				narrativeCacheKey  : record.narrative_cache_key[ 1 ] ?: "",
+			snapshotReuseKey   : record.snapshot_reuse_key[ 1 ] ?: "",
 			snapshot           : snapshot,
 			narrative          : narrative
 		};
+	}
+
+	/** Latest usable snapshot for the local project map entry point. */
+	any function findLatestProjectSnapshot( required string projectPath ) {
+		if ( !len( trim( arguments.projectPath ) ) ) return javacast( "null", "" );
+		var projectPathValue = arguments.projectPath;
+		var record = withSqliteRetry(
+			() => queryExecute(
+				"
+					SELECT s.run_id
+					FROM codegraph_snapshots s
+					INNER JOIN review_runs r ON r.id = s.run_id
+					WHERE s.project_path = :projectPath
+						AND s.snapshot_json IS NOT NULL
+						AND s.snapshot_json <> ''
+					AND ( s.narrative_json IS NULL OR s.narrative_json = '' OR s.narrative_json NOT LIKE '%""pending"":true%' )
+						AND r.status IN ( 'succeeded', 'partial', 'failed', 'cancelled' )
+					ORDER BY s.created_at DESC
+					LIMIT 1
+				",
+				{ projectPath: projectPathValue },
+				{ datasource: datasource }
+			),
+			"codegraph-project-read"
+		);
+		if ( !record.recordCount ) return javacast( "null", "" );
+		var stored = get( record.run_id[ 1 ] );
+		if ( isNull( stored ) ) return javacast( "null", "" );
+		stored.runId = record.run_id[ 1 ];
+		return stored;
+	}
+
+	/** Latest complete structure for a project/revision/settings key. Pending
+	 * narrative rows are deliberately excluded because they are mid-write. */
+	any function findReusableSnapshot(
+		required string projectPath,
+		required string repositoryRevision,
+		required string snapshotReuseKey,
+	string snapshotVersion = "codegraph-snapshot-v1"
+	) {
+		if ( !len( trim( arguments.projectPath ) ) || !len( trim( arguments.repositoryRevision ) ) || !len( trim( arguments.snapshotReuseKey ) ) ) return javacast( "null", "" );
+		var projectPathValue = arguments.projectPath;
+		var repositoryRevisionValue = arguments.repositoryRevision;
+		var snapshotReuseKeyValue = arguments.snapshotReuseKey;
+		var snapshotVersionValue = arguments.snapshotVersion;
+		var record = withSqliteRetry(
+			() => queryExecute(
+			"
+				SELECT s.run_id
+				FROM codegraph_snapshots s
+				INNER JOIN review_runs r ON r.id = s.run_id
+				WHERE s.project_path = :projectPath
+					AND r.status IN ( 'succeeded', 'partial', 'failed', 'cancelled' )
+					AND s.repository_revision = :repositoryRevision
+					AND s.snapshot_reuse_key = :snapshotReuseKey
+					AND s.snapshot_version = :snapshotVersion
+					AND ( s.narrative_json IS NULL OR s.narrative_json = '' OR s.narrative_json NOT LIKE '%""pending"":true%' )
+				ORDER BY s.created_at DESC
+				LIMIT 1
+			",
+			{
+				projectPath: projectPathValue,
+				repositoryRevision: repositoryRevisionValue,
+				snapshotReuseKey: snapshotReuseKeyValue,
+				snapshotVersion: snapshotVersionValue
+			},
+			{ datasource: datasource }
+			),
+			"codegraph-snapshot-read"
+		);
+		if ( !record.recordCount ) return javacast( "null", "" );
+		var stored = get( record.run_id[ 1 ] );
+		if ( isNull( stored ) ) return javacast( "null", "" );
+		stored.runId = toString( record.run_id[ 1 ] );
+		return stored;
 	}
 
 	/**
@@ -117,25 +198,33 @@ class threadsafe {
 		) {
 			return javacast( "null", "" );
 		}
-		var record = queryExecute(
+		var projectPathValue = arguments.projectPath;
+		var repositoryRevisionValue = arguments.repositoryRevision;
+		var narrativeCacheKeyValue = arguments.narrativeCacheKey;
+		var record = withSqliteRetry(
+			() => queryExecute(
 			"
-				SELECT narrative_json
-				FROM codegraph_snapshots
-				WHERE project_path = :projectPath
-					AND repository_revision = :repositoryRevision
-					AND narrative_cache_key = :narrativeCacheKey
-					AND narrative_json IS NOT NULL
-					AND narrative_json <> ''
-					AND narrative_json <> '{}'
-				ORDER BY created_at DESC
+				SELECT s.narrative_json
+				FROM codegraph_snapshots s
+				INNER JOIN review_runs r ON r.id = s.run_id
+				WHERE s.project_path = :projectPath
+					AND r.status IN ( 'succeeded', 'partial' )
+					AND s.repository_revision = :repositoryRevision
+					AND s.narrative_cache_key = :narrativeCacheKey
+					AND s.narrative_json IS NOT NULL
+					AND s.narrative_json <> ''
+					AND s.narrative_json <> '{}'
+				ORDER BY s.created_at DESC
 				LIMIT 1
 			",
 			{
-				projectPath        : arguments.projectPath,
-				repositoryRevision : arguments.repositoryRevision,
-				narrativeCacheKey  : arguments.narrativeCacheKey
+				projectPath        : projectPathValue,
+				repositoryRevision : repositoryRevisionValue,
+				narrativeCacheKey  : narrativeCacheKeyValue
 			},
 			{ datasource: datasource }
+			),
+			"codegraph-narrative-read"
 		);
 		if ( !record.recordCount ) {
 			return javacast( "null", "" );
@@ -153,7 +242,8 @@ class threadsafe {
 	void function updateNarrative(
 		required string runId,
 		required struct narrative,
-		string narrativeCacheKey = ""
+		string narrativeCacheKey = "",
+		struct snapshot = {}
 	) {
 		queryExecute(
 			"
@@ -169,6 +259,231 @@ class threadsafe {
 			},
 			{ datasource: datasource }
 		);
+		if ( arguments.snapshot.count() ) {
+			var labelProjectPath = trim( toString( arguments.snapshot.projectPath ?: "" ) );
+			if ( !len( labelProjectPath ) ) {
+				var projectRecord = queryExecute(
+					"SELECT project_path FROM codegraph_snapshots WHERE run_id = :runId",
+					{ runId: arguments.runId },
+					{ datasource: datasource }
+				);
+				if ( projectRecord.recordCount ) labelProjectPath = trim( toString( projectRecord.project_path[ 1 ] ?: "" ) );
+			}
+			if ( len( labelProjectPath ) ) saveNarrativeLabels( labelProjectPath, arguments.snapshot, arguments.narrative );
+		}
+	}
+
+	/** AI labels are replaceable; a user label always wins. */
+	void function saveNarrativeLabels( required string projectPath, required struct snapshot, required struct narrative ) {
+		if ( !len( trim( arguments.projectPath ) ) || !isArray( arguments.narrative.domains ?: "" ) ) return;
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		for ( var domain in arguments.narrative.domains ) {
+			if ( !isStruct( domain ) || !len( trim( toString( domain.title ?: "" ) ) ) ) continue;
+			var cluster = clusters.filter( ( item ) => isStruct( item ) && toString( item.id ?: "" ) == toString( domain.clusterId ?: "" ) );
+			var members = cluster.len() && isArray( cluster[ 1 ].filePaths ?: "" ) ? duplicate( cluster[ 1 ].filePaths ) : [ domain.clusterId ?: "" ];
+			var clusterData = cluster.len() ? cluster[ 1 ] : { filePaths: members };
+			var stableClusterKey = clusterKey( clusterData );
+			var stableClusterFingerprint = clusterFingerprint( clusterData );
+			queryExecute(
+				"
+					INSERT INTO codegraph_labels ( project_path, cluster_key, label, provenance, cluster_fingerprint, created_at )
+					VALUES ( :projectPath, :clusterKey, :label, 'ai', :clusterFingerprint, :createdAt )
+					ON CONFLICT ( project_path, cluster_key ) DO UPDATE SET
+						label = CASE WHEN codegraph_labels.provenance = 'user' THEN codegraph_labels.label ELSE excluded.label END,
+						provenance = CASE WHEN codegraph_labels.provenance = 'user' THEN codegraph_labels.provenance ELSE excluded.provenance END,
+						cluster_fingerprint = excluded.cluster_fingerprint,
+						created_at = excluded.created_at
+				",
+				{ projectPath: arguments.projectPath, clusterKey: stableClusterKey, label: left( trim( domain.title ), 160 ), clusterFingerprint: stableClusterFingerprint, createdAt: timestamp() },
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	/** Persist a local user override for a stable member-composition key. */
+	any function findNarrativeShard(
+		required string projectPath,
+		required string clusterKey,
+		required string clusterFingerprint
+	) {
+		if ( !len( trim( arguments.projectPath ) ) || !len( trim( arguments.clusterKey ) ) || !len( trim( arguments.clusterFingerprint ) ) ) return javacast( "null", "" );
+		var projectPathValue = arguments.projectPath;
+		var clusterKeyValue = arguments.clusterKey;
+		var clusterFingerprintValue = arguments.clusterFingerprint;
+		var record = withSqliteRetry(
+			() => queryExecute(
+				"
+					SELECT narrative_json
+					FROM codegraph_narrative_shards
+					WHERE project_path = :projectPath
+						AND cluster_key = :clusterKey
+						AND cluster_fingerprint = :clusterFingerprint
+					ORDER BY created_at DESC
+					LIMIT 1
+				",
+				{
+					projectPath       : projectPathValue,
+					clusterKey        : clusterKeyValue,
+					clusterFingerprint: clusterFingerprintValue
+				},
+				{ datasource: datasource }
+			),
+			"codegraph-shard-read"
+		);
+		if ( !record.recordCount ) return javacast( "null", "" );
+		var narrative = jsonDeserialize( record.narrative_json[ 1 ] ?: "{}" );
+		return isStruct( narrative ) && ( narrative.used ?: false ) ? narrative : javacast( "null", "" );
+	}
+
+	void function saveNarrativeShard(
+		required string projectPath,
+		required string clusterKey,
+		required string clusterFingerprint,
+		required struct narrative
+	) {
+		queryExecute(
+			"
+				INSERT INTO codegraph_narrative_shards ( project_path, cluster_key, cluster_fingerprint, narrative_json, created_at )
+				VALUES ( :projectPath, :clusterKey, :clusterFingerprint, :narrativeJson, :createdAt )
+				ON CONFLICT ( project_path, cluster_key, cluster_fingerprint ) DO UPDATE SET
+					narrative_json = excluded.narrative_json,
+					created_at = excluded.created_at
+			",
+			{
+				projectPath       : arguments.projectPath,
+				clusterKey        : arguments.clusterKey,
+				clusterFingerprint: arguments.clusterFingerprint,
+				narrativeJson     : jsonSerialize( arguments.narrative ),
+				createdAt         : timestamp()
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	/** Persist a local user override for a stable member-composition key. */
+	struct function saveUserLabel(
+		required string projectPath,
+		required string clusterKey,
+		required string label,
+		string clusterFingerprint = ""
+	) {
+		var value = left( trim( arguments.label ), 160 );
+		if ( !len( trim( arguments.projectPath ) ) || !len( trim( arguments.clusterKey ) ) || !len( value ) ) {
+			throw( type = "ValidationException", message = "projectPath, clusterKey, and label are required" );
+		}
+		queryExecute(
+			"
+				INSERT INTO codegraph_labels ( project_path, cluster_key, label, provenance, cluster_fingerprint, created_at )
+				VALUES ( :projectPath, :clusterKey, :label, 'user', :clusterFingerprint, :createdAt )
+				ON CONFLICT ( project_path, cluster_key ) DO UPDATE SET
+					label = excluded.label,
+					provenance = 'user',
+					cluster_fingerprint = excluded.cluster_fingerprint,
+					created_at = excluded.created_at
+			",
+			{
+				projectPath       : arguments.projectPath,
+				clusterKey        : arguments.clusterKey,
+				label             : value,
+				clusterFingerprint: arguments.clusterFingerprint,
+				createdAt         : timestamp()
+			},
+			{ datasource: datasource }
+		);
+		return { label: value, provenance: "user", clusterKey: arguments.clusterKey };
+	}
+
+	boolean function clearUserLabel( required string projectPath, required string clusterKey ) {
+		var result = queryExecute(
+			"DELETE FROM codegraph_labels WHERE project_path = :projectPath AND cluster_key = :clusterKey AND provenance = 'user'",
+			{ projectPath: arguments.projectPath, clusterKey: arguments.clusterKey },
+			{ datasource: datasource }
+		);
+		return true;
+	}
+
+	/** Stable key used by both persistence and the label override endpoint. */
+	string function clusterKey( required struct cluster ) {
+		var members = isArray( arguments.cluster.filePaths ?: "" ) ? duplicate( arguments.cluster.filePaths ) : [];
+		if ( !members.len() && len( trim( toString( arguments.cluster.id ?: "" ) ) ) ) members = [ arguments.cluster.id ];
+		members = members.map( ( path ) => lCase( replace( trim( toString( path ) ), "\", "/", "all" ) ) );
+		members.sort( ( a, b ) => compareNoCase( toString( a ), toString( b ) ) );
+		return lCase( hash( jsonSerialize( members ), "SHA-256" ) );
+	}
+
+	string function clusterFingerprint( required struct cluster ) {
+		var members = isArray( arguments.cluster.filePaths ?: "" ) ? duplicate( arguments.cluster.filePaths ) : [];
+		members = members.map( ( path ) => lCase( replace( trim( toString( path ) ), "\", "/", "all" ) ) );
+		members.sort( ( a, b ) => compareNoCase( toString( a ), toString( b ) ) );
+		return lCase( hash( jsonSerialize( {
+			members       : members,
+			symbolCount   : val( arguments.cluster.symbolCount ?: 0 ),
+			internalEdges : val( arguments.cluster.internalEdges ?: 0 ),
+			crossingEdges : val( arguments.cluster.crossingEdges ?: 0 ),
+			cohesion      : arguments.cluster.cohesion ?: ""
+		} ), "SHA-256" ) );
+	}
+
+	private void function applyStoredLabels( required struct snapshot, required struct narrative, required string projectPath ) {
+		if ( !len( trim( arguments.projectPath ) ) || !isArray( arguments.snapshot.clusters ?: "" ) ) return;
+		var labels = readLabels( arguments.projectPath );
+		if ( !labels.len() ) return;
+		var labelsByCluster = {};
+		for ( var label in labels ) labelsByCluster[ label.clusterKey ] = label;
+		var labelsById = {};
+		for ( var cluster in arguments.snapshot.clusters ) {
+			if ( !isStruct( cluster ) ) continue;
+			var key = clusterKey( cluster );
+			if ( !labelsByCluster.keyExists( key ) ) continue;
+			var stored = labelsByCluster[ key ];
+			var validFingerprint = stored.provenance == "user"
+				|| !len( trim( toString( stored.clusterFingerprint ?: "" ) ) )
+				|| stored.clusterFingerprint == clusterFingerprint( cluster );
+			if ( !validFingerprint ) continue;
+			cluster.label = stored.label;
+			cluster.labelProvenance = stored.provenance;
+			cluster.clusterKey = key;
+			labelsById[ toString( cluster.id ?: "" ) ] = stored;
+		}
+		if ( isArray( arguments.narrative.domains ?: "" ) ) {
+			for ( var domain in arguments.narrative.domains ) {
+				var domainLabel = labelsById[ toString( domain.clusterId ?: "" ) ] ?: {};
+				if ( isStruct( domainLabel ) && len( trim( toString( domainLabel.label ?: "" ) ) ) ) domain.title = domainLabel.label;
+			}
+		}
+		if ( isArray( arguments.narrative.summaries ?: "" ) ) {
+			for ( var summary in arguments.narrative.summaries ) {
+				var summaryLabel = labelsById[ toString( summary.clusterId ?: "" ) ] ?: {};
+				if ( isStruct( summaryLabel ) && len( trim( toString( summaryLabel.label ?: "" ) ) ) ) summary.title = summaryLabel.label;
+			}
+		}
+	}
+
+	private array function readLabels( required string projectPath ) {
+		try {
+			var rows = queryExecute(
+				"SELECT cluster_key, label, provenance, cluster_fingerprint FROM codegraph_labels WHERE project_path = :projectPath",
+				{ projectPath: arguments.projectPath },
+				{ datasource: datasource }
+			);
+			var output = [];
+			for ( var row = 1; row <= rows.recordCount; row++ ) {
+				output.append( {
+					clusterKey        : rows.cluster_key[ row ] ?: "",
+					label             : rows.label[ row ] ?: "",
+					provenance        : rows.provenance[ row ] ?: "ai",
+					clusterFingerprint: rows.cluster_fingerprint[ row ] ?: ""
+				} );
+			}
+			return output;
+		} catch ( any compatibilityError ) {
+			return [];
+		}
+	}
+
+	private any function withSqliteRetry( required any work, required string label ) {
+		if ( !isNull( variables.sqliteContentionRetry ?: javacast( "null", "" ) ) ) return sqliteContentionRetry.run( arguments.work, arguments.label );
+		return arguments.work();
 	}
 
 	private string function timestamp() {

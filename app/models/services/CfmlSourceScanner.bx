@@ -74,4 +74,63 @@ class threadsafe {
 	any function matcher( required string expression, required string source, boolean normalizeDoubledEscapes = false ) {
 		return compiledPattern( arguments.expression, arguments.normalizeDoubledEscapes ).matcher( arguments.source );
 	}
+
+	/**
+	 * Shared SQL-reference mechanics. Modernize keeps its own taxonomy and calls
+	 * this with includeDeclarations=false; CodeGraph parsers opt into DDL names
+	 * because SchemaService is part of the structural table map.
+	 */
+	struct function sqlReferences( required string source, boolean includeDeclarations = false ) {
+		var tables = [];
+		var columns = [];
+		var tableExpression = "(?:from|join|into|update|delete\\s+from)\\s+([A-Za-z_][A-Za-z0-9_.$-]*)";
+		if ( arguments.includeDeclarations ) {
+			tableExpression = "(?:from|join|into|update|delete\\s+from|create\\s+table(?:\\s+if\\s+not\\s+exists)?)\\s+([A-Za-z_][A-Za-z0-9_.$-]*)";
+		}
+		var tableMatch = matcher( tableExpression, arguments.source, true );
+		while ( tableMatch.find() ) {
+			var table = tableMatch.group( 1 );
+			if ( !tables.contains( table ) ) tables.append( table );
+		}
+		var columnMatch = matcher( "\\b([A-Za-z_][A-Za-z0-9_.$-]*)\\s*(?:=|>|<|in\\s*\\(|like\\s)", arguments.source, true );
+		while ( columnMatch.find() ) columns.append( columnMatch.group( 1 ) );
+		var sqlKeyword = matcher( "(select|insert|update|delete|create\\s+table)", arguments.source, true ).find();
+		var hasInterpolation = find( char( 35 ), arguments.source ) > 0 || find( "&", arguments.source ) > 0 || find( "+", arguments.source ) > 0 || findNoCase( "stringFormat", arguments.source ) > 0;
+		var unparameterized = sqlKeyword && hasInterpolation;
+		var hasBinding = reFindNoCase( "(cfqueryparam|params?|queryParams|setParameter)", arguments.source ) > 0;
+		var parameterMismatch = unparameterized || ( find( "?", arguments.source ) > 0 && !hasBinding );
+		var dynamicIdentifier = reFindNoCase( "(from|join|into|update|delete|create[ ]+table)[ ]+", arguments.source ) > 0 && find( char( 35 ), arguments.source ) > 0;
+		return {
+			tables            : tables,
+			columns           : columns,
+			unparameterized   : unparameterized,
+			parameterMismatch : parameterMismatch,
+			dynamicIdentifier : dynamicIdentifier
+		};
+	}
+
+	/** Bounded logical queryExecute windows with source positions. */
+	array function queryWindows( required array lines, numeric maxLookahead = 200 ) {
+		var windows = [];
+		for ( var startLine = 1; startLine <= arguments.lines.len(); startLine++ ) {
+			if ( !matcher( "\\bqueryExecute\\s*\\(", toString( arguments.lines[ startLine ] ?: "" ), true ).find() ) continue;
+			var blockLines = [];
+			var endLine = startLine;
+			var limit = min( arguments.lines.len(), startLine + max( 1, int( arguments.maxLookahead ) ) );
+			for ( var lineNumber = startLine; lineNumber <= limit; lineNumber++ ) {
+				var sourceLine = toString( arguments.lines[ lineNumber ] ?: "" );
+				blockLines.append( sourceLine );
+				endLine = lineNumber;
+				if ( matcher( "\\)\\s*;?\\s*$", sourceLine, true ).find() ) break;
+			}
+			windows.append( {
+				startLine : startLine,
+				endLine   : endLine,
+				lines     : blockLines,
+				text      : arrayToList( blockLines, char( 10 ) )
+			} );
+			startLine = endLine;
+		}
+		return windows;
+	}
 }

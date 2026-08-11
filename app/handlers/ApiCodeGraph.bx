@@ -5,6 +5,8 @@
  */
 class extends="coldbox.system.RestHandler" {
 	property name="codeGraphRunService" inject="CodeGraphRunService";
+	property name="graphRepository" inject="AnalysisGraphRepository";
+	property name="codeGraphRepository" inject="CodeGraphRepository";
 
 	property name="runService" inject="ReviewRunService";
 
@@ -15,6 +17,8 @@ class extends="coldbox.system.RestHandler" {
 	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
 
 	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
+	property name="codegraphPathMaxResults" inject="coldbox:setting:codegraphPathMaxResults";
+	property name="codegraphPathMaxDepth" inject="coldbox:setting:codegraphPathMaxDepth";
 
 	function preHandler(
 		event,
@@ -24,6 +28,40 @@ class extends="coldbox.system.RestHandler" {
 		eventArguments
 	) {
 		prc.securityContext = securityContextService.authenticate( event );
+	}
+
+	/**
+	 * Project-scoped CodeGraph entry point. Returns the newest usable local
+	 * snapshot so the workspace can orient without creating a new run.
+	 *
+	 * @tags CodeGraph
+	 * @hint Open the newest usable CodeGraph snapshot for a local project path
+	 * @param-projectPath { "name":"projectPath", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-projectId { "name":"projectId", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @response-200 Project snapshot entry point
+	 * @response-404 No usable snapshot for project
+	 * @response-422 Validation failed
+	 */
+	function project( event, rc, prc ) {
+		try {
+			var projectPath = securityContextService.authorizeProjectPath(
+				prc.securityContext,
+				rc.projectId ?: "",
+				rc.projectPath ?: ""
+			);
+			var stored = codeGraphRepository.findLatestProjectSnapshot( projectPath );
+			if ( isNull( stored ) ) {
+				return notFound( event );
+			}
+			var run = runService.getScoped( stored.runId ?: "", prc.securityContext, rc.projectId ?: "" );
+			if ( isNull( run ) ) return notFound( event );
+			event.renderData(
+				type = "json",
+				data = { data: { projectPath: projectPath, run: run.getMemento(), reused: true } }
+			);
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
 	}
 
 	/**
@@ -46,7 +84,7 @@ class extends="coldbox.system.RestHandler" {
 				prc.securityContext,
 				rc.projectId ?: ""
 			);
-		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) {
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) {
 			return notFound( event );
 		}
 
@@ -105,7 +143,7 @@ class extends="coldbox.system.RestHandler" {
 				prc.securityContext,
 				rc.projectId ?: ""
 			);
-		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) {
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) {
 			return notFound( event );
 		}
 
@@ -127,6 +165,87 @@ class extends="coldbox.system.RestHandler" {
 					}
 				);
 			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/**
+	 * Directed path finder between two graph nodes.
+	 *
+	 * @tags CodeGraph
+	 * @hint Bounded directed dependency paths with per-hop evidence
+	 * @param-from { "name":"from", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-to { "name":"to", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-direction { "name":"direction", "in":"query", "required":false, "schema":{"type":"string","enum":["forward","reverse","any"]} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-depth { "name":"depth", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @response-200 Directed paths payload
+	 * @response-404 Run not found or no indexed graph
+	 * @response-422 Validation failed
+	 */
+	function paths( event, rc, prc ) {
+		var run = runService.getScoped(
+			rc.id ?: "",
+			prc.securityContext,
+			rc.projectId ?: ""
+		);
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) return notFound( event );
+		var maxResults = max( 1, val( variables.codegraphPathMaxResults ?: 3 ) );
+		var maxDepth = max( 1, val( variables.codegraphPathMaxDepth ?: 12 ) );
+		if ( !len( trim( toString( rc.from ?: "" ) ) ) || !len( trim( toString( rc.to ?: "" ) ) ) ) return validationError( event, "from and to are required" );
+		if ( len( trim( toString( rc.limit ?: "" ) ) ) && ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > maxResults ) ) return validationError( event, "limit must be between 1 and #maxResults#" );
+		if ( len( trim( toString( rc.depth ?: "" ) ) ) && ( !isNumeric( rc.depth ) || val( rc.depth ) < 1 || val( rc.depth ) > maxDepth ) ) return validationError( event, "depth must be between 1 and #maxDepth#" );
+		try {
+			var payload = codeGraphRunService.paths( run.getId(), {
+				from     : rc.from ?: "",
+				to       : rc.to ?: "",
+				direction: rc.direction ?: "forward",
+				limit    : rc.limit ?: "",
+				depth    : rc.depth ?: "",
+				includeTests: rc.includeTests ?: false
+			} );
+			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/**
+	 * Local source window around a cited dependency line.
+	 *
+	 * @tags CodeGraph
+	 * @hint Repository-relative source excerpt for inspector evidence
+	 * @param-path { "name":"path", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-line { "name":"line", "in":"query", "required":true, "schema":{"type":"integer","minimum":1} }
+	 * @param-before { "name":"before", "in":"query", "required":false, "schema":{"type":"integer","minimum":0,"maximum":20} }
+	 * @param-after { "name":"after", "in":"query", "required":false, "schema":{"type":"integer","minimum":0,"maximum":40} }
+	 * @response-200 Source excerpt payload
+	 * @response-404 Run or source file not found
+	 * @response-422 Validation failed
+	 */
+	function source( event, rc, prc ) {
+		var run = runService.getScoped(
+			rc.id ?: "",
+			prc.securityContext,
+			rc.projectId ?: ""
+		);
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) return notFound( event );
+		if ( !len( trim( toString( rc.path ?: "" ) ) ) || !len( trim( toString( rc.line ?: "" ) ) ) || !isNumeric( rc.line ) || val( rc.line ) < 1 ) {
+			return validationError( event, "path and a positive line are required" );
+		}
+		if ( len( trim( toString( rc.before ?: "" ) ) ) && ( !isNumeric( rc.before ) || val( rc.before ) < 0 || val( rc.before ) > 20 ) ) return validationError( event, "before must be between 0 and 20" );
+		if ( len( trim( toString( rc.after ?: "" ) ) ) && ( !isNumeric( rc.after ) || val( rc.after ) < 0 || val( rc.after ) > 40 ) ) return validationError( event, "after must be between 0 and 40" );
+		try {
+			var payload = codeGraphRunService.sourceExcerpt( run.getId(), {
+				path  : rc.path,
+				line  : rc.line,
+				before: structKeyExists( rc, "before" ) ? rc.before : "",
+				after : structKeyExists( rc, "after" ) ? rc.after : ""
+			} );
+			event.renderData( type = "json", data = { data: payload } );
+		} catch ( "NotFoundException" error ) {
+			notFound( event );
 		} catch ( "ValidationException" error ) {
 			validationError( event, error.message );
 		}
@@ -160,6 +279,60 @@ class extends="coldbox.system.RestHandler" {
 		}
 	}
 
+	/**
+	 * Override one cluster label locally. The member-composition key is derived
+	 * from the stored snapshot; callers never provide a path or SQL key.
+	 *
+	 * @tags CodeGraph
+	 * @hint Persist a local user label for one stable CodeGraph cluster
+	 * @response-200 User label payload
+	 * @response-404 CodeGraph run or snapshot not found
+	 * @response-422 Validation failed
+	 */
+	function label( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) return notFound( event );
+		var stored = codeGraphRepository.get( run.getId() );
+		if ( isNull( stored ) ) return notFound( event );
+		var body = {};
+		try { body = event.getHTTPContent( json = true ); } catch ( any ignored ) {}
+		if ( !isStruct( body ) || !body.count() ) body = rc;
+		var clusterId = trim( toString( body.clusterId ?: rc.clusterId ?: "" ) );
+		var labelValue = left( trim( toString( body.label ?: rc.label ?: "" ) ), 160 );
+		if ( !len( clusterId ) || !len( labelValue ) ) return validationError( event, "clusterId and label are required" );
+		var snapshot = isStruct( stored.snapshot ?: "" ) ? stored.snapshot : {};
+		var clusters = isArray( snapshot.clusters ?: "" ) ? snapshot.clusters : [];
+		var matches = clusters.filter( ( item ) => isStruct( item ) && toString( item.id ?: "" ) == clusterId );
+		if ( !matches.len() ) return validationError( event, "clusterId is not present in the stored snapshot" );
+		try {
+			var saved = codeGraphRepository.saveUserLabel(
+				stored.projectPath ?: run.getProjectPath(),
+				codeGraphRepository.clusterKey( matches[ 1 ] ),
+				labelValue,
+				codeGraphRepository.clusterFingerprint( matches[ 1 ] )
+			);
+			event.renderData( type = "json", data = { data: { clusterId: clusterId, label: saved.label, provenance: "user" } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/** Clear a user label so the next narrative can supply an AI label. */
+	function clearLabel( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) || lCase( run.getRunKind() ?: "" ) != "codegraph" ) return notFound( event );
+		var stored = codeGraphRepository.get( run.getId() );
+		if ( isNull( stored ) ) return notFound( event );
+		var clusterId = trim( toString( rc.clusterId ?: "" ) );
+		if ( !len( clusterId ) ) return validationError( event, "clusterId is required" );
+		var snapshot = isStruct( stored.snapshot ?: "" ) ? stored.snapshot : {};
+		var clusters = isArray( snapshot.clusters ?: "" ) ? snapshot.clusters : [];
+		var matches = clusters.filter( ( item ) => isStruct( item ) && toString( item.id ?: "" ) == clusterId );
+		if ( !matches.len() ) return validationError( event, "clusterId is not present in the stored snapshot" );
+		codeGraphRepository.clearUserLabel( stored.projectPath ?: run.getProjectPath(), codeGraphRepository.clusterKey( matches[ 1 ] ) );
+		event.renderData( type = "json", data = { data: { clusterId: clusterId, cleared: true } } );
+	}
+
 	private void function notFound( required event ) {
 		arguments.event.renderData(
 				type       = "json",
@@ -174,5 +347,15 @@ class extends="coldbox.system.RestHandler" {
 				statusCode = 422,
 				data       = { error: { code: "validation_failed", message: arguments.message } }
 			);
+	}
+
+	private boolean function hasIndexedGraph( required any run ) {
+		try {
+			var graph = graphRepository.getGraph( runId = arguments.run.getId(), resultLimit = 1 );
+			var summary = isStruct( graph.summary ?: "" ) ? graph.summary : {};
+			return val( summary.filesAnalyzed ?: 0 ) > 0 || ( isArray( graph.symbols ?: "" ) && graph.symbols.len() > 0 ) || ( isArray( graph.dependencies ?: "" ) && graph.dependencies.len() > 0 );
+		} catch ( any ignored ) {
+			return false;
+		}
 	}
 }

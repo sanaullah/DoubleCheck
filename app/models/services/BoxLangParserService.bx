@@ -3,11 +3,14 @@
  */
 
 @singleton
-class {
-	variables.parserVersion = "boxlang-symbol-parser-v2";
+class threadsafe {
+	property name="codegraphParserStrategy" inject="coldbox:setting:codegraphParserStrategy";
+
+	variables.parserVersion = "boxlang-ast-parser-v4";
+	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
 
 	string function getVersion() {
-		return variables.parserVersion;
+		return variables.parserVersion & "-strategy-" & configuredStrategy();
 	}
 
 	boolean function supports( required struct file ) {
@@ -15,6 +18,34 @@ class {
 	}
 
 	struct function parse( required struct file ) {
+		var strategy = configuredStrategy();
+		if ( strategy != "regex" ) {
+			try {
+				var sourcePath = trim( toString( arguments.file.absolutePath ?: arguments.file.filePath ?: "" ) );
+				if ( len( sourcePath ) && fileExists( sourcePath ) ) {
+					var ast = BoxAST( filepath = sourcePath, returnType = "struct" );
+					var parsed = parseRegex( arguments.file, "ast" );
+					walkAstSemantics( ast, parsed, arguments.file );
+					applyAstPositions( parsed, ast );
+					return parsed;
+				}
+				var sourceText = toString( arguments.file.content ?: "" );
+				if ( len( trim( sourceText ) ) ) {
+					var sourceType = lCase( right( trim( toString( arguments.file.filePath ?: "" ) ), 4 ) ) == ".bxm" ? "template" : "script";
+					var sourceAst = BoxAST( source = sourceText, sourceType = sourceType, returnType = "struct" );
+					var sourceParsed = parseRegex( arguments.file, "ast" );
+					walkAstSemantics( sourceAst, sourceParsed, arguments.file );
+					applyAstPositions( sourceParsed, sourceAst );
+					return sourceParsed;
+				}
+			} catch ( any astError ) {
+				if ( strategy == "ast" ) return parseRegex( arguments.file, "regex-fallback" );
+			}
+		}
+		return parseRegex( arguments.file, "regex" );
+	}
+
+	private struct function parseRegex( required struct file, string parseStrategy = "regex" ) {
 		var symbols = [];
 		var dependencies = [];
 		var normalizedPath = replace(
@@ -26,6 +57,7 @@ class {
 		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
 		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.bx$", normalizedPath ) > 0;
 		var className = listFirst( listLast( normalizedPath, "/" ), "." );
+		extractSqlDependencies( dependencies, arguments.file.lines );
 
 		for ( var lineNumber = 1; lineNumber <=
 			arguments
@@ -179,8 +211,26 @@ class {
 							lineNumber,
 							sourceLine
 						)
-					);
+				);
+				var routeWindow = logicalSource( arguments.file.lines, lineNumber );
+				var routeText = routeWindow.text;
+				var actionMatch = match( "\.withAction\s*\(\s*[""']([^""']+)[""']", routeText );
+				var handlerMatch = match( "\.toHandler\s*\(\s*[""']([^""']+)[""']", routeText );
+				var verbMatch = match( "\.withVerbs?\s*\(\s*[""']([^""']+)[""']", routeText );
+				if ( handlerMatch.find() ) {
+					var routeMetadata = {
+						pattern: routeMatch.group( 1 ),
+						action : actionMatch.find() ? actionMatch.group( 1 ) : "",
+						verb   : verbMatch.find() ? verbMatch.group( 1 ) : ""
+					};
+					routeMetadata.handler = handlerMatch.group( 1 );
+					dependencies.append( dependency( "routes", routeMatch.group( 1 ), lineNumber, routeText, routeWindow.endLine, routeMetadata ) );
+				}
 			}
+
+			var viewMatch = match( "\b(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']", sourceLine );
+			if ( viewMatch.find() ) dependencies.append( dependency( "renders", viewMatch.group( 1 ), lineNumber, sourceLine ) );
+			extractResourceDependencies( dependencies, sourceLine, lineNumber );
 
 			var constructionMatch = match( "\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
 			while ( constructionMatch.find() ) {
@@ -211,10 +261,254 @@ class {
 		}
 
 		return {
-			parserVersion: variables.parserVersion,
+			parserVersion: getVersion(),
+			parseStrategy: arguments.parseStrategy,
 			symbols      : symbols,
 			dependencies : dependencies
 		};
+	}
+
+	private string function configuredStrategy() {
+		var strategy = lCase( trim( toString( variables.codegraphParserStrategy ?: "auto" ) ) );
+		return listFindNoCase( "auto,ast,regex", strategy ) ? strategy : "auto";
+	}
+
+	/**
+	 * Keep the existing extraction taxonomy as the compatibility baseline, but
+	 * use BoxAST's declaration positions when the AST is available. This makes
+	 * multi-line declarations cite their real end line while preserving the
+	 * regex kill switch for dialects the AST cannot parse.
+	 */
+	private void function applyAstPositions( required struct parsed, required struct ast ) {
+		var symbolsByName = {};
+		for ( var item in arguments.parsed.symbols ?: [] ) {
+			var key = lCase( trim( toString( item.name ?: "" ) ) );
+			if ( !len( key ) ) continue;
+			if ( !symbolsByName.keyExists( key ) ) symbolsByName[ key ] = [];
+			symbolsByName[ key ].append( item );
+		}
+		walkAstPositions( arguments.ast, symbolsByName );
+	}
+
+	private void function walkAstPositions( required any node, required struct symbolsByName ) {
+		if ( isArray( arguments.node ) ) {
+			for ( var child in arguments.node ) walkAstPositions( child, arguments.symbolsByName );
+			return;
+		}
+		if ( !isStruct( arguments.node ) ) return;
+
+		var astType = lCase( trim( toString( astField( arguments.node, "ASTType" ) ) ) );
+		var name = astText( astField( arguments.node, "name" ) );
+		if ( listFindNoCase( "boxfunctiondeclaration,boxproperty,boxlocalclass", astType ) && len( name ) && arguments.symbolsByName.keyExists( lCase( name ) ) ) {
+			var endLine = astEndLine( arguments.node );
+			if ( endLine > 0 ) {
+				for ( var symbolItem in arguments.symbolsByName[ lCase( name ) ] ) {
+					symbolItem.endLine = max( val( symbolItem.endLine ?: symbolItem.line ?: 1 ), endLine );
+				}
+			}
+		}
+
+		for ( var key in structKeyArray( arguments.node ) ) {
+			if ( listFindNoCase( "ASTPackage,sourceText,comments,position,documentation,annotations", key ) ) continue;
+			var childValue = arguments.node[ key ];
+			if ( isStruct( childValue ) || isArray( childValue ) ) walkAstPositions( childValue, arguments.symbolsByName );
+		}
+	}
+
+	/**
+	 * Walk the AST for declarations and expression-level evidence. The regex
+	 * extractor remains the compatibility baseline; AST records are merged into
+	 * it so a successful AST parse can add multi-line declarations/calls without
+	 * dropping dialect-specific regex evidence.
+	 */
+	private void function walkAstSemantics( required any ast, required struct parsed, required struct file ) {
+		var normalizedPath = replace( arguments.file.filePath ?: "", "\", "/", "all" );
+		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.bx$", normalizedPath ) > 0;
+		var className = listFirst( listLast( normalizedPath, "/" ), "." );
+		walkAstNode( arguments.ast, arguments.parsed, isHandler, isTest, className );
+	}
+
+	private void function walkAstNode(
+		required any node,
+		required struct parsed,
+		required boolean isHandler,
+		required boolean isTest,
+		required string className
+	) {
+		if ( isArray( arguments.node ) ) {
+			for ( var child in arguments.node ) walkAstNode( child, arguments.parsed, arguments.isHandler, arguments.isTest, arguments.className );
+			return;
+		}
+		if ( !isStruct( arguments.node ) ) return;
+
+		var astType = lCase( trim( toString( astField( arguments.node, "ASTType" ) ) ) );
+		var line = astStartLine( arguments.node );
+		var endLine = max( line, astEndLine( arguments.node ) );
+		var evidence = left( trim( toString( astField( arguments.node, "sourceText" ) ) ), 500 );
+
+		if ( astType == "boxlocalclass" ) {
+			var declaredClass = astText( astField( arguments.node, "name" ) );
+			if ( !len( declaredClass ) ) declaredClass = arguments.className;
+			appendAstSymbol( arguments.parsed.symbols, "class", declaredClass, line, endLine, evidence );
+			if ( reFindNoCase( "\\b(?:testbox\\.system\\.BaseSpec|coldbox\\.system\\.testing\\.BaseTestCase)\\b", evidence ) ) arguments.isTest = true;
+		}
+		if ( astType == "boxclass" && len( arguments.className ) ) appendAstSymbol( arguments.parsed.symbols, "class", arguments.className, line, endLine, evidence );
+
+		if ( astType == "boxfunctiondeclaration" ) {
+			var functionName = astText( astField( arguments.node, "name" ) );
+			if ( len( functionName ) ) {
+				appendAstSymbol( arguments.parsed.symbols, "function", functionName, line, endLine, evidence );
+				if ( arguments.isHandler && !isLifecycleFunction( functionName ) ) appendAstSymbol( arguments.parsed.symbols, "handler-action", functionName, line, endLine, evidence );
+				if ( arguments.isTest && reFindNoCase( "^test", functionName ) ) appendAstSymbol( arguments.parsed.symbols, "test", functionName, line, endLine, evidence );
+				addTypeDependency( arguments.parsed.dependencies, astText( astField( arguments.node, "type" ) ), line, evidence );
+				for ( var arg in ( isArray( astField( arguments.node, "args" ) ) ? astField( arguments.node, "args" ) : [] ) ) {
+					addTypeDependency( arguments.parsed.dependencies, astText( astField( arg, "type" ) ), line, evidence );
+				}
+			}
+		}
+
+		if ( astType == "boxproperty" ) {
+			var propertyName = astAnnotationValue( arguments.node, "name" );
+			if ( len( propertyName ) ) appendAstSymbol( arguments.parsed.symbols, "property", propertyName, line, endLine, evidence );
+			var injected = astAnnotationValue( arguments.node, "inject" );
+			if ( len( injected ) ) appendAstDependency( arguments.parsed.dependencies, "injects", injected, line, endLine, evidence );
+			addTypeDependency( arguments.parsed.dependencies, astAnnotationValue( arguments.node, "type" ), line, evidence );
+		}
+
+		if ( astType == "boxnew" ) {
+			var constructed = astText( astField( arguments.node, "expression" ) );
+			if ( len( constructed ) ) appendAstDependency( arguments.parsed.dependencies, "constructs", constructed, line, endLine, evidence );
+		}
+
+		if ( astType == "boximport" ) {
+			var imported = astText( astField( arguments.node, "value" ) );
+			if ( !len( imported ) ) imported = astText( astField( arguments.node, "expression" ) );
+			if ( !len( imported ) ) imported = reReplace( trim( toString( astField( arguments.node, "sourceText" ) ) ), "^import\\s+", "" );
+			if ( len( imported ) ) appendAstDependency( arguments.parsed.dependencies, "imports", imported, line, endLine, evidence );
+		}
+
+		if ( astType == "boxfunctioninvocation" ) {
+			var functionCall = astText( astField( arguments.node, "name" ) );
+			var firstArgument = astArgumentValue( arguments.node, 1 );
+			if ( functionCall == "route" && len( firstArgument ) ) appendAstSymbol( arguments.parsed.symbols, "route", firstArgument, line, endLine, evidence );
+			if ( functionCall == "queryExecute" ) extractResourceDependencies( arguments.parsed.dependencies, evidence, line );
+			if ( listFindNoCase( "describe,feature,story,scenario,given,when,it,then", functionCall ) && len( firstArgument ) ) appendAstSymbol( arguments.parsed.symbols, listFindNoCase( "describe,feature,story,scenario,given,when", functionCall ) ? "test-suite" : "test", firstArgument, line, endLine, evidence );
+		}
+
+		if ( astType == "boxmethodinvocation" ) {
+			var methodName = astText( astField( arguments.node, "name" ) );
+			var methodArgument = astArgumentValue( arguments.node, 1 );
+			if ( methodName == "setView" && len( methodArgument ) ) appendAstDependency( arguments.parsed.dependencies, "renders", methodArgument, line, endLine, evidence );
+			var routePath = astInvocationValue( arguments.node, "route" );
+			if ( len( routePath ) ) {
+				var routeHandler = astInvocationValue( arguments.node, "toHandler" );
+				var routeAction = astInvocationValue( arguments.node, "withAction" );
+				var routeVerb = astInvocationValue( arguments.node, "withVerbs" );
+				appendAstSymbol( arguments.parsed.symbols, "route", routePath, line, endLine, evidence );
+				if ( len( routeHandler ) ) appendAstDependency( arguments.parsed.dependencies, "routes", routePath, line, endLine, evidence, { pattern: routePath, action: routeAction, verb: routeVerb, handler: routeHandler } );
+			}
+		}
+
+		for ( var key in structKeyArray( arguments.node ) ) {
+			if ( listFindNoCase( "ASTPackage,sourceText,comments,position,documentation,annotations", key ) ) continue;
+			var childValue = arguments.node[ key ];
+			if ( isStruct( childValue ) || isArray( childValue ) ) walkAstNode( childValue, arguments.parsed, arguments.isHandler, arguments.isTest, arguments.className );
+		}
+	}
+
+	private void function appendAstSymbol(
+		required array symbols,
+		required string kind,
+		required string name,
+		required numeric line,
+		required numeric endLine,
+		required string evidence
+	) {
+		var key = lCase( arguments.kind & "|" & arguments.name & "|" & arguments.line );
+		for ( var item in arguments.symbols ) {
+			var itemKind = structKeyExists( item, "kind" ) ? toString( item.kind ) : "";
+			var itemName = structKeyExists( item, "name" ) ? toString( item.name ) : "";
+			var itemLine = structKeyExists( item, "line" ) ? val( item.line ) : 0;
+			if ( lCase( itemKind & "|" & itemName & "|" & itemLine ) == key ) {
+				item.endLine = max( val( structKeyExists( item, "endLine" ) ? item.endLine : itemLine ), arguments.endLine );
+				return;
+			}
+		}
+		arguments.symbols.append( symbol( arguments.kind, arguments.name, arguments.line, arguments.evidence, arguments.endLine ) );
+	}
+
+	private void function appendAstDependency(
+		required array dependencies,
+		required string kind,
+		required string target,
+		required numeric line,
+		required numeric endLine,
+		required string evidence,
+		struct metadata = {}
+	) {
+		if ( !len( trim( arguments.target ) ) ) return;
+		var key = lCase( arguments.kind & "|" & arguments.target & "|" & arguments.line );
+		for ( var item in arguments.dependencies ) {
+			var itemKind = structKeyExists( item, "kind" ) ? toString( item.kind ) : "";
+			var itemTarget = structKeyExists( item, "target" ) ? toString( item.target ) : "";
+			var itemLine = structKeyExists( item, "line" ) ? val( item.line ) : 0;
+			if ( lCase( itemKind & "|" & itemTarget & "|" & itemLine ) == key ) return;
+		}
+		arguments.dependencies.append( dependency( arguments.kind, arguments.target, arguments.line, arguments.evidence, arguments.endLine, arguments.metadata ) );
+	}
+
+	private any function astField( required struct node, required string key ) {
+		if ( !structKeyExists( arguments.node, arguments.key ) ) return "";
+		return arguments.node[ arguments.key ];
+	}
+
+	private string function astText( required any value ) {
+		if ( isNull( arguments.value ) ) return "";
+		if ( isSimpleValue( arguments.value ) ) return trim( toString( arguments.value ) );
+		if ( !isStruct( arguments.value ) ) return "";
+		if ( structKeyExists( arguments.value, "value" ) && !isNull( arguments.value.value ) ) return astText( arguments.value.value );
+		if ( structKeyExists( arguments.value, "name" ) && !isStruct( arguments.value.name ) ) return trim( toString( arguments.value.name ?: "" ) );
+		if ( structKeyExists( arguments.value, "sourceText" ) ) return trim( toString( arguments.value.sourceText ?: "" ) );
+		return "";
+	}
+
+	private string function astAnnotationValue( required struct node, required string key ) {
+		for ( var annotation in ( isArray( astField( arguments.node, "annotations" ) ) ? astField( arguments.node, "annotations" ) : [] ) ) {
+			if ( lCase( astText( astField( annotation, "key" ) ) ) == lCase( arguments.key ) ) return astText( astField( annotation, "value" ) );
+		}
+		return "";
+	}
+
+	private string function astArgumentValue( required struct node, required numeric index ) {
+		var args = isArray( astField( arguments.node, "arguments" ) ) ? astField( arguments.node, "arguments" ) : [];
+		if ( arguments.index < 1 || arguments.index > args.len() ) return "";
+		var argument = args[ arguments.index ];
+		return astText( isStruct( argument ) ? astField( argument, "value" ) : argument );
+	}
+
+	private string function astInvocationValue( required any node, required string target ) {
+		if ( isNull( arguments.node ) || !isStruct( arguments.node ) ) return "";
+		var astType = lCase( trim( toString( astField( arguments.node, "ASTType" ) ) ) );
+		if ( listFindNoCase( "boxfunctioninvocation,boxmethodinvocation", astType ) && lCase( astText( astField( arguments.node, "name" ) ) ) == lCase( arguments.target ) ) return astArgumentValue( arguments.node, 1 );
+		if ( astType == "boxmethodinvocation" ) return astInvocationValue( astField( arguments.node, "obj" ), arguments.target );
+		return "";
+	}
+
+	private numeric function astStartLine( required struct node ) {
+		var position = astField( arguments.node, "position" );
+		if ( !isStruct( position ) ) return 1;
+		var start = astField( position, "start" );
+		if ( !isStruct( start ) ) return 1;
+		return max( 1, val( astField( start, "line" ) ?: 1 ) );
+	}
+
+	private numeric function astEndLine( required struct node ) {
+		var position = astField( arguments.node, "position" );
+		if ( !isStruct( position ) ) return 0;
+		var end = astField( position, "end" );
+		if ( !isStruct( end ) ) return 0;
+		return max( 0, val( astField( end, "line" ) ?: 0 ) );
 	}
 
 	private void function addTestBoxSymbols(
@@ -325,12 +619,14 @@ class {
 		required string kind,
 		required string name,
 		required numeric line,
-		required string evidence
+		required string evidence,
+		numeric endLine = 0
 	) {
 		return {
 			kind    : arguments.kind,
 			name    : arguments.name,
 			line    : arguments.line,
+			endLine : arguments.endLine > 0 ? arguments.endLine : arguments.line,
 			evidence: left( trim( arguments.evidence ), 500 )
 		};
 	}
@@ -339,14 +635,76 @@ class {
 		required string kind,
 		required string target,
 		required numeric line,
-		required string evidence
+		required string evidence,
+		numeric endLine = 0,
+		struct metadata = {}
 	) {
-		return {
+		var result = {
 			kind    : arguments.kind,
 			target  : arguments.target,
 			line    : arguments.line,
+			endLine : arguments.endLine > 0 ? arguments.endLine : arguments.line,
 			evidence: left( trim( arguments.evidence ), 500 )
 		};
+		for ( var key in arguments.metadata ) result[ key ] = arguments.metadata[ key ];
+		return result;
+	}
+
+	private struct function logicalSource( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+		var text = "";
+		var endLine = arguments.startLine;
+		var limit = min( arguments.lines.len(), arguments.startLine + arguments.maxLookahead );
+		for ( var i = arguments.startLine; i <= limit; i++ ) {
+			text &= " " & toString( arguments.lines[ i ] ?: "" );
+			endLine = i;
+			if ( find( ".end()", text ) ) break;
+		}
+		return { text: text, endLine: endLine };
+	}
+
+	private void function extractResourceDependencies( required array dependencies, required string sourceLine, required numeric lineNumber ) {
+		var scopeMatch = match( "\b(application|session|client)\.([A-Za-z_][A-Za-z0-9_]*)", arguments.sourceLine );
+		while ( scopeMatch.find() ) appendUniqueDependency( arguments.dependencies, "scope.#scopeMatch.group( 1 )#", scopeMatch.group( 2 ), arguments.lineNumber, arguments.sourceLine );
+		var httpMatch = match( "\b(?:http|httpService)\s*\(\s*[""']([^""']+)[""']", arguments.sourceLine );
+		if ( httpMatch.find() ) appendUniqueDependency( arguments.dependencies, "http", httpMatch.group( 1 ), arguments.lineNumber, arguments.sourceLine );
+		if ( match( "\bschedule\s*\(", arguments.sourceLine ).find() ) appendUniqueDependency( arguments.dependencies, "schedule", "schedule", arguments.lineNumber, arguments.sourceLine );
+	}
+
+	private void function extractSqlDependencies( required array dependencies, required array lines ) {
+		for ( var queryWindow in variables.sourceScanner.queryWindows( arguments.lines ) ) {
+			var references = variables.sourceScanner.sqlReferences( queryWindow.text, true );
+			if ( references.dynamicIdentifier ?: false ) continue;
+			for ( var table in ( references.tables ?: [] ) ) {
+				var evidenceLine = queryWindow.startLine;
+				var evidence = queryWindow.lines.len() ? queryWindow.lines[ 1 ] : queryWindow.text;
+				for ( var offset = 1; offset <= queryWindow.lines.len(); offset++ ) {
+					if ( findNoCase( table, queryWindow.lines[ offset ] ) ) {
+						evidenceLine = queryWindow.startLine + offset - 1;
+						evidence = queryWindow.lines[ offset ];
+						break;
+					}
+				}
+				appendUniqueDependency( arguments.dependencies, "table-query", table, evidenceLine, evidence, evidenceLine );
+			}
+		}
+	}
+
+	private void function appendUniqueDependency(
+		required array dependencies,
+		required string kind,
+		required string target,
+		required numeric line,
+		required string evidence,
+		numeric endLine = 0
+	) {
+		var key = lCase( arguments.kind & "|" & arguments.target & "|" & arguments.line );
+		for ( var item in arguments.dependencies ) {
+			var itemKind = structKeyExists( item, "kind" ) ? toString( item.kind ) : "";
+			var itemTarget = structKeyExists( item, "target" ) ? toString( item.target ) : "";
+			var itemLine = structKeyExists( item, "line" ) ? val( item.line ) : 0;
+			if ( lCase( itemKind & "|" & itemTarget & "|" & itemLine ) == key ) return;
+		}
+		arguments.dependencies.append( dependency( arguments.kind, arguments.target, arguments.line, arguments.evidence, arguments.endLine ) );
 	}
 
 	private void function addAttributeDependency(
@@ -378,7 +736,6 @@ class {
 	}
 
 	private any function match( required string expression, required string source ) {
-		return createObject( "java", "java.util.regex.Pattern" ).compile( arguments.expression,
-				createObject( "java", "java.util.regex.Pattern" ).CASE_INSENSITIVE ).matcher( arguments.source );
+		return variables.sourceScanner.matcher( arguments.expression, arguments.source, false );
 	}
 }

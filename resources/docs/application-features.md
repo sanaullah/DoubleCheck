@@ -49,9 +49,9 @@ No other languages are product targets.
 2. **Legacy ColdFusion modernization assist** — propose and validate a migration
    plan; **assist**, not an automatic migrator. Never writes application source
    or executes DDL.
-3. **Interactive CodeGraph explorer** — deterministic CF/BoxLang knowledge graph
-   (roles, flows, clusters) plus an LLM Domain lens for business meaning; not a
-   findings or migration product.
+3. **Interactive CodeGraph explorer** — deterministic BoxLang/CFML/JavaScript
+   knowledge graph (roles, routes/resources, flows, paths, clusters) plus an LLM
+   Domain lens for business meaning; not a findings or migration product.
 4. **Honest capability claims** — measured labels, evidence validation, one clear
    path per feature. Prefer under-claiming over marketing language.
 
@@ -172,7 +172,7 @@ Stage wiring: [`technical-flow.md`](technical-flow.md). Service ownership:
 ## CodeGraph — purpose
 
 Use CodeGraph when you want an interactive knowledge graph of a ColdFusion /
-BoxLang repository: files, symbols, dependencies, clusters, cycles, hotspots,
+BoxLang / JavaScript repository: files, symbols, dependencies, clusters, cycles, hotspots,
 file roles, and handler-seeded flows. Review and Modernize already compute parts
 of this graph; CodeGraph turns it into an explorable workspace with a Domain
 lens for strangers to the repo.
@@ -189,8 +189,8 @@ run still completes; do not treat deterministic labels as business meaning.
 
 **Success looks like**
 
-- A persisted snapshot with nodes (with `role`), clusters, extracted `flows`,
-  cycles, orphans, layer violations, and hotspots
+- A persisted snapshot with nodes (with `role`), clusters, directories,
+  reachability, extracted `flows`, cycles, orphans, layer violations, and hotspots
 - Interactive drill-down (Overview → module/cluster files → neighbourhood subgraph)
 - With AI: pitch, domain summaries, process stories, onboarding steps, and risk
   briefing — all citing computed ids; never altering deterministic metrics
@@ -198,8 +198,6 @@ run still completes; do not treat deterministic labels as business meaning.
 **CodeGraph does not**
 
 - Present business domains or process narratives without a successful LLM narrative
-- Analyze JavaScript (JS files are skipped silently)
-- Export Markdown/JSON/SARIF yet (`export` returns 422)
 - Replace Review findings or Modernize migration proposals
 
 ---
@@ -209,17 +207,19 @@ run still completes; do not treat deterministic labels as business meaning.
 | Area | What you get |
 |---|---|
 | Workspace | `/codegraph` UI on the same local run queue (`runKind=codegraph`) |
-| Scan | CF/BoxLang-only indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`); JS → skipped.unsupported |
-| Graph | Symbols + dependencies via existing parsers; coupling metrics reuse Modernize services |
-| Roles | Per-node `entry` / `orchestrator` / `domain` / `persistence` / `shared` / `test` legend (deterministic) |
-| Flows | Handler-seeded call paths in snapshot `flows[]`; Overview process chips + graph highlight |
+| Scan | BoxLang/CFML/JavaScript indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`/`js`/`jsx`); bounded parser fallback is recorded |
+| Graph | Symbols + dependencies, routes, views, tables, HTTP/schedule resources; coupling metrics reuse Modernize services |
+| Roles | Per-node evidence-backed `entry` / `client` / `integration` / `orchestrator` / `domain` / `persistence` / `view` / `shared` / `test` legend |
+| Flows | Handler- and browser-seeded bounded paths in snapshot `flows[]`; route/table sinks retain typed evidence |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
-| Issues | Cycles, orphans, layer violations, hotspot ranking |
-| Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / radial layouts; pan/zoom |
-| Subgraph | `GET /api/v1/runs/:id/codegraph/subgraph` neighbourhood drill-down |
+| Issues | Cycles, orphans, layer violations, hotspot ranking, reachability gaps |
+| Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / swimlane / radial layouts; pan/zoom |
+| Search / paths | Directory rollup + search; inspector start/end picker; bounded directed paths with hop evidence and graph highlighting via `/codegraph/paths` |
+| Subgraph | `/codegraph/subgraph` neighbourhood drill-down and `/codegraph/edges` bounded edge slices |
 | Domain lens | LLM narrative v2 (`CodeGraphNarrativeService`): pitch, domains, processes, onboarding, risk; no key → structure only + meaning banner |
 | History | Dashboard filter + `/api/v1/history?runKind=codegraph` |
-| Export | Not available yet — API returns 422 `export_unsupported` |
+| Export | UI downloads plus local Markdown/JSON/Mermaid/SVG via `/api/v1/runs/:id/export`; no narrative still exports structure |
+| Temporal signal | Optional local Git co-change affinity, bounded churn counts, cluster author count/last touch; non-Git runs stay structural-only |
 
 ---
 
@@ -291,7 +291,7 @@ implementation work is [`plans/codegraph-depth-plan.md`](plans/codegraph-depth-p
 | Gap | Detail | Fixed in |
 |---|---|---|
 | No Modernize evaluation corpus | Review has a scored corpus with precision/recall/F1 thresholds; Modernize has unit fixtures only, so its quality is unmeasured — and the CFML tier cannot rise without one | Steps 2a, 6 |
-| No CodeGraph evaluation corpus | CodeGraph has unit/integration fixtures; quality is unmeasured beyond those | — |
+| ~~No CodeGraph evaluation corpus~~ **closed** | Source-backed `resources/evaluation-corpus/codegraph-v1` scores expected routes, tables, flows, bounded paths, and stable deterministic domain labels through `tests/specs/integration/CodeGraphCorpusSpec.bx`; it does not promote a language tier | Step 17 |
 | ~~JS tests are ungated~~ **closed** | `tests/js/*.spec.mjs` runs via `box.json` `scripts.test` / `box run-script test` (`node --test tests/js/*.spec.mjs`) | — |
 
 ---

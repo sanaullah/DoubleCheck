@@ -28,6 +28,188 @@ class extends="testbox.system.BaseSpec" {
 				);
 
 				it(
+					"extracts multiline query and schema DDL table resources",
+					() => {
+						var parser = new app.models.services.BoxLangParserService();
+						parser.codegraphParserStrategy = "regex";
+						var lines = [
+							"class Repository {",
+							"    function load() {",
+							"        queryExecute(",
+							repeatString( " ", 12 ) & char( 34 ),
+							"                SELECT o.id",
+							"                FROM orders o",
+							"                JOIN order_items i ON i.order_id = o.id",
+							repeatString( " ", 12 ) & char( 34 ),
+							"        );",
+							"        queryExecute(",
+							repeatString( " ", 12 ) & char( 34 ),
+							"                CREATE TABLE IF NOT EXISTS audit_log ( id TEXT )",
+							repeatString( " ", 12 ) & char( 34 ),
+							"        );",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse( {
+							filePath: "app/models/Repository.bx", language: "BoxLang",
+							contentHash: lCase( hash( content, "SHA-256" ) ), content: content, lines: lines
+						} );
+						var tables = parsed.dependencies
+							.filter( ( item ) => item.kind == "table-query" )
+							.map( ( item ) => item.target );
+
+						expect( tables ).toInclude( "orders" );
+						expect( tables ).toInclude( "order_items" );
+						expect( tables ).toInclude( "audit_log" );
+					}
+				);
+
+				it(
+					"uses BoxAST positions and semantic traversal when source is available",
+					() => {
+						var sourceRoot = getTempDirectory() & "doublecheck-boxlang-ast-" & replace( lCase( createUUID() ), "-", "", "all" );
+						var sourcePath = sourceRoot & "/app/handlers/AstHandler.bx";
+						var lines = [
+							"class AstHandler {",
+							"    function index() {",
+							"        route(",
+							"            ""/api/ast""",
+							"        ).withAction( ""index"" );",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						directoryCreate( sourceRoot & "/app/handlers", true, true );
+						fileWrite( sourcePath, content, "UTF-8" );
+						try {
+							var parser = new app.models.services.BoxLangParserService();
+							parser.codegraphParserStrategy = "ast";
+							var parsed = parser.parse(
+								{
+									filePath    : "app/handlers/AstHandler.bx",
+									absolutePath : sourcePath,
+									language    : "BoxLang",
+									contentHash : lCase( hash( content, "SHA-256" ) ),
+									content     : content,
+									lines      : lines
+								}
+							);
+							var functions = parsed.symbols.filter( ( item ) => item.kind == "function" );
+							var routes = parsed.symbols.filter( ( item ) => item.kind == "route" );
+							var regexParser = new app.models.services.BoxLangParserService();
+							regexParser.codegraphParserStrategy = "regex";
+							var regexParsed = regexParser.parse(
+								{
+									filePath    : "app/handlers/AstHandler.bx",
+									absolutePath : sourcePath,
+									language    : "BoxLang",
+									contentHash : lCase( hash( content, "SHA-256" ) ),
+									content     : content,
+									lines      : lines
+								}
+							);
+
+							expect( parsed.parseStrategy ).toBe( "ast" );
+							expect( regexParsed.parseStrategy ).toBe( "regex" );
+							expect( regexParsed.parserVersion ).notToBe( parsed.parserVersion );
+						expect( functions.len() ).toBeGT( 0 );
+						expect( functions[ 1 ].endLine ).toBeGT( functions[ 1 ].line );
+							expect( routes.map( ( item ) => item.name ) ).toInclude( "/api/ast" );
+						} finally {
+							if ( directoryExists( sourceRoot ) ) directoryDelete( sourceRoot, true, true );
+						}
+					}
+				);
+
+				it(
+					"keeps app-wide AST symbols and dependencies as a superset of regex",
+					() => {
+						var appRoot = new java:java.io.File(
+							getDirectoryFromPath( getCurrentTemplatePath() ),
+							"../../../app"
+						).getCanonicalFile();
+						var paths = directoryList( appRoot.getPath(), true, "path" )
+							.filter( ( path ) => reFindNoCase( "\.bx[ms]?$", path ) > 0 )
+							.sort( "textnocase" );
+						var files = [];
+						for ( var path in paths ) {
+							var sourceFile = new java:java.io.File( path ).getCanonicalFile();
+							var content = fileRead( sourceFile.getPath(), "UTF-8" );
+							var relativePath = replace(
+								sourceFile.getPath().substring( appRoot.getPath().len() + 1 ),
+								"\",
+								"/",
+								"all"
+							);
+							files.append( {
+								filePath    : relativePath,
+								absolutePath: sourceFile.getPath(),
+								language    : "BoxLang",
+								contentHash : lCase( hash( content, "SHA-256" ) ),
+								content     : content,
+								lines       : listToArray( replace( content, char( 13 ), "", "all" ), char( 10 ), true, true )
+							} );
+						}
+
+						var semanticSet = ( items ) => {
+							var out = {};
+							for ( var item in items ) {
+								var key = lCase( trim( toString( item.kind ?: "" ) ) & "|" & trim( toString( item.name ?: item.target ?: "" ) ) );
+								if ( len( key ) ) out[ key ] = true;
+							}
+							return out;
+						};
+						var regexParser = new app.models.services.BoxLangParserService();
+						regexParser.codegraphParserStrategy = "regex";
+						var regexByPath = {};
+						var regexStarted = getTickCount();
+						for ( var file in files ) {
+							var parsed = regexParser.parse( file );
+							regexByPath[ file.filePath ] = {
+								symbols     : semanticSet( parsed.symbols ),
+								dependencies: semanticSet( parsed.dependencies )
+							};
+						}
+						var regexMs = getTickCount() - regexStarted;
+
+						var astParser = new app.models.services.BoxLangParserService();
+						astParser.codegraphParserStrategy = "ast";
+						var regressions = [];
+						var fallbacks = [];
+						var astStarted = getTickCount();
+						for ( var file in files ) {
+							var parsed = astParser.parse( file );
+							if ( parsed.parseStrategy != "ast" ) fallbacks.append( file.filePath );
+							var astSymbols = semanticSet( parsed.symbols );
+							var astDependencies = semanticSet( parsed.dependencies );
+							for ( var key in regexByPath[ file.filePath ].symbols ) {
+								if ( !astSymbols.keyExists( key ) ) regressions.append( "#file.filePath# symbol #key#" );
+							}
+							for ( var key in regexByPath[ file.filePath ].dependencies ) {
+								if ( !astDependencies.keyExists( key ) ) regressions.append( "#file.filePath# dependency #key#" );
+							}
+						}
+						var astMs = getTickCount() - astStarted;
+						fileWrite(
+							getTempDirectory() & "doublecheck-codegraph-parser-parity.json",
+							jsonSerialize( {
+								files      : files.len(),
+								regexMs    : regexMs,
+								astMs      : astMs,
+								fallbacks  : fallbacks,
+								regressions: regressions
+							} ),
+							"UTF-8"
+						);
+
+						expect( files.len() ).toBeGT( 0 );
+						expect( regressions ).toBe( [] );
+						expect( fallbacks ).toBe( [] );
+					}
+				);
+
+				it(
 					"reuses parser output by content hash and parser version",
 					() => {
 						var parser = new app.models.services.BoxLangParserService();
@@ -93,6 +275,11 @@ class extends="testbox.system.BaseSpec" {
 								new app.models.services.CfmlParserService()
 							);
 						service.$property(
+								"javaScriptParserService",
+								"variables",
+								new app.models.services.JavaScriptParserService()
+							);
+						service.$property(
 								"graphRepository",
 								"variables",
 								graphRepository
@@ -126,9 +313,68 @@ class extends="testbox.system.BaseSpec" {
 						];
 						var metrics = service.index( "run-cfml-dispatch", files );
 
-						expect( metrics.filesAnalyzed ).toBe( 2 );
-						expect( metrics.parserVersion ).toInclude( "boxlang-symbol-parser" );
+						expect( metrics.filesAnalyzed ).toBe( 3 );
+						expect( metrics.parserVersion ).toInclude( "boxlang-ast-parser" );
 						expect( metrics.parserVersion ).toInclude( "cfml-symbol-parser" );
+						expect( metrics.parserVersion ).toInclude( "javascript-symbol-parser" );
+					}
+				);
+
+				it(
+					"keeps ids, fingerprint, narrative key, and impact stable across blank-line shifts",
+					() => {
+						var captured = {};
+						var repository = {
+							findCached: ( contentHash, parserVersion ) => javacast( "null", "" ),
+							saveCached: ( contentHash, parserVersion, language, parsed ) => {},
+							findBaselineGraph: ( runId, resultLimit ) => { return { runId: "", symbols: [], dependencies: [] }; },
+							replaceRunGraph: ( runId, parsedFiles, impacts, metrics ) => {
+								captured[ runId ] = duplicate( parsedFiles );
+							}
+						};
+						var parser = new app.models.services.BoxLangParserService();
+						parser.codegraphParserStrategy = "regex";
+						var service = prepareMock( new app.models.services.ArchitectureIndexService() );
+						service.$property( "boxLangParserService", "variables", parser );
+						service.$property( "cfmlParserService", "variables", new app.models.services.CfmlParserService() );
+						service.$property( "graphRepository", "variables", repository );
+
+						var source = "class {" & char( 10 ) & "property name=""orders"" inject=""OrderService"";" & char( 10 ) & "function run() {}" & char( 10 ) & "}";
+						var shifted = char( 10 ) & source;
+						service.index( "before", [ sourceFile( source ) ] );
+						service.index( "after", [ sourceFile( shifted ) ] );
+
+						var firstFile = captured.before[ 1 ];
+						var secondFile = captured.after[ 1 ];
+						expect( firstFile.symbols.map( ( item ) => item.id ) ).toBe( secondFile.symbols.map( ( item ) => item.id ) );
+						expect( firstFile.dependencies.map( ( item ) => item.id ) ).toBe( secondFile.dependencies.map( ( item ) => item.id ) );
+
+						var asReviewGraph = ( parsedFile ) => {
+							var symbols = parsedFile.symbols.map( ( item ) => {
+								var copy = duplicate( item );
+								copy.filePath = parsedFile.filePath;
+								return copy;
+							} );
+							var dependencies = parsedFile.dependencies.map( ( item ) => {
+								var copy = duplicate( item );
+								copy.sourceFile = parsedFile.filePath;
+								return copy;
+							} );
+							return { symbols: symbols, dependencies: dependencies, files: [ parsedFile.filePath ] };
+						};
+						var metrics = new app.models.services.CodeGraphMetricsService();
+						var firstSnapshot = metrics.assemble( asReviewGraph( firstFile ) );
+						var secondSnapshot = metrics.assemble( asReviewGraph( secondFile ) );
+						expect( firstSnapshot.fingerprint ).toBe( secondSnapshot.fingerprint );
+						var narrative = new app.models.services.CodeGraphNarrativeService();
+						narrative.aiProviderResolver = { resolve: () => { return { apiKey: "", isLocal: false, provider: "none", model: "none" }; } };
+						narrative.chatGateway = { isEnabled: ( apiKey, isLocal ) => false };
+						expect( narrative.cacheKey( firstSnapshot, "C:/fixture" ) ).toBe( narrative.cacheKey( secondSnapshot, "C:/fixture" ) );
+
+						var impactDependencies = [ { sourceFile: "app/handlers/Caller.bx", targetFile: firstFile.filePath, kind: "calls" } ];
+						var firstImpact = service.buildImpactCone( [ firstFile.filePath ], asReviewGraph( firstFile ).symbols, impactDependencies );
+						var secondImpact = service.buildImpactCone( [ secondFile.filePath ], asReviewGraph( secondFile ).symbols, impactDependencies );
+						expect( firstImpact ).toBe( secondImpact );
 					}
 				);
 
@@ -234,6 +480,16 @@ class extends="testbox.system.BaseSpec" {
 			contentHash: lCase( hash( content, "SHA-256" ) ),
 			content    : content,
 			lines      : lines
+		};
+	}
+
+	private struct function sourceFile( required string content ) {
+		return {
+			filePath: "app/models/StableIds.bx",
+			language: "BoxLang",
+			contentHash: lCase( hash( arguments.content, "SHA-256" ) ),
+			content: arguments.content,
+			lines: listToArray( arguments.content, char( 10 ), true, true )
 		};
 	}
 }

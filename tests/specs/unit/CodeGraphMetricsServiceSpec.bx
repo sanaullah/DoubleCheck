@@ -101,6 +101,40 @@ class extends="testbox.system.BaseSpec" {
 				expect( first.hotspots[ 1 ].hotspotScore ).toBeGTE( first.hotspots[ 2 ].hotspotScore );
 			} );
 
+			it( "surfaces bounded co-change metrics without changing structural ownership", () => {
+				var snapshot = metrics.assemble(
+					{
+						symbols: [],
+						files: [ "app/models/Order.cfc", "app/models/Invoice.cfc" ],
+						dependencies: [
+							{ id: "d1", sourceFile: "app/models/Order.cfc", kind: "constructs", targetFile: "app/models/Invoice.cfc", line: 5 }
+						]
+					},
+					{
+						coChange: {
+							enabled        : true,
+							available      : true,
+							degraded       : false,
+							commits        : 4,
+							filesChanged   : 2,
+							pairCount      : 1,
+							files          : {
+								"app/models/order.cfc": { changeCount: 4, authors: [ "A" ], lastTouched: "2026-08-01T00:00:00Z" },
+								"app/models/invoice.cfc": { changeCount: 2, authors: [ "A", "B" ], lastTouched: "2026-08-02T00:00:00Z" }
+							},
+							affinityWeights: { "app/models/order.cfc": { "app/models/invoice.cfc": 0.5 } }
+						}
+					}
+				);
+				var order = snapshot.nodes.filter( ( node ) => node.path == "app/models/Order.cfc" )[ 1 ];
+				var cluster = snapshot.clusters[ 1 ];
+				expect( order.churnCount ).toBe( 4 );
+				expect( snapshot.hotspotFormula ).toInclude( "churnCount" );
+				expect( snapshot.coChange.available ).toBeTrue();
+				expect( cluster.coChange.authorCount ).toBe( 2 );
+				expect( cluster.coChange.lastTouched ).toBe( "2026-08-02T00:00:00Z" );
+			} );
+
 			it( "sets truncated when every presenter cap is hit", () => {
 				var files = [];
 				var deps = [];
@@ -128,7 +162,7 @@ class extends="testbox.system.BaseSpec" {
 						maxHotspots        : 2,
 						maxOrphans         : 2,
 						maxLayerViolations : 2,
-						maxNodes           : 4,
+						maxNodes           : 20,
 						maxEdges           : 1
 					}
 				);
@@ -144,7 +178,18 @@ class extends="testbox.system.BaseSpec" {
 				expect( snapshot.hotspots ).toHaveLength( 2 );
 				expect( snapshot.orphans ).toHaveLength( 2 );
 				expect( snapshot.layerViolations ).toHaveLength( 2 );
-				expect( snapshot.nodes.len() ).toBeLTE( 4 );
+				expect( snapshot.nodes.len() ).toBeLTE( 20 );
+				var visibleIds = {};
+				for ( var node in snapshot.nodes ) visibleIds[ lCase( node.id ) ] = true;
+				for ( var hotspot in snapshot.hotspots ) expect( visibleIds ).toHaveKey( lCase( hotspot.id ) );
+				for ( var orphan in snapshot.orphans ) expect( visibleIds ).toHaveKey( lCase( orphan.id ) );
+				for ( var violation in snapshot.layerViolations ) {
+					expect( visibleIds ).toHaveKey( lCase( violation.from ) );
+					expect( visibleIds ).toHaveKey( lCase( violation.to ) );
+				}
+				for ( var flow in snapshot.flows ) {
+					for ( var step in flow.steps ) expect( visibleIds ).toHaveKey( lCase( step ) );
+				}
 			} );
 
 			it( "assigns entry role to handler paths", () => {
@@ -157,6 +202,29 @@ class extends="testbox.system.BaseSpec" {
 				var handler = snapshot.nodes.filter( ( node ) => node.path == "app/handlers/Orders.bx" )[ 1 ];
 				expect( handler ).toHaveKey( "role" );
 				expect( handler.role ).toBe( "entry" );
+			} );
+
+			it( "distinguishes reachable, test-only, and unreachable files", () => {
+				var snapshot = metrics.assemble( {
+					files: [
+						"app/handlers/Main.bx", "app/models/Live.bx", "app/models/TestOnly.bx",
+						"app/models/Dead.bx", "tests/MainSpec.bx"
+					],
+					symbols: [
+						{ id: "entry", filePath: "app/handlers/Main.bx", kind: "handler-action", name: "index", line: 1 }
+					],
+					dependencies: [
+						{ id: "live", sourceFile: "app/handlers/Main.bx", kind: "calls", target: "Live", targetFile: "app/models/Live.bx", line: 2 },
+						{ id: "test", sourceFile: "tests/MainSpec.bx", kind: "calls", target: "TestOnly", targetFile: "app/models/TestOnly.bx", line: 3 }
+					]
+				} );
+				var byPath = {};
+				for ( var item in snapshot.unreachable ) byPath[ lCase( item.path ) ] = item.reason;
+
+				expect( snapshot.reachability.available ).toBeTrue();
+				expect( byPath ).notToHaveKey( "app/models/live.bx" );
+				expect( byPath[ "app/models/testonly.bx" ] ).toBe( "test-only" );
+				expect( byPath[ "app/models/dead.bx" ] ).toBe( "unreachable" );
 			} );
 
 			it( "assigns persistence role to DAO-ish model paths", () => {
@@ -173,6 +241,13 @@ class extends="testbox.system.BaseSpec" {
 				var dao = snapshot.nodes.filter( ( node ) => node.path == "app/models/OrderDAO.cfc" )[ 1 ];
 				expect( repository.role ).toBe( "persistence" );
 				expect( dao.role ).toBe( "persistence" );
+			} );
+
+			it( "assigns client rather than entry to public JavaScript assets", () => {
+				var snapshot = metrics.assemble( { files: [ "public/assets/app.js" ], symbols: [], dependencies: [] } );
+				var node = snapshot.nodes.filter( ( item ) => lCase( item.path ) == "public/assets/app.js" )[ 1 ];
+				expect( node.role ).toBe( "client" );
+				expect( node.language ).toBe( "JavaScript" );
 			} );
 
 			it( "assigns test role to test paths", () => {
@@ -280,6 +355,57 @@ class extends="testbox.system.BaseSpec" {
 				expect( flow.edgeKinds ).toInclude( "injects" );
 			} );
 
+			it( "caps flows per cluster without a hidden global flow cap", () => {
+				var inventory = { units: [], dependencies: [] };
+				var dependencies = [];
+				var clusterOf = {};
+				for ( var i = 1; i <= 25; i++ ) {
+					var handler = "app/handlers/H#i#.bx";
+					inventory.units.append( { id: "h#i#", unitType: "handler-action", filePath: handler, symbolName: "index" } );
+					dependencies.append( { sourceFile: handler, kind: "table-query", target: "table_#i#", targetFile: "" } );
+					clusterOf[ lCase( handler ) ] = "cluster-#i#";
+				}
+				var truncation = { truncated: false, reasons: [] };
+				var flows = new app.models.services.CodeGraphFlowService().extract(
+					inventory,
+					{ getNodes: () => [] },
+					{ flowMaxDepth: 3, maxFlowsPerCluster: 1, maxFlows: 1 },
+					{ dependencies: dependencies },
+					truncation,
+					{},
+					clusterOf
+				);
+
+				expect( flows ).toHaveLength( 25 );
+				expect( truncation.reasons ).notToInclude( "maxFlows" );
+			} );
+
+			it( "ranks a typed sink ahead of longer depth-exhausted branches", () => {
+				var handler = "app/handlers/Orders.bx";
+				var dependencies = [
+					{ sourceFile: handler, kind: "calls", targetFile: "app/models/Repository.bx" },
+					{ sourceFile: "app/models/Repository.bx", kind: "table-query", target: "orders", targetFile: "" }
+				];
+				for ( var i = 1; i <= 4; i++ ) {
+					dependencies.append( { sourceFile: handler, kind: "calls", targetFile: "app/services/Branch#i#.bx" } );
+					dependencies.append( { sourceFile: "app/services/Branch#i#.bx", kind: "calls", targetFile: "app/services/Branch#i#Tail.bx" } );
+					dependencies.append( { sourceFile: "app/services/Branch#i#Tail.bx", kind: "calls", targetFile: "app/services/Branch#i#End.bx" } );
+				}
+				var flows = new app.models.services.CodeGraphFlowService().extract(
+					{ units: [ { id: "orders", unitType: "handler-action", filePath: handler, symbolName: "index" } ] },
+					{ getNodes: () => [] },
+					{ flowMaxDepth: 3, maxFlowsPerCluster: 1 },
+					{ dependencies: dependencies },
+					{ truncated: false, reasons: [] },
+					{},
+					{ "app/handlers/orders.bx": "orders" }
+				);
+
+				expect( flows ).toHaveLength( 1 );
+				expect( flows[ 1 ].sinkKind ).toBe( "table-read" );
+				expect( flows[ 1 ].sinkFile ).toBe( "table:orders" );
+			} );
+
 			it( "keeps fingerprint stable under key-order shuffle of identical content", () => {
 				var reviewGraph = {
 					symbols: [ { id: "s1", filePath: "app/models/A.cfc", kind: "class", name: "A", line: 1 } ],
@@ -298,6 +424,22 @@ class extends="testbox.system.BaseSpec" {
 				expect( first.fingerprint ).toBe( second.fingerprint );
 				expect( first.version ).toBe( "codegraph-snapshot-v1" );
 				expect( len( first.fingerprint ) ).toBe( 64 );
+			} );
+
+			it( "keeps fingerprint stable when blank lines only shift source positions", () => {
+				var first = metrics.assemble( {
+					symbols: [ { id: "s1", filePath: "app/models/A.bx", kind: "function", name: "run", line: 2, endLine: 4 } ],
+					files: [ { filePath: "app/models/A.bx", lineCount: 4 } ],
+					dependencies: []
+				} );
+				var shifted = metrics.assemble( {
+					symbols: [ { id: "s1", filePath: "app/models/A.bx", kind: "function", name: "run", line: 12, endLine: 14 } ],
+					files: [ { filePath: "app/models/A.bx", lineCount: 14 } ],
+					dependencies: []
+				} );
+
+				expect( first.nodes[ 1 ].lineCount ).notToBe( shifted.nodes[ 1 ].lineCount );
+				expect( first.fingerprint ).toBe( shifted.fingerprint );
 			} );
 
 		} );

@@ -399,7 +399,7 @@ class threadsafe {
 				// Never set modernize:true — that drops file.lines required by parsers.
 				scanOptions = {
 					codegraph: true,
-					allowedExtensions: [ "cfc", "cfm", "bx", "bxm", "bxs" ],
+					allowedExtensions: [ "cfc", "cfm", "bx", "bxm", "bxs", "js", "jsx" ],
 					maxFiles: val( variables.codegraphScanMaxFiles ?: 2500 ),
 					maxBytes: val( variables.codegraphScanMaxBytes ?: 33554432 ),
 					maxEntries: val( variables.codegraphScanMaxEntries ?: 30000 ),
@@ -412,6 +412,55 @@ class threadsafe {
 			if ( isArray( runInputForScan.scopePaths ?: "" ) && runInputForScan.scopePaths.len() ) {
 				scanOptions.pathPrefixes = runInputForScan.scopePaths;
 				scanOptions.priorityPathPrefixes = runInputForScan.scopePaths;
+			}
+			if ( scanKind == "codegraph" && !structKeyExists( scanOptions, "selectedFiles" ) && !structKeyExists( scanOptions, "pathPrefixes" ) ) {
+				var preScanReuse = codeGraphRunService.reuseBeforeScan( run );
+				if ( preScanReuse.reused ?: false ) {
+					var reusedNodes = isArray( preScanReuse.snapshot.nodes ?: "" ) ? preScanReuse.snapshot.nodes : [];
+					var reusedLanguages = [];
+					for ( var reusedNode in reusedNodes ) {
+						var reusedLanguage = trim( toString( reusedNode.language ?: "" ) );
+						if ( len( reusedLanguage ) && !reusedLanguages.contains( reusedLanguage ) ) reusedLanguages.append( reusedLanguage );
+					}
+					publishDetail(
+						arguments.runId,
+						"review.indexed",
+						{
+							filesScanned      : val( preScanReuse.snapshot.totals.files ?: reusedNodes.len() ),
+							bytesScanned      : 0,
+							languages         : reusedLanguages,
+							scope             : "snapshot-reuse",
+							skipped           : {},
+							discoveryTruncated: false,
+							runKind           : "codegraph"
+						}
+					);
+					resultRepository.saveSummary(
+						runId = arguments.runId,
+						summary = preScanReuse.message,
+						languages = reusedLanguages,
+						filesScanned = val( preScanReuse.snapshot.totals.files ?: reusedNodes.len() ),
+						bytesScanned = 0,
+						findingsCount = 0,
+						aiEnabled = false,
+						reviewScope = "snapshot-reuse",
+						repositoryRevision = preScanReuse.repositoryRevision,
+						baseRevision = run.getBaseRevision() ?: "",
+						headRevision = preScanReuse.repositoryRevision,
+						discoveryTruncated = false,
+						skipped = {}
+					);
+					var reusedCompleted = transition(
+						runId = arguments.runId, status = "succeeded", progress = 100,
+						phase = "completed", message = preScanReuse.message,
+						completedAt = timestamp(), eventType = "run.completed"
+					);
+					eventService.publish(
+						arguments.runId, "codegraph.completed",
+						{ run: reusedCompleted.getMemento(), result: codeGraphRunService.getResult( arguments.runId ) }
+					);
+					return;
+				}
 			}
 			var scan = scannerService.scan(
 					projectPath  = run.getProjectPath(),

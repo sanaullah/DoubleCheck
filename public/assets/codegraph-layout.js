@@ -341,6 +341,9 @@
 			const key = from + "\0" + to + "\0" + kind;
 			if (seen.has(key)) {
 				const existing = seen.get(key);
+				if (Array.isArray(e.kinds)) {
+					existing.kinds = Array.from(new Set([...(existing.kinds || []), ...e.kinds.map(String)])).sort();
+				}
 				if (e.evidence && !existing.evidence) existing.evidence = String(e.evidence);
 				if (e.line != null && (existing.line == null || existing.line === 0)) {
 					existing.line = Number(e.line) || 0;
@@ -367,6 +370,7 @@
 				crossing: !!e.crossing,
 				id: e.id != null ? String(e.id) : ""
 			};
+			if (Array.isArray(e.kinds)) edge.kinds = Array.from(new Set(e.kinds.map(String))).sort();
 			seen.set(key, edge);
 			out.push(edge);
 		});
@@ -731,6 +735,50 @@
 				h: box.h
 			});
 		});
+		const nodeById = new Map(positioned.map((n) => [normId(n.id), n]));
+		const graphEdges = edges.filter((e) => nodeById.has(normId(e.from)) && nodeById.has(normId(e.to)));
+		// Fixed-seed, fixed-iteration relaxation: overview stays reproducible while
+		// dense connected modules stop looking like an arbitrary alphabetic grid.
+		for (let iteration = 0; iteration < 14; iteration++) {
+			const delta = positioned.map(() => ({ x: 0, y: 0 }));
+			for (let i = 0; i < positioned.length; i++) {
+				for (let j = i + 1; j < positioned.length; j++) {
+					const a = positioned[i];
+					const b = positioned[j];
+					const ax = a.x + a.w / 2;
+					const ay = a.y + a.h / 2;
+					const bx = b.x + b.w / 2;
+					const by = b.y + b.h / 2;
+					const dx = ax - bx || (i < j ? 1 : -1);
+					const dy = ay - by || (i < j ? 1 : -1);
+					const distance = Math.max(24, Math.hypot(dx, dy));
+					const force = Math.min(8, 1800 / (distance * distance));
+					delta[i].x += (dx / distance) * force;
+					delta[i].y += (dy / distance) * force;
+					delta[j].x -= (dx / distance) * force;
+					delta[j].y -= (dy / distance) * force;
+				}
+			}
+			graphEdges.forEach((edge) => {
+				const aIndex = positioned.indexOf(nodeById.get(normId(edge.from)));
+				const bIndex = positioned.indexOf(nodeById.get(normId(edge.to)));
+				if (aIndex < 0 || bIndex < 0) return;
+				const a = positioned[aIndex];
+				const b = positioned[bIndex];
+				const dx = b.x - a.x;
+				const dy = b.y - a.y;
+				const distance = Math.max(1, Math.hypot(dx, dy));
+				const force = Math.min(5, (distance - cfg.gapX - cfg.nodeWidth) * 0.004);
+				delta[aIndex].x += (dx / distance) * force;
+				delta[aIndex].y += (dy / distance) * force;
+				delta[bIndex].x -= (dx / distance) * force;
+				delta[bIndex].y -= (dy / distance) * force;
+			});
+			positioned.forEach((node, index) => {
+				node.x = Math.max(cfg.pad, node.x + delta[index].x);
+				node.y = Math.max(cfg.pad, node.y + delta[index].y);
+			});
+		}
 		const bounds = layoutBounds(positioned, cfg.pad);
 		return {
 			width: bounds.width,
@@ -758,11 +806,44 @@
 		});
 
 		const colKeys = [...columns.keys()].sort((a, b) => a - b);
+		const edgePairs = edges.map((e) => ({ from: normId(e.from), to: normId(e.to) }));
+		const orderedColumns = new Map();
+		colKeys.forEach((layer) => orderedColumns.set(layer, columns.get(layer).slice().sort((a, b) => String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id)))));
+		const positionMap = () => {
+			const map = new Map();
+			colKeys.forEach((layer) => orderedColumns.get(layer).forEach((node, index) => map.set(normId(node.id), index)));
+			return map;
+		};
+		// Barycenter sweeps reduce crossings without introducing layout randomness.
+		for (let sweep = 0; sweep < 3; sweep++) {
+			for (let columnIndex = 1; columnIndex < colKeys.length; columnIndex++) {
+				const previous = new Set(orderedColumns.get(colKeys[columnIndex - 1]).map((n) => normId(n.id)));
+				const positions = positionMap();
+				orderedColumns.get(colKeys[columnIndex]).sort((a, b) => {
+					const mean = (node) => {
+						const neighbors = edgePairs.filter((edge) => edge.to === normId(node.id) && previous.has(edge.from)).map((edge) => positions.get(edge.from));
+						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
+					};
+					const byMean = mean(a) - mean(b);
+					return Number.isFinite(byMean) && byMean !== 0 ? byMean : String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+				});
+			}
+			for (let columnIndex = colKeys.length - 2; columnIndex >= 0; columnIndex--) {
+				const next = new Set(orderedColumns.get(colKeys[columnIndex + 1]).map((n) => normId(n.id)));
+				const positions = positionMap();
+				orderedColumns.get(colKeys[columnIndex]).sort((a, b) => {
+					const mean = (node) => {
+						const neighbors = edgePairs.filter((edge) => edge.from === normId(node.id) && next.has(edge.to)).map((edge) => positions.get(edge.to));
+						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
+					};
+					const byMean = mean(a) - mean(b);
+					return Number.isFinite(byMean) && byMean !== 0 ? byMean : String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+				});
+			}
+		}
 		const positioned = [];
 		colKeys.forEach((layer, colIndex) => {
-			const list = columns.get(layer).slice().sort((a, b) =>
-				String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id))
-			);
+			const list = orderedColumns.get(layer);
 			list.forEach((n, row) => {
 				positioned.push(
 					Object.assign({}, n, {
@@ -783,6 +864,116 @@
 			nodes: positioned,
 			edges: edges.map((e) => Object.assign({}, e)),
 			mode: (view && view.mode) || "layered",
+			overview: overview,
+			detail: !overview && detail
+		};
+	}
+
+	const SWIMLANE_ORDER = {
+		client: 0,
+		"entry-points": 1,
+		entry: 1,
+		orchestrator: 2,
+		domain: 3,
+		view: 4,
+		persistence: 5,
+		integration: 6,
+		configuration: 7,
+		config: 7,
+		test: 8,
+		tests: 8,
+		other: 9,
+		unknown: 9
+	};
+
+	function swimlaneRole(node) {
+		const id = normId((node && (node.id || node.path)) || "");
+		if (id.indexOf("route:") === 0) return "entry";
+		if (id.indexOf("table:") === 0) return "persistence";
+		if (id.indexOf("http:") === 0 || id.indexOf("schedule:") === 0) return "integration";
+		const role = String((node && (node.role || node.layerLabel || node.layer)) || "")
+			.toLowerCase()
+			.replace(/\s+/g, "-")
+			.trim();
+		return role || "unknown";
+	}
+
+	function swimlaneLabel(role) {
+		return String(role || "unknown")
+			.replace(/-/g, " ")
+			.replace(/\b\w/g, (letter) => letter.toUpperCase());
+	}
+
+	function layoutSwimlane(view, opts) {
+		const overview = !!(view && (view.overview || view.mode === "cluster")) || !!(opts && opts.overview);
+		const detail = !!(view && view.detail) || !!(opts && opts.detail);
+		const cfg = mergeDefaults(Object.assign({}, opts, { overview: overview, detail: detail && !overview }));
+		const nodes = (view && view.nodes) || [];
+		const edges = (view && view.edges) || [];
+		if (!nodes.length) {
+			return { width: cfg.pad * 2, height: cfg.pad * 2, nodes: [], edges: [], lanes: [], mode: "swimlane", overview: overview, detail: !overview && detail };
+		}
+
+		const stepOrder = new Map();
+		(Array.isArray(opts && opts.flowStepSet) ? opts.flowStepSet : []).forEach((id, index) => {
+			const normalized = normId(id);
+			if (normalized && !stepOrder.has(normalized)) stepOrder.set(normalized, index);
+		});
+		const lanes = new Map();
+		nodes.forEach((node) => {
+			const role = swimlaneRole(node);
+			if (!lanes.has(role)) lanes.set(role, []);
+			lanes.get(role).push(node);
+		});
+		const laneKeys = [...lanes.keys()].sort((a, b) => {
+			const order = (SWIMLANE_ORDER[a] ?? 9) - (SWIMLANE_ORDER[b] ?? 9);
+			return order || a.localeCompare(b);
+		});
+		const laneHeight = cfg.nodeHeight + cfg.gapY;
+		const positioned = [];
+		const laneRects = [];
+		let maxColumns = 1;
+		laneKeys.forEach((role, laneIndex) => {
+			const list = lanes.get(role).slice().sort((a, b) => {
+				const aStep = stepOrder.has(normId(a.id)) ? stepOrder.get(normId(a.id)) : Number.POSITIVE_INFINITY;
+				const bStep = stepOrder.has(normId(b.id)) ? stepOrder.get(normId(b.id)) : Number.POSITIVE_INFINITY;
+				return aStep - bStep || String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+			});
+			list.forEach((node, columnIndex) => {
+				const box = nodeBoxSize(node, cfg, view);
+				const flowColumn = stepOrder.has(normId(node.id)) ? stepOrder.get(normId(node.id)) : stepOrder.size + columnIndex;
+				maxColumns = Math.max(maxColumns, flowColumn + 1);
+				positioned.push(Object.assign({}, node, {
+					lane: role,
+					laneLabel: swimlaneLabel(role),
+					x: cfg.pad + flowColumn * (cfg.nodeWidth + cfg.gapX),
+					y: cfg.pad + laneIndex * laneHeight,
+					w: box.w,
+					h: box.h
+				}));
+			});
+			laneRects.push({
+				key: role,
+				label: swimlaneLabel(role),
+				x: 0,
+				y: laneIndex * laneHeight,
+				width: cfg.pad * 2 + Math.max(1, maxColumns) * cfg.nodeWidth + Math.max(0, maxColumns - 1) * cfg.gapX,
+				height: laneHeight
+			});
+		});
+		const width = cfg.pad * 2 + maxColumns * cfg.nodeWidth + Math.max(0, maxColumns - 1) * cfg.gapX;
+		const height = cfg.pad * 2 + laneKeys.length * laneHeight;
+		laneRects.forEach((lane) => {
+			lane.width = width;
+			lane.y += cfg.pad;
+		});
+		return {
+			width: width,
+			height: height,
+			nodes: positioned,
+			edges: edges.map((e) => Object.assign({}, e)),
+			lanes: laneRects,
+			mode: "swimlane",
 			overview: overview,
 			detail: !overview && detail
 		};
@@ -845,6 +1036,18 @@
 				return;
 			}
 			const radius = d * (cfg.nodeWidth + cfg.gapX);
+			if (d > 1) {
+				const prior = rings.get(d - 1) || [];
+				const priorIndex = new Map(prior.map((node, index) => [node.id, index]));
+				list.sort((a, b) => {
+					const score = (node) => {
+						const neighbors = (adj.get(node.id) || []).map((id) => priorIndex.get(id)).filter((value) => value != null);
+						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
+					};
+					const diff = score(a) - score(b);
+					return Number.isFinite(diff) && diff !== 0 ? diff : String(a.label || a.id).localeCompare(String(b.label || b.id));
+				});
+			}
 			list.forEach((n, i) => {
 				const angle = (Math.PI * 2 * i) / Math.max(1, list.length) - Math.PI / 2;
 				const box = nodeBoxSize(n, cfg, view);
@@ -900,16 +1103,27 @@
 		const ah = a.h || DEFAULTS.nodeHeight;
 		const bw = b.w || DEFAULTS.nodeWidth;
 		const bh = b.h || DEFAULTS.nodeHeight;
-		const x1 = a.x + aw;
-		const y1 = a.y + ah / 2;
-		const x2 = b.x;
-		const y2 = b.y + bh / 2;
+		const acx = a.x + aw / 2;
+		const acy = a.y + ah / 2;
+		const bcx = b.x + bw / 2;
+		const bcy = b.y + bh / 2;
+		const horizontal = Math.abs(bcx - acx) >= Math.abs(bcy - acy);
+		const rightward = bcx >= acx;
+		const downward = bcy >= acy;
+		const x1 = horizontal ? (rightward ? a.x + aw : a.x) : acx;
+		const y1 = horizontal ? acy : (downward ? a.y + ah : a.y);
+		const x2 = horizontal ? (rightward ? b.x : b.x + bw) : bcx;
+		const y2 = horizontal ? bcy : (downward ? b.y : b.y + bh);
 		const curved = !opts || opts.curved !== false;
 		if (!curved) {
 			return "M " + x1 + " " + y1 + " L " + x2 + " " + y2;
 		}
-		const midX = (x1 + x2) / 2;
-		return "M " + x1 + " " + y1 + " C " + midX + " " + y1 + ", " + midX + " " + y2 + ", " + x2 + " " + y2;
+		if (horizontal) {
+			const midX = (x1 + x2) / 2;
+			return "M " + x1 + " " + y1 + " C " + midX + " " + y1 + ", " + midX + " " + y2 + ", " + x2 + " " + y2;
+		}
+		const midY = (y1 + y2) / 2;
+		return "M " + x1 + " " + y1 + " C " + x1 + " " + midY + ", " + x2 + " " + midY + ", " + x2 + " " + y2;
 	}
 
 	function buildFlowHighlightContext(opts) {
@@ -1214,6 +1428,14 @@
 			(layout && layout.mode === "cluster") ||
 			nodes.some((n) => n.kind === "cluster" && (n.summary || n.complexity));
 		const selectedEdgeKey = opts && opts.selectedEdgeKey ? String(opts.selectedEdgeKey) : "";
+		const laneParts = layout && layout.mode === "swimlane"
+			? ((layout.lanes || []).map((lane, index) =>
+				'<g class="cg-swimlane" data-lane="' + escapeXml(lane.key) + '">' +
+				'<rect x="' + lane.x + '" y="' + lane.y + '" width="' + lane.width + '" height="' + lane.height + '" fill="' + (index % 2 ? "#f8fafc" : "#ffffff") + '"/>' +
+				'<text class="cg-swimlane-label" x="12" y="' + (lane.y + 18) + '">' + escapeXml(lane.label) + '</text>' +
+				'</g>'
+			)).join("")
+			: "";
 
 		const edgeParts = [];
 		edges.forEach((e) => {
@@ -1289,6 +1511,7 @@
 			aria +
 			'">' +
 			'<defs><marker id="cg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker></defs>' +
+			laneParts +
 			'<g class="cg-edges">' +
 			edgeParts.join("") +
 			"</g>" +
@@ -1421,6 +1644,7 @@
 		selectSubgraph,
 		layoutClusters,
 		layoutLayered,
+		layoutSwimlane,
 		layoutRadial,
 		buildSvg,
 		edgePath,
