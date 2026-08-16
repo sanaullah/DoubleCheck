@@ -88,6 +88,46 @@ class extends="testbox.system.BaseSpec" {
 				expect( windows[ 1 ].endLine ).toBe( 3 );
 				expect( windows[ 1 ].text ).notToInclude( "ignored" );
 			} );
+
+			describe( "maskLiterals", () => {
+
+				var scanner = new app.models.services.CfmlSourceScanner();
+				var q = char( 34 );
+
+				it( "blanks SQL inside a string so keywords are not read as calls", () => {
+					// `IN` and `JOIN` were the most frequent bogus call targets.
+					var masked = scanner.maskLiterals( 'var sql = ' & q & "SELECT a FROM t WHERE id IN ( 1 ) JOIN ( x )" & q & ";" );
+					expect( masked ).notToInclude( "IN (" );
+					expect( masked ).notToInclude( "JOIN" );
+					expect( len( masked ) ).toBe( len( 'var sql = ' & q & "SELECT a FROM t WHERE id IN ( 1 ) JOIN ( x )" & q & ";" ), "length must be preserved" );
+				} );
+
+				it( "keeps code outside the literal", () => {
+					var masked = scanner.maskLiterals( 'writeOutput( ' & q & 'IN (' & q & ' );' );
+					expect( masked ).toInclude( "writeOutput(" );
+				} );
+
+				it( "preserves interpolation because it holds real calls", () => {
+					var masked = scanner.maskLiterals( q & "total ##formatCount( items )## done" & q );
+					expect( masked ).toInclude( "formatCount(" );
+				} );
+
+				it( "blanks a line comment to end of line", () => {
+					var masked = scanner.maskLiterals( "keep( 1 ); // dropped( 2 )" );
+					expect( masked ).toInclude( "keep(" );
+					expect( masked ).notToInclude( "dropped(" );
+				} );
+
+				it( "handles a doubled quote escape without ending the literal early", () => {
+					var masked = scanner.maskLiterals( q & "a" & q & q & "b IN ( c )" & q & " realCall( 1 )" );
+					expect( masked ).notToInclude( "IN (" );
+					expect( masked ).toInclude( "realCall(" );
+				} );
+
+				it( "returns empty input unchanged", () => {
+					expect( scanner.maskLiterals( "" ) ).toBe( "" );
+				} );
+			} );
 		} );
 	}
 }

@@ -377,11 +377,16 @@ class threadsafe {
 			},
 			{ datasource: datasource }
 		);
+		// `calls` sorts last, below the unnamed structural kinds. It is the highest
+		// volume and least reliable relationship, and while it outranked `ELSE` it
+		// consumed the whole budget — `constructs`, `extends`, `type-reference`,
+		// `imports`, `includes` and `tests` all loaded zero rows on this repository.
 		var dependencyRecords = queryExecute(
 			"
 				SELECT id, source_file, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
 				FROM review_dependencies
 				WHERE run_id = :runId
+					AND NOT ( kind = 'calls' AND ( target_file IS NULL OR target_file = '' ) )
 				ORDER BY
 					CASE kind
 						WHEN 'calls-api' THEN 0
@@ -393,8 +398,8 @@ class threadsafe {
 						WHEN 'table-write' THEN 4
 						WHEN 'http' THEN 5
 						WHEN 'schedule' THEN 5
-						WHEN 'calls' THEN 6
-						ELSE 7
+						WHEN 'calls' THEN 7
+						ELSE 6
 					END,
 					source_file, line, kind, target
 				LIMIT :dependencyLimit
@@ -465,6 +470,29 @@ class threadsafe {
 					}
 				);
 		}
+
+		// An unresolved call names no target file, so it can never become an edge at
+		// any level. Excluding it from the load frees the budget for the structural
+		// kinds it used to starve — but the count is reported, because "what could
+		// this tool not prove" is a real answer and deleting it would trade one
+		// silence for another.
+		var unresolvedCalls = queryExecute(
+			"SELECT COUNT(*) AS total FROM review_dependencies WHERE run_id = :runId AND kind = 'calls' AND ( target_file IS NULL OR target_file = '' )",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var unresolvedCount = val( unresolvedCalls.total[ 1 ] ?: 0 );
+		// `available` is the graph-eligible population, not every stored row.
+		// Counting the excluded rows here would report truncation on every run.
+		var eligibleDependencies = summary.recordCount
+			? max( dependencies.len(), val( summary.dependency_count[ 1 ] ) - unresolvedCount )
+			: dependencies.len();
+		// A kind the cap removed entirely is not a sample loss: nothing downstream
+		// can ever draw that relationship. Name it instead of leaving it to a sort.
+		var starvedKinds = eligibleDependencies > dependencies.len() ? starvedDependencyKinds( arguments.runId, dependencies ) : [];
+		var dependencyCompleteness = loadCompleteness( dependencies.len(), eligibleDependencies, "kind_priority,source_file" );
+		dependencyCompleteness.starvedKinds = starvedKinds;
+		dependencyCompleteness.unresolved = unresolvedCount;
 		return {
 			summary: summary.recordCount
 				? {
@@ -492,13 +520,14 @@ class threadsafe {
 			impacts     : impacts,
 			truncated   : summary.recordCount &&
 				(
-					summary.symbol_count[ 1 ] > symbols.len() || summary.dependency_count[ 1 ] > dependencies.len() ||
+					summary.symbol_count[ 1 ] > symbols.len() || eligibleDependencies > dependencies.len() ||
 						summary.impact_count[ 1 ] > impacts.len()
 				),
 			truncationReasons: summary.recordCount ? [
 				(summary.symbol_count[ 1 ] > symbols.len() ? "graphSymbols" : ""),
-				(summary.dependency_count[ 1 ] > dependencies.len() ? "graphDependencies" : ""),
-				(summary.impact_count[ 1 ] > impacts.len() ? "graphImpacts" : "")
+				(eligibleDependencies > dependencies.len() ? "graphDependencies" : ""),
+				(summary.impact_count[ 1 ] > impacts.len() ? "graphImpacts" : ""),
+				(starvedKinds.len() ? "dependencyKindStarved" : "")
 			].filter( ( reason ) => len( reason ) ) : [],
 			// The run summary already holds exact totals, so the loader can state
 			// what it dropped instead of only that it dropped something. Naming the
@@ -506,10 +535,35 @@ class threadsafe {
 			// so what goes missing is a directory, not a sample.
 			completeness: {
 				symbols     : loadCompleteness( symbols.len(), summary.recordCount ? summary.symbol_count[ 1 ] : symbols.len(), "file_path,line" ),
-				dependencies: loadCompleteness( dependencies.len(), summary.recordCount ? summary.dependency_count[ 1 ] : dependencies.len(), "kind_priority,source_file" ),
+				dependencies: dependencyCompleteness,
 				impacts     : loadCompleteness( impacts.len(), summary.recordCount ? summary.impact_count[ 1 ] : impacts.len(), "changed_file,depth" )
 			}
 		};
+	}
+
+	/**
+	 * Kinds present in storage but wholly absent from the loaded set.
+	 *
+	 * The dependency LIMIT orders by kind priority, so a low-priority kind can be
+	 * removed in full rather than sampled. Measured before the call filter landed:
+	 * `constructs`, `extends`, `type-reference`, `imports`, `includes` and `tests`
+	 * all reached zero while 19,034 `calls` rows occupied the budget.
+	 */
+	private array function starvedDependencyKinds( required string runId, required array loaded ) {
+		var present = {};
+		for ( var dep in arguments.loaded ) present[ lCase( trim( toString( dep.kind ?: "" ) ) ) ] = true;
+		var records = queryExecute(
+			"SELECT DISTINCT kind FROM review_dependencies WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var starved = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var kind = lCase( trim( toString( records.kind[ row ] ) ) );
+			if ( len( kind ) && !present.keyExists( kind ) ) starved.append( kind );
+		}
+		starved.sort( ( a, b ) => compareNoCase( a, b ) );
+		return starved;
 	}
 
 	private struct function loadCompleteness(

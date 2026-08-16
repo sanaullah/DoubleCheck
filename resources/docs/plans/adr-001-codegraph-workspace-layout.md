@@ -3,7 +3,7 @@
 **Status:** Accepted — implemented 2026-08-11
 **Date:** 2026-08-11
 **Deciders:** maintainer
-**Feeds:** [`codegraph-graph-fidelity-design.md`](codegraph-graph-fidelity-design.md) (live plan)
+**Feeds:** [`codegraph-remediation-plan.md`](codegraph-remediation-plan.md) (live plan)
 
 ## Context
 

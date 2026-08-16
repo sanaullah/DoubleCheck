@@ -272,8 +272,8 @@ Verified against code, not suspected. Tracked here rather than quietly, per the
 claim rule. Historical Modernize inversion notes remain in
 [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). The live
 CodeGraph plan is
-[`plans/codegraph-graph-fidelity-design.md`](plans/codegraph-graph-fidelity-design.md);
-its §8 records measured results, two design corrections, and known limits.
+[`plans/codegraph-remediation-plan.md`](plans/codegraph-remediation-plan.md);
+its §2 carries the measured baseline and §4 the verified defect register.
 
 ### Capability limits — the output is thinner than the feature row implies
 
@@ -331,7 +331,7 @@ promotion happen — the `measured` flag is what makes the claim honest.
 |---|---|
 | Install / config | [`readme.md`](../../readme.md) |
 | How Review / Modernize / CodeGraph are wired | [`technical-flow.md`](technical-flow.md) |
-| CodeGraph plan (live; measured results + known limits) | [`plans/codegraph-graph-fidelity-design.md`](plans/codegraph-graph-fidelity-design.md) |
+| CodeGraph plan (live; baseline + defect register) | [`plans/codegraph-remediation-plan.md`](plans/codegraph-remediation-plan.md) |
 | Prior Modernize inversion notes | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
 | Open issues | [`open-issues.md`](open-issues.md) |
 | Prompt contract system | [`prompt-system.md`](prompt-system.md) |

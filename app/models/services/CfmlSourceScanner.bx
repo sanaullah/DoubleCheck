@@ -133,4 +133,93 @@ class threadsafe {
 		}
 		return windows;
 	}
+
+	/**
+	 * Blank out string literals and line comments so identifier scanning cannot
+	 * match inside them, preserving length so column positions stay valid.
+	 *
+	 * Without this the call extractor reads SQL keywords out of query strings:
+	 * `IN` and `JOIN` were the 1st and 8th most frequent "call targets" on this
+	 * repository, from `WHERE x IN (` and `JOIN (` inside quoted SQL.
+	 *
+	 * Interpolation spans are deliberately preserved. `"total ##count( items )##"`
+	 * contains a real call, and masking it would trade one class of wrong answer
+	 * for another. Block comments are only handled from their opening delimiter to
+	 * the end of that line — the callers scan a line at a time and carry no
+	 * cross-line state.
+	 */
+	string function maskLiterals( required string sourceLine ) {
+		var source = toString( arguments.sourceLine ?: "" );
+		var length = len( source );
+		if ( !length ) return source;
+
+		var out = [];
+		var quote = "";
+		var interpolating = false;
+		var index = 1;
+
+		while ( index <= length ) {
+			var glyph = mid( source, index, 1 );
+
+			if ( !len( quote ) ) {
+				var pair = index < length ? mid( source, index, 2 ) : "";
+				// A comment runs to end of line; nothing after it is code.
+				if ( pair == "//" || pair == "/*" ) {
+					for ( var pad = index; pad <= length; pad++ ) out.append( " " );
+					break;
+				}
+				if ( glyph == '"' || glyph == "'" || glyph == "`" ) {
+					quote = glyph;
+					out.append( glyph );
+					index++;
+					continue;
+				}
+				out.append( glyph );
+				index++;
+				continue;
+			}
+
+			// Inside a literal.
+			if ( glyph == "##" || ( quote == "`" && mid( source, index, 2 ) == '${' ) ) {
+				interpolating = !interpolating;
+				out.append( glyph );
+				index++;
+				continue;
+			}
+			if ( glyph == "}" && interpolating && quote == "`" ) {
+				interpolating = false;
+				out.append( glyph );
+				index++;
+				continue;
+			}
+			if ( interpolating ) {
+				out.append( glyph );
+				index++;
+				continue;
+			}
+			if ( glyph == quote ) {
+				// A doubled quote escapes itself in CFML/BoxLang.
+				if ( index < length && mid( source, index + 1, 1 ) == quote ) {
+					out.append( " " );
+					out.append( " " );
+					index += 2;
+					continue;
+				}
+				quote = "";
+				out.append( glyph );
+				index++;
+				continue;
+			}
+			if ( glyph == "\" && index < length ) {
+				out.append( " " );
+				out.append( " " );
+				index += 2;
+				continue;
+			}
+			out.append( " " );
+			index++;
+		}
+
+		return arrayToList( out, "" );
+	}
 }

@@ -6,8 +6,9 @@
 class threadsafe {
 	property name="codegraphParserStrategy" inject="coldbox:setting:codegraphParserStrategy";
 
-	variables.parserVersion = "boxlang-ast-parser-v4";
+	variables.parserVersion = "boxlang-ast-parser-v5";
 	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
+	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 
 	string function getVersion() {
 		return variables.parserVersion & "-strategy-" & configuredStrategy();
@@ -544,15 +545,18 @@ class threadsafe {
 		required numeric lineNumber,
 		string declaredFunction = ""
 	) {
-		var ignored = "if,for,while,switch,catch,function,new,return,throw,class,interface,property,import,route,describe,feature,story,scenario,given,when,it,then,beforeEach,afterEach,aroundEach,beforeAll,afterAll";
+		// Match against masked text so SQL and prose inside string literals cannot
+		// register as calls; evidence below still cites the original line.
 		var callMatch = match(
 			"\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\(",
-			arguments.sourceLine
+			sourceScanner.maskLiterals( arguments.sourceLine )
 		);
 		while ( callMatch.find() ) {
 			var target = callMatch.group( 1 );
 			var leafName = listLast( target, "." );
-			if ( listFindNoCase( ignored, leafName ) || ( len( arguments.declaredFunction ) && leafName == arguments.declaredFunction ) ) {
+			// Built-ins, matchers and globals can never resolve to a project
+			// file, so persisting them only consumes the edge budget.
+			if ( callTargetFilter.isNoise( target, "BoxLang" ) || ( len( arguments.declaredFunction ) && leafName == arguments.declaredFunction ) ) {
 				continue;
 			}
 			arguments.dependencies.append(

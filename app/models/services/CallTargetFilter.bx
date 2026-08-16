@@ -1,0 +1,99 @@
+/**
+ * Decides whether a parsed call target is project code or language noise.
+ *
+ * The call extractors match every `identifier(` on a source line, which sweeps
+ * up the language's own built-in functions, test-framework matchers and browser
+ * globals. None of those can resolve to a file in the project, so each one
+ * occupies a dependency row and a slot in the edge budget without ever being
+ * able to produce an edge. Measured on this repository before filtering:
+ * 39,165 `calls` rows, 95.8% unresolved, the most frequent targets being
+ * `expect`, `len`, `trim`, `toBe` and `toString`.
+ *
+ * The built-in list is read from the runtime's own `getFunctionList()` rather
+ * than a hand-maintained copy, so it cannot drift from the BoxLang version in
+ * use. The curated sets cover what the runtime cannot know about: test-framework
+ * matchers and browser globals.
+ *
+ * **Only bare identifiers are filtered.** A dotted target such as
+ * `service.method(` is how a call resolves to a file — `ArchitectureIndexService`
+ * looks the receiver up as a type — so dotted targets are kept unless the
+ * receiver is itself a known global (`document.querySelector`, `JSON.parse`).
+ *
+ * Accepted trade-off: a project function sharing a built-in's name is filtered
+ * out. At a 96% noise rate that exchange is worth making, and it is the reason
+ * this list lives in one place with a test rather than in three parsers.
+ *
+ * @see BoxLangParserService
+ * @see CfmlParserService
+ * @see JavaScriptParserService
+ */
+class {
+
+	variables.keywords = "if,for,while,switch,case,catch,try,finally,function,new,return,throw,class,interface,property,import,include,param,var,do,else,elseif,foreach,lock,thread,transaction,savecontent,cfif,cfloop,cfset";
+
+	// TestBox / BDD surface. `describe`/`it`/`expect` dominate any suite-heavy
+	// repository and none of them is project code.
+	variables.matchers = "describe,it,test,feature,story,scenario,given,when,then,and,expect,expectAll,assert,fail,beforeEach,afterEach,aroundEach,beforeAll,afterAll,toBe,toBeTrue,toBeFalse,toBeNull,toBeEmpty,toBeArray,toBeStruct,toBeString,toBeNumeric,toBeBoolean,toBeDate,toBeInstanceOf,toBeTypeOf,toBeCloseTo,toBeGT,toBeGTE,toBeLT,toBeLTE,toBeWithin,toInclude,toIncludeWithCase,toHaveLength,toHaveKey,toHaveKeyWithCase,toThrow,toMatch,toSatisfy,notToBe,toBeWithCase,notToInclude,notToBeNull,notToBeEmpty,notToHaveKey,notToThrow,notToMatch,toBeEmptyStruct,toBeEmptyArray";
+
+	// Bare JavaScript globals and constructors.
+	variables.jsGlobals = "String,Number,Boolean,Array,Object,Symbol,BigInt,Promise,Map,Set,WeakMap,WeakSet,Date,RegExp,Error,TypeError,RangeError,JSON,Math,Proxy,Reflect,parseInt,parseFloat,isNaN,isFinite,encodeURIComponent,decodeURIComponent,encodeURI,decodeURI,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,structuredClone,alert,confirm,prompt,fetch,require,super,typeof,instanceof,await,void,delete";
+
+	// Receivers whose members are platform APIs, never project files.
+	variables.globalReceivers = "document,window,console,JSON,Math,Object,Array,String,Number,Boolean,Date,Promise,Reflect,navigator,location,history,localStorage,sessionStorage,performance,crypto,URL,URLSearchParams,FormData,Headers,Response,Request,AbortController,CustomEvent,Event,Intl,globalThis,self,process,module,exports";
+
+	function init() {
+		variables.builtins = loadBuiltins();
+		return this;
+	}
+
+	/**
+	 * True when the target cannot be project code.
+	 *
+	 * @target   The captured call target, dotted or bare.
+	 * @language The owning file's language; built-ins only apply to BoxLang/CFML.
+	 */
+	boolean function isNoise( required any target, string language = "BoxLang" ) {
+		var value = trim( toString( arguments.target ?: "" ) );
+		if ( !len( value ) ) return true;
+
+		var isJavaScript = lCase( trim( toString( arguments.language ?: "" ) ) ) == "javascript";
+
+		if ( find( ".", value ) ) {
+			// Dotted targets are how a call resolves to a file. Only drop them
+			// when the receiver is a platform global.
+			return listFindNoCase( variables.globalReceivers, listFirst( value, "." ) ) > 0;
+		}
+
+		if ( listFindNoCase( variables.keywords, value ) ) return true;
+		if ( listFindNoCase( variables.matchers, value ) ) return true;
+		if ( isJavaScript ) return listFindNoCase( variables.jsGlobals, value ) > 0;
+		return variables.builtins.keyExists( lCase( value ) );
+	}
+
+	/** Count of runtime built-ins recognised; 0 means the lookup was unavailable. */
+	numeric function builtinCount() {
+		return variables.builtins.count();
+	}
+
+	/**
+	 * Built-in names from the runtime itself.
+	 *
+	 * A hand-maintained list silently rots against the runtime it is meant to
+	 * describe. If the BIF registry is unavailable the filter degrades to
+	 * keywords and matchers only — fewer rows removed, never a wrong removal.
+	 */
+	private struct function loadBuiltins() {
+		var lookup = {};
+		try {
+			var registry = getFunctionList();
+			var names = isStruct( registry ) ? structKeyArray( registry ) : ( isArray( registry ) ? registry : [] );
+			for ( var name in names ) {
+				var key = lCase( trim( toString( name ) ) );
+				if ( len( key ) ) lookup[ key ] = true;
+			}
+		} catch ( any unavailable ) {
+			return {};
+		}
+		return lookup;
+	}
+}

@@ -1,7 +1,7 @@
 # CodeGraph Domain lens — design
 
 **Status:** Approved 2026-08-06  
-**Live plan:** [codegraph-graph-fidelity-design.md](codegraph-graph-fidelity-design.md) (implementation tasks)  
+**Live plan:** [codegraph-remediation-plan.md](codegraph-remediation-plan.md) (implementation tasks)  
 **Canvas:** `codegraph-domain-lens-design.canvas.tsx` (companion)
 
 ## Goal
@@ -104,10 +104,9 @@ Unchanged spine. Add process highlight. Edge click → evidence (shipped).
 - SaaS / hosted / mobile
 
 **Superseded scope.** Two lines here are no longer accurate. "JS remains
-skipped" and the P2 deferral of a glossary are both overturned by
-[codegraph-graph-fidelity-design.md](codegraph-graph-fidelity-design.md) — JavaScript
-becomes a parsed language, and domain labels persist across runs with
-provenance. Everything else in this document stands.
+skipped" and the P2 deferral of a glossary are both overturned by the shipped
+graph-fidelity work — JavaScript is a parsed language, and domain labels persist
+across runs with provenance. Everything else in this document stands.
 
 ## Ship order
 
@@ -120,9 +119,10 @@ provenance. Everything else in this document stands.
 | P2 glossary + impact-as-story | Jargon chips; “if you change X…” | See depth plan |
 
 The substrate this design assumed is thinner than it needs to be — the parsers
-read one line at a time, and the graph has no front end and no data layer.
-[codegraph-graph-fidelity-design.md](codegraph-graph-fidelity-design.md) is the live plan that fixes
-that.
+read one line at a time, and the graph has no front end and no data layer. The
+graph-fidelity work has since shipped both; see
+[codegraph-remediation-plan.md](codegraph-remediation-plan.md) §2 for what it
+measured and §4 for what it left wrong.
 
 ## Non-goals vs Review/Modernize
 
