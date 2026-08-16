@@ -1,0 +1,94 @@
+/**
+ * Architecture rules, evaluated against the stored graph.
+ *
+ * The layer policy was a single hardcoded string parsed as comma-separated
+ * `from>to` pairs, with no escaping and no way to express anything but "this
+ * exact pair is forbidden". A rule set is the smallest thing that makes the
+ * question askable: start with three to five rules covering the boundaries that
+ * actually matter, which is the consensus starting point in the ArchUnit /
+ * dependency-cruiser family.
+ *
+ * Local evaluation only. DoubleCheck is not a CI gate and must not imply it is;
+ * this reports, it does not fail a build.
+ *
+ * @see CodeGraphGraphRepository
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * Evaluate rules against file-level edges.
+	 *
+	 * A rule is `{ id, description, from, to, allowed }` where `from` and `to`
+	 * match a path fragment. `allowed: false` means the dependency is a
+	 * violation; `allowed: true` expresses an allow-list boundary — everything
+	 * from `from` that is not to `to` is reported.
+	 */
+	struct function evaluate( required array edges, required array rules ) {
+		var results = [];
+		var totalViolations = 0;
+		for ( var rule in arguments.rules ) {
+			if ( !isStruct( rule ) ) continue;
+			var from = lCase( trim( toString( rule.from ?: "" ) ) );
+			var to = lCase( trim( toString( rule.to ?: "" ) ) );
+			if ( !len( from ) || !len( to ) ) continue;
+			var allowed = isBoolean( rule.allowed ?: "" ) ? rule.allowed : false;
+
+			var violations = [];
+			for ( var edge in arguments.edges ) {
+				if ( !isStruct( edge ) ) continue;
+				var source = lCase( trim( toString( edge.from ?: "" ) ) );
+				var target = lCase( trim( toString( edge.to ?: "" ) ) );
+				if ( !find( from, source ) ) continue;
+				var matchesTarget = find( to, target ) > 0;
+				// A forbidden pair violates on a match; an allow-list violates on
+				// everything that is not the permitted target.
+				if ( allowed == !matchesTarget ) {
+					violations.append( {
+						from    : edge.from ?: "",
+						to      : edge.to ?: "",
+						kind    : edge.kind ?: "",
+						evidence: edge.evidence ?: "",
+						line    : val( edge.line ?: 0 )
+					} );
+				}
+			}
+			violations.sort( ( a, b ) => {
+				var byFrom = compareNoCase( a.from, b.from );
+				return byFrom != 0 ? byFrom : compareNoCase( a.to, b.to );
+			} );
+			totalViolations += violations.len();
+			results.append( {
+				id         : trim( toString( rule.id ?: from & "-" & to ) ),
+				description: trim( toString( rule.description ?: "" ) ),
+				from       : from,
+				to         : to,
+				allowed    : allowed,
+				passed     : !violations.len(),
+				violations : violations.len() > 25 ? violations.slice( 1, 25 ) : violations,
+				violationCount: violations.len()
+			} );
+		}
+		return {
+			rules     : results,
+			passed    : totalViolations == 0,
+			violations: totalViolations,
+			evaluated : results.len()
+		};
+	}
+
+	/**
+	 * The default set: small on purpose.
+	 *
+	 * Three rules covering the boundaries this product already has opinions
+	 * about. More rules than a reader will actually maintain is how a rule set
+	 * becomes noise that everyone learns to ignore.
+	 */
+	array function defaultRules() {
+		return [
+			{ id: "models-must-not-call-handlers", description: "Application models must not depend on HTTP handlers", from: "/models/", to: "/handlers/", allowed: false },
+			{ id: "views-must-not-reach-repositories", description: "Views must not reach the data layer directly", from: "/views/", to: "/repositories/", allowed: false },
+			{ id: "handlers-must-not-reach-repositories", description: "Handlers should go through a service, not straight to a repository", from: "/handlers/", to: "/repositories/", allowed: false }
+		];
+	}
+}

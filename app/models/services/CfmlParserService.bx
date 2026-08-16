@@ -8,9 +8,10 @@
 
 @singleton
 class {
-	variables.parserVersion = "cfml-symbol-parser-v5";
+	variables.parserVersion = "cfml-symbol-parser-v6";
 	variables.patternCache  = {};
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
+	variables.integrationDetector = new app.models.services.IntegrationDetector();
 
 	string function getVersion() {
 		return variables.parserVersion;
@@ -234,6 +235,32 @@ class {
 					sourceLine,
 					lineNumber
 				);
+			}
+
+			// G14: CFML had neither of these, so a ColdFusion project could not
+			// answer "how does a route reach a handler" or show view rendering at
+			// all — a supported language producing a strictly weaker graph.
+			var routeMatch = match( "route\s*\(\s*[""']([^""']+)[""']", sourceLine );
+			if ( routeMatch.find() ) {
+				symbols.append( symbol( "route", routeMatch.group( 1 ), lineNumber, sourceLine ) );
+				var routeWindow = joinTagLines( arguments.file.lines, lineNumber );
+				var routeText = routeWindow.text;
+				var actionMatch = match( "\.withAction\s*\(\s*[""']([^""']+)[""']", routeText );
+				var handlerMatch = match( "\.toHandler\s*\(\s*[""']([^""']+)[""']", routeText );
+				var verbMatch = match( "\.withVerbs?\s*\(\s*[""']([^""']+)[""']", routeText );
+				if ( handlerMatch.find() ) {
+					dependencies.append( dependency( "routes", routeMatch.group( 1 ), lineNumber, routeText, routeWindow.endLine, {
+						pattern: routeMatch.group( 1 ),
+						action : actionMatch.find() ? actionMatch.group( 1 ) : "",
+						verb   : verbMatch.find() ? verbMatch.group( 1 ) : "",
+						handler: handlerMatch.group( 1 )
+					} ) );
+				}
+			}
+			var viewMatch = match( "(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']|<cfinclude\s+template\s*=\s*[""']([^""']+\.cfm)[""']", sourceLine );
+			if ( viewMatch.find() ) {
+				var viewTarget = isNull( viewMatch.group( 1 ) ) ? viewMatch.group( 2 ) : viewMatch.group( 1 );
+				if ( len( trim( toString( viewTarget ?: "" ) ) ) ) dependencies.append( dependency( "renders", viewTarget, lineNumber, sourceLine ) );
 			}
 
 			addCallDependencies(
@@ -643,9 +670,12 @@ class {
 	private void function extractResourceDependencies( required array dependencies, required string sourceLine, required numeric lineNumber ) {
 		var scopeMatch = match( "\b(application|session|client)\.([A-Za-z_][A-Za-z0-9_]*)", arguments.sourceLine );
 		while ( scopeMatch.find() ) appendUniqueDependency( arguments.dependencies, "scope.#scopeMatch.group( 1 )#", scopeMatch.group( 2 ), arguments.lineNumber, arguments.sourceLine );
-		var httpMatch = match( "\b(?:http|httpService)\s*\(\s*[""']([^""']+)[""']", arguments.sourceLine );
-		if ( httpMatch.find() ) appendUniqueDependency( arguments.dependencies, "http", httpMatch.group( 1 ), arguments.lineNumber, arguments.sourceLine );
-		if ( match( "\bschedule\s*\(", arguments.sourceLine ).find() ) appendUniqueDependency( arguments.dependencies, "schedule", "schedule", arguments.lineNumber, arguments.sourceLine );
+		// Shared with Modernize so "what does this talk to" cannot be answered two
+		// different ways on the same file. The previous test needed a literal URL
+		// as the first argument of `http(` and therefore never fired.
+		for ( var integration in integrationDetector.detect( arguments.sourceLine ) ) {
+			appendUniqueDependency( arguments.dependencies, integration.kind, integration.target, arguments.lineNumber, arguments.sourceLine );
+		}
 	}
 
 	private void function extractSqlDependencies( required array dependencies, required array lines ) {

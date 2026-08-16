@@ -5,6 +5,19 @@
 @singleton
 class threadsafe {
 	property name="modernizationExportService" inject="ModernizationExportService";
+	property name="diagramService" inject="CodeGraphDiagramService";
+
+	/**
+	 * Lazily resolve collaborators so a directly-constructed instance still works.
+	 * Specs and small local callers build this service with `new`, which does not
+	 * run WireBox injection.
+	 */
+	function init() {
+		if ( isNull( variables.diagramService ?: javacast( "null", "" ) ) ) {
+			variables.diagramService = new app.models.services.CodeGraphDiagramService();
+		}
+		return this;
+	}
 	variables.supportedFormats = [ "json", "markdown", "sarif"];
 	variables.sarifLevels = {
 		critical: "error",
@@ -91,10 +104,10 @@ class threadsafe {
 	) {
 		var normalized = lCase( trim( arguments.format ) );
 		if ( normalized == "md" ) normalized = "markdown";
-		if ( !listFindNoCase( "markdown,json,mermaid,svg", normalized ) ) {
+		if ( !listFindNoCase( "markdown,json,mermaid,svg,sequence,matrix", normalized ) ) {
 			throw(
 				type    = "ValidationException",
-				message = "Unsupported CodeGraph export format. Use markdown, json, mermaid, or svg."
+				message = "Unsupported CodeGraph export format. Use markdown, json, mermaid, svg, sequence, or matrix."
 			);
 		}
 
@@ -128,7 +141,23 @@ class threadsafe {
 				normalized,
 				"image/svg+xml; charset=utf-8",
 				"doublecheck-codegraph-#runToken#.svg",
-				toCodeGraphSvg( snapshot )
+				diagrams().toCodeGraphSvg( snapshot )
+			);
+		}
+		if ( normalized == "matrix" ) {
+			return package(
+				normalized,
+				"image/svg+xml; charset=utf-8",
+				"doublecheck-codegraph-#runToken#-matrix.svg",
+				diagrams().toCodeGraphMatrix( snapshot )
+			);
+		}
+		if ( normalized == "sequence" ) {
+			return package(
+				normalized,
+				"image/svg+xml; charset=utf-8",
+				"doublecheck-codegraph-#runToken#-flow.svg",
+				diagrams().toCodeGraphSequence( snapshot, arguments.options )
 			);
 		}
 		return package(
@@ -248,24 +277,11 @@ class threadsafe {
 		return arrayToList( lines, char( 10 ) ) & char( 10 );
 	}
 
-	private string function toCodeGraphSvg( required struct snapshot ) {
-		var nodes = isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [];
-		var svgHeight = max( 140, min( 900, 80 + nodes.len() * 24 ) );
-		var hash = char( 35 );
-		var lines = [
-			'<svg xmlns="http://www.w3.org/2000/svg" width="960" height="' & svgHeight & '" role="img" aria-label="DoubleCheck CodeGraph">',
-			'<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>',
-			'<text x="24" y="32" font-family="sans-serif" font-size="18" fill="' & hash & '1f2937">DoubleCheck CodeGraph</text>'
-		];
-		var visible = min( 32, nodes.len() );
-		for ( var index = 1; index <= visible; index++ ) {
-			var node = nodes[ index ];
-			var label = xmlEscape( node.path ?: node.id ?: "node" );
-			lines.append( '<text x="32" y="' & ( 60 + index * 22 ) & '" font-family="monospace" font-size="12" fill="' & hash & '374151">' & label & '</text>' );
+	private any function diagrams() {
+		if ( isNull( variables.diagramService ?: javacast( "null", "" ) ) ) {
+			variables.diagramService = new app.models.services.CodeGraphDiagramService();
 		}
-		if ( nodes.len() > visible ) lines.append( '<text x="32" y="' & ( 82 + visible * 22 ) & '" font-family="sans-serif" font-size="12" fill="' & hash & '6b7280">+' & ( nodes.len() - visible ) & ' more nodes</text>' );
-		lines.append( "</svg>" );
-		return arrayToList( lines, char( 10 ) );
+		return variables.diagramService;
 	}
 
 	private string function mermaidLabel( required any value ) {

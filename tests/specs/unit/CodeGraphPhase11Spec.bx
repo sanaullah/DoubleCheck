@@ -1,0 +1,78 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Architecture rules, SCIP export and the MCP descriptor", () => {
+
+			var rules = new app.models.services.ArchitectureRuleService();
+			var diagrams = new app.models.services.CodeGraphDiagramService();
+			var descriptor = new app.models.services.CodeGraphMcpDescriptor();
+
+			var edges = [
+				{ from: "file:app/models/OrderService.bx", to: "file:app/handlers/ApiOrders.bx", kind: "calls", evidence: "handler.index()", line: 12 },
+				{ from: "file:app/models/OrderService.bx", to: "file:app/repositories/OrderRepo.bx", kind: "injects", evidence: "inject", line: 4 },
+				{ from: "file:app/handlers/ApiOrders.bx", to: "file:app/models/OrderService.bx", kind: "calls", evidence: "service.place()", line: 20 }
+			];
+
+			it( "reports a forbidden dependency with the edge that proves it", () => {
+				var result = rules.evaluate( edges, [
+					{ id: "no-models-to-handlers", description: "models must not depend on handlers", from: "/models/", to: "/handlers/", allowed: false }
+				] );
+
+				expect( result.passed ).toBeFalse();
+				expect( result.violations ).toBe( 1 );
+				expect( result.rules[ 1 ].violations[ 1 ].evidence ).toBe( "handler.index()" );
+				expect( result.rules[ 1 ].violations[ 1 ].line ).toBe( 12 );
+			} );
+
+			it( "passes a rule nothing violates", () => {
+				var result = rules.evaluate( edges, [
+					{ id: "no-views-to-repos", from: "/views/", to: "/repositories/", allowed: false }
+				] );
+
+				expect( result.passed ).toBeTrue();
+				expect( result.rules[ 1 ].violationCount ).toBe( 0 );
+			} );
+
+			it( "ships a small default set rather than an unmaintainable one", () => {
+				// More rules than anyone maintains is how a rule set becomes noise.
+				expect( rules.defaultRules().len() ).toBeLTE( 5 );
+				expect( rules.defaultRules().len() ).toBeGTE( 3 );
+			} );
+
+			it( "emits a SCIP-shaped document with one entry per file", () => {
+				var json = diagrams.toScipDocument(
+					{ version: "codegraph-snapshot-v2", projectPath: "/tmp/p" },
+					[
+						{ id: "symbol:a", path: "app/A.bx", symbolName: "run", kind: "function", line: 3, endLine: 9 },
+						{ id: "symbol:b", path: "app/B.bx", symbolName: "save", kind: "function", line: 5, endLine: 8 }
+					],
+					[ { from: "symbol:a", to: "symbol:b", kind: "calls" } ]
+				);
+				var parsed = jsonDeserialize( json );
+
+				expect( parsed.metadata.version ).toBe( "scip-shaped-v1" );
+				expect( parsed.documents ).toHaveLength( 2 );
+				expect( parsed.documents[ 1 ].relativePath ).toBe( "app/A.bx" );
+				expect( parsed.documents[ 1 ].symbols[ 1 ].relationships ).toHaveLength( 1 );
+			} );
+
+			it( "describes every query as an MCP tool with a schema", () => {
+				var tools = descriptor.tools();
+
+				expect( tools.len() ).toBeGTE( 8 );
+				for ( var tool in tools ) {
+					expect( len( trim( tool.name ) ) ).toBeGT( 0 );
+					expect( len( trim( tool.description ) ) ).toBeGT( 0 );
+					expect( tool.inputSchema.type ).toBe( "object" );
+				}
+			} );
+
+			it( "states the empty-versus-missing contract an agent cannot infer", () => {
+				// The whole reason this is gated behind a truthful graph.
+				expect( descriptor.contract().emptyVsMissing ).toInclude( "409" );
+				expect( descriptor.contract().localOnly ).toBeTrue();
+				expect( descriptor.contract().unsupported ).toInclude( "reflection" );
+			} );
+		} );
+	}
+}

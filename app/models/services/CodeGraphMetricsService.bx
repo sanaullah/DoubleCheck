@@ -20,6 +20,7 @@ class threadsafe {
 	property name="inventoryAdapter" inject="CodeGraphInventoryAdapter";
 	property name="flowService" inject="CodeGraphFlowService";
 	property name="completenessService" inject="CodeGraphCompletenessService";
+	property name="centralityService" inject="CodeGraphCentralityService";
 
 	variables.snapshotVersion = "codegraph-snapshot-v2";
 	variables.defaultCaps = {
@@ -51,6 +52,9 @@ class threadsafe {
 		}
 		if ( isNull( variables.completenessService ?: javacast( "null", "" ) ) ) {
 			variables.completenessService = new app.models.services.CodeGraphCompletenessService();
+		}
+		if ( isNull( variables.centralityService ?: javacast( "null", "" ) ) ) {
+			variables.centralityService = new app.models.services.CodeGraphCentralityService();
 		}
 		return this;
 	}
@@ -105,7 +109,33 @@ class threadsafe {
 			// Select by importance, then restore path order for presentation so
 			// the returned array stays stable and comparable.
 			nodeRanking = "hotspotScore";
-			nodes = completenessService.rankNodes( nodes, caps.maxNodes );
+			// Routes and tables score 0 by construction, so a plain ranked cut
+			// removes every entry point and sink first — and because flows are
+			// filtered against the visible set, the process list then empties on
+			// exactly the large repositories it exists for. They are bounded by the
+			// route and table count, not by repository size, so they are exempt.
+			nodeRanking = "centrality";
+			var syntheticNodes = [];
+			var rankableNodes = [];
+			for ( var candidate in nodes ) {
+				if ( isSyntheticNode( candidate ) ) syntheticNodes.append( candidate );
+				else rankableNodes.append( candidate );
+			}
+			var rankBudget = max( 1, caps.maxNodes - syntheticNodes.len() );
+			// Structure decides what the graph keeps; hotspotScore stays for display.
+			var centralityByFile = centralityService.rank( graph, rankableNodes );
+			for ( var rankable in rankableNodes ) {
+				rankable.centrality = centralityByFile[ normalizePath( rankable.id ?: rankable.path ?: "" ) ] ?: 0;
+			}
+			rankableNodes.sort( ( a, b ) => {
+				var aRank = val( a.centrality ?: 0 );
+				var bRank = val( b.centrality ?: 0 );
+				if ( aRank != bRank ) return aRank > bRank ? -1 : 1;
+				return compareNoCase( a.path ?: "", b.path ?: "" );
+			} );
+			nodes = rankableNodes.slice( 1, min( rankBudget, rankableNodes.len() ) );
+			for ( var kept in syntheticNodes ) nodes.append( kept );
+			nodes.sort( ( a, b ) => compareNoCase( a.path ?: "", b.path ?: "" ) );
 		}
 		var visibleNodes = {};
 		for ( var visibleNode in nodes ) visibleNodes[ normalizePath( visibleNode.id ?: visibleNode.path ?: "" ) ] = true;
@@ -143,6 +173,10 @@ class threadsafe {
 		// ordering. `truncated` says only that something was lost somewhere.
 		var completeness = completenessService.report( {
 			loaded              : arguments.reviewGraph.completeness ?: {},
+			clusterCount        : clusters.len(),
+			availableClusters   : rawClusters.len(),
+			flowCandidateCount  : val( truncation.flowCandidates ?: flows.len() ),
+			layerViolationCandidateCount: val( truncation.layerViolationCandidates ?: layerViolations.len() ),
 			graph               : graph,
 			nodeCount           : nodes.len(),
 			availableNodes      : availableNodes,
@@ -186,7 +220,7 @@ class threadsafe {
 			unreachable        : reachability.unreachable,
 			reachability       : reachability.summary,
 			coChange           : coChangeSummary( coChange ),
-			hotspotFormula     : hotspotFormula(),
+			hotspotFormula     : centralityService.hotspotFormula(),
 			canonicalPaths     : inventory.canonicalPaths ?: {}
 		};
 	}
@@ -224,7 +258,17 @@ class threadsafe {
 
 		if ( ordered.len() > arguments.caps.maxClusters ) {
 			markTruncated( arguments.truncation, "maxClusters" );
+			// Slicing an id-sorted list deletes late-alphabet domains wholesale.
+			// Keep the largest domains, then restore id order for presentation so
+			// the returned array stays stable and comparable.
+			ordered.sort( ( a, b ) => {
+				var aSize = isArray( a.filePaths ?: "" ) ? a.filePaths.len() : 0;
+				var bSize = isArray( b.filePaths ?: "" ) ? b.filePaths.len() : 0;
+				if ( aSize != bSize ) return aSize > bSize ? -1 : 1;
+				return compareNoCase( a.id ?: "", b.id ?: "" );
+			} );
 			ordered = ordered.slice( 1, arguments.caps.maxClusters );
+			ordered.sort( ( a, b ) => compareNoCase( a.id ?: "", b.id ?: "" ) );
 		}
 
 		var presented = [];
@@ -273,7 +317,7 @@ class threadsafe {
 			var changeCount = 0;
 			var lastTouched = "";
 			for ( var path in ( cluster.filePaths ?: [] ) ) {
-				var key = lCase( replace( trim( toString( path ) ), "\\", "/", "all" ) );
+				var key = lCase( replace( trim( toString( path ) ), "\", "/", "all" ) );
 				var fileStats = arguments.coChange.files[ key ] ?: {};
 				changeCount += val( fileStats.changeCount ?: 0 );
 				for ( var author in ( fileStats.authors ?: [] ) ) {
@@ -303,10 +347,6 @@ class threadsafe {
 			files     : val( arguments.coChange.filesChanged ?: 0 ),
 			pairCount : val( arguments.coChange.pairCount ?: 0 )
 		};
-	}
-
-	private string function hotspotFormula() {
-		return "((max(1,fanIn) + 0.5*fanOut) * max(1,churnCount) * cycleMultiplier) + crossingEdges; churnCount=1 when Git history is unavailable";
 	}
 
 	private array function buildClusterEdges( required any graph, required struct clusterOf, required struct truncation ) {
@@ -428,7 +468,7 @@ class threadsafe {
 			} );
 			var churnStats = arguments.churnByFile[ key ] ?: {};
 			var churn = val( churnStats.changeCount ?: 0 );
-			var score = hotspotScore( fanInValue, fanOutValue, churn, inCycle, crossing );
+			var score = centralityService.hotspotScore( fanInValue, fanOutValue, churn, inCycle, crossing );
 
 			nodes.append( {
 				id           : key,
@@ -445,7 +485,11 @@ class threadsafe {
 				churnCount   : churn,
 				clusterId    : clusterId,
 				hotspotScore : round4( score ),
-				inCycle      : inCycle
+				inCycle      : inCycle,
+				// A ranking nobody can interrogate is a ranking nobody trusts, and
+				// the formula was published once per snapshot rather than per node.
+				// Every input is already computed here; only the product survived.
+				rankRationale: centralityService.rankRationale( fanInValue, fanOutValue, churn, inCycle, crossing )
 			} );
 		}
 
@@ -513,7 +557,9 @@ class threadsafe {
 		for ( var key in evidence ) {
 			var path = lCase( key );
 			if ( reFind( "(^|/)public/assets?/", path ) || listFindNoCase( "js,jsx,mjs", listLast( path, "." ) ) ) evidence[ key ].clientAsset = true;
-			if ( ( evidence.injects ?: 0 ) >= 2 && ( evidence.symbols ?: 0 ) <= 12 ) evidence[ key ].orchestrator = true;
+			// Read the entry, not the map: `evidence.injects` resolved against the
+			// outer path-keyed struct, was always 0, and left this branch dead.
+			if ( ( evidence[ key ].injects ?: 0 ) >= 2 && ( evidence[ key ].symbols ?: 0 ) <= 12 ) evidence[ key ].orchestrator = true;
 		}
 		return evidence;
 	}
@@ -556,19 +602,6 @@ class threadsafe {
 			counts[ to ] = ( counts[ to ] ?: 0 ) + 1;
 		}
 		return counts;
-	}
-
-	private numeric function hotspotScore(
-		required numeric fanIn,
-		required numeric fanOut,
-		required numeric churn,
-		required boolean inCycle,
-		required numeric crossingEdgeCount
-	) {
-		return ( max( 1, arguments.fanIn ) + ( 0.5 * max( 0, arguments.fanOut ) ) ) *
-			max( 1, arguments.churn ) *
-			( arguments.inCycle ? 2 : 1 ) +
-			arguments.crossingEdgeCount;
 	}
 
 	private array function selectHotspots( required array nodes, required numeric limit, required struct truncation ) {

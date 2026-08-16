@@ -1,0 +1,113 @@
+/**
+ * The CodeGraph query surface described as MCP tools.
+ *
+ * A category of local-first MCP servers exists to give a coding agent a queryable
+ * knowledge graph so it stops re-reading files to answer structural questions.
+ * DoubleCheck already built the expensive part: the graph is indexed SQLite rows
+ * and `/api/v1/runs/:id/codegraph/*` is exactly the tool surface those servers
+ * expose. This describes that surface in MCP's shape so an adapter is a thin
+ * translation rather than a second implementation.
+ *
+ * Descriptor only — this does not open a socket or speak the protocol. Shipping
+ * a transport would be a second product path; describing the tools is what makes
+ * one cheap to add and keeps the contract in one place.
+ *
+ * **It must not be exposed before the graph tells the truth.** An agent cannot
+ * distinguish an empty graph from an empty result, so a run without levelled
+ * rows would have it confidently report that a symbol has no callers. Every tool
+ * here answers 409 in that state rather than an empty list.
+ *
+ * @see ApiCodeGraph
+ */
+@singleton
+class threadsafe {
+
+	/** MCP-shaped tool definitions for one run's graph. */
+	array function tools() {
+		return [
+			tool(
+				"codegraph_search",
+				"Find code entities by path, symbol name, role or kind, including ones no diagram draws.",
+				{ q: text( "Search term", true ), level: enumeration( "Restrict to one level", [ "cluster", "directory", "file", "symbol" ] ), limit: number( "Maximum matches", 50 ) }
+			),
+			tool(
+				"codegraph_neighbours",
+				"What calls a node and what it calls, with evidence and a confidence class.",
+				{ node: text( "Node id", true ), direction: enumeration( "Which side", [ "both", "incoming", "outgoing" ] ), limit: number( "Maximum edges", 100 ) }
+			),
+			tool(
+				"codegraph_hierarchy",
+				"What a type extends or implements, and what does so to it.",
+				{ node: text( "Node id", true ) }
+			),
+			tool(
+				"codegraph_lineage",
+				"Which files read a table and which write it.",
+				{ table: text( "Table name", true ) }
+			),
+			tool(
+				"codegraph_impact",
+				"What breaks if a node changes: its transitive callers, depth-bounded.",
+				{ node: text( "Node id", true ), depth: number( "How many hops", 3 ), limit: number( "Maximum nodes", 200 ) }
+			),
+			tool(
+				"codegraph_paths",
+				"Bounded directed dependency paths between two nodes, with per-hop evidence.",
+				{ from: text( "Start node", true ), to: text( "End node", true ), direction: enumeration( "Traversal", [ "forward", "reverse", "any" ] ) }
+			),
+			tool(
+				"codegraph_onboarding",
+				"Where to start reading an unfamiliar project: entry points, largest domains, most depended-upon files.",
+				{ limit: number( "Entries per section", 6 ) }
+			),
+			tool(
+				"codegraph_source",
+				"A small source window around a cited line, so a claim can be checked.",
+				{ path: text( "Repository-relative path", true ), line: number( "Focus line", 1 ) }
+			)
+		];
+	}
+
+	/**
+	 * The contract an adapter must honour.
+	 *
+	 * Stated explicitly because the failure mode is silent: an agent that cannot
+	 * tell "no graph" from "no result" will assert the second when it means the
+	 * first, and its answer reads exactly like a correct one.
+	 */
+	struct function contract() {
+		return {
+			transport      : "none — descriptor only",
+			completeness   : "every response carries returned, available, omitted, unresolved and state",
+			emptyVsMissing : "a run without levelled rows answers 409, never an empty list",
+			evidence       : "every edge carries file:line evidence and a resolution class",
+			unsupported    : [ "dynamic component construction", "reflection", "runtime wiring", "dynamic SQL" ],
+			localOnly      : true
+		};
+	}
+
+	private struct function tool( required string name, required string description, required struct properties ) {
+		var required = [];
+		for ( var key in properties ) if ( properties[ key ].required ?: false ) required.append( key );
+		required.sort( ( a, b ) => compareNoCase( a, b ) );
+		var schema = { type: "object", properties: {}, required: required };
+		for ( var key in properties ) {
+			var property = duplicate( properties[ key ] );
+			property.delete( "required" );
+			schema.properties[ key ] = property;
+		}
+		return { name: arguments.name, description: arguments.description, inputSchema: schema };
+	}
+
+	private struct function text( required string description, boolean required = false ) {
+		return { type: "string", description: arguments.description, required: arguments.required };
+	}
+
+	private struct function number( required string description, numeric fallback = 0 ) {
+		return { type: "integer", description: arguments.description, default: arguments.fallback, required: false };
+	}
+
+	private struct function enumeration( required string description, required array values ) {
+		return { type: "string", description: arguments.description, enum: arguments.values, required: false };
+	}
+}

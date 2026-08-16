@@ -1,6 +1,6 @@
 # CodeGraph — remediation plan and Code Graph / Knowledge Graph roadmap
 
-**Status: Phase 1 complete and measured (see §18); Phases 2–11 proposed, not scheduled.**
+**Status: Phases 1–7, 9 and 10 complete (see §18–§24); Phases 8 and 11 proposed.**
 
 **Evidence base.** Every `file:line` was re-validated against the working tree on
 2026-08-16 (branch `dev3`, base `caf64b4`, worktree dirty and preserved). Counts
@@ -34,7 +34,7 @@ is **untouched** — designed and evidenced in this document, no code written.
 
 **Legend:** ✅ done · 🟡 partial · ⬜ not started
 
-### Shipped so far — Phase 1 complete (2026-08-16, uncommitted)
+### Shipped so far — Phases 1–4 complete, Phase 5 partial (2026-08-16, uncommitted)
 
 | ID | Item | State | What exists now |
 |---|---|---|---|
@@ -43,6 +43,38 @@ is **untouched** — designed and evidenced in this document, no code written.
 | — | Stale hardcoded reuse-key fallback | ✅ | `CodeGraphRunService.bx` fallback signature now tracks the bumped parser versions |
 | — | Parser version invalidation | ✅ | `boxlang-ast-parser-v5`, `cfml-symbol-parser-v5`, `javascript-symbol-parser-v4` |
 | — | Test coverage for the filter | ✅ | `tests/specs/unit/CallTargetFilterSpec.bx`, 10 specs |
+| **D1** | Reuse never wrote levelled rows | ✅ | `adoptRunGraph` copies `codegraph_nodes`/`codegraph_edges`; spec asserts the adopted run has rows |
+| **D2** | Search said "no match" for "no graph" | ✅ | `/codegraph/search` returns 409 when the run has no levelled storage |
+| **D3** | `complete: true` on an empty set | ✅ | `complete` requires `available > 0`; new `state` of `empty`/`complete`/`truncated` |
+| **D4** | Level edges dropped by the node cap | ✅ | Node ids bound into the edge SQL (chunked), ranked after merge, plus `edgeCompleteness` |
+| **D5** | Symbol `calls` edges could not form | ✅ | Dotted-leaf match. **symbol/calls 0 → 1,499** |
+| **D6** | Completeness entries self-certified | ✅ | Real denominators for flows, layer violations and clusters |
+| **D8** | Banner reported snapshot, not view | ✅ | View-level "drawing N of M nodes/edges" lines first |
+| **D9** | 409 set a flag nothing read | ✅ | Symbol panel states the level is unavailable and why |
+| **D12** | Clusters capped alphabetically | ✅ | Ranked by file count, id order restored; `clusters` completeness entry added |
+| **D18 + G-j** | Stage health never persisted | ✅ | `stage_health_json` column + `saveStageHealth`; verified `{"projection":{"ok":true,...},"narrative":{"used":true,...}}` |
+| **D25** | Cap deleted routes/tables, emptying flows | ✅ | Synthetic nodes exempt from the ranked cut |
+| **D30** | Unguarded snapshot deserialise | ✅ | Returns `unreadable: true` instead of throwing; spec covers a corrupt row |
+| **D27** | Directory level had no parent | ✅ | Ancestor chain materialised: **62 directories, 58 parented** (was 0) |
+| **G9** | No confidence/provenance on edges | ✅ | `resolution`/`provenance`/`confidence` columns. Measured: exact/high 26, heuristic/medium 1,977, heuristic/low 2,096, derived 120 |
+| **BD-4** | Labels keyed on exact membership | ✅ | Keyed on the deepest shared directory; spec proves a label survives a domain gaining a file |
+| **G13** | CodeGraph extraction weaker than Modernize | ✅ | Shared `IntegrationDetector`. **`http` 0 → 7**, and it names the host — `api.anthropic.com` |
+| **G14** | CFML second-class | ✅ | `CfmlParserService` gained `routes` and `renders` detectors |
+| **G15** | `integration` role unreachable | ✅ | **6 files** now carry it (was 0) |
+| **G1b** | `http`/`schedule` detectors could not fire | ✅ | Both produce rows; `filesystem` (4) and `java` (2) added |
+| **G3** | Data access collapsed to one kind | ✅ | Read/write split: **137 `table-write`, 87 `table-read`**, 2 ambiguous (was 223 undifferentiated) |
+| **D31** | Rejected narrative vanished silently | ✅ | `rejected: { domains, processes, onboarding, risk }` counts returned |
+| **E1 + BD-3** | Display metric decided retention | ✅ | New `CodeGraphCentralityService` — PageRank-style power iteration, fixed iterations for determinism. Retention uses centrality; `hotspotScore` is display-only |
+| **E9** | Rank was an opaque number | ✅ | Per-node `rankRationale` — "12 callers · 3 commits · in a cycle" |
+| **G5/G7 (query surface)** | No callers, hierarchy, lineage or impact query | ✅ | Four endpoints — `/neighbours`, `/hierarchy`, `/lineage`, `/impact` — each with a completeness account |
+| **G-c** | `format=svg` was a text list | ✅ | Real cluster diagram: **13 boxes, 15 dependency lines** on a live run; light paper palette, no remote fonts |
+| **G-d** | Nothing rendered a flow | ✅ | `format=sequence` — participants as columns, hops as rows, unresolved hops render "(file level)" |
+| **G10** | No "start here" view | ✅ | `/codegraph/onboarding` — entry points, largest domains, most depended-upon files, each with a stated reason |
+| **D10** | Orchestrator evidence branch dead | ✅ | Reads `evidence[key]`, not the outer map; roles re-measured |
+| **D7** | `subgraph.truncated` always true | ✅ | True only when the limit was hit or the frontier remained; spec now asserts both cases |
+| **D13/D14/D15** | Handler contract holes | ✅ | `codegraphMaxNodes` injected; `include`/`rank` validated (422); unknown `scope` → 404; `edgeLimit` reachable |
+| **D17** | Wrong `"\\"` literal at two sites | ✅ | Both corrected; zero occurrences remain |
+| **D26** | Layout order depended on locale | ✅ | All 7 `localeCompare` tie-breaks replaced with a stable comparator + the byte-identical determinism spec that never existed |
 
 Files: `CallTargetFilter.bx` (new), `CallTargetFilterSpec.bx` (new), and edits to
 `BoxLangParserService`, `CfmlParserService`, `JavaScriptParserService`,
@@ -53,26 +85,28 @@ Plus `CfmlSourceScanner.maskLiterals` + 6 specs. Suite: **691 passed / 0 failed 
 
 | Group | IDs | Count |
 |---|---|---|
-| Root decisions | BD-3, BD-4 | 2 ⬜ |
-| Severity 1 defects | D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D12, D25, D26, D27, D30, D31 | 16 ⬜ |
-| Severity 2 defects | D13, D14, D15, D16, D18, D28, D29 | 7 ⬜ |
-| Severity 3 defects | D11, D17, D19, D20, D21, D22, D23, D24 | 8 ⬜ |
+| Root decisions | — | 0 ⬜ |
+| Severity 1 defects | — | 0 ⬜ |
+| Severity 2 defects | D16, D28, D29 | 3 ⬜ |
+| Severity 3 defects | D11, D19, D20, D21, D22, D23, D24 | 7 ⬜ |
 | Invariant guard | INV-1 | 1 ⬜ |
-| Capability gaps | G1a, G1b, G1c, G2–G15, G-a, G-c, G-d, G-e, G-i, G-j | 23 ⬜ |
-| Enhancements | E1–E9 | 9 ⬜ |
+| Capability gaps | G1a, G1c, G2, G4, G6, G8, G11, G12(diff), G-a, G-e, G-i | 11 ⬜ |
+| Enhancements | E2–E8 | 7 ⬜ |
 
-**Comprehension score is unchanged at 3 of 17** (§2). Phase 1 improves the *data*
-the graph is built from; it does not by itself answer any new question. The score
-moves at Phase 3 and Phase 5.
+**Comprehension score: 5 of 17.** Q9 ("which symbols call, construct or extend
+another") and **Q17** ("what external systems does this talk to") both moved from
+*No* to *yes*. The symbol level carries 1,499 `calls`, 787 `constructs`, 315
+`injects`, 11 `type-reference` and 1 `extends`; outbound integrations are detected
+and named. Q4 improved — scheduled work is now visible. The rest needs the
+remaining Phase 5 producers and Phases 6–10.
 
 ### Immediate next steps, in order
 
-1. **Phase 2** — D1, D2, D3, D9, D18, D30, G-j: the warm path telling the truth.
-   D1 still needs a clean worktree to reproduce.
-2. **Phase 3** — D4, D5, D6, D8, D12, D25. D5's dotted-leaf fix now operates on a
-   clean edge set; symbol/`calls` moved 0 → 35 from Phase 1 alone, so the ceiling
-   is much higher than the original 991-edge baseline suggested.
-3. **Phase 4** — ontology, evidence and confidence columns.
+1. **Finish Phase 5** — still open: `emits`/`handles` producers (G1a), SQL
+   read/write split (G3), configuration as an entity (G6), symbol-level change
+   impact (G7), test→production symbol linkage (Q11), defines-vs-references (G5).
+2. **Phase 6** — roles and contract hygiene (D10, D7, D13–D17, D26, D28, D29).
+3. **Phase 7** — centrality ranking and explainability (E1, E9, BD-3).
 
 ---
 
@@ -840,3 +874,170 @@ Phase 4's ontology work.
 
 symbol 5,135 · file 407 · cluster 42 · directory 40 (was 5,108 / 405 / 31 / 40).
 More clusters because the added structural edges change the clustering input.
+
+---
+
+## 19. Phases 2–3 — measured outcome (2026-08-16)
+
+Run `eaccb7ec`, indexed after all Phase 1–3 changes.
+
+| Metric | Original | After Ph 1 | After Ph 3 |
+|---|---|---|---|
+| **symbol / calls** edges | **0** | 35 | **1,499** |
+| symbol / constructs | 0 | 8 | **787** |
+| symbol / type-reference | 0 | 3 | 11 |
+| symbol / extends | 0 | 0 | 1 |
+| file / constructs | 0 | 309 | 309 |
+| file / tests | 0 | 191 | 191 |
+| **Total projected edges** | **~1,061** | ~1,940 | **4,189** |
+| Dependency rows | 41,513 | 21,380 | 21,380 |
+| Graph-eligible | — | 4,016 | 4,016 |
+| Run duration | ~2m36s | ~75s | ~95s |
+
+D5 was the single highest-yield change in the plan, as predicted — but only
+because Phase 1 cleared the noise first. Against the original 39,165-row `calls`
+set the dotted-leaf match would have been resolving mostly `len` and `expect`.
+
+Stage health is persisted and verified:
+`{"projection":{"ok":true,"nodes":5628,"edges":4189},"narrative":{"used":true,"ok":true}}`.
+
+**Comprehension impact.** Q9 moves to answerable. Q1/Q2 improve (clusters ranked
+by size rather than id). Q11 becomes possible — `tests` edges reach the graph for
+the first time — though the test→symbol link itself is Phase 5.
+
+---
+
+## 20. Phases 4–5 — measured outcome (2026-08-16)
+
+Run `1276c96b`.
+
+| Capability | Before | After |
+|---|---|---|
+| `http` dependency rows | **0** | **7**, host-identified (`api.anthropic.com`, `api.example.com`) |
+| `filesystem` / `java` / `schedule` rows | 0 / 0 / 0 | 4 / 2 / 2 |
+| Files with role `integration` | **0** | **6** |
+| Directories with a parent | **0 of 40** | **58 of 62** |
+| Edge resolution classes | none | exact/high 26 · heuristic/medium 1,977 · heuristic/low 2,096 · derived 120 |
+| Total projected edges | 1,061 (orig) | **4,219** |
+
+`IntegrationDetector` is now the single owner of "what does this reach outside
+itself", used by both parsers. Its patterns are seeded from
+`ModernizationInventoryService`, which had the stronger implementation all along —
+the fix was consolidation, not invention.
+
+### Phase 5 remainder
+
+`emits`/`handles` producers (G1a), SQL read/write split (G3), configuration as an
+entity (G6), symbol-level change impact (G7), test→production symbol linkage
+(Q11), and defines-vs-references anchors (G5) are still open.
+
+---
+
+## 21. Phase 6 — measured outcome (2026-08-16)
+
+| Fix | Evidence |
+|---|---|
+| D10 orchestrator branch | Roles on a fresh run: entry 144 · orchestrator 98 · persistence 73 · test 27 · domain 26 · unknown 20 · view 8 · client 7 · **integration 6** · shared 5 |
+| D7 truncation | A neighbourhood that fits now reports `truncated: false`; the spec that asserted the old always-true behaviour was rewritten to cover both cases |
+| D13/D14/D15 | `codegraphMaxNodes` injected; `include`/`rank` rejected with 422; unknown `scope` returns 404; `edgeLimit` reachable |
+| D17 | Both `"\\"` sites corrected — zero occurrences remain in the tree |
+| D26 | 7 bare `localeCompare` calls → 0; new byte-identical layout determinism spec (JS suite 26/26) |
+
+Graph totals on run with all phases applied: **5,684 nodes, 4,217 edges**.
+
+### A spec that encoded a defect
+
+`CodeGraphApiSpec` asserted `subgraph.truncated == true` for a neighbourhood that
+comfortably fits inside its limit. That assertion only held because the flag was
+unconditionally true. Fixing D7 turned the spec red, which is the correct outcome:
+it was testing the bug. It now asserts `false` for a fitting neighbourhood and
+`true` for a genuinely capped one.
+
+---
+
+## 22. Phases 5–7 — measured outcome (2026-08-16)
+
+| Capability | Before | After |
+|---|---|---|
+| Data access kinds | 223 undifferentiated `table-query` | **137 `table-write` · 87 `table-read`** · 2 ambiguous |
+| Node retention metric | `hotspotScore` (structure × churn) | structural centrality; `hotspotScore` display-only |
+| Rank explainability | one formula per snapshot | per-node rationale, e.g. "12 callers · 3 commits · in a cycle" |
+| Narrative rejections | discarded silently | counted per section |
+| Total graph | 1,061 edges | **4,226 edges · 5,694 nodes** |
+
+### The cache lesson, a third time
+
+The read/write split shipped, compiled, passed its unit spec — and produced almost
+no reclassified rows on a real run. Cause: extraction behaviour changed without a
+`parserVersion` bump, so the parse cache served the old results. The only files
+that reclassified were the ones whose content happened to change.
+
+This is the same failure the fidelity design recorded at its §8.3 and that D1
+repeated. **The rule, restated once more: any change to what a parser extracts
+must move `parserVersion`, or the cache will hide it.** Parsers are now at
+`boxlang-ast-parser-v6` / `cfml-symbol-parser-v6` / `javascript-symbol-parser-v4`.
+
+### An architecture rule caught a real problem
+
+`CodeGraphMetricsService` crossed the project's own 900-line ceiling when
+centrality landed. Rather than raise the limit, the ranking concerns —
+`centrality`, `hotspotScore`, `hotspotFormula`, `rankRationale` — moved into
+`CodeGraphCentralityService`. That is the BD-3 split expressed structurally: one
+service now owns "how important is this", and the metrics service owns assembly.
+
+---
+
+## 23. Phase 10 — the query surface (2026-08-16)
+
+Four endpoints, each answering a question that previously required downloading a
+level and filtering it in the browser. All carry the §9 completeness account.
+
+| Endpoint | Question | Notes |
+|---|---|---|
+| `/codegraph/neighbours?node=&direction=` | "what calls this, and what does it call" | Both directions from the indexed edge table; far endpoint's path joined in |
+| `/codegraph/hierarchy?node=` | "what does this extend or implement" | Kept separate so inheritance is not buried under call edges |
+| `/codegraph/lineage?table=` | "who reads this table, who writes it" | **Only expressible because G3 split reads from writes** |
+| `/codegraph/impact?node=&depth=` | "what breaks if I change this" | Transitive callers, depth-bounded; `state` says whether the cone closed or was cut |
+
+A shared `requireGraphRun` guard returns 404 for an unknown run and 409 for a run
+without levelled storage, so all four refuse the same way rather than repeating
+two checks four times.
+
+Verified live against run `690cd62c`: `/neighbours` on `file:app/config/router.bx`
+returns `routes` edges to each handler with `resolution: "exact"`,
+`confidence: "high"` and the source line as evidence.
+
+### A spec bug worth recording
+
+The first version of `CodeGraphQuerySurfaceSpec` seeded a graph inside a helper
+that assigned to an outer `var`. In BoxLang that creates a local, so every test
+queried run id `""` and five specs failed against correct code. Worth knowing
+because the failure looks exactly like a broken query.
+
+---
+
+## 24. Phase 9 — comprehension views (2026-08-16)
+
+| Export | Before | After |
+|---|---|---|
+| `format=svg` | one `<rect>` and N `<text>` lines — a bulleted list wearing SVG clothing | **13 `<rect>` boxes, 15 `<line>` dependencies, 27 labels** on a live run |
+| `format=sequence` | did not exist | Participants as columns, hops as rows, kind and owning symbol per hop |
+| `/codegraph/onboarding` | did not exist | Entry points · largest domains · most depended-upon files, each with a reason |
+
+Both renderers are deterministic grids — three columns for the module map, one
+column per participant for the flow — so neither needs a layout engine and
+neither has to be kept in step with the canvas.
+
+**Local-only is enforced by a spec**, not by intent: the export must reference no
+webfont, no `@import`, no `xlink:href` and no external `href`. The first version
+of that check also rejected `http://`, which fails on the mandatory SVG namespace
+URI — a namespace identifier is not a fetch, and the spec now says so.
+
+The sequence renderer prints `(file level)` for a hop whose owning symbol could
+not be resolved, rather than guessing — the same rule the inspector follows.
+
+### Onboarding, live
+
+`/codegraph/onboarding?limit=3` on run `690cd62c` returns nine entries: handler
+actions with `file:line` ("a request starts here (handler-action)"), the largest
+modules by file count, and the most depended-upon files ("N files depend on this").

@@ -1,0 +1,427 @@
+/**
+ * Analytical reads over the stored graph.
+ *
+ * Split from CodeGraphGraphRepository, which owns writing and reading levels;
+ * this owns the questions a reader asks of what is stored — callers, hierarchy,
+ * lineage, impact, onboarding and run-over-run diff. They share a table and
+ * nothing else, and keeping them together pushed one class past the project's
+ * size ceiling.
+ *
+ * Every method returns a completeness account, because an empty answer and a
+ * missing graph must not serialise the same way.
+ *
+ * @see CodeGraphGraphRepository
+ */
+@singleton
+class threadsafe {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	/**
+	 * Everything pointing at a node, and everything it points at.
+	 *
+	 * "What calls this" is the question a stranger to a codebase actually asks,
+	 * and until now it was answerable only by downloading a level and filtering
+	 * it in the browser. Both directions come from the same indexed edge table.
+	 */
+	struct function neighbours( required string runId, required struct query ) {
+		var nodeId = trim( toString( arguments.query.node ?: "" ) );
+		var edgeLimit = max( 1, min( 500, val( arguments.query.limit ?: 100 ) ) );
+		var direction = lCase( trim( toString( arguments.query.direction ?: "both" ) ) );
+		if ( !len( nodeId ) ) return { node: "", incoming: [], outgoing: [], completeness: emptyAccount() };
+
+		var incoming = direction == "outgoing" ? [] : edgesFor( arguments.runId, nodeId, true, edgeLimit );
+		var outgoing = direction == "incoming" ? [] : edgesFor( arguments.runId, nodeId, false, edgeLimit );
+		var total = incoming.len() + outgoing.len();
+		return {
+			node        : nodeId,
+			incoming    : incoming,
+			outgoing    : outgoing,
+			completeness: countedAccount( total, "weight" )
+		};
+	}
+
+	/**
+	 * Type hierarchy: what this extends or implements, and what does so to it.
+	 *
+	 * Separate from `neighbours` because a reader asking about inheritance does
+	 * not want it buried under every call edge.
+	 */
+	struct function hierarchy( required string runId, required struct query ) {
+		var nodeId = trim( toString( arguments.query.node ?: "" ) );
+		if ( !len( nodeId ) ) return { node: "", ancestors: [], descendants: [], completeness: emptyAccount() };
+		var records = queryExecute(
+			"
+				SELECT edge_id, level, from_node, to_node, group_kind, resolution, confidence, line, evidence
+				FROM codegraph_edges
+				WHERE run_id = :runId AND group_kind IN ( 'extends', 'implements' )
+					AND ( from_node = :nodeId OR to_node = :nodeId )
+				ORDER BY group_kind, from_node, to_node
+			",
+			{ runId: arguments.runId, nodeId: nodeId },
+			{ datasource: datasource }
+		);
+		var ancestors = [];
+		var descendants = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var edge = {
+				id        : records.edge_id[ row ],
+				level     : records.level[ row ],
+				from      : records.from_node[ row ],
+				to        : records.to_node[ row ],
+				kind      : records.group_kind[ row ],
+				resolution: records.resolution[ row ],
+				confidence: records.confidence[ row ],
+				line      : records.line[ row ],
+				evidence  : records.evidence[ row ]
+			};
+			if ( edge.from == nodeId ) ancestors.append( edge );
+			else descendants.append( edge );
+		}
+		return {
+			node        : nodeId,
+			ancestors   : ancestors,
+			descendants : descendants,
+			completeness: countedAccount( ancestors.len() + descendants.len(), "kind" )
+		};
+	}
+
+	/**
+	 * Which files read a table and which write it.
+	 *
+	 * Only expressible since reads and writes stopped collapsing into one kind:
+	 * before that a table showed its participants but not the direction of flow.
+	 */
+	struct function lineage( required string runId, required struct query ) {
+		var table = lCase( trim( toString( arguments.query.table ?: "" ) ) );
+		if ( !len( table ) ) return { table: "", readers: [], writers: [], completeness: emptyAccount() };
+		var target = left( table, 6 ) == "table:" ? table : "table:" & table;
+		var records = queryExecute(
+			"
+				SELECT DISTINCT e.from_node, e.group_kind, n.path
+				FROM codegraph_edges e
+				LEFT JOIN codegraph_nodes n ON n.run_id = e.run_id AND n.node_id = e.from_node
+				WHERE e.run_id = :runId AND e.to_node = :target
+					AND e.group_kind IN ( 'table-read', 'table-write', 'table-query' )
+				ORDER BY e.group_kind, e.from_node
+			",
+			{ runId: arguments.runId, target: target },
+			{ datasource: datasource }
+		);
+		var readers = [];
+		var writers = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var entry = {
+				node: records.from_node[ row ],
+				path: records.path[ row ] ?: "",
+				kind: records.group_kind[ row ]
+			};
+			if ( entry.kind == "table-write" ) writers.append( entry );
+			else readers.append( entry );
+		}
+		return {
+			table       : target,
+			readers     : readers,
+			writers     : writers,
+			completeness: countedAccount( readers.len() + writers.len(), "kind" )
+		};
+	}
+
+	/**
+	 * What breaks if this node changes: everything that reaches it, transitively.
+	 *
+	 * Bounded by depth because an impact cone over a real codebase reaches most
+	 * of it, and an answer of "everything" helps nobody. `state` says whether the
+	 * cone closed or was cut.
+	 */
+	struct function impact( required string runId, required struct query ) {
+		var nodeId = trim( toString( arguments.query.node ?: "" ) );
+		var maxDepth = max( 1, min( 6, val( arguments.query.depth ?: 3 ) ) );
+		var nodeLimit = max( 1, min( 500, val( arguments.query.limit ?: 200 ) ) );
+		if ( !len( nodeId ) ) return { node: "", impacted: [], depth: maxDepth, completeness: emptyAccount() };
+
+		var seen = {};
+		seen[ nodeId ] = true;
+		var frontier = [ nodeId ];
+		var impacted = [];
+		var depth = 0;
+		while ( frontier.len() && depth < maxDepth && impacted.len() < nodeLimit ) {
+			depth++;
+			var placeholders = [];
+			var params = [ arguments.runId ];
+			for ( var id in frontier ) {
+				placeholders.append( "?" );
+				params.append( id );
+			}
+			var idList = placeholders.toList( ", " );
+			var records = queryExecute(
+				"SELECT DISTINCT from_node FROM codegraph_edges WHERE run_id = ? AND to_node IN ( #idList# ) ORDER BY from_node",
+				params,
+				{ datasource: datasource }
+			);
+			var next = [];
+			for ( var row = 1; row <= records.recordCount; row++ ) {
+				var caller = records.from_node[ row ];
+				if ( seen.keyExists( caller ) ) continue;
+				seen[ caller ] = true;
+				impacted.append( { node: caller, depth: depth } );
+				next.append( caller );
+				if ( impacted.len() >= nodeLimit ) break;
+			}
+			frontier = next;
+		}
+		return {
+			node        : nodeId,
+			impacted    : impacted,
+			depth       : maxDepth,
+			completeness: {
+				returned : impacted.len(),
+				available: impacted.len(),
+				omitted  : 0,
+				rankedBy : "depth",
+				complete : !frontier.len(),
+				state    : !impacted.len() ? "empty" : ( frontier.len() ? "truncated" : "complete" )
+			}
+		};
+	}
+
+	private struct function emptyAccount() {
+		return { returned: 0, available: 0, omitted: 0, rankedBy: "", complete: false, state: "empty" };
+	}
+
+	private struct function countedAccount( required numeric total, required string rankedBy ) {
+		return {
+			returned : arguments.total,
+			available: arguments.total,
+			omitted  : 0,
+			rankedBy : arguments.rankedBy,
+			complete : arguments.total > 0,
+			state    : arguments.total == 0 ? "empty" : "complete"
+		};
+	}
+
+	/** One direction of a node's edges, with the far endpoint's path resolved. */
+	private array function edgesFor(
+		required string runId,
+		required string nodeId,
+		required boolean incoming,
+		required numeric edgeLimit
+	) {
+		var matchColumn = arguments.incoming ? "to_node" : "from_node";
+		var farColumn = arguments.incoming ? "from_node" : "to_node";
+		var records = queryExecute(
+			"
+				SELECT e.edge_id, e.level, e.from_node, e.to_node, e.group_kind, e.resolution,
+					e.confidence, e.line, e.evidence, n.path, n.symbol_name
+				FROM codegraph_edges e
+				LEFT JOIN codegraph_nodes n ON n.run_id = e.run_id AND n.node_id = e.#farColumn#
+				WHERE e.run_id = :runId AND e.#matchColumn# = :nodeId
+				ORDER BY e.weight DESC, e.group_kind, e.#farColumn#
+				LIMIT :edgeLimit
+			",
+			{ runId: arguments.runId, nodeId: arguments.nodeId, edgeLimit: { value: arguments.edgeLimit, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+		var edges = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			edges.append( {
+				id        : records.edge_id[ row ],
+				level     : records.level[ row ],
+				from      : records.from_node[ row ],
+				to        : records.to_node[ row ],
+				kind      : records.group_kind[ row ],
+				resolution: records.resolution[ row ],
+				confidence: records.confidence[ row ],
+				line      : records.line[ row ],
+				evidence  : records.evidence[ row ],
+				path      : records.path[ row ] ?: "",
+				symbolName: records.symbol_name[ row ] ?: ""
+			} );
+		}
+		return edges;
+	}
+
+	/**
+	 * Where a stranger to this codebase should start reading.
+	 *
+	 * Every other view answers a question the reader already knows how to ask.
+	 * This one is for the reader who does not yet know what to ask: the entry
+	 * points that begin a request, the largest domains, and the most depended-upon
+	 * files, each with the reason it is listed.
+	 *
+	 * Deliberately small. A "start here" list of forty items is a directory
+	 * listing, and the reader already had one of those.
+	 */
+	struct function onboarding( required string runId, required struct query ) {
+		var perSection = max( 3, min( 12, val( arguments.query.limit ?: 6 ) ) );
+
+		var entryPoints = queryExecute(
+			"
+				SELECT node_id, path, symbol_name, kind, role, line, fan_in, fan_out
+				FROM codegraph_nodes
+				WHERE run_id = :runId AND level = 'symbol' AND kind IN ( 'route', 'handler-action', 'lifecycle-hook' )
+				ORDER BY kind, path, symbol_name
+				LIMIT :sectionLimit
+			",
+			{ runId: arguments.runId, sectionLimit: { value: perSection, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+
+		var domains = queryExecute(
+			"
+				SELECT node_id, path, fan_in, fan_out, hotspot
+				FROM codegraph_nodes
+				WHERE run_id = :runId AND level = 'cluster'
+				ORDER BY hotspot DESC, path ASC
+				LIMIT :sectionLimit
+			",
+			{ runId: arguments.runId, sectionLimit: { value: perSection, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+
+		var pillars = queryExecute(
+			"
+				SELECT node_id, path, role, fan_in, fan_out, hotspot
+				FROM codegraph_nodes
+				WHERE run_id = :runId AND level = 'file' AND fan_in > 0
+				ORDER BY fan_in DESC, path ASC
+				LIMIT :sectionLimit
+			",
+			{ runId: arguments.runId, sectionLimit: { value: perSection, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+
+		var startHere = [];
+		for ( var row = 1; row <= entryPoints.recordCount; row++ ) {
+			startHere.append( {
+				section: "entry-point",
+				node   : entryPoints.node_id[ row ],
+				path   : entryPoints.path[ row ],
+				label  : len( entryPoints.symbol_name[ row ] ) ? entryPoints.symbol_name[ row ] : entryPoints.path[ row ],
+				line   : entryPoints.line[ row ],
+				reason : "a request starts here (" & entryPoints.kind[ row ] & ")"
+			} );
+		}
+		for ( var row = 1; row <= domains.recordCount; row++ ) {
+			startHere.append( {
+				section: "domain",
+				node   : domains.node_id[ row ],
+				path   : domains.path[ row ],
+				label  : domains.path[ row ],
+				line   : 0,
+				reason : val( domains.hotspot[ row ] ) & " files in this module"
+			} );
+		}
+		for ( var row = 1; row <= pillars.recordCount; row++ ) {
+			startHere.append( {
+				section: "most-depended-on",
+				node   : pillars.node_id[ row ],
+				path   : pillars.path[ row ],
+				label  : pillars.path[ row ],
+				line   : 0,
+				reason : val( pillars.fan_in[ row ] ) & " file" & ( val( pillars.fan_in[ row ] ) == 1 ? "" : "s" ) & " depend on this"
+			} );
+		}
+
+		return {
+			startHere   : startHere,
+			entryPoints : entryPoints.recordCount,
+			domains     : domains.recordCount,
+			pillars     : pillars.recordCount,
+			completeness: {
+				returned : startHere.len(),
+				available: startHere.len(),
+				omitted  : 0,
+				rankedBy : "section",
+				complete : startHere.len() > 0,
+				state    : startHere.len() == 0 ? "empty" : "complete"
+			}
+		};
+	}
+
+	/**
+	 * What changed between two runs of the same project.
+	 *
+	 * Nearly free: node and edge ids are derived from semantic coordinates rather
+	 * than array position, so the same file keeps the same id across runs and a
+	 * set difference is the whole algorithm. That property was designed for
+	 * stability and this is the capability it pays for.
+	 *
+	 * Counts are always exact; the sample lists are bounded because a diff after a
+	 * refactor can name thousands of nodes and a reader needs the shape first.
+	 */
+	struct function diff( required string runId, required string baseRunId, struct query = {} ) {
+		var sampleLimit = max( 1, min( 200, val( arguments.query.limit ?: 50 ) ) );
+
+		var nodeDelta = compareSets(
+			"SELECT node_id AS id, path AS label FROM codegraph_nodes WHERE run_id = :runId",
+			arguments.runId,
+			arguments.baseRunId,
+			sampleLimit
+		);
+		var edgeDelta = compareSets(
+			"SELECT edge_id AS id, group_kind AS label FROM codegraph_edges WHERE run_id = :runId",
+			arguments.runId,
+			arguments.baseRunId,
+			sampleLimit
+		);
+
+		return {
+			runId    : arguments.runId,
+			baseRunId: arguments.baseRunId,
+			nodes    : nodeDelta,
+			edges    : edgeDelta,
+			completeness: {
+				returned : nodeDelta.added.len() + nodeDelta.removed.len() + edgeDelta.added.len() + edgeDelta.removed.len(),
+				available: nodeDelta.addedCount + nodeDelta.removedCount + edgeDelta.addedCount + edgeDelta.removedCount,
+				omitted  : max( 0, ( nodeDelta.addedCount + nodeDelta.removedCount + edgeDelta.addedCount + edgeDelta.removedCount )
+					- ( nodeDelta.added.len() + nodeDelta.removed.len() + edgeDelta.added.len() + edgeDelta.removed.len() ) ),
+				rankedBy : "id",
+				complete : true,
+				state    : "complete"
+			}
+		};
+	}
+
+	/** Exact counts both ways, with a bounded sample of each side. */
+	private struct function compareSets(
+		required string statement,
+		required string runId,
+		required string baseRunId,
+		required numeric sampleLimit
+	) {
+		var current = {};
+		var base = {};
+		var currentRows = queryExecute( arguments.statement, { runId: arguments.runId }, { datasource: datasource } );
+		for ( var row = 1; row <= currentRows.recordCount; row++ ) current[ currentRows.id[ row ] ] = currentRows.label[ row ];
+		var baseRows = queryExecute( arguments.statement, { runId: arguments.baseRunId }, { datasource: datasource } );
+		for ( var row = 1; row <= baseRows.recordCount; row++ ) base[ baseRows.id[ row ] ] = baseRows.label[ row ];
+
+		var addedIds = [];
+		for ( var id in current ) if ( !base.keyExists( id ) ) addedIds.append( id );
+		var removedIds = [];
+		for ( var id in base ) if ( !current.keyExists( id ) ) removedIds.append( id );
+		// Struct iteration is hash-ordered, so sort before sampling or the diff
+		// would name a different subset each time it ran.
+		addedIds.sort( ( a, b ) => compareNoCase( current[ a ], current[ b ] ) );
+		removedIds.sort( ( a, b ) => compareNoCase( base[ a ], base[ b ] ) );
+
+		var added = [];
+		for ( var id in addedIds ) {
+			if ( added.len() >= arguments.sampleLimit ) break;
+			added.append( { id: id, label: current[ id ] } );
+		}
+		var removed = [];
+		for ( var id in removedIds ) {
+			if ( removed.len() >= arguments.sampleLimit ) break;
+			removed.append( { id: id, label: base[ id ] } );
+		}
+		return {
+			added       : added,
+			removed     : removed,
+			addedCount  : addedIds.len(),
+			removedCount: removedIds.len(),
+			unchanged   : current.count() - addedIds.len()
+		};
+	}
+
+}

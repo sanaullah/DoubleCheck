@@ -1,0 +1,185 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function run() {
+		describe( "CodeGraph query surface (Phase 10)", () => {
+			beforeEach( () => setup() );
+
+			// Returns both, because assigning to an outer `var` from inside a
+			// nested function creates a local and leaves the outer one empty.
+			// Declared, not assigned to a var: an arrow function held in a
+			// describe-scope variable is not visible inside a named function here.
+			function node( required string id, required string level, required string path, numeric fanIn = 0 ) {
+				return { id: arguments.id, level: arguments.level, parentId: "", path: arguments.path, symbolName: "", kind: "file", role: "", language: "BoxLang", line: 0, endLine: 0, fanIn: arguments.fanIn, fanOut: 0, hotspot: arguments.fanIn };
+			}
+			function edge( required string id, required string from, required string to, required string kind, required string resolution ) {
+				return { id: arguments.id, level: "file", from: arguments.from, to: arguments.to, groupKind: arguments.kind, kinds: [ arguments.kind ], occurrences: 1, weight: 1, resolution: arguments.resolution, provenance: "parser", confidence: arguments.resolution == "exact" ? "high" : "low", line: 1, evidence: arguments.kind };
+			}
+
+			function seedGraph() {
+				var runId = "qs-" & createUUID();
+				queryExecute(
+					"INSERT INTO review_runs ( id, project_path, status, run_kind, mode, created_at, updated_at ) VALUES ( :id, '/tmp/p', 'succeeded', 'codegraph', 'full', :now, :now )",
+					{ id: runId, now: dateTimeFormat( now(), "iso" ) }
+				);
+				getInstance( "CodeGraphGraphRepository" ).replaceGraph(
+					runId,
+					[
+						node( "file:handler.bx", "file", "handler.bx" ),
+						node( "file:service.bx", "file", "service.bx", 3 ),
+						node( "file:repo.bx", "file", "repo.bx", 1 ),
+						node( "file:base.bx", "file", "base.bx" ),
+						node( "table:orders", "file", "orders" )
+					],
+					[
+						edge( "e1", "file:handler.bx", "file:service.bx", "calls", "heuristic" ),
+						edge( "e2", "file:service.bx", "file:repo.bx", "injects", "heuristic" ),
+						edge( "e3", "file:repo.bx", "table:orders", "table-read", "heuristic" ),
+						edge( "e4", "file:service.bx", "table:orders", "table-write", "heuristic" ),
+						edge( "e5", "file:service.bx", "file:base.bx", "extends", "exact" )
+					]
+				);
+				// Storage and analytical reads are two collaborators since the split.
+				return {
+					runId     : runId,
+					repository: getInstance( "CodeGraphQueryRepository" ),
+					storage   : getInstance( "CodeGraphGraphRepository" )
+				};
+			}
+
+			function cleanup( required string runId ) {
+				queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: arguments.runId } );
+			}
+
+			it( "answers what calls this and what this calls", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				var result = repo.neighbours( runId, { node: "file:service.bx" } );
+
+				expect( result.incoming ).toHaveLength( 1, "one caller" );
+				expect( result.incoming[ 1 ].from ).toBe( "file:handler.bx" );
+				// Three outgoing: injects, table-write, extends.
+				expect( result.outgoing ).toHaveLength( 3 );
+				expect( result.completeness.state ).toBe( "complete" );
+				cleanup( runId );
+			} );
+
+			it( "honours direction so a caller list is not buried in callees", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				expect( repo.neighbours( runId, { node: "file:service.bx", direction: "incoming" } ).outgoing ).toBeEmpty();
+				expect( repo.neighbours( runId, { node: "file:service.bx", direction: "outgoing" } ).incoming ).toBeEmpty();
+				cleanup( runId );
+			} );
+
+			it( "separates the type hierarchy from ordinary edges", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				var result = repo.hierarchy( runId, { node: "file:service.bx" } );
+
+				expect( result.ancestors ).toHaveLength( 1 );
+				expect( result.ancestors[ 1 ].to ).toBe( "file:base.bx" );
+				expect( result.ancestors[ 1 ].resolution ).toBe( "exact", "a declared relationship is exact" );
+				expect( repo.hierarchy( runId, { node: "file:base.bx" } ).descendants ).toHaveLength( 1 );
+				cleanup( runId );
+			} );
+
+			it( "splits table lineage by direction of flow", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				var result = repo.lineage( runId, { table: "orders" } );
+
+				expect( result.readers ).toHaveLength( 1 );
+				expect( result.readers[ 1 ].node ).toBe( "file:repo.bx" );
+				expect( result.writers ).toHaveLength( 1 );
+				expect( result.writers[ 1 ].node ).toBe( "file:service.bx" );
+				cleanup( runId );
+			} );
+
+			it( "accepts a table id with or without its prefix", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				expect( repo.lineage( runId, { table: "table:orders" } ).readers ).toHaveLength( 1 );
+				cleanup( runId );
+			} );
+
+			it( "walks the impact cone transitively and bounds it by depth", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				// repo.bx is reached from service.bx, which is reached from handler.bx.
+				var deep = repo.impact( runId, { node: "file:repo.bx", depth: 3 } );
+				var nodes = deep.impacted.map( ( item ) => item.node );
+
+				expect( nodes ).toInclude( "file:service.bx" );
+				expect( nodes ).toInclude( "file:handler.bx" );
+				expect( deep.completeness.state ).toBe( "complete", "a cone that closed is complete" );
+
+				var shallow = repo.impact( runId, { node: "file:repo.bx", depth: 1 } );
+				expect( shallow.impacted ).toHaveLength( 1, "depth 1 stops at the direct caller" );
+				expect( shallow.completeness.state ).toBe( "truncated", "a cone that was cut says so" );
+				cleanup( runId );
+			} );
+
+			it( "tells a stranger where to start, with a reason for each entry", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				var result = repo.onboarding( runId, { limit: 5 } );
+
+				// Two fixture files carry fan-in, so the most-depended-on section fills;
+				// the fixture has no clusters or entry-point symbols, which is why the
+				// other two sections are legitimately empty here.
+				expect( result.startHere.len() ).toBeGT( 0 );
+				for ( var entry in result.startHere ) {
+					expect( len( trim( entry.reason ) ) ).toBeGT( 0, "every starting point states why it is listed" );
+					expect( entry ).toHaveKey( "node" );
+					expect( entry ).toHaveKey( "section" );
+				}
+				expect( result.completeness.state ).toBe( "complete" );
+				cleanup( runId );
+			} );
+
+			it( "diffs two runs by stable id, with exact counts and a bounded sample", () => {
+				var before = seedGraph();
+				var after = seedGraph();
+				// Add one node to the later run so there is something to find.
+				after.storage.replaceGraph(
+					after.runId,
+					[
+						node( "file:handler.bx", "file", "handler.bx" ),
+						node( "file:service.bx", "file", "service.bx", 3 ),
+						node( "file:newcomer.bx", "file", "newcomer.bx" )
+					],
+					[ edge( "e1", "file:handler.bx", "file:service.bx", "calls", "heuristic" ) ]
+				);
+
+				var result = after.repository.diff( after.runId, before.runId, { limit: 10 } );
+
+				var addedLabels = result.nodes.added.map( ( item ) => item.label );
+				expect( addedLabels ).toInclude( "newcomer.bx", "a node only in the later run is added" );
+				expect( result.nodes.removedCount ).toBeGT( 0, "nodes dropped since the base run are removed" );
+				expect( result.edges.removedCount ).toBeGT( 0 );
+				expect( result.completeness.state ).toBe( "complete" );
+
+				cleanup( before.runId );
+				cleanup( after.runId );
+			} );
+
+			it( "reports empty rather than complete when nothing matches", () => {
+				var seeded = seedGraph();
+				var repo = seeded.repository;
+				var runId = seeded.runId;
+				var result = repo.neighbours( runId, { node: "file:nothing.bx" } );
+
+				expect( result.completeness.state ).toBe( "empty" );
+				expect( result.completeness.complete ).toBeFalse( "0 of 0 is not a complete answer" );
+				cleanup( runId );
+			} );
+		} );
+	}
+}

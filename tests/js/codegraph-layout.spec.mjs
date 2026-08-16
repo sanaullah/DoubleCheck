@@ -501,3 +501,129 @@ test("hotspot heat classes scale with score", () => {
 	assert.ok(svg.includes("heat-high"));
 	assert.ok(svg.includes("heat-mid"));
 });
+
+test("layout output is byte-identical across runs and independent of locale", () => {
+	// D26: seven bare localeCompare tie-breaks meant the same snapshot laid out
+	// on two machines with different collation produced different coordinates,
+	// and no spec existed to catch it.
+	const snapshot = {
+		nodes: [
+			{ id: "app/Ähnlich.bx", path: "app/Ähnlich.bx", role: "domain", fanIn: 1, fanOut: 1 },
+			{ id: "app/apple.bx", path: "app/apple.bx", role: "domain", fanIn: 2, fanOut: 0 },
+			{ id: "app/Banana.bx", path: "app/Banana.bx", role: "entry", fanIn: 0, fanOut: 3 },
+			{ id: "app/aardvark.bx", path: "app/aardvark.bx", role: "persistence", fanIn: 1, fanOut: 1 },
+			{ id: "app/zebra.bx", path: "app/zebra.bx", role: "view", fanIn: 1, fanOut: 0 }
+		],
+		edges: [
+			{ from: "app/apple.bx", to: "app/Banana.bx", kind: "calls" },
+			{ from: "app/zebra.bx", to: "app/aardvark.bx", kind: "injects" }
+		],
+		clusters: []
+	};
+
+	const first = layout.layoutClusters(layout.buildFileView(snapshot, { maxNodes: 20, detail: true }), { detail: true });
+	const second = layout.layoutClusters(layout.buildFileView(snapshot, { maxNodes: 20, detail: true }), { detail: true });
+
+	assert.equal(JSON.stringify(first), JSON.stringify(second), "same input must produce byte-identical layout");
+
+	// Every emitted coordinate must be a finite number, not a locale artefact.
+	for (const node of first.nodes) {
+		assert.ok(Number.isFinite(node.x) && Number.isFinite(node.y), `node ${node.id} has non-finite coordinates`);
+	}
+});
+
+test("every drawn node carries an accessible name and a keyboard target", () => {
+	// E8/G-i: the canvas was pointer-only, and an SVG shape announces nothing on
+	// its own. Colour carries nine roles, so a name is the only differentiator
+	// for a screen reader.
+	const snapshot = {
+		nodes: [
+			{ id: "app/OrderService.bx", path: "app/OrderService.bx", role: "domain", fanIn: 4, fanOut: 2 },
+			{ id: "app/OrderRepo.bx", path: "app/OrderRepo.bx", role: "persistence", fanIn: 1, fanOut: 0 }
+		],
+		edges: [{ from: "app/OrderService.bx", to: "app/OrderRepo.bx", kind: "injects" }],
+		clusters: []
+	};
+	const svg = layout.buildSvg(
+		layout.layoutClusters(layout.buildFileView(snapshot, { maxNodes: 10, detail: true }), { detail: true }),
+		{ ariaLabel: "Code knowledge graph" }
+	);
+
+	assert.match(svg, /role="list"/, "the node set must be enumerable");
+	// Attribute order is deliberately not asserted here: `class` must stay first
+	// for the older specs, so the a11y attributes sit at the end of the tag.
+	const labels = svg.match(/aria-label="[^"]*called by[^"]*"/g) || [];
+	assert.equal(labels.length, 2, "every node is a focusable list item with a name");
+	// The label uses the node\'s display name, not its full path — that is what
+	// a reader hears, and the path is already on data-path.
+	assert.match(svg, /aria-label="OrderService\.bx, domain, called by 4, calls 2"/);
+});
+
+test("ariaLabelFor degrades without throwing on a sparse node", () => {
+	assert.equal(layout.ariaLabelFor(null), "graph node");
+	assert.match(layout.ariaLabelFor({ id: "x.bx" }), /x\.bx/);
+});
+
+test("degree-of-interest keeps the focus neighbourhood that a flat slice would drop", () => {
+	// E2: the cap used to take the first N in array order, so a neighbour of the
+	// focus could be dropped purely for sorting late while an unrelated node
+	// survived. DOI is importance minus hops from the focus.
+	const nodes = [];
+	// Twenty unrelated, moderately important nodes sort before the focus.
+	for (let i = 0; i < 20; i++) {
+		nodes.push({ id: `app/aaa${i}.bx`, path: `app/aaa${i}.bx`, fanIn: 5, fanOut: 0 });
+	}
+	nodes.push({ id: "app/zzz-focus.bx", path: "app/zzz-focus.bx", fanIn: 1, fanOut: 1 });
+	nodes.push({ id: "app/zzz-neighbour.bx", path: "app/zzz-neighbour.bx", fanIn: 0, fanOut: 0 });
+
+	const edges = [{ from: "app/zzz-focus.bx", to: "app/zzz-neighbour.bx", kind: "calls" }];
+	const view = layout.buildFileView({ nodes, edges, clusters: [] }, {
+		maxNodes: 5,
+		detail: true,
+		focus: "app/zzz-focus.bx"
+	});
+	const kept = view.nodes.map((n) => String(n.id));
+
+	assert.ok(kept.some((id) => id.includes("zzz-focus")), "the focus must survive its own cap");
+	assert.ok(kept.some((id) => id.includes("zzz-neighbour")), "a direct neighbour outranks an unrelated node");
+	assert.ok(view.truncated, "the cap still reports that it cut");
+});
+
+test("degree-of-interest is deterministic and needs no focus", () => {
+	const nodes = [
+		{ id: "b.bx", path: "b.bx", fanIn: 2, fanOut: 0 },
+		{ id: "a.bx", path: "a.bx", fanIn: 2, fanOut: 0 }
+	];
+	const first = layout.degreeOfInterest(nodes, [], "");
+	const second = layout.degreeOfInterest(nodes, [], "");
+	assert.deepEqual(first.map((e) => e.interest), second.map((e) => e.interest));
+	// Without a focus every node sits at distance zero, so importance alone ranks.
+	assert.equal(first[0].interest, first[1].interest);
+});
+
+test("the symbol level is drawable, not just listable", () => {
+	// G-a: symbols existed only as a rail list, so "what calls this function"
+	// could be answered in a panel but never seen on the map.
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const view = readFileSync(new URL("../../app/views/main/codegraph.bxm", import.meta.url), "utf8");
+
+	assert.match(ui, /depth === "symbol"/, "the painter handles a symbol depth");
+	assert.match(ui, /codeGraphLoadSymbolCanvas/, "symbol rows are fetched for the canvas");
+	assert.match(ui, /level=symbol&scope=/, "rows come from the levelled endpoint, not the snapshot blob");
+	assert.match(view, /data-codegraph-depth="symbol"/, "the depth control offers it");
+});
+
+test("plain /codegraph stays on the run form and never reopens the last map", () => {
+	// The page silently reopened the newest saved snapshot for whatever project
+	// path was in the form, so "Start CodeGraph" looked like it had already run
+	// and offered no obvious way to begin a fresh one. Only an explicit ?run=
+	// opens a map; History's Open button is the way back to a saved one.
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const resume = ui.slice(ui.indexOf("async function resumeRunFromQuery"), ui.indexOf("function historyQueryParams"));
+
+	assert.match(resume, /if \(!resumeId\) return;/, "no run id means stay on the form");
+	assert.doesNotMatch(resume, /api\/v1\/codegraph\?projectPath/, "must not look up the newest saved map");
+	assert.doesNotMatch(resume, /elements\.projectPath\?\.value/, "must not read the form field to decide what to open");
+	// History still routes here with an explicit id.
+	assert.match(ui, /\/\$\{runKind\}\?run=\$\{encodeURIComponent\(run\.id\)\}/);
+});

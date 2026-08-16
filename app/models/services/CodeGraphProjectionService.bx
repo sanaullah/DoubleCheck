@@ -54,16 +54,42 @@ class threadsafe {
 			}
 		}
 
+		// The design's navigation model is cluster → directory → directory → file →
+		// symbol, one self-join per level. Directories were written as roots, so the
+		// middle of that chain did not exist: `app/` never listed `app/models/`.
+		// Every ancestor is materialised here, including ones the rollup skipped
+		// because they hold no files directly.
 		var directorySeen = {};
+		var directoryStats = {};
 		for ( var directory in ( arguments.snapshot.directories ?: [] ) ) {
 			if ( !isStruct( directory ) ) continue;
 			var dirPath = normalizePath( directory.path ?: "" );
+			directoryStats[ dirPath ] = {
+				fanIn  : val( directory.fanInSum ?: 0 ),
+				fanOut : val( directory.fanOutSum ?: 0 ),
+				hotspot: val( directory.fileCount ?: 0 )
+			};
+		}
+		var directoryPaths = {};
+		for ( var dirPath in directoryStats ) {
+			var walk = dirPath;
+			while ( len( walk ) && walk != "." ) {
+				directoryPaths[ walk ] = true;
+				if ( !find( "/", walk ) ) break;
+				walk = left( walk, len( walk ) - len( listLast( walk, "/" ) ) - 1 );
+			}
+		}
+		var orderedDirectories = structKeyArray( directoryPaths );
+		orderedDirectories.sort( ( a, b ) => compareNoCase( a, b ) );
+		for ( var dirPath in orderedDirectories ) {
 			var dirId = "dir:" & dirPath;
 			directorySeen[ dirPath ] = dirId;
+			var parentPath = find( "/", dirPath ) ? left( dirPath, len( dirPath ) - len( listLast( dirPath, "/" ) ) - 1 ) : "";
+			var stats = directoryStats[ dirPath ] ?: { fanIn: 0, fanOut: 0, hotspot: 0 };
 			appendNode( {
 				id        : dirId,
 				level     : "directory",
-				parentId  : "",
+				parentId  : len( parentPath ) && directoryPaths.keyExists( parentPath ) ? "dir:" & parentPath : "",
 				path      : dirPath,
 				symbolName: "",
 				kind      : "directory",
@@ -71,9 +97,9 @@ class threadsafe {
 				language  : "",
 				line      : 0,
 				endLine   : 0,
-				fanIn     : val( directory.fanInSum ?: 0 ),
-				fanOut    : val( directory.fanOutSum ?: 0 ),
-				hotspot   : val( directory.fileCount ?: 0 )
+				fanIn     : stats.fanIn,
+				fanOut    : stats.fanOut,
+				hotspot   : stats.hotspot
 			} );
 		}
 
@@ -146,7 +172,9 @@ class threadsafe {
 				kinds      : [],
 				occurrences: val( edge.weight ?: edge.occurrences ?: 1 ),
 				weight     : val( edge.weight ?: 0 ),
-				resolution : "",
+				resolution : "derived",
+				provenance : "derived",
+				confidence : "derived",
 				line       : 0,
 				evidence   : ""
 			} );
@@ -176,7 +204,9 @@ class threadsafe {
 					kinds      : [ kind ],
 					occurrences: 1,
 					weight     : 1,
-					resolution : "path",
+					resolution : resolutionOf( kind ),
+					provenance : "parser",
+					confidence : confidenceOf( kind ),
 					line       : val( dep.line ?: 0 ),
 					evidence   : trim( toString( dep.evidence ?: "" ) )
 				} );
@@ -189,8 +219,16 @@ class threadsafe {
 			// names no symbol in that file, the dependency is already represented
 			// by the file-level edge above — emitting a symbol-to-file edge here
 			// would break the level contract and the reader would drop it anyway.
+			// `ArchitectureIndexService` resolves the file from the call's *receiver*
+			// (`service` in `service.method`) while `target` keeps the whole dotted
+			// expression, so a verbatim match can never find `method`. Try the leaf
+			// as well; prefer a full match when both resolve.
 			var targetName = lCase( trim( toString( dep.target ?: "" ) ) );
-			var symbolTo = ( symbolsByFile[ toFile ] ?: {} )[ targetName ] ?: "";
+			var fileSymbols = symbolsByFile[ toFile ] ?: {};
+			var symbolTo = fileSymbols[ targetName ] ?: "";
+			if ( !len( symbolTo ) && find( ".", targetName ) ) {
+				symbolTo = fileSymbols[ lCase( listLast( targetName, "." ) ) ] ?: "";
+			}
 			if ( !len( symbolTo ) || symbolFrom == symbolTo ) continue;
 			var symbolKey = symbolFrom & "|" & symbolTo & "|" & kind;
 			if ( edgeSeen.keyExists( symbolKey ) ) continue;
@@ -206,7 +244,9 @@ class threadsafe {
 				kinds      : [ kind ],
 				occurrences: 1,
 				weight     : 1,
-				resolution : "symbol",
+				resolution : resolutionOf( kind ),
+				provenance : "parser",
+				confidence : confidenceOf( kind ),
 				line       : val( dep.line ?: 0 ),
 				evidence   : trim( toString( dep.evidence ?: "" ) )
 			} );
@@ -220,6 +260,24 @@ class threadsafe {
 		}
 
 		return { nodes: nodes, edges: edges };
+	}
+
+	/**
+	 * How the relationship was established, so a reader can weigh it.
+	 *
+	 * `exact` is declared in the source and cannot be wrong. `heuristic` was
+	 * resolved by matching a name against a type or symbol, which is right most of
+	 * the time and is the honest label for the rest. Nothing here is `unresolved`:
+	 * unresolved dependencies are excluded upstream and reported as a count.
+	 */
+	private string function resolutionOf( required string kind ) {
+		return listFindNoCase( "extends,implements,routes,renders,includes,imports", arguments.kind ) ? "exact" : "heuristic";
+	}
+
+	private string function confidenceOf( required string kind ) {
+		if ( listFindNoCase( "extends,implements,routes,renders,includes,imports", arguments.kind ) ) return "high";
+		if ( listFindNoCase( "injects,constructs,type-reference,tests", arguments.kind ) ) return "medium";
+		return "low";
 	}
 
 	private string function edgeId(

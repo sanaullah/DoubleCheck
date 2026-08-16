@@ -1741,6 +1741,7 @@ const elements = {
 	codegraphAiSummaries: document.querySelector("#codegraph-ai-summaries"),
 	codegraphWorkspace: document.querySelector("#codegraph-workspace"),
 	codegraphCanvas: document.querySelector("#codegraph-canvas"),
+	codegraphA11yStatus: document.querySelector("#codegraph-a11y-status"),
 	codegraphInspector: document.querySelector("#codegraph-inspector"),
 	codegraphIssues: document.querySelector("#codegraph-issues"),
 	codegraphIssueTabs: document.querySelector("#codegraph-issue-tabs"),
@@ -4833,6 +4834,24 @@ async function codeGraphServerSearch(term) {
 	renderCodeGraphDirectoryTree();
 }
 
+// Symbol rows for the canvas, scoped to one file. Same endpoint as the rail's
+// list; kept separate because the canvas needs edges and the rail does not.
+async function codeGraphLoadSymbolCanvas(filePath) {
+	const runId = state.activeRun?.id || "";
+	const normalized = String(filePath || "").replace(/\\/g, "/").toLowerCase();
+	if (!runId || !normalized) return;
+	if (state.codegraph.symbolCanvas?.file === normalized && state.codegraph.symbolCanvas?.runId === runId) return;
+	try {
+		const payload = await request(
+			`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/graph?level=symbol&scope=${encodeURIComponent("file:" + normalized)}&rank=fanIn&limit=120`
+		);
+		state.codegraph.symbolCanvas = { file: normalized, runId, ...(payload.data || {}) };
+	} catch (error) {
+		state.codegraph.symbolCanvas = { file: normalized, runId, nodes: [], edges: [], unavailable: true };
+	}
+	paintCodeGraphCanvas({ fit: true });
+}
+
 // Symbols inside one file, straight from the stored graph. This level does not
 // exist in the snapshot the canvas draws from.
 async function codeGraphLoadSymbols(filePath) {
@@ -4921,6 +4940,11 @@ function renderCodeGraphDirectoryTree() {
 	const symbols = state.codegraph.symbolLevel;
 	const selectedPath = String(state.codegraph.selectedId || "").replace(/\\/g, "/").toLowerCase();
 	const onFileSelection = !!selectedPath && symbols?.file === selectedPath;
+	if (onFileSelection && !state.codegraph.roleFilter && symbols.unavailable) {
+		host.hidden = false;
+		host.innerHTML = `<p class="field-hint">Symbol level unavailable for this run — its graph has no levelled storage. Rebuild the map to explore below the canvas.</p>`;
+		return;
+	}
 	if (onFileSelection && !state.codegraph.roleFilter && Array.isArray(symbols.nodes) && symbols.nodes.length) {
 		const c = symbols.completeness || {};
 		const omitted = Number(c.omitted) || 0;
@@ -5472,6 +5496,8 @@ function renderCodeGraphDepthControl() {
 		btn.classList.toggle("is-active", active);
 		if (depth === "file") btn.disabled = !hasCluster;
 		else if (depth === "focus") btn.disabled = !hasFocus;
+		// Symbols needs a selected file: the level is scoped to one file's symbols.
+		else if (depth === "symbol") btn.disabled = !state.codegraph.selectedId;
 		else btn.disabled = false;
 	});
 }
@@ -5600,6 +5626,33 @@ function paintCodeGraphCanvas(options = {}) {
 		};
 		view = CG.buildFocusView(enriched, { maxNodes: 120, detail: true });
 		view.edges = codeGraphFilterEdges(view.edges);
+	} else if (depth === "symbol") {
+		// G-a: the symbol level existed only as a list in the rail. "What calls
+		// this function" is the question a stranger actually asks, and it was
+		// unanswerable on the map. The rows come from /codegraph/graph, so the
+		// canvas draws stored rows here rather than filtering the snapshot blob.
+		const level = state.codegraph.symbolCanvas;
+		const drawable = {
+			nodes: (level?.nodes || []).map((n) => ({
+				id: codeGraphNormId(n.id),
+				path: n.path || "",
+				label: n.symbolName || n.path || n.id,
+				role: n.kind || "symbol",
+				kind: "symbol",
+				fanIn: Number(n.fanIn) || 0,
+				fanOut: Number(n.fanOut) || 0,
+				hotspotScore: Number(n.hotspot) || 0
+			})),
+			edges: (level?.edges || []).map((e) => ({
+				from: codeGraphNormId(e.from),
+				to: codeGraphNormId(e.to),
+				kind: e.kind || "calls",
+				evidence: e.evidence || "",
+				line: e.line || 0
+			})),
+			clusters: []
+		};
+		view = CG.buildFileView(drawable, { maxNodes: 120, detail: true, focus: state.codegraph.focusId || "" });
 	} else if (depth === "file") {
 		const clusterId = state.codegraph.clusterId;
 		const edgesKey = String(clusterId || "__all__");
@@ -5679,9 +5732,22 @@ function paintCodeGraphCanvas(options = {}) {
 		const show = state.codegraph.viewTruncated || !!snapshot.truncated;
 		elements.codegraphTruncation.hidden = !show;
 		if (show) {
-			// Prefer the server's own account of what it kept. The reason-code
-			// sentence is the fallback for snapshots built before completeness.
-			const counted = codeGraphCompletenessLines(snapshot.completeness);
+			// Two different losses, and the on-screen one was never counted: the
+			// canvas caps nodes and edges itself, so a snapshot that is complete
+			// server-side can still be showing a fraction of it. Report what this
+			// view dropped first, then what the server dropped before sending it.
+			const drawnNodes = Array.isArray(view?.nodes) ? view.nodes.length : 0;
+			const drawnEdges = Array.isArray(view?.edges) ? view.edges.length : 0;
+			const viewNodeTotal = Number(view?.totalNodes) || drawnNodes;
+			const viewEdgeTotal = Number(view?.totalEdges) || drawnEdges;
+			const viewLines = [];
+			if (viewNodeTotal > drawnNodes) {
+				viewLines.push(`Drawing ${drawnNodes.toLocaleString()} of ${viewNodeTotal.toLocaleString()} nodes in this view — ${(viewNodeTotal - drawnNodes).toLocaleString()} not shown`);
+			}
+			if (viewEdgeTotal > drawnEdges) {
+				viewLines.push(`Drawing ${drawnEdges.toLocaleString()} of ${viewEdgeTotal.toLocaleString()} edges in this view — ${(viewEdgeTotal - drawnEdges).toLocaleString()} not shown`);
+			}
+			const counted = viewLines.concat(codeGraphCompletenessLines(snapshot.completeness));
 			elements.codegraphTruncation.innerHTML = counted.length
 				? `<strong>Showing part of the graph.</strong><ul class="codegraph-completeness">${counted.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`
 				: escapeHtml(codeGraphTruncationMessage(reasons, !!state.codegraph.viewTruncated));
@@ -7096,32 +7162,18 @@ async function resumeRunFromQuery() {
 	if (state.activeRun || state.didAutoResume) return;
 	const params = new URLSearchParams(window.location.search);
 	const resumeId = params.get("run");
-	// Plain /codegraph is an orientation request, not a run request: fall back to
-	// the form's project path and open the newest saved map for it. A project
-	// with no snapshot yet still lands on the run form, unchanged.
-	const projectPath = params.get("projectPath")
-		|| params.get("project")
-		|| (state.workspace === "codegraph" ? String(elements.projectPath?.value || "").trim() : "");
-	if (!resumeId && !(state.workspace === "codegraph" && projectPath)) return;
+	// Only an explicit run id opens a map. Plain /codegraph is a request to start
+	// one, so it stays on the form: silently reopening the newest saved snapshot
+	// made the page look like it had already run, and left no obvious way to
+	// begin a fresh one. History's Open button is the way back to a saved map,
+	// and it arrives here with ?run=.
+	if (!resumeId) return;
 	state.didAutoResume = true;
 	try {
-		if (resumeId) {
-			const payload = await request(`/api/v1/runs/${encodeURIComponent(resumeId)}`);
-			watchRun(payload.data);
-		} else {
-			if (elements.projectPath) elements.projectPath.value = projectPath;
-			let payload = null;
-			try {
-				payload = await request(`/api/v1/codegraph?projectPath=${encodeURIComponent(projectPath)}`);
-			} catch (lookupError) {
-				// No saved map for this project is the normal first-visit case.
-				return;
-			}
-			if (payload?.data?.run) {
-				state.codegraph.openedFromSavedMap = true;
-				watchRun(payload.data.run);
-			}
-		}
+		const payload = await request(`/api/v1/runs/${encodeURIComponent(resumeId)}`);
+		// Arriving by run id means this map was stored, not just produced.
+		state.codegraph.openedFromSavedMap = true;
+		watchRun(payload.data);
 		if (params.get("focus") === "trace") {
 			window.setTimeout(() => {
 				elements.observePanel?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -8407,6 +8459,15 @@ elements.codegraphDepth?.addEventListener("click", (event) => {
 	} else if (depth === "file") {
 		if (!state.codegraph.clusterId && state.codegraph.mode !== "file") return;
 		codeGraphEnterFiles(state.codegraph.clusterId, { fit: true });
+	} else if (depth === "symbol") {
+		// Scoped to the selected file: "the symbols of everything" is not a view,
+		// it is 5,000 nodes.
+		const target = state.codegraph.selectedId;
+		if (!target) return;
+		state.codegraph.mode = "symbol";
+		state.codegraph.selectedEdge = null;
+		codeGraphLoadSymbolCanvas(target);
+		paintCodeGraphCanvas({ fit: true });
 	} else if (depth === "focus") {
 		if (!state.codegraph.focusSubgraph) return;
 		state.codegraph.mode = "focus";
@@ -8556,6 +8617,43 @@ elements.codegraphBreadcrumb?.addEventListener("click", (event) => {
 		paintCodeGraphCanvas({ fit: true });
 	} else if (target === "cluster") {
 		codeGraphEnterFiles(state.codegraph.clusterId, { fit: true });
+	}
+});
+
+// Keyboard traversal of the graph. The canvas was reachable only by pointer, so
+// every node was invisible to keyboard and screen-reader users — the role hues
+// that carry the primary signal are also the only differentiator without a name.
+//
+// Pattern is the established one for node-link data: tab to the region, then
+// arrow between data points. Order follows the drawn order, which is already
+// deterministic, so "next" means the same thing on every machine.
+elements.codegraphCanvas?.addEventListener("keydown", (event) => {
+	const drawn = Array.from(elements.codegraphCanvas.querySelectorAll(".cg-node"));
+	if (!drawn.length) return;
+	const active = document.activeElement?.closest?.(".cg-node") || null;
+	const index = active ? drawn.indexOf(active) : -1;
+
+	let next = null;
+	if (event.key === "ArrowRight" || event.key === "ArrowDown") next = drawn[Math.min(drawn.length - 1, index + 1)];
+	else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = drawn[Math.max(0, index <= 0 ? 0 : index - 1)];
+	else if (event.key === "Home") next = drawn[0];
+	else if (event.key === "End") next = drawn[drawn.length - 1];
+	else if ((event.key === "Enter" || event.key === " ") && active) {
+		event.preventDefault();
+		const nodeId = active.getAttribute("data-node-id") || "";
+		if (nodeId) codeGraphSelectNode(nodeId);
+		return;
+	} else {
+		return;
+	}
+
+	if (next) {
+		event.preventDefault();
+		next.focus();
+		// Announce without stealing the visual selection: focus is navigation,
+		// Enter is selection.
+		const label = next.getAttribute("aria-label") || "";
+		if (elements.codegraphA11yStatus && label) elements.codegraphA11yStatus.textContent = label;
 	}
 });
 

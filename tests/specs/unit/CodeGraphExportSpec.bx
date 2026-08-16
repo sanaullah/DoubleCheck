@@ -1,0 +1,88 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraph visual exports (Phase 9)", () => {
+
+			var service = new app.models.services.ReportExportService();
+			var run = { id: "export-run-1", runKind: "codegraph" };
+
+			var snapshot = {
+				projectName : "Orders",
+				clusters    : [
+					{ id: "c1", label: "Ordering", fileCount: 12 },
+					{ id: "c2", label: "Billing", fileCount: 7 },
+					{ id: "c3", label: "Reporting", fileCount: 3 }
+				],
+				clusterEdges: [ { from: "c1", to: "c2", weight: 3 } ],
+				flows       : [ {
+					id         : "flow-1",
+					steps      : [ "route:/api/v1/orders", "app/handlers/ApiOrders.bx", "app/models/OrderService.bx", "table:orders" ],
+					edgeKinds  : [ "routes", "calls", "table-write" ],
+					stepSymbols: [ "", "ApiOrders.create", "" ],
+					sinkKind   : "table-write"
+				} ]
+			};
+
+			it( "draws boxes and edges, not a list of paths wearing SVG clothing", () => {
+				var result = service.export( run, { codegraph: snapshot }, "svg" );
+
+				expect( result.content ).toInclude( "<rect", "modules must be drawn as boxes" );
+				expect( result.content ).toInclude( "<line", "dependencies must be drawn as lines" );
+				expect( result.content ).toInclude( "Ordering" );
+				expect( result.content ).toInclude( "12 files" );
+				expect( result.contentType ).toInclude( "image/svg+xml" );
+			} );
+
+			it( "never references a remote font, because local-only is a boundary", () => {
+				var result = service.export( run, { codegraph: snapshot }, "svg" );
+
+				// The xmlns URI is a namespace identifier, not a fetch, so the check
+				// is for things that actually load: webfonts, imports, external refs.
+				expect( result.content ).notToInclude( "fonts.googleapis" );
+				expect( result.content ).notToInclude( "@import" );
+				expect( result.content ).notToInclude( "xlink:href" );
+				expect( result.content ).notToInclude( "<image" );
+				expect( reFindNoCase( "href[ ]*=[ ]*""http", result.content ) ).toBe( 0, "no external resource may be referenced" );
+			} );
+
+			it( "renders a flow as a sequence diagram with one column per participant", () => {
+				var result = service.export( run, { codegraph: snapshot }, "sequence" );
+
+				expect( result.content ).toInclude( "/api/v1/orders", "the route is a participant" );
+				expect( result.content ).toInclude( "orders", "the table sink is a participant" );
+				expect( result.content ).toInclude( "routes" );
+				expect( result.content ).toInclude( "table-write" );
+				expect( result.content ).toInclude( "ApiOrders.create", "an attributed hop names its symbol" );
+			} );
+
+			it( "says file level rather than guessing a symbol it could not resolve", () => {
+				var result = service.export( run, { codegraph: snapshot }, "sequence" );
+
+				expect( result.content ).toInclude( "(file level)" );
+			} );
+
+			it( "degrades honestly when there is nothing to draw", () => {
+				var empty = service.export( run, { codegraph: { clusters: [], clusterEdges: [], flows: [] } }, "svg" );
+				expect( empty.content ).toInclude( "No clusters" );
+
+				var noFlow = service.export( run, { codegraph: { clusters: [], clusterEdges: [], flows: [] } }, "sequence" );
+				expect( noFlow.content ).toInclude( "No process flow" );
+			} );
+
+			it( "draws a dependency structure matrix that scales past node-link density", () => {
+				var result = service.export( run, { codegraph: snapshot }, "matrix" );
+
+				// One cell per pair plus the diagonal: 3 modules is a 3x3 grid.
+				expect( result.content ).toInclude( "dependency structure matrix" );
+				expect( result.content ).toInclude( "row depends on column" );
+				var cells = reMatch( "<rect", result.content );
+				expect( cells.len() ).toBeGTE( 10, "background plus a 3x3 grid" );
+				expect( result.content ).toInclude( "Ordering" );
+			} );
+
+			it( "rejects an unknown format by name", () => {
+				expect( () => service.export( run, { codegraph: snapshot }, "png" ) ).toThrow( type = "ValidationException" );
+			} );
+		} );
+	}
+}

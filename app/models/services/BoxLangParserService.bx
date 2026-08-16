@@ -6,9 +6,10 @@
 class threadsafe {
 	property name="codegraphParserStrategy" inject="coldbox:setting:codegraphParserStrategy";
 
-	variables.parserVersion = "boxlang-ast-parser-v5";
+	variables.parserVersion = "boxlang-ast-parser-v6";
 	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
+	variables.integrationDetector = new app.models.services.IntegrationDetector();
 
 	string function getVersion() {
 		return variables.parserVersion & "-strategy-" & configuredStrategy();
@@ -669,9 +670,12 @@ class threadsafe {
 	private void function extractResourceDependencies( required array dependencies, required string sourceLine, required numeric lineNumber ) {
 		var scopeMatch = match( "\b(application|session|client)\.([A-Za-z_][A-Za-z0-9_]*)", arguments.sourceLine );
 		while ( scopeMatch.find() ) appendUniqueDependency( arguments.dependencies, "scope.#scopeMatch.group( 1 )#", scopeMatch.group( 2 ), arguments.lineNumber, arguments.sourceLine );
-		var httpMatch = match( "\b(?:http|httpService)\s*\(\s*[""']([^""']+)[""']", arguments.sourceLine );
-		if ( httpMatch.find() ) appendUniqueDependency( arguments.dependencies, "http", httpMatch.group( 1 ), arguments.lineNumber, arguments.sourceLine );
-		if ( match( "\bschedule\s*\(", arguments.sourceLine ).find() ) appendUniqueDependency( arguments.dependencies, "schedule", "schedule", arguments.lineNumber, arguments.sourceLine );
+		// Shared with Modernize so "what does this talk to" cannot be answered two
+		// different ways on the same file. The previous test needed a literal URL
+		// as the first argument of `http(` and therefore never fired.
+		for ( var integration in integrationDetector.detect( arguments.sourceLine ) ) {
+			appendUniqueDependency( arguments.dependencies, integration.kind, integration.target, arguments.lineNumber, arguments.sourceLine );
+		}
 	}
 
 	private void function extractSqlDependencies( required array dependencies, required array lines ) {
@@ -688,7 +692,7 @@ class threadsafe {
 						break;
 					}
 				}
-				appendUniqueDependency( arguments.dependencies, "table-query", table, evidenceLine, evidence, evidenceLine );
+				appendUniqueDependency( arguments.dependencies, references.statementKind ?: "table-query", table, evidenceLine, evidence, evidenceLine );
 			}
 		}
 	}

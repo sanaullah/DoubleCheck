@@ -14,7 +14,8 @@ class threadsafe {
 		string repositoryRevision    = "",
 		string narrativeCacheKey     = "",
 		struct narrative             = {},
-		string snapshotReuseKey      = ""
+		string snapshotReuseKey      = "",
+		struct stageHealth           = {}
 	) {
 		var truncated = arguments.snapshot.truncated ?: false;
 		queryExecute(
@@ -23,12 +24,12 @@ class threadsafe {
 					run_id, snapshot_version, project_path, repository_revision,
 					fingerprint, node_count, edge_count, cluster_count, cycle_count,
 					truncated, truncation_reasons_json, snapshot_json,
-					snapshot_reuse_key, narrative_cache_key, narrative_json, created_at
+					snapshot_reuse_key, narrative_cache_key, narrative_json, stage_health_json, created_at
 				) VALUES (
 					:runId, :snapshotVersion, :projectPath, :repositoryRevision,
 					:fingerprint, :nodeCount, :edgeCount, :clusterCount, :cycleCount,
 					:truncated, :truncationReasonsJson, :snapshotJson,
-					:snapshotReuseKey, :narrativeCacheKey, :narrativeJson, :createdAt
+					:snapshotReuseKey, :narrativeCacheKey, :narrativeJson, :stageHealthJson, :createdAt
 				)
 				ON CONFLICT ( run_id ) DO UPDATE SET
 					snapshot_version = excluded.snapshot_version,
@@ -45,6 +46,7 @@ class threadsafe {
 					snapshot_reuse_key = excluded.snapshot_reuse_key,
 					narrative_cache_key = excluded.narrative_cache_key,
 					narrative_json = excluded.narrative_json,
+					stage_health_json = excluded.stage_health_json,
 					created_at = excluded.created_at
 			",
 			{
@@ -61,6 +63,7 @@ class threadsafe {
 				truncationReasonsJson : jsonSerialize( arguments.snapshot.truncationReasons ?: [] ),
 				snapshotJson          : jsonSerialize( arguments.snapshot ),
 				snapshotReuseKey      : arguments.snapshotReuseKey,
+				stageHealthJson       : jsonSerialize( arguments.stageHealth ?: {} ),
 				narrativeCacheKey     : arguments.narrativeCacheKey,
 				narrativeJson         : jsonSerialize( arguments.narrative.count() ? arguments.narrative : { used: false } ),
 				createdAt             : timestamp()
@@ -73,7 +76,7 @@ class threadsafe {
 		var record = queryExecute(
 			"
 				SELECT snapshot_json, narrative_json, narrative_cache_key, snapshot_reuse_key,
-					truncated, truncation_reasons_json, fingerprint,
+					truncated, truncation_reasons_json, fingerprint, stage_health_json,
 					snapshot_version, project_path, repository_revision
 				FROM codegraph_snapshots
 				WHERE run_id = :runId
@@ -84,16 +87,33 @@ class threadsafe {
 		if ( !record.recordCount ) {
 			return javacast( "null", "" );
 		}
-		var snapshot = jsonDeserialize( record.snapshot_json[ 1 ] );
+		// A partially written or corrupt snapshot must not throw out of the most
+		// used read in the subsystem: `hasIndexedGraph` swallows the error and the
+		// user is told the run does not exist. `unreadable` lets the caller offer a
+		// rebuild instead of a lie.
+		var snapshot = safeDeserialize( record.snapshot_json[ 1 ] ?: "" );
+		if ( isNull( snapshot ) ) {
+			return {
+				version    : record.snapshot_version[ 1 ] ?: "",
+				fingerprint: record.fingerprint[ 1 ] ?: "",
+				projectPath: record.project_path[ 1 ] ?: "",
+				snapshot   : {},
+				narrative  : { used: false },
+				unreadable : true,
+				reason     : "snapshot-json-unreadable"
+			};
+		}
 		if ( !isStruct( snapshot ) ) {
 			snapshot = {};
 		}
-		var narrative = jsonDeserialize( record.narrative_json[ 1 ] ?: "{}" );
+		var narrative = safeDeserialize( record.narrative_json[ 1 ] ?: "{}" ) ?: { used: false };
 		if ( !isStruct( narrative ) ) {
 			 narrative = { used: false };
 		}
 		applyStoredLabels( snapshot, narrative, record.project_path[ 1 ] ?: "" );
+		var stageHealth = safeDeserialize( record.stage_health_json[ 1 ] ?: "{}" ) ?: {};
 		return {
+			stageHealth        : isStruct( stageHealth ) ? stageHealth : {},
 			version            : record.snapshot_version[ 1 ] ?: ( snapshot.version ?: "codegraph-snapshot-v1" ),
 			fingerprint        : record.fingerprint[ 1 ] ?: ( snapshot.fingerprint ?: "" ),
 			projectPath        : record.project_path[ 1 ] ?: "",
@@ -411,12 +431,67 @@ class threadsafe {
 	}
 
 	/** Stable key used by both persistence and the label override endpoint. */
+	/**
+	 * Record which optional stages degraded on this run.
+	 *
+	 * Written separately because the happy path finishes through `updateNarrative`,
+	 * and a run's health is known only after every optional stage has had its turn.
+	 */
+	void function saveStageHealth( required string runId, required struct stageHealth ) {
+		queryExecute(
+			"UPDATE codegraph_snapshots SET stage_health_json = :stageHealthJson WHERE run_id = :runId",
+			{ runId: arguments.runId, stageHealthJson: jsonSerialize( arguments.stageHealth ) },
+			{ datasource: datasource }
+		);
+	}
+
+	/** Null when the stored JSON cannot be parsed, so callers can say so. */
+	private any function safeDeserialize( required any raw ) {
+		var text = toString( arguments.raw ?: "" );
+		if ( !len( trim( text ) ) ) return {};
+		try {
+			return jsonDeserialize( text );
+		} catch ( any unreadable ) {
+			return javacast( "null", "" );
+		}
+	}
+
+	/**
+	 * Identity for a user's domain label.
+	 *
+	 * Previously a hash of the exact sorted member list, so adding one file to a
+	 * domain changed the key and silently orphaned the human-written name — the
+	 * one piece of genuine knowledge in the system, keyed on its most volatile
+	 * property. The anchor is the deepest shared directory of the members, which
+	 * survives a domain gaining or losing files. `clusterFingerprint` remains the
+	 * change-detection value; these are two different questions.
+	 */
 	string function clusterKey( required struct cluster ) {
 		var members = isArray( arguments.cluster.filePaths ?: "" ) ? duplicate( arguments.cluster.filePaths ) : [];
 		if ( !members.len() && len( trim( toString( arguments.cluster.id ?: "" ) ) ) ) members = [ arguments.cluster.id ];
 		members = members.map( ( path ) => lCase( replace( trim( toString( path ) ), "\", "/", "all" ) ) );
 		members.sort( ( a, b ) => compareNoCase( toString( a ), toString( b ) ) );
-		return lCase( hash( jsonSerialize( members ), "SHA-256" ) );
+		return lCase( hash( clusterAnchor( members ), "SHA-256" ) );
+	}
+
+	/** Deepest directory common to every member; the member list when there is none. */
+	private string function clusterAnchor( required array members ) {
+		if ( !arguments.members.len() ) return "";
+		var segments = listToArray( arguments.members[ 1 ], "/" );
+		if ( segments.len() ) segments.deleteAt( segments.len() );
+		for ( var member in arguments.members ) {
+			var parts = listToArray( member, "/" );
+			if ( parts.len() ) parts.deleteAt( parts.len() );
+			var shared = [];
+			for ( var index = 1; index <= min( segments.len(), parts.len() ); index++ ) {
+				if ( compareNoCase( segments[ index ], parts[ index ] ) != 0 ) break;
+				shared.append( segments[ index ] );
+			}
+			segments = shared;
+			if ( !segments.len() ) break;
+		}
+		// No shared root — fall back to membership so the key stays deterministic.
+		return segments.len() ? arrayToList( segments, "/" ) : jsonSerialize( arguments.members );
 	}
 
 	string function clusterFingerprint( required struct cluster ) {

@@ -1,0 +1,64 @@
+/**
+ * One detector for the ways code reaches outside itself.
+ *
+ * CodeGraph and Modernize both answered "what does this talk to" and answered it
+ * differently on the same files. CodeGraph's outbound-HTTP test required a
+ * function literally named `http`/`httpService` with a quoted literal URL as its
+ * first argument, so on a codebase whose whole purpose includes calling LLM
+ * providers it matched **nothing**: `http` had zero rows, and the `integration`
+ * role was assigned to zero files. Modernize's equivalent already caught
+ * `cfhttp`, `httpRequest`, `httpClient`, `new Http(` and `fetch(`.
+ *
+ * Patterns here are seeded from the stronger implementation. Both consumers use
+ * this so the answer cannot diverge by subsystem again.
+ *
+ * @see ModernizationInventoryService
+ * @see BoxLangParserService
+ */
+class {
+
+	variables.patterns = [
+		{ kind: "http", target: "outbound", expression: "(?:<cfhttp\b|\bhttpRequest\b|\bhttpClient\b|\bnew\s+Http\s*\(|\bfetch\s*\(|\bhttpService\s*\(|\bhttp\s*\(\s*[""'])" },
+		{ kind: "schedule", target: "scheduled-work", expression: "(?:<cfschedule\b|\bscheduler(?:New|Start|Stop)?\b|\bonSchedule\b|\bschedule\s*\()" },
+		{ kind: "filesystem", target: "filesystem", expression: "(?:cf_file|fileRead|fileWrite|fileCopy|fileMove|directoryList|directoryCreate|fileUpload|cffile)" },
+		{ kind: "java", target: "java-interop", expression: "(?:new\s+java[.:]|createObject\s*\(\s*[""']java[""'])" }
+	];
+
+	/**
+	 * Outbound integrations named on one source line.
+	 *
+	 * Returns `[ { kind, target } ]`; the caller owns evidence and line numbers so
+	 * each parser keeps its own dependency shape.
+	 */
+	array function detect( required string sourceLine ) {
+		var found = [];
+		var source = toString( arguments.sourceLine ?: "" );
+		if ( !len( trim( source ) ) ) return found;
+		for ( var pattern in variables.patterns ) {
+			if ( reFindNoCase( pattern.expression, source ) ) {
+				found.append( { kind: pattern.kind, target: hostFor( source, pattern.kind ) } );
+			}
+		}
+		return found;
+	}
+
+	/**
+	 * The system on the other end, when the line names it.
+	 *
+	 * A URL literal makes the external system identifiable, which is what turns
+	 * "this file calls out" into "this file calls Anthropic". When the target is
+	 * built at runtime the honest answer is the generic one, not a guess.
+	 */
+	private string function hostFor( required string sourceLine, required string kind ) {
+		if ( arguments.kind != "http" ) return arguments.kind == "schedule" ? "scheduled-work" : arguments.kind;
+		// reFind's struct form returns positions, not text.
+		var found = reFindNoCase( "https?://([A-Za-z0-9._-]+)", arguments.sourceLine, 1, true );
+		if (
+			isStruct( found ) && isArray( found.pos ?: "" ) && found.pos.len() >= 2 &&
+			val( found.pos[ 2 ] ) > 0 && val( found.len[ 2 ] ) > 0
+		) {
+			return lCase( mid( arguments.sourceLine, found.pos[ 2 ], found.len[ 2 ] ) );
+		}
+		return "outbound";
+	}
+}

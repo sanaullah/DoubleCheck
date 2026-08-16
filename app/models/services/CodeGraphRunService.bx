@@ -16,6 +16,7 @@ class threadsafe {
 	property name="codeGraphQueryService" inject="CodeGraphQueryService";
 	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
 	property name="graphProjectionService" inject="CodeGraphProjectionService";
+	property name="reuseKeyService" inject="CodeGraphReuseKeyService";
 	property name="narrativeService" inject="CodeGraphNarrativeService";
 	property name="eventService" inject="ReviewEventService";
 	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
@@ -210,7 +211,9 @@ class threadsafe {
 			// Deeper levels are written after the structure is durable so
 			// time-to-first-map does not pay for the row write. If this fails the
 			// snapshot still serves; only drill-down below the canvas is missing.
-			var levelsSummary = projectGraphRows( runId, snapshot, reviewGraph );
+			var levels = projectGraphRows( runId, snapshot, reviewGraph );
+			var levelsSummary = levels.summary;
+			var stageHealth = { projection: levels.health };
 			checkCancellation( arguments.callbacks );
 			renewLease( arguments.callbacks );
 
@@ -247,6 +250,16 @@ class threadsafe {
 			} else {
 				saveSnapshot( runId, snapshot, projectPath, repositoryRevision, narrativeCacheKey, narrative, snapshotReuseKey );
 			}
+
+			// Every optional stage has now run, so the health record is complete.
+			// Never fails the run: a missing health row is worse than a failed one,
+			// but neither is worth losing a good graph over.
+			stageHealth.narrative = {
+				ok    : ( narrative.used ?: false ) || !( narrative.pending ?: false ),
+				used  : narrative.used ?: false,
+				reason: trim( toString( narrative.error ?: "" ) )
+			};
+			try { codeGraphRepository.saveStageHealth( runId, stageHealth ); } catch ( any healthError ) {}
 
 			return {
 				status    : "succeeded",
@@ -639,7 +652,8 @@ class threadsafe {
 		required string repositoryRevision,
 		required string narrativeCacheKey,
 		required struct narrative,
-		string snapshotReuseKey = ""
+		string snapshotReuseKey = "",
+		struct stageHealth = {}
 	) {
 		try {
 			codeGraphRepository.save(
@@ -649,7 +663,8 @@ class threadsafe {
 				arguments.repositoryRevision,
 				arguments.narrativeCacheKey,
 				arguments.narrative,
-				arguments.snapshotReuseKey
+				arguments.snapshotReuseKey,
+				arguments.stageHealth
 			);
 		} catch ( any compatibilityError ) {
 			// Older unit doubles/local services expose the pre-reuse six-argument API.
@@ -669,57 +684,71 @@ class threadsafe {
 	 * silently either: a swallowed error here looks exactly like a snapshot that
 	 * predates levelled storage, and the two need different remedies.
 	 */
-	private string function projectGraphRows(
+	private struct function projectGraphRows(
 		required string runId,
 		required struct snapshot,
 		required struct reviewGraph
 	) {
 		if ( isNull( variables.graphProjectionService ?: javacast( "null", "" ) ) || isNull( variables.codeGraphGraphRepository ?: javacast( "null", "" ) ) ) {
-			return "levelled graph unavailable in this configuration";
+			return { summary: "levelled graph unavailable in this configuration", health: { ok: false, nodes: 0, edges: 0, reason: "not-configured" } };
 		}
 		try {
+			// Identical fingerprint means an identical projection, so copying rows
+			// beats recomputing ~10,000 of them. The fingerprint already covers
+			// every input the projection reads.
+			var fingerprint = trim( toString( arguments.snapshot.fingerprint ?: "" ) );
+			if ( len( fingerprint ) ) {
+				var source = codeGraphGraphRepository.findProjectionSource( fingerprint, arguments.runId );
+				if ( len( source ) && codeGraphGraphRepository.reuseGraphFrom( source, arguments.runId ) ) {
+					return {
+						summary: "levelled graph reused from an identical snapshot",
+						health : { ok: true, nodes: 0, edges: 0, reason: "reused" }
+					};
+				}
+			}
 			var projected = graphProjectionService.project( arguments.snapshot, arguments.reviewGraph );
 			codeGraphGraphRepository.replaceGraph( arguments.runId, projected.nodes, projected.edges );
-			return "#projected.nodes.len()# graph nodes, #projected.edges.len()# graph edges";
+			return {
+				summary: "#projected.nodes.len()# graph nodes, #projected.edges.len()# graph edges",
+				health : { ok: true, nodes: projected.nodes.len(), edges: projected.edges.len(), reason: "" }
+			};
 		} catch ( any projectionError ) {
 			// Structure is already durable; drill-down degrades rather than the run.
-			return "levelled graph unavailable: #projectionError.message#";
+			// The reason is persisted with the snapshot: after the run finishes a
+			// transient progress message is the only other place it existed.
+			return {
+				summary: "levelled graph unavailable: ##projectionError.message##",
+				health : { ok: false, nodes: 0, edges: 0, reason: projectionError.message }
+			};
 		}
 	}
 
+	/** Delegates so cache-key derivation has exactly one owner. */
 	private string function buildSnapshotReuseKey( array files = [] ) {
-		var parserVersion = "";
-		try {
-			parserVersion = architectureIndexService.parserVersionSignature();
-		} catch ( any ignored ) {
-			try {
-				if ( arguments.files.len() ) parserVersion = architectureIndexService.parserVersionFor( arguments.files );
-			} catch ( any ignoredFallback ) {
-				parserVersion = "";
-			}
+		// Specs and small local callers construct this service with `new`, which
+		// does not run WireBox injection.
+		if ( isNull( variables.reuseKeyService ?: javacast( "null", "" ) ) ) {
+			variables.reuseKeyService = new app.models.services.CodeGraphReuseKeyService();
 		}
-		// Must track the parser versions above it: a stale literal here silently
-		// reuses snapshots built by an older parser whenever the signature lookup
-		// falls through.
-		if ( !len( trim( parserVersion ) ) ) parserVersion = "boxlang-ast-parser-v5|cfml-symbol-parser-v5|javascript-symbol-parser-v4";
-		var settings = {
-			parserVersion      : parserVersion,
-			parserStrategy     : variables.codegraphParserStrategy ?: "auto",
-			maxSymbols         : variables.codegraphMaxSymbols ?: 20000,
-			maxEdges           : variables.codegraphMaxEdges ?: 20000,
-			maxNodes           : variables.codegraphMaxNodes ?: 1500,
-			maxClusters        : variables.codegraphMaxClusters ?: 60,
-			maxHotspots        : variables.codegraphMaxHotspots ?: 50,
-			maxOrphans         : variables.codegraphMaxOrphans ?: 200,
-			maxLayerViolations : variables.codegraphMaxLayerViolations ?: 200,
-			flowMaxDepth       : variables.codegraphFlowMaxDepth ?: 6,
-			maxFlowsPerCluster : variables.codegraphMaxFlowsPerCluster ?: 4,
-			layerPolicy        : variables.codegraphLayerPolicy ?: "application-models>http-handlers",
-			coChangeEnabled    : structKeyExists( variables, "codegraphCoChangeEnabled" ) ? variables.codegraphCoChangeEnabled : true,
-			coChangeMaxCommits : variables.codegraphCoChangeMaxCommits ?: 500,
-			snapshotVersion    : "codegraph-snapshot-v2"
-		};
-		return lCase( hash( jsonSerialize( settings ), "SHA-256" ) );
+		return reuseKeyService.build(
+			isNull( variables.architectureIndexService ?: javacast( "null", "" ) ) ? "" : architectureIndexService,
+			arguments.files,
+			{
+				parserStrategy     : variables.codegraphParserStrategy ?: "auto",
+				maxSymbols         : variables.codegraphMaxSymbols ?: 20000,
+				maxEdges           : variables.codegraphMaxEdges ?: 20000,
+				maxNodes           : variables.codegraphMaxNodes ?: 1500,
+				maxClusters        : variables.codegraphMaxClusters ?: 60,
+				maxHotspots        : variables.codegraphMaxHotspots ?: 50,
+				maxOrphans         : variables.codegraphMaxOrphans ?: 200,
+				maxLayerViolations : variables.codegraphMaxLayerViolations ?: 200,
+				flowMaxDepth       : variables.codegraphFlowMaxDepth ?: 6,
+				maxFlowsPerCluster : variables.codegraphMaxFlowsPerCluster ?: 4,
+				layerPolicy        : variables.codegraphLayerPolicy ?: "application-models>http-handlers",
+				coChangeEnabled    : variables.codegraphCoChangeEnabled ?: true,
+				coChangeMaxCommits : variables.codegraphCoChangeMaxCommits ?: 500
+			}
+		);
 	}
 
 	/** Reuse is safe only when Git proves the working tree matches HEAD. */

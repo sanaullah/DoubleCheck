@@ -1,0 +1,49 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "IntegrationDetector", () => {
+
+			var detector = new app.models.services.IntegrationDetector();
+
+			function kinds( required array found ) {
+				var list = "";
+				for ( var item in arguments.found ) list = listAppend( list, item.kind );
+				return list;
+			}
+
+			it( "detects the outbound forms the old CodeGraph pattern could not", () => {
+				// The previous test needed `http( "literal-url" )` and therefore
+				// matched nothing on a codebase that calls LLM providers.
+				for ( var line in [
+					'<cfhttp url="https://api.example.com/v1" method="post">',
+					'var response = httpClient.send( request );',
+					'var reply = new Http( url = endpoint ).send();',
+					'const res = await fetch( "/api/v1/runs" );'
+				] ) {
+					expect( listFindNoCase( kinds( detector.detect( line ) ), "http" ) ).toBeGT( 0, "should detect: " & line );
+				}
+			} );
+
+			it( "names the external system when the line names it", () => {
+				var found = detector.detect( 'httpClient.post( "https://api.anthropic.com/v1/messages" )' );
+				expect( found[ 1 ].target ).toBe( "api.anthropic.com" );
+			} );
+
+			it( "stays generic when the target is built at runtime", () => {
+				var found = detector.detect( 'httpClient.post( providerEndpoint )' );
+				expect( found[ 1 ].target ).toBe( "outbound" );
+			} );
+
+			it( "detects scheduled work, filesystem and java interop", () => {
+				expect( listFindNoCase( kinds( detector.detect( '<cfschedule action="update">' ) ), "schedule" ) ).toBeGT( 0 );
+				expect( listFindNoCase( kinds( detector.detect( 'var body = fileRead( path );' ) ), "filesystem" ) ).toBeGT( 0 );
+				expect( listFindNoCase( kinds( detector.detect( 'var f = new java:java.io.File( path );' ) ), "java" ) ).toBeGT( 0 );
+			} );
+
+			it( "stays quiet on ordinary code", () => {
+				expect( detector.detect( 'var total = orders.len();' ) ).toBeEmpty();
+				expect( detector.detect( "" ) ).toBeEmpty();
+			} );
+		} );
+	}
+}

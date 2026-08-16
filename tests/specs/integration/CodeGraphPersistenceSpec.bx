@@ -154,6 +154,51 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				}
 			} );
 
+			it( "carries levelled rows through graph adoption so a reused run can still be explored", () => {
+				// D1: adoption copied review_* only, so every reused run answered 409
+				// "snapshot predates levelled storage" and searched to nothing.
+				var graphs = getInstance( "AnalysisGraphRepository" );
+				var source = "adopt-source-" & createUUID();
+				var target = "adopt-target-" & createUUID();
+				for ( var runId in [ source, target ] ) {
+					queryExecute(
+						"INSERT INTO review_runs ( id, project_path, status, run_kind, mode, created_at, updated_at ) VALUES ( :id, '/tmp/p', 'succeeded', 'codegraph', 'full', :now, :now )",
+						{ id: runId, now: dateTimeFormat( now(), "iso" ) }
+					);
+				}
+				getInstance( "CodeGraphGraphRepository" ).replaceGraph(
+					source,
+					[ { id: "file:a.bx", level: "file", parentId: "", path: "a.bx", symbolName: "", kind: "file", role: "", language: "BoxLang", line: 0, endLine: 0, fanIn: 1, fanOut: 0, hotspot: 2 } ],
+					[ { id: "file-1", level: "file", from: "file:a.bx", to: "file:a.bx", groupKind: "calls", kinds: [ "calls" ], occurrences: 1, weight: 1, resolution: "path", line: 3, evidence: "x()" } ]
+				);
+
+				graphs.adoptRunGraph( source, target );
+
+				var nodes = queryExecute( "SELECT COUNT(*) AS n FROM codegraph_nodes WHERE run_id = :id", { id: target } );
+				expect( nodes.n[ 1 ] ).toBe( 1, "adopted run must carry node rows" );
+				expect( getInstance( "CodeGraphGraphRepository" ).hasGraph( target ) ).toBeTrue();
+				queryExecute( "DELETE FROM review_runs WHERE id IN ( :a, :b )", { a: source, b: target } );
+			} );
+
+			it( "reports an unreadable snapshot instead of throwing out of the read path", () => {
+				// D30: an unguarded jsonDeserialize surfaced as "run not found".
+				var runId = "corrupt-" & createUUID();
+				queryExecute(
+					"INSERT INTO review_runs ( id, project_path, status, run_kind, mode, created_at, updated_at ) VALUES ( :id, '/tmp/p', 'succeeded', 'codegraph', 'full', :now, :now )",
+					{ id: runId, now: dateTimeFormat( now(), "iso" ) }
+				);
+				queryExecute(
+					"INSERT INTO codegraph_snapshots ( run_id, snapshot_version, project_path, fingerprint, node_count, edge_count, cluster_count, cycle_count, truncated, truncation_reasons_json, snapshot_json, created_at ) VALUES ( :id, 'v', '/tmp/p', 'f', 0, 0, 0, 0, 0, '[]', :bad, :now )",
+					{ id: runId, bad: "{ this is not json", now: dateTimeFormat( now(), "iso" ) }
+				);
+
+				var stored = getInstance( "CodeGraphRepository" ).get( runId );
+
+				expect( isNull( stored ) ).toBeFalse( "a corrupt snapshot must not read as a missing run" );
+				expect( stored.unreadable ?: false ).toBeTrue();
+				queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: runId } );
+			} );
+
 			it( "reuses narrative by project path, revision, and cache key", () => {
 				var runIdA = lCase( createUUID() );
 				var runIdB = lCase( createUUID() );

@@ -8,6 +8,8 @@ class extends="coldbox.system.RestHandler" {
 	property name="graphRepository" inject="AnalysisGraphRepository";
 	property name="codeGraphRepository" inject="CodeGraphRepository";
 	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
+	property name="architectureRuleService" inject="ArchitectureRuleService";
+	property name="codeGraphQueryRepository" inject="CodeGraphQueryRepository";
 
 	property name="runService" inject="ReviewRunService";
 
@@ -18,6 +20,9 @@ class extends="coldbox.system.RestHandler" {
 	property name="codegraphSubgraphMaxDepth" inject="coldbox:setting:codegraphSubgraphMaxDepth";
 
 	property name="codegraphMaxEdges" inject="coldbox:setting:codegraphMaxEdges";
+	// Read by `graph` for the limit ceiling; without the injection the setting
+	// was inert and the ceiling was a hard-coded 1500.
+	property name="codegraphMaxNodes" inject="coldbox:setting:codegraphMaxNodes";
 	property name="codegraphPathMaxResults" inject="coldbox:setting:codegraphPathMaxResults";
 	property name="codegraphPathMaxDepth" inject="coldbox:setting:codegraphPathMaxDepth";
 
@@ -247,13 +252,23 @@ class extends="coldbox.system.RestHandler" {
 				data       = { error: { code: "snapshot_predates_node_tables", message: "This snapshot was built before levelled storage. Rebuild the map to explore below the canvas." } }
 			);
 		}
+		var include = lCase( trim( toString( rc.include ?: "both" ) ) );
+		if ( !listFindNoCase( "both,nodes", include ) ) return validationError( event, "include must be both or nodes" );
+		var rank = lCase( trim( toString( rc.rank ?: "hotspot" ) ) );
+		if ( !listFindNoCase( "hotspot,fanIn,name", rank ) ) return validationError( event, "rank must be hotspot, fanIn, or name" );
+		var scope = trim( toString( rc.scope ?: "" ) );
+		// A typo and a leaf must not both answer 200 with an empty list.
+		if ( len( scope ) && !codeGraphGraphRepository.hasNode( run.getId(), scope ) ) {
+			return notFound( event );
+		}
 		try {
 			var payload = codeGraphGraphRepository.readLevel( run.getId(), {
 				level  : level,
-				scope  : rc.scope ?: "",
-				rank   : rc.rank ?: "hotspot",
+				scope  : scope,
+				rank   : rank,
 				limit  : len( trim( toString( rc.limit ?: "" ) ) ) ? val( rc.limit ) : 200,
-				include: rc.include ?: "both"
+				include: include,
+				edgeLimit: len( trim( toString( rc.edgeLimit ?: "" ) ) ) ? val( rc.edgeLimit ) : 2000
 			} );
 			event.renderData( type = "json", data = { data: payload } );
 		} catch ( "ValidationException" error ) {
@@ -278,6 +293,16 @@ class extends="coldbox.system.RestHandler" {
 		if ( isNull( run ) || !hasIndexedGraph( run ) ) return notFound( event );
 		var term = trim( toString( rc.q ?: "" ) );
 		if ( !len( term ) ) return validationError( event, "q is required" );
+		// Without this an unprojected run answers 200 `matches: []` and the client
+		// renders "nothing matches" for a file that is on screen. "No graph" and
+		// "no match" must not serialise the same way.
+		if ( !codeGraphGraphRepository.hasGraph( run.getId() ) ) {
+			return event.renderData(
+				type       = "json",
+				statusCode = 409,
+				data       = { error: { code: "snapshot_predates_node_tables", message: "This snapshot has no levelled storage. Rebuild the map to search below the canvas." } }
+			);
+		}
 		if ( len( trim( toString( rc.limit ?: "" ) ) ) && ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > 200 ) ) {
 			return validationError( event, "limit must be between 1 and 200" );
 		}
@@ -287,6 +312,155 @@ class extends="coldbox.system.RestHandler" {
 			limit: len( trim( toString( rc.limit ?: "" ) ) ) ? val( rc.limit ) : 50
 		} );
 		event.renderData( type = "json", data = { data: payload } );
+	}
+
+	/**
+	 * Callers and callees of one node.
+	 *
+	 * @tags CodeGraph
+	 * @hint Incoming and outgoing edges for a node, with evidence and confidence
+	 * @param-node { "name":"node", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-direction { "name":"direction", "in":"query", "required":false, "schema":{"type":"string","enum":["both","incoming","outgoing"]} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":500} }
+	 * @response-200 Incoming and outgoing edges
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 * @response-422 Validation failed
+	 */
+	function neighbours( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		if ( !len( trim( toString( rc.node ?: "" ) ) ) ) return validationError( event, "node is required" );
+		var direction = lCase( trim( toString( rc.direction ?: "both" ) ) );
+		if ( !listFindNoCase( "both,incoming,outgoing", direction ) ) return validationError( event, "direction must be both, incoming, or outgoing" );
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.neighbours( run.getId(), {
+			node: rc.node, direction: direction, limit: rc.limit ?: 100
+		} ) } );
+	}
+
+	/**
+	 * Type hierarchy around one node.
+	 *
+	 * @tags CodeGraph
+	 * @hint What a node extends or implements, and what does so to it
+	 * @param-node { "name":"node", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @response-200 Ancestors and descendants
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 * @response-422 Validation failed
+	 */
+	function hierarchy( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		if ( !len( trim( toString( rc.node ?: "" ) ) ) ) return validationError( event, "node is required" );
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.hierarchy( run.getId(), { node: rc.node } ) } );
+	}
+
+	/**
+	 * Which files read a table and which write it.
+	 *
+	 * @tags CodeGraph
+	 * @hint Data lineage for one table, split by direction
+	 * @param-table { "name":"table", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @response-200 Readers and writers
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 * @response-422 Validation failed
+	 */
+	function lineage( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		if ( !len( trim( toString( rc.table ?: "" ) ) ) ) return validationError( event, "table is required" );
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.lineage( run.getId(), { table: rc.table } ) } );
+	}
+
+	/**
+	 * What changes when this node changes.
+	 *
+	 * @tags CodeGraph
+	 * @hint Transitive callers of a node, bounded by depth
+	 * @param-node { "name":"node", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-depth { "name":"depth", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":6} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":500} }
+	 * @response-200 Impacted nodes with the depth each was reached at
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 * @response-422 Validation failed
+	 */
+	function impact( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		if ( !len( trim( toString( rc.node ?: "" ) ) ) ) return validationError( event, "node is required" );
+		if ( len( trim( toString( rc.depth ?: "" ) ) ) && ( !isNumeric( rc.depth ) || val( rc.depth ) < 1 || val( rc.depth ) > 6 ) ) {
+			return validationError( event, "depth must be between 1 and 6" );
+		}
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.impact( run.getId(), {
+			node: rc.node, depth: rc.depth ?: 3, limit: rc.limit ?: 200
+		} ) } );
+	}
+
+	/**
+	 * Where to start reading an unfamiliar project.
+	 *
+	 * @tags CodeGraph
+	 * @hint Entry points, largest domains and most depended-upon files, each with a reason
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":3,"maximum":12} }
+	 * @response-200 Ranked starting points
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 */
+	function onboarding( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.onboarding( run.getId(), { limit: rc.limit ?: 6 } ) } );
+	}
+
+	/**
+	 * What changed between this run and an earlier one.
+	 *
+	 * @tags CodeGraph
+	 * @hint Added and removed nodes and edges against a base run
+	 * @param-base { "name":"base", "in":"query", "required":true, "schema":{"type":"string"} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":200} }
+	 * @response-200 Node and edge deltas with exact counts
+	 * @response-404 Run, base run, or graph not found
+	 * @response-409 Snapshot has no levelled storage
+	 * @response-422 Validation failed
+	 */
+	function diff( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		var baseId = trim( toString( rc.base ?: "" ) );
+		if ( !len( baseId ) ) return validationError( event, "base is required" );
+		var baseRun = runService.getScoped( baseId, prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( baseRun ) ) return notFound( event );
+		// Comparing against a run with no rows would report every node as added.
+		if ( !codeGraphGraphRepository.hasGraph( baseRun.getId() ) ) {
+			return event.renderData(
+				type       = "json",
+				statusCode = 409,
+				data       = { error: { code: "base_snapshot_has_no_graph", message: "The base run has no levelled storage, so a diff would report every node as added." } }
+			);
+		}
+		event.renderData( type = "json", data = { data: codeGraphQueryRepository.diff( run.getId(), baseRun.getId(), { limit: rc.limit ?: 50 } ) } );
+	}
+
+	/**
+	 * Architecture rules evaluated against this run's graph.
+	 *
+	 * @tags CodeGraph
+	 * @hint Layer and boundary rules with the edges that violate each
+	 * @response-200 Rule results with violation counts and evidence
+	 * @response-404 Run not found or no indexed graph
+	 * @response-409 Snapshot has no levelled storage
+	 */
+	function rules( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		var level = codeGraphGraphRepository.readLevel( run.getId(), { level: "file", limit: 1500, edgeLimit: 4000 } );
+		var evaluated = architectureRuleService.evaluate( level.edges ?: [], architectureRuleService.defaultRules() );
+		// Reporting, never a gate: this is a local desktop tool, not CI.
+		event.renderData( type = "json", data = { data: evaluated } );
 	}
 
 	/**
@@ -409,6 +583,29 @@ class extends="coldbox.system.RestHandler" {
 		if ( !matches.len() ) return validationError( event, "clusterId is not present in the stored snapshot" );
 		codeGraphRepository.clearUserLabel( stored.projectPath ?: run.getProjectPath(), codeGraphRepository.clusterKey( matches[ 1 ] ) );
 		event.renderData( type = "json", data = { data: { clusterId: clusterId, cleared: true } } );
+	}
+
+	/**
+	 * A scoped run whose graph is actually queryable, or the right refusal.
+	 *
+	 * Returns null having already rendered 404 or 409, so callers read as a
+	 * straight line rather than repeating the same two checks four times.
+	 */
+	private any function requireGraphRun( required event, required rc, required prc ) {
+		var run = runService.getScoped( arguments.rc.id ?: "", arguments.prc.securityContext, arguments.rc.projectId ?: "" );
+		if ( isNull( run ) || !hasIndexedGraph( run ) ) {
+			notFound( arguments.event );
+			return javacast( "null", "" );
+		}
+		if ( !codeGraphGraphRepository.hasGraph( run.getId() ) ) {
+			arguments.event.renderData(
+				type       = "json",
+				statusCode = 409,
+				data       = { error: { code: "snapshot_predates_node_tables", message: "This snapshot has no levelled storage. Rebuild the map to query the graph." } }
+			);
+			return javacast( "null", "" );
+		}
+		return run;
 	}
 
 	private void function notFound( required event ) {

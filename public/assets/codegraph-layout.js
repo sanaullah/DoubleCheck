@@ -225,7 +225,7 @@
 		list.sort((a, b) => {
 			const diff = overviewScore(b) - overviewScore(a);
 			if (diff !== 0) return diff;
-			return String(a.label || a.id || "").localeCompare(String(b.label || b.id || ""));
+			return cmpStable(a.label || a.id || "", b.label || b.id || "");
 		});
 		return list.slice(0, capped);
 	}
@@ -292,6 +292,32 @@
 	}
 
 	/** Stable graph id: forward-slash + lowercase (matches snapshot node.id). */
+	// Bare localeCompare uses the runtime's default collation, so the same snapshot
+	// laid out on two machines with different locales produced a different node
+	// order and therefore different coordinates. Ordering is part of the
+	// deterministic contract, so it must not depend on where it runs.
+	// Colour must not be the only differentiator, and an SVG shape carries no
+	// accessible name on its own. Role and counts are what a reader needs spoken.
+	function ariaLabelFor(node) {
+		if (!node) return "graph node";
+		const parts = [];
+		parts.push(String(node.label || node.path || node.id || "node"));
+		if (node.role) parts.push(String(node.role));
+		if (node.kind && node.kind !== "file") parts.push(String(node.kind));
+		const fanIn = Number(node.fanIn);
+		const fanOut = Number(node.fanOut);
+		if (Number.isFinite(fanIn) || Number.isFinite(fanOut)) {
+			parts.push("called by " + (Number.isFinite(fanIn) ? fanIn : 0) + ", calls " + (Number.isFinite(fanOut) ? fanOut : 0));
+		}
+		return parts.join(", ");
+	}
+
+	function cmpStable(a, b) {
+		const left = String(a == null ? "" : a);
+		const right = String(b == null ? "" : b);
+		return left < right ? -1 : left > right ? 1 : 0;
+	}
+
 	function normId(path) {
 		return normPath(path).toLowerCase();
 	}
@@ -390,7 +416,63 @@
 		);
 	}
 
-	function capGraph(nodes, edges, maxNodes, maxEdges) {
+	// Degree-of-interest: a priori importance minus distance from the focus.
+	//
+	// Furnas' DOI, adapted from trees to graphs. It replaces a flat top-N slice,
+	// which cuts by position in the array and can therefore drop the very
+	// neighbours that explain the node you are looking at. Interest is:
+	//
+	//     structural importance  −  hops from the focus
+	//
+	// so the focus and its immediate neighbourhood always survive, and what falls
+	// off the end is genuinely peripheral rather than merely late.
+	//
+	// Deterministic: importance comes from stored fan-in/out, distance from a BFS
+	// over the edge list in its existing order, and ties break on id.
+	function degreeOfInterest(nodes, edges, focusId) {
+		const adjacency = new Map();
+		const link = (a, b) => {
+			if (!adjacency.has(a)) adjacency.set(a, []);
+			adjacency.get(a).push(b);
+		};
+		edges.forEach((e) => {
+			const from = normId(e.from);
+			const to = normId(e.to);
+			if (!from || !to) return;
+			link(from, to);
+			link(to, from);
+		});
+
+		const distance = new Map();
+		const focus = normId(focusId);
+		if (focus) {
+			distance.set(focus, 0);
+			let frontier = [focus];
+			let hop = 0;
+			while (frontier.length && hop < 6) {
+				hop++;
+				const next = [];
+				for (const id of frontier) {
+					for (const neighbour of adjacency.get(id) || []) {
+						if (distance.has(neighbour)) continue;
+						distance.set(neighbour, hop);
+						next.push(neighbour);
+					}
+				}
+				frontier = next;
+			}
+		}
+
+		return nodes.map((n) => {
+			const id = normId(n.id || n.path);
+			const importance = (Number(n.hotspotScore) || 0) + (Number(n.fanIn) || 0) + 0.5 * (Number(n.fanOut) || 0);
+			// Unreached nodes sit beyond the walk rather than at distance zero.
+			const hops = distance.has(id) ? distance.get(id) : focus ? 99 : 0;
+			return { node: n, id, interest: importance - hops * 4 };
+		});
+	}
+
+	function capGraph(nodes, edges, maxNodes, maxEdges, focusId) {
 		const totalNodes = nodes.length;
 		const totalEdges = edges.length;
 		let selectedNodes = nodes;
@@ -398,7 +480,15 @@
 		let truncated = false;
 
 		if (selectedNodes.length > maxNodes) {
-			selectedNodes = selectedNodes.slice(0, maxNodes);
+			const scored = degreeOfInterest(selectedNodes, edges, focusId);
+			scored.sort((a, b) => {
+				if (a.interest !== b.interest) return b.interest - a.interest;
+				return cmpStable(a.id, b.id);
+			});
+			const keep = new Set(scored.slice(0, maxNodes).map((entry) => entry.id));
+			// Restore the incoming order so layout and specs stay comparable; DOI
+			// decides membership, not arrangement.
+			selectedNodes = selectedNodes.filter((n) => keep.has(normId(n.id || n.path)));
 			truncated = true;
 		}
 		const idSet = new Set(selectedNodes.map((n) => normId(n.id || n.path)));
@@ -464,7 +554,7 @@
 
 		const idSet = new Set(nodes.map((n) => normId(n.id)));
 		const edges = uniqueEdges(clusterEdges).filter((e) => idSet.has(normId(e.from)) && idSet.has(normId(e.to)));
-		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
+		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges, opts && opts.focus);
 		return Object.assign(
 			{
 				mode: "cluster",
@@ -549,7 +639,7 @@
 			if (!n.complexity) n.complexity = fileComplexityOf(n);
 		});
 
-		const capped = capGraph(nodes, filteredEdges, cfg.maxNodes, cfg.maxEdges);
+		const capped = capGraph(nodes, filteredEdges, cfg.maxNodes, cfg.maxEdges, (snapshot && snapshot.focus) || (opts && opts.focus));
 		return Object.assign({ mode: "file", detail: true }, capped);
 	}
 
@@ -579,7 +669,7 @@
 			};
 		});
 		const edges = uniqueEdges(rawEdges);
-		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges);
+		const capped = capGraph(nodes, edges, cfg.maxNodes, cfg.maxEdges, opts && opts.focus);
 		return Object.assign(
 			{
 				mode: "focus",
@@ -808,7 +898,7 @@
 		const colKeys = [...columns.keys()].sort((a, b) => a - b);
 		const edgePairs = edges.map((e) => ({ from: normId(e.from), to: normId(e.to) }));
 		const orderedColumns = new Map();
-		colKeys.forEach((layer) => orderedColumns.set(layer, columns.get(layer).slice().sort((a, b) => String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id)))));
+		colKeys.forEach((layer) => orderedColumns.set(layer, columns.get(layer).slice().sort((a, b) => cmpStable(a.label || a.path || a.id, b.label || b.path || b.id))));
 		const positionMap = () => {
 			const map = new Map();
 			colKeys.forEach((layer) => orderedColumns.get(layer).forEach((node, index) => map.set(normId(node.id), index)));
@@ -825,7 +915,7 @@
 						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
 					};
 					const byMean = mean(a) - mean(b);
-					return Number.isFinite(byMean) && byMean !== 0 ? byMean : String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+					return Number.isFinite(byMean) && byMean !== 0 ? byMean : cmpStable(a.label || a.path || a.id, b.label || b.path || b.id);
 				});
 			}
 			for (let columnIndex = colKeys.length - 2; columnIndex >= 0; columnIndex--) {
@@ -837,7 +927,7 @@
 						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
 					};
 					const byMean = mean(a) - mean(b);
-					return Number.isFinite(byMean) && byMean !== 0 ? byMean : String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+					return Number.isFinite(byMean) && byMean !== 0 ? byMean : cmpStable(a.label || a.path || a.id, b.label || b.path || b.id);
 				});
 			}
 		}
@@ -927,7 +1017,7 @@
 		});
 		const laneKeys = [...lanes.keys()].sort((a, b) => {
 			const order = (SWIMLANE_ORDER[a] ?? 9) - (SWIMLANE_ORDER[b] ?? 9);
-			return order || a.localeCompare(b);
+			return order || cmpStable(a, b);
 		});
 		const laneHeight = cfg.nodeHeight + cfg.gapY;
 		const positioned = [];
@@ -937,7 +1027,7 @@
 			const list = lanes.get(role).slice().sort((a, b) => {
 				const aStep = stepOrder.has(normId(a.id)) ? stepOrder.get(normId(a.id)) : Number.POSITIVE_INFINITY;
 				const bStep = stepOrder.has(normId(b.id)) ? stepOrder.get(normId(b.id)) : Number.POSITIVE_INFINITY;
-				return aStep - bStep || String(a.label || a.path || a.id).localeCompare(String(b.label || b.path || b.id));
+				return aStep - bStep || cmpStable(a.label || a.path || a.id, b.label || b.path || b.id);
 			});
 			list.forEach((node, columnIndex) => {
 				const box = nodeBoxSize(node, cfg, view);
@@ -1045,7 +1135,7 @@
 						return neighbors.length ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length : Number.POSITIVE_INFINITY;
 					};
 					const diff = score(a) - score(b);
-					return Number.isFinite(diff) && diff !== 0 ? diff : String(a.label || a.id).localeCompare(String(b.label || b.id));
+					return Number.isFinite(diff) && diff !== 0 ? diff : cmpStable(a.label || a.id, b.label || b.id);
 				});
 			}
 			list.forEach((n, i) => {
@@ -1213,6 +1303,8 @@
 			.join("");
 		const flowHighlight = nodeIsFlowHighlighted(n, opts && opts._flowHighlightCtx);
 		return (
+			// WCAG 2.1.1/4.1.2: every data point must be reachable by keyboard and
+			// announce a name. Colour alone carries nine roles otherwise.
 			'<g class="cg-node cg-card' +
 			(flowHighlight ? " is-flow-highlight" : "") +
 			'" data-node-id="' +
@@ -1221,6 +1313,8 @@
 			complexity +
 			'" data-summary-origin="' +
 			summaryOrigin +
+			'" role="listitem" tabindex="-1" aria-label="' +
+			escapeXml(ariaLabelFor(n)) +
 			'">' +
 			'<rect class="cg-card-body" x="' +
 			n.x +
@@ -1326,6 +1420,9 @@
 				"</text>"
 			: "";
 		return (
+			// Focusable and named: an SVG shape carries no accessible name, and the
+			// role hues are the only differentiator without one. `class` stays the
+			// first attribute — existing specs match on it.
 			'<g class="' +
 			cls +
 			'" data-node-id="' +
@@ -1339,6 +1436,8 @@
 			(roleChip ? ' data-role="' + escapeXml(roleChip) + '"' : n.role ? ' data-role="' + escapeXml(String(n.role)) + '"' : "") +
 			' data-complexity="' +
 			escapeXml(complexity) +
+			'" role="listitem" tabindex="-1" aria-label="' +
+			escapeXml(ariaLabelFor(n)) +
 			'">' +
 			"<title>" +
 			escapeXml(fileTooltip(n)) +
@@ -1387,6 +1486,8 @@
 			escapeXml(n.id) +
 			'" data-kind="' +
 			escapeXml(n.kind || "file") +
+			'" role="listitem" tabindex="-1" aria-label="' +
+			escapeXml(ariaLabelFor(n)) +
 			'">' +
 			'<rect x="' +
 			n.x +
@@ -1515,7 +1616,7 @@
 			'<g class="cg-edges">' +
 			edgeParts.join("") +
 			"</g>" +
-			'<g class="cg-nodes">' +
+			'<g class="cg-nodes" role="list">' +
 			nodeParts.join("") +
 			"</g>" +
 			"</svg>"
@@ -1647,6 +1748,8 @@
 		layoutSwimlane,
 		layoutRadial,
 		buildSvg,
+		ariaLabelFor,
+		degreeOfInterest,
 		edgePath,
 		nodeLabel,
 		createViewport,

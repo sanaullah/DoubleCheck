@@ -342,6 +342,38 @@ class threadsafe {
 				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
 				{ datasource: datasource }
 			);
+			// Adoption has to carry everything that shapes the served graph, not
+			// only the parser output. Without these two the reused run answers 409
+			// "snapshot predates levelled storage" and its search returns nothing —
+			// a false diagnosis whose remedy re-triggers reuse and never succeeds.
+			queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute(
+				"
+					INSERT INTO codegraph_nodes (
+						run_id, node_id, level, parent_id, path, symbol_name, kind, role,
+						language, line, end_line, fan_in, fan_out, hotspot
+					)
+					SELECT :targetRunId, node_id, level, parent_id, path, symbol_name, kind, role,
+						language, line, end_line, fan_in, fan_out, hotspot
+					FROM codegraph_nodes WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO codegraph_edges (
+						run_id, edge_id, level, from_node, to_node, group_kind,
+						kinds_json, occurrences, weight, resolution, line, evidence
+					)
+					SELECT :targetRunId, edge_id, level, from_node, to_node, group_kind,
+						kinds_json, occurrences, weight, resolution, line, evidence
+					FROM codegraph_edges WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
 		}
 	}
 
