@@ -86,7 +86,7 @@ class threadsafe {
 			}
 			visible.append( candidate );
 		}
-		return selectFlows( visible, arguments.caps, arguments.truncation, arguments.clusterOf );
+		return selectFlows( visible, arguments.caps, arguments.truncation, arguments.clusterOf, adjacency );
 	}
 
 	/**
@@ -99,7 +99,8 @@ class threadsafe {
 		required array candidates,
 		required struct caps,
 		required struct truncation,
-		required struct clusterOf
+		required struct clusterOf,
+		struct adjacency = {}
 	) {
 		if ( !arguments.candidates.len() ) return [];
 		// A sink most candidates reach is infrastructure, not a destination.
@@ -218,6 +219,11 @@ class threadsafe {
 				entrySymbol : candidate.entrySymbol,
 				steps       : duplicate( candidate.steps ),
 				stepSymbols : stepSymbolsFor( candidate.steps, candidate.edgeSymbols ?: [] ),
+				// The same chain as an array of edges rather than an array of nodes,
+				// each carrying where it was seen. `steps` alone cannot be inspected:
+				// a reader could see that a request reaches a table and never which
+				// line proves it.
+				hops        : hopsFor( candidate, arguments.adjacency ),
 				sinkFile    : candidate.sinkFile,
 				edgeKinds   : duplicate( candidate.edgeKinds ),
 				sinkKind    : candidate.sinkKind,
@@ -289,7 +295,17 @@ class threadsafe {
 			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
 			// The edge carries the symbol that owns it, so a hop can name the
 			// method that made the call rather than restating the file name.
-			adjacency[ from ].append( { to: to, kind: kind, sourceSymbol: trim( toString( dep.sourceSymbol ?: "" ) ) } );
+			// Line and evidence travel with the edge so a flow hop can be opened at
+			// its source. A flow used to carry only `steps` (paths) and
+			// `stepSymbols`, which made the product's central promise — following a
+			// request end to end — the one answer with no `file:line` behind it.
+			adjacency[ from ].append( {
+				to          : to,
+				kind        : kind,
+				sourceSymbol: trim( toString( dep.sourceSymbol ?: "" ) ),
+				line        : val( dep.line ?: 0 ),
+				evidence    : left( trim( toString( dep.evidence ?: "" ) ), 240 )
+			} );
 		}
 		for ( var from in adjacency ) adjacency[ from ].sort( ( a, b ) => { var byTo = compareNoCase( a.to, b.to ); return byTo != 0 ? byTo : compareNoCase( a.kind, b.kind ); } );
 		return adjacency;
@@ -408,6 +424,48 @@ class threadsafe {
 	 * file is the class name and therefore restates the path. An empty entry
 	 * means "file level", and the UI says so.
 	 */
+	/**
+	 * The flow as a list of edges, each with where it was seen.
+	 *
+	 * `steps` is a list of nodes and cannot be inspected: a reader could see that
+	 * a request reaches `review_runs` and never which line proved it. A hop names
+	 * both ends, the relationship, the symbol that owns it, and the `file:line`
+	 * plus source text the parser matched.
+	 *
+	 * A hop whose edge cannot be found in the adjacency is returned with
+	 * `resolution: "unresolved"` and no line, rather than omitted — a gap in a
+	 * trace is part of the trace.
+	 */
+	private array function hopsFor( required struct candidate, required struct adjacency ) {
+		var hops = [];
+		var steps = arguments.candidate.steps ?: [];
+		var kinds = arguments.candidate.edgeKinds ?: [];
+		for ( var index = 1; index < steps.len(); index++ ) {
+			var from = steps[ index ];
+			var to = steps[ index + 1 ];
+			var kind = index <= kinds.len() ? kinds[ index ] : "";
+			var matched = { line: 0, evidence: "", sourceSymbol: "" };
+			var found = false;
+			for ( var edge in ( arguments.adjacency[ from ] ?: [] ) ) {
+				if ( edge.to == to && ( !len( kind ) || edge.kind == kind ) ) {
+					matched = edge;
+					found = true;
+					break;
+				}
+			}
+			hops.append( {
+				from      : from,
+				to        : to,
+				kind      : kind,
+				symbol    : trim( toString( matched.sourceSymbol ?: "" ) ),
+				line      : val( matched.line ?: 0 ),
+				evidence  : trim( toString( matched.evidence ?: "" ) ),
+				resolution: found ? "exact" : "unresolved"
+			} );
+		}
+		return hops;
+	}
+
 	private array function stepSymbolsFor( required array steps, required array edgeSymbols ) {
 		var symbols = [];
 		for ( var index = 1; index <= arguments.steps.len(); index++ ) {

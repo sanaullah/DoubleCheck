@@ -11,7 +11,19 @@
 @singleton
 class threadsafe {
 
-	variables.snapshotVersion = "codegraph-snapshot-v2";
+	property name="metricsService" inject="CodeGraphMetricsService";
+
+	/**
+	 * Fallback only. The live value comes from `CodeGraphMetricsService`, which
+	 * owns the snapshot shape.
+	 *
+	 * This was a second copy of the version literal and it had already drifted:
+	 * pinned at `v2` while snapshots were being written as `v3`, so the shape
+	 * change that produced v3 did not move the reuse key and a clean-tree run
+	 * could adopt a v2-shaped snapshot as if it were current. Exactly the failure
+	 * this file's header says it exists to prevent, in this file.
+	 */
+	variables.snapshotVersionFallback = "codegraph-snapshot-v5";
 
 	/**
 	 * @indexService Supplies the parser version signature; may be an empty string.
@@ -33,11 +45,23 @@ class threadsafe {
 		}
 		// Must track the parser versions in the parsers themselves: a stale literal
 		// here silently reuses snapshots built by an older extractor.
-		if ( !len( trim( parserVersion ) ) ) parserVersion = "boxlang-ast-parser-v11|cfml-symbol-parser-v11|javascript-symbol-parser-v6";
+		if ( !len( trim( parserVersion ) ) ) parserVersion = "boxlang-ast-parser-v12|cfml-symbol-parser-v12|javascript-symbol-parser-v6";
 
 		var payload = duplicate( arguments.settings );
 		payload.parserVersion = parserVersion;
-		payload.snapshotVersion = variables.snapshotVersion;
+		payload.snapshotVersion = snapshotVersion();
 		return lCase( hash( jsonSerialize( payload ), "SHA-256" ) );
+	}
+
+	/** The snapshot shape this key must cover, from the service that owns it. */
+	string function snapshotVersion() {
+		try {
+			var live = trim( toString( metricsService.snapshotVersion() ) );
+			if ( len( live ) ) return live;
+		} catch ( any unavailable ) {
+			// Fall through: a key built from the fallback is stale-safe as long as
+			// the fallback tracks the live version, which a spec asserts.
+		}
+		return variables.snapshotVersionFallback;
 	}
 }

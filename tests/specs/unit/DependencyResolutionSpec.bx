@@ -1,0 +1,106 @@
+/**
+ * Binding a name to a file is a claim, and these are the two ways it was wrong.
+ *
+ * Both defects were live on this repository and produced its *entire* visible
+ * answer to "where are the architectural violations": `/rules` reported two, and
+ * neither relationship existed.
+ *
+ *   1. `constructs` matched the raw source line, so the prose inside
+ *      "Keep the capability in the new main application until…" produced
+ *      `constructs -> main`, which resolved to `app/handlers/Main.bx`.
+ *   2. A bare receiver resolved to any file declaring a type of that name, so
+ *      `if ( !flight.count() )` — where `flight` is a local struct — bound to
+ *      `aiFlight/handlers/Flight.bx`.
+ *
+ * @see ArchitectureIndexService
+ * @see BoxLangParserService
+ */
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function run() {
+		describe( "Dependency resolution", () => {
+
+			it( "does not read a construction out of a string literal", () => {
+				var parser = new app.models.services.BoxLangParserService();
+				var lines = [
+					"class {",
+					"    function build() {",
+					"        var note = ""Keep the capability in the new main application until later."";",
+					"        var real = new OrderService();",
+					"    }",
+					"}"
+				];
+				var parsed = parser.parse( {
+					filePath: "app/models/services/Sample.bx",
+					language: "BoxLang",
+					lines   : lines,
+					content : arrayToList( lines, char( 10 ) )
+				} );
+				var constructed = [];
+				for ( var dep in parsed.dependencies ) {
+					if ( dep.kind == "constructs" ) constructed.append( lCase( dep.target ) );
+				}
+				expect( constructed ).toInclude( "orderservice", "a real construction is still extracted" );
+				expect( constructed ).notToInclude(
+					"main",
+					"prose inside a literal must not register as a construction — this produced a false architecture violation"
+				);
+			} );
+
+			it( "leaves a bare receiver unresolved when the file gives no sign of using that type", () => {
+				// `flight` is a local variable. The file neither imports, injects,
+				// constructs nor extends `Flight`, so there is no evidence the
+				// receiver is that type — and a same-named file elsewhere is not
+				// evidence.
+				var index = getInstance( "ArchitectureIndexService" );
+				var symbols = [
+					{ kind: "class", name: "Flight", filePath: "app/modules/aiFlight/handlers/Flight.bx", line: 1 },
+					{ kind: "class", name: "Listener", filePath: "app/modules/aiFlight/models/Listener.bx", line: 1 },
+					{ kind: "function", name: "handle", filePath: "app/modules/aiFlight/models/Listener.bx", line: 5 }
+				];
+				var dependencies = [
+					{ kind: "calls", target: "flight.count", sourceFile: "app/modules/aiFlight/models/Listener.bx", line: 10 }
+				];
+				index.resolveTargetsForTesting( symbols, dependencies, [] );
+				expect( dependencies[ 1 ].targetFile ).toBe(
+					"",
+					"a receiver with no corroboration must stay unresolved rather than bind to a same-named file"
+				);
+			} );
+
+			it( "binds a receiver the file gives evidence of using", () => {
+				var index = getInstance( "ArchitectureIndexService" );
+				var symbols = [
+					{ kind: "class", name: "OrderService", filePath: "app/models/services/OrderService.bx", line: 1 },
+					{ kind: "class", name: "Caller", filePath: "app/models/Caller.bx", line: 1 }
+				];
+				var dependencies = [
+					{ kind: "constructs", target: "OrderService", sourceFile: "app/models/Caller.bx", line: 3 },
+					{ kind: "calls", target: "orderService.save", sourceFile: "app/models/Caller.bx", line: 4 }
+				];
+				index.resolveTargetsForTesting( symbols, dependencies, [] );
+				expect( dependencies[ 2 ].targetFile ).toBe(
+					"app/models/services/OrderService.bx",
+					"a construction of that type in the same file is the corroboration"
+				);
+			} );
+
+			it( "refuses to pick one of several files declaring the same type", () => {
+				// It used to take whichever file was parsed last, and stored the edge
+				// looking exactly like an unambiguous one.
+				var index = getInstance( "ArchitectureIndexService" );
+				var symbols = [
+					{ kind: "class", name: "Router", filePath: "app/config/Router.bx", line: 1 },
+					{ kind: "class", name: "Router", filePath: "app/modules/a/config/Router.bx", line: 1 },
+					{ kind: "class", name: "Caller", filePath: "app/models/Caller.bx", line: 1 }
+				];
+				var dependencies = [
+					{ kind: "type-reference", target: "Router", sourceFile: "app/models/Caller.bx", line: 2 }
+				];
+				index.resolveTargetsForTesting( symbols, dependencies, [] );
+				expect( dependencies[ 1 ].targetFile ).toBe( "", "two candidates is not a resolution" );
+				expect( dependencies[ 1 ].candidateCount ?: 0 ).toBe( 2, "and the count says why" );
+			} );
+		} );
+	}
+}

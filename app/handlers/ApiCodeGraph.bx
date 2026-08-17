@@ -308,9 +308,23 @@ class extends="coldbox.system.RestHandler" {
 		if ( len( trim( toString( rc.limit ?: "" ) ) ) && ( !isNumeric( rc.limit ) || val( rc.limit ) < 1 || val( rc.limit ) > 200 ) ) {
 			return validationError( event, "limit must be between 1 and 200" );
 		}
+		// `kind` and `role` were accepted and ignored, so a caller filtering by
+		// `kind=route` got every match with nothing saying the filter had not been
+		// applied. They are applied now; a facet the graph cannot filter on is
+		// rejected rather than quietly dropped.
+		for ( var unsupported in [ "relation", "domain", "resolution" ] ) {
+			if ( len( trim( toString( rc[ unsupported ] ?: "" ) ) ) ) {
+				return validationError(
+					event,
+					"#unsupported# is not a supported search facet. Supported: level, kind, role."
+				);
+			}
+		}
 		var payload = codeGraphGraphRepository.search( run.getId(), {
 			q    : term,
 			level: rc.level ?: "",
+			kind : rc.kind ?: "",
+			role : rc.role ?: "",
 			limit: len( trim( toString( rc.limit ?: "" ) ) ) ? val( rc.limit ) : 50
 		} );
 		event.renderData( type = "json", data = { data: payload } );
@@ -470,6 +484,77 @@ class extends="coldbox.system.RestHandler" {
 			);
 		}
 		event.renderData( type = "json", data = { data: codeGraphQueryRepository.diff( run.getId(), baseRun.getId(), { limit: rc.limit ?: 50 } ) } );
+	}
+
+	/**
+	 * End-to-end request flows, with per-hop evidence.
+	 *
+	 * Flows existed only inside the snapshot blob returned by `/result`: the
+	 * product's central promise — following a request from its entry to its
+	 * effect — was the one answer with no endpoint and no `file:line` behind it.
+	 *
+	 * @tags CodeGraph
+	 * @hint Traced request flows; one flow with its hops when `flow` is supplied
+	 * @param-flow { "name":"flow", "in":"query", "required":false, "schema":{"type":"string"} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":200} }
+	 * @response-200 Flows with a completeness account
+	 * @response-404 Run, graph, or flow not found
+	 * @response-409 Snapshot has no levelled storage
+	 */
+	function flows( event, rc, prc ) {
+		var run = requireGraphRun( event, rc, prc );
+		if ( isNull( run ) ) return;
+		var stored = codeGraphRepository.get( run.getId() );
+		if ( isNull( stored ) ) return notFound( event );
+		var snapshot = isStruct( stored.snapshot ?: "" ) ? stored.snapshot : {};
+		var all = isArray( snapshot.flows ?: "" ) ? snapshot.flows : [];
+		var wanted = trim( toString( rc.flow ?: "" ) );
+		if ( len( wanted ) ) {
+			for ( var flow in all ) {
+				if ( isStruct( flow ) && toString( flow.id ?: "" ) == wanted ) {
+					return event.renderData( type = "json", data = { data: {
+						flow        : flow,
+						completeness: {
+							returned : 1,
+							available: 1,
+							omitted  : 0,
+							rankedBy : "id",
+							complete : true,
+							state    : "complete",
+							// A hop the traversal could not bind is reported, not dropped.
+							unresolvedHops: unresolvedHopCount( flow )
+						}
+					} } );
+				}
+			}
+			return notFound( event );
+		}
+		var limit = max( 1, min( 200, val( rc.limit ?: 50 ) ) );
+		var returned = [];
+		for ( var flow in all ) {
+			if ( returned.len() >= limit ) break;
+			returned.append( flow );
+		}
+		event.renderData( type = "json", data = { data: {
+			flows       : returned,
+			completeness: {
+				returned : returned.len(),
+				available: all.len(),
+				omitted  : max( 0, all.len() - returned.len() ),
+				rankedBy : "sinkCoverage",
+				complete : returned.len() == all.len() && all.len() > 0,
+				state    : all.len() == 0 ? "empty" : ( returned.len() < all.len() ? "truncated" : "complete" )
+			}
+		} } );
+	}
+
+	/** Hops in a flow whose edge could not be bound back to a parsed line. */
+	private numeric function unresolvedHopCount( required any flow ) {
+		var count = 0;
+		for ( var hop in ( isStruct( arguments.flow ) && isArray( arguments.flow.hops ?: "" ) ? arguments.flow.hops : [] ) ) {
+			if ( toString( hop.resolution ?: "" ) != "exact" ) count++;
+		}
+		return count;
 	}
 
 	/**

@@ -27,7 +27,17 @@ class threadsafe {
 	 * rows. That failure has already been recorded three times against the parse
 	 * cache; this is the same mistake one layer down, with its own version.
 	 */
-	variables.projectionVersion = "codegraph-projection-v5";
+	// v9: every node carries `resolution` / `provenance` / `confidence`, so an
+	// entity can state how it came to exist the way an edge already could.
+	// v8: knowledge carries domain -> domain `depends-on` edges derived from
+	// cluster dependencies, and process edges carry their step ordinal.
+	// v7: directory edges roll up through every ancestor, so intermediate
+	// directories that hold no files directly are no longer isolated.
+	// v6: resource nodes carry a declaration line and a parent file for the kinds
+	// that genuinely have one (routes, events). They were all `line: 0,
+	// parentId: ""`, so every route, table, config key and event the graph named
+	// was un-openable and outside the drill hierarchy.
+	variables.projectionVersion = "codegraph-projection-v9";
 
 	string function getVersion() {
 		return variables.projectionVersion;
@@ -58,6 +68,12 @@ class threadsafe {
 				kind      : "cluster",
 				role      : "",
 				language  : "",
+				// A cluster is computed by modularity over the coupling graph, not
+				// read from source. Saying so is the entity-level half of the contract
+				// edges have carried since the ontology work.
+				resolution: "derived",
+				provenance: "derived",
+				confidence: "derived",
 				line      : 0,
 				endLine   : 0,
 				fanIn     : val( cluster.crossingEdges ?: 0 ),
@@ -110,6 +126,10 @@ class threadsafe {
 				kind      : "directory",
 				role      : "",
 				language  : "",
+				// Directories exist on disk; the rollup statistics are derived.
+				resolution: "exact",
+				provenance: "filesystem",
+				confidence: "high",
 				line      : 0,
 				endLine   : 0,
 				fanIn     : stats.fanIn,
@@ -121,6 +141,47 @@ class threadsafe {
 		// A route, table, setting or event is not a file, and storing it as one made
 		// the file level 52% non-code and self-certifying as complete. They get
 		// their own level; the ids stay derived from the entity, not its position.
+		// Where a resource is *declared*, for the kinds that genuinely have a
+		// declaration in this repository. A route is declared by a `route( "/x" )`
+		// call and an event by the line that publishes it; a table, a config key or
+		// a remote host is referenced from code but declared outside it.
+		//
+		// Every resource carried `line: 0` and `parentId: ""`, so the answers to
+		// "what starts a request" and "which settings does this read" named entities
+		// the reader could neither open nor drill to. Only the ones with real
+		// evidence get a site — the rest stay 0, because a fabricated location is
+		// worse than none.
+		// File nodes are appended after this block, so their ids are not known yet.
+		// The set of file paths is, and that is all the parent link needs.
+		var knownFilePaths = {};
+		for ( var node in ( arguments.snapshot.nodes ?: [] ) ) {
+			if ( !isStruct( node ) ) continue;
+			var candidatePath = normalizePath( node.path ?: node.id ?: "" );
+			if ( len( candidatePath ) && !isResourceId( trim( toString( node.id ?: node.path ?: "" ) ) ) ) {
+				knownFilePaths[ candidatePath ] = true;
+			}
+		}
+
+		var resourceOrigins = {};
+		for ( var symbolItem in ( arguments.reviewGraph.symbols ?: [] ) ) {
+			if ( !isStruct( symbolItem ) || trim( toString( symbolItem.kind ?: "" ) ) != "route" ) continue;
+			var routeKey = "route:" & lCase( trim( toString( symbolItem.name ?: "" ) ) );
+			if ( resourceOrigins.keyExists( routeKey ) ) continue;
+			resourceOrigins[ routeKey ] = {
+				path: normalizePath( symbolItem.filePath ?: "" ),
+				line: val( symbolItem.line ?: 0 )
+			};
+		}
+		for ( var depItem in ( arguments.reviewGraph.dependencies ?: [] ) ) {
+			if ( !isStruct( depItem ) || trim( toString( depItem.kind ?: "" ) ) != "emits" ) continue;
+			var eventKey = "event:" & lCase( trim( toString( depItem.target ?: "" ) ) );
+			if ( resourceOrigins.keyExists( eventKey ) ) continue;
+			resourceOrigins[ eventKey ] = {
+				path: normalizePath( depItem.sourceFile ?: "" ),
+				line: val( depItem.line ?: 0 )
+			};
+		}
+
 		var resourceNodeIds = {};
 		for ( var node in ( arguments.snapshot.nodes ?: [] ) ) {
 			if ( !isStruct( node ) ) continue;
@@ -128,16 +189,25 @@ class threadsafe {
 			if ( !isResourceId( rawId ) ) continue;
 			var resourceId = "resource:" & lCase( rawId );
 			resourceNodeIds[ lCase( rawId ) ] = resourceId;
+			var origin = resourceOrigins[ lCase( rawId ) ] ?: { path: "", line: 0 };
 			appendNode( {
 				id        : resourceId,
 				level     : "resource",
-				parentId  : "",
+				// The declaring file, so a route belongs to its router and the
+				// cluster → resource drill exists. Empty for entities declared
+				// outside the codebase.
+				parentId  : len( origin.path ) && knownFilePaths.keyExists( origin.path ) ? "file:" & origin.path : "",
 				path      : rawId,
 				symbolName: listRest( rawId, ":" ),
 				kind      : lCase( listFirst( rawId, ":" ) ),
 				role      : trim( toString( node.role ?: "" ) ),
 				language  : "",
-				line      : 0,
+				// A route or event was matched at a known line; a table, config key or
+				// remote host was inferred from a reference and has no declaration.
+				resolution: len( origin.path ) ? "exact" : "heuristic",
+				provenance: "parser",
+				confidence: len( origin.path ) ? "high" : "medium",
+				line      : origin.line,
 				endLine   : 0,
 				fanIn     : val( node.fanIn ?: 0 ),
 				fanOut    : val( node.fanOut ?: 0 ),
@@ -163,6 +233,10 @@ class threadsafe {
 				kind      : trim( toString( node.component ?: "file" ) ),
 				role      : trim( toString( node.role ?: "" ) ),
 				language  : trim( toString( node.language ?: "" ) ),
+				// The file is on disk; its role and layer are classified.
+				resolution: "exact",
+				provenance: "filesystem",
+				confidence: "high",
 				line      : 0,
 				endLine   : val( node.lineCount ?: 0 ),
 				fanIn     : val( node.fanIn ?: 0 ),
@@ -211,6 +285,10 @@ class threadsafe {
 				kind      : trim( toString( symbol.kind ?: "symbol" ) ),
 				role      : "",
 				language  : "",
+				// A declaration the parser matched at a known line.
+				resolution: "exact",
+				provenance: "parser",
+				confidence: "high",
 				line      : val( symbol.line ?: 0 ),
 				endLine   : val( symbol.endLine ?: 0 ),
 				fanIn     : 0,
@@ -386,8 +464,20 @@ class threadsafe {
 		var nodes = [];
 		var edges = [];
 		var seen = {};
+		// Model output that named something the graph does not contain was dropped
+		// with no record: 29 narrative processes became 23 nodes and nothing said
+		// six had gone. The normalizer already counts what *it* rejects; this is a
+		// second, later drop point that had no account at all.
+		var dropped = { domain: 0, process: 0, risk: 0, duplicate: 0 };
 		var appendKnowledge = ( id, kind, label, text, targets ) => {
-			if ( seen.keyExists( id ) || !targets.len() ) return;
+			if ( seen.keyExists( id ) ) {
+				dropped.duplicate++;
+				return;
+			}
+			if ( !targets.len() ) {
+				dropped[ kind ] = ( dropped[ kind ] ?: 0 ) + 1;
+				return;
+			}
 			seen[ id ] = true;
 			nodes.append( {
 				id        : id,
@@ -398,13 +488,20 @@ class threadsafe {
 				kind      : kind,
 				role      : "knowledge",
 				language  : "",
+				// The §1 contract on the entity as well as the edge: a domain, process
+				// or risk is a model's interpretation of proven structure.
+				resolution: "narrative",
+				provenance: "llm",
+				confidence: "interpretive",
 				line      : 0,
 				endLine   : 0,
 				fanIn     : 0,
 				fanOut    : targets.len(),
 				hotspot   : 0
 			} );
+			var stepOrdinal = 0;
 			for ( var target in targets ) {
+				stepOrdinal++;
 				edges.append( {
 					id         : edgeId( "knowledge", id, target, kind == "risk" ? "affects" : "describes" ),
 					level      : "knowledge",
@@ -412,7 +509,10 @@ class threadsafe {
 					to         : target,
 					groupKind  : kind == "risk" ? "affects" : "describes",
 					kinds      : [ kind == "risk" ? "affects" : "describes" ],
-					occurrences: 1,
+					// For a process the targets arrive in flow order, so this is the
+					// step number; for a domain or a risk there is one target and the
+					// ordinal is simply 1.
+					occurrences: stepOrdinal,
 					weight     : 1,
 					// An LLM sentence about proven structure is neither parsed nor
 					// derived from parsing. Saying so on the edge is what keeps the
@@ -439,6 +539,49 @@ class threadsafe {
 			);
 		}
 
+		// Domain → domain, derived from the cluster dependencies that already exist.
+		//
+		// The knowledge layer had only `describes` and `affects`: every edge pointed
+		// from meaning down at structure, and nothing related two domains to each
+		// other. "Which domains does this one depend on" — the question an architect
+		// asks first — had no answer at any level.
+		//
+		// This is derived, not interpreted: the edge exists because files in one
+		// cluster depend on files in the other. It is marked `derived` rather than
+		// `narrative` for exactly that reason — the *names* are the model's, the
+		// relationship is the graph's.
+		var domainOfCluster = {};
+		for ( var domain in ( arguments.narrative.domains ?: [] ) ) {
+			if ( !isStruct( domain ) ) continue;
+			var domainCluster = trim( toString( domain.clusterId ?: "" ) );
+			if ( len( domainCluster ) ) domainOfCluster[ domainCluster ] = "knowledge:domain:" & lCase( domainCluster );
+		}
+		var seenDomainEdges = {};
+		for ( var clusterEdge in ( arguments.snapshot.clusterEdges ?: [] ) ) {
+			if ( !isStruct( clusterEdge ) ) continue;
+			var fromDomain = domainOfCluster[ trim( toString( clusterEdge.from ?: "" ) ) ] ?: "";
+			var toDomain = domainOfCluster[ trim( toString( clusterEdge.to ?: "" ) ) ] ?: "";
+			if ( !len( fromDomain ) || !len( toDomain ) || fromDomain == toDomain ) continue;
+			var domainEdgeKey = fromDomain & "|" & toDomain;
+			if ( seenDomainEdges.keyExists( domainEdgeKey ) ) continue;
+			seenDomainEdges[ domainEdgeKey ] = true;
+			edges.append( {
+				id         : edgeId( "knowledge", fromDomain, toDomain, "depends-on" ),
+				level      : "knowledge",
+				from       : fromDomain,
+				to         : toDomain,
+				groupKind  : "depends-on",
+				kinds      : [ "depends-on" ],
+				occurrences: val( clusterEdge.edgeCount ?: clusterEdge.weight ?: 1 ),
+				weight     : val( clusterEdge.weight ?: 1 ),
+				resolution : "derived",
+				provenance : "derived",
+				confidence : "derived",
+				line       : 0,
+				evidence   : val( clusterEdge.edgeCount ?: clusterEdge.weight ?: 1 ) & " file dependencies between these modules"
+			} );
+		}
+
 		// A process is named by a flow, and a flow already knows every file it
 		// touches — so the knowledge node attaches to all of them and "which
 		// processes run through this file" becomes one query.
@@ -449,13 +592,21 @@ class threadsafe {
 		for ( var process in ( arguments.narrative.processes ?: [] ) ) {
 			if ( !isStruct( process ) ) continue;
 			var flowId = trim( toString( process.flowId ?: "" ) );
-			if ( !flowsById.keyExists( flowId ) ) continue;
+			if ( !flowsById.keyExists( flowId ) ) {
+				dropped.process++;
+				continue;
+			}
+			// `occurrences` carries the step ordinal, so "which processes run through
+			// this file" can also answer *where* in the process. A process attached to
+			// its files as an unordered set could say a request touches a repository
+			// and not whether that was before or after the handler.
+			var orderedTargets = flowTargets( flowsById[ flowId ] );
 			appendKnowledge(
 				"knowledge:process:" & lCase( flowId ),
 				"process",
 				trim( toString( process.title ?: flowId ) ),
 				trim( toString( process.text ?: "" ) ),
-				flowTargets( flowsById[ flowId ] )
+				orderedTargets
 			);
 		}
 
@@ -466,13 +617,32 @@ class threadsafe {
 			appendKnowledge(
 				"knowledge:risk:" & lCase( refId ),
 				"risk",
-				left( trim( toString( risk.text ?: refId ) ), 120 ),
+				// A hard 120-character cut left every risk node named by half a
+				// sentence — "…including ReviewRunService, ModernizationRunService,
+				// CodeGrap". Trim at a word boundary and mark the elision.
+				summarise( trim( toString( risk.text ?: refId ) ), 120 ),
 				trim( toString( risk.text ?: "" ) ),
 				[ "file:" & normalizePath( refId ) ]
 			);
 		}
 
-		return { nodes: nodes, edges: edges };
+		return { nodes: nodes, edges: edges, dropped: dropped };
+	}
+
+	/**
+	 * A label short enough for a node, cut at a word boundary.
+	 *
+	 * `left( text, 120 )` produced names ending mid-word. A reader scanning the
+	 * knowledge level saw fragments, and the ellipsis is what tells them the rest
+	 * exists rather than that the sentence simply stopped.
+	 */
+	private string function summarise( required string text, required numeric maximum ) {
+		var value = trim( arguments.text );
+		if ( len( value ) <= arguments.maximum ) return value;
+		var cut = left( value, arguments.maximum );
+		var boundary = cut.lastIndexOf( " " );
+		if ( boundary > arguments.maximum * 0.6 ) cut = left( cut, boundary );
+		return trim( cut ) & "…";
 	}
 
 	/** Every structural node a flow passes through, as projected node ids. */
@@ -507,26 +677,40 @@ class threadsafe {
 		required array edges,
 		required struct directorySeen
 	) {
-		var directoryOfFile = {};
+		// Every directory a file sits under, not only its immediate parent. Rolling
+		// up one level left every intermediate directory isolated — `app/models`,
+		// `app/views`, `app/modules` and `tests/specs` had no edges at all, because
+		// no file sits *directly* in them. Half the directory level was unusable as
+		// an architecture view: the layer that should answer "how does this project
+		// hang together" showed the domain layer connected to nothing.
+		var ancestorsOfFile = {};
 		for ( var node in arguments.nodes ) {
 			if ( node.level != "file" ) continue;
 			var dirPath = normalizePath( node.path );
 			dirPath = find( "/", dirPath ) ? left( dirPath, len( dirPath ) - len( listLast( dirPath, "/" ) ) - 1 ) : "";
-			if ( len( dirPath ) && arguments.directorySeen.keyExists( dirPath ) ) {
-				directoryOfFile[ node.id ] = arguments.directorySeen[ dirPath ];
+			var chain = [];
+			var walk = dirPath;
+			while ( len( walk ) && walk != "." ) {
+				if ( arguments.directorySeen.keyExists( walk ) ) chain.append( arguments.directorySeen[ walk ] );
+				if ( !find( "/", walk ) ) break;
+				walk = left( walk, len( walk ) - len( listLast( walk, "/" ) ) - 1 );
 			}
+			ancestorsOfFile[ node.id ] = chain;
 		}
 		var rolled = {};
 		for ( var edge in arguments.edges ) {
 			if ( edge.level != "file" ) continue;
-			var from = directoryOfFile[ edge.from ] ?: "";
-			var to = directoryOfFile[ edge.to ] ?: "";
-			if ( !len( from ) || !len( to ) || from == to ) continue;
-			var key = from & "|" & to & "|" & edge.groupKind;
-			if ( !rolled.keyExists( key ) ) {
-				rolled[ key ] = { from: from, to: to, kind: edge.groupKind, count: 0, line: 0, evidence: "" };
+			for ( var from in ( ancestorsOfFile[ edge.from ] ?: [] ) ) {
+				for ( var to in ( ancestorsOfFile[ edge.to ] ?: [] ) ) {
+					// A directory depending on itself is containment, not a dependency.
+					if ( from == to ) continue;
+					var key = from & "|" & to & "|" & edge.groupKind;
+					if ( !rolled.keyExists( key ) ) {
+						rolled[ key ] = { from: from, to: to, kind: edge.groupKind, count: 0, line: 0, evidence: "" };
+					}
+					rolled[ key ].count++;
+				}
 			}
-			rolled[ key ].count++;
 		}
 		var keys = structKeyArray( rolled );
 		keys.sort( ( a, b ) => compareNoCase( a, b ) );

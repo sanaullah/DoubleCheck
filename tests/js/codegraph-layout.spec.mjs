@@ -628,27 +628,23 @@ test("the symbol level is drawable, not just listable", () => {
 	assert.match(view, /data-codegraph-depth="symbol"/, "the depth control offers it");
 });
 
-test("plain /codegraph opens the saved map and still offers a fresh run", () => {
-	// This spec used to assert the opposite: that a bare /codegraph must never
-	// reopen the newest snapshot. The concern behind it was real and is preserved
-	// below — silently reopening a map "offered no obvious way to begin a fresh
-	// one". But withholding the map answered that concern by breaking the
-	// workspace's purpose: a project with 42 stored graphs greeted its reader with
-	// "No graph snapshot", and the only way back to a map was the dashboard.
+test("plain /codegraph stays on the form and only offers the saved map", () => {
+	// The form is the point of this page: it is how someone scans a *different*
+	// project or directory. Auto-loading the last snapshot put a stale map in
+	// front of that, so a bare /codegraph must not open anything.
 	//
-	// Both hold at once: open the map, say it is a saved one, and leave starting a
-	// new run in plain sight. So this now pins the arrival *and* the escape hatch.
+	// The real gap it was trying to close — dozens of stored graphs with no route
+	// back to one except the dashboard — is closed by *offering* the map instead.
 	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
 	const view = readFileSync(new URL("../../app/views/main/codegraph.bxm", import.meta.url), "utf8");
-	const resume = ui.slice(ui.indexOf("async function resumeRunFromQuery"), ui.indexOf("function historyQueryParams"));
-
-	assert.match(resume, /if \(!resumeId\) \{/, "no run id now takes a branch rather than returning");
-	assert.match(resume, /restoreProjectSnapshot\(\)/, "bare /codegraph asks for the newest saved map");
-	assert.match(ui, /api\/v1\/codegraph\?projectPath/, "through the project snapshot endpoint");
-	// The concern the old spec protected, kept as an assertion rather than a comment.
-	assert.match(view, /id="run-form"/, "the run form stays on the page");
-	assert.match(view, /id="codegraph-rebuild"/, "and Rebuild map is offered beside the opened map");
-	assert.match(ui, /openedFromSavedMap = true/, "the header says this is a saved map, not a run that just finished");
+	// Only the no-run-id branch, not the whole function: an explicit ?run= is
+	// still expected to open a run, and that is what History's Open button uses.
+	const bareStart = ui.indexOf("if (!resumeId) {");
+	const bare = ui.slice(bareStart, ui.indexOf("return;", bareStart));
+	assert.doesNotMatch(bare, /watchRun\(/, "a bare /codegraph must not open a run");
+	assert.match(bare, /offerProjectSnapshot\(\)/, "it offers the saved map instead");
+	assert.match(ui, /data-open-saved-map/, "and the offer only loads when clicked");
+	assert.match(view, /id="run-form"/, "the form stays in front");
 	// History still routes here with an explicit id.
 	assert.match(ui, /\/\$\{runKind\}\?run=\$\{encodeURIComponent\(run\.id\)\}/);
 });
@@ -810,4 +806,44 @@ test("every visible card claim traces to a payload value", () => {
 			.map((n) => [n.id, n.layerLabel, n.complexity, n.fileCount, n.summary].join("|"))
 			.sort();
 	assert.deepEqual(claimsOf(a), claimsOf(b), "a card's claims must not depend on its position");
+});
+
+test("the flows endpoint and its hop contract are wired", () => {
+	// Flows were the product's central promise and the one answer with no endpoint:
+	// they lived only inside the snapshot blob returned by /result, as a list of
+	// node names with no line behind any step.
+	const handler = readFileSync(new URL("../../app/handlers/ApiCodeGraph.bx", import.meta.url), "utf8");
+	const router = readFileSync(new URL("../../app/config/Router.bx", import.meta.url), "utf8");
+	const flowService = readFileSync(new URL("../../app/models/services/CodeGraphFlowService.bx", import.meta.url), "utf8");
+	const mcp = readFileSync(new URL("../../app/models/services/CodeGraphMcpDescriptor.bx", import.meta.url), "utf8");
+
+	assert.match(router, /codegraph\/flows/, "the route exists");
+	assert.match(handler, /function flows\(/, "the action exists");
+	assert.match(handler, /unresolvedHops/, "a hop that could not be bound is reported, not dropped");
+	assert.match(flowService, /hopsFor\(/, "hops are assembled");
+	assert.match(flowService, /resolution: found \? "exact" : "unresolved"/, "every hop carries a resolution class");
+	assert.match(mcp, /codegraph_flows/, "an agent can reach flows too");
+});
+
+test("search facets are applied or refused, never silently ignored", () => {
+	const handler = readFileSync(new URL("../../app/handlers/ApiCodeGraph.bx", import.meta.url), "utf8");
+	const repo = readFileSync(new URL("../../app/models/repositories/CodeGraphGraphRepository.bx", import.meta.url), "utf8");
+	assert.match(repo, /kindFilter/, "kind is a predicate");
+	assert.match(repo, /roleFilter/, "role is a predicate");
+	assert.match(handler, /is not a supported search facet/, "an unsupported facet is rejected rather than dropped");
+});
+
+test("every shipped browser asset parses", () => {
+	// A syntax error in app.js takes the whole workspace down — no canvas, no
+	// drawer, no arrival — and the suite stayed green because nothing here ever
+	// parsed the file it asserts against with string matches. One bad regex
+	// escape shipped exactly that.
+	const { execFileSync } = require("node:child_process");
+	for (const asset of ["app.js", "codegraph-layout.js", "modernization-render-helpers.js", "modernization-contract.js", "architecture-flow.js"]) {
+		const path = new URL(`../../public/assets/${asset}`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+		assert.doesNotThrow(
+			() => execFileSync(process.execPath, ["--check", path], { stdio: "pipe" }),
+			`${asset} must parse`
+		);
+	}
 });

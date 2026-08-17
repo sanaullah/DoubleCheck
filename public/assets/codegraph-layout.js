@@ -257,24 +257,52 @@
 		if (cycles) {
 			blurb += " " + cycles + " dependency cycle" + (cycles === 1 ? "" : "s") + " flagged.";
 		}
+		// The AI summary of the largest module used to *replace* this sentence, so a
+		// module description stood in as the project description. The structural
+		// sentence is about the project and holds without a provider, so it stays;
+		// the featured module is named separately and the caller labels it.
+		let featuredModule = "";
+		let featuredSummary = "";
 		if (Array.isArray(summaries) && summaries.length && o.preferAi !== false) {
 			const featured = selectTopClusters(clusters, 1)[0];
 			const fid = featured ? String(featured.id || featured.key || "") : "";
 			const hit = summaries.find((s) => s && s.clusterId === fid && s.text);
 			if (hit && hit.text) {
-				blurb = String(hit.text).replace(/\s+/g, " ").trim();
-				if (blurb.length > 220) blurb = blurb.slice(0, 217).replace(/\s+\S*$/, "") + "…";
+				featuredModule = String((featured && (featured.label || featured.name)) || "").trim();
+				featuredSummary = String(hit.text).replace(/\s+/g, " ").trim();
+				if (featuredSummary.length > 220) {
+					featuredSummary = featuredSummary.slice(0, 217).replace(/\s+\S*$/, "") + "…";
+				}
 			}
 		}
 		return {
 			title: name,
 			blurb: blurb,
+			featuredModule: featuredModule,
+			featuredSummary: featuredSummary,
 			files: files,
 			modules: moduleCount,
 			cycles: cycles,
 			shown: Number(o.shown) || 0,
 			totalModules: moduleCount
 		};
+	}
+
+	/**
+	 * The first complete sentence, for places that can only show one.
+	 *
+	 * Overview cards fit about two lines and were given a whole paragraph, so
+	 * every card read as a fragment — "The single supplied cluster, labeled",
+	 * "Index, contains 117 files and…". A sentence that ends is worth more than
+	 * twice as much text that stops mid-clause. Falls back to the raw text when
+	 * there is no sentence boundary to find.
+	 */
+	function firstSentence(text) {
+		const raw = String(text || "").replace(/\s+/g, " ").trim();
+		if (!raw) return "";
+		const end = raw.search(/[.!?](\s|$)/);
+		if (end === -1) return raw;
+		return raw.slice(0, end + 1);
 	}
 
 	function wrapText(text, maxChars, maxLines) {
@@ -551,6 +579,12 @@
 				// already falls back to the component ordering, which is real.
 				layer: typeof c.layer === "number" ? c.layer : undefined,
 				layerLabel: layerLabelOf(c),
+				// "user", "ai", or "" for a name derived from the largest file in the
+				// module. Cards showed `Index` and `AI Chat and Specialist Agent
+				// Gateway` in identical styling, so a reader could not tell a domain
+				// name from a filename — and the largest module in this repository is
+				// called `Index`.
+				labelOrigin: String(c.labelProvenance || ""),
 				fileCount: fileCount,
 				symbolCount: c.symbolCount || 0,
 				crossingEdges: c.crossingEdges != null ? c.crossingEdges : 0,
@@ -1350,7 +1384,7 @@
 		const files = Number(n.fileCount) || 0;
 		const fileLabel = files === 1 ? "1 file" : files + " files";
 		const lines = wrapText(
-			n.summary || "",
+			firstSentence(n.summary || ""),
 			Math.floor((n.w - 28) / 7.4),
 			DEFAULTS.overviewMaxSummaryLines
 		);
@@ -1390,6 +1424,10 @@
 			complexity +
 			'" data-summary-origin="' +
 			summaryOrigin +
+			// Styling hook so a derived name can read differently from a named
+			// domain. "derived" is a fact about the label, not a guess.
+			'" data-label-origin="' +
+			escapeXml(String(n.labelOrigin || "derived")) +
 			'" role="listitem" tabindex="-1" aria-label="' +
 			escapeXml(ariaLabelFor(n)) +
 			'">' +

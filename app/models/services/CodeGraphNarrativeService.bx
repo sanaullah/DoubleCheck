@@ -195,9 +195,40 @@ class threadsafe {
 			trimmedSections : []
 		};
 		var failures = [];
-		if ( clusters.len() > maxClusterCount ) combined.trimmedSections.append( "clusters" );
-		for ( var index = 1; index <= min( clusters.len(), maxClusterCount ); index++ ) {
-			var cluster = clusters[ index ];
+		// The cap used to slice `clusters` in stored order, which is cluster-id
+		// (hash) order — so which domains got named was decided by a hash. On this
+		// repository that dropped modules of 20, 14 and 13 files while narrating
+		// nine of 2 files, and 23% of the codebase went unnamed for no stated
+		// reason. Order by size first; the array itself keeps id order for the
+		// fingerprint, so this sorts a copy.
+		var ordered = [];
+		for ( var candidate in clusters ) if ( isStruct( candidate ) ) ordered.append( candidate );
+		ordered.sort( ( a, b ) => {
+			var aFiles = val( a.fileCount ?: 0 );
+			var bFiles = val( b.fileCount ?: 0 );
+			if ( aFiles != bFiles ) return aFiles > bFiles ? -1 : 1;
+			var aSymbols = val( a.symbolCount ?: 0 );
+			var bSymbols = val( b.symbolCount ?: 0 );
+			if ( aSymbols != bSymbols ) return aSymbols > bSymbols ? -1 : 1;
+			// Total tiebreak so the selection is deterministic across runs.
+			return compareNoCase( toString( a.id ?: "" ), toString( b.id ?: "" ) );
+		} );
+		if ( ordered.len() > maxClusterCount ) {
+			combined.trimmedSections.append( "clusters" );
+			// "clusters were trimmed" without saying which is the drop this plan
+			// keeps finding. Name them, smallest-first, so a reader can see the
+			// omission is by size rather than arbitrary.
+			combined[ "omittedClusters" ] = [];
+			for ( var position = maxClusterCount + 1; position <= ordered.len(); position++ ) {
+				combined.omittedClusters.append( {
+					id       : toString( ordered[ position ].id ?: "" ),
+					label    : toString( ordered[ position ].label ?: "" ),
+					fileCount: val( ordered[ position ].fileCount ?: 0 )
+				} );
+			}
+		}
+		for ( var index = 1; index <= min( ordered.len(), maxClusterCount ); index++ ) {
+			var cluster = ordered[ index ];
 			if ( !isStruct( cluster ) ) continue;
 			var key = "";
 			var fingerprint = "";

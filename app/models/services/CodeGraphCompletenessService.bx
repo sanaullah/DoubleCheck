@@ -125,8 +125,47 @@ class threadsafe {
 	 * dependencies — exact counts from the run summary, not estimates — so those
 	 * entries pass through rather than being recomputed less accurately here.
 	 */
+	/**
+	 * Which snapshot section each truncation reason belongs to.
+	 *
+	 * A reason is evidence that a specific cap fired. Without this mapping a
+	 * section whose candidate count was never supplied computed `available` from
+	 * its own returned length and certified itself complete — so the snapshot
+	 * could report `truncated: true` with `truncationReasons: [ maxHotspots,
+	 * maxFlowsPerCluster ]` while `hotspots` and `flows` both said `complete`.
+	 */
+	variables.reasonSections = {
+		maxNodes           : "nodes",
+		maxEdges           : "edges",
+		maxHotspots        : "hotspots",
+		maxOrphans         : "orphans",
+		maxLayerViolations : "layerViolations",
+		maxClusters        : "clusters",
+		maxFlowsPerCluster : "flows",
+		flowSinkDiversity  : "flows",
+		graphImpacts       : "dependencies",
+		graphLoad          : "dependencies",
+		couplingGraph      : "edges"
+	};
+
 	struct function report( required struct parts ) {
 		var loaded = isStruct( arguments.parts.loaded ?: "" ) ? arguments.parts.loaded : {};
+		var report = buildReport( arguments.parts, loaded );
+		// A cap that fired makes its section incomplete, whatever the section's own
+		// arithmetic concluded. `omitted` is left alone: the count is unknown here,
+		// and inventing one would be the same defect in the other direction.
+		for ( var reason in ( arguments.parts.truncationReasons ?: [] ) ) {
+			var section = variables.reasonSections[ trim( toString( reason ) ) ] ?: "";
+			if ( len( section ) && isStruct( report[ section ] ?: "" ) ) {
+				report[ section ].complete = false;
+				report[ section ].truncatedBy = trim( toString( reason ) );
+			}
+		}
+		return report;
+	}
+
+	private struct function buildReport( required struct parts, required struct loaded ) {
+		var loaded = arguments.loaded;
 		return {
 			nodes          : entry( arguments.parts.nodeCount, arguments.parts.availableNodes, arguments.parts.nodeRanking ),
 			edges          : edges( arguments.parts.graph ),

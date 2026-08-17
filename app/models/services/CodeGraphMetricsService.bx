@@ -23,7 +23,12 @@ class threadsafe {
 	property name="architectureRuleService" inject="ArchitectureRuleService";
 	property name="centralityService" inject="CodeGraphCentralityService";
 
-	variables.snapshotVersion = "codegraph-snapshot-v3";
+	// v5: flows carry `hops` — the chain as evidence-bearing edges rather than a
+	// list of node names, so a trace can be opened at each step.
+	// v4: `roleCounts` now counts files only, excluding route/table/config/event/
+	// http/schedule/response entities. That changes stored snapshot content, so
+	// the version has to move or reuse will serve the old counts.
+	variables.snapshotVersion = "codegraph-snapshot-v5";
 	variables.defaultCaps = {
 		maxClusters         : 60,
 		maxHotspots         : 50,
@@ -196,7 +201,12 @@ class threadsafe {
 			layerViolationCount : layerViolations.len(),
 			flowCount           : flows.len(),
 			symbolCount         : fileStats.symbolCount,
-			dependencyCount     : totals.dependencies
+			dependencyCount     : totals.dependencies,
+			// The snapshot reported `truncated: true` beside nine accounts that all
+			// said `complete: true`, because a section whose candidate count was never
+			// supplied certified itself from its own length. The reasons name which
+			// caps fired, so they are the missing input rather than a second opinion.
+			truncationReasons   : truncation.reasons ?: []
 		} );
 
 		var fingerprintPayload = {
@@ -581,9 +591,23 @@ class threadsafe {
 		return evidence;
 	}
 
+	/**
+	 * Role distribution across **files**, not across every node in the snapshot.
+	 *
+	 * `snapshot.nodes` holds routes, tables, config keys, events and responses
+	 * alongside files, so this counted 252 `shared` for a repository with five
+	 * config *files* — 247 of them were config keys. That number leads the canvas
+	 * role legend, which makes it the first structural claim a reader meets, and
+	 * it described the extraction rather than the codebase.
+	 */
 	private struct function countRoles( required array nodes ) {
 		var counts = {};
 		for ( var node in arguments.nodes ) {
+			var rawId = trim( toString( node.id ?: node.path ?: "" ) );
+			var prefix = lCase( listFirst( rawId, ":" ) );
+			if ( find( ":", rawId ) > 0 && listFindNoCase( "route,table,config,event,http,schedule,response", prefix ) > 0 ) {
+				continue;
+			}
 			var role = trim( toString( node.role ?: "unknown" ) );
 			counts[ role ] = ( counts[ role ] ?: 0 ) + 1;
 		}

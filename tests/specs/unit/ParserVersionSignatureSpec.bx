@@ -36,6 +36,31 @@ class extends="testbox.system.BaseSpec" {
 				}
 			} );
 
+			/**
+			 * The same failure, one field over. `CodeGraphReuseKeyService` held its own
+			 * copy of the snapshot version and it had drifted: pinned at
+			 * `codegraph-snapshot-v2` while the metrics service was writing `v3`. So a
+			 * change to the snapshot's shape did not move the reuse key, and a
+			 * clean-tree run could adopt a v2-shaped snapshot as current.
+			 *
+			 * The live value now comes from the service that owns the shape. This pins
+			 * the fallback to it, because a fallback that lies is the whole defect.
+			 */
+			it( "keeps the reuse-key snapshot version in step with the metrics service", () => {
+				var metrics = new app.models.services.CodeGraphMetricsService();
+				var source = fileRead( expandPath( "/app/models/services/CodeGraphReuseKeyService.bx" ), "UTF-8" );
+				var fallback = "";
+				var found = reFind( "[""'](codegraph-snapshot-v[0-9]+)[""']", source, 1, true );
+				if ( isStruct( found ) && isArray( found.pos ?: "" ) && found.pos.len() >= 2 && val( found.pos[ 2 ] ) > 0 ) {
+					fallback = mid( source, found.pos[ 2 ], found.len[ 2 ] );
+				}
+				expect( len( fallback ) ).toBeGT( 0, "could not find the snapshot version fallback to check" );
+				expect( fallback ).toBe(
+					metrics.snapshotVersion(),
+					"reuse-key snapshot fallback [#fallback#] does not match the live snapshot version [#metrics.snapshotVersion()#]. Bump it with the snapshot shape, or a snapshot of the old shape will be reused silently."
+				);
+			} );
+
 			it( "gives every parser a distinct version so one bump cannot mask another", () => {
 				var versions = [ boxLang.getVersion(), cfml.getVersion(), javaScript.getVersion() ];
 				var seen = {};

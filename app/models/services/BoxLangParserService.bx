@@ -6,7 +6,7 @@
 class threadsafe {
 	property name="codegraphParserStrategy" inject="coldbox:setting:codegraphParserStrategy";
 
-	variables.parserVersion = "boxlang-ast-parser-v11";
+	variables.parserVersion = "boxlang-ast-parser-v12";
 	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 	variables.integrationDetector = new app.models.services.IntegrationDetector();
@@ -240,7 +240,19 @@ class threadsafe {
 			addResponseDependency( dependencies, sourceLine, lineNumber );
 			extractResourceDependencies( dependencies, sourceLine, lineNumber );
 
-			var constructionMatch = match( "\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
+			// Masked, like `calls` above: this matches a code identifier, so prose
+			// inside a string literal must not register as a construction. It did —
+			// "Keep the capability in the new main application until…" produced
+			// `constructs → main`, which resolved to `app/handlers/Main.bx` and
+			// became one of this repository's two architecture-rule violations.
+			//
+			// The detectors above deliberately keep the *raw* line, because the value
+			// they capture is itself a quoted literal (`route( "/x" )`,
+			// `setView( "y" )`). Masking is only correct where the match is code.
+			var constructionMatch = match(
+				"\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)",
+				sourceScanner.maskLiterals( sourceLine )
+			);
 			while ( constructionMatch.find() ) {
 				dependencies.append(
 						dependency(

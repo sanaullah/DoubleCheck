@@ -180,6 +180,40 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 				queryExecute( "DELETE FROM review_runs WHERE id IN ( :a, :b )", { a: source, b: target } );
 			} );
 
+			it( "keeps the search mirror exact when the same nodes are appended twice", () => {
+				// The knowledge layer is appended in a second pass, and appending was
+				// not idempotent: re-projecting a run mirrored those nodes again. The
+				// coverage check compares mirrored rows to stored nodes *exactly*, so
+				// the surplus made `searchIndexCovers` false and silently disabled the
+				// trigram index for the whole run — three attempts and two reverts of
+				// work, switched off by a duplicate row. Search stayed correct via the
+				// LIKE backstop, which is why nothing ever failed.
+				//
+				// Measured before the fix: a first run mirrored 6,175 rows for 6,175
+				// nodes and used the index; an accumulated run held 6,275 for 6,192.
+				var repo = getInstance( "CodeGraphGraphRepository" );
+				var runId = "mirror-" & createUUID();
+				queryExecute(
+					"INSERT INTO review_runs ( id, project_path, status, run_kind, mode, created_at, updated_at ) VALUES ( :id, '/tmp/p', 'succeeded', 'codegraph', 'full', :now, :now )",
+					{ id: runId, now: dateTimeFormat( now(), "iso" ) }
+				);
+				var fileNode = { id: "file:a.bx", level: "file", parentId: "", path: "a.bx", symbolName: "", kind: "file", role: "", language: "BoxLang", line: 0, endLine: 0, fanIn: 0, fanOut: 0, hotspot: 0 };
+				var knowledgeNode = { id: "knowledge:risk:a", level: "knowledge", parentId: "file:a.bx", path: "a risk", symbolName: "a risk", kind: "risk", role: "knowledge", language: "", line: 0, endLine: 0, fanIn: 0, fanOut: 1, hotspot: 0 };
+
+				repo.replaceGraph( runId, [ fileNode ], [] );
+				repo.appendGraph( runId, [ knowledgeNode ], [] );
+				// The second pass, as a re-projection would run it.
+				repo.appendGraph( runId, [ knowledgeNode ], [] );
+
+				var mirrored = queryExecute( "SELECT COUNT(*) AS n FROM codegraph_node_search WHERE run_id = :id", { id: runId } );
+				var stored = queryExecute( "SELECT COUNT(*) AS n FROM codegraph_nodes WHERE run_id = :id", { id: runId } );
+				expect( mirrored.n[ 1 ] ).toBe(
+					stored.n[ 1 ],
+					"mirror rows must equal node rows, or searchIndexCovers turns the index off for the whole run"
+				);
+				queryExecute( "DELETE FROM review_runs WHERE id = :id", { id: runId } );
+			} );
+
 			it( "reports an unreadable snapshot instead of throwing out of the read path", () => {
 				// D30: an unguarded jsonDeserialize surfaced as "run not found".
 				var runId = "corrupt-" & createUUID();

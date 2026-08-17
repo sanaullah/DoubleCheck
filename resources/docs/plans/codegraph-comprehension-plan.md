@@ -474,6 +474,9 @@ Root cause of N5.
 ### 4.3 New defects — Severity 2
 
 **N8 · Name-collision resolution produces confidently-wrong cross-file edges · RV**
+*(Severity overstated — see §21. The 41% below counts ambiguity across all symbol
+kinds; resolution only consults **type** names, of which three were ambiguous.
+Fixed and guarded, but this entry's headline figure is not the at-risk set.)*
 14% of distinct symbol names are declared in more than one file (`run` in 116,
 `init` in 47, `log` in 29). Of 628 cross-file edges whose target is a bare
 undotted name, **260 (41%) name a symbol declared in more than one file** and the
@@ -1204,19 +1207,27 @@ rm -f .db/doublecheck.db .db/doublecheck.db-wal .db/doublecheck.db-shm
 ```
 
 Then clear compiled classes so no stale `app/` class survives the reset — §25's
-rule, the one that invalidated a whole investigation:
+rule, the one that invalidated a whole investigation. **The path is
+`.tmp/boxlang-home/classes`**; an earlier draft of this section named
+`.engine/boxlang/classes`, which does not exist, so clearing it was a no-op:
 
 ```bash
-rm -rf .engine/boxlang/classes
+rm -rf .tmp/boxlang-home/classes
 ```
 
 ```bash
 box server start
 ```
 
-`SchemaService` recreates the complete schema on start. **Do not run
-`box run-script setup`** — it would touch `.env`, and AGENTS.md forbids
-overwriting an existing one.
+`SchemaService` recreates the schema **lazily, on the first request** — not on
+start. Until something touches the app the store does not exist:
+
+```bash
+curl -s http://127.0.0.1:55098/api/v1/health
+```
+
+**Do not run `box run-script setup`** — it would touch `.env`, and AGENTS.md
+forbids overwriting an existing one.
 
 ### 17.3 The full live test
 
@@ -1530,3 +1541,620 @@ accumulation artefact, and the four uncertainties in §17.4 stand. No re-index, 
 parser or projection change, no version bump. `lib/coldbox` was not re-run. The
 Cold-Read Protocol was not re-taken, so §2's score is unchanged on paper even
 though three of its inputs improved.
+
+---
+
+## 19. Phase V — run, and what the clean store settled (2026-08-17)
+
+The 394 MB store holding 39 accumulated runs was exported, dropped and rebuilt
+from `SchemaService`. Every number below comes from a **first run against an
+empty database**.
+
+**Two corrections to §17.2 before anything else.** The compiled-class path is
+`.tmp/boxlang-home/classes`, not `.engine/boxlang/classes` — the latter does not
+exist and clearing it was a no-op. And the schema is created **lazily on first
+request**, not on server start, so the sequence needs a request (`/api/v1/health`)
+before the store exists. Both corrected in §17.2.
+
+`evaluation_gate_runs` exported first: **677 rows** to `.db/gate-history-backup.csv`
+(gitignored). Nothing else was at risk — confirmed again on the live store before
+dropping.
+
+### The cold baseline
+
+| | Accumulated store | **Clean store** |
+|---|---|---|
+| Database size | 394 MB / 39 runs | **46.3 MB / 1 run** |
+| Full cold run, AI enabled | unmeasured from empty | **22m 47s** — 23 sequential narrative shard calls with the cache empty |
+| Projected nodes | 6,192 | 6,175 |
+| Projected edges | 15,300 | 15,270 |
+| Clusters | 36 | 32 |
+| Snapshot version | `codegraph-snapshot-v3` | **`codegraph-snapshot-v4`** |
+
+**The run duration is almost entirely the narrative.** The structural graph was
+complete at 75% progress within ~6 minutes; the remaining ~17 were 23 shard
+calls. That is worth knowing before anyone optimises projection again — §28
+measured the same thing one layer down and reached the same conclusion.
+
+### §17.4's four uncertainties, answered
+
+**N5/N6 — the FTS mirror. Answered, and the answer changes the fix.**
+
+```
+first run:  mirror 6,175   nodes 6,175   distinct 6,175   →  EXACT MATCH, index active
+accumulated: mirror 6,275  nodes 6,192   distinct 6,192   →  83 duplicates, index bypassed
+```
+
+A first run does **not** duplicate. So the knowledge pass is not inserting twice
+on its own — the duplication needs the graph to be **projected more than once for
+the same run**, which is the reuse/adopt path re-running the knowledge append
+without the delete that `replaceGraph` performs. §4.3's mechanism was right and
+its trigger was wrong: this is not "knowledge nodes are always mirrored twice",
+it is "a re-projected run accumulates mirror rows". Search is correct in both
+cases; the index is silently bypassed only in the second. **The fix moves from
+the knowledge append to the re-projection path.**
+
+**Cold-narrative determinism — not settled, and now known to be expensive to
+settle.** The cold run took 23 minutes of provider calls. A second cold run is
+the only way to test it and costs the same again; it was not run. What §3
+measured remains a warm-cache result.
+
+**B7 — cluster labels.** 23 of 32 clusters were labelled from scratch on the
+first run, so labels do regenerate. Whether they re-attach to the *same* clusters
+still needs a second run.
+
+**N22 — cluster distribution.** Reproduces from empty: 32 clusters for 322 files
+with the same long tail. Not an accumulation artefact.
+
+### What the clean store confirmed about the shipped work
+
+| Fix | Verified on the clean store |
+|---|---|
+| **U5** roleCounts | `shared: 5` (was 252) and the ten role counts **sum to 322, exactly the file count**. The legend now describes the codebase rather than the extraction |
+| **N4** narrative selection | 23 domains narrated **largest-first** — 30, 21, 20, 13, 10, 8, 7, 5… — and the 8 omitted clusters are **named with their sizes**, all of them 2-file. Previously the 20-, 14- and 13-file modules were the ones dropped |
+| **N3** project blurb | *"DoubleCheck — 322 files across 32 modules. 2 dependency cycles flagged."* leads, with the AI text following. The AI text also improved on its own: size-ordered shards mean the pitch now comes from the largest module — *"a ColdBox application with a central Setup.bx module…"* rather than *"a single domain cluster… three files"* |
+| **U2** fabricated layer | **0** `.cg-card-layer` elements across 18 cards |
+| **U6** title provenance | 9 derived / 9 AI titles, now visually distinct |
+| **U8** disclosure | *"Showing 18 of 32 modules — show the rest"* |
+| **N1** truncation honesty | `/neighbours` limit 60 → `available 315, omitted 254, truncated` |
+| **N2** landing screen | six entry points across six files |
+| **N23** rules account | `complete`, over 961 file-level edges, with `unevaluatedLevels` stated |
+| Snapshot/reuse version | `codegraph-snapshot-v4` written; the reuse key now derives from the metrics service |
+
+### A live drift defect found and closed while doing this
+
+`CodeGraphReuseKeyService` held its **own copy** of the snapshot version, pinned
+at `codegraph-snapshot-v2` while snapshots were being written as `v3`. So the
+shape change that produced v3 never moved the reuse key, and a clean-tree run
+could adopt a v2-shaped snapshot as current. This is precisely the failure that
+file's own header says it exists to prevent — *"a cache key that does not cover
+everything shaping the stored rows… it has now happened three times in this
+subsystem alone"* — occurring a fourth time, inside the file written to stop it.
+
+The live value now comes from `CodeGraphMetricsService`, which owns the shape.
+`ParserVersionSignatureSpec` gained a matching assertion and it was
+**negative-tested**: reintroducing `v2` fails with
+*"reuse-key snapshot fallback [codegraph-snapshot-v2] does not match the live
+snapshot version [codegraph-snapshot-v4]"*.
+
+### N5/N6 fixed at the site Phase V identified
+
+`appendSearchIndex` now deletes a node's mirror row before inserting it, so an
+append is idempotent. That is the *re-projection* path, not the knowledge pass —
+the distinction Phase V was run to establish, and it is the line that would have
+been edited wrongly without it.
+
+`CodeGraphPersistenceSpec` gained "keeps the search mirror exact when the same
+nodes are appended twice", **negative-tested**: removing the delete fails it with
+`Expected [2] Actual [3]`.
+
+### Suite on the clean store
+
+**TestBox 736 passed / 0 failed / 0 errored / 1 skipped**, 737 specs, 111
+bundles, 127 s. JavaScript **41 / 0**.
+
+The first clean-store run reported 2 failures and both were informative:
+
+- `CodeGraphMetricsServiceSpec` asserts the snapshot version as a **deliberate
+  literal** — *"this assertion is what forces that to be a decision rather than
+  an oversight"*. It caught the v4 bump, which is exactly its job. Updated to v4
+  with the reason recorded; **not** relaxed into reading the version from the
+  service, which would defeat it.
+- `ReviewExecuteRunSpec` timed out at 60 s waiting for a terminal state — the
+  known flake, made likelier here because a cold store forces a full index inside
+  that budget. Green in isolation in 13.5 s.
+
+---
+
+## 20. Remaining work
+
+Honest status of everything this plan specifies but has not delivered.
+
+| Phase | State |
+|---|---|
+| **V** | **Done** — §19 |
+| **0** Stop showing invented data | **Done** — §18 |
+| **1** Arrive on the map | **Done** — §18 |
+| **2** Counts stop lying | **Done** — §18; **N17 not done** (the snapshot still reports `truncated: true` beside nine `complete: true` accounts) |
+| **3** Orient reads true | **Mostly done** — N2, N3, N4, U5, U6, U8 shipped. **U7 not done**: card summaries are still wrapped mid-sentence with an ellipsis |
+| **4** Resolution accuracy | **Not started.** N7 (both `/rules` violations false — a string literal and a local variable), N8 (260 ambiguous cross-file edges), and the 4 mis-extracted `route` symbols the landing screen now filters but the extractor still produces |
+| **5** Ontology completion | **Not started.** N10–N14, N18, N20 |
+| **6** Follow — flows first class | **Not started.** N19, N24 — the largest remaining comprehension gap |
+| **7** Map covers the graph | **Not started.** Resource and knowledge canvas depths, references and diff panels |
+| **8** Search, facets, agents | **Partly** — N5/N6 fixed (§19). N15 (facets silently ignored) and N16 (MCP cannot reach `resource`/`knowledge`; no knowledge tool) not started |
+| **9** Knowledge depth | **Not started** |
+| **10** Scale | **Not started** — no latency measured above ~6k nodes |
+
+**Recommended next:** Phase 4. It is the only remaining phase that makes existing
+answers *wrong* rather than absent — `/rules` currently reports two violations on
+this repository and both are false, which is Q13's entire visible answer.
+
+**Still true and still unrun:** the human half of the Cold-Read Protocol, and a
+second cold narrative run to settle determinism (23 minutes of provider calls
+each, per §19).
+
+---
+
+## 21. Phase 4 — resolution accuracy (2026-08-17)
+
+Two defects, both of which produced this repository's **entire visible answer** to
+"where are the architectural violations". Verified by re-indexing (parser
+versions `boxlang-ast-parser-v12` / `cfml-symbol-parser-v12`) and reading
+`/rules`.
+
+### N7 — both false violations are gone
+
+| | Before | After |
+|---|---|---|
+| `ModernizationPlacementService --constructs--> handlers/Main.bx` | 2 dependency rows, from the literal *"…in the new **main** application…"* | **0 rows** |
+| `AIFlightListener --calls--> aiFlight/handlers/Flight.bx` | 4 rows, from `if ( !flight.count() )` where `flight` is a local struct | **0 rows** |
+| *"Application models must not depend on HTTP handlers"* | **FAIL, 2 violations, both false** | **pass, 0 violations** |
+| *"Handlers should go through a service, not straight to a repository"* | 12 violations | **12 violations, all real** — `ApiCodeGraph` injects and calls `AnalysisGraphRepository` and `CodeGraphGraphRepository` directly, with correct evidence lines |
+
+**Cause one — masking.** `constructs` matched the **raw** source line while
+`calls` had been matching the masked one since Phase 1 of the prior plan. The
+detectors around it (`route(`, `setView(`) must keep the raw line, because the
+value they capture *is* a quoted literal — so masking is applied per detector
+according to whether the match is code, not blanket.
+
+**Cause two — corroboration.** A bare receiver resolved to any file declaring a
+type of that name. It now binds only when the source file gives independent
+evidence of using that type: it imports, injects, constructs, extends,
+implements or type-references it. The injected-property alias path is unchanged
+and still binds without corroboration, because an injection *is* the evidence.
+
+### N8 — my own measurement was wrong, and the corrected figure is small
+
+§4.3 reported *"260 of 628 cross-file bare-name edges (41%) target a name
+declared in more than one file"*. That number conflated **symbol-name** ambiguity
+with **type-name** ambiguity, and only the second is what resolution can get
+wrong. Measured after the fix:
+
+```
+resolved deps whose target is an ambiguous TYPE name:  0
+ambiguous type names in the repository:                3   (application ×4, router ×2, index ×2)
+the 256 "ambiguous" cross-file edges, by kind:         253 injects · 3 calls
+```
+
+Those 253 `injects` resolve from an `inject="FooService"` attribute — evidence,
+not a name guess — and they were only "ambiguous" because some *function* named
+`run` or `init` exists in several files, which resolution never consults for
+them. **The genuinely at-risk population was three type names, and it is now
+zero.** N8's severity in §4.3 is overstated; the fix is still correct and is now
+guarded, but the register entry should be read with this correction.
+
+`resolveTypeFile` refuses an ambiguous name outright rather than taking whichever
+file was parsed last, and records `candidateCount` so the refusal is legible.
+
+### Cost of the fix
+
+`calls` edges 5,584 → 5,492 (−92) and `constructs` 1,161 → 1,151 (−10): 102
+bindings withdrawn, which is the intended loss. Total projected edges rose
+15,270 → 15,327 because the narrative produced more knowledge nodes.
+
+### Guards
+
+New `tests/specs/unit/DependencyResolutionSpec.bx`, four specs: a construction is
+not read out of a string literal (while a real one still is); a bare receiver
+with no corroboration stays unresolved; a corroborated receiver binds; two
+candidates is not a resolution and the count says why. A `resolveTargetsForTesting`
+seam was added because resolution previously could only be checked by running a
+full index and reading the output.
+
+**Suite: 737 passed / 0 failed / 0 errored / 1 skipped** (738 specs).
+
+---
+
+## 22. Phase 5 (part) — resources get a location (2026-08-17)
+
+`projection-v6`. Every resource node carried `line: 0` and `parentId: ""`, so the
+answers to "what starts a request", "which settings does this read" and "what
+does this talk to" named entities the reader could neither **open** nor **drill
+to**. Measured after the change:
+
+| Resource kind | Total | With a declaration line | With a parent file |
+|---|---|---|---|
+| route | 53 | **48** | **48** |
+| event | 20 | **20** | **20** |
+| config | 247 | 0 | 0 |
+| table | 39 | 0 | 0 |
+| response · http · schedule | 8 | 0 | 0 |
+
+```
+resource:route:/api/v1/ai-providers   router.bx:237   parent file:app/config/router.bx
+resource:event:codegraph-index        codegraphrunservice.bx:168
+```
+
+**The zeros are the correct answer, not remaining work.** A route is declared by
+a `route( "/x" )` call and an event by the line that publishes it. A table, a
+config key or a remote host is *referenced* from code and declared outside it —
+inventing a location for those would be U2 again in a different field. The edges
+that reach them still carry evidence, so the reference is inspectable even where
+the entity has no site of its own.
+
+---
+
+## 23. Final state of this session
+
+| Suite | Result |
+|---|---|
+| TestBox | **741 passed / 0 failed / 0 errored / 1 skipped** — 742 specs, 112 bundles |
+| JavaScript | **41 / 0** |
+| `git diff --check` | clean |
+
+Started at 735 passing / 736 specs; +6 specs, no regressions, on a database that
+was dropped and rebuilt mid-session.
+
+### The three screens, start of session → now
+
+```
+ARRIVE     "No graph snapshot"                    →  "Saved map of C:\Box\DoubleCheck · built 4 min ago"
+BRIEFING   (blank — never rendered)               →  "DoubleCheck — 323 files across 44 modules."
+                                                     AI · Largest module — Modernization Contract: …
+LEGEND     Shared 252 (247 were config keys)      →  Shared 5 · roles sum to the file count
+START      smoke / activate / create / delete /   →  apiProbe · /api/v1/openapi.yaml · export ·
+           index / notFound                          codegraph · graph · compareModernizeScoped
+OVERVIEW   18 cards, every one carrying a layer   →  0 fabricated fields · 11 derived vs 7 AI titles
+           chip computed as cardIndex % 5            marked distinctly · "Showing 18 of 44 modules"
+RULES      2 violations, both false                →  0 false · 12 real, with correct evidence
+```
+
+### Versions moved, and why
+
+`boxlang-ast-parser-v12` · `cfml-symbol-parser-v12` (extraction: literal masking
+on `constructs`, corroborated receiver resolution) · `codegraph-snapshot-v4`
+(`roleCounts` counts files only) · `codegraph-projection-v6` (resource
+declaration sites and parents). Each was exercised by a full re-index, not
+assumed.
+
+### Still open
+
+Unchanged from §20 except Phase 4 and part of Phase 5:
+
+- **N17** — the snapshot still reports `truncated: true` beside nine `complete: true` accounts.
+- **U7** — card summaries still wrap mid-sentence.
+- **Phase 5 remainder** — N12 (nodes carry no resolution/provenance/confidence), N13, N14, N18 (half the directory level isolated), N20 (`tests/fixtures/**` still indexed).
+- **Phase 6** — flows are still not first-class and have no endpoint. The largest remaining comprehension gap.
+- **Phase 7** — resource and knowledge levels still cannot be drawn; no references or diff panel.
+- **Phase 8 remainder** — N15 (search facets silently ignored), N16 (MCP cannot reach `resource`/`knowledge`).
+- **Phases 9, 10** — knowledge depth, scale benchmarks.
+- **The human cold read**, and a second cold narrative run for determinism (~23 min of provider calls each).
+
+---
+
+## 24. Phases 5–6 and 8 completed (2026-08-17)
+
+### Phase 6 — flows are first class · **RV**
+
+Flows were the product's central promise and the one answer with no endpoint:
+they existed only inside the snapshot blob returned by `/result`, as a list of
+node names with no line behind any step.
+
+`buildAdjacency` now carries `line` and `evidence` on every edge, and `hopsFor`
+assembles the chain as edges rather than nodes. `GET /codegraph/flows` lists
+them; `?flow=<id>` returns one with its hops. Live:
+
+```
+route:/api/v1/workers  →  table:review_workers        terminal: table-read
+  routes      route:/api/v1/workers  → apiworkers.bx           :61  exact  route( "/api/v1/workers" ).withVerbs( "G…
+  calls       apiworkers.bx          → workerregistryservice   :16  exact  data = { data: workerRegistryService.listAct…
+  table-read  workerregistryservice  → table:review_workers    :52  exact  FROM review_workers
+```
+
+Every hop carries `from`, `to`, `kind`, the owning symbol, `file:line`, the
+matched source text and a resolution class. A hop that cannot be bound is
+returned `resolution: "unresolved"` and counted as `unresolvedHops` — a gap in a
+trace is part of the trace. The list account is honest: `available 44, returned
+3, omitted 41, truncated`.
+
+### Phase 8 — facets and agent parity · **RV**
+
+| | Before | After |
+|---|---|---|
+| `/search?q=api&kind=route` | ignored — 770 matches, no signal | **337** |
+| `/search?q=api&role=entry` | ignored — 770 | **63** |
+| `/search?…&resolution=exact` | ignored | **422**, naming the supported facets |
+| MCP tools | 9 | **13** — adds `graph`, `flows`, `rules`, `diff` |
+| MCP search levels | 4 | **6** — `resource` and `knowledge` reachable at last |
+| MCP evidence claim | "every edge carries file:line" | states that derived and narrative edges carry a class and no line |
+
+### Phase 5 remainder
+
+**N18 — the directory level is usable.** The rollup mapped a file only to its
+immediate directory, so every directory holding no files *directly* —
+`app/models`, `app/views`, `app/modules`, `tests/specs` — had no edges at all.
+Rolling through every ancestor: **isolated directories 20 of 39 → 6 of 29**,
+directory edges **66 → 236**.
+
+**N20 — fixtures are out.** `tests/fixtures/**` joins the ignore list: 6 files
+and 15 symbols of deliberately-insecure and legacy-CFML sample code were being
+analysed as product. `tests/specs/**` stays, because the `tests` edges that
+answer "which tests cover this" depend on it. Files 322 → 317.
+
+### N17 — the snapshot stops contradicting itself
+
+`truncated: true` sat beside nine accounts all reporting `complete: true`,
+because a section whose candidate count was never supplied computed `available`
+from its own returned length. Truncation reasons are now mapped to the section
+each belongs to:
+
+```
+truncated: true   reasons: [ graphLoad, graphImpacts, maxHotspots, maxFlowsPerCluster ]
+  dependencies  complete=false  truncatedBy=graphImpacts
+  flows         complete=false  truncatedBy=maxFlowsPerCluster
+  hotspots      complete=false  truncatedBy=maxHotspots
+  …the other six unchanged and genuinely complete
+```
+
+`omitted` is deliberately left at 0 where the count is unknown: inventing one
+would be the same defect facing the other way.
+
+### Verification
+
+**TestBox 741 / 0 / 0 / 1** (742 specs, 112 bundles) · **JavaScript 43 / 0** ·
+`git diff --check` clean. Versions moved and each was exercised by a full
+re-index: `codegraph-snapshot-v5`, `codegraph-projection-v7`.
+
+Live arrival after all of it: *"Saved map of C:\Box\DoubleCheck · built 5 min
+ago"*, `DoubleCheck — 317 files across 44 modules`, legend `Shared 5`, 18 cards
+with **0** fabricated fields, *"Showing 18 of 44 modules — show the rest"*, and
+the unresolved-reference banner unchanged and still the best sentence in the UI.
+
+### What remains
+
+- **Phase 7** — resource and knowledge canvas depths; references and diff panels; the in-product sequence view for the flows now available at `/flows`.
+- **Phase 5 remainder** — N12 (nodes carry no resolution/provenance/confidence), N13 (knowledge labels truncated at 120 chars), N14 (knowledge materialisation drops silently).
+- **U7** — card summaries still wrap mid-sentence.
+- **Phase 9** — glossary terms, domain→domain relations, ordered process steps.
+- **Phase 10** — no query latency measured above ~6k nodes.
+- **The human cold read**, and a second cold narrative run for determinism.
+
+---
+
+## 25. Phases 7, 9 and 10 (2026-08-17)
+
+### Phase 7 — the map covers the graph, and the panels catch up · **RV**
+
+**Resource and Meaning are canvas depths.** 367 resource nodes with 1,251 edges
+— routes, tables, config keys, events, outbound integrations — and the whole
+knowledge layer were queryable by API and drawn by nothing. Both now load from
+the levelled tables (`codeGraphLoadLevelCanvas`, cached per run+level) and draw:
+**200 nodes each** on this repository. `context` is kept beside `nodes` rather
+than merged, matching the endpoint, so the far endpoints are drawable without
+being counted as the level.
+
+**References panel.** `/references` was API-only and is the only endpoint that
+can report unresolved references *inside* its own answer. Live: `normalizePath`
+→ **24 definitions**, occurrences each badged `bound` or `unresolved`.
+
+**Flow panel — the sequence view.** Live for `route:/api/v1/workers`:
+
+```
+ROUTES      route:/api/v1/workers:61                    → apiworkers.bx           exact
+CALLS       apiworkers.bx:16                            → workerregistryservice   exact   index
+TABLE-READ  workerregistryservice.bx:52                 → table:review_workers    exact
+```
+
+Prefers a flow passing through the current map selection, so it answers "how does
+a request reach *this*".
+
+**A syntax error shipped, and the suite could not see it.** A bad regex escape in
+`app.js` took the entire workspace down — no canvas, no drawer, no arrival — and
+44 passing JS specs stayed green, because every one of them asserts against the
+file as a *string* and nothing ever parsed it. New spec: every shipped browser
+asset must pass `node --check`. It would have caught this in under a second.
+
+### U7 — cards show a complete thought
+
+Overview cards fit two lines and were handed a whole paragraph, so every card
+read as a fragment. `firstSentence()` now feeds `wrapText`:
+
+```
+before  "The single supplied cluster, labeled" / "Index, contains 117 files and…"
+after   "The core domain orchestrates modernization runs and…"
+        "This cluster covers the API handlers, services, and repositories that…"
+```
+
+### N13, N14 — knowledge labels and silent drops
+
+`left( text, 120 )` named every risk node with half a word; `summarise()` cuts at
+a word boundary and marks the elision. Model output naming something the graph
+does not contain was discarded with no record — 29 processes became 23 nodes and
+nothing said six had gone. `projectKnowledge` now returns a `dropped` account
+(`domain`, `process`, `risk`, `duplicate`) carried into stage health.
+
+### Phase 9 — the knowledge layer relates to itself · **RV**
+
+| Knowledge edge kind | Before | After |
+|---|---|---|
+| `describes` | 233 | 233 |
+| `affects` | 47 | 47 |
+| **`depends-on`** (domain → domain) | **0** | **74** |
+
+The knowledge layer had only edges pointing *down* at structure; nothing related
+two domains. "Which domains does this one depend on" — the first question an
+architect asks — had no answer at any level. Derived from the cluster
+dependencies that already exist, and marked `resolution: derived` rather than
+`narrative` for exactly that reason: **the names are the model's, the
+relationship is the graph's.**
+
+**Processes are ordered.** A process attached to its files as an unordered set
+could say a request touches a repository and not whether that was before or
+after the handler. The step ordinal rides on `occurrences`:
+
+```
+resource:route/api/v1/capabilities  1
+apicapabilities.bx                  2
+qualitygateservice.bx               3
+codegraphcorpusservice.bx           4
+architectureindexservice.bx         5
+```
+
+**Glossary terms are not built.** They need a prompt-schema change and a provider
+call to verify, and unlike the two above they cannot be derived from structure —
+so building one would mean shipping a feature whose output I could not check.
+Recorded as remaining rather than guessed at.
+
+### Phase 10 — latency measured, and what the measurement is worth
+
+At **6,229 nodes / 15,629 edges**:
+
+| Query | Time |
+|---|---|
+| `level=symbol` ranked, 200 rows | **0.44 ms** |
+| neighbours count for the router | **2.01 ms** |
+| unindexed `LIKE '%service%'` scan | **1.49 ms** |
+| one-hop impact cone | **2.10 ms** |
+
+All far inside the 150 ms target — **at 6k nodes, which is not the 50k the target
+was written for.** §14's benchmark asked for 50k and this repository cannot
+supply it. The honest reading: nothing here is slow, and the scaling question is
+still open. It stays in the register.
+
+### Verification
+
+**TestBox 741 / 0 / 0 / 1** (742 specs, 112 bundles) · **JavaScript 44 / 0** ·
+`git diff --check` clean · `projection-v8`, exercised by a full re-index.
+
+Canvas depths now: `start · cluster · matrix · resource · knowledge · file ·
+focus · symbol`.
+
+### What remains, honestly
+
+- **Glossary terms** (above) — the only Phase 9 item not done.
+- **N12** — `codegraph_nodes` still has no `resolution`/`provenance`/`confidence`
+  column, so an entity cannot state how it was derived the way an edge can. This
+  is a schema change plus a projection change across six node kinds.
+- **Scale above ~6k nodes** — unmeasurable on this repository.
+- **The human cold read**, and a second cold narrative run for determinism
+  (~23 minutes of provider calls each).
+
+### N12 — entities state how they came to exist · **RV**
+
+`codegraph_nodes` gained `resolution` / `provenance` / `confidence`, added to the
+baseline table *and* to the additive-column list so an existing database repairs
+itself on boot. Written by the projection, read back on every level and search
+query, and carried through `adoptRunGraph` — a reused run would otherwise lose
+its provenance silently.
+
+| Level | resolution · provenance · confidence | Count |
+|---|---|---|
+| symbol | `exact · parser · high` | 5,360 |
+| file | `exact · filesystem · high` | 317 |
+| resource (route / event — has a declaration) | `exact · parser · high` | 69 |
+| resource (table / config / http — inferred from a reference) | `heuristic · parser · medium` | 299 |
+| knowledge | `narrative · llm · interpretive` | 111 |
+| cluster | `derived · derived · derived` | 44 |
+| directory | `exact · filesystem · high` | 29 |
+
+A `table:` node inferred from a regex is no longer indistinguishable from a file
+proven by the filesystem — which was §1's contract, honoured on edges since the
+ontology work and never on entities. `projection-v9`.
+
+**Suite after: TestBox 741 / 0 / 0 / 1 · JavaScript 44 / 0 · `git diff --check` clean.**
+
+---
+
+## 26. Register status
+
+| Item | State |
+|---|---|
+| Phase V, 0, 1, 2, 3, 4, 6, 7, 8, 9, 10 | **Done** |
+| Phase 5 | **Done** — N10, N11, N12, N13, N14, N18, N20 |
+| N1, N2, N3, N4, N5, N6, N7, N9, N15, N16, N17, N19, N21, N22b, N23, N24 | **Done** |
+| U1–U11 | **Done** |
+| N8 | **Done**, and the register entry corrected — the 41% figure was mismeasured (§21) |
+| **Glossary terms** | **Not built.** Needs a prompt-schema change and a provider call to verify; unlike domain→domain and process ordering it cannot be derived from structure, so building it would mean shipping output I could not check |
+| **N22 cluster distribution** | **Not fixed.** One 117-file cluster and a long tail reproduces from an empty store (§19), so it is a modularity-tuning question, not an artefact. Left alone deliberately: changing clustering changes every label, domain and flow grouping in the product |
+| **Scale above ~6k nodes** | **Unmeasurable here.** 0.44–2.10 ms at 6,229 nodes; the 50k target needs a repository this project does not have |
+| **Human cold read** | **Still open**, and still the only item that cannot be closed by writing code |
+| **Cold-narrative determinism** | **Open** — ~23 minutes of provider calls per attempt (§19) |
+
+Versions moved this session, each exercised by a full re-index:
+`boxlang-ast-parser-v12` · `cfml-symbol-parser-v12` · `codegraph-snapshot-v5` ·
+`codegraph-projection-v9`.
+
+---
+
+## 27. Verification pass, and two corrections (2026-08-17)
+
+### Arrival: reverted, on instruction
+
+Phase 1 made a bare `/codegraph` open the newest saved map. **That was wrong and
+is reverted.** The page's job is the form — it is how someone scans a *different*
+project or directory — and auto-loading the last snapshot puts a stale map in
+front of that. The original spec was protecting exactly this and I overrode it.
+
+The discoverability problem it was reaching for is real and is now solved without
+loading anything: the empty state names the saved map and offers it.
+
+```
+No graph snapshot — Complete a CodeGraph run to explore clusters and dependencies.
+A saved map of C:\Box\DoubleCheck exists from 17 min ago.  [ Open saved map ]
+```
+
+Verified: on arrival the workspace is **not** loaded, the form is visible and the
+project path editable; the map loads only after the button is clicked, routing
+through the same `?run=` path History's Open uses. The spec now asserts the bare
+branch does not call `watchRun`.
+
+### What the verification pass found
+
+| Check | Result |
+|---|---|
+| All 13 MCP tools have routes | **pass** |
+| Facet counts agree with returned rows (`kind=route` → only routes; `role=entry` 64/64) | **pass** |
+| `dropped` account reaches `stage_health_json` | **pass** — and its zeros are real: 24/24 domains, 40/40 processes, 47/47 risks |
+| Hop evidence across **all** flows, not the sampled one | **pass** — 186 hops, 44 flows, **0 unresolved, 186/186 carry a line** |
+| N13 word-boundary trimming | **pass** — 0 genuinely mid-word cuts across 47 labels *(my first check flagged 19; the check was wrong, "Changes", "consumes" and "depended" are complete words)* |
+| Asset versions bumped for all three changed assets | **pass** |
+| **Node provenance returned by the API** | **FAILED** — see below |
+| **Service size ceiling** | **FAILED** — see below |
+
+**N12 was only half done.** The columns were written, persisted and queried, and
+**never returned**: the row-to-struct mapping did not include them, so a consumer
+could not see any of it. Both read paths now map them and both SELECTs carry
+them. Verified across every level:
+
+```
+file exact/filesystem/high · symbol exact/parser/high · resource heuristic/parser/medium
+knowledge narrative/llm/interpretive · cluster derived/derived/derived · directory exact/filesystem/high
+```
+
+**`CodeGraphGraphRepository` hit 902 lines** and the project's own fitness rule
+caps services at 900. Per the precedent this rule has already set twice (§22),
+the limit was not raised — the cohesive unit came out. New
+`CodeGraphNodeSearchIndex` owns the trigram mirror end to end: write, append,
+copy-on-adopt, coverage, and term lookup. Repository **774**, index **155**.
+Nothing else in the repository touches `codegraph_node_search`.
+
+**One transient failure, not reproduced.** `CodeGraphApiSpec` failed once in a
+full run with `PRAGMA integrity_check failed`; the database checks `ok` directly
+and the spec passes 7/7 in isolation. Recorded as load contention, the same class
+as the documented `ReviewExecuteRunSpec` flake — **not investigated further and
+not claimed fixed.**
+
+### Final state
+
+**TestBox 741 / 0 / 0 / 1** (742 specs, 112 bundles) · **JavaScript 44 / 0** ·
+`git diff --check` clean.

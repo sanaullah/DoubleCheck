@@ -20,6 +20,7 @@ class threadsafe {
 	property name="datasource" inject="coldbox:setting:datasource";
 	property name="sqliteContentionRetry" inject="SqliteContentionRetry";
 	property name="completenessService" inject="CodeGraphCompletenessService";
+	property name="searchIndex" inject="CodeGraphNodeSearchIndex";
 
 	variables.levels = [ "cluster", "directory", "file", "symbol", "resource", "knowledge" ];
 	variables.insertChunkSize = 50;
@@ -56,7 +57,7 @@ class threadsafe {
 				queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runIdValue }, { datasource: datasource } );
 				insertNodes( runIdValue, nodeRows );
 				insertEdges( runIdValue, edgeRows );
-				indexNodesForSearch( runIdValue, nodeRows );
+				searchIndex.replaceFor( runIdValue, nodeRows );
 				// Stamped inside the same transaction as the rows it describes, so a
 				// half-written projection can never advertise itself as reusable.
 				queryExecute(
@@ -85,7 +86,7 @@ class threadsafe {
 			bx:transaction datasource="#datasource#" {
 				insertNodes( runIdValue, nodeRows );
 				insertEdges( runIdValue, edgeRows );
-				appendSearchIndex( runIdValue, nodeRows );
+				searchIndex.appendFor( runIdValue, nodeRows );
 			}
 		}, "codegraph-graph-append" );
 	}
@@ -101,7 +102,7 @@ class threadsafe {
 	 * parameter.
 	 */
 	private void function insertNodes( required string runId, required array rows ) {
-		var rowSql = "( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )";
+		var rowSql = "( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )";
 		var index = 1;
 		while ( index <= arguments.rows.len() ) {
 			var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
@@ -124,12 +125,19 @@ class threadsafe {
 				params.append( { value: val( node.fanIn ?: 0 ), sqltype: "INTEGER" } );
 				params.append( { value: val( node.fanOut ?: 0 ), sqltype: "INTEGER" } );
 				params.append( { value: val( node.hotspot ?: 0 ), sqltype: "DOUBLE" } );
+				// How this entity came to exist. Edges have carried these three since
+				// the ontology work; a node could not say whether it was read off the
+				// filesystem, matched by a parser, computed, or written by a model.
+				params.append( toString( node.resolution ?: "" ) );
+				params.append( toString( node.provenance ?: "" ) );
+				params.append( toString( node.confidence ?: "" ) );
 			}
 			queryExecute(
 				"
 					INSERT INTO codegraph_nodes (
 						run_id, node_id, level, parent_id, path, symbol_name, kind, role,
-						language, line, end_line, fan_in, fan_out, hotspot
+						language, line, end_line, fan_in, fan_out, hotspot,
+						resolution, provenance, confidence
 					) VALUES #placeholders.toList( ", " )#
 					-- Rows for the run are deleted first, so a conflict can only be a
 					-- duplicate id within one projection. Update rather than discard.
@@ -216,8 +224,8 @@ class threadsafe {
 				queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: targetRunId }, { datasource: datasource } );
 				queryExecute(
 					"
-						INSERT INTO codegraph_nodes ( run_id, node_id, level, parent_id, path, symbol_name, kind, role, language, line, end_line, fan_in, fan_out, hotspot )
-						SELECT :targetRunId, node_id, level, parent_id, path, symbol_name, kind, role, language, line, end_line, fan_in, fan_out, hotspot
+						INSERT INTO codegraph_nodes ( run_id, node_id, level, parent_id, path, symbol_name, kind, role, language, line, end_line, fan_in, fan_out, hotspot, resolution, provenance, confidence )
+						SELECT :targetRunId, node_id, level, parent_id, path, symbol_name, kind, role, language, line, end_line, fan_in, fan_out, hotspot, resolution, provenance, confidence
 						FROM codegraph_nodes WHERE run_id = :sourceRunId
 					",
 					{ sourceRunId: sourceRunId, targetRunId: targetRunId },
@@ -254,15 +262,7 @@ class threadsafe {
 	/** Mirror rows follow the nodes they describe when a run adopts a projection. */
 	private void function copySearchIndex( required string sourceRunId, required string targetRunId ) {
 		try {
-			queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
-			queryExecute(
-				"
-					INSERT INTO codegraph_node_search ( run_id, node_id, haystack )
-					SELECT :targetRunId, node_id, haystack FROM codegraph_node_search WHERE run_id = :sourceRunId
-				",
-				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
-				{ datasource: datasource }
-			);
+			searchIndex.copyRun( arguments.sourceRunId, arguments.targetRunId );
 		} catch ( any searchIndexError ) {
 		}
 	}
@@ -331,7 +331,7 @@ class threadsafe {
 		var records = queryExecute(
 			"
 				SELECT node_id, level, parent_id, path, symbol_name, kind, role, language,
-					line, end_line, fan_in, fan_out, hotspot
+					line, end_line, fan_in, fan_out, hotspot, resolution, provenance, confidence
 				FROM codegraph_nodes
 				WHERE run_id = :runId AND level = :level
 					AND ( :scope = '' OR parent_id = :scope )
@@ -363,7 +363,13 @@ class threadsafe {
 				endLine   : records.end_line[ row ],
 				fanIn     : records.fan_in[ row ],
 				fanOut    : records.fan_out[ row ],
-				hotspot   : records.hotspot[ row ]
+				hotspot   : records.hotspot[ row ],
+				// Persisting these and not returning them would leave the caller
+				// unable to tell an inferred entity from a proven one — which is the
+				// whole reason the columns exist.
+				resolution: records.resolution[ row ] ?: "",
+				provenance: records.provenance[ row ] ?: "",
+				confidence: records.confidence[ row ] ?: ""
 			} );
 		}
 		nodes.sort( ( a, b ) => compareNoCase( a.path & a.symbolName, b.path & b.symbolName ) );
@@ -411,15 +417,20 @@ class threadsafe {
 		// Escape LIKE wildcards so a term containing % or _ matches literally.
 		var like = "%" & escapeLike( lCase( term ) ) & "%";
 		var levelFilter = trim( toString( arguments.query.level ?: "" ) );
+		// `kind` and `role` were advertised in the query contract and silently
+		// ignored: an agent filtering by `kind=route` received every match and had
+		// no way to tell. They are real columns, so they are real predicates.
+		var kindFilter = lCase( trim( toString( arguments.query.kind ?: "" ) ) );
+		var roleFilter = lCase( trim( toString( arguments.query.role ?: "" ) ) );
 		// `LIKE '%term%'` cannot use an index, so this scanned every node row on
 		// each debounced keystroke. When the trigram index can serve the term, its
 		// hits narrow the row set; the LIKE predicate stays as the correctness
 		// backstop, so the answer is identical either way and a missing or stale
 		// index costs speed rather than truth.
-		var indexHits = len( term ) >= 3 ? searchIndexHits( arguments.runId, term ) : javacast( "null", "" );
+		var indexHits = len( term ) >= 3 ? searchIndex.hits( arguments.runId, term ) : javacast( "null", "" );
 		var useIndex = !isNull( indexHits ) && isArray( indexHits ) && indexHits.len() > 0;
 		var idClause = useIndex ? " AND node_id IN ( :ids )" : "";
-		var searchParams = { runId: arguments.runId, level: levelFilter, term: like };
+		var searchParams = { runId: arguments.runId, level: levelFilter, term: like, kindFilter: kindFilter, roleFilter: roleFilter };
 		if ( useIndex ) searchParams.ids = { value: arrayToList( indexHits, "," ), list: true };
 		if ( !isNull( indexHits ) && isArray( indexHits ) && !indexHits.len() ) {
 			return {
@@ -433,6 +444,8 @@ class threadsafe {
 				SELECT COUNT(*) AS total FROM codegraph_nodes
 				WHERE run_id = :runId
 					AND ( :level = '' OR level = :level )
+					AND ( :kindFilter = '' OR lower( kind ) = :kindFilter )
+					AND ( :roleFilter = '' OR lower( role ) = :roleFilter )
 					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
 					#idClause#
 			",
@@ -443,10 +456,13 @@ class threadsafe {
 		matchParams.matchLimit = { value: limit, sqltype: "INTEGER" };
 		var records = queryExecute(
 			"
-				SELECT node_id, level, parent_id, path, symbol_name, kind, role, line, fan_in, fan_out, hotspot
+				SELECT node_id, level, parent_id, path, symbol_name, kind, role, line, fan_in, fan_out, hotspot,
+					resolution, provenance, confidence
 				FROM codegraph_nodes
 				WHERE run_id = :runId
 					AND ( :level = '' OR level = :level )
+					AND ( :kindFilter = '' OR lower( kind ) = :kindFilter )
+					AND ( :roleFilter = '' OR lower( role ) = :roleFilter )
 					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
 					#idClause#
 				ORDER BY hotspot DESC, path ASC, symbol_name ASC
@@ -467,7 +483,10 @@ class threadsafe {
 				role      : records.role[ row ],
 				line      : records.line[ row ],
 				fanIn     : records.fan_in[ row ],
-				fanOut    : records.fan_out[ row ]
+				fanOut    : records.fan_out[ row ],
+				resolution: records.resolution[ row ] ?: "",
+				provenance: records.provenance[ row ] ?: "",
+				confidence: records.confidence[ row ] ?: ""
 			} );
 		}
 		var totalAvailable = val( available.total[ 1 ] ?: 0 );
@@ -584,7 +603,7 @@ class threadsafe {
 			var records = queryExecute(
 				"
 					SELECT node_id, level, parent_id, path, symbol_name, kind, role, language,
-						line, end_line, fan_in, fan_out, hotspot
+						line, end_line, fan_in, fan_out, hotspot, resolution, provenance, confidence
 					FROM codegraph_nodes
 					WHERE run_id = ? AND node_id IN ( #placeholders.toList( ", " )# )
 				",
@@ -705,108 +724,6 @@ class threadsafe {
 
 		// One chunk cannot see another's rows, so rank after merging, not per chunk.
 		return rankEdges( collected, arguments.limit );
-	}
-
-	/**
-	 * Mirror this run's nodes into the trigram search index.
-	 *
-	 * Trigram is the only FTS5 tokenizer that matches inside a token, which is
-	 * what searching code requires: `graphmet` has to find
-	 * `CodeGraphMetricsService`. Failure here is deliberately swallowed — the
-	 * index is an accelerator and `search` keeps its `LIKE` predicate, so a
-	 * missing index costs speed and never an answer.
-	 */
-	private void function indexNodesForSearch( required string runId, required array rows ) {
-		try {
-			queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: arguments.runId }, { datasource: datasource } );
-			appendSearchIndex( arguments.runId, arguments.rows );
-		} catch ( any searchIndexError ) {
-		}
-	}
-
-	/**
-	 * Mirror rows for nodes added after the first write.
-	 *
-	 * Kept separate from `indexNodesForSearch` because the coverage check compares
-	 * mirrored rows to stored nodes: an append that skipped the mirror would make
-	 * the index look stale and silently disable itself for the whole run.
-	 */
-	private void function appendSearchIndex( required string runId, required array rows ) {
-		try {
-			var index = 1;
-			while ( index <= arguments.rows.len() ) {
-				var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
-				var marks = [];
-				var params = [];
-				for ( var position = index; position <= last; position++ ) {
-					var node = arguments.rows[ position ];
-					marks.append( "( ?, ?, ? )" );
-					params.append( arguments.runId );
-					params.append( toString( node.id ) );
-					params.append( lCase( toString( node.path ?: "" ) & " " & toString( node.symbolName ?: "" ) & " " & toString( node.role ?: "" ) & " " & toString( node.kind ?: "" ) ) );
-				}
-				queryExecute(
-					"INSERT INTO codegraph_node_search ( run_id, node_id, haystack ) VALUES #marks.toList( ", " )#",
-					params,
-					{ datasource: datasource }
-				);
-				index = last + 1;
-			}
-		} catch ( any searchIndexError ) {
-		}
-	}
-
-	/**
-	 * Node ids matching the term, or null when the index cannot serve it.
-	 *
-	 * "Cannot serve it" has to include **the mirror not covering this run**, not
-	 * only FTS5 being absent. Runs indexed before the mirror shipped have nodes and
-	 * no mirrored rows, and an empty hit list there is indistinguishable from a
-	 * genuine no-match — which turned every historical run's search into a
-	 * confident "nothing matches". The index is a narrowing optimisation, so it is
-	 * used only when it demonstrably covers the run; otherwise the caller falls
-	 * back to the scan, which is slower and right.
-	 */
-	private any function searchIndexHits( required string runId, required string term ) {
-		try {
-			if ( !searchIndexCovers( arguments.runId ) ) return javacast( "null", "" );
-			var records = queryExecute(
-				"SELECT node_id FROM codegraph_node_search WHERE run_id = :runId AND haystack MATCH :term",
-				{ runId: arguments.runId, term: """" & replace( lCase( arguments.term ), """", """""", "all" ) & """" },
-				{ datasource: datasource }
-			);
-			var ids = [];
-			for ( var row = 1; row <= records.recordCount; row++ ) ids.append( records.node_id[ row ] );
-			return ids;
-		} catch ( any unavailable ) {
-			return javacast( "null", "" );
-		}
-	}
-
-	/**
-	 * Does the mirror hold a row for every node in this run?
-	 *
-	 * An exact count comparison rather than "are there any rows": a partially
-	 * written mirror narrows the scan to a subset and silently loses matches, which
-	 * is the same failure as an empty one with a smaller blast radius.
-	 */
-	private boolean function searchIndexCovers( required string runId ) {
-		try {
-			var mirrored = queryExecute(
-				"SELECT COUNT(*) AS total FROM codegraph_node_search WHERE run_id = :runId",
-				{ runId: arguments.runId },
-				{ datasource: datasource }
-			);
-			var stored = queryExecute(
-				"SELECT COUNT(*) AS total FROM codegraph_nodes WHERE run_id = :runId",
-				{ runId: arguments.runId },
-				{ datasource: datasource }
-			);
-			var mirroredCount = val( mirrored.total[ 1 ] ?: 0 );
-			return mirroredCount > 0 && mirroredCount == val( stored.total[ 1 ] ?: 0 );
-		} catch ( any unavailable ) {
-			return false;
-		}
 	}
 
 	/** The run's unresolved reference count, so every response can state it. */

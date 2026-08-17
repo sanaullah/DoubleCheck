@@ -1,0 +1,155 @@
+/**
+ * The trigram search mirror for `codegraph_nodes`.
+ *
+ * Split out of `CodeGraphGraphRepository`, which crossed the project's 900-line
+ * ceiling. This is the cohesive unit that came out: writing the mirror, deciding
+ * whether it covers a run, and answering a term from it. Nothing else in the
+ * repository touches `codegraph_node_search`.
+ *
+ * Trigram is the only FTS5 tokenizer that matches *inside* a token, which is the
+ * requirement for code search: `graphmet` has to find `CodeGraphMetricsService`.
+ * The default tokenizer cannot, which is why trigram was the only viable choice.
+ *
+ * Every failure here is deliberately swallowed. The index is an accelerator and
+ * `search` keeps its `LIKE` predicate as the correctness backstop, so a missing,
+ * stale or unavailable index costs speed and never an answer.
+ *
+ * @see CodeGraphGraphRepository
+ */
+@singleton
+class threadsafe {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	variables.insertChunkSize = 50;
+
+	/** Replace every mirrored row for a run. */
+	void function replaceFor( required string runId, required array rows ) {
+		try {
+			queryExecute(
+				"DELETE FROM codegraph_node_search WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			appendFor( arguments.runId, arguments.rows );
+		} catch ( any searchIndexError ) {
+		}
+	}
+
+	/**
+	 * Mirror rows for nodes added after the first write.
+	 *
+	 * Kept separate from `replaceFor` because the coverage check compares mirrored
+	 * rows to stored nodes: an append that skipped the mirror would make the index
+	 * look stale and silently disable itself for the whole run.
+	 */
+	void function appendFor( required string runId, required array rows ) {
+		try {
+			var index = 1;
+			while ( index <= arguments.rows.len() ) {
+				var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
+				var marks = [];
+				var params = [];
+				var idMarks = [];
+				var idParams = [ arguments.runId ];
+				for ( var position = index; position <= last; position++ ) {
+					var node = arguments.rows[ position ];
+					marks.append( "( ?, ?, ? )" );
+					params.append( arguments.runId );
+					params.append( toString( node.id ) );
+					params.append( lCase( toString( node.path ?: "" ) & " " & toString( node.symbolName ?: "" ) & " " & toString( node.role ?: "" ) & " " & toString( node.kind ?: "" ) ) );
+					idMarks.append( "?" );
+					idParams.append( toString( node.id ) );
+				}
+				// An append must be idempotent. It was not: projecting the same run
+				// twice — which the reuse path does when it re-runs the knowledge pass
+				// over an existing graph — mirrored those nodes again. The coverage
+				// check compares mirrored rows to stored nodes exactly, so the surplus
+				// made `covers()` false and **silently disabled the index for the whole
+				// run**. Measured: a first run matched 6,175/6,175 and used the index;
+				// an accumulated run held 6,275 mirror rows for 6,192 nodes — 83
+				// duplicates, exactly the knowledge node count — and fell back to the
+				// unindexed scan. Correct results either way, which is why nothing ever
+				// failed.
+				queryExecute(
+					"DELETE FROM codegraph_node_search WHERE run_id = ? AND node_id IN ( #idMarks.toList( ", " )# )",
+					idParams,
+					{ datasource: datasource }
+				);
+				queryExecute(
+					"INSERT INTO codegraph_node_search ( run_id, node_id, haystack ) VALUES #marks.toList( ", " )#",
+					params,
+					{ datasource: datasource }
+				);
+				index = last + 1;
+			}
+		} catch ( any searchIndexError ) {
+		}
+	}
+
+	/** Copy one run's mirror to another, for graph adoption. */
+	void function copyRun( required string sourceRunId, required string targetRunId ) {
+		queryExecute(
+			"DELETE FROM codegraph_node_search WHERE run_id = :runId",
+			{ runId: arguments.targetRunId },
+			{ datasource: datasource }
+		);
+		queryExecute(
+			"
+				INSERT INTO codegraph_node_search ( run_id, node_id, haystack )
+				SELECT :targetRunId, node_id, haystack FROM codegraph_node_search WHERE run_id = :sourceRunId
+			",
+			{ targetRunId: arguments.targetRunId, sourceRunId: arguments.sourceRunId },
+			{ datasource: datasource }
+		);
+	}
+
+	/**
+	 * Node ids matching the term, or null when the index cannot serve it.
+	 *
+	 * Null and an empty array mean different things and the caller depends on the
+	 * difference: null is "ask the database directly", empty is "nothing matched".
+	 * Returning empty for an uncovered run is how `/search` once answered
+	 * `matches: []` for 39 of 42 stored runs.
+	 */
+	any function hits( required string runId, required string term ) {
+		try {
+			if ( !covers( arguments.runId ) ) return javacast( "null", "" );
+			var records = queryExecute(
+				"SELECT node_id FROM codegraph_node_search WHERE run_id = :runId AND haystack MATCH :term",
+				{ runId: arguments.runId, term: """" & replace( lCase( arguments.term ), """", """""", "all" ) & """" },
+				{ datasource: datasource }
+			);
+			var ids = [];
+			for ( var row = 1; row <= records.recordCount; row++ ) ids.append( records.node_id[ row ] );
+			return ids;
+		} catch ( any unavailable ) {
+			return javacast( "null", "" );
+		}
+	}
+
+	/**
+	 * Does the mirror hold a row for every node in this run?
+	 *
+	 * An exact count comparison rather than "are there any rows": a partially
+	 * written mirror narrows the scan to a subset and silently loses matches, which
+	 * is the same failure as an empty one with a smaller blast radius.
+	 */
+	boolean function covers( required string runId ) {
+		try {
+			var mirrored = queryExecute(
+				"SELECT COUNT(*) AS total FROM codegraph_node_search WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			var stored = queryExecute(
+				"SELECT COUNT(*) AS total FROM codegraph_nodes WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			var mirroredCount = val( mirrored.total[ 1 ] ?: 0 );
+			return mirroredCount > 0 && mirroredCount == val( stored.total[ 1 ] ?: 0 );
+		} catch ( any unavailable ) {
+			return false;
+		}
+	}
+}

@@ -254,6 +254,17 @@ class threadsafe {
 		return javacast( "null", "" );
 	}
 
+	/**
+	 * Test seam for `resolveTargets`.
+	 *
+	 * Resolution decides what every edge in the graph points at, and it had two
+	 * defects that were only ever visible by running a full index and reading the
+	 * result. A seam is cheaper than a re-index and makes the rules assertable.
+	 */
+	void function resolveTargetsForTesting( required array symbols, required array dependencies, array files = [] ) {
+		resolveTargets( arguments.symbols, arguments.dependencies, arguments.files );
+	}
+
 	private void function resolveTargets( required array symbols, required array dependencies, array files = [] ) {
 		var typeFiles = {};
 		var propertiesByLocation = {};
@@ -266,9 +277,19 @@ class threadsafe {
 		// with no edge at all. Local resolution is the half of the problem that is
 		// cheap and certain — the callee is in the same file or it is not.
 		var localCallables = {};
+		// name → every file declaring a type of that name. `typeFiles` keeps only the
+		// last writer, so an ambiguous name resolved to whichever file happened to be
+		// parsed last and the edge carried no hint that a choice had been made.
+		// Measured on this repository: 14% of distinct symbol names are declared in
+		// more than one file (`run` in 116, `init` in 47), and 260 of 628 cross-file
+		// bare-name edges — 41% — named one of them.
+		var typeCandidates = {};
 		for ( var item in arguments.symbols ) {
 			if ( listFindNoCase( "class,interface", item.kind ) ) {
-				typeFiles[ normalizeTarget( item.name ) ] = item.filePath;
+				var typeKey = normalizeTarget( item.name );
+				typeFiles[ typeKey ] = item.filePath;
+				if ( !typeCandidates.keyExists( typeKey ) ) typeCandidates[ typeKey ] = [];
+				if ( !typeCandidates[ typeKey ].contains( item.filePath ) ) typeCandidates[ typeKey ].append( item.filePath );
 			}
 			if ( item.kind == "property" ) {
 				propertiesByLocation[ "#item.filePath#:#item.line#" ] = item.name;
@@ -302,6 +323,22 @@ class threadsafe {
 			}
 		}
 
+		// Which type names each file gives independent evidence of knowing about:
+		// it imports one, injects one, constructs one, extends one, or declares a
+		// parameter of that type. A bare receiver is only a type reference if the
+		// file shows some other sign of using that type.
+		//
+		// Without this, `if ( !flight.count() )` — where `flight` is a local struct —
+		// bound to `app/modules/aiFlight/handlers/Flight.bx` purely because a class
+		// of that name exists somewhere in the project, and became one of this
+		// repository's two architecture-rule violations. Neither violation was real.
+		var corroborated = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( !listFindNoCase( "imports,injects,constructs,extends,implements,type-reference", edge.kind ) ) continue;
+			var referenced = normalizeTarget( edge.target ?: "" );
+			if ( len( referenced ) ) corroborated[ "#edge.sourceFile#:#referenced#" ] = true;
+		}
+
 		for ( var edge in arguments.dependencies ) {
 			var targetFile = edge.keyExists( "targetFile" ) ? edge.targetFile : "";
 			if ( edge.kind == "renders" && !len( targetFile ) ) {
@@ -319,19 +356,29 @@ class threadsafe {
 				var receiver = listFirst( edge.target, "." );
 				var aliasKey = "#edge.sourceFile#:#lCase( receiver )#";
 				if ( aliases.keyExists( aliasKey ) ) {
+					// An injected property whose type resolved: this is evidence, not a
+					// name match, so it binds without corroboration.
 					targetFile = aliases[ aliasKey ];
+				} else if ( corroborated.keyExists( "#edge.sourceFile#:#normalizeTarget( receiver )#" ) ) {
+					targetFile = resolveTypeFile( receiver, typeFiles, typeCandidates );
+					edge.candidateCount = candidateCountFor( receiver, typeCandidates );
 				} else {
-					targetFile = resolveTypeFile( receiver, typeFiles );
+					// A receiver naming a type this file never imports, injects,
+					// constructs or extends is far more often a local variable. Left
+					// unresolved and counted, rather than bound to a same-named file.
+					edge.candidateCount = candidateCountFor( receiver, typeCandidates );
 				}
 				// Tried last of the three, so a receiver that names a real type still
 				// wins: `orderService.save()` is a call into another file even if this
 				// file also declares a `save`.
 				if ( !len( targetFile ) && localCallables.keyExists( "#edge.sourceFile#:#localCallName( edge.target )#" ) ) {
 					targetFile = edge.sourceFile;
+					edge.candidateCount = 1;
 				}
 			}
 			if ( !len( targetFile ) ) {
-				targetFile = resolveTypeFile( edge.target, typeFiles );
+				targetFile = resolveTypeFile( edge.target, typeFiles, typeCandidates );
+				if ( !edge.keyExists( "candidateCount" ) ) edge.candidateCount = candidateCountFor( edge.target, typeCandidates );
 			}
 			edge.targetFile = targetFile;
 		}
@@ -539,10 +586,32 @@ class threadsafe {
 		return index;
 	}
 
-	private string function resolveTypeFile( required string target, required struct typeFiles ) {
+	/**
+	 * The file declaring this type, or "" when that cannot be decided.
+	 *
+	 * An ambiguous name — declared in more than one file — resolves to nothing.
+	 * It used to resolve to whichever file was parsed last, silently, and the edge
+	 * was stored looking exactly like an unambiguous one. A guess presented as a
+	 * fact is the failure mode this register keeps recording; an unresolved
+	 * reference with a candidate count is a result the reader can act on.
+	 */
+	private string function resolveTypeFile(
+		required string target,
+		required struct typeFiles,
+		struct typeCandidates = {}
+	) {
 		if ( isExternalType( arguments.target ) ) return "";
 		var normalized = normalizeTarget( arguments.target );
-		return arguments.typeFiles.keyExists( normalized ) ? arguments.typeFiles[ normalized ] : "";
+		if ( !arguments.typeFiles.keyExists( normalized ) ) return "";
+		if ( candidateCountFor( arguments.target, arguments.typeCandidates ) > 1 ) return "";
+		return arguments.typeFiles[ normalized ];
+	}
+
+	/** How many files declare a type of this name; 0 when unknown. */
+	private numeric function candidateCountFor( required string target, required struct typeCandidates ) {
+		var normalized = normalizeTarget( arguments.target );
+		if ( !arguments.typeCandidates.keyExists( normalized ) ) return 0;
+		return arguments.typeCandidates[ normalized ].len();
 	}
 
 	/**
