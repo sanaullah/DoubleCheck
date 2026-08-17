@@ -220,8 +220,11 @@ run still completes; do not treat deterministic labels as business meaning.
 | Graph | Symbols + dependencies, routes, views, tables, HTTP/schedule resources; coupling metrics reuse Modernize services |
 | Roles | Per-node evidence-backed `entry` / `client` / `integration` / `orchestrator` / `domain` / `persistence` / `view` / `shared` / `test` legend, rendered from snapshot counts. Legend chips filter: one click dims every other role on the canvas and lists that role's files |
 | Flows | Route- and browser-seeded bounded paths in snapshot `flows[]`; each hop names the **symbol that owns the edge** (`OrderHandler.index`) or says file level; one flow per (entry, sink) with `variantCount`, selected for sink coverage rather than path depth |
-| Levels | The run is stored as rows in `codegraph_nodes` / `codegraph_edges` at `cluster` / `directory` / `file` / `symbol`, linked by `parentId`. `GET /codegraph/graph?level=&scope=` serves one level; `GET /codegraph/search?q=` finds nodes — including symbols — that the canvas never drew |
-| Completeness | Every capped collection reports `{ returned, available, omitted, rankedBy }`, and the UI prints it ("20,000 of 40,911 dependencies loaded — kept by edge kind, then file path"). Node truncation now keeps the most connected files instead of the alphabetically first |
+| Levels | The run is stored as rows in `codegraph_nodes` / `codegraph_edges` at `cluster` / `directory` / `file` / `symbol` / `resource` / `knowledge`, linked by `parentId`. `GET /codegraph/graph?level=&scope=` serves one level; `GET /codegraph/search?q=` finds nodes — including symbols — that the canvas never drew |
+| Resources | Routes, tables, configuration keys, events and outbound integrations are their own level, not files. Each carries its participants: who declares a route and which handler serves it, who reads a table and who writes it, which files read a setting |
+| Knowledge | With AI, domains, processes and risks are stored as nodes with `describes` / `affects` edges to the structure they explain, so "which risks touch this file" is a query. Every knowledge edge is marked `resolution: narrative`, `provenance: llm` — it is never evidence |
+| Completeness | Every capped collection reports `{ returned, available, omitted, rankedBy, complete, state }`, plus `unresolved` (run-level, with `unresolvedScope`) and `unsupported` — the behaviour static analysis cannot prove. The UI prints the loaded/available counts and names any relationship kind that produced nothing. Node truncation keeps the most connected files, not the alphabetically first |
+| Query surface | `GET /codegraph/neighbours` (what calls this, what it calls), `/hierarchy` (extends / implements), `/lineage?table=` (readers and writers), `/impact?node=` (transitive callers, depth-bounded), `/onboarding` (where to start reading), `/diff?base=` (run over run), `/rules` (architecture fitness with violation evidence), `/mcp` (the same surface described as MCP tools) |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
 | Issues | Cycles, orphans, layer violations, hotspot ranking, reachability gaps |
 | Explorer | Hand-rolled SVG UMD (`codegraph-layout.js`); cluster / layer / swimlane / radial layouts; pan/zoom |
@@ -317,8 +320,15 @@ passed; otherwise it reports the registry default with `measured: false`.
 | Language | Registry default | Promoted to | On what |
 |---|---|---|---|
 | BoxLang | `unverified` | `parsed-dependency-aware` | `resources/evaluation-corpus/v1` passing its precision / recall / F1 / citation thresholds |
-| ColdFusion | `discovery-only` | — | no corpus yet, so the tier cannot rise regardless of shipped depth |
-| JavaScript | `discovery-only` | — | no corpus yet |
+| ColdFusion | `discovery-only` | — | **graph** structure is now scored by `codegraph-v1/cases/cfml-invoice-flow` (routes, renders, table read/write, full route→table path). That corpus deliberately does not promote a tier: the review corpus is what promotes, and ColdFusion still has none |
+| JavaScript | `discovery-only` | — | participates in both CodeGraph corpus cases through the `fetch` → route → handler → table path; no review corpus |
+
+**What the CodeGraph corpus found.** It was added because self-analysis on a
+BoxLang repository cannot show that ColdFusion produces a weaker graph. On its
+first run it showed exactly that: `routes` and `renders` could never fire — a
+literal backspace byte sat where `` was intended in both patterns — and table
+access never split into reads and writes, so `/lineage` could not say who writes
+a table in a ColdFusion project. All three are fixed and scored.
 
 Do not raise a tier here by intention. Add a corpus, run the gate, and let the
 promotion happen — the `measured` flag is what makes the claim honest.

@@ -15,6 +15,7 @@
 @singleton
 class threadsafe {
 	property name="datasource" inject="coldbox:setting:datasource";
+	property name="completenessService" inject="CodeGraphCompletenessService";
 
 	/**
 	 * Everything pointing at a node, and everything it points at.
@@ -36,7 +37,7 @@ class threadsafe {
 			node        : nodeId,
 			incoming    : incoming,
 			outgoing    : outgoing,
-			completeness: countedAccount( total, "weight" )
+			completeness: countedAccount( total, "weight", arguments.runId )
 		};
 	}
 
@@ -81,7 +82,7 @@ class threadsafe {
 			node        : nodeId,
 			ancestors   : ancestors,
 			descendants : descendants,
-			completeness: countedAccount( ancestors.len() + descendants.len(), "kind" )
+			completeness: countedAccount( ancestors.len() + descendants.len(), "kind", arguments.runId )
 		};
 	}
 
@@ -94,17 +95,22 @@ class threadsafe {
 	struct function lineage( required string runId, required struct query ) {
 		var table = lCase( trim( toString( arguments.query.table ?: "" ) ) );
 		if ( !len( table ) ) return { table: "", readers: [], writers: [], completeness: emptyAccount() };
-		var target = left( table, 6 ) == "table:" ? table : "table:" & table;
+		// Accept `orders`, `table:orders` or the stored id. The stored id carries a
+		// level prefix, and matching only the bare form is how this returned nothing
+		// for every table in the repository while the rows sat one prefix away.
+		var bare = left( table, 6 ) == "table:" ? table : "table:" & table;
+		if ( left( bare, 9 ) == "resource:" ) bare = mid( bare, 10, len( bare ) );
+		var target = "resource:" & bare;
 		var records = queryExecute(
 			"
 				SELECT DISTINCT e.from_node, e.group_kind, n.path
 				FROM codegraph_edges e
 				LEFT JOIN codegraph_nodes n ON n.run_id = e.run_id AND n.node_id = e.from_node
-				WHERE e.run_id = :runId AND e.to_node = :target
+				WHERE e.run_id = :runId AND e.to_node IN ( :target, :bare )
 					AND e.group_kind IN ( 'table-read', 'table-write', 'table-query' )
 				ORDER BY e.group_kind, e.from_node
 			",
-			{ runId: arguments.runId, target: target },
+			{ runId: arguments.runId, target: target, bare: bare },
 			{ datasource: datasource }
 		);
 		var readers = [];
@@ -122,7 +128,7 @@ class threadsafe {
 			table       : target,
 			readers     : readers,
 			writers     : writers,
-			completeness: countedAccount( readers.len() + writers.len(), "kind" )
+			completeness: countedAccount( readers.len() + writers.len(), "kind", arguments.runId )
 		};
 	}
 
@@ -173,30 +179,59 @@ class threadsafe {
 			node        : nodeId,
 			impacted    : impacted,
 			depth       : maxDepth,
-			completeness: {
-				returned : impacted.len(),
-				available: impacted.len(),
-				omitted  : 0,
-				rankedBy : "depth",
-				complete : !frontier.len(),
-				state    : !impacted.len() ? "empty" : ( frontier.len() ? "truncated" : "complete" )
-			}
+			completeness: completeness().queryAccount(
+				impacted.len(),
+				impacted.len(),
+				"depth",
+				unresolvedFor( arguments.runId ),
+				!impacted.len() ? "empty" : ( frontier.len() ? "truncated" : "complete" )
+			)
 		};
 	}
 
 	private struct function emptyAccount() {
-		return { returned: 0, available: 0, omitted: 0, rankedBy: "", complete: false, state: "empty" };
+		return completeness().queryAccount( 0, 0, "", 0, "empty" );
 	}
 
-	private struct function countedAccount( required numeric total, required string rankedBy ) {
-		return {
-			returned : arguments.total,
-			available: arguments.total,
-			omitted  : 0,
-			rankedBy : arguments.rankedBy,
-			complete : arguments.total > 0,
-			state    : arguments.total == 0 ? "empty" : "complete"
-		};
+	private struct function countedAccount(
+		required numeric total,
+		required string rankedBy,
+		string runId = ""
+	) {
+		return completeness().queryAccount(
+			arguments.total,
+			arguments.total,
+			arguments.rankedBy,
+			unresolvedFor( arguments.runId )
+		);
+	}
+
+	/**
+	 * The run's unresolved reference count, or 0 when it was never recorded.
+	 *
+	 * One primary-key lookup. Runs indexed before the column existed report 0,
+	 * which is why the account names the scope rather than implying the graph is
+	 * whole.
+	 */
+	private numeric function unresolvedFor( required string runId ) {
+		if ( !len( trim( arguments.runId ) ) ) return 0;
+		try {
+			var record = queryExecute(
+				"SELECT unresolved_count FROM codegraph_snapshots WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			return record.recordCount ? val( record.unresolved_count[ 1 ] ?: 0 ) : 0;
+		} catch ( any unavailable ) {
+			return 0;
+		}
+	}
+
+	private any function completeness() {
+		if ( isNull( variables.completenessService ?: javacast( "null", "" ) ) ) {
+			variables.completenessService = new app.models.services.CodeGraphCompletenessService();
+		}
+		return variables.completenessService;
 	}
 
 	/** One direction of a node's edges, with the far endpoint's path resolved. */

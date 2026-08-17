@@ -1,0 +1,209 @@
+/**
+ * Scores the CodeGraph corpus: does the graph find the routes, tables, flows and
+ * bounded paths a known fixture is built to contain?
+ *
+ * The scoring existed only inside `CodeGraphCorpusSpec`, so the corpus could go
+ * green in the suite and still never appear in `evaluation_gate_runs` — every one
+ * of the 5,418 recorded gate rows belonged to the *review* corpus. A capability
+ * with no recorded measurement has no trend and cannot be pointed at.
+ *
+ * Deliberately source-backed: parser dispatch, target resolution, metric and flow
+ * assembly and bounded path traversal all run before a threshold is checked, so
+ * this measures the pipeline rather than a fixture of its output.
+ *
+ * This corpus **does not promote a language tier** — that is the review corpus's
+ * job. It measures graph fidelity per language, which is a different claim.
+ *
+ * @see QualityGateService
+ * @see CodeGraphMetricsService
+ */
+@singleton
+class threadsafe {
+
+	/** Manifest plus a score per case. */
+	struct function evaluate( required string corpusRoot, boolean reverseFileOrder = false ) {
+		var manifest = jsonDeserialize( fileRead( arguments.corpusRoot & "/manifest.json", "UTF-8" ) );
+		var results = [];
+		var passed = true;
+		var thresholds = manifest.thresholds ?: {};
+		for ( var corpusCase in manifest.cases ) {
+			var scored = scoreCase( arguments.corpusRoot, corpusCase, arguments.reverseFileOrder );
+			var failures = [];
+			for ( var route in ( corpusCase.expected.routes ?: [] ) ) {
+				if ( !scored.routes.contains( route ) ) failures.append( "#corpusCase.id#: route not found — #route#" );
+			}
+			for ( var table in ( corpusCase.expected.tables ?: [] ) ) {
+				if ( !scored.tables.contains( table ) ) failures.append( "#corpusCase.id#: table not found — #table#" );
+			}
+			if ( scored.flowRecall < val( thresholds.flowRecall ?: 1 ) ) failures.append( "#corpusCase.id#: flow recall #scored.flowRecall#" );
+			if ( scored.pathRecall < val( thresholds.pathRecall ?: 1 ) ) failures.append( "#corpusCase.id#: path recall #scored.pathRecall#" );
+			results.append( {
+				id      : corpusCase.id,
+				language: corpusCase.language ?: "unknown",
+				passed  : !failures.len(),
+				metrics : { flowRecall: scored.flowRecall, pathRecall: scored.pathRecall, routes: scored.routes.len(), tables: scored.tables.len() },
+				failures: failures,
+				score   : scored
+			} );
+			passed = passed && !failures.len();
+		}
+		return {
+			version             : manifest.version ?: "codegraph-corpus-v1",
+			corpusKind          : manifest.corpusKind ?: "codegraph",
+			promotesLanguageTier: manifest.promotesLanguageTier ?: false,
+			thresholds          : thresholds,
+			cases               : results,
+			passed              : passed
+		};
+	}
+
+	/** One case, indexed from source and measured. */
+	struct function scoreCase(
+		required string corpusRoot,
+		required struct corpusCase,
+		boolean reverseFileOrder = false
+	) {
+		var caseRoot = new java:java.io.File( arguments.corpusRoot & "/" & arguments.corpusCase.root ).getCanonicalFile();
+		var files = readCaseFiles( caseRoot );
+		if ( arguments.reverseFileOrder ) {
+			var reversed = [];
+			for ( var index = files.len(); index >= 1; index-- ) reversed.append( files[ index ] );
+			files = reversed;
+		}
+
+		var capture = { files: [] };
+		var indexer = new app.models.services.ArchitectureIndexService();
+		indexer.boxLangParserService = new app.models.services.BoxLangParserService();
+		indexer.boxLangParserService.codegraphParserStrategy = "regex";
+		indexer.cfmlParserService = new app.models.services.CfmlParserService();
+		indexer.javaScriptParserService = new app.models.services.JavaScriptParserService();
+		indexer.graphRepository = {
+			findCached      : ( contentHash, parserVersion ) => javacast( "null", "" ),
+			saveCached      : ( contentHash, parserVersion, language, parsed ) => {},
+			findBaselineGraph: ( runId, limit ) => { return { runId: "", symbols: [], dependencies: [] }; },
+			replaceRunGraph : ( runId, parsedFiles, impacts, metrics ) => { capture.files = parsedFiles; }
+		};
+		indexer.index( "codegraph-corpus", files );
+
+		var symbols = [];
+		var dependencies = [];
+		for ( var parsedFile in capture.files ) {
+			for ( var symbol in parsedFile.symbols ) {
+				var symbolCopy = duplicate( symbol );
+				symbolCopy.filePath = parsedFile.filePath;
+				symbols.append( symbolCopy );
+			}
+			for ( var dependency in parsedFile.dependencies ) {
+				var dependencyCopy = duplicate( dependency );
+				dependencyCopy.sourceFile = parsedFile.filePath;
+				dependencies.append( dependencyCopy );
+			}
+		}
+		var reviewGraph = { files: files, symbols: symbols, dependencies: dependencies };
+		var metrics = new app.models.services.CodeGraphMetricsService();
+		var snapshot = metrics.assemble( reviewGraph, { maxFlowsPerCluster: 8, flowMaxDepth: 6 } );
+
+		var domains = [];
+		for ( var cluster in ( snapshot.clusters ?: [] ) ) domains.append( cluster.label ?: cluster.id );
+		domains.sort( ( a, b ) => compareNoCase( a, b ) );
+
+		var routeSet = [];
+		var tableSet = [];
+		for ( var node in ( snapshot.nodes ?: [] ) ) {
+			var nodeId = lCase( toString( node.id ?: "" ) );
+			if ( left( nodeId, 6 ) == "route:" ) routeSet.append( replace( nodeId, "route:", "", "one" ) );
+			if ( left( nodeId, 6 ) == "table:" ) tableSet.append( replace( nodeId, "table:", "", "one" ) );
+		}
+
+		return {
+			fingerprint    : snapshot.fingerprint,
+			domains        : domains,
+			domainSignature: jsonSerialize( domains ),
+			routes         : routeSet,
+			tables         : tableSet,
+			flowRecall     : flowRecall( snapshot, arguments.corpusCase ),
+			pathRecall     : pathRecall( reviewGraph, arguments.corpusCase )
+		};
+	}
+
+	private array function readCaseFiles( required any caseRoot ) {
+		var files = [];
+		var listing = directoryList( arguments.caseRoot.getPath(), true, "query" );
+		for ( var row = 1; row <= listing.recordCount; row++ ) {
+			if ( lCase( listing.type[ row ] ?: "" ) != "file" ) continue;
+			var absoluteFile = new java:java.io.File( listing.directory[ row ] & new java:java.io.File( "" ).separator & listing.name[ row ] ).getCanonicalFile();
+			var relativePath = replace( arguments.caseRoot.toPath().relativize( absoluteFile.toPath() ).toString(), "\", "/", "all" );
+			var extension = lCase( listLast( relativePath, "." ) );
+			if ( !listFindNoCase( "bx,bxm,bxs,cfm,cfc,js,jsx", extension ) ) continue;
+			var content = fileRead( absoluteFile.getPath(), "UTF-8" );
+			var lines = listToArray( replace( content, char( 13 ), "", "all" ), char( 10 ), true, true );
+			files.append( {
+				filePath   : relativePath,
+				language   : languageFor( extension ),
+				lines      : lines,
+				lineCount  : lines.len(),
+				content    : content,
+				contentHash: lCase( hash( content, "SHA-256" ) )
+			} );
+		}
+		files.sort( ( a, b ) => compareNoCase( a.filePath, b.filePath ) );
+		return files;
+	}
+
+	private numeric function flowRecall( required struct snapshot, required struct corpusCase ) {
+		var matches = 0;
+		var expectedFlows = arguments.corpusCase.expected.flows ?: [];
+		for ( var expectedFlow in expectedFlows ) {
+			for ( var flow in ( arguments.snapshot.flows ?: [] ) ) {
+				var steps = duplicate( flow.steps ?: [] );
+				steps.insertAt( 1, flow.entryFile ?: "" );
+				var lowered = steps.map( ( item ) => lCase( toString( item ) ) );
+				if ( lowered.contains( lCase( expectedFlow.from ) ) && lowered.contains( lCase( expectedFlow.to ) ) ) {
+					matches++;
+					break;
+				}
+			}
+		}
+		return matches / max( 1, expectedFlows.len() );
+	}
+
+	private numeric function pathRecall( required struct reviewGraph, required struct corpusCase ) {
+		var pathService = new app.models.services.CodeGraphRunService();
+		pathService.graphRepository = { getGraph: ( runId, resultLimit ) => reviewGraph };
+		pathService.codegraphMaxEdges = 20000;
+		pathService.codegraphMaxSymbols = 20000;
+		pathService.codegraphPathMaxResults = 3;
+		pathService.codegraphPathMaxExploredNodes = 5000;
+		pathService.codegraphPathMaxDepth = 12;
+		var matches = 0;
+		var expectedPaths = arguments.corpusCase.expected.paths ?: [];
+		for ( var expectedPath in expectedPaths ) {
+			var pathResult = pathService.paths( "codegraph-corpus", { from: expectedPath.from, to: expectedPath.to, limit: 3, depth: 12 } );
+			for ( var candidate in ( pathResult.paths ?: [] ) ) {
+				var kinds = candidate.hops.map( ( hop ) => lCase( toString( hop.kind ?: "" ) ) );
+				var endpointsMatch = candidate.hops.len()
+					&& lCase( candidate.hops[ 1 ].from ) == lCase( expectedPath.from )
+					&& lCase( candidate.hops[ candidate.hops.len() ].to ) == lCase( expectedPath.to );
+				if ( endpointsMatch && startsWithKinds( kinds, expectedPath.requiredKinds ?: [] ) ) {
+					matches++;
+					break;
+				}
+			}
+		}
+		return matches / max( 1, expectedPaths.len() );
+	}
+
+	private string function languageFor( required string extension ) {
+		if ( listFindNoCase( "bx,bxm,bxs", arguments.extension ) ) return "BoxLang";
+		if ( listFindNoCase( "js,jsx", arguments.extension ) ) return "JavaScript";
+		return "CFML";
+	}
+
+	private boolean function startsWithKinds( required array actual, required array expected ) {
+		if ( arguments.expected.len() > arguments.actual.len() ) return false;
+		for ( var index = 1; index <= arguments.expected.len(); index++ ) {
+			if ( lCase( toString( arguments.actual[ index ] ?: "" ) ) != lCase( toString( arguments.expected[ index ] ?: "" ) ) ) return false;
+		}
+		return true;
+	}
+}

@@ -1,0 +1,98 @@
+/**
+ * Writes a run's levelled rows, and decides when a previous run's can be reused.
+ *
+ * Split out of `CodeGraphRunService` when the knowledge pass pushed that class
+ * past the project's 900-line ceiling. The split is not arbitrary: the run
+ * service orchestrates stages and reports progress, while this owns one
+ * question — *what does this run's graph storage contain, and did we have to
+ * compute it?* Both passes answer it, so both live here.
+ *
+ * Neither pass may fail a run. The snapshot is already durable by the time these
+ * are called, so a projection failure costs drill-down and a knowledge failure
+ * costs meaning; both are reported as stage health rather than raised.
+ *
+ * @see CodeGraphProjectionService
+ * @see CodeGraphGraphRepository
+ */
+@singleton
+class threadsafe {
+	property name="graphProjectionService" inject="CodeGraphProjectionService";
+	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
+
+	/**
+	 * The structural graph: clusters, directories, files, symbols and resources.
+	 *
+	 * Reuse requires an identical snapshot fingerprint **and** an identical
+	 * projection build. The fingerprint covers every input the projection reads;
+	 * it cannot see what the projection does with them, so without the version a
+	 * changed projection against an unchanged repository silently copies the
+	 * previous build's rows.
+	 */
+	struct function projectStructure(
+		required string runId,
+		required struct snapshot,
+		required struct reviewGraph
+	) {
+		if ( !configured() ) {
+			return { summary: "levelled graph unavailable in this configuration", health: { ok: false, nodes: 0, edges: 0, reason: "not-configured" } };
+		}
+		try {
+			var projectionVersion = graphProjectionService.getVersion();
+			var fingerprint = trim( toString( arguments.snapshot.fingerprint ?: "" ) );
+			if ( len( fingerprint ) ) {
+				var source = codeGraphGraphRepository.findProjectionSource( fingerprint, arguments.runId, projectionVersion );
+				if ( len( source ) && codeGraphGraphRepository.reuseGraphFrom( source, arguments.runId ) ) {
+					return {
+						summary: "levelled graph reused from an identical snapshot",
+						health : { ok: true, nodes: 0, edges: 0, reason: "reused" }
+					};
+				}
+			}
+			var projected = graphProjectionService.project( arguments.snapshot, arguments.reviewGraph );
+			codeGraphGraphRepository.replaceGraph( arguments.runId, projected.nodes, projected.edges, projectionVersion );
+			return {
+				summary: "#projected.nodes.len()# graph nodes, #projected.edges.len()# graph edges",
+				health : { ok: true, nodes: projected.nodes.len(), edges: projected.edges.len(), reason: "" }
+			};
+		} catch ( any projectionError ) {
+			// Structure is already durable; drill-down degrades rather than the run.
+			// The reason is persisted with the snapshot: after the run finishes a
+			// transient progress message is the only other place it existed.
+			return {
+				summary: "levelled graph unavailable: ##projectionError.message##",
+				health : { ok: false, nodes: 0, edges: 0, reason: projectionError.message }
+			};
+		}
+	}
+
+	/**
+	 * The knowledge layer: domains, processes and risks as nodes and edges.
+	 *
+	 * Appended rather than replaced, because it runs after the narrative resolves
+	 * and the structural rows are already in place. A run without a provider takes
+	 * the "no narrative" branch and keeps its structural graph, which is the
+	 * no-key contract.
+	 */
+	struct function projectKnowledge(
+		required string runId,
+		required struct snapshot,
+		required any narrative
+	) {
+		if ( !configured() || !isStruct( arguments.narrative ) || !( arguments.narrative.used ?: false ) ) {
+			return { ok: true, nodes: 0, edges: 0, reason: "no narrative" };
+		}
+		try {
+			var knowledge = graphProjectionService.projectKnowledge( arguments.snapshot, arguments.narrative );
+			codeGraphGraphRepository.appendGraph( arguments.runId, knowledge.nodes, knowledge.edges );
+			return { ok: true, nodes: knowledge.nodes.len(), edges: knowledge.edges.len(), reason: "" };
+		} catch ( any knowledgeError ) {
+			return { ok: false, nodes: 0, edges: 0, reason: knowledgeError.message };
+		}
+	}
+
+	/** Specs and small local callers construct with `new`, which skips injection. */
+	private boolean function configured() {
+		return !isNull( variables.graphProjectionService ?: javacast( "null", "" ) )
+			&& !isNull( variables.codeGraphGraphRepository ?: javacast( "null", "" ) );
+	}
+}

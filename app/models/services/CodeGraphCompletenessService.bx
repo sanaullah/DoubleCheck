@@ -33,6 +33,53 @@ class threadsafe {
 		return ranked;
 	}
 
+	/**
+	 * Behaviour a symbol index cannot prove, whatever the cap is set to.
+	 *
+	 * Carried on every query response because "we returned nothing" and "this
+	 * cannot be answered by static analysis" are different answers, and only one
+	 * of them is fixed by a bigger limit or a rebuild.
+	 */
+	array function unsupported() {
+		return [ "dynamic component construction", "reflection", "runtime wiring", "dynamic SQL" ];
+	}
+
+	/**
+	 * The account a *query* response carries, as distinct from a snapshot's.
+	 *
+	 * `unresolved` is a run-level figure — references the parsers could not bind —
+	 * not a per-query one, and is labelled `unresolvedScope` so a caller cannot
+	 * mistake it for "unresolved within this result". Reporting it as 0 when it is
+	 * unknown would be the same lie as omitting it.
+	 */
+	struct function queryAccount(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy,
+		numeric unresolved = 0,
+		string state = ""
+	) {
+		var returnedCount = val( arguments.returned );
+		var availableCount = val( arguments.available );
+		var resolvedState = len( trim( arguments.state ) )
+			? arguments.state
+			: ( availableCount == 0 ? "empty" : ( availableCount <= returnedCount ? "complete" : "truncated" ) );
+		return {
+			returned      : returnedCount,
+			available     : availableCount,
+			omitted       : max( 0, availableCount - returnedCount ),
+			rankedBy      : arguments.rankedBy,
+			// The state is authoritative. Deriving `complete` from the counts as well
+			// let a caller that knew its traversal had been cut still be reported
+			// complete, because the rows it did return were all the rows it had.
+			complete      : resolvedState == "complete",
+			state         : resolvedState,
+			unresolved    : val( arguments.unresolved ),
+			unresolvedScope: "run",
+			unsupported   : unsupported()
+		};
+	}
+
 	/** One collection's account. */
 	struct function entry(
 		required numeric returned,

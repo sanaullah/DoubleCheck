@@ -259,6 +259,13 @@ class threadsafe {
 		var propertiesByLocation = {};
 		var routeFiles = {};
 		var viewFiles = {};
+		// Callables declared in each file, for resolving a call that names no
+		// receiver. Without it an unqualified `myHelper()` could only be matched
+		// against *type* names, so every within-file call in the repository stayed
+		// unresolved: 0 same-file dependencies out of 3,310, and 78% of functions
+		// with no edge at all. Local resolution is the half of the problem that is
+		// cheap and certain — the callee is in the same file or it is not.
+		var localCallables = {};
 		for ( var item in arguments.symbols ) {
 			if ( listFindNoCase( "class,interface", item.kind ) ) {
 				typeFiles[ normalizeTarget( item.name ) ] = item.filePath;
@@ -268,6 +275,9 @@ class threadsafe {
 			}
 			if ( item.kind == "route" ) {
 				routeFiles[ normalizeRoute( item.name ) ] = item.filePath;
+			}
+			if ( listFindNoCase( "function,handler-action,lifecycle-hook,test", item.kind ) ) {
+				localCallables[ "#item.filePath#:#lCase( trim( item.name ) )#" ] = true;
 			}
 		}
 		for ( var file in arguments.files ) {
@@ -312,6 +322,12 @@ class threadsafe {
 					targetFile = aliases[ aliasKey ];
 				} else {
 					targetFile = resolveTypeFile( receiver, typeFiles );
+				}
+				// Tried last of the three, so a receiver that names a real type still
+				// wins: `orderService.save()` is a call into another file even if this
+				// file also declares a `save`.
+				if ( !len( targetFile ) && localCallables.keyExists( "#edge.sourceFile#:#localCallName( edge.target )#" ) ) {
+					targetFile = edge.sourceFile;
 				}
 			}
 			if ( !len( targetFile ) ) {
@@ -517,8 +533,51 @@ class threadsafe {
 	}
 
 	private string function resolveTypeFile( required string target, required struct typeFiles ) {
+		if ( isExternalType( arguments.target ) ) return "";
 		var normalized = normalizeTarget( arguments.target );
 		return arguments.typeFiles.keyExists( normalized ) ? arguments.typeFiles[ normalized ] : "";
+	}
+
+	/**
+	 * Does this dotted name belong to a framework or the JDK rather than the repo?
+	 *
+	 * Resolution matches on the **leaf** of a dotted path, so
+	 * `coldbox.system.web.routing.Router` matched any file in the project named
+	 * `Router.bx` — and produced the repository's only `extends` edge, pointing at
+	 * an unrelated fixture and stored `resolution: exact, confidence: high`. A
+	 * wrong edge labelled proven is worse than a missing one, so a name rooted in a
+	 * known external namespace resolves to nothing and is reported unresolved.
+	 *
+	 * Deliberately a namespace-root test, not a path check: only the first segment
+	 * identifies the owner, and a project class may legitimately share a leaf name
+	 * with a framework one.
+	 */
+	private boolean function isExternalType( required string target ) {
+		var value = trim( listFirst( toString( arguments.target ), "@" ) );
+		if ( !find( ".", value ) ) return false;
+		// Framework and JDK roots only. `com` / `org` / `net` are deliberately absent:
+		// a project may root its own code there, and suppressing a real match costs
+		// more than the rare vendor-jar false positive this would also catch.
+		return listFindNoCase(
+			"coldbox,testbox,wirebox,logbox,cachebox,cbsecurity,java,javax,jakarta,sun",
+			listFirst( value, "." )
+		) > 0;
+	}
+
+	/**
+	 * The function name a call names, once the scope prefix is removed.
+	 *
+	 * `save()`, `this.save()` and `variables.save()` are the same callee. Anything
+	 * with a different receiver is not a local call and returns a name that cannot
+	 * match, rather than a wrong one.
+	 */
+	private string function localCallName( required any target ) {
+		var value = lCase( trim( toString( arguments.target ?: "" ) ) );
+		if ( !find( ".", value ) ) return value;
+		var receiver = listFirst( value, "." );
+		// A name no symbol can carry, so a non-local receiver cannot accidentally
+		// match a same-file callable.
+		return listFindNoCase( "this,variables", receiver ) && listLen( value, "." ) == 2 ? listLast( value, "." ) : "##not-a-local-call##";
 	}
 
 	private string function normalizeTarget( required string target ) {

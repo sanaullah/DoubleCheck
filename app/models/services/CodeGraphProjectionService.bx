@@ -18,6 +18,21 @@
 @singleton
 class threadsafe {
 
+	/**
+	 * Move this whenever the projection's **output shape** changes.
+	 *
+	 * The snapshot fingerprint covers what the projection reads, not what it does
+	 * with it, so a changed projection against an unchanged repository produces an
+	 * identical fingerprint — and the reuse path then copies the previous build's
+	 * rows. That failure has already been recorded three times against the parse
+	 * cache; this is the same mistake one layer down, with its own version.
+	 */
+	variables.projectionVersion = "codegraph-projection-v3";
+
+	string function getVersion() {
+		return variables.projectionVersion;
+	}
+
 	struct function project( required struct snapshot, required struct reviewGraph ) {
 		var nodes = [];
 		var edges = [];
@@ -103,10 +118,37 @@ class threadsafe {
 			} );
 		}
 
+		// A route, table, setting or event is not a file, and storing it as one made
+		// the file level 52% non-code and self-certifying as complete. They get
+		// their own level; the ids stay derived from the entity, not its position.
+		var resourceNodeIds = {};
+		for ( var node in ( arguments.snapshot.nodes ?: [] ) ) {
+			if ( !isStruct( node ) ) continue;
+			var rawId = trim( toString( node.id ?: node.path ?: "" ) );
+			if ( !isResourceId( rawId ) ) continue;
+			var resourceId = "resource:" & lCase( rawId );
+			resourceNodeIds[ lCase( rawId ) ] = resourceId;
+			appendNode( {
+				id        : resourceId,
+				level     : "resource",
+				parentId  : "",
+				path      : rawId,
+				symbolName: listRest( rawId, ":" ),
+				kind      : lCase( listFirst( rawId, ":" ) ),
+				role      : trim( toString( node.role ?: "" ) ),
+				language  : "",
+				line      : 0,
+				endLine   : 0,
+				fanIn     : val( node.fanIn ?: 0 ),
+				fanOut    : val( node.fanOut ?: 0 ),
+				hotspot   : val( node.hotspotScore ?: 0 )
+			} );
+		}
+
 		for ( var node in ( arguments.snapshot.nodes ?: [] ) ) {
 			if ( !isStruct( node ) ) continue;
 			var filePath = normalizePath( node.path ?: node.id ?: "" );
-			if ( !len( filePath ) ) continue;
+			if ( !len( filePath ) || isResourceId( trim( toString( node.id ?: node.path ?: "" ) ) ) ) continue;
 			var fileId = "file:" & filePath;
 			fileNodeIds[ filePath ] = fileId;
 			// A file's parent is its cluster when it has one, so drilling a domain
@@ -188,12 +230,49 @@ class threadsafe {
 			if ( !isStruct( dep ) ) continue;
 			var fromFile = normalizePath( dep.sourceFile ?: "" );
 			var toFile = normalizePath( dep.targetFile ?: "" );
-			if ( !fileNodeIds.keyExists( fromFile ) || !fileNodeIds.keyExists( toFile ) || fromFile == toFile ) continue;
 			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+
+			// A dependency on a table, setting, route, event or remote host has no
+			// target *file*, so requiring one dropped every such relationship at
+			// projection: the entities were stored as nodes nothing pointed at, and
+			// `/lineage`, `/neighbours` and the MCP tools answered "empty" for
+			// questions the snapshot could already answer.
+			if ( !fileNodeIds.keyExists( toFile ) && fileNodeIds.keyExists( fromFile ) ) {
+				var resourceKey = lCase( syntheticNodeBuilder().resourceId( dep ) );
+				if ( !len( resourceKey ) || !resourceNodeIds.keyExists( resourceKey ) ) continue;
+				var resourceTo = resourceNodeIds[ resourceKey ];
+				var resourceFrom = fileNodeIds[ fromFile ];
+				appendResourceEdge( edges, edgeSeen, resourceFrom, resourceTo, kind, dep );
+				var resourceSymbolId = trim( toString( dep.sourceSymbolId ?: "" ) );
+				if ( len( resourceSymbolId ) && symbolIdByKey.keyExists( resourceSymbolId ) ) {
+					appendResourceEdge( edges, edgeSeen, symbolIdByKey[ resourceSymbolId ], resourceTo, kind, dep );
+				}
+				continue;
+			}
+
+			if ( !fileNodeIds.keyExists( fromFile ) || !fileNodeIds.keyExists( toFile ) ) continue;
 			var fileFrom = fileNodeIds[ fromFile ];
 			var fileTo = fileNodeIds[ toFile ];
+			// A file depending on itself is not a relationship anyone can act on, so
+			// it stays out of the file level — but the *symbols* inside it do call
+			// each other, and dropping the row here is what kept the call graph
+			// cross-file only. Fall through to the symbol pass instead of skipping.
+			var sameFile = fromFile == toFile;
+
+			// A `routes` or `calls-api` row resolves to the handling *file*, so the
+			// route itself was bypassed: 51 route nodes with no edge, and the entity
+			// every flow starts at could not be asked what declares or serves it.
+			// Route the relationship through the entity as well as around it.
+			var throughResource = lCase( syntheticNodeBuilder().resourceId( dep ) );
+			if ( len( throughResource ) && resourceNodeIds.keyExists( throughResource ) && listFindNoCase( "routes,calls-api", kind ) ) {
+				var viaNode = resourceNodeIds[ throughResource ];
+				appendResourceEdge( edges, edgeSeen, fileFrom, viaNode, kind == "routes" ? "declares" : kind, dep );
+				// A route "handled by" the file that declared it is the declaration
+				// read twice, not a second fact.
+				if ( !sameFile ) appendResourceEdge( edges, edgeSeen, viaNode, fileTo, "routes-to", dep );
+			}
 			var fileKey = fileFrom & "|" & fileTo & "|" & kind;
-			if ( !edgeSeen.keyExists( fileKey ) ) {
+			if ( !sameFile && !edgeSeen.keyExists( fileKey ) ) {
 				edgeSeen[ fileKey ] = true;
 				edges.append( {
 					id         : edgeId( "file", fileFrom, fileTo, kind ),
@@ -259,7 +338,242 @@ class threadsafe {
 			node.hotspot = node.fanIn + ( 0.5 * node.fanOut );
 		}
 
+		appendDirectoryEdges( nodes, edges, directorySeen );
+
 		return { nodes: nodes, edges: edges };
+	}
+
+	/**
+	 * Project the narrative into knowledge nodes and edges.
+	 *
+	 * The meaning layer was prose keyed to ids inside one JSON blob: readable, and
+	 * not a graph. Nothing could ask "which risks touch this file", "what is this
+	 * cluster for" or "which domain owns this process" without downloading the
+	 * narrative and re-implementing the joins in the caller.
+	 *
+	 * Every knowledge node points at a structural node that already exists — the
+	 * normalizer has already discarded any id the snapshot does not contain — so
+	 * this cannot invent structure, which is the §1 contract. It only attaches.
+	 *
+	 * Run as a second pass because the narrative resolves after the projection, and
+	 * because a run without a provider must still get the structural graph.
+	 */
+	struct function projectKnowledge( required struct snapshot, required struct narrative ) {
+		var nodes = [];
+		var edges = [];
+		var seen = {};
+		var appendKnowledge = ( id, kind, label, text, targets ) => {
+			if ( seen.keyExists( id ) || !targets.len() ) return;
+			seen[ id ] = true;
+			nodes.append( {
+				id        : id,
+				level     : "knowledge",
+				parentId  : targets[ 1 ],
+				path      : label,
+				symbolName: label,
+				kind      : kind,
+				role      : "knowledge",
+				language  : "",
+				line      : 0,
+				endLine   : 0,
+				fanIn     : 0,
+				fanOut    : targets.len(),
+				hotspot   : 0
+			} );
+			for ( var target in targets ) {
+				edges.append( {
+					id         : edgeId( "knowledge", id, target, kind == "risk" ? "affects" : "describes" ),
+					level      : "knowledge",
+					from       : id,
+					to         : target,
+					groupKind  : kind == "risk" ? "affects" : "describes",
+					kinds      : [ kind == "risk" ? "affects" : "describes" ],
+					occurrences: 1,
+					weight     : 1,
+					// An LLM sentence about proven structure is neither parsed nor
+					// derived from parsing. Saying so on the edge is what keeps the
+					// knowledge layer from reading as evidence.
+					resolution : "narrative",
+					provenance : "llm",
+					confidence : "interpretive",
+					line       : 0,
+					evidence   : left( text, 500 )
+				} );
+			}
+		};
+
+		for ( var domain in ( arguments.narrative.domains ?: [] ) ) {
+			if ( !isStruct( domain ) ) continue;
+			var clusterId = trim( toString( domain.clusterId ?: "" ) );
+			if ( !len( clusterId ) ) continue;
+			appendKnowledge(
+				"knowledge:domain:" & lCase( clusterId ),
+				"domain",
+				trim( toString( domain.title ?: clusterId ) ),
+				trim( toString( domain.text ?: "" ) ),
+				[ "cluster:" & clusterId ]
+			);
+		}
+
+		// A process is named by a flow, and a flow already knows every file it
+		// touches — so the knowledge node attaches to all of them and "which
+		// processes run through this file" becomes one query.
+		var flowsById = {};
+		for ( var flow in ( arguments.snapshot.flows ?: [] ) ) {
+			if ( isStruct( flow ) && len( trim( toString( flow.id ?: "" ) ) ) ) flowsById[ trim( toString( flow.id ) ) ] = flow;
+		}
+		for ( var process in ( arguments.narrative.processes ?: [] ) ) {
+			if ( !isStruct( process ) ) continue;
+			var flowId = trim( toString( process.flowId ?: "" ) );
+			if ( !flowsById.keyExists( flowId ) ) continue;
+			appendKnowledge(
+				"knowledge:process:" & lCase( flowId ),
+				"process",
+				trim( toString( process.title ?: flowId ) ),
+				trim( toString( process.text ?: "" ) ),
+				flowTargets( flowsById[ flowId ] )
+			);
+		}
+
+		for ( var risk in ( arguments.narrative.risk ?: [] ) ) {
+			if ( !isStruct( risk ) ) continue;
+			var refId = trim( toString( risk.refId ?: "" ) );
+			if ( !len( refId ) ) continue;
+			appendKnowledge(
+				"knowledge:risk:" & lCase( refId ),
+				"risk",
+				left( trim( toString( risk.text ?: refId ) ), 120 ),
+				trim( toString( risk.text ?: "" ) ),
+				[ "file:" & normalizePath( refId ) ]
+			);
+		}
+
+		return { nodes: nodes, edges: edges };
+	}
+
+	/** Every structural node a flow passes through, as projected node ids. */
+	private array function flowTargets( required struct flow ) {
+		var targets = [];
+		var seen = {};
+		var steps = duplicate( arguments.flow.steps ?: [] );
+		steps.insertAt( 1, arguments.flow.entryFile ?: "" );
+		for ( var step in steps ) {
+			var raw = trim( toString( step ?: "" ) );
+			if ( !len( raw ) ) continue;
+			var id = isResourceId( raw ) ? "resource:" & lCase( raw ) : "file:" & normalizePath( raw );
+			if ( seen.keyExists( id ) ) continue;
+			seen[ id ] = true;
+			targets.append( id );
+		}
+		return targets;
+	}
+
+	/**
+	 * Roll file dependencies up into directory-to-directory edges.
+	 *
+	 * The directory level existed as 62 parented boxes with no relationships at
+	 * all, and reported itself complete — a drill step that shows structure and
+	 * hides every dependency crossing it. Weight is the number of distinct file
+	 * edges behind the roll-up, so a thick line means many files, not one busy
+	 * pair. A directory's edge to itself is omitted: internal coupling is what the
+	 * level below is for.
+	 */
+	private void function appendDirectoryEdges(
+		required array nodes,
+		required array edges,
+		required struct directorySeen
+	) {
+		var directoryOfFile = {};
+		for ( var node in arguments.nodes ) {
+			if ( node.level != "file" ) continue;
+			var dirPath = normalizePath( node.path );
+			dirPath = find( "/", dirPath ) ? left( dirPath, len( dirPath ) - len( listLast( dirPath, "/" ) ) - 1 ) : "";
+			if ( len( dirPath ) && arguments.directorySeen.keyExists( dirPath ) ) {
+				directoryOfFile[ node.id ] = arguments.directorySeen[ dirPath ];
+			}
+		}
+		var rolled = {};
+		for ( var edge in arguments.edges ) {
+			if ( edge.level != "file" ) continue;
+			var from = directoryOfFile[ edge.from ] ?: "";
+			var to = directoryOfFile[ edge.to ] ?: "";
+			if ( !len( from ) || !len( to ) || from == to ) continue;
+			var key = from & "|" & to & "|" & edge.groupKind;
+			if ( !rolled.keyExists( key ) ) {
+				rolled[ key ] = { from: from, to: to, kind: edge.groupKind, count: 0, line: 0, evidence: "" };
+			}
+			rolled[ key ].count++;
+		}
+		var keys = structKeyArray( rolled );
+		keys.sort( ( a, b ) => compareNoCase( a, b ) );
+		for ( var key in keys ) {
+			var roll = rolled[ key ];
+			arguments.edges.append( {
+				id         : edgeId( "directory", roll.from, roll.to, roll.kind ),
+				level      : "directory",
+				from       : roll.from,
+				to         : roll.to,
+				groupKind  : roll.kind,
+				kinds      : [ roll.kind ],
+				occurrences: roll.count,
+				weight     : roll.count,
+				// Derived from file edges rather than read from source, so it carries
+				// the resolution of a roll-up and not of a parsed line.
+				resolution : "derived",
+				provenance : "derived",
+				confidence : "derived",
+				line       : 0,
+				evidence   : roll.count & " file dependencies"
+			} );
+		}
+	}
+
+	/** Is this snapshot node one of the non-file entities? */
+	private boolean function isResourceId( required string id ) {
+		var prefix = lCase( listFirst( arguments.id, ":" ) );
+		return find( ":", arguments.id ) > 0 && listFindNoCase( "route,table,config,event,http,schedule", prefix ) > 0;
+	}
+
+	/**
+	 * One file-or-symbol → resource edge.
+	 *
+	 * Stored at `level: "resource"` because its endpoints sit at different levels,
+	 * and a level-homogeneous reader would otherwise return an edge to a node it
+	 * did not also return.
+	 */
+	private void function appendResourceEdge(
+		required array edges,
+		required struct edgeSeen,
+		required string from,
+		required string to,
+		required string kind,
+		required struct dep
+	) {
+		var key = arguments.from & "|" & arguments.to & "|" & arguments.kind;
+		if ( arguments.edgeSeen.keyExists( key ) ) return;
+		arguments.edgeSeen[ key ] = true;
+		arguments.edges.append( {
+			id         : edgeId( "resource", arguments.from, arguments.to, arguments.kind ),
+			level      : "resource",
+			from       : arguments.from,
+			to         : arguments.to,
+			groupKind  : arguments.kind,
+			kinds      : [ arguments.kind ],
+			occurrences: 1,
+			weight     : 1,
+			resolution : resolutionOf( arguments.kind ),
+			provenance : "parser",
+			confidence : confidenceOf( arguments.kind ),
+			line       : val( arguments.dep.line ?: 0 ),
+			evidence   : trim( toString( arguments.dep.evidence ?: "" ) )
+		} );
+	}
+
+	private any function syntheticNodeBuilder() {
+		if ( isNull( variables.syntheticNodes ?: javacast( "null", "" ) ) ) {
+			variables.syntheticNodes = new app.models.services.SyntheticNodeBuilder();
+		}
+		return variables.syntheticNodes;
 	}
 
 	/**
@@ -271,12 +585,16 @@ class threadsafe {
 	 * unresolved dependencies are excluded upstream and reported as a count.
 	 */
 	private string function resolutionOf( required string kind ) {
-		return listFindNoCase( "extends,implements,routes,renders,includes,imports", arguments.kind ) ? "exact" : "heuristic";
+		return listFindNoCase( "extends,implements,routes,routes-to,declares,renders,includes,imports", arguments.kind ) ? "exact" : "heuristic";
 	}
 
 	private string function confidenceOf( required string kind ) {
-		if ( listFindNoCase( "extends,implements,routes,renders,includes,imports", arguments.kind ) ) return "high";
-		if ( listFindNoCase( "injects,constructs,type-reference,tests", arguments.kind ) ) return "medium";
+		if ( listFindNoCase( "extends,implements,routes,routes-to,declares,renders,includes,imports", arguments.kind ) ) return "high";
+		// A table name, setting key or event name is read from a literal in the
+		// source, so the *name* is not a guess — only its binding to a real table or
+		// listener is. That is better evidence than a receiver-type match and worse
+		// than a declaration, which is exactly what medium is for.
+		if ( listFindNoCase( "injects,constructs,type-reference,tests,table-read,table-write,table-query,reads-config,emits,http,schedule,calls-api", arguments.kind ) ) return "medium";
 		return "low";
 	}
 

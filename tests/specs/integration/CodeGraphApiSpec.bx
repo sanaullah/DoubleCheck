@@ -485,6 +485,100 @@ class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
 					var badLevel = this.get( "/api/v1/runs/#runId#/codegraph/graph", { level: "galaxy" } );
 					expect( badLevel.getRenderData().statusCode ?: 0 ).toBe( 422 );
 				} finally {
+					queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: runId } );
+					queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: runId } );
+					queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runId } );
+					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );
+				}
+			} );
+
+			it( "still finds nodes when the search index does not cover the run", () => {
+				// A run indexed before the FTS mirror existed has nodes and no mirrored
+				// rows. Narrowing to zero index hits made every such run answer "nothing
+				// matches" — the defect the LIKE backstop was supposed to make
+				// impossible. The index may only ever change how many rows are examined.
+				var marker = lCase( createUUID() );
+				var runId = "codegraph-unmirrored-#marker#";
+				var nowValue = dateTimeFormat( now(), "iso" );
+				var fixtureRoot = expandPath( "/tests/../resources/evaluation-corpus/codegraph-v1/cases/order-flow" );
+				try {
+					getInstance( "ReviewRunRepository" ).create( {
+						id          : runId,
+						tenantId    : "default",
+						projectId   : "default",
+						projectPath : fixtureRoot,
+						mode        : "full",
+						runKind     : "codegraph",
+						input       : { version: "codegraph-input-v1" },
+						baseRevision: "",
+						headRevision: "HEAD",
+						status      : "succeeded",
+						progress    : 100,
+						currentPhase: "completed",
+						message     : "CodeGraph unmirrored search fixture",
+						policy      : { version: "codegraph-input-v1", runKind: "codegraph" },
+						budgets     : {},
+						createdAt   : nowValue,
+						updatedAt   : nowValue
+					} );
+					// `hasIndexedGraph` gates every structural endpoint, so the review
+					// graph has to exist before the levelled rows are worth writing.
+					var seedSource = "class {" & char( 10 ) & "function place() {" & char( 10 ) & "orderRepository.save();" & char( 10 ) & "}" & char( 10 ) & "}";
+					getInstance( "ArchitectureIndexService" ).index( runId, [ {
+						filePath   : "app/OrderService.bx",
+						contentHash: lCase( hash( seedSource & marker, "SHA-256" ) ),
+						language   : "BoxLang",
+						content    : seedSource,
+						lines      : listToArray( seedSource, char( 10 ), true, true )
+					} ] );
+					getInstance( "CodeGraphGraphRepository" ).replaceGraph(
+						runId,
+						[
+							{
+								id      : "file:app/OrderService.bx",
+								level   : "file",
+								parentId: "",
+								path    : "app/OrderService.bx",
+								symbolName: "",
+								kind    : "application-models",
+								role    : "domain",
+								language: "BoxLang",
+								line    : 0,
+								endLine : 0,
+								fanIn   : 1,
+								fanOut  : 0,
+								hotspot : 3
+							}
+						],
+						[]
+					);
+
+					var mirrored = queryExecute(
+						"SELECT COUNT(*) AS total FROM codegraph_node_search WHERE run_id = :runId",
+						{ runId: runId }
+					);
+					expect( val( mirrored.total[ 1 ] ?: 0 ) ).toBeGT( 0, "replaceGraph must mirror rows for a fresh run" );
+
+					// Reproduce a pre-mirror run exactly: nodes present, index empty.
+					queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: runId } );
+
+					// `orderservice` is a mid-identifier term, so it exercises the trigram
+					// path rather than a prefix the default tokenizer would also serve.
+					var found = this.get( "/api/v1/runs/#runId#/codegraph/search", { q: "orderservice" } );
+					expect( found.getResponse() ).toHaveStatus( 200 );
+					var body = jsonDeserialize( found.getRenderedContent() );
+					expect( body.data.matches ).notToBeEmpty( "an uncovered index must fall back to the scan, not answer empty" );
+					expect( body.data.completeness.available ).toBe( 1 );
+					expect( body.data.completeness.state ).toBe( "complete" );
+
+					// A term genuinely absent still answers empty, so the fallback did not
+					// simply disable the predicate.
+					var absent = this.get( "/api/v1/runs/#runId#/codegraph/search", { q: "zzzabsentzzz" } );
+					var absentBody = jsonDeserialize( absent.getRenderedContent() );
+					expect( absentBody.data.matches ).toBeEmpty();
+					expect( absentBody.data.completeness.state ).toBe( "empty" );
+				} finally {
+					queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: runId } );
 					queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: runId } );
 					queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runId } );
 					queryExecute( "DELETE FROM review_runs WHERE id = :runId", { runId: runId } );

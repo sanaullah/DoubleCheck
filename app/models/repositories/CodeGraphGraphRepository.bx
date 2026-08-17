@@ -2,9 +2,14 @@
  * Row storage for the CodeGraph knowledge graph.
  *
  * The snapshot blob answers "show me everything you kept"; these tables answer
- * "show me this part of the graph". Levels are `cluster`, `directory`, `file`
- * and `symbol`, linked by `parent_id`, so drilling at any depth is one indexed
- * self-join rather than a full download filtered in the browser.
+ * "show me this part of the graph". Levels are `cluster`, `directory`, `file`,
+ * `symbol` and `resource`, linked by `parent_id`, so drilling at any depth is one
+ * indexed self-join rather than a full download filtered in the browser.
+ *
+ * `resource` holds the entities that are not files — routes, tables,
+ * configuration keys, events and outbound integrations. It is the one level whose
+ * edges cross levels by design (a file or a symbol reaches a table), so it reads
+ * edges *touching* its nodes and returns the far endpoints alongside them.
  *
  * @see CodeGraphRepository
  * @see CodeGraphMetricsService
@@ -14,8 +19,9 @@
 class threadsafe {
 	property name="datasource" inject="coldbox:setting:datasource";
 	property name="sqliteContentionRetry" inject="SqliteContentionRetry";
+	property name="completenessService" inject="CodeGraphCompletenessService";
 
-	variables.levels = [ "cluster", "directory", "file", "symbol" ];
+	variables.levels = [ "cluster", "directory", "file", "symbol", "resource", "knowledge" ];
 	variables.insertChunkSize = 50;
 	// The allowlist and the SQL fragment are the same structure, so an unlisted
 	// rank cannot reach the ORDER BY clause even if the guard above it moves.
@@ -32,12 +38,18 @@ class threadsafe {
 	 * for the write. A failure here leaves the snapshot usable and the deeper
 	 * levels unavailable, which the read path reports rather than hides.
 	 */
-	void function replaceGraph( required string runId, required array nodes, required array edges ) {
+	void function replaceGraph(
+		required string runId,
+		required array nodes,
+		required array edges,
+		string projectionVersion = ""
+	) {
 		// Bind before the closure: inside an arrow function `arguments` is the
 		// closure's own empty scope, not this method's.
 		var runIdValue = arguments.runId;
 		var nodeRows = arguments.nodes;
 		var edgeRows = arguments.edges;
+		var versionValue = arguments.projectionVersion;
 		withSqliteRetry( () => {
 			bx:transaction datasource="#datasource#" {
 				queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: runIdValue }, { datasource: datasource } );
@@ -45,8 +57,37 @@ class threadsafe {
 				insertNodes( runIdValue, nodeRows );
 				insertEdges( runIdValue, edgeRows );
 				indexNodesForSearch( runIdValue, nodeRows );
+				// Stamped inside the same transaction as the rows it describes, so a
+				// half-written projection can never advertise itself as reusable.
+				queryExecute(
+					"UPDATE codegraph_snapshots SET projection_version = :version WHERE run_id = :runId",
+					{ version: versionValue, runId: runIdValue },
+					{ datasource: datasource }
+				);
 			}
 		}, "codegraph-graph-write" );
+	}
+
+	/**
+	 * Add rows to an existing projection without disturbing it.
+	 *
+	 * The knowledge layer is projected in a second pass, because the narrative
+	 * resolves after the structural graph is already durable and a run without a
+	 * provider must still get that graph. Append rather than replace so a failed or
+	 * absent narrative can never cost the structure.
+	 */
+	void function appendGraph( required string runId, required array nodes, required array edges ) {
+		if ( !arguments.nodes.len() && !arguments.edges.len() ) return;
+		var runIdValue = arguments.runId;
+		var nodeRows = arguments.nodes;
+		var edgeRows = arguments.edges;
+		withSqliteRetry( () => {
+			bx:transaction datasource="#datasource#" {
+				insertNodes( runIdValue, nodeRows );
+				insertEdges( runIdValue, edgeRows );
+				appendSearchIndex( runIdValue, nodeRows );
+			}
+		}, "codegraph-graph-append" );
 	}
 
 	/**
@@ -191,24 +232,65 @@ class threadsafe {
 					{ sourceRunId: sourceRunId, targetRunId: targetRunId },
 					{ datasource: datasource }
 				);
+				// The search mirror is part of the projection, not a side effect of it.
+				// Copying rows without it leaves the adopting run with nodes the index
+				// does not cover — which is exactly the state that made search answer
+				// "nothing matches" for historical runs.
+				copySearchIndex( sourceRunId, targetRunId );
+				queryExecute(
+					"
+						UPDATE codegraph_snapshots
+						SET projection_version = COALESCE( ( SELECT projection_version FROM codegraph_snapshots WHERE run_id = :sourceRunId ), '' )
+						WHERE run_id = :targetRunId
+					",
+					{ sourceRunId: sourceRunId, targetRunId: targetRunId },
+					{ datasource: datasource }
+				);
 			}
 		}, "codegraph-graph-reuse" );
 		return true;
 	}
 
+	/** Mirror rows follow the nodes they describe when a run adopts a projection. */
+	private void function copySearchIndex( required string sourceRunId, required string targetRunId ) {
+		try {
+			queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute(
+				"
+					INSERT INTO codegraph_node_search ( run_id, node_id, haystack )
+					SELECT :targetRunId, node_id, haystack FROM codegraph_node_search WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+		} catch ( any searchIndexError ) {
+		}
+	}
+
 	/** The newest run whose snapshot carries this fingerprint, if any. */
-	string function findProjectionSource( required string fingerprint, required string excludeRunId ) {
+	string function findProjectionSource(
+		required string fingerprint,
+		required string excludeRunId,
+		string projectionVersion = ""
+	) {
 		if ( !len( trim( arguments.fingerprint ) ) ) return "";
+		// Same inputs *and* same projection build. Matching on the fingerprint alone
+		// makes every projection change invisible on a repository that has not moved.
 		var record = queryExecute(
 			"
 				SELECT s.run_id
 				FROM codegraph_snapshots s
 				WHERE s.fingerprint = :fingerprint AND s.run_id <> :excludeRunId
+					AND s.projection_version = :projectionVersion
 					AND EXISTS ( SELECT 1 FROM codegraph_nodes n WHERE n.run_id = s.run_id )
 				ORDER BY s.created_at DESC
 				LIMIT 1
 			",
-			{ fingerprint: arguments.fingerprint, excludeRunId: arguments.excludeRunId },
+			{
+				fingerprint      : arguments.fingerprint,
+				excludeRunId     : arguments.excludeRunId,
+				projectionVersion: arguments.projectionVersion
+			},
 			{ datasource: datasource }
 		);
 		return record.recordCount ? record.run_id[ 1 ] : "";
@@ -289,9 +371,14 @@ class threadsafe {
 		var edges = [];
 		var edgeAccount = { returned: 0, available: 0, omitted: 0, rankedBy: "weight", complete: true, state: "empty" };
 		if ( nodes.len() && ( arguments.query.include ?: "both" ) != "nodes" ) {
-			var edgeResult = readEdgesWithin( arguments.runId, level, max( 1, val( arguments.query.edgeLimit ?: 2000 ) ), nodes );
+			var edgeResult = listFindNoCase( "resource,knowledge", level )
+				? readEdgesTouching( arguments.runId, level, max( 1, val( arguments.query.edgeLimit ?: 2000 ) ), nodes )
+				: readEdgesWithin( arguments.runId, level, max( 1, val( arguments.query.edgeLimit ?: 2000 ) ), nodes );
 			edges = edgeResult.edges;
 			edgeAccount = edgeResult.completeness;
+			// The participants live at other levels, so returning only the resources
+			// would hand back edges pointing at nodes the caller was never given.
+			if ( listFindNoCase( "resource,knowledge", level ) ) nodes = appendEdgeEndpoints( arguments.runId, nodes, nodeIds, edges );
 		}
 		return {
 			level       : level,
@@ -299,16 +386,9 @@ class threadsafe {
 			nodes       : nodes,
 			edges       : edges,
 			edgeCompleteness: edgeAccount,
-			completeness: {
-				returned : nodes.len(),
-				available: totalAvailable,
-				omitted  : max( 0, totalAvailable - nodes.len() ),
-				rankedBy : rank,
-				// 0 of 0 is not a complete answer, it is an empty level. Saying
-				// "complete" there is how a missing graph reads as a finished one.
-				complete : totalAvailable > 0 && totalAvailable <= nodes.len(),
-				state    : totalAvailable == 0 ? "empty" : ( totalAvailable <= nodes.len() ? "complete" : "truncated" )
-			}
+			// 0 of 0 is not a complete answer, it is an empty level. Saying
+			// "complete" there is how a missing graph reads as a finished one.
+			completeness: completeness().queryAccount( nodes.len(), totalAvailable, rank, unresolvedFor( arguments.runId ) )
 		};
 	}
 
@@ -316,7 +396,7 @@ class threadsafe {
 	struct function search( required string runId, required struct query ) {
 		var term = trim( toString( arguments.query.q ?: "" ) );
 		var limit = max( 1, val( arguments.query.limit ?: 50 ) );
-		if ( !len( term ) ) return { term: "", matches: [], completeness: { returned: 0, available: 0, omitted: 0, rankedBy: "hotspot", complete: true } };
+		if ( !len( term ) ) return { term: "", matches: [], completeness: completeness().queryAccount( 0, 0, "hotspot", 0, "empty" ) };
 		// Escape LIKE wildcards so a term containing % or _ matches literally.
 		var like = "%" & escapeLike( lCase( term ) ) & "%";
 		var levelFilter = trim( toString( arguments.query.level ?: "" ) );
@@ -334,7 +414,7 @@ class threadsafe {
 			return {
 				term        : term,
 				matches     : [],
-				completeness: { returned: 0, available: 0, omitted: 0, rankedBy: "hotspot", complete: false, state: "empty" }
+				completeness: completeness().queryAccount( 0, 0, "hotspot", unresolvedFor( arguments.runId ), "empty" )
 			};
 		}
 		var available = queryExecute(
@@ -383,16 +463,7 @@ class threadsafe {
 		return {
 			term        : term,
 			matches     : matches,
-			completeness: {
-				returned : matches.len(),
-				available: totalAvailable,
-				omitted  : max( 0, totalAvailable - matches.len() ),
-				rankedBy : "hotspot",
-				// 0 of 0 is not a complete answer, it is an empty level. Saying
-				// "complete" there is how a missing graph reads as a finished one.
-				complete : totalAvailable > 0 && totalAvailable <= matches.len(),
-				state    : totalAvailable == 0 ? "empty" : ( totalAvailable <= matches.len() ? "complete" : "truncated" )
-			}
+			completeness: completeness().queryAccount( matches.len(), totalAvailable, "hotspot", unresolvedFor( arguments.runId ) )
 		};
 	}
 
@@ -417,6 +488,169 @@ class threadsafe {
 	 * SQLite has a bound-variable ceiling, so the id list is chunked and the
 	 * per-chunk results are merged, ranked and cut once.
 	 */
+	/**
+	 * Edges with **either** endpoint in the returned node set.
+	 *
+	 * Only the resource level uses this. A route, table or setting is reached *by*
+	 * a file or a symbol, so a both-endpoints predicate returns nothing however
+	 * many edges exist — which is precisely how these relationships stayed
+	 * invisible after they started being projected.
+	 */
+	private struct function readEdgesTouching(
+		required string runId,
+		required string level,
+		required numeric limit,
+		required array nodes
+	) {
+		var ids = [];
+		for ( var node in arguments.nodes ) ids.append( toString( node.id ) );
+		if ( !ids.len() ) {
+			return { edges: [], completeness: { returned: 0, available: 0, omitted: 0, rankedBy: "weight", complete: true, state: "empty" } };
+		}
+		var collected = [];
+		var chunkSize = 400;
+		var index = 1;
+		while ( index <= ids.len() ) {
+			var last = min( index + chunkSize - 1, ids.len() );
+			var placeholders = [];
+			var params = [ arguments.runId, arguments.level ];
+			for ( var position = index; position <= last; position++ ) {
+				placeholders.append( "?" );
+				params.append( ids[ position ] );
+			}
+			var idList = placeholders.toList( ", " );
+			for ( var position = index; position <= last; position++ ) params.append( ids[ position ] );
+			var records = queryExecute(
+				"
+					SELECT edge_id, level, from_node, to_node, group_kind, kinds_json,
+						occurrences, weight, resolution, provenance, confidence, line, evidence
+					FROM codegraph_edges
+					WHERE run_id = ? AND level = ?
+						AND ( to_node IN ( #idList# ) OR from_node IN ( #idList# ) )
+				",
+				params,
+				{ datasource: datasource }
+			);
+			for ( var row = 1; row <= records.recordCount; row++ ) collected.append( edgeRow( records, row ) );
+			index = last + 1;
+		}
+		return rankEdges( collected, arguments.limit );
+	}
+
+	/**
+	 * Add any edge endpoint the caller was not already given.
+	 *
+	 * Bounded by the edge limit, and each node is fetched from storage rather than
+	 * synthesised, so a participant carries the same role, kind and path it has
+	 * everywhere else.
+	 */
+	private array function appendEdgeEndpoints(
+		required string runId,
+		required array nodes,
+		required struct nodeIds,
+		required array edges
+	) {
+		var missing = {};
+		for ( var edge in arguments.edges ) {
+			for ( var endpoint in [ edge.from, edge.to ] ) {
+				if ( !arguments.nodeIds.keyExists( endpoint ) ) missing[ endpoint ] = true;
+			}
+		}
+		var wanted = structKeyArray( missing );
+		if ( !wanted.len() ) return arguments.nodes;
+		wanted.sort( ( a, b ) => compareNoCase( a, b ) );
+		var merged = duplicate( arguments.nodes );
+		var chunkSize = 400;
+		var index = 1;
+		while ( index <= wanted.len() ) {
+			var last = min( index + chunkSize - 1, wanted.len() );
+			var placeholders = [];
+			var params = [ arguments.runId ];
+			for ( var position = index; position <= last; position++ ) {
+				placeholders.append( "?" );
+				params.append( wanted[ position ] );
+			}
+			var records = queryExecute(
+				"
+					SELECT node_id, level, parent_id, path, symbol_name, kind, role, language,
+						line, end_line, fan_in, fan_out, hotspot
+					FROM codegraph_nodes
+					WHERE run_id = ? AND node_id IN ( #placeholders.toList( ", " )# )
+				",
+				params,
+				{ datasource: datasource }
+			);
+			for ( var row = 1; row <= records.recordCount; row++ ) {
+				merged.append( {
+					id        : records.node_id[ row ],
+					level     : records.level[ row ],
+					parentId  : records.parent_id[ row ],
+					path      : records.path[ row ],
+					symbolName: records.symbol_name[ row ],
+					kind      : records.kind[ row ],
+					role      : records.role[ row ],
+					language  : records.language[ row ],
+					line      : records.line[ row ],
+					endLine   : records.end_line[ row ],
+					fanIn     : records.fan_in[ row ],
+					fanOut    : records.fan_out[ row ],
+					hotspot   : records.hotspot[ row ]
+				} );
+			}
+			index = last + 1;
+		}
+		merged.sort( ( a, b ) => compareNoCase( a.path & a.symbolName, b.path & b.symbolName ) );
+		return merged;
+	}
+
+	private struct function edgeRow( required any records, required numeric row ) {
+		return {
+			id         : arguments.records.edge_id[ arguments.row ],
+			level      : arguments.records.level[ arguments.row ],
+			from       : arguments.records.from_node[ arguments.row ],
+			to         : arguments.records.to_node[ arguments.row ],
+			kind       : arguments.records.group_kind[ arguments.row ],
+			kinds      : deserializeKinds( arguments.records.kinds_json[ arguments.row ] ),
+			occurrences: arguments.records.occurrences[ arguments.row ],
+			weight     : arguments.records.weight[ arguments.row ],
+			resolution : arguments.records.resolution[ arguments.row ],
+			provenance : arguments.records.provenance[ arguments.row ],
+			confidence : arguments.records.confidence[ arguments.row ],
+			line       : arguments.records.line[ arguments.row ],
+			evidence   : arguments.records.evidence[ arguments.row ]
+		};
+	}
+
+	/** De-duplicate, rank by weight, cut once — shared by both edge readers. */
+	private struct function rankEdges( required array collected, required numeric limit ) {
+		var seen = {};
+		var unique = [];
+		for ( var edge in arguments.collected ) {
+			if ( seen.keyExists( edge.id ) ) continue;
+			seen[ edge.id ] = true;
+			unique.append( edge );
+		}
+		unique.sort( ( a, b ) => {
+			if ( val( a.weight ) != val( b.weight ) ) return val( a.weight ) > val( b.weight ) ? -1 : 1;
+			if ( val( a.occurrences ) != val( b.occurrences ) ) return val( a.occurrences ) > val( b.occurrences ) ? -1 : 1;
+			var byFrom = compareNoCase( a.from, b.from );
+			return byFrom != 0 ? byFrom : compareNoCase( a.to, b.to );
+		} );
+		var available = unique.len();
+		var kept = available > arguments.limit ? unique.slice( 1, arguments.limit ) : unique;
+		return {
+			edges       : kept,
+			completeness: {
+				returned : kept.len(),
+				available: available,
+				omitted  : max( 0, available - kept.len() ),
+				rankedBy : "weight",
+				complete : available > 0 && available <= kept.len(),
+				state    : available == 0 ? "empty" : ( available <= kept.len() ? "complete" : "truncated" )
+			}
+		};
+	}
+
 	private struct function readEdgesWithin(
 		required string runId,
 		required string level,
@@ -454,53 +688,12 @@ class threadsafe {
 				params,
 				{ datasource: datasource }
 			);
-			for ( var row = 1; row <= records.recordCount; row++ ) {
-				collected.append( {
-					id         : records.edge_id[ row ],
-					level      : records.level[ row ],
-					from       : records.from_node[ row ],
-					to         : records.to_node[ row ],
-					kind       : records.group_kind[ row ],
-					kinds      : deserializeKinds( records.kinds_json[ row ] ),
-					occurrences: records.occurrences[ row ],
-					weight     : records.weight[ row ],
-					resolution : records.resolution[ row ],
-					provenance : records.provenance[ row ],
-					confidence : records.confidence[ row ],
-					line       : records.line[ row ],
-					evidence   : records.evidence[ row ]
-				} );
-			}
+			for ( var row = 1; row <= records.recordCount; row++ ) collected.append( edgeRow( records, row ) );
 			index = last + 1;
 		}
 
 		// One chunk cannot see another's rows, so rank after merging, not per chunk.
-		var seen = {};
-		var unique = [];
-		for ( var edge in collected ) {
-			if ( seen.keyExists( edge.id ) ) continue;
-			seen[ edge.id ] = true;
-			unique.append( edge );
-		}
-		unique.sort( ( a, b ) => {
-			if ( val( a.weight ) != val( b.weight ) ) return val( a.weight ) > val( b.weight ) ? -1 : 1;
-			if ( val( a.occurrences ) != val( b.occurrences ) ) return val( a.occurrences ) > val( b.occurrences ) ? -1 : 1;
-			var byFrom = compareNoCase( a.from, b.from );
-			return byFrom != 0 ? byFrom : compareNoCase( a.to, b.to );
-		} );
-		var available = unique.len();
-		var kept = available > arguments.limit ? unique.slice( 1, arguments.limit ) : unique;
-		return {
-			edges       : kept,
-			completeness: {
-				returned : kept.len(),
-				available: available,
-				omitted  : max( 0, available - kept.len() ),
-				rankedBy : "weight",
-				complete : available > 0 && available <= kept.len(),
-				state    : available == 0 ? "empty" : ( available <= kept.len() ? "complete" : "truncated" )
-			}
-		};
+		return rankEdges( collected, arguments.limit );
 	}
 
 	/**
@@ -515,6 +708,20 @@ class threadsafe {
 	private void function indexNodesForSearch( required string runId, required array rows ) {
 		try {
 			queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: arguments.runId }, { datasource: datasource } );
+			appendSearchIndex( arguments.runId, arguments.rows );
+		} catch ( any searchIndexError ) {
+		}
+	}
+
+	/**
+	 * Mirror rows for nodes added after the first write.
+	 *
+	 * Kept separate from `indexNodesForSearch` because the coverage check compares
+	 * mirrored rows to stored nodes: an append that skipped the mirror would make
+	 * the index look stale and silently disable itself for the whole run.
+	 */
+	private void function appendSearchIndex( required string runId, required array rows ) {
+		try {
 			var index = 1;
 			while ( index <= arguments.rows.len() ) {
 				var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
@@ -538,9 +745,20 @@ class threadsafe {
 		}
 	}
 
-	/** Node ids matching the term, or null when the index cannot serve it. */
+	/**
+	 * Node ids matching the term, or null when the index cannot serve it.
+	 *
+	 * "Cannot serve it" has to include **the mirror not covering this run**, not
+	 * only FTS5 being absent. Runs indexed before the mirror shipped have nodes and
+	 * no mirrored rows, and an empty hit list there is indistinguishable from a
+	 * genuine no-match — which turned every historical run's search into a
+	 * confident "nothing matches". The index is a narrowing optimisation, so it is
+	 * used only when it demonstrably covers the run; otherwise the caller falls
+	 * back to the scan, which is slower and right.
+	 */
 	private any function searchIndexHits( required string runId, required string term ) {
 		try {
+			if ( !searchIndexCovers( arguments.runId ) ) return javacast( "null", "" );
 			var records = queryExecute(
 				"SELECT node_id FROM codegraph_node_search WHERE run_id = :runId AND haystack MATCH :term",
 				{ runId: arguments.runId, term: """" & replace( lCase( arguments.term ), """", """""", "all" ) & """" },
@@ -552,6 +770,53 @@ class threadsafe {
 		} catch ( any unavailable ) {
 			return javacast( "null", "" );
 		}
+	}
+
+	/**
+	 * Does the mirror hold a row for every node in this run?
+	 *
+	 * An exact count comparison rather than "are there any rows": a partially
+	 * written mirror narrows the scan to a subset and silently loses matches, which
+	 * is the same failure as an empty one with a smaller blast radius.
+	 */
+	private boolean function searchIndexCovers( required string runId ) {
+		try {
+			var mirrored = queryExecute(
+				"SELECT COUNT(*) AS total FROM codegraph_node_search WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			var stored = queryExecute(
+				"SELECT COUNT(*) AS total FROM codegraph_nodes WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			var mirroredCount = val( mirrored.total[ 1 ] ?: 0 );
+			return mirroredCount > 0 && mirroredCount == val( stored.total[ 1 ] ?: 0 );
+		} catch ( any unavailable ) {
+			return false;
+		}
+	}
+
+	/** The run's unresolved reference count, so every response can state it. */
+	private numeric function unresolvedFor( required string runId ) {
+		try {
+			var record = queryExecute(
+				"SELECT unresolved_count FROM codegraph_snapshots WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			return record.recordCount ? val( record.unresolved_count[ 1 ] ?: 0 ) : 0;
+		} catch ( any unavailable ) {
+			return 0;
+		}
+	}
+
+	private any function completeness() {
+		if ( isNull( variables.completenessService ?: javacast( "null", "" ) ) ) {
+			variables.completenessService = new app.models.services.CodeGraphCompletenessService();
+		}
+		return variables.completenessService;
 	}
 
 	private string function escapeLike( required string term ) {

@@ -211,7 +211,7 @@ class threadsafe {
 			// Deeper levels are written after the structure is durable so
 			// time-to-first-map does not pay for the row write. If this fails the
 			// snapshot still serves; only drill-down below the canvas is missing.
-			var levels = projectGraphRows( runId, snapshot, reviewGraph );
+			var levels = levelProjector().projectStructure( runId, snapshot, reviewGraph );
 			var levelsSummary = levels.summary;
 			var stageHealth = { projection: levels.health };
 			checkCancellation( arguments.callbacks );
@@ -224,6 +224,12 @@ class threadsafe {
 			if ( isStruct( narrative ) && ( narrative.used ?: false ) ) {
 				narrativeCacheKey = narrativeService.cacheKey( snapshot, projectPath );
 			}
+			// Attach the meaning layer to the structure it describes, so "which
+			// risks touch this file" and "what is this cluster for" are queries
+			// rather than a download of the narrative blob. Never fails the run: a
+			// missing knowledge layer degrades to the structural graph, which is the
+			// no-provider contract anyway.
+			stageHealth.knowledge = levelProjector().projectKnowledge( runId, snapshot, narrative );
 			checkCancellation( arguments.callbacks );
 			renewLease( arguments.callbacks );
 
@@ -260,6 +266,14 @@ class threadsafe {
 				reason: trim( toString( narrative.error ?: "" ) )
 			};
 			try { codeGraphRepository.saveStageHealth( runId, stageHealth ); } catch ( any healthError ) {}
+			// The unresolved count is measured during the load and then only ever
+			// lived inside the snapshot blob, where no query could afford to read it.
+			try {
+				codeGraphRepository.saveUnresolvedCount(
+					runId,
+					val( ( snapshot.completeness.dependencies.unresolved ?: 0 ) )
+				);
+			} catch ( any unresolvedError ) {}
 
 			return {
 				status    : "succeeded",
@@ -684,43 +698,14 @@ class threadsafe {
 	 * silently either: a swallowed error here looks exactly like a snapshot that
 	 * predates levelled storage, and the two need different remedies.
 	 */
-	private struct function projectGraphRows(
-		required string runId,
-		required struct snapshot,
-		required struct reviewGraph
-	) {
-		if ( isNull( variables.graphProjectionService ?: javacast( "null", "" ) ) || isNull( variables.codeGraphGraphRepository ?: javacast( "null", "" ) ) ) {
-			return { summary: "levelled graph unavailable in this configuration", health: { ok: false, nodes: 0, edges: 0, reason: "not-configured" } };
+	/** Levelled and knowledge row writing has one owner; this is the handle. */
+	private any function levelProjector() {
+		if ( isNull( variables.codeGraphLevelProjector ?: javacast( "null", "" ) ) ) {
+			variables.codeGraphLevelProjector = new app.models.services.CodeGraphLevelProjector();
+			variables.codeGraphLevelProjector.graphProjectionService = variables.graphProjectionService ?: javacast( "null", "" );
+			variables.codeGraphLevelProjector.codeGraphGraphRepository = variables.codeGraphGraphRepository ?: javacast( "null", "" );
 		}
-		try {
-			// Identical fingerprint means an identical projection, so copying rows
-			// beats recomputing ~10,000 of them. The fingerprint already covers
-			// every input the projection reads.
-			var fingerprint = trim( toString( arguments.snapshot.fingerprint ?: "" ) );
-			if ( len( fingerprint ) ) {
-				var source = codeGraphGraphRepository.findProjectionSource( fingerprint, arguments.runId );
-				if ( len( source ) && codeGraphGraphRepository.reuseGraphFrom( source, arguments.runId ) ) {
-					return {
-						summary: "levelled graph reused from an identical snapshot",
-						health : { ok: true, nodes: 0, edges: 0, reason: "reused" }
-					};
-				}
-			}
-			var projected = graphProjectionService.project( arguments.snapshot, arguments.reviewGraph );
-			codeGraphGraphRepository.replaceGraph( arguments.runId, projected.nodes, projected.edges );
-			return {
-				summary: "#projected.nodes.len()# graph nodes, #projected.edges.len()# graph edges",
-				health : { ok: true, nodes: projected.nodes.len(), edges: projected.edges.len(), reason: "" }
-			};
-		} catch ( any projectionError ) {
-			// Structure is already durable; drill-down degrades rather than the run.
-			// The reason is persisted with the snapshot: after the run finishes a
-			// transient progress message is the only other place it existed.
-			return {
-				summary: "levelled graph unavailable: ##projectionError.message##",
-				health : { ok: false, nodes: 0, edges: 0, reason: projectionError.message }
-			};
-		}
+		return variables.codeGraphLevelProjector;
 	}
 
 	/** Delegates so cache-key derivation has exactly one owner. */

@@ -8,7 +8,11 @@
 
 @singleton
 class {
-	variables.parserVersion = "cfml-symbol-parser-v6";
+	// v7: the `routes` and `renders` detectors held a literal backspace byte where
+	// `\b` was intended, so neither could ever match, and the SQL read/write split
+	// was BoxLang-only. All three change what this parser extracts, so the version
+	// moves or the parse cache serves the old results.
+	variables.parserVersion = "cfml-symbol-parser-v7";
 	variables.patternCache  = {};
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 	variables.integrationDetector = new app.models.services.IntegrationDetector();
@@ -240,7 +244,7 @@ class {
 			// G14: CFML had neither of these, so a ColdFusion project could not
 			// answer "how does a route reach a handler" or show view rendering at
 			// all — a supported language producing a strictly weaker graph.
-			var routeMatch = match( "route\s*\(\s*[""']([^""']+)[""']", sourceLine );
+			var routeMatch = match( "\broute\s*\(\s*[""']([^""']+)[""']", sourceLine );
 			if ( routeMatch.find() ) {
 				symbols.append( symbol( "route", routeMatch.group( 1 ), lineNumber, sourceLine ) );
 				var routeWindow = joinTagLines( arguments.file.lines, lineNumber );
@@ -257,7 +261,7 @@ class {
 					} ) );
 				}
 			}
-			var viewMatch = match( "(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']|<cfinclude\s+template\s*=\s*[""']([^""']+\.cfm)[""']", sourceLine );
+			var viewMatch = match( "\b(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']|<cfinclude\s+template\s*=\s*[""']([^""']+\.cfm)[""']", sourceLine );
 			if ( viewMatch.find() ) {
 				var viewTarget = isNull( viewMatch.group( 1 ) ) ? viewMatch.group( 2 ) : viewMatch.group( 1 );
 				if ( len( trim( toString( viewTarget ?: "" ) ) ) ) dependencies.append( dependency( "renders", viewTarget, lineNumber, sourceLine ) );
@@ -693,7 +697,10 @@ class {
 						break;
 					}
 				}
-				appendUniqueDependency( arguments.dependencies, "table-query", table, evidenceLine, evidence, evidenceLine );
+				// G3's read/write split shipped in the BoxLang parser only, so a
+				// ColdFusion project saw one undifferentiated kind and `/lineage`
+				// could not say who *writes* a table. Same scanner, same answer.
+				appendUniqueDependency( arguments.dependencies, references.statementKind ?: "table-query", table, evidenceLine, evidence, evidenceLine );
 			}
 		}
 	}

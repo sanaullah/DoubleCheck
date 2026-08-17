@@ -15,6 +15,8 @@ class threadsafe {
 	property name="environment" inject="coldbox:setting:environment";
 
 	property name="supportedLanguageService" inject="SupportedLanguageService";
+	property name="codeGraphCorpusService" inject="CodeGraphCorpusService";
+	property name="codegraphCorpusPath" inject="coldbox:setting:codegraphCorpusPath";
 
 	function init() {
 		if (
@@ -67,6 +69,33 @@ class threadsafe {
 			);
 		}
 		return gateRun;
+	}
+
+	/**
+	 * Score the CodeGraph corpus and record the result.
+	 *
+	 * Recorded so graph fidelity has a trend rather than only a green suite, and
+	 * recorded **without** promoting a language tier: this measures whether the
+	 * graph finds a known route, table, flow and path, which is a different claim
+	 * from the review corpus's precision and recall.
+	 */
+	struct function runCodeGraphGate() {
+		var corpusRoot = trim( toString( variables.codegraphCorpusPath ?: "" ) );
+		if ( !len( corpusRoot ) ) corpusRoot = expandPath( "/resources/evaluation-corpus/codegraph-v1" );
+		var scored = codeGraphCorpusService.evaluate( corpusRoot );
+		var failures = scored.cases.reduce( ( collected, item ) => collected.append( item.failures, true ), [] );
+		var languages = [];
+		for ( var item in scored.cases ) if ( !languages.contains( item.language ) ) languages.append( item.language );
+		languages.sort( ( a, b ) => compareNoCase( a, b ) );
+		return persist(
+			scored.version,
+			languages.toList( "," ),
+			"graph-structure",
+			scored.passed,
+			{ cases: scored.cases, thresholds: scored.thresholds },
+			failures,
+			scored.promotesLanguageTier
+		);
 	}
 
 	struct function status() {
@@ -137,7 +166,8 @@ class threadsafe {
 		required string capabilityTier,
 		required boolean passed,
 		required struct metrics,
-		required array failures
+		required array failures,
+		boolean promotesTier = true
 	) {
 		var id = lCase( createUUID() );
 		var createdAt = dateTimeFormat( now(), "iso" );
@@ -170,7 +200,10 @@ class threadsafe {
 				},
 				{ datasource: datasource }
 			);
-			if ( arguments.passed ) {
+			// A corpus that measures graph fidelity does not earn a *review* tier.
+			// Promoting on any passing gate is how a tier could be claimed by a
+			// measurement that never tested the thing the tier names.
+			if ( arguments.passed && arguments.promotesTier ) {
 				queryExecute(
 					"
 						INSERT INTO language_capabilities (

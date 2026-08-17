@@ -39,7 +39,11 @@ class extends="testbox.system.BaseSpec" {
 						expect( functions.len() ).toBeGT( 0 );
 						expect( functions[ 1 ].endLine ).toBeGT( functions[ 1 ].line );
 							expect( dependencyKinds ).toInclude( "injects" );
-							expect( dependencyKinds ).toInclude( "table-query" );
+							// `SELECT * FROM orders` is a read. This asserted `table-query`
+						// only because the CFML parser had never applied G3's split;
+						// the undifferentiated kind now survives solely for statements
+						// whose direction genuinely cannot be determined.
+						expect( dependencyKinds ).toInclude( "table-read" );
 						} finally {
 							if ( directoryExists( sourceRoot ) ) directoryDelete( sourceRoot, true, true );
 						}
@@ -281,6 +285,76 @@ class extends="testbox.system.BaseSpec" {
 						expect( symbolNames ).toInclude( "findUser" );
 						expect( dependencyTargets ).toInclude( "app.models.BaseGateway" );
 						expect( dependencyTargets ).toInclude( "app.models.IGateway" );
+					}
+				);
+
+				it(
+					"routes, renders and splits table access on a ColdBox-style CFC",
+					() => {
+						// G14's acceptance test, written against the syntax a real
+						// ColdFusion project uses rather than against the detector. The
+						// CFML corpus case produced zero `routes` and zero `renders` while
+						// the same syntax in a `.bx` file produced both — a supported
+						// language answering "how does a route reach a handler" with
+						// nothing.
+						var routerLines = [
+							"component {",
+							"    function configure() {",
+							"        route( ""/api/v1/invoices"" ).withAction( ""index"" ).toHandler( ""InvoiceHandler"" ).end();",
+							"    }",
+							"}"
+						];
+						var handlerLines = [
+							"component {",
+							"    property name=""invoiceService"" inject=""InvoiceService"";",
+							"    function index( event, rc, prc ) {",
+							"        event.setView( ""invoices/show"" );",
+							"    }",
+							"}"
+						];
+						var repositoryLines = [
+							"component {",
+							"    function findAll() {",
+							"        return queryExecute( ""SELECT * FROM invoices"" );",
+							"    }",
+							"    function markPaid( required numeric invoiceId ) {",
+							"        return queryExecute( ""UPDATE invoices SET paid = 1 WHERE id = :id"", { id: arguments.invoiceId } );",
+							"    }",
+							"}"
+						];
+						var parser = new app.models.services.CfmlParserService();
+						var parseLines = ( path, lines ) => {
+							var content = arrayToList( lines, char( 10 ) );
+							return parser.parse( {
+								filePath   : path,
+								language   : "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								content    : content,
+								lines      : lines
+							} );
+						};
+
+						var router = parseLines( "app/config/Router.cfc", routerLines );
+						var routeSymbols = router.symbols.filter( ( item ) => item.kind == "route" );
+						var routeDependencies = router.dependencies.filter( ( item ) => item.kind == "routes" );
+						expect( routeSymbols.len() ).toBeGT( 0, "a CFML router must yield route symbols" );
+						expect( routeDependencies.len() ).toBeGT( 0, "a CFML router must yield routes dependencies" );
+						expect( routeDependencies[ 1 ].target ).toBe( "/api/v1/invoices" );
+
+						var handler = parseLines( "app/handlers/InvoiceHandler.cfc", handlerLines );
+						var renders = handler.dependencies.filter( ( item ) => item.kind == "renders" );
+						expect( renders.len() ).toBeGT( 0, "setView in a CFC must yield a renders dependency" );
+						expect( renders[ 1 ].target ).toBe( "invoices/show" );
+
+						// G3 split reads from writes so lineage can state direction. It
+						// shipped for BoxLang only; a CFML repository saw one undifferentiated
+						// kind and `/lineage` could not say who writes a table.
+						var repository = parseLines( "app/repositories/InvoiceRepository.cfc", repositoryLines );
+						var accessKinds = repository.dependencies
+							.filter( ( item ) => listFindNoCase( "table-read,table-write,table-query", item.kind ) )
+							.map( ( item ) => item.kind );
+						expect( accessKinds ).toInclude( "table-read" );
+						expect( accessKinds ).toInclude( "table-write" );
 					}
 				);
 

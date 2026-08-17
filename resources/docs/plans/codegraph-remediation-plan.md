@@ -2,6 +2,16 @@
 
 **Status: Phases 1–7, 9 and 10 complete (see §18–§24); Phases 8 and 11 proposed.**
 
+> **Read §31 and §32 first.** §31 is an independent audit (2026-08-17) that found
+> the product was building *two* graphs and serving the weaker one to every query
+> endpoint, plus six live defects. §32 records the remediation, measured. Anything
+> earlier in this document describes the graph as it was before that pass —
+> several numbers below are superseded there, and the capability claims in §0's
+> ledger were true of the extraction tables while the endpoints that consume them
+> answered "empty". **The rule §32 adds: verify a capability at the surface that
+> consumes it. A row in the extraction table is not a capability; a green endpoint
+> is.**
+
 **Evidence base.** Every `file:line` was re-validated against the working tree on
 2026-08-16 (branch `dev3`, base `caf64b4`, worktree dirty and preserved). Counts
 marked *(RV)* were queried from the live database `.db/doublecheck.db`
@@ -1501,3 +1511,328 @@ seventh and the most instructive, because "already built" and "working" were
 different things: the code path existed, ran, and produced an unusable picture.
 A register entry can be wrong by being too pessimistic *and* the code can be wrong
 while appearing complete. Neither is visible without looking at the output.
+
+---
+
+## 31. Audit 2026-08-17 — what is still missing for a proper Code / Knowledge Graph
+
+Independent pass. Method: query the live database (`.db/doublecheck.db`, run
+`51dd489a`, 6,139 nodes / 4,347 edges, indexed 2026-08-17T02:20Z), replay each
+endpoint's own SQL against it, then **exercise the endpoints over HTTP on a
+running server** (`127.0.0.1:55098`). Every number below is `RV`. Nothing here is
+inferred from reading code alone; where code is cited it is to explain a measured
+result, not to substitute for one.
+
+### 31.0 The finding in one paragraph
+
+The structural substrate is real and much better than the session-start baseline.
+What is missing is not more extraction — it is that **the product builds two
+graphs and ships the weaker one to every query**. Entities the parsers now find
+(tables, config keys, routes, events, external hosts) become *nodes* with **zero
+edges**, so the entire Phase 10 query surface, the MCP tool contract and the
+directory level answer "empty" to questions the snapshot can already answer.
+Separately, the knowledge layer is prose keyed to ids, not a graph — it cannot be
+traversed, queried, or exported as knowledge.
+
+### 31.1 Live defects — a confident wrong answer today
+
+Each was reproduced over HTTP, not predicted.
+
+| ID | Defect | Proof |
+|---|---|---|
+| **A1** | **`/codegraph/search` returns `matches: []` for 39 of the 42 stored graph runs.** The D23 FTS mirror is only populated for runs indexed after it shipped. `searchIndexHits` returns an **empty array** (not null) when a run has no mirrored rows, and [CodeGraphGraphRepository.bx:333](../../../app/models/repositories/CodeGraphGraphRepository.bx) short-circuits to `matches: []` **before** the `LIKE` backstop can run | Run `690cd62c`, term `graphmet`: **66 nodes LIKE-match, 0 rows mirrored, API returns `{"matches":[],"state":"empty"}`**. Same term on run `51dd489a`: 68/68/68 |
+| **A2** | **`/lineage?table=` returns empty for all 38 tables.** Two independent causes, either alone fatal: no `table-read`/`table-write` edge is ever projected, and the query targets `table:x` while the node is stored as `file:table:x` | `curl …/lineage?table=review_runs` → `readers: [], writers: []`. Replayed for all 38 table nodes under both id forms: **0 rows** |
+| **A3** | **`/hierarchy` has 2 edges in the whole repository, and one is false.** 127 `extends` dependency rows exist; 126 resolve to nothing | The one file-level edge: `app/modules/aiflight/config/router.bx --extends--> resources/evaluation-corpus/…/order-flow/app/config/Router.bx`, evidence `class extends="coldbox.system.web.routing.Router"`. `resolveTypeFile` matched the **leaf name** of an external framework type to an unrelated fixture file. It is stored `resolution: "exact", confidence: "high"` |
+| **A4** | **`/neighbours` is empty for every route, table, config and event node** | `curl …/neighbours?node=file:config:datasource` → `{}`; `node=file:route:/api/v1/runs` → `{}`. 0 edges touch any of the 362 synthetic nodes |
+| **A5** | **Directory level has no edges and says it is complete** | `GET /graph?level=directory` → **62 nodes, 0 edges, `state: "complete", complete: true`**. All 62 directory nodes are isolated |
+| **A6** | **File level is 71% disconnected and says it is complete** | `GET /graph?level=file` → **703 nodes, 907 edges, 499 nodes with no edge, `state: "complete"`** |
+| **A7** | **The MCP contract states a guarantee no endpoint honours.** `contract().completeness` promises "every response carries returned, available, omitted, **unresolved** and state" | `grep unresolved` over `ApiCodeGraph.bx`, `CodeGraphQueryRepository.bx`, `CodeGraphGraphRepository.bx` → **zero occurrences**. The descriptor also advertises `codegraph_lineage` and `codegraph_hierarchy`, which return empty for every input (A2, A3) |
+
+A5 and A6 are the honesty rule of §16 failing in the exact way it forbids: not
+incomplete, but *silently* incomplete, with `complete: true` attached.
+
+A1 is the D2 defect ("says nothing matches when it means no index") reintroduced
+by the D23 fix. §29 recorded that `LIKE` was kept "as the predicate… slower,
+never wrong" — that holds only when `searchIndexHits` returns null. It does not
+when the table exists and the run is absent from it.
+
+### 31.2 Root gaps — why the defects cluster
+
+**B1 · There are two graphs, and the query surface reads the poorer one.**
+
+| Substrate | Storage | Contains | Serves |
+|---|---|---|---|
+| **A — review graph / snapshot** | `review_symbols`, `review_dependencies`, `snapshot_json` | routes, tables, config keys, events, external hosts, flows, cycles, clusters, bounded paths | `/subgraph`, `/edges`, `/paths`, `/source`, `/narrative`, canvas overlays |
+| **B — levelled projection** | `codegraph_nodes`, `codegraph_edges` | files, symbols, directories, clusters — **and nothing whose target did not resolve to a file** | `/graph`, `/search`, `/neighbours`, `/hierarchy`, `/lineage`, `/impact`, `/onboarding`, `/diff`, `/rules`, `/mcp` |
+
+The mechanism is one line:
+[CodeGraphProjectionService.bx:191](../../../app/models/services/CodeGraphProjectionService.bx)
+skips any dependency whose `sourceFile` **or `targetFile`** is not a known file
+node. A table, setting, event, route or remote host has no target file by
+definition, so **every one of those relationships is dropped at projection.**
+
+Measured: 599 dependency rows of kinds `reads-config` (324), `table-write` (144),
+`table-read` (96), `emits` (39), `http` (28), `schedule` (4) — and
+**0 corresponding edges** in `codegraph_edges`. Nine relationship kinds were made
+to produce evidence in §27; six of them never reach the graph the user queries.
+
+**B2 · Non-file entities are stored as files.** 362 of 703 `level: "file"` nodes
+are not files — 246 `config:`, 52 `route:`, 38 `table:`, 20 `event:`, 5 `http:`,
+1 `schedule:`. §26 called this "a modelling wart, not a gap" because nothing was
+unreachable. The measurements say otherwise: it makes the file level 71%
+disconnected (A6), it puts `kind=configuration, role=shared` on 251 "files" when
+the repository has 5 config files, and it means `/rules`, cluster statistics, the
+DSM and the canvas all compute over a population that is half non-code.
+
+**B3 · No local resolution — the call graph is cross-file only.**
+`resolveTargets` resolves a call by its **receiver's** type name
+([ArchitectureIndexService.bx:308](../../../app/models/services/ArchitectureIndexService.bx)),
+so an unqualified in-file call (`myHelper()`) can never resolve.
+**Measured: 0 same-file resolved dependencies out of 3,310**, 17,450 unresolved
+calls, and **78% of `function` symbols (2,300 of 2,942) have no edge at all**.
+Symbol isolation by kind: route 89% · function 78% · class 57% · property 55% ·
+test-suite 52% · test 51%. §12 adopted CodeQL's "local resolution is affordable,
+global is not" and the local half was never built.
+
+**B4 · No anchor / occurrence model (G5).** Still no `defines` vs `references`
+split, no `/references` endpoint, no occurrence entity. An edge is a fact about
+two files, not about a position that binds a name.
+
+**B5 · No terminal modelling (G4).** **14 of 35 flows carry `sinkKind: "unknown"`** —
+40% of the traces end without saying what completes them.
+
+**B6 · The knowledge layer is prose, not a graph.** `domains`, `processes`,
+`risk`, `onboarding` and `pitch` exist only as text inside `narrative_json`,
+keyed to cluster and flow ids. §7 lists `domain | process | risk | glossary-term`
+as entity kinds; **none is ever materialised as a node or an edge.** Consequences:
+there is no domain→domain relation, no "which risks touch this file", no
+glossary at all, the narrative is absent from the MCP tool surface (an agent gets
+structure with no meaning), and knowledge cannot be exported as knowledge.
+`codegraph_nodes.level` remains `symbol|file|directory|cluster`.
+
+**B7 · BD-4 is fixed only for the minority case.** `clusterAnchor` uses the
+deepest shared directory, but falls back to `jsonSerialize( members )` — the exact
+membership hash it replaced — when members share no directory.
+**Measured: 28 of 42 clusters (67%) have no shared anchor.** Consequence:
+**70 of 90 stored labels (78%) are orphaned**, and only **20 of 42** current
+clusters carry one. The spec passes because it tests a cluster inside one
+directory.
+
+**B8 · The evaluation fixtures are analysed as if they were the product.**
+`resources/evaluation-corpus/` contributes 21 file nodes and 54 symbols, and
+lands in **9 of 42 clusters**. The LLM then names them: **8 of 24 domains** and
+3 of 22 processes describe fixtures, and the project pitch reads *"a focused test
+support and utility codebase"* — DoubleCheck described as its own test data. Two
+dependency edges cross from product code into fixture code. There is no
+vendor / fixture / generated classification anywhere in the pipeline.
+
+### 31.3 Measurement gaps
+
+| ID | Gap | Evidence |
+|---|---|---|
+| **C1** | **CFML and JavaScript have no measured capability tier.** `language_capabilities` holds exactly one row: `BoxLang / parsed-dependency-aware` | The two other headline-supported languages have never been promoted by any gate |
+| **C2** | **The CodeGraph corpus has never been recorded as a gate run.** All **5,418** `evaluation_gate_runs` rows are `boxlang-review-corpus-v1` | `codegraph-corpus-v1` is exercised by `CodeGraphCorpusSpec` (flow/path recall = 1 on `order-flow`) but produces no gate record, no trend, and no tier |
+| **C3** | **The corpus has one case and it is BoxLang.** `codegraph-v1/cases/order-flow` is `.bx` only | So G14's CFML parity and the JS chain are asserted by unit specs, never by a scored fixture |
+| **C4** | **Self-analysis remains the only whole-repo evidence.** This repository is 316 BoxLang / 18 CFML / 7 JavaScript files | CFML and JS graph quality at scale is unmeasured |
+| **C5** | **The Cold-Read Protocol (§2a) is still unrun.** The 5-of-17 score is still an assessment | Unchanged since it was written |
+| **C6** | **Doc drift.** `application-features.md` has no feature row for `/neighbours`, `/hierarchy`, `/lineage`, `/impact`, `/onboarding`, `/diff`, `/rules` or `/mcp`, and its Completeness row still quotes the pre-Phase-1 "20,000 of 40,911 dependencies" | By that document's own rule, a shipped capability without a row is indistinguishable from one never built |
+
+### 31.4 What this changes about the plan's own ledger
+
+Not a retraction of §18–§30 — those numbers reproduce. The correction is about
+**where the evidence stops**: every one of them was verified in
+`review_dependencies` or in the snapshot, which is substrate A. None was verified
+through the endpoint a user or an agent actually calls. `emits` produces 39 rows
+and `/neighbours` cannot see one of them; `table-read`/`table-write` was called
+"the reason `/lineage` is expressible" and `/lineage` returns nothing.
+
+**The rule this pass adds to the ones already recorded here: verify a capability
+at the surface that consumes it.** A row in the extraction table is not a
+capability; a green endpoint is.
+
+### 31.5 Remediation order
+
+Ordered by (user-visible correctness ÷ cost), not by document order.
+
+| # | Work | Fixes | Size | Note |
+|---|---|---|---|---|
+| **1** | `searchIndexHits` returns null when the run has **no** mirrored rows; empty-but-present stays empty. Add a spec that searches a run with an unmirrored graph | A1 | ~1 h | Highest severity, smallest change in the list |
+| **2** | **Give non-file entities their own level** (`resource` or per-kind) and **project their edges**: relax the `targetFile` requirement at `CodeGraphProjectionService.bx:191` so a dependency to a synthetic id becomes an edge to that node | A2, A4, B1, B2 | 1.5 d | Single highest-yield item. Turns on lineage, config→consumer, event, http and route neighbours at once, and takes the file level from 499 isolated nodes to ~137 |
+| **3** | Roll file edges up to directory edges; make `state` distinguish `unsupported` from `empty` at every level and endpoint; add `unresolved` to the completeness block so A7's contract becomes true | A5, A6, A7, G8 | 1 d | |
+| **4** | Reject a `resolveTypeFile` match whose target is a dotted external namespace (`coldbox.`, `testbox.`, `java.`, …) unless the full path matches; classify the reference `external` instead | A3 | 0.5 d | 7 rows today, but 1 of only 2 hierarchy edges |
+| **5** | Exclude `resources/evaluation-corpus/**` (and a configurable ignore set) from indexing, or tag it `fixture` and drop it from clusters, narrative and flows | B8 | 0.5 d | Also repairs the project pitch |
+| **6** | Local (within-file) call resolution: resolve an unqualified call against the symbols of its own file before falling back to type lookup | B3 | 2 d | Should move symbol coverage far off 22% and shrink `unresolved` materially |
+| **7** | Key cluster labels on a **stable derived identity** (dominant directory + dominant role + size band), never on membership; migrate the 70 orphaned rows or delete them | B7 | 1 d | |
+| **8** | Materialise the knowledge layer: `domain`, `process`, `risk`, `glossary-term` as real nodes with `describes` / `belongs-to` / `affects` edges; expose `codegraph_narrative` as an MCP tool | B6 | 3 d | This is what makes the second half of the product name true |
+| **9** | Record a `codegraph-corpus-v1` gate run; add a CFML case and a JS case; promote or explicitly withhold the CFML and JavaScript tiers | C1–C4 | 2 d | |
+| **10** | Feature rows for the Phase 9/10/11 endpoints; refresh the stale completeness example | C6 | 1 h | |
+
+Items 1–5 are ~3.5 days and convert most of §31.1 from "confidently wrong" to
+"correct or honestly unsupported". Item 6 is the largest fidelity gain still
+available. Item 8 is the only one that is a new capability rather than a repair.
+
+### 31.6 Checks run in this pass
+
+**Run.** Live database queried directly (read-only) for node/edge composition,
+resolution classes, isolation census, synthetic-node connectivity, label
+orphaning, FTS mirror coverage, language tiers and gate history. Endpoint SQL
+replayed verbatim for `lineage`, `hierarchy`, `impact` and `search`. Eight
+endpoints exercised over HTTP against a running server. JavaScript suite:
+**35 passed / 0 failed** (`node --test tests/js/*.spec.mjs`). TestBox suite:
+**729 passed / 0 failed / 0 errored / 1 skipped**, 111 bundles, 425 s — the §27
+baseline reproduces, which is the point: **every defect in §31.1 is green in the
+suite.** Nothing tests an endpoint against a graph that lacks the kind of edge it
+queries.
+
+**Not run, not claimed.** No re-index and no parser change, so every count
+describes run `51dd489a` and not a fresh extraction. No CFML or JavaScript
+project was analysed, so C3/C4 remain the same blind spot §2a named. The
+Cold-Read Protocol was not attempted.
+
+---
+
+## 32. §31 remediation — shipped and measured (2026-08-17)
+
+All ten items of §31.5. Measured on run `7ad6ef12`, a full re-index after every
+change, with each previously-dead endpoint exercised over HTTP.
+Suite: **734 passed / 0 failed / 0 errored / 1 skipped**.
+
+### The headline numbers
+
+| | Audit (`51dd489a`) | Now (`7ad6ef12`) |
+|---|---|---|
+| `file` level nodes | 703, of which **362 were not files** | **322**, all real files |
+| file nodes with no edge | **499 (71%)** | **20 (6%)** |
+| symbol nodes with no edge | 3,638 (68%) | **1,640 (31%)** |
+| `symbol / calls` edges | 1,543 | **4,897** |
+| resource edges (tables, config, events, http, routes) | **0** | **1,251** |
+| directory edges | **0** | **66** |
+| knowledge nodes / edges | **0 / 0** | **87 / 197** |
+| same-file resolved dependencies | **0 of 3,310** | **6,148 of 9,467** |
+| unresolved `calls` | 17,450 | **11,463** |
+| fixture nodes in the graph | 75 | **0** |
+| `/lineage?table=review_runs` | `readers 0, writers 0` | **21 readers, 56 writers** |
+| `/search` on a pre-mirror run | `matches: []` | **66 available** |
+| languages scored by a graph corpus | 1 | **2 (+ JS in both paths)** |
+| recorded `codegraph-corpus-v1` gate runs | **0** | **1, passing** |
+
+### What each item did
+
+**A1 — search.** `searchIndexHits` now returns null when the mirror does not
+cover the run, so the `LIKE` backstop can actually run. Coverage is an exact
+count comparison, not "are there any rows": a partially written mirror loses
+matches the same way an empty one does, quietly. `reuseGraphFrom` copies the
+mirror alongside the rows it describes, so an adopted run no longer inherits an
+index that does not match its nodes.
+
+**Items 2 and 3 — the two graphs became one.** Non-file entities now live at
+`level: "resource"` and **carry their edges**. The mechanism was one condition:
+the projection required a resolved target *file*, and a table, setting, event or
+remote host does not have one. Routes additionally now route *through* the
+entity — `Router.bx --declares--> route:/api/v1/runs --routes-to--> ApiRuns.bx` —
+because a `routes` row resolves to the handling file and used to bypass the
+entity it names. `/neighbours` on that route returns the JS caller, the router
+and the handler: the cross-language chain of §8, in one query.
+
+Directory edges are rolled up from file edges, weighted by how many files sit
+behind each one. That level had 62 parented boxes, no relationships at all, and
+`state: "complete"`.
+
+**Completeness.** One owner (`CodeGraphCompletenessService.queryAccount`) for
+every query response, carrying `unresolved` — sourced from a new
+`unresolved_count` column rather than a megabyte of snapshot JSON — plus
+`unresolvedScope: "run"` and the `unsupported` list. The MCP contract claimed
+every response carried these; now it does, and it states that the count is the
+run's, because an agent reading `unresolved: 11463` beside four callers must not
+conclude that 11,459 were dropped from *this* answer. `state` is now
+authoritative: `complete` is derived from it, so a cut traversal cannot report
+itself complete.
+
+**Item 4 — the false `extends`.** `resolveTypeFile` matched on the leaf of a
+dotted name, so `coldbox.system.web.routing.Router` bound to a fixture file named
+`Router.bx` and produced the repository's only hierarchy edge, stored
+`resolution: exact, confidence: high`. External namespace roots now resolve to
+nothing. Hierarchy is **0 edges here and that is the honest answer** — this
+codebase inherits only from framework classes. The capability is proven by the
+corpus, not by this repository.
+
+**Item 5 — fixtures.** `resources/evaluation-corpus/**` is excluded at the
+scanner, matched from the repository root so a user's own `resources/` is
+untouched. The project pitch no longer describes DoubleCheck as "a focused test
+support and utility codebase" — it was describing its own fixture.
+
+**Item 6 — local resolution.** An unqualified call now resolves against the
+callables of its own file, tried *after* receiver-type resolution so
+`orderService.save()` still crosses the file boundary. The projection stopped
+discarding same-file rows: a file depending on itself is not a fact worth an
+edge, but the symbols inside it calling each other are the call graph.
+
+**Item 7 — label identity.** The anchor is the dominant directory plus a size
+band, not the deepest *common* directory. The old rule only worked for clusters
+whose files sit together — 14 of 42 here — and the other 28 fell back to hashing
+the member list, the exact volatile key it was introduced to replace, orphaning
+78% of stored labels.
+
+**Item 8 — the knowledge layer is a graph.** Domains, processes and risks are
+nodes with `describes` / `affects` edges to the structure they explain, appended
+in a second pass so a run without a provider still gets its structural graph.
+Every knowledge edge is stored `resolution: narrative, provenance: llm,
+confidence: interpretive` — the §1 contract made visible on the row. "Which risks
+touch this file" is now a `/neighbours` call.
+
+**Item 9 — and what the CFML corpus found.** A ColdFusion case was added, and the
+spec now scores **every** case rather than `cases[1]`. On its first run it failed,
+and the reasons were real:
+
+- **`routes` and `renders` could never fire in CFML.** Both patterns held a
+  literal **backspace byte (0x08)** where `\b` was intended — the identical defect
+  §25 recorded for G6's `reads-config`, from the same cause: a scripted edit
+  writing the escape sequence as the character it denotes. Two detectors, dead
+  since the day they shipped, under a comment explaining the gap they closed.
+- **G3's read/write split was BoxLang-only.** One line: the BoxLang parser passed
+  `references.statementKind`, the CFML parser hard-coded `"table-query"`. So
+  `/lineage` could not say who *writes* a table in a ColdFusion project.
+
+Both fixed, `cfml-symbol-parser-v7`, and scored: the CFML case now reaches
+**flowRecall 1, pathRecall 1**, including the full `fetch → route → handler →
+service → repository → table-read` chain. Scoring moved out of the spec into
+`CodeGraphCorpusService` so the gate and the suite share one implementation, and
+`QualityGateService.runCodeGraphGate()` records the result **without** promoting a
+language tier — measuring graph fidelity is not the claim a review tier makes.
+
+**Item 10 — docs.** Feature rows for the resource and knowledge levels and for
+the whole query surface; the completeness row now states what it actually
+returns; the language-tier table says what the CFML graph corpus does and does
+not certify.
+
+### Two things this pass proves about the ones before it
+
+**A projection needs a version as much as a parser does.** The reuse path matched
+on the snapshot fingerprint alone, and the fingerprint covers what the projection
+*reads*, not what it does with it — so every change here would have been silently
+copied over by the next run on an unchanged repository. `projection_version` is
+now stamped in the same transaction as the rows it describes. That is the
+parse-cache lesson of §22 and §23 one layer down, caught before it cost a session
+rather than after.
+
+**The corpus earned its place immediately.** Two detectors that had never once
+matched, and a split that covered one of two languages, were invisible to 734
+passing specs and to every measurement ever taken on this repository — because
+this repository is BoxLang. §2a said self-analysis flatters a code-graph tool and
+predicted exactly this class of finding. It took one six-file ColdFusion fixture
+to surface it.
+
+### Still open, deliberately
+
+- **The Cold-Read Protocol (§2a) has still never been run.** Everything above is a
+  structural measurement. Nobody has watched a reader answer the 17 questions.
+- **No UI surfaces the query endpoints.** `/neighbours`, `/hierarchy`, `/lineage`,
+  `/impact`, `/rules` and `/diff` are reachable by API and MCP only; the canvas
+  still uses `/graph`, `/subgraph`, `/edges`, `/paths` and `/search`. §11's Trace
+  and Assess journeys are API-complete and UI-absent.
+- **31% of symbols still have no edge**, mostly properties, tests, and functions
+  reached only dynamically. Local resolution addressed the affordable half; the
+  rest is dispatch a symbol index cannot prove, and is now reported as unresolved
+  rather than guessed at.
+- **`/hierarchy` is empty on this repository** and only the corpus proves it
+  works. A project with real inheritance is the missing evidence.

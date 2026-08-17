@@ -24,44 +24,17 @@ class threadsafe {
 		var seen = {};
 		for ( var node in arguments.nodes ) seen[ pathNormalizer.path( node.id ?: "" ) ] = true;
 		for ( var dep in arguments.dependencies ) {
-			if ( !isStruct( dep ) ) continue;
-			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
-			var id = "";
-			var role = "shared";
-			var component = "other";
-			if ( kind == "routes" || kind == "calls-api" ) {
-				var routePath = pathNormalizer.route( dep.target ?: "" );
-				id = len( routePath ) ? "route:" & routePath : "";
-				role = "entry";
-				component = "http-handlers";
-			} else if ( listFindNoCase( "table-query,table-read,table-write", kind ) ) {
-				id = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
-				role = "persistence";
-				component = "application-models";
-			} else if ( listFindNoCase( "http,schedule", kind ) ) {
-				id = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
-				role = "integration";
-				component = "other";
-			} else if ( kind == "emits" ) {
-				id = "event:" & lCase( trim( toString( dep.target ?: "event" ) ) );
-				role = "integration";
-				component = "other";
-			} else if ( kind == "reads-config" ) {
-				// A setting is a thing the system has, not just a line in a file.
-				// As a node it answers "what does this key affect" from either end.
-				id = "config:" & lCase( trim( toString( dep.target ?: "config" ) ) );
-				role = "shared";
-				component = "configuration";
-			}
-			if ( !len( id ) || listFindNoCase( "route:,config:,event:", id ) || seen.keyExists( pathNormalizer.path( id ) ) ) continue;
+			var id = resourceId( dep );
+			if ( !len( id ) || seen.keyExists( pathNormalizer.path( id ) ) ) continue;
 			seen[ pathNormalizer.path( id ) ] = true;
+			var meta = resourceMeta( id );
 			arguments.nodes.append( {
 				id          : id,
 				path        : id,
 				dir         : "",
-				component   : component,
-				layer       : component,
-				role        : role,
+				component   : meta.component,
+				layer       : meta.component,
+				role        : meta.role,
 				language    : "",
 				symbolCount : 0,
 				lineCount   : 0,
@@ -73,5 +46,46 @@ class threadsafe {
 			} );
 		}
 		arguments.nodes.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+	}
+
+	/**
+	 * The non-file entity a dependency points at, or "" when it points at a file.
+	 *
+	 * The single owner of this mapping. `CodeGraphProjectionService` needs the same
+	 * answer to give these entities edges, and two copies of "what does a
+	 * `table-write` row name" would drift the way five copies of `normalizePath`
+	 * once did.
+	 */
+	string function resourceId( required any dep ) {
+		if ( !isStruct( arguments.dep ) ) return "";
+		var kind = lCase( trim( toString( arguments.dep.kind ?: "" ) ) );
+		var target = trim( toString( arguments.dep.target ?: "" ) );
+		var id = "";
+		if ( kind == "routes" || kind == "calls-api" ) {
+			var routePath = pathNormalizer.route( target );
+			id = len( routePath ) ? "route:" & routePath : "";
+		} else if ( listFindNoCase( "table-query,table-read,table-write", kind ) ) {
+			id = "table:" & lCase( target );
+		} else if ( listFindNoCase( "http,schedule", kind ) ) {
+			id = kind & ":" & lCase( len( target ) ? target : kind );
+		} else if ( kind == "emits" ) {
+			id = "event:" & lCase( len( target ) ? target : "event" );
+		} else if ( kind == "reads-config" ) {
+			// A setting is a thing the system has, not just a line in a file.
+			// As a node it answers "what does this key affect" from either end.
+			id = "config:" & lCase( len( target ) ? target : "config" );
+		}
+		// A bare prefix names nothing; it would collapse every unnamed row of that
+		// kind onto one node and claim they were the same table or setting.
+		return listFindNoCase( "route:,config:,event:,table:,http:,schedule:", id ) ? "" : id;
+	}
+
+	/** Role and component for a resource id, so both producers label it alike. */
+	struct function resourceMeta( required string id ) {
+		var prefix = lCase( listFirst( arguments.id, ":" ) );
+		if ( prefix == "route" ) return { role: "entry", component: "http-handlers" };
+		if ( prefix == "table" ) return { role: "persistence", component: "application-models" };
+		if ( prefix == "config" ) return { role: "shared", component: "configuration" };
+		return { role: "integration", component: "other" };
 	}
 }
