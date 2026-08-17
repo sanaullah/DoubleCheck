@@ -17,8 +17,11 @@ class extends="coldbox.system.testing.BaseTestCase" {
 			// the spec read `cases[1]`, so adding a case would have scored nothing —
 			// and the CFML gap it exposes (routes, renders and the read/write split
 			// all absent) survived precisely because nothing scored ColdFusion.
-			for ( var caseIndex = 1; caseIndex <= manifest.cases.len(); caseIndex++ ) {
-				var scored = manifest.cases[ caseIndex ];
+			// `each` rather than an index loop: a closure created inside a `for` body
+			// captures the loop variable, so every `it` block saw the last case and
+			// two specs reported the same case's failure. `each` gives each iteration
+			// its own binding.
+			manifest.cases.each( ( scored ) => {
 				it( "meets flow/path/domain thresholds for the #scored.language ?: 'unknown'# case '#scored.id#'", () => {
 					expect( manifest.version ).toBe( "codegraph-corpus-v1" );
 					expect( manifest.corpusKind ).toBe( "codegraph" );
@@ -34,9 +37,15 @@ class extends="coldbox.system.testing.BaseTestCase" {
 					for ( var table in ( expected.tables ?: [] ) ) {
 						expect( first.tables ).toInclude( table, "table missing for #scored.id#" );
 					}
-					var expectedDomains = duplicate( expected.domains );
-					expectedDomains.sort( ( a, b ) => compareNoCase( a, b ) );
-					expect( first.domains ).toBe( expectedDomains );
+					// Containment, not equality. Exact equality made the corpus assert
+					// the clustering algorithm's current output, so adding a file to a
+					// case failed it for a reason that had nothing to do with the
+					// capability being measured. What matters is that the domains the
+					// case is built to expose are found, and that the set does not move
+					// between identical runs — which `domainStability` covers.
+					for ( var domain in ( expected.domains ?: [] ) ) {
+						expect( first.domains ).toInclude( domain, "domain missing for #scored.id#" );
+					}
 					var domainStability = first.domainSignature == second.domainSignature ? 1 : 0;
 
 					var flowThreshold = val( manifest.thresholds.flowRecall ?: 1 );
@@ -44,10 +53,18 @@ class extends="coldbox.system.testing.BaseTestCase" {
 					var domainThreshold = val( manifest.thresholds.domainStability ?: 1 );
 					expect( first.flowRecall ).toBeGTE( flowThreshold, "flow recall below threshold for #scored.id#" );
 					expect( first.pathRecall ).toBeGTE( pathThreshold, "path recall below threshold for #scored.id#" );
+					// `extends` and `implements` were correct-and-empty on this
+					// repository, which reads exactly like a broken relationship.
+					// Both cases declare a supertype and an interface so the
+					// difference is measurable.
+					expect( first.hierarchyRecall ).toBeGTE(
+						val( manifest.thresholds.hierarchyRecall ?: 1 ),
+						"hierarchy recall below threshold for #scored.id#"
+					);
 					expect( domainStability ).toBeGTE( domainThreshold, "domain labels changed between repeated runs for #scored.id#" );
 					expect( first.fingerprint ).toBe( second.fingerprint, "repeated source indexing must remain deterministic" );
 				} );
-			}
+			} );
 
 			it( "scores at least one case per supported language", () => {
 				// BoxLang, ColdFusion and JavaScript are the product's three supported

@@ -224,6 +224,8 @@ run still completes; do not treat deterministic labels as business meaning.
 | Resources | Routes, tables, configuration keys, events and outbound integrations are their own level, not files. Each carries its participants: who declares a route and which handler serves it, who reads a table and who writes it, which files read a setting |
 | Knowledge | With AI, domains, processes and risks are stored as nodes with `describes` / `affects` edges to the structure they explain, so "which risks touch this file" is a query. Every knowledge edge is marked `resolution: narrative`, `provenance: llm` — it is never evidence |
 | Completeness | Every capped collection reports `{ returned, available, omitted, rankedBy, complete, state }`, plus `unresolved` (run-level, with `unresolvedScope`) and `unsupported` — the behaviour static analysis cannot prove. The UI prints the loaded/available counts and names any relationship kind that produced nothing. Node truncation keeps the most connected files, not the alphabetically first |
+| Trace | Drawer tab: neighbours (what reaches this, what it reaches), type hierarchy, and table lineage by name. Each row carries kind, `file:line`, the source excerpt and a resolution badge, so a declaration and a name-match look different. Selecting a row moves the map |
+| Assess | Drawer tab: depth-bounded change impact grouped by hop, and architecture rules with per-violation evidence |
 | Query surface | `GET /codegraph/neighbours` (what calls this, what it calls), `/hierarchy` (extends / implements), `/lineage?table=` (readers and writers), `/impact?node=` (transitive callers, depth-bounded), `/onboarding` (where to start reading), `/diff?base=` (run over run), `/rules` (architecture fitness with violation evidence), `/mcp` (the same surface described as MCP tools) |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
 | Issues | Cycles, orphans, layer violations, hotspot ranking, reachability gaps |
@@ -322,6 +324,12 @@ passed; otherwise it reports the registry default with `measured: false`.
 | BoxLang | `unverified` | `parsed-dependency-aware` | `resources/evaluation-corpus/v1` passing its precision / recall / F1 / citation thresholds |
 | ColdFusion | `discovery-only` | — | **graph** structure is now scored by `codegraph-v1/cases/cfml-invoice-flow` (routes, renders, table read/write, full route→table path). That corpus deliberately does not promote a tier: the review corpus is what promotes, and ColdFusion still has none |
 | JavaScript | `discovery-only` | — | participates in both CodeGraph corpus cases through the `fetch` → route → handler → table path; no review corpus |
+
+**Hierarchy is scored, not assumed.** Both cases declare a supertype and an
+interface, because `extends` and `implements` are 0 on DoubleCheck itself — it
+inherits only from framework classes — and correct-and-empty is indistinguishable
+from broken. Adding them found that CFML produced no symbol for `interface`
+declarations at all, so `implements` could never resolve in a ColdFusion project.
 
 **What the CodeGraph corpus found.** It was added because self-analysis on a
 BoxLang repository cannot show that ColdFusion produces a weaker graph. On its

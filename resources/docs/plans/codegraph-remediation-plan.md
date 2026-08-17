@@ -2,7 +2,7 @@
 
 **Status: Phases 1–7, 9 and 10 complete (see §18–§24); Phases 8 and 11 proposed.**
 
-> **Read §31 and §32 first.** §31 is an independent audit (2026-08-17) that found
+> **Read §31, §32 and §33 first.** §31 is an independent audit (2026-08-17) that found
 > the product was building *two* graphs and serving the weaker one to every query
 > endpoint, plus six live defects. §32 records the remediation, measured. Anything
 > earlier in this document describes the graph as it was before that pass —
@@ -10,7 +10,9 @@
 > ledger were true of the extraction tables while the endpoints that consume them
 > answered "empty". **The rule §32 adds: verify a capability at the surface that
 > consumes it. A row in the extraction table is not a capability; a green endpoint
-> is.**
+> is.** §33 closes the three items §32 left open, including the first run of the
+> Cold-Read Protocol (§2a) — **14 of 17, and read its honesty label**: it is an
+> instrument run, not a human cold read.
 
 **Evidence base.** Every `file:line` was re-validated against the working tree on
 2026-08-16 (branch `dev3`, base `caf64b4`, worktree dirty and preserved). Counts
@@ -1836,3 +1838,137 @@ to surface it.
   rather than guessed at.
 - **`/hierarchy` is empty on this repository** and only the corpus proves it
   works. A project with real inheritance is the missing evidence.
+
+---
+
+## 33. The three remaining items, closed (2026-08-17)
+
+§32 left three things open and named them. All three are done, on a **dropped and
+rebuilt database** — the 956 MB working store was deleted and the schema
+recreated from `SchemaService`, so every number below comes from a first run
+against an empty database rather than from accumulated state.
+
+Suite: **734 passed / 0 failed / 0 errored / 1 skipped**. JS: **35 / 0**.
+
+### 33.1 The Cold-Read Protocol — run, with an honest label
+
+**14 of 17 questions fully answered, 3 partial, 0 unanswerable.** Every question
+was answered using only the CodeGraph HTTP surface — no source reads, no editor
+search — and scores `yes` only when the surface returned an answer *and* that
+answer carried checkable evidence.
+
+| | Verdict | Answered from | Evidence returned |
+|---|---|---|---|
+| Q1 organisation | yes | `/result` | 36 modules + project pitch |
+| Q2 domains | yes | narrative + `level=cluster` | 24 named domains |
+| Q3 entry points | yes | `/onboarding` | `app/handlers/ApiAI.bx:24` |
+| Q4 what starts work | yes | `/graph?level=resource` | 52 routes · 1 schedule · 20 events |
+| Q5 JS → route | yes | `/neighbours` | `public/assets/app.js:8292 --calls-api--> route` |
+| Q6 route → handler | yes | `/neighbours` | `route --routes-to--> ApiRuns.bx` |
+| Q7 services → tables | yes | `/lineage?table=` | `review_runs`: 56 writers, 21 readers |
+| **Q8 response / side effect** | **partial** | `/result` flows | 14 of 31 flows name a sink; no response modelling (**G4**) |
+| **Q9 symbol relations** | **partial** | `/neighbours` | calls, constructs, injects, tests, describes, affects; no defines-vs-references (**G5**) |
+| Q10 configuration | yes | `/neighbours` | `config:datasource` read by 38 files |
+| **Q11 tests** | **partial** | `/neighbours` | file-level `tests` edges only; no test→symbol link |
+| Q12 change impact | yes | `/impact` | 88 impacted, `state: truncated` |
+| Q13 cycles / violations | yes | `/rules` + `/result` | 2 cycles, 11 orphans, 14 violations with evidence |
+| Q14 proven vs inferred | yes | every completeness block | state · unresolved · unsupported · per-edge resolution |
+| Q15 where to start | yes | `/onboarding` | 18 ranked entries, each with a reason |
+| Q16 what matters most | yes | `/result` | 50 ranked hotspots + per-node rationale |
+| Q17 external systems | yes | `/graph?level=resource` | 4 outbound integrations |
+
+That matches §2a's "after Phase 9" target of 14 of 17.
+
+**What this is, and what it is not.** This is an **instrument run**: it proves the
+surface can produce each answer with evidence attached. It is *not* a human cold
+read. §2a asks for a reader who has never seen the project, and no such reader
+has been found; the three remaining partials are capability gaps (G4, G5,
+test→symbol), not comprehension failures, so an instrument can see them. What an
+instrument cannot see is whether a stranger would *find* these endpoints, phrase
+the question the way the API expects, or trust the answer. **Treat 14 of 17 as a
+capability measurement. The human half of §2a is still unrun**, and the score
+should not be quoted as though it were.
+
+**The protocol earned its keep on its first run.** Q6 came back
+`route --routes-to--> app/config/Router.bx` — a route served by its own router,
+which is not a fact. Cause: the `routes-to` edge was emitted for `calls-api` rows
+as well as `routes` rows, and a `calls-api` row resolves to the file that
+*declares* the route, not the one that handles it. Fixed; the route now reads
+exactly right:
+
+```
+IN : calls-api  public/assets/app.js
+     declares   app/config/Router.bx
+     describes  "Run Rebuild with AI Provider Resolution"   (knowledge)
+OUT: routes-to  app/handlers/ApiRuns.bx
+```
+
+One query, the whole cross-language chain, plus what it means. Found by asking
+the seventeen questions rather than by reading the code — which is the entire
+argument for §2a existing.
+
+### 33.2 `/hierarchy` is proven, not merely correct
+
+`extends` and `implements` were 0 on this repository and correct at 0: DoubleCheck
+inherits only from framework classes. Correct-and-empty is indistinguishable from
+broken, so both corpus cases now declare a supertype **and** an interface, and
+`hierarchyRecall` is a scored threshold beside flow and path recall.
+
+Adding them found one more gap: **CFML produced no symbol for `interface`
+declarations at all**, so a CFC declaring `implements="IHandlerContract"` had
+nothing to resolve against and the dependency stayed permanently unresolved. The
+component matcher covered `component` and `<cfcomponent>` and neither interface
+form. Fixed in `cfml-symbol-parser-v8`; both languages now resolve both relations
+inside the case:
+
+```
+BoxLang: OrderHandler.bx   --extends-->    BaseHandler.bx
+         BaseHandler.bx    --implements--> IHandlerContract.bx
+CFML:    InvoiceHandler.cfc --extends-->    BaseHandler.cfc
+         BaseHandler.cfc    --implements--> IHandlerContract.cfc
+```
+
+This is the third CFML defect the corpus has surfaced in two sessions, after the
+backspace-byte detectors and the BoxLang-only read/write split. Each was
+invisible to a green suite because the suite only ever measured BoxLang.
+
+### 33.3 Trace and Assess — §11's journeys, in the product
+
+Six endpoints shipped and were reachable only by curl. Two drawer tabs now carry
+them:
+
+- **Trace** — neighbours (what reaches this, what it reaches), type hierarchy, and
+  table lineage by name. Every row shows kind, `file:line`, the source excerpt,
+  and a **resolution badge**, so a declaration and a name-match are visually
+  different without opening the file.
+- **Assess** — depth-bounded change impact grouped by hop, and architecture rules
+  with per-violation evidence.
+
+Both key off the canvas selection, and every result row selects that file on the
+map, so the answer and the picture stay in step. The completeness account renders
+too — including `unresolved`, labelled *"in run"* so nobody reads it as rows
+dropped from the answer they are looking at.
+
+Verified in a live browser against a real run, not asserted: `/neighbours`,
+`/hierarchy`, `/lineage`, `/impact` and `/rules` all returned 200 from the UI,
+27 incoming edges rendered for `FindingService`, lineage returned 77 rows for
+`review_runs`, impact returned 88 across 3 hops, and clicking an impact row moved
+the map selection from `findingservice.bx` to `aireviewservice.bx`.
+
+The knowledge layer shows up here without being asked for: tracing
+`FindingService` returns an `affects` edge, badged `narrative`, carrying the risk
+briefing about that file. Structure and meaning in one list, with the
+interpretive rows marked as interpretive.
+
+### 33.4 What is still open
+
+- **The human half of the Cold-Read Protocol.** §2a wants a reader who has never
+  seen the project, and ideally an unfamiliar ColdFusion repository. The corpus
+  now covers CFML *fidelity*; it says nothing about CFML *comprehension*.
+- **G4 (response / side-effect modelling)** — 17 of 31 flows still end at
+  `sinkKind: unknown`.
+- **G5 (defines vs references)** — no anchor entity, so `/references` cannot exist.
+- **Test → symbol linkage** — `tests` edges remain file-level.
+
+These are the three partials in §33.1 and they are capability work, not defects.
+Nothing in this section is a known-broken path.

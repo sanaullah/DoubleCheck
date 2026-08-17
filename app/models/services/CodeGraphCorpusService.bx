@@ -37,11 +37,18 @@ class threadsafe {
 			}
 			if ( scored.flowRecall < val( thresholds.flowRecall ?: 1 ) ) failures.append( "#corpusCase.id#: flow recall #scored.flowRecall#" );
 			if ( scored.pathRecall < val( thresholds.pathRecall ?: 1 ) ) failures.append( "#corpusCase.id#: path recall #scored.pathRecall#" );
+			if ( scored.hierarchyRecall < val( thresholds.hierarchyRecall ?: 1 ) ) failures.append( "#corpusCase.id#: hierarchy recall #scored.hierarchyRecall#" );
 			results.append( {
 				id      : corpusCase.id,
 				language: corpusCase.language ?: "unknown",
 				passed  : !failures.len(),
-				metrics : { flowRecall: scored.flowRecall, pathRecall: scored.pathRecall, routes: scored.routes.len(), tables: scored.tables.len() },
+				metrics : {
+					flowRecall     : scored.flowRecall,
+					pathRecall     : scored.pathRecall,
+					hierarchyRecall: scored.hierarchyRecall,
+					routes         : scored.routes.len(),
+					tables         : scored.tables.len()
+				},
 				failures: failures,
 				score   : scored
 			} );
@@ -122,8 +129,38 @@ class threadsafe {
 			routes         : routeSet,
 			tables         : tableSet,
 			flowRecall     : flowRecall( snapshot, arguments.corpusCase ),
-			pathRecall     : pathRecall( reviewGraph, arguments.corpusCase )
+			pathRecall     : pathRecall( reviewGraph, arguments.corpusCase ),
+			hierarchyRecall: hierarchyRecall( dependencies, arguments.corpusCase )
 		};
+	}
+
+	/**
+	 * Does the graph find the declared supertypes and interfaces?
+	 *
+	 * Scored against resolved dependencies rather than the snapshot, because
+	 * `extends` and `implements` are what `/hierarchy` reads and they must resolve
+	 * to a file inside the case. An unresolved supertype is the failure mode this
+	 * measures: `coldbox.system.web.routing.Router` once "resolved" to whatever
+	 * file happened to be named `Router`.
+	 */
+	private numeric function hierarchyRecall( required array dependencies, required struct corpusCase ) {
+		var expected = arguments.corpusCase.expected.hierarchy ?: [];
+		if ( !expected.len() ) return 1;
+		var matches = 0;
+		for ( var wanted in expected ) {
+			for ( var edge in arguments.dependencies ) {
+				if ( lCase( toString( edge.kind ?: "" ) ) != lCase( wanted.kind ) ) continue;
+				if ( lCase( normalize( edge.sourceFile ?: "" ) ) != lCase( normalize( wanted.from ) ) ) continue;
+				if ( lCase( normalize( edge.targetFile ?: "" ) ) != lCase( normalize( wanted.to ) ) ) continue;
+				matches++;
+				break;
+			}
+		}
+		return matches / expected.len();
+	}
+
+	private string function normalize( required any path ) {
+		return replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
 	}
 
 	private array function readCaseFiles( required any caseRoot ) {

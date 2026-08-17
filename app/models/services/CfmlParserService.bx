@@ -8,11 +8,12 @@
 
 @singleton
 class {
+	// v8: `interface` declarations produce a symbol, so `implements` can resolve.
 	// v7: the `routes` and `renders` detectors held a literal backspace byte where
 	// `\b` was intended, so neither could ever match, and the SQL read/write split
 	// was BoxLang-only. All three change what this parser extracts, so the version
 	// moves or the parse cache serves the old results.
-	variables.parserVersion = "cfml-symbol-parser-v7";
+	variables.parserVersion = "cfml-symbol-parser-v8";
 	variables.patternCache  = {};
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 	variables.integrationDetector = new app.models.services.IntegrationDetector();
@@ -47,17 +48,24 @@ class {
 				continue;
 			}
 
-			// <cfcomponent name="..." extends="..." implements="...">
-			var tagComponentMatch = match( "<cfcomponent\b", sourceLine );
-			// script: component extends="..." implements="..." { ... }
-			var scriptComponentMatch = match( "^\s*(?:final\s+|abstract\s+)?component\b", sourceLine );
+			// <cfcomponent name="..." extends="..." implements="..."> and
+			// <cfinterface> | script: component ... { } and interface { }
+			//
+			// The interface forms were missing entirely, so a CFC declaring
+			// `implements="IHandlerContract"` had nothing to resolve against: the
+			// dependency was extracted and then went unresolved forever, because
+			// target resolution matches against `class` and `interface` symbols and
+			// no CFML file ever produced the second kind.
+			var tagComponentMatch = match( "<cf(?:component|interface)\b", sourceLine );
+			var scriptComponentMatch = match( "^\s*(?:final\s+|abstract\s+)?(?:component|interface)\b", sourceLine );
 			var isTagComponent = tagComponentMatch.find();
 			if ( isTagComponent || scriptComponentMatch.find() ) {
 				var componentTagText = isTagComponent ? joinTagLines( arguments.file.lines, lineNumber ).text : sourceLine;
 				var componentName = attribute( componentTagText, "name" );
+				var declaredKind = reFindNoCase( "(<cfinterface\b|^\s*interface\b)", sourceLine ) > 0 ? "interface" : "class";
 				symbols.append(
 						symbol(
-							"class",
+							declaredKind,
 							len( componentName ) ? componentName : className,
 							lineNumber,
 							sourceLine

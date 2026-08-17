@@ -1,4 +1,4 @@
-component {
+component extends="BaseHandler" {
 
     property name="invoiceService" inject="InvoiceService";
 

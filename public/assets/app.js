@@ -5324,6 +5324,7 @@ async function codeGraphOpenFile(pathOrId, { neighbourhood = false } = {}) {
 		el.classList.toggle("is-selected", codeGraphIdsEqual(el.getAttribute("data-node-id"), id));
 	});
 	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(laid);
+	refreshCodeGraphQueryPanels();
 	codeGraphCentreOnNode(id);
 	void codeGraphLoadSymbols(node?.path || id);
 }
@@ -5652,6 +5653,204 @@ async function renderCodeGraphStartHere(host) {
 			</button>`).join("");
 		return `<section class="codegraph-starthere-group"><h3>${escapeHtml(titles[section] || section)}</h3>${rows}</section>`;
 	}).join("") + `</div>`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Trace and Assess — §11's second and third comprehension journeys.
+ *
+ * The endpoints behind these shipped and were reachable only by curl, so the
+ * questions they answer were API-complete and invisible in the product. Each
+ * panel is a thin read of one endpoint: no client-side graph traversal, because
+ * the server already refuses to confuse "no graph" with "no result" and
+ * re-deriving that here would give the UI a second, weaker opinion.
+ * ------------------------------------------------------------------------- */
+
+/** Shared rendering for a completeness account, so every panel says the same thing. */
+function codeGraphAccountHtml(account) {
+	if (!account) return "";
+	const state = String(account.state || "");
+	const bits = [];
+	if (state) bits.push(`<span class="cg-account-state" data-state="${escapeHtml(state)}">${escapeHtml(state)}</span>`);
+	if (Number(account.available)) bits.push(`${Number(account.returned)} of ${Number(account.available)}`);
+	if (Number(account.omitted)) bits.push(`${Number(account.omitted)} not shown`);
+	// An unresolved reference is a first-class result, not an omission — the
+	// count is the run's, and the label says so rather than implying this answer
+	// dropped them.
+	if (Number(account.unresolved)) {
+		bits.push(`<span class="cg-account-unresolved" title="References the parsers could not bind anywhere in this run. Not omitted from this answer.">${Number(account.unresolved).toLocaleString()} unresolved in run</span>`);
+	}
+	if (!bits.length) return "";
+	return `<p class="cg-account">${bits.join(" · ")}</p>`;
+}
+
+function codeGraphEdgeRowHtml(edge, { arrow }) {
+	const label = String(edge.symbolName || edge.path || edge.to || edge.from || "");
+	const line = Number(edge.line) ? `:${Number(edge.line)}` : "";
+    const resolution = String(edge.resolution || "");
+	const confidence = String(edge.confidence || "");
+	const evidence = String(edge.evidence || "");
+	return `<button type="button" class="cg-query-row" data-cg-goto="${escapeHtml(String(edge.path || ""))}">
+		<span class="cg-query-kind">${escapeHtml(String(edge.kind || ""))}</span>
+		<span class="cg-query-arrow" aria-hidden="true">${arrow}</span>
+		<span class="cg-query-label">${escapeHtml(label)}${escapeHtml(line)}</span>
+		${resolution ? `<span class="cg-badge" data-resolution="${escapeHtml(resolution)}" title="${escapeHtml(resolution)} / ${escapeHtml(confidence)}">${escapeHtml(resolution)}</span>` : ""}
+		${evidence ? `<code class="cg-query-evidence">${escapeHtml(evidence.slice(0, 120))}</code>` : ""}
+	</button>`;
+}
+
+async function codeGraphQuery(path) {
+	const runId = state.activeRun?.id || "";
+	if (!runId) throw new Error("no active run");
+	const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/${path}`);
+	return payload?.data || null;
+}
+
+/** Both panels key off the canvas selection, so tracing is one click from the map. */
+function codeGraphSelectedNodeId() {
+	const selected = String(state.codegraph.selectedId || "");
+	if (!selected) return "";
+	// The canvas selects by path; the levelled tables key on a prefixed id.
+	if (/^(file|symbol|cluster|dir|resource|knowledge):/i.test(selected)) return selected;
+	return `file:${selected.replace(/\\/g, "/").toLowerCase()}`;
+}
+
+async function renderCodeGraphTrace() {
+	const status = document.querySelector("#codegraph-trace-status");
+	const neighbourHost = document.querySelector("#codegraph-trace-neighbours");
+	const hierarchyHost = document.querySelector("#codegraph-trace-hierarchy");
+	if (!neighbourHost || !hierarchyHost) return;
+	const node = codeGraphSelectedNodeId();
+	if (!node) {
+		if (status) status.textContent = "Select a node on the map to trace it.";
+		neighbourHost.innerHTML = `<p class="codegraph-empty-hint">Nothing selected.</p>`;
+		hierarchyHost.innerHTML = "";
+		return;
+	}
+	if (status) status.textContent = node;
+	neighbourHost.innerHTML = `<p class="codegraph-empty-hint">Reading…</p>`;
+	hierarchyHost.innerHTML = "";
+	try {
+		const [neighbours, hierarchy] = await Promise.all([
+			codeGraphQuery(`neighbours?node=${encodeURIComponent(node)}&limit=60`),
+			codeGraphQuery(`hierarchy?node=${encodeURIComponent(node)}`)
+		]);
+		const incoming = neighbours?.incoming || [];
+		const outgoing = neighbours?.outgoing || [];
+		neighbourHost.innerHTML = (incoming.length || outgoing.length)
+			? `${incoming.length ? `<h5>Reached by ${incoming.length}</h5>${incoming.map((e) => codeGraphEdgeRowHtml(e, { arrow: "←" })).join("")}` : ""}
+			   ${outgoing.length ? `<h5>Reaches ${outgoing.length}</h5>${outgoing.map((e) => codeGraphEdgeRowHtml(e, { arrow: "→" })).join("")}` : ""}
+			   ${codeGraphAccountHtml(neighbours?.completeness)}`
+			: `<p class="codegraph-empty-hint">No edges touch this node.</p>${codeGraphAccountHtml(neighbours?.completeness)}`;
+
+		const ancestors = hierarchy?.ancestors || [];
+		const descendants = hierarchy?.descendants || [];
+		hierarchyHost.innerHTML = (ancestors.length || descendants.length)
+			? `${ancestors.length ? `<h5>Extends / implements</h5>${ancestors.map((e) => codeGraphEdgeRowHtml(e, { arrow: "→" })).join("")}` : ""}
+			   ${descendants.length ? `<h5>Extended by</h5>${descendants.map((e) => codeGraphEdgeRowHtml(e, { arrow: "←" })).join("")}` : ""}`
+			// Distinguish "nothing inherits here" from "inheritance is broken":
+			// the graph knows the difference and the reader should see it.
+			: `<p class="codegraph-empty-hint">No declared supertype or interface. Inheritance from framework classes outside this repository is not graphed.</p>`;
+	} catch (error) {
+		neighbourHost.innerHTML = `<p class="codegraph-empty-hint">Could not trace this node: ${escapeHtml(error.message || "unavailable")}</p>`;
+	}
+}
+
+async function renderCodeGraphLineage() {
+	const host = document.querySelector("#codegraph-trace-lineage");
+	const input = document.querySelector("#codegraph-lineage-table");
+	if (!host || !input) return;
+	const table = String(input.value || "").trim();
+	if (!table) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Name a table.</p>`;
+		return;
+	}
+	host.innerHTML = `<p class="codegraph-empty-hint">Reading…</p>`;
+	try {
+		const lineage = await codeGraphQuery(`lineage?table=${encodeURIComponent(table)}`);
+		const readers = lineage?.readers || [];
+		const writers = lineage?.writers || [];
+		host.innerHTML = (readers.length || writers.length)
+			? `${writers.length ? `<h5>Writes ${writers.length}</h5>${writers.map((r) => `<button type="button" class="cg-query-row" data-cg-goto="${escapeHtml(String(r.path || ""))}"><span class="cg-query-kind">write</span><span class="cg-query-label">${escapeHtml(String(r.path || r.node))}</span></button>`).join("")}` : ""}
+			   ${readers.length ? `<h5>Reads ${readers.length}</h5>${readers.map((r) => `<button type="button" class="cg-query-row" data-cg-goto="${escapeHtml(String(r.path || ""))}"><span class="cg-query-kind">read</span><span class="cg-query-label">${escapeHtml(String(r.path || r.node))}</span></button>`).join("")}` : ""}
+			   ${codeGraphAccountHtml(lineage?.completeness)}`
+			: `<p class="codegraph-empty-hint">No file reads or writes <code>${escapeHtml(table)}</code> in this run.</p>`;
+	} catch (error) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Could not read lineage: ${escapeHtml(error.message || "unavailable")}</p>`;
+	}
+}
+
+async function renderCodeGraphImpact() {
+	const host = document.querySelector("#codegraph-assess-impact");
+	const status = document.querySelector("#codegraph-assess-status");
+	if (!host) return;
+	const node = codeGraphSelectedNodeId();
+	if (!node) {
+		if (status) status.textContent = "Select a node on the map to assess it.";
+		host.innerHTML = `<p class="codegraph-empty-hint">Nothing selected.</p>`;
+		return;
+	}
+	if (status) status.textContent = node;
+	const depth = Number(document.querySelector("#codegraph-impact-depth")?.value || 3);
+	host.innerHTML = `<p class="codegraph-empty-hint">Walking callers…</p>`;
+	try {
+		const impact = await codeGraphQuery(`impact?node=${encodeURIComponent(node)}&depth=${depth}&limit=200`);
+		const items = impact?.impacted || [];
+		if (!items.length) {
+			host.innerHTML = `<p class="codegraph-empty-hint">Nothing depends on this node.</p>${codeGraphAccountHtml(impact?.completeness)}`;
+			return;
+		}
+		const byDepth = {};
+		items.forEach((item) => { (byDepth[item.depth] = byDepth[item.depth] || []).push(item); });
+		host.innerHTML = Object.keys(byDepth).sort((a, b) => Number(a) - Number(b)).map((d) => `
+			<h5>${Number(d) === 1 ? "Directly" : `${d} hops`} — ${byDepth[d].length}</h5>
+			${byDepth[d].map((item) => {
+				const path = String(item.node || "").replace(/^(file|symbol|resource|knowledge):/, "");
+				return `<button type="button" class="cg-query-row" data-cg-goto="${escapeHtml(path)}"><span class="cg-query-label">${escapeHtml(path)}</span></button>`;
+			}).join("")}
+		`).join("") + codeGraphAccountHtml(impact?.completeness);
+	} catch (error) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Could not assess impact: ${escapeHtml(error.message || "unavailable")}</p>`;
+	}
+}
+
+async function renderCodeGraphRules() {
+	const host = document.querySelector("#codegraph-assess-rules");
+	if (!host) return;
+	if (host.dataset.run === (state.activeRun?.id || "")) return;
+	host.innerHTML = `<p class="codegraph-empty-hint">Checking boundaries…</p>`;
+	try {
+		const payload = await codeGraphQuery("rules");
+		host.dataset.run = state.activeRun?.id || "";
+		const rules = payload?.rules || [];
+		if (!rules.length) {
+			host.innerHTML = `<p class="codegraph-empty-hint">No architecture rules are configured.</p>`;
+			return;
+		}
+		host.innerHTML = rules.map((rule) => {
+			const violations = rule.violations || [];
+			return `<div class="cg-rule" data-passed="${rule.passed ? "true" : "false"}">
+				<p class="cg-rule-head"><span class="cg-badge" data-resolution="${rule.passed ? "exact" : "violation"}">${rule.passed ? "holds" : `${violations.length} violation${violations.length === 1 ? "" : "s"}`}</span> ${escapeHtml(String(rule.description || rule.id || ""))}</p>
+				${violations.slice(0, 8).map((v) => `<button type="button" class="cg-query-row" data-cg-goto="${escapeHtml(String(v.from || "").replace(/^file:/, ""))}">
+					<span class="cg-query-kind">${escapeHtml(String(v.kind || ""))}</span>
+					<span class="cg-query-label">${escapeHtml(String(v.from || "").replace(/^file:/, ""))}${Number(v.line) ? ":" + Number(v.line) : ""} → ${escapeHtml(String(v.to || "").replace(/^file:/, ""))}</span>
+					${v.evidence ? `<code class="cg-query-evidence">${escapeHtml(String(v.evidence).slice(0, 110))}</code>` : ""}
+				</button>`).join("")}
+			</div>`;
+		}).join("");
+	} catch (error) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Could not check rules: ${escapeHtml(error.message || "unavailable")}</p>`;
+	}
+}
+
+/** Re-read whichever query panel is showing; called on selection and tab change. */
+function refreshCodeGraphQueryPanels() {
+	const tab = elements.codegraphDrawer?.dataset.tab || "";
+	if (tab === "trace") void renderCodeGraphTrace();
+	if (tab === "assess") {
+		const button = document.querySelector("#codegraph-impact-run");
+		if (button) button.disabled = !codeGraphSelectedNodeId();
+		void renderCodeGraphRules();
+	}
 }
 
 /**
@@ -6068,6 +6267,7 @@ function codeGraphSelectNode(nodeId, { drill = false } = {}) {
 	});
 	elements.codegraphCanvas?.querySelectorAll(".cg-edge").forEach((el) => el.classList.remove("is-selected"));
 	if (elements.codegraphInspector) elements.codegraphInspector.innerHTML = codeGraphInspectorHtml(node);
+	refreshCodeGraphQueryPanels();
 	// Overview: select only unless explicit drill (Explore / double-click / Enter)
 	if (onOverview && node.kind === "cluster") {
 		if (!drill) return;
@@ -8504,6 +8704,35 @@ elements.codegraphDrawerTabs?.addEventListener("click", (event) => {
 	const active = elements.codegraphDrawer?.dataset.tab;
 	const isOpen = elements.codegraphDrawer?.dataset.open === "true";
 	setCodeGraphDrawer({ tab: tab.dataset.cgDrawer, open: !(isOpen && active === tab.dataset.cgDrawer) });
+	// Query panels read on show rather than on every selection, so switching to
+	// an unopened tab does not cost two requests the reader never sees.
+	refreshCodeGraphQueryPanels();
+});
+
+// One delegated handler for both query panels: every result row names a file, and
+// clicking it selects that file on the map so the answer and the picture agree.
+elements.codegraphDrawer?.addEventListener("click", (event) => {
+	const goTo = event.target.closest("[data-cg-goto]");
+	if (goTo) {
+		const path = String(goTo.dataset.cgGoto || "").trim();
+		if (path) void codeGraphOpenFile(path);
+		return;
+	}
+	if (event.target.closest("#codegraph-lineage-run")) {
+		void renderCodeGraphLineage();
+		return;
+	}
+	if (event.target.closest("#codegraph-impact-run")) {
+		void renderCodeGraphImpact();
+	}
+});
+
+elements.codegraphDrawer?.addEventListener("keydown", (event) => {
+	if (event.key !== "Enter") return;
+	if (event.target.closest("#codegraph-lineage-table")) {
+		event.preventDefault();
+		void renderCodeGraphLineage();
+	}
 });
 
 elements.codegraphRoleLegend?.addEventListener("click", (event) => {
