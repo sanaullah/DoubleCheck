@@ -84,6 +84,35 @@ class threadsafe {
 	 * about. More rules than a reader will actually maintain is how a rule set
 	 * becomes noise that everyone learns to ignore.
 	 */
+	/**
+	 * Does an edge between two layers break the configured layer policy?
+	 *
+	 * The policy is comma-separated `from>to` pairs; `*` on either side means
+	 * "any layer", so "nothing may depend on this" is expressible without naming
+	 * every counterpart. Lives here rather than in the metrics service so layer
+	 * rules have one owner.
+	 */
+	boolean function isLayerViolation( required string fromLayer, required string toLayer, any policy = "" ) {
+		var rules = [];
+		if ( isArray( arguments.policy ?: "" ) ) {
+			rules = arguments.policy;
+		} else {
+			var raw = trim( toString( arguments.policy ?: "" ) );
+			if ( !len( raw ) ) raw = "application-models>http-handlers";
+			for ( var rule in listToArray( raw, "," ) ) rules.append( trim( rule ) );
+		}
+		for ( var rule in rules ) {
+			var parts = listToArray( toString( rule ), ">" );
+			if ( parts.len() != 2 ) continue;
+			var fromRule = lCase( trim( parts[ 1 ] ) );
+			var toRule = lCase( trim( parts[ 2 ] ) );
+			var fromMatches = fromRule == "*" || fromRule == lCase( arguments.fromLayer );
+			var toMatches = toRule == "*" || toRule == lCase( arguments.toLayer );
+			if ( fromMatches && toMatches ) return true;
+		}
+		return false;
+	}
+
 	array function defaultRules() {
 		return [
 			{ id: "models-must-not-call-handlers", description: "Application models must not depend on HTTP handlers", from: "/models/", to: "/handlers/", allowed: false },

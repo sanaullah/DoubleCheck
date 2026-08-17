@@ -5116,7 +5116,7 @@ function codeGraphCompletenessLines(completeness) {
 		sinkCoverage: "widest coverage first",
 		severity: "most severe first"
 	};
-	return Object.entries(completeness)
+	const lines = Object.entries(completeness)
 		.filter(([, value]) => value && typeof value === "object" && Number(value.omitted) > 0)
 		.sort((a, b) => Number(b[1].omitted) - Number(a[1].omitted))
 		.map(([key, value]) => {
@@ -5126,6 +5126,23 @@ function codeGraphCompletenessLines(completeness) {
 			const total = Number(value.available).toLocaleString();
 			return `${shown} of ${total} ${label}${ranking ? ` — kept ${ranking}` : ""}`;
 		});
+
+	// An unresolved reference is a different fact from an omitted one: the graph
+	// saw the call and could not prove where it goes. It is not a cap and no
+	// bigger limit recovers it, so it is stated separately rather than folded
+	// into the "kept N of M" lines — that is what "what could this tool not
+	// prove" looks like when answered honestly.
+	const unresolved = Number(completeness?.dependencies?.unresolved) || 0;
+	if (unresolved > 0) {
+		lines.push(`${unresolved.toLocaleString()} references could not be resolved to a file — recorded, not drawn`);
+	}
+	const starved = Array.isArray(completeness?.dependencies?.starvedKinds)
+		? completeness.dependencies.starvedKinds
+		: [];
+	if (starved.length) {
+		lines.push(`no ${starved.join(", ")} relationships survived the load limit`);
+	}
+	return lines;
 }
 
 function codeGraphTruncationMessage(reasons, viewTruncated) {
@@ -5652,7 +5669,13 @@ function paintCodeGraphCanvas(options = {}) {
 			})),
 			clusters: []
 		};
-		view = CG.buildFileView(drawable, { maxNodes: 120, detail: true, focus: state.codegraph.focusId || "" });
+		// buildFileView labels by path — identical for every symbol in one file —
+		// and orders by path, which is no order at all here. buildSymbolView
+		// labels by symbol name and follows the source line.
+		view = CG.buildSymbolView(
+			{ nodes: level?.nodes || [], edges: drawable.edges, focus: state.codegraph.focusId || "" },
+			{ maxNodes: 120, detail: true, focus: state.codegraph.focusId || "" }
+		);
 	} else if (depth === "file") {
 		const clusterId = state.codegraph.clusterId;
 		const edgesKey = String(clusterId || "__all__");
@@ -5729,7 +5752,10 @@ function paintCodeGraphCanvas(options = {}) {
 	}
 	if (elements.codegraphTruncation) {
 		const reasons = [].concat(snapshot.truncationReasons || snapshot.truncation_reasons || []).filter(Boolean);
-		const show = state.codegraph.viewTruncated || !!snapshot.truncated;
+		// Unresolved references are worth stating even on an untruncated snapshot;
+		// "complete" and "everything was provable" are not the same claim.
+		const hasUnresolved = Number(snapshot.completeness?.dependencies?.unresolved) > 0;
+		const show = state.codegraph.viewTruncated || !!snapshot.truncated || hasUnresolved;
 		elements.codegraphTruncation.hidden = !show;
 		if (show) {
 			// Two different losses, and the on-screen one was never counted: the

@@ -10,10 +10,12 @@ class extends="coldbox.system.RestHandler" {
 	property name="codeGraphGraphRepository" inject="CodeGraphGraphRepository";
 	property name="architectureRuleService" inject="ArchitectureRuleService";
 	property name="codeGraphQueryRepository" inject="CodeGraphQueryRepository";
+	property name="mcpDescriptor" inject="CodeGraphMcpDescriptor";
 
 	property name="runService" inject="ReviewRunService";
 
 	property name="securityContextService" inject="SecurityContextService";
+	property name="log" inject="logbox:logger:{this}";
 
 	property name="codegraphSubgraphMaxNodes" inject="coldbox:setting:codegraphSubgraphMaxNodes";
 
@@ -624,13 +626,57 @@ class extends="coldbox.system.RestHandler" {
 			);
 	}
 
+	/**
+	 * The CodeGraph query surface described as MCP tools.
+	 *
+	 * Descriptor only — it does not speak the protocol. An adapter fetches this
+	 * and translates, so the tool contract lives in one place instead of being
+	 * reimplemented alongside a transport.
+	 *
+	 * Gated on the run having levelled rows, because that is the whole reason the
+	 * descriptor exists: an agent cannot tell an empty graph from an empty result,
+	 * and would report that a symbol has no callers when the truth is that nothing
+	 * was ever indexed.
+	 *
+	 * @tags CodeGraph
+	 * @hint MCP tool descriptor for this run's graph
+	 * @response-200 Tool descriptor
+	 * @response-404 Run not found
+	 * @response-409 Run has no levelled graph
+	 */
+	function mcp( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		if ( !codeGraphGraphRepository.hasGraph( run.getId() ) ) {
+			return event.renderData(
+				type       = "json",
+				statusCode = 409,
+				data       = { error: { code: "snapshot_predates_node_tables", message: "This run has no levelled graph. Rebuild the map before exposing it to an agent." } }
+			);
+		}
+		// Both halves: the tools an adapter would expose, and the contract those
+		// tools promise. Serving the contract alone described guarantees for tools
+		// the caller could not see.
+		event.renderData(
+			type = "json",
+			data = { data: { runId: run.getId(), tools: mcpDescriptor.tools(), contract: mcpDescriptor.contract() } }
+		);
+	}
+
 	private boolean function hasIndexedGraph( required any run ) {
 		try {
 			var graph = graphRepository.getGraph( runId = arguments.run.getId(), resultLimit = 1 );
 			var summary = isStruct( graph.summary ?: "" ) ? graph.summary : {};
 			return val( summary.filesAnalyzed ?: 0 ) > 0 || ( isArray( graph.symbols ?: "" ) && graph.symbols.len() > 0 ) || ( isArray( graph.dependencies ?: "" ) && graph.dependencies.len() > 0 );
-		} catch ( any ignored ) {
-			return false;
+		} catch ( any lookupError ) {
+			// A storage failure is not the same as an unindexed run. Swallowing it
+			// here rendered a real error as "Review run not found", which sent the
+			// reader looking for a run that exists and is intact.
+			log.error( "CodeGraph index lookup failed for run [#arguments.run.getId()#]", lookupError );
+			throw(
+				type    = "GraphUnavailableException",
+				message = "Could not read the analysis graph for this run: #lookupError.message#"
+			);
 		}
 	}
 }

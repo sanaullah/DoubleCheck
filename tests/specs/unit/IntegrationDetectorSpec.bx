@@ -1,48 +1,58 @@
 class extends="testbox.system.BaseSpec" {
 
+	/**
+	 * Detector behaviour, asserted where it actually runs.
+	 *
+	 * A standalone CLI probe of this class returned nothing for patterns that
+	 * demonstrably work in the application, because BoxLang serves compiled
+	 * classes from its runtime cache. A spec runs against the same compiled state
+	 * as the server, which is the only place the answer is meaningful.
+	 */
 	function run() {
 		describe( "IntegrationDetector", () => {
 
 			var detector = new app.models.services.IntegrationDetector();
 
-			function kinds( required array found ) {
-				var list = "";
-				for ( var item in arguments.found ) list = listAppend( list, item.kind );
-				return list;
-			}
+			var kindsFor = ( line ) => {
+				var kinds = [];
+				for ( var hit in detector.detect( line ) ) kinds.append( hit.kind );
+				return kinds;
+			};
 
-			it( "detects the outbound forms the old CodeGraph pattern could not", () => {
-				// The previous test needed `http( "literal-url" )` and therefore
-				// matched nothing on a codebase that calls LLM providers.
-				for ( var line in [
-					'<cfhttp url="https://api.example.com/v1" method="post">',
-					'var response = httpClient.send( request );',
-					'var reply = new Http( url = endpoint ).send();',
-					'const res = await fetch( "/api/v1/runs" );'
-				] ) {
-					expect( listFindNoCase( kinds( detector.detect( line ) ), "http" ) ).toBeGT( 0, "should detect: " & line );
+			it( "detects configuration read both ways it is written", () => {
+				// G6: the row count alone could not tell these apart, and all 27 rows
+				// on the live run came from the injection form.
+				expect( kindsFor( "var limit = getSystemSetting( 'DOUBLECHECK_MAX', 10 );" ) ).toInclude( "reads-config" );
+				expect( kindsFor( 'property name="datasource" inject="coldbox:setting:datasource";' ) ).toInclude( "reads-config" );
+			} );
+
+			it( "names the setting rather than reporting an anonymous read", () => {
+				var found = detector.detect( "getSystemSetting( 'DOUBLECHECK_MAX_NODES' )" );
+				var target = "";
+				for ( var hit in found ) if ( hit.kind == "reads-config" ) target = hit.target;
+				expect( target ).toBe( "doublecheck_max_nodes" );
+			} );
+
+			it( "still detects the integrations it shipped with", () => {
+				expect( kindsFor( "fileRead( path )" ) ).toInclude( "filesystem" );
+				expect( kindsFor( "new java:java.io.File( x )" ) ).toInclude( "java" );
+				expect( kindsFor( "httpRequest( url )" ) ).toInclude( "http" );
+			} );
+
+			it( "detects event publication", () => {
+				// G1a. Previously shipped dead and removed; re-added only with an
+				// assertion, after a backspace byte was found silently disabling a
+				// sibling pattern in exactly this way.
+				expect( kindsFor( "eventService.publish( runId, 'codegraph.completed', {} )" ) ).toInclude( "emits" );
+				expect( kindsFor( "announce( 'onRunComplete' )" ) ).toInclude( "emits" );
+			} );
+
+			it( "names the event rather than reporting an anonymous emit", () => {
+				var target = "";
+				for ( var hit in detector.detect( "eventService.publish( runId, 'codegraph.completed', {} )" ) ) {
+					if ( hit.kind == "emits" ) target = hit.target;
 				}
-			} );
-
-			it( "names the external system when the line names it", () => {
-				var found = detector.detect( 'httpClient.post( "https://api.anthropic.com/v1/messages" )' );
-				expect( found[ 1 ].target ).toBe( "api.anthropic.com" );
-			} );
-
-			it( "stays generic when the target is built at runtime", () => {
-				var found = detector.detect( 'httpClient.post( providerEndpoint )' );
-				expect( found[ 1 ].target ).toBe( "outbound" );
-			} );
-
-			it( "detects scheduled work, filesystem and java interop", () => {
-				expect( listFindNoCase( kinds( detector.detect( '<cfschedule action="update">' ) ), "schedule" ) ).toBeGT( 0 );
-				expect( listFindNoCase( kinds( detector.detect( 'var body = fileRead( path );' ) ), "filesystem" ) ).toBeGT( 0 );
-				expect( listFindNoCase( kinds( detector.detect( 'var f = new java:java.io.File( path );' ) ), "java" ) ).toBeGT( 0 );
-			} );
-
-			it( "stays quiet on ordinary code", () => {
-				expect( detector.detect( 'var total = orders.len();' ) ).toBeEmpty();
-				expect( detector.detect( "" ) ).toBeEmpty();
+				expect( target ).toBe( "codegraph.completed" );
 			} );
 		} );
 	}

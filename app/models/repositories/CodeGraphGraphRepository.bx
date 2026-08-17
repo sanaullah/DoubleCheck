@@ -44,6 +44,7 @@ class threadsafe {
 				queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: runIdValue }, { datasource: datasource } );
 				insertNodes( runIdValue, nodeRows );
 				insertEdges( runIdValue, edgeRows );
+				indexNodesForSearch( runIdValue, nodeRows );
 			}
 		}, "codegraph-graph-write" );
 	}
@@ -89,7 +90,11 @@ class threadsafe {
 						run_id, node_id, level, parent_id, path, symbol_name, kind, role,
 						language, line, end_line, fan_in, fan_out, hotspot
 					) VALUES #placeholders.toList( ", " )#
-					ON CONFLICT ( run_id, node_id ) DO NOTHING
+					-- Rows for the run are deleted first, so a conflict can only be a
+					-- duplicate id within one projection. Update rather than discard.
+					ON CONFLICT ( run_id, node_id ) DO UPDATE SET
+						level = excluded.level, parent_id = excluded.parent_id,
+						path = excluded.path, symbol_name = excluded.symbol_name
 				",
 				params,
 				{ datasource: datasource }
@@ -129,7 +134,8 @@ class threadsafe {
 						run_id, edge_id, level, from_node, to_node, group_kind,
 						kinds_json, occurrences, weight, resolution, provenance, confidence, line, evidence
 					) VALUES #placeholders.toList( ", " )#
-					ON CONFLICT ( run_id, edge_id ) DO NOTHING
+					ON CONFLICT ( run_id, edge_id ) DO UPDATE SET
+						occurrences = excluded.occurrences, weight = excluded.weight
 				",
 				params,
 				{ datasource: datasource }
@@ -314,16 +320,36 @@ class threadsafe {
 		// Escape LIKE wildcards so a term containing % or _ matches literally.
 		var like = "%" & escapeLike( lCase( term ) ) & "%";
 		var levelFilter = trim( toString( arguments.query.level ?: "" ) );
+		// `LIKE '%term%'` cannot use an index, so this scanned every node row on
+		// each debounced keystroke. When the trigram index can serve the term, its
+		// hits narrow the row set; the LIKE predicate stays as the correctness
+		// backstop, so the answer is identical either way and a missing or stale
+		// index costs speed rather than truth.
+		var indexHits = len( term ) >= 3 ? searchIndexHits( arguments.runId, term ) : javacast( "null", "" );
+		var useIndex = !isNull( indexHits ) && isArray( indexHits ) && indexHits.len() > 0;
+		var idClause = useIndex ? " AND node_id IN ( :ids )" : "";
+		var searchParams = { runId: arguments.runId, level: levelFilter, term: like };
+		if ( useIndex ) searchParams.ids = { value: arrayToList( indexHits, "," ), list: true };
+		if ( !isNull( indexHits ) && isArray( indexHits ) && !indexHits.len() ) {
+			return {
+				term        : term,
+				matches     : [],
+				completeness: { returned: 0, available: 0, omitted: 0, rankedBy: "hotspot", complete: false, state: "empty" }
+			};
+		}
 		var available = queryExecute(
 			"
 				SELECT COUNT(*) AS total FROM codegraph_nodes
 				WHERE run_id = :runId
 					AND ( :level = '' OR level = :level )
 					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
+					#idClause#
 			",
-			{ runId: arguments.runId, level: levelFilter, term: like },
+			searchParams,
 			{ datasource: datasource }
 		);
+		var matchParams = duplicate( searchParams );
+		matchParams.matchLimit = { value: limit, sqltype: "INTEGER" };
 		var records = queryExecute(
 			"
 				SELECT node_id, level, parent_id, path, symbol_name, kind, role, line, fan_in, fan_out, hotspot
@@ -331,15 +357,11 @@ class threadsafe {
 				WHERE run_id = :runId
 					AND ( :level = '' OR level = :level )
 					AND ( lower( path ) LIKE :term ESCAPE '\' OR lower( symbol_name ) LIKE :term ESCAPE '\' OR lower( role ) LIKE :term ESCAPE '\' OR lower( kind ) LIKE :term ESCAPE '\' )
+					#idClause#
 				ORDER BY hotspot DESC, path ASC, symbol_name ASC
 				LIMIT :matchLimit
 			",
-			{
-				runId     : arguments.runId,
-				level     : levelFilter,
-				term      : like,
-				matchLimit: { value: limit, sqltype: "INTEGER" }
-			},
+			matchParams,
 			{ datasource: datasource }
 		);
 		var matches = [];
@@ -479,6 +501,57 @@ class threadsafe {
 				state    : available == 0 ? "empty" : ( available <= kept.len() ? "complete" : "truncated" )
 			}
 		};
+	}
+
+	/**
+	 * Mirror this run's nodes into the trigram search index.
+	 *
+	 * Trigram is the only FTS5 tokenizer that matches inside a token, which is
+	 * what searching code requires: `graphmet` has to find
+	 * `CodeGraphMetricsService`. Failure here is deliberately swallowed — the
+	 * index is an accelerator and `search` keeps its `LIKE` predicate, so a
+	 * missing index costs speed and never an answer.
+	 */
+	private void function indexNodesForSearch( required string runId, required array rows ) {
+		try {
+			queryExecute( "DELETE FROM codegraph_node_search WHERE run_id = :runId", { runId: arguments.runId }, { datasource: datasource } );
+			var index = 1;
+			while ( index <= arguments.rows.len() ) {
+				var last = min( index + variables.insertChunkSize - 1, arguments.rows.len() );
+				var marks = [];
+				var params = [];
+				for ( var position = index; position <= last; position++ ) {
+					var node = arguments.rows[ position ];
+					marks.append( "( ?, ?, ? )" );
+					params.append( arguments.runId );
+					params.append( toString( node.id ) );
+					params.append( lCase( toString( node.path ?: "" ) & " " & toString( node.symbolName ?: "" ) & " " & toString( node.role ?: "" ) & " " & toString( node.kind ?: "" ) ) );
+				}
+				queryExecute(
+					"INSERT INTO codegraph_node_search ( run_id, node_id, haystack ) VALUES #marks.toList( ", " )#",
+					params,
+					{ datasource: datasource }
+				);
+				index = last + 1;
+			}
+		} catch ( any searchIndexError ) {
+		}
+	}
+
+	/** Node ids matching the term, or null when the index cannot serve it. */
+	private any function searchIndexHits( required string runId, required string term ) {
+		try {
+			var records = queryExecute(
+				"SELECT node_id FROM codegraph_node_search WHERE run_id = :runId AND haystack MATCH :term",
+				{ runId: arguments.runId, term: """" & replace( lCase( arguments.term ), """", """""", "all" ) & """" },
+				{ datasource: datasource }
+			);
+			var ids = [];
+			for ( var row = 1; row <= records.recordCount; row++ ) ids.append( records.node_id[ row ] );
+			return ids;
+		} catch ( any unavailable ) {
+			return javacast( "null", "" );
+		}
 	}
 
 	private string function escapeLike( required string term ) {

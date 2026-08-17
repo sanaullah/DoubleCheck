@@ -5,7 +5,7 @@
  */
 @singleton
 class {
-	variables.parserVersion = "javascript-symbol-parser-v4";
+	variables.parserVersion = "javascript-symbol-parser-v6";
 	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 
@@ -66,9 +66,38 @@ class {
 		return {
 			parserVersion: variables.parserVersion,
 			parseStrategy: "regex",
-			symbols      : symbols,
+			symbols      : closeSymbolSpans( symbols, lines.len() ),
 			dependencies : dependencies
 		};
+	}
+
+	/**
+	 * Give each declaration a span reaching to the next one.
+	 *
+	 * Symbols were emitted with `endLine` equal to their declaration line, so a
+	 * span one line tall. Attribution is an interval containment test, which means
+	 * nothing inside a function body could ever be attributed to it: measured
+	 * **0 of 49** `calls-api` rows carried an owning symbol, so the graph knew a
+	 * route was called but never by which function.
+	 *
+	 * A line-based parser cannot find the true closing brace without tracking
+	 * nesting through strings, comments and regex literals. Running each symbol to
+	 * the line before the next declaration is approximate in exactly one way —
+	 * trailing module-level code is attributed to the last function — and right
+	 * for the common case. The alternative on offer is not a better span; it is no
+	 * span at all.
+	 */
+	private array function closeSymbolSpans( required array symbols, required numeric lastLine ) {
+		var ordered = duplicate( arguments.symbols );
+		ordered.sort( ( a, b ) => {
+			if ( val( a.line ) != val( b.line ) ) return val( a.line ) < val( b.line ) ? -1 : 1;
+			return compareNoCase( a.name ?: "", b.name ?: "" );
+		} );
+		for ( var index = 1; index <= ordered.len(); index++ ) {
+			var nextLine = index < ordered.len() ? val( ordered[ index + 1 ].line ) - 1 : val( arguments.lastLine );
+			ordered[ index ].endLine = max( val( ordered[ index ].line ), nextLine );
+		}
+		return ordered;
 	}
 
 	private struct function symbol( required string kind, required string name, required numeric line, required string evidence ) {

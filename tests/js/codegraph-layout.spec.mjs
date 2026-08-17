@@ -627,3 +627,33 @@ test("plain /codegraph stays on the run form and never reopens the last map", ()
 	// History still routes here with an explicit id.
 	assert.match(ui, /\/\$\{runKind\}\?run=\$\{encodeURIComponent\(run\.id\)\}/);
 });
+
+test("unresolved references and starved kinds are stated, not folded into cap counts", () => {
+	// G8: 17,364 references the graph could not resolve were recorded and never
+	// shown. An unresolved reference is not an omission — no larger cap recovers
+	// it — so it gets its own sentence.
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const fn = ui.slice(ui.indexOf("function codeGraphCompletenessLines"), ui.indexOf("function codeGraphTruncationMessage"));
+
+	assert.match(fn, /could not be resolved to a file/, "unresolved count must be surfaced");
+	assert.match(fn, /starvedKinds/, "a wholly starved relationship kind must be named");
+	// And the banner must appear when that is the only thing to report.
+	assert.match(ui, /hasUnresolved/, "an untruncated snapshot with unresolved refs still reports them");
+});
+
+test("symbol view labels by symbol name and follows source order", () => {
+	// G-a: the symbol level was drawn through buildFileView, which labels by path
+	// — the same string on every box, since they share one file — and orders by
+	// path, which is no order at all within a file.
+	const view = layout.buildSymbolView({
+		nodes: [
+			{ id: "sym:b", path: "app/S.bx", symbolName: "zeta", kind: "function", line: 40, fanIn: 1, fanOut: 0 },
+			{ id: "sym:a", path: "app/S.bx", symbolName: "alpha", kind: "function", line: 10, fanIn: 3, fanOut: 2 }
+		],
+		edges: [ { from: "sym:a", to: "sym:b", kind: "calls", line: 12 } ]
+	}, { maxNodes: 50 });
+
+	assert.equal(view.mode, "symbol");
+	assert.deepEqual(view.nodes.map((n) => n.label), ["alpha", "zeta"], "labelled by symbol, ordered by line");
+	assert.equal(view.edges.length, 1, "symbol edges survive");
+});

@@ -39,6 +39,16 @@ class extends="testbox.system.BaseSpec" {
 				expect( first.fingerprint ).toBe( second.fingerprint, "repeated source indexing must remain deterministic" );
 			} );
 
+			it( "produces an identical fingerprint when the same files arrive in reverse order", () => {
+				// INV-1's guard. `canonicalJson` sorts struct keys before hashing and
+				// every struct iteration sorts before it reaches output; this is the
+				// check that keeps that true, because a single missed sort would be
+				// silent and would break byte-identical output across machines.
+				var forward = evaluateCase( corpusRoot, corpusCase );
+				var reversed = evaluateCase( corpusRoot, corpusCase, true );
+				expect( reversed.fingerprint ).toBe( forward.fingerprint, "input order must not change the snapshot fingerprint" );
+			} );
+
 			it( "keeps the corpus honest about language-tier measurement", () => {
 				expect( manifest.promotesLanguageTier ).toBeFalse();
 				expect( manifest.thresholds.flowRecall ).toBeGTE( 1 );
@@ -48,7 +58,7 @@ class extends="testbox.system.BaseSpec" {
 		} );
 	}
 
-	private struct function evaluateCase( required string corpusRoot, required struct corpusCase ) {
+	private struct function evaluateCase( required string corpusRoot, required struct corpusCase, boolean reverseFileOrder = false ) {
 		var caseRoot = new java:java.io.File( arguments.corpusRoot & "/" & arguments.corpusCase.root ).getCanonicalFile();
 		var files = [];
 		var listing = directoryList( caseRoot.getPath(), true, "query" );
@@ -70,6 +80,14 @@ class extends="testbox.system.BaseSpec" {
 			} );
 		}
 		files.sort( ( a, b ) => compareNoCase( a.filePath, b.filePath ) );
+		// INV-1: struct iteration is hash-ordered, so any place that iterates a
+		// struct and appends straight to output would produce machine-varying
+		// results. Feeding the same corpus in reverse proves no such path exists.
+		if ( arguments.reverseFileOrder ) {
+			var reversed = [];
+			for ( var index = files.len(); index >= 1; index-- ) reversed.append( files[ index ] );
+			files = reversed;
+		}
 
 		var capture = { files: [] };
 		var indexer = new app.models.services.ArchitectureIndexService();

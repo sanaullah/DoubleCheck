@@ -1,0 +1,77 @@
+/**
+ * The graph's non-file entities: routes, tables, outbound integrations,
+ * configuration keys and events.
+ *
+ * These are the endpoints of a flow — where a request enters and where it lands
+ * — so they have to be nodes for a path to be drawable at all. They are bounded
+ * by how many routes and tables a project has, not by its file count, which is
+ * why `CodeGraphMetricsService` exempts them from the node cap.
+ *
+ * @see CodeGraphMetricsService
+ */
+@singleton
+class threadsafe {
+	property name="pathNormalizer" inject="GraphPathNormalizer";
+
+	function init() {
+		if ( isNull( variables.pathNormalizer ?: javacast( "null", "" ) ) ) {
+			variables.pathNormalizer = new app.models.services.GraphPathNormalizer();
+		}
+		return this;
+	}
+
+	void function append( required array nodes, required array dependencies ) {
+		var seen = {};
+		for ( var node in arguments.nodes ) seen[ pathNormalizer.path( node.id ?: "" ) ] = true;
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			var id = "";
+			var role = "shared";
+			var component = "other";
+			if ( kind == "routes" || kind == "calls-api" ) {
+				var routePath = pathNormalizer.route( dep.target ?: "" );
+				id = len( routePath ) ? "route:" & routePath : "";
+				role = "entry";
+				component = "http-handlers";
+			} else if ( listFindNoCase( "table-query,table-read,table-write", kind ) ) {
+				id = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
+				role = "persistence";
+				component = "application-models";
+			} else if ( listFindNoCase( "http,schedule", kind ) ) {
+				id = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+				role = "integration";
+				component = "other";
+			} else if ( kind == "emits" ) {
+				id = "event:" & lCase( trim( toString( dep.target ?: "event" ) ) );
+				role = "integration";
+				component = "other";
+			} else if ( kind == "reads-config" ) {
+				// A setting is a thing the system has, not just a line in a file.
+				// As a node it answers "what does this key affect" from either end.
+				id = "config:" & lCase( trim( toString( dep.target ?: "config" ) ) );
+				role = "shared";
+				component = "configuration";
+			}
+			if ( !len( id ) || listFindNoCase( "route:,config:,event:", id ) || seen.keyExists( pathNormalizer.path( id ) ) ) continue;
+			seen[ pathNormalizer.path( id ) ] = true;
+			arguments.nodes.append( {
+				id          : id,
+				path        : id,
+				dir         : "",
+				component   : component,
+				layer       : component,
+				role        : role,
+				language    : "",
+				symbolCount : 0,
+				lineCount   : 0,
+				fanIn       : 0,
+				fanOut      : 0,
+				clusterId   : "",
+				hotspotScore: 0,
+				inCycle     : false
+			} );
+		}
+		arguments.nodes.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+	}
+}

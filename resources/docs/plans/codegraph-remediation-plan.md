@@ -75,6 +75,32 @@ is **untouched** — designed and evidenced in this document, no code written.
 | **D13/D14/D15** | Handler contract holes | ✅ | `codegraphMaxNodes` injected; `include`/`rank` validated (422); unknown `scope` → 404; `edgeLimit` reachable |
 | **D17** | Wrong `"\\"` literal at two sites | ✅ | Both corrected; zero occurrences remain |
 | **D26** | Layout order depended on locale | ✅ | All 7 `localeCompare` tie-breaks replaced with a stable comparator + the byte-identical determinism spec that never existed |
+| **D11** | Duplicate-span attribution was incidental | ✅ | Total tiebreak on `kind` then `id`; the winner is named rather than inherited from parser emission order |
+| **D16** | A storage failure read as "run not found" | ✅ | `hasIndexedGraph` logs and rethrows `GraphUnavailableException` instead of returning `false` |
+| **D22** | `trimmedSections` had two append paths | ✅ | All four sections use the de-duplicating helper |
+| **D24** | `ON CONFLICT DO NOTHING` hid projection duplicates | ✅ | Upserts instead of discarding; a duplicate id no longer silently loses a row |
+| **D28** | Truncation flagged by the visibility filter | ✅ | Only the cap marks truncation; the candidate count is carried separately |
+| **D29** | Layer policy unescapable and inexpressive | ✅ | `*` wildcards on either side; **moved into `ArchitectureRuleService`** so layer rules have one owner |
+| **D20** | Symbol count derived two ways | ✅ | `presentClusters` now reads `indexFileStats`, so cluster and file totals cannot disagree |
+| **D21** | Fan-in floor weakened the cap | ✅ | Resolved by E1 — retention uses `centralityService.rank`, so `hotspotScore`'s floor no longer decides what survives |
+| **G-a** | Symbol level listed but not drawn | ✅ | A `depth === "symbol"` canvas branch already existed but rendered through `buildFileView`, which labels by path — the same string on every box in one file — and orders by path. New `buildSymbolView` labels by symbol and follows source line. Verified in-browser |
+| **D23** | Search was an unindexable full scan | ✅ | Trigram FTS5 mirror + narrowing, `LIKE` retained as the correctness backstop. **6,140 rows mirrored; FTS hits and LIKE-only count agree exactly at 68 for `graphmet`** — a mid-identifier term the default tokenizer cannot match. Third attempt; see §21 |
+| **G2** | JS action → route chain had no owner | ✅ | JS symbols were emitted with `endLine == line`, so containment could never reach a `fetch` in the body — **0 of 49** `calls-api` rows carried an owning symbol. Spans now run to the next declaration: **49/49**, e.g. `loadSession → /api/v1/session` |
+| **E7** | MCP descriptor written but unreachable | ✅ | `/codegraph/mcp` now serves the 8 tools plus the contract, gated on levelled rows. **Curl-verified; no automated spec** — see §24 |
+| **E4** | No matrix overview | ✅ | **Already built** — `toCodeGraphMatrix` renders a DSM |
+| **E6** | No SCIP export | ✅ | **Already built** — `scipSymbol` in the diagram service |
+| **E3** | Architecture rules not expressible | ✅ | Same work as G-e — `ArchitectureRuleService.defaultRules` + `/codegraph/rules` |
+| **G12** | No run-over-run diff | ✅ | **Already built** — `/codegraph/diff?base=` returns added/removed nodes and edges. Its completeness hardcoded `complete: true` beside a computed `omitted`; now derived together (D3's defect in a newer endpoint) |
+| **G-e** | Architecture rules were one hardcoded string | ✅ | **Already built** — `/codegraph/rules` returns pass/fail per rule with violation evidence. Verified live: *"Application models must not depend on HTTP handlers"*, 2 violations |
+| **G1c** | `implements` produced only by Modernize | ✅ | Detector exists in `BoxLangParserService`; 0 rows here because this codebase declares no interfaces — absence of data, not absence of capability |
+| **E2** | Flat top-N slicing instead of focus+context | ✅ | `degreeOfInterest()` in `codegraph-layout.js` scores and bounds the drawn set |
+| **G8** | Unresolved / unprovable behaviour never reported | ✅ | Banner states unresolved reference counts and names any wholly starved relationship kind, separately from cap losses — an unresolved reference is not an omission and no larger cap recovers it |
+| **G-i + E8** | Canvas unreachable by keyboard | ✅ | **Was already implemented** — `role="application"` tab stop, arrow/Home/End traversal, Enter to select, and a polite live region announcing each node. Ledger was stale; verified in source, not assumed |
+| — | Parser signature drift was unenforced | ✅ | `ParserVersionSignatureSpec` — asserts the reuse-key fallback names live parser versions. **Negative-tested:** reintroducing the stale `v4` literal fails it with the right message |
+| **G6** | Configuration was not an entity | ✅ | `reads-config` detector + `config:` synthetic nodes. A literal backspace byte was silently killing two of three branches; repaired, and coverage went **27 → 324 rows** *(see §25)*. Covered by `IntegrationDetectorSpec` |
+| **G1a** | `emits` / `handles` had no producer | ✅ | `emits` re-added **with a spec this time** — 39 rows naming `codegraph.completed`, `run.cancelled`. The earlier 0-row result was a stale-probe artefact plus a missing array comma, not a bad pattern. `handles` stays out by design: listeners resolve at runtime |
+| **D19** | Five hand-rolled `normalizePath` copies | ✅ | New `GraphPathNormalizer`; four services delegate, `normalizeRoute` folded in too |
+| **INV-1** | Struct-order invariant undefended | ✅ | Corpus spec builds the same case with the file list reversed and asserts an identical fingerprint — **passes** |
 
 Files: `CallTargetFilter.bx` (new), `CallTargetFilterSpec.bx` (new), and edits to
 `BoxLangParserService`, `CfmlParserService`, `JavaScriptParserService`,
@@ -87,11 +113,11 @@ Plus `CfmlSourceScanner.maskLiterals` + 6 specs. Suite: **691 passed / 0 failed 
 |---|---|---|
 | Root decisions | — | 0 ⬜ |
 | Severity 1 defects | — | 0 ⬜ |
-| Severity 2 defects | D16, D28, D29 | 3 ⬜ |
-| Severity 3 defects | D11, D19, D20, D21, D22, D23, D24 | 7 ⬜ |
-| Invariant guard | INV-1 | 1 ⬜ |
-| Capability gaps | G1a, G1c, G2, G4, G6, G8, G11, G12(diff), G-a, G-e, G-i | 11 ⬜ |
-| Enhancements | E2–E8 | 7 ⬜ |
+| Severity 2 defects | — | 0 ⬜ |
+| Severity 3 defects | — | 0 ⬜ |
+| Invariant guard | — | 0 ⬜ |
+| Capability gaps | — | 0 ⬜ · G11 and the response half of G4 are **NS** by design; G16 retracted (§26) |
+| Enhancements | — | 0 ⬜ · E1–E4, E6–E9 done; **E5 measured and re-scoped (§28)** |
 
 **Comprehension score: 5 of 17.** Q9 ("which symbols call, construct or extend
 another") and **Q17** ("what external systems does this talk to") both moved from
@@ -164,23 +190,33 @@ Current answerability:
 | Q1 | What is this application, how is it organised? | **PA** | Clusters + narrative exist; cluster count capped alphabetically (D12) |
 | Q2 | Main domains, modules, layers, responsibilities? | **PA** | Domains are LLM labels over derived clusters; labels detach on drift (BD-4) |
 | Q3 | Where are the entry points? | **RV yes** | 271 `route` symbols, 141 `handler-action`, 4 `lifecycle-hook` indexed |
-| Q4 | What starts each request / job / event / background process? | **PA** | Routes yes. **Scheduled jobs: 0 rows, detector too narrow (G1b). Events: 0 rows, no producer (G1a)** |
-| Q5 | How does a JavaScript action reach an HTTP route? | **PA** | `calls-api` exists but only 6 edges survive projection *(RV)*; no JS event → fetch link (G2) |
+| Q4 | What starts each request / job / event / background process? | **PA** | Routes yes; **scheduled work now visible — 5 `schedule` rows** *(RV, was 0)*. **Events still 0 rows, no producer (G1a)** |
+| Q5 | How does a JavaScript action reach an HTTP route? | **RV yes** | `calls-api` now names the calling function — **49/49 attributed** *(was 0/49)*: `loadSession → /api/v1/session` |
 | Q6 | How does a route reach a handler and action? | **RV yes** | 45 `routes` file edges projected |
-| Q7 | Which services, repositories, queries, tables participate? | **PA** | `injects` (1,029) and `table-query` (214) yes; **`table-read`/`table-write` never produced (G3)** |
+| Q7 | Which services, repositories, queries, tables participate? | **RV yes** | `injects` and `table-query` plus the read/write split — **95 `table-read`, 143 `table-write`** *(RV, both were 0; G3 shipped)* |
 | Q8 | What response or side effect completes the flow? | **No** | No response/side-effect modelling (G4) |
-| Q9 | Which symbols define / reference / call / extend / implement / render / emit / handle / test another? | **No** | Symbol level carries **only `injects` edges — zero `calls` (RV, D5)**; no defines-vs-references split (G5); `emits`/`handles` have no producer (G1a); `implements` is produced only by Modernize (G1c, G13) |
+| Q9 | Which symbols define / reference / call / extend / implement / render / emit / handle / test another? | **PA** | Symbol level now carries 1,499 `calls`, 787 `constructs`, 315 `injects`, 11 `type-reference`, 1 `extends` *(RV, D5 fixed)*; no defines-vs-references split (G5); `emits`/`handles` have no producer (G1a); `implements` is produced only by Modernize (G1c, G13) |
 | Q10 | Which configuration values influence each component? | **No** | Config is not an entity (G6) |
-| Q11 | Which tests exercise each implementation path? | **No** | `tests` deps indexed (190) but **zero survive into the projected graph (RV, BD-2)** |
+| Q11 | Which tests exercise each implementation path? | **RV yes, file level** | **198 `tests` file edges** now reach the graph (`tests/…spec.bx → app/models/domain/cluster.bx`); was 0. Symbol-level test→symbol linkage is still Phase 5 |
 | Q12 | What changes when a file / symbol / endpoint / table changes? | **PA** | `review_impacts` is file-level; no symbol, endpoint or table impact (G7) |
 | Q13 | Cycles, hotspots, dead code, violations, unresolved dynamic behaviour? | **PA** | Cycles, hotspots, orphans, layer violations exist; **unresolved/dynamic behaviour is not reported at all (G8)** |
 | Q14 | What is proven, inferred, truncated, unsupported, stale, unknown? | **No** | Only a partial truncation account; no confidence class, no unresolved count (G9) |
 | Q15 | Where do I start reading? | **No** | No onboarding/"start here" ranking view (G10) |
 | Q16 | Which components matter most, and why? | **No** | Ranking exists but is unexplained, mixes churn with structure, and is spent on retention not attention (BD-3); needs E1 + E9 |
-| Q17 | What external systems does this talk to? | **No** | `http` produces **0 rows** *(RV)*; detector cannot fire (G1b, G13); `integration` role assigned to **0 files** *(RV, G15)* |
+| Q17 | What external systems does this talk to? | **RV yes** | **33 `http` rows** and **19 files carrying `role=integration`** *(RV, both were 0)* — shared detector shipped (G13), role precedence fixed (G15) |
 
-**Three of seventeen are answerable today. Six are partial. Eight are not
-answerable.**
+**Five of seventeen are answerable, six partial, six not.** Answerable: **Q3**
+(entry points), **Q6** (route → handler), **Q7** (services → repositories →
+queries → tables, now with read/write), **Q11** (tests, file level) and **Q17**
+(external systems). Q9 and Q4 are partial — real structural relations exist, but
+the defines/references split and event wiring do not.
+
+> **This is an assessment from the capability matrix above, not an observed
+> result.** It is derived from what the graph now contains, not from watching a
+> developer try to answer the questions. The Cold-Read Protocol in §2a has
+> **never been run**, and until it has — on a non-BoxLang project — treat this
+> number as a hypothesis about comprehension, not a measurement of it. G13 and
+> G14 exist precisely because self-analysis flattered the tool.
 
 ---
 
@@ -197,9 +233,14 @@ the screen or endpoint that produced it. A question counts as answered only if t
 reader can state the answer **and** point to the `file:line` evidence CodeGraph
 gave them.
 
+**Status: never run.** Every score below is a target except the first, and the
+first is an assessment from §2's capability matrix rather than an observed
+reading session. Running it is the single most valuable unclaimed item in this
+plan, because it is the only check that measures the product's actual promise.
+
 | After phase | Fully answered | Time budget |
 |---|---|---|
-| today (baseline) | **3 of 17** *(RV)* | — |
+| today, after Phases 1–3 | **5 of 17** *(assessed, not observed)* | — |
 | 3 | 6 of 17 | — |
 | 5 | 11 of 17 | ≤ 30 min |
 | 9 | 14 of 17 | ≤ 20 min |
@@ -410,8 +451,8 @@ The gaps that block §2's unanswerable questions. All **PR**.
 
 | ID | Missing capability | Blocks | Root cause |
 |---|---|---|---|
-| **G1a** | Kinds with **no producer anywhere**: `emits`, `handles`, `table-read`, `table-write` *(RV: absent from `review_dependencies`)* | Q4, Q7, Q9 | Never extracted. `mapKind` and the cap ordering reference kinds nothing emits **(OD)** |
-| **G1b** | Kinds whose **producer exists but cannot fire**: `http`, `schedule` — 0 rows *(RV)* | Q4, Q17 | Detector is too narrow, not absent. See G13 |
+| **G1a** | Kinds with **no producer anywhere**: `emits`, `handles` — still 0 rows *(RV)*. `table-read`/`table-write` **shipped**: 95 / 143 rows | Q4, Q9 | Event wiring is never extracted; the SQL read/write split now is |
+| **G1b** | ~~`http`, `schedule` cannot fire~~ **resolved** — 33 and 5 rows *(RV, both were 0)* | — | Shared detector shipped (G13) |
 | **G1c** | Kinds produced **only by Modernize**, never by CodeGraph: `implements`, `java`, `filesystem`, `datasource`, `sql-proc-call`, `column-query`, `security-session-gate` | Q9, Q13, Q17 | See G13 — CodeGraph extraction is a strict subset |
 | **G2** | JS event → `fetch` → route chain | Q5 | `calls-api` resolves a URL to a route file, but nothing links a DOM event handler to the fetch call |
 | **G3** | Read/write discrimination on data access | Q7, data lineage | All SQL access collapses to `table-query`; no statement-kind analysis |
@@ -1041,3 +1082,422 @@ not be resolved, rather than guessing — the same rule the inspector follows.
 `/codegraph/onboarding?limit=3` on run `690cd62c` returns nine entries: handler
 actions with `file:line` ("a request starts here (handler-action)"), the largest
 modules by file count, and the most depended-upon files ("N files depend on this").
+
+---
+
+## 20. Standing caveats
+
+Kept here rather than in a chat message, because an unverified claim that lives
+outside the document is exactly the failure this plan is about.
+
+**The Cold-Read Protocol has never been run.** The comprehension score of
+**5 of 17** is an assessment derived from §2's capability matrix — from what the
+graph now demonstrably contains — not from observing anyone try to answer the
+questions. It is a hypothesis about comprehension, not a measurement of it.
+
+An honest score additionally requires **a non-BoxLang project**. G13 (CodeGraph's
+extraction being a strict subset of Modernize's) and G14 (CFML having no `routes`
+or `renders` detector) were both invisible for as long as the tool was only ever
+pointed at itself. Self-analysis flatters a code-graph tool, and this one has the
+receipts to prove it.
+
+**`ReviewExecuteRunSpec` is intermittently flaky under load.** Observed failing in
+roughly one run in three of the full suite while every bundle-level result stayed
+clean. Pre-existing and unrelated to this work — it was flaky before the Phase 1
+changes — but it means a single red full-suite run is not automatically a
+regression. Re-run before concluding one. Not investigated; not in scope here.
+
+**Nothing is committed.** All work sits in the working tree. The user's staged
+changes to `app/config/Coldbox.bx`, `app/models/services/GitRepositoryService.bx`
+and `tests/specs/unit/GitRepositoryServiceSpec.bx` are untouched throughout.
+
+---
+
+## 21. D23 — attempted, backed out
+
+**Not done. Reverted deliberately, not abandoned by accident.**
+
+Search is `lower(path) LIKE '%term%'`, which no index can serve. The fix was to
+mirror node rows into an FTS5 virtual table and narrow the scan to its hits.
+Two things were established and are worth keeping:
+
+- **FTS5 is available** in this SQLite build, and the **`trigram` tokenizer**
+  works — verified by probe. Trigram is the only FTS5 mode that matches *inside*
+  a token, which is the requirement for code search: `graphmet` must find
+  `CodeGraphMetricsService`. The default tokenizer cannot do this and would have
+  been the wrong choice.
+- The narrowing has to keep the `LIKE` predicate as a correctness backstop so the
+  index changes only how many rows are examined, never which rows match.
+
+The implementation returned **500** on `/codegraph/search` and the cause was not
+identified within a reasonable diagnostic budget. It was reverted rather than
+left half-wired, because a dormant FTS table nothing reads is worse than no FTS
+table: it silently drifts from the rows it claims to mirror.
+
+**Why this is the right call for now.** D23 is a *scaling* defect. At this
+repository's 5,600 nodes the scan is instant; the plan itself files it as "the
+first thing N1 will fail on" at 80,000 nodes, on an estate nobody has pointed
+this at yet. Shipping a correct scan beats shipping a fast one that 500s.
+
+**Attempted twice, reverted twice.** The second attempt addressed both hypotheses
+from the first — the FTS table was declared in `SchemaService` beside the other
+DDL, and the `IN` list used a BoxLang list parameter so every binding stayed
+named. It failed for a third reason: **the scripted edits could not reliably match
+the SQL string containing `ESCAPE ''`**, so the predicate landed in neither
+query while a conditional parameter landed in one. That combination compiles and
+passes the suite only because the tests never exercise a term the index would
+serve — which is its own warning about the coverage here.
+
+**The real lesson is about the edit, not the design.** Both attempts were
+defeated by tooling: a backslash in the target string. Anyone retrying should edit
+this method by hand, or restructure it first so the SQL is built in a helper
+without the `ESCAPE` clause inline. The design itself is sound and unchanged:
+trigram FTS5 (verified available), narrow by index hits, keep `LIKE` as the
+correctness backstop.
+
+The plain B-tree index added alongside it — `idx_codegraph_nodes_search` on
+`( run_id, level, symbol_name )` — **was kept**. It is harmless and helps the
+symbol-name lookups that are not substring searches.
+
+---
+
+## 22. G6 shipped; G1a's `emits` half did not fire
+
+**G6 — configuration as an entity. Done and measured.**
+`IntegrationDetector` gained a `reads-config` pattern covering `getSystemSetting(`,
+`getSetting(` and `coldbox:setting:` injections, and the name is captured from the
+line's first quoted literal so the target is the setting itself. `config:` nodes
+join `route:` and `table:` as first-class endpoints. Measured on a live run:
+**27 rows**, naming `datasource`, `codegraphmaxedges`, `codegraphsubgraphmaxnodes`
+and others. Q10 ("which configuration values influence each component") has a
+substrate for the first time.
+
+**G1a — `emits` is in the detector but produced 0 rows.**
+The pattern `(?:\.publish\s*\(|announce\s*\(|emit\s*\()` should match this
+codebase's own idiom (`eventService.publish(` at `CodeGraphRunService.bx:861`),
+and it does when tested in isolation. It produced nothing on a live index, and the
+cause was **not diagnosed**. Do not assume the pattern is wrong — the more likely
+explanation is where `extractResourceDependencies` is called from, i.e. which
+lines the parser routes through the detector at all. That is the first thing to
+check.
+
+`handles` — the subscriber half — is deliberately untouched. This codebase
+resolves listeners at runtime, so the link is not statically provable and belongs
+in the "impossible to prove" class of §7, reported as unsupported rather than
+guessed at.
+
+**Structural note.** Both this change and D29 tripped the repository's own
+`holds no service above 900 lines` fitness rule. Rather than raise the threshold,
+`CodeGraphMetricsService` gave up two cohesive units — layer-policy matching to
+`ArchitectureRuleService`, and non-file entity construction to a new
+`SyntheticNodeBuilder`. It is now 858 lines and each concept has one owner. The
+fitness rule did its job twice in one session.
+
+---
+
+## 23. G1a: `emits` removed — and a wrong explanation corrected
+
+**An earlier revision of this section blamed the parse cache. That was wrong, and
+the correction is the point of this entry.**
+
+The sequence: G6's `reads-config` produced 27 rows and G1a's `emits` produced
+zero, from detectors added in the same edit. The `emits` pattern was verified
+correct in isolation — 3 of 3 against this codebase's own `eventService.publish(`
+idiom, in BoxLang's regex engine rather than by eye. The hypothesis was a stale
+parse cache, since parses are keyed on `( contentHash, parserVersion )` and the
+version had not been bumped.
+
+**A full re-parse disproved it.** All three parser versions were bumped
+(`boxlang-ast-parser-v6`, `cfml-symbol-parser-v6`,
+`javascript-symbol-parser-v5`), every file was re-parsed, and the result was
+unchanged: `reads-config` **still exactly 27**, `emits` **still absent**. So 27 is
+the true count, not an undercount, and the cache was never the explanation.
+
+The pattern includes `emit\s*\(`, which should match the many `emit(` calls in
+`CodeGraphRunService` alone. No downstream kind filter was found in
+`appendUniqueDependency`, `ArchitectureIndexService` or the inventory adapter.
+**The real cause is still unknown.**
+
+**`emits` has therefore been removed**, along with its `event:` synthetic-node
+branch. A detector that never fires is precisely the defect this plan catalogues
+twice already — D10's dead orchestrator branch and G15's unreachable
+`integration` role. Shipping a third one, knowing it does not work, would be
+worse than not shipping it.
+
+`handles` remains unaddressed by design: this codebase resolves listeners at
+runtime, so publisher → subscriber is not statically provable and belongs in the
+"impossible to prove" class of §7.
+
+**What the detour was worth.** The parser bump was correct on its own merits and
+is kept. It also surfaced a **second stale hardcoded parser signature** — in
+`CodeGraphReuseKeyService`, alongside the one already corrected in
+`CodeGraphRunService`. Two literals that must track the live parser versions,
+neither enforced by anything. A spec asserting they match now exists —
+`tests/specs/unit/ParserVersionSignatureSpec.bx` — and was negative-tested by
+reintroducing the stale literal and confirming it fails.
+
+**Standing lesson.** The isolation test proved the regex, and the regex was never
+the question. Proving a component in isolation says nothing about whether it is
+reached — and "it must be the cache" was a plausible story that survived exactly
+until it was measured.
+
+---
+
+## 24. E7 exposed — and a spec that could not be made to work
+
+`CodeGraphMcpDescriptor` had been written and **nothing referenced it**: no route,
+no handler, no caller. A contract that cannot be fetched is a design note, not a
+capability. `/api/v1/runs/:id/codegraph/mcp` now serves it — the eight tools
+(`codegraph_search`, `neighbours`, `hierarchy`, `lineage`, `impact`, `paths`,
+`onboarding`, `source`) together with the contract those tools promise. Serving
+the contract alone would have described guarantees for tools the caller could not
+see.
+
+The endpoint is gated on the run having levelled rows, which is the descriptor's
+own stated precondition: an agent cannot distinguish an empty graph from an empty
+result and would report that a symbol has no callers.
+
+**Verified by curl against a real run; there is no automated spec.** Three
+attempts to build one failed at the fixture: a synthetic run created directly
+through `ReviewRunRepository` does not survive `runService.getScoped` in this
+endpoint's path, returning 404 where the sibling `/codegraph/graph` spec with an
+apparently identical fixture returns its expected status. The cause was not
+identified, and the spec was removed rather than left erroring.
+
+**This is the weakest link in the session's work.** Everything else that landed
+has a passing test; this has a manual check and a note. Anyone extending the MCP
+surface should fix the fixture first — most likely by reusing the seeding that the
+"predates levelled storage" spec performs, rather than creating the run row
+directly.
+
+### Also found already built while verifying
+
+`toCodeGraphMatrix` (E4, DSM), `scipSymbol` (E6, SCIP export), `degreeOfInterest`
+(E2), `/codegraph/diff` (G12), `/codegraph/rules` (E3 / G-e), the `implements`
+detector (G1c), and the canvas keyboard/ARIA layer (G-i / E8). The register listed
+all of these as outstanding.
+
+**The ledger has now been stale in both directions.** It understated progress here
+and overstated it earlier in the session. Verify a claim against the code before
+planning work against it — that habit found four already-built capabilities and
+one live defect (the diff endpoint's hardcoded `complete: true`) in a single pass.
+
+---
+
+## 25. A backspace byte, and two lessons about evidence
+
+**The defect.** G6's detector was matching only one of its three alternatives.
+The stored pattern was:
+
+```
+"(?:<0x08>getSystemSetting\s*\(|<0x08>getSetting\s*\(|coldbox:setting:)"
+```
+
+A literal **backspace character (0x08)** sat where `` was intended. A scripted
+edit had written `` as the escape sequence rather than the two characters a
+regex word boundary needs, so both function-call branches could never match and
+only `coldbox:setting:` survived. Nothing failed; the detector simply saw less.
+
+Repairing it took `reads-config` from **27 rows to 324** — the earlier number was
+injected settings only. Q10 is now answered for both forms.
+
+**Lesson one: a plausible number is not a passing test.** 27 rows looked like
+success and was reported as such. The count could not distinguish "the detector
+works" from "one third of the detector works", and no assertion existed at the
+method level. `IntegrationDetectorSpec` now asserts each form independently, and
+it is what found this.
+
+**Lesson two: the standalone CLI probe cannot test application classes.** BoxLang
+serves compiled classes from its runtime home, and clearing the obvious cache
+directory did not stop it returning stale results — a probe reported `fileRead`
+matching and `getSystemSetting` not, from a build that predated the edit. Several
+probes in this session instantiated `app/` classes that way. **Those results are
+unsound**, including the investigation behind G1a in §23; treat that entry as
+"cause unknown" with one fewer supporting observation.
+
+Probes that tested *language semantics only* — backslash literals, sort
+stability, struct iteration order, regex-engine behaviour — instantiated nothing
+from `app/` and are unaffected.
+
+**The rule:** to test an application class, write a TestBox spec. It runs against
+the same compiled state as the server. A CLI probe is for language questions.
+
+---
+
+## 26. G1a closed, and a new gap it exposed
+
+**G1a is done.** `emits` produces **39 rows** naming real events —
+`codegraph.completed`, `run.cancelled`, `onruncomplete`. The earlier zero was
+never a bad pattern: it was a stale CLI probe (§25) compounded by a missing comma
+that briefly broke the pattern array. Re-added only alongside
+`IntegrationDetectorSpec` assertions, which is the difference between this attempt
+and the one that shipped dead.
+
+`handles` remains deliberately absent. Listeners resolve at runtime here, so
+publisher → subscriber is not statically provable and belongs in §7's
+"impossible to prove" class — reported as unsupported, never guessed.
+
+### G16 — retracted. The claim was wrong.
+
+**An earlier revision of this section reported that synthetic entities never reach
+the levelled tables. That is false, and the error was mine.**
+
+I queried `codegraph_nodes` for ids matching `route:%`, found zero, and published a
+gap with a confident consequence — that an agent could find the file calling a
+route but never the route itself. The projection prefixes every node id with
+`file:`, so the correct predicate is `file:route:%`. Measured on the same run:
+
+```
+file:route:%   52      file:config:%  246
+file:table:%   37      file:event:%    20
+```
+
+They are projected, queryable through `/codegraph/graph` and `/search`, and carry
+their roles — a route node arrives as `kind=http-handlers, role=entry`. **Q4, Q7,
+Q10 and Q17 are answerable from the query surface, not only from the snapshot.**
+
+What survives is a modelling wart, not a gap: a route, table, setting and event
+are all stored at `level: "file"` with a `file:` id prefix, because the projection
+has one loop for everything in `snapshot.nodes`. A route is not a file. Giving
+them their own level would be tidier and would let a caller ask for "every entry
+point" without pattern-matching an id. Nothing is unreachable today.
+
+**Fourth wrong claim caught by measurement in this session** — after the 3×
+aggregation error in the baseline, the parse-cache theory, and the G6 row count
+that looked plausible at 27. Every one was published confidently and every one was
+found by checking rather than by review. The pattern is not carelessness about
+evidence; it is that a query returning zero feels like a finding, when it is just
+as often a wrong question.
+
+---
+
+## 27. Final state
+
+Measured on the last full index of this session.
+
+| | Session start | Now |
+|---|---|---|
+| `review_dependencies` rows | 41,513 | **22,186** |
+| Projected edges | ~1,061 | **4,357** |
+| `symbol / calls` edges | **0** | **1,543** |
+| JS route attribution | **0 / 49** | **49 / 49** |
+| `constructs` | 0 | 946 |
+| `reads-config` | 0 | 324 |
+| `tests` | 0 | 201 |
+| `table-write` / `table-read` | 0 / 0 | 143 / 95 |
+| `extends` | 0 | 127 |
+| `emits` | 0 | 39 |
+| `http` / `schedule` | 0 / 0 | 28 / 4 |
+| Suite | 675 | **729 passing, 0 failing** |
+
+Nine relationship kinds went from producing nothing to producing evidence. The
+graph is smaller and says more.
+
+### Still open
+
+- **G-a** — the symbol level is fetched, listed and searchable, but not *drawn*.
+  Real, unstarted canvas work.
+- **D23** — search remains an unindexed scan. Reverted deliberately; §21 holds the
+  reproduction path and the trigram finding.
+- **E5** — **measured (§28) and re-scoped.** Parsing is the cost and is already
+  cached; the projection writes the same 10,500 rows whether a run takes 60 s or
+  160 s. Not worth building as specified.
+
+### What to distrust in this document
+
+Six items listed as outstanding turned out to be already built. One gap (G16) was
+published and retracted. Four confident claims were overturned by measurement —
+the 3× aggregation error in the baseline, the parse-cache theory, G6's plausible
+27, and G16's wrong query prefix.
+
+The register is a starting point, not a specification. **Check the code before
+planning against any entry**, and prefer a TestBox spec over a CLI probe for
+anything touching an application class (§25).
+
+---
+
+## 28. E5 — measured, and re-scoped
+
+E5 proposed incremental projection: key projected rows by content hash and
+re-project only changed files. **It was never measured, so it was never justified.**
+Three consecutive full runs, same repository:
+
+| run | wall time | projected rows |
+|---|---|---|
+| after a parser-version bump | **153 s** | 10,473 |
+| after a parser-version bump | **160 s** | 10,494 |
+| with the parse cache warm | **60 s** | 10,494 |
+
+The projection writes the same ~10,500 rows in every one of them, while the wall
+time varies by 100 seconds. **The cost is parsing, and parsing is already
+incremental** — the `( contentHash, parserVersion )` cache is what separates the
+60-second run from the 155-second ones. Re-projecting is a small share of a run
+that is already fast when the cache is warm.
+
+**Disposition: re-scoped, not scheduled.** Incremental *projection* addresses the
+wrong half. If run duration becomes a problem, the measurement to take first is
+the projection's actual share of the 60-second warm run — instrument it before
+building anything, because the numbers above say the answer is probably "a few
+seconds".
+
+This is filed as done in the sense that matters: the question E5 asked has been
+answered with evidence, and the answer is that the work it proposed is not worth
+doing yet. That is a decision, not a deferral.
+
+---
+
+## 29. D23 landed on the third attempt
+
+Two earlier attempts were reverted (§21). Both died the same way: scripted edits
+could not match the SQL string containing `ESCAPE '\'`, leaving the predicate in
+one query and the parameter in another. The third attempt changed **nothing about
+the design** — it used an exact-match editor instead of pattern substitution.
+
+Shipped: a `codegraph_node_search` FTS5 virtual table declared in `SchemaService`
+beside the other DDL, mirrored during `replaceGraph`, with `search` narrowing to
+its hits through a **list parameter** so every binding stays named.
+
+Verified on a live run:
+
+| | |
+|---|---|
+| rows mirrored | **6,140** |
+| FTS hits for `graphmet` | **68** |
+| `LIKE`-only count for the same term | **68** |
+| API `available` | **68** |
+
+The three agree, which is the property that matters: the index changes how many
+rows the database examines, never which rows match. `graphmet` is deliberately a
+mid-identifier term — it finds `CodeGraphMetricsService`, which the default FTS5
+tokenizer cannot do and which is why trigram was the only viable choice.
+
+`LIKE` is retained as the predicate. If the index is missing, stale, or FTS5 is
+unavailable in a user's SQLite build, `searchIndexHits` returns null and the query
+degrades to the original scan — slower, never wrong.
+
+**The lesson is about tooling, not design.** Two reverts cost more than the
+feature, and both were caused by the same unexamined assumption: that a scripted
+replacement had applied because it reported success. It had not. Verify the file
+after a scripted edit, or use an editor that fails loudly on a missed match.
+
+---
+
+## 30. G-a — the last item, and it was half-built too
+
+The register said the symbol level was fetched and listed but never drawn. **A
+`depth === "symbol"` canvas branch already existed.** What it did was render the
+payload through `buildFileView`, which labels nodes by path and orders them by
+path — inside a single file that means every box carries the same label and the
+ordering is arbitrary. The level was drawn and unreadable.
+
+`buildSymbolView` labels by symbol name, orders by source line so the drawing
+follows the file, and carries `kind` as the layer label. Verified three ways: a
+`node --test` spec, the full BoxLang suite, and executing it in the running
+browser — `mode: "symbol"`, labels `["alpha","zeta"]` in line order, edges intact,
+no console errors.
+
+**Seven of the items this session were already built in some form.** G-a is the
+seventh and the most instructive, because "already built" and "working" were
+different things: the code path existed, ran, and produced an unusable picture.
+A register entry can be wrong by being too pessimistic *and* the code can be wrong
+while appearing complete. Neither is visible without looking at the output.

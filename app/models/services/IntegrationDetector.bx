@@ -21,7 +21,13 @@ class {
 		{ kind: "http", target: "outbound", expression: "(?:<cfhttp\b|\bhttpRequest\b|\bhttpClient\b|\bnew\s+Http\s*\(|\bfetch\s*\(|\bhttpService\s*\(|\bhttp\s*\(\s*[""'])" },
 		{ kind: "schedule", target: "scheduled-work", expression: "(?:<cfschedule\b|\bscheduler(?:New|Start|Stop)?\b|\bonSchedule\b|\bschedule\s*\()" },
 		{ kind: "filesystem", target: "filesystem", expression: "(?:cf_file|fileRead|fileWrite|fileCopy|fileMove|directoryList|directoryCreate|fileUpload|cffile)" },
-		{ kind: "java", target: "java-interop", expression: "(?:new\s+java[.:]|createObject\s*\(\s*[""']java[""'])" }
+		{ kind: "java", target: "java-interop", expression: "(?:new\s+java[.:]|createObject\s*\(\s*[""']java[""'])" },
+		// Configuration a component reads. Without this, "which settings affect
+		// this file" is unanswerable and the settings themselves are invisible.
+		{ kind: "reads-config", target: "config", expression: "(?:\bgetSystemSetting\s*\(|\bgetSetting\s*\(|coldbox:setting:)" },
+		// Event publication. The subscriber half is not statically provable here —
+		// listeners resolve at runtime — so only the emit side is claimed.
+		{ kind: "emits", target: "event", expression: "(?:\.publish\s*\(|\bannounce\s*\(|\bemit\s*\()" }
 	];
 
 	/**
@@ -50,6 +56,10 @@ class {
 	 * built at runtime the honest answer is the generic one, not a guess.
 	 */
 	private string function hostFor( required string sourceLine, required string kind ) {
+		// A setting or event is only useful if it is named; an unnamed one is a
+		// fact about the line, not about the system.
+		if ( arguments.kind == "reads-config" ) return quotedName( arguments.sourceLine, "config" );
+		if ( arguments.kind == "emits" ) return quotedName( arguments.sourceLine, "event" );
 		if ( arguments.kind != "http" ) return arguments.kind == "schedule" ? "scheduled-work" : arguments.kind;
 		// reFind's struct form returns positions, not text.
 		var found = reFindNoCase( "https?://([A-Za-z0-9._-]+)", arguments.sourceLine, 1, true );
@@ -60,5 +70,17 @@ class {
 			return lCase( mid( arguments.sourceLine, found.pos[ 2 ], found.len[ 2 ] ) );
 		}
 		return "outbound";
+	}
+
+	/** The first quoted literal on the line, which is the setting or event name. */
+	private string function quotedName( required string sourceLine, required string fallback ) {
+		var found = reFindNoCase( "[""']([A-Za-z][A-Za-z0-9_.:-]{2,})[""']", arguments.sourceLine, 1, true );
+		if (
+			isStruct( found ) && isArray( found.pos ?: "" ) && found.pos.len() >= 2 &&
+			val( found.pos[ 2 ] ) > 0 && val( found.len[ 2 ] ) > 0
+		) {
+			return lCase( mid( arguments.sourceLine, found.pos[ 2 ], found.len[ 2 ] ) );
+		}
+		return arguments.fallback;
 	}
 }

@@ -680,6 +680,55 @@
 		);
 	}
 
+	/**
+	 * Draw the symbol level of one file.
+	 *
+	 * The symbol level was fetched, listed and searchable but never rendered, so
+	 * "what calls this function" was answerable only as a side-panel list. The
+	 * payload from /codegraph/graph?level=symbol is already nodes and edges; it
+	 * needs shaping, not new data.
+	 *
+	 * Symbols are labelled by name rather than by path — every node here shares
+	 * one file, so a path label would repeat the same string on every box — and
+	 * ordered by line so the drawing follows the source.
+	 */
+	function buildSymbolView(payload, opts) {
+		const cfg = mergeDefaults(Object.assign({}, opts, { detail: true, overview: false }));
+		const rawNodes = Array.isArray(payload && payload.nodes) ? payload.nodes : [];
+		const rawEdges = Array.isArray(payload && payload.edges) ? payload.edges : [];
+		const focusId = payload && payload.focus ? normId(payload.focus) : "";
+
+		const ordered = rawNodes.slice().sort((a, b) => {
+			const byLine = (Number(a.line) || 0) - (Number(b.line) || 0);
+			if (byLine !== 0) return byLine;
+			return String(a.symbolName || "").localeCompare(String(b.symbolName || ""), "en");
+		});
+
+		const nodes = ordered.map((n, index) => {
+			const id = normId(n.id || n.path || "") || "symbol-" + index;
+			const name = String(n.symbolName || "").trim();
+			return {
+				id: id,
+				path: normPath(n.path || ""),
+				label: name || fileBasename(normPath(n.path || "")) || id,
+				kind: n.kind || "function",
+				layer: numericLayer(n),
+				layerLabel: String(n.kind || "symbol"),
+				clusterId: "",
+				fanIn: n.fanIn || 0,
+				fanOut: n.fanOut || 0,
+				symbolCount: 0,
+				line: Number(n.line) || 0,
+				inCycle: false,
+				hotspotScore: n.hotspot || 0,
+				role: n.role || (idsEqual(id, focusId) ? "focus" : "symbol")
+			};
+		});
+
+		const capped = capGraph(nodes, uniqueEdges(rawEdges), cfg.maxNodes, cfg.maxEdges, opts && opts.focus);
+		return Object.assign({ mode: "symbol", detail: true, focus: focusId }, capped);
+	}
+
 	function selectSubgraph(snapshot, options) {
 		const opts = options || {};
 		const focus = String(opts.focus || "");
@@ -1742,6 +1791,7 @@
 		buildClusterView,
 		buildFileView,
 		buildFocusView,
+		buildSymbolView,
 		selectSubgraph,
 		layoutClusters,
 		layoutLayered,

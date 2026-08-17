@@ -1,0 +1,49 @@
+class extends="testbox.system.BaseSpec" {
+
+	/**
+	 * The snapshot reuse key falls back to a hardcoded parser signature when the
+	 * live lookup returns nothing. That literal has gone stale twice: once when
+	 * the call filter landed, and again when the config detector did. Both times
+	 * the consequence is the same and silent — a reused snapshot built by an older
+	 * parser, served as if it were current.
+	 *
+	 * Nothing enforced the two staying in step. This does.
+	 */
+	function run() {
+		describe( "Parser version signature", () => {
+
+			var boxLang = new app.models.services.BoxLangParserService();
+			var cfml = new app.models.services.CfmlParserService();
+			var javaScript = new app.models.services.JavaScriptParserService();
+
+			it( "keeps the reuse-key fallback in step with the live parser versions", () => {
+				var source = fileRead( expandPath( "/app/models/services/CodeGraphReuseKeyService.bx" ), "UTF-8" );
+				var fallback = "";
+				var found = reFind( "[""']([a-z0-9-]+\|[a-z0-9-]+\|[a-z0-9-]+)[""']", source, 1, true );
+				if ( isStruct( found ) && isArray( found.pos ?: "" ) && found.pos.len() >= 2 && val( found.pos[ 2 ] ) > 0 ) {
+					fallback = mid( source, found.pos[ 2 ], found.len[ 2 ] );
+				}
+				expect( len( fallback ) ).toBeGT( 0, "could not find the hardcoded parser signature to check" );
+
+				// getVersion() carries a strategy suffix; the signature uses the base.
+				for ( var part in listToArray( fallback, "|" ) ) {
+					var matchesOne = findNoCase( part, boxLang.getVersion() ) > 0
+						|| findNoCase( part, cfml.getVersion() ) > 0
+						|| findNoCase( part, javaScript.getVersion() ) > 0;
+					expect( matchesOne ).toBeTrue(
+						"reuse-key fallback names [#part#], which no live parser reports. Bump the fallback when a parser version changes, or snapshots built by the old parser will be reused silently."
+					);
+				}
+			} );
+
+			it( "gives every parser a distinct version so one bump cannot mask another", () => {
+				var versions = [ boxLang.getVersion(), cfml.getVersion(), javaScript.getVersion() ];
+				var seen = {};
+				for ( var version in versions ) {
+					expect( seen.keyExists( lCase( version ) ) ).toBeFalse( "duplicate parser version: #version#" );
+					seen[ lCase( version ) ] = true;
+				}
+			} );
+		} );
+	}
+}

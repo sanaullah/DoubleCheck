@@ -20,6 +20,7 @@ class threadsafe {
 	property name="inventoryAdapter" inject="CodeGraphInventoryAdapter";
 	property name="flowService" inject="CodeGraphFlowService";
 	property name="completenessService" inject="CodeGraphCompletenessService";
+	property name="architectureRuleService" inject="ArchitectureRuleService";
 	property name="centralityService" inject="CodeGraphCentralityService";
 
 	variables.snapshotVersion = "codegraph-snapshot-v2";
@@ -52,6 +53,14 @@ class threadsafe {
 		}
 		if ( isNull( variables.completenessService ?: javacast( "null", "" ) ) ) {
 			variables.completenessService = new app.models.services.CodeGraphCompletenessService();
+		}
+		// Specs construct this service directly, so an injected-only collaborator
+		// would be null for every unit test that never touches WireBox.
+		if ( isNull( variables.architectureRuleService ?: javacast( "null", "" ) ) ) {
+			variables.architectureRuleService = new app.models.services.ArchitectureRuleService();
+		}
+		if ( isNull( variables.syntheticNodes ?: javacast( "null", "" ) ) ) {
+			variables.syntheticNodes = new app.models.services.SyntheticNodeBuilder();
 		}
 		if ( isNull( variables.centralityService ?: javacast( "null", "" ) ) ) {
 			variables.centralityService = new app.models.services.CodeGraphCentralityService();
@@ -90,16 +99,16 @@ class threadsafe {
 		}
 
 		var rawClusters = derivedStructureService.deriveClusters( graph, inventory.units ?: [], [], coChange.affinityWeights );
+		var fileStats = indexFileStats( inventory, arguments.reviewGraph );
 		var clusterOf = {};
-		var clusters = presentClusters( rawClusters, graph, caps, truncation, clusterOf );
+		var clusters = presentClusters( rawClusters, graph, caps, truncation, clusterOf, fileStats );
 		clusters = appendCoChangeMetrics( clusters, coChange );
 
 		var clusterEdges = buildClusterEdges( graph, clusterOf, truncation );
-		var fileStats = indexFileStats( inventory, arguments.reviewGraph );
 		var crossingCounts = indexCrossingEdges( graph, clusterOf );
 		var roleEvidence = indexRoleEvidence( inventory );
 		var nodes = buildNodes( graph, inventory, fileStats, clusterOf, crossingCounts, roleEvidence, coChange.files );
-		appendSyntheticNodes( nodes, arguments.reviewGraph.dependencies ?: [] );
+		syntheticNodeBuilder().append( nodes, arguments.reviewGraph.dependencies ?: [] );
 		var orphanCandidateCount = countOrphanCandidates( nodes );
 		var availableNodes = nodes.len();
 		var nodeRanking = "path";
@@ -251,7 +260,8 @@ class threadsafe {
 		required any graph,
 		required struct caps,
 		required struct truncation,
-		required struct clusterOf
+		required struct clusterOf,
+		struct fileStats = {}
 	) {
 		var ordered = duplicate( arguments.rawClusters );
 		ordered.sort( ( a, b ) => compareNoCase( a.id ?: "", b.id ?: "" ) );
@@ -272,10 +282,17 @@ class threadsafe {
 		}
 
 		var presented = [];
+		// One derivation of "symbols in this file". `indexFileStats` counts the
+		// non-file units; deriving it a second time from `unitCount - 1` here let
+		// the cluster total disagree with the file total for the same files.
+		var byFile = isStruct( arguments.fileStats.byFile ?: "" ) ? arguments.fileStats.byFile : {};
 		var symbolsByFile = {};
 		for ( var graphNode in arguments.graph.getNodes() ) {
 			var graphPath = normalizePath( graphNode.filePath ?: graphNode.id ?: "" );
-			if ( len( graphPath ) ) symbolsByFile[ graphPath ] = max( 0, val( graphNode.unitCount ?: 0 ) - 1 );
+			if ( !len( graphPath ) ) continue;
+			symbolsByFile[ graphPath ] = byFile.keyExists( graphPath )
+				? val( byFile[ graphPath ].symbolCount ?: 0 )
+				: max( 0, val( graphNode.unitCount ?: 0 ) - 1 );
 		}
 		for ( var cluster in ordered ) {
 			var filePaths = isArray( cluster.filePaths ?: "" ) ? duplicate( cluster.filePaths ) : [];
@@ -681,7 +698,7 @@ class threadsafe {
 			var toPath = arguments.canonicalPaths[ edge.toFile ] ?: edge.toFile;
 			var fromLayer = architectureModelService.classifyFile( fromPath );
 			var toLayer = architectureModelService.classifyFile( toPath );
-			if ( isLayerViolation( fromLayer, toLayer, arguments.policy ) ) {
+			if ( architectureRuleService.isLayerViolation( fromLayer, toLayer, arguments.policy ) ) {
 				candidateCount++;
 				if ( arguments.visibleNodes.count() && ( !arguments.visibleNodes.keyExists( normalizePath( edge.fromFile ) ) || !arguments.visibleNodes.keyExists( normalizePath( edge.toFile ) ) ) ) continue;
 				violations.append( {
@@ -699,30 +716,17 @@ class threadsafe {
 			if ( byFrom != 0 ) return byFrom;
 			return compareNoCase( a.to, b.to );
 		} );
-		if ( candidateCount > arguments.limit ) {
-			markTruncated( arguments.truncation, "maxLayerViolations" );
-		}
+		// Candidates are counted before the visible-node filter, so comparing that
+		// count to the limit flags truncation the cap did not cause. Only the cut
+		// itself is truncation; the filtered rows are a different loss.
+		arguments.truncation.layerViolationCandidates = candidateCount;
 		if ( violations.len() > arguments.limit ) {
+			markTruncated( arguments.truncation, "maxLayerViolations" );
 			violations = violations.slice( 1, arguments.limit );
 		}
 		return violations;
 	}
 
-	private boolean function isLayerViolation( required string fromLayer, required string toLayer, required any policy ) {
-		var rules = [];
-		if ( isArray( arguments.policy ?: "" ) ) {
-			rules = arguments.policy;
-		} else {
-			var raw = trim( toString( arguments.policy ?: "" ) );
-			if ( !len( raw ) ) raw = "application-models>http-handlers";
-			for ( var rule in listToArray( raw, "," ) ) rules.append( trim( rule ) );
-		}
-		for ( var rule in rules ) {
-			var parts = listToArray( toString( rule ), ">" );
-			if ( parts.len() == 2 && lCase( trim( parts[ 1 ] ) ) == lCase( arguments.fromLayer ) && lCase( trim( parts[ 2 ] ) ) == lCase( arguments.toLayer ) ) return true;
-		}
-		return false;
-	}
 
 	private array function directoryRollup( required array nodes ) {
 		var dirs = {};
@@ -750,61 +754,13 @@ class threadsafe {
 		return output;
 	}
 
-	private void function appendSyntheticNodes( required array nodes, required array dependencies ) {
-		var seen = {};
-		for ( var node in arguments.nodes ) seen[ normalizePath( node.id ?: "" ) ] = true;
-		for ( var dep in arguments.dependencies ) {
-			if ( !isStruct( dep ) ) continue;
-			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
-			var id = "";
-			var role = "shared";
-			var component = "other";
-			if ( kind == "routes" || kind == "calls-api" ) {
-				var routePath = normalizeRoute( dep.target ?: "" );
-				id = len( routePath ) ? "route:" & routePath : "";
-				role = "entry";
-				component = "http-handlers";
-			} else if ( listFindNoCase( "table-query,table-read,table-write", kind ) ) {
-				id = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
-				role = "persistence";
-				component = "application-models";
-			} else if ( listFindNoCase( "http,schedule", kind ) ) {
-				id = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
-				role = "integration";
-				component = "other";
-			}
-			if ( !len( id ) || id == "route:" || seen.keyExists( normalizePath( id ) ) ) continue;
-			seen[ normalizePath( id ) ] = true;
-			arguments.nodes.append( {
-				id          : id,
-				path        : id,
-				dir         : "",
-				component   : component,
-				layer       : component,
-				role        : role,
-				language    : "",
-				symbolCount : 0,
-				lineCount   : 0,
-				fanIn       : 0,
-				fanOut      : 0,
-				clusterId   : "",
-				hotspotScore: 0,
-				inCycle     : false
-			} );
-		}
-		arguments.nodes.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
-	}
 
 	private boolean function isSyntheticNode( required struct node ) {
-		return reFindNoCase( "^(route|table|http|schedule):", toString( arguments.node.id ?: "" ) ) > 0;
+		return reFindNoCase( "^(route|table|http|schedule|config|event):", toString( arguments.node.id ?: "" ) ) > 0;
 	}
 
 	private string function normalizeRoute( required any target ) {
-		var value = trim( toString( arguments.target ?: "" ) );
-		value = reReplace( value, "\?.*$", "" );
-		value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" );
-		while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 );
-		return lCase( value );
+		return pathNormalizer().route( arguments.target );
 	}
 
 	private string function languageFor( required string filePath ) {
@@ -836,10 +792,15 @@ class threadsafe {
 		return keys;
 	}
 
+	private any function syntheticNodeBuilder() {
+		if ( isNull( variables.syntheticNodes ?: javacast( "null", "" ) ) ) {
+			variables.syntheticNodes = new app.models.services.SyntheticNodeBuilder();
+		}
+		return variables.syntheticNodes;
+	}
+
 	private string function normalizePath( required any path ) {
-		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
-		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
-		return lCase( value );
+		return pathNormalizer().path( arguments.path );
 	}
 
 	private numeric function round4( required numeric value ) {
@@ -887,5 +848,11 @@ class threadsafe {
 
 	private string function stableHash( required string value ) {
 		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+	private any function pathNormalizer() {
+		if ( isNull( variables.graphPathNormalizer ?: javacast( "null", "" ) ) ) {
+			variables.graphPathNormalizer = new app.models.services.GraphPathNormalizer();
+		}
+		return variables.graphPathNormalizer;
 	}
 }
