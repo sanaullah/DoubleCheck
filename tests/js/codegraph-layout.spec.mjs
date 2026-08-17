@@ -657,3 +657,18 @@ test("symbol view labels by symbol name and follows source order", () => {
 	assert.deepEqual(view.nodes.map((n) => n.label), ["alpha", "zeta"], "labelled by symbol, ordered by line");
 	assert.equal(view.edges.length, 1, "symbol edges survive");
 });
+
+test("the overview offers two non-diagram views and lands on the reading order", () => {
+	// The 42-box overview overlapped, clipped its own labels, and named modules
+	// from filenames. Neither of these can overlap: one is a list, one is a grid.
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const markup = readFileSync(new URL("../../app/views/main/codegraph.bxm", import.meta.url), "utf8");
+
+	assert.match(markup, /data-codegraph-depth="start"/, "Start here is a depth");
+	assert.match(markup, /data-codegraph-depth="matrix"/, "Matrix is a depth");
+	assert.match(ui, /mode:\s*"start"/, "a run opens on the reading order, not the diagram");
+	assert.match(ui, /renderCodeGraphStartHere/);
+	assert.match(ui, /renderCodeGraphMatrix/);
+	// Below the diagonal is a cycle — the property that makes a DSM worth drawing.
+	assert.match(ui, /is-cycle/);
+});

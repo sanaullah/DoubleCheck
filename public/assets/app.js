@@ -102,7 +102,8 @@ const state = {
 		snapshot: null,
 		loading: false,
 		error: "",
-		mode: "cluster",
+		// A stranger meets a ranked reading order, not 42 derived-name boxes.
+		mode: "start",
 		layout: "cluster",
 		selectedId: "",
 		selectedEdge: null,
@@ -124,6 +125,8 @@ const state = {
 		overviewShowAll: false,
 		roleFilter: "",
 		openedFromSavedMap: false,
+		startHere: [],
+		startHereRun: "",
 		serverSearch: null,
 		searchTimer: null,
 		symbolLevel: null,
@@ -2237,7 +2240,9 @@ function setRun(run) {
 		state.codegraph.snapshot = null;
 		state.codegraph.loading = !state.terminal.has(run.status);
 		state.codegraph.error = "";
-		state.codegraph.mode = "cluster";
+		// Opening a run lands on the reading order, not the module diagram.
+		state.codegraph.mode = "start";
+		state.codegraph.startHereRun = "";
 		state.codegraph.selectedId = "";
 		state.codegraph.selectedEdge = null;
 		state.codegraph.clusterId = "";
@@ -5605,6 +5610,88 @@ function renderCodeGraphIssues() {
 	}).join("");
 }
 
+/**
+ * "Start here" — a ranked reading order, not a diagram.
+ *
+ * For a developer meeting a project for the first time, 42 boxes with derived
+ * names answer nothing. This lists entry points, the largest modules and the most
+ * depended-upon files, each with the reason it is listed, and each clickable
+ * through to the graph. It cannot overlap, cannot truncate, and needs no layout.
+ */
+async function renderCodeGraphStartHere(host) {
+	const runId = state.activeRun?.id || "";
+	if (!runId) return;
+	if (state.codegraph.startHereRun !== runId) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Reading the graph…</p>`;
+		try {
+			const payload = await request(`/api/v1/runs/${encodeURIComponent(runId)}/codegraph/onboarding?limit=6`);
+			state.codegraph.startHere = payload?.data?.startHere || [];
+			state.codegraph.startHereRun = runId;
+		} catch (error) {
+			host.innerHTML = `<p class="codegraph-empty-hint">Could not read the orientation view: ${escapeHtml(error.message || "unavailable")}</p>`;
+			return;
+		}
+	}
+	const items = Array.isArray(state.codegraph.startHere) ? state.codegraph.startHere : [];
+	if (!items.length) {
+		host.innerHTML = `<p class="codegraph-empty-hint">Nothing to orient from — this run has no indexed entry points.</p>`;
+		return;
+	}
+	const titles = { "entry-point": "Where requests begin", domain: "Largest modules", pillar: "Most depended upon" };
+	const grouped = {};
+	items.forEach((item) => {
+		const key = String(item.section || "other");
+		(grouped[key] = grouped[key] || []).push(item);
+	});
+	host.innerHTML = `<div class="codegraph-starthere">` + Object.keys(grouped).map((section) => {
+		const rows = grouped[section].map((item) => `
+			<button type="button" class="codegraph-starthere-item" data-codegraph-search-type="node" data-codegraph-search-target="${escapeHtml(String(item.path || ""))}">
+				<strong>${escapeHtml(String(item.label || item.path || ""))}</strong>
+				<small>${escapeHtml(String(item.reason || ""))}</small>
+				<code>${escapeHtml(String(item.path || ""))}${Number(item.line) ? ":" + Number(item.line) : ""}</code>
+			</button>`).join("");
+		return `<section class="codegraph-starthere-group"><h3>${escapeHtml(titles[section] || section)}</h3>${rows}</section>`;
+	}).join("") + `</div>`;
+}
+
+/**
+ * Dependency structure matrix.
+ *
+ * A grid cannot overlap, which is the failure mode of the box-and-arrow overview
+ * at this module count. Rows and columns are modules; a filled cell is a
+ * dependency; anything below the diagonal is a cycle.
+ */
+function renderCodeGraphMatrix(host, snapshot) {
+	const clusters = (Array.isArray(snapshot.clusters) ? snapshot.clusters : []).slice(0, 40);
+	const edges = Array.isArray(snapshot.clusterEdges) ? snapshot.clusterEdges : [];
+	if (!clusters.length) {
+		host.innerHTML = `<p class="codegraph-empty-hint">No modules to compare.</p>`;
+		return;
+	}
+	const index = {};
+	clusters.forEach((c, i) => { index[c.id] = i; });
+	const weight = {};
+	edges.forEach((e) => {
+		if (index[e.from] == null || index[e.to] == null) return;
+		weight[`${index[e.from]}:${index[e.to]}`] = Number(e.edgeCount) || 1;
+	});
+	const label = (c) => String(c.label || c.key || c.id || "").slice(0, 22);
+	const head = clusters.map((c, i) => `<th scope="col" title="${escapeHtml(String(c.label || c.id))}"><span>${i + 1}</span></th>`).join("");
+	const rows = clusters.map((rowCluster, r) => {
+		const cells = clusters.map((_, c) => {
+			const w = weight[`${r}:${c}`];
+			if (r === c) return `<td class="is-self"></td>`;
+			if (!w) return `<td></td>`;
+			// Below the diagonal means the dependency points back — a cycle.
+			const cls = c < r ? "is-cycle" : "is-dep";
+			return `<td class="${cls}" title="${escapeHtml(label(rowCluster))} → ${escapeHtml(label(clusters[c]))} (${w})">${w}</td>`;
+		}).join("");
+		return `<tr><th scope="row"><span>${r + 1}</span> ${escapeHtml(label(rowCluster))}</th>${cells}</tr>`;
+	}).join("");
+	host.innerHTML = `<div class="codegraph-matrix-wrap"><table class="codegraph-matrix"><thead><tr><th></th>${head}</tr></thead><tbody>${rows}</tbody></table>
+		<p class="codegraph-matrix-key">Row depends on column. Cells below the diagonal are cycles.</p></div>`;
+}
+
 function paintCodeGraphCanvas(options = {}) {
 	const fit = options.fit !== false;
 	const CG = codeGraphLayoutApi();
@@ -5627,6 +5714,17 @@ function paintCodeGraphCanvas(options = {}) {
 			: state.codegraph.showAi && narrative && Array.isArray(narrative.summaries)
 				? narrative.summaries
 				: [];
+	// Two non-diagram overviews. The node-link overview is at its worst here —
+	// most nodes, least context — and it is the first thing a stranger sees, so
+	// neither of these has to compete with it for the same job.
+	if (depth === "start") {
+		renderCodeGraphStartHere(host);
+		return;
+	}
+	if (depth === "matrix") {
+		renderCodeGraphMatrix(host, snapshot);
+		return;
+	}
 	const viewSnapshot = codeGraphViewSnapshot(snapshot);
 	let view;
 	if (depth === "focus" && state.codegraph.focusSubgraph) {
@@ -8475,6 +8573,14 @@ elements.codegraphDepth?.addEventListener("click", (event) => {
 	const btn = event.target.closest("[data-codegraph-depth]");
 	if (!btn || btn.disabled) return;
 	const depth = btn.dataset.codegraphDepth || "cluster";
+	// Neither overview draws a graph, so neither needs the selection machinery
+	// the diagram modes below reset.
+	if (depth === "start" || depth === "matrix") {
+		state.codegraph.mode = depth;
+		paintCodeGraphCanvas({ fit: true });
+		renderCodeGraphDepthControl();
+		return;
+	}
 	if (depth === "cluster") {
 		state.codegraph.mode = "cluster";
 		state.codegraph.focusId = "";
@@ -8635,7 +8741,7 @@ elements.codegraphBreadcrumb?.addEventListener("click", (event) => {
 	if (!crumb) return;
 	const target = crumb.dataset.codegraphCrumb;
 	if (target === "root") {
-		state.codegraph.mode = "cluster";
+		state.codegraph.mode = "start";
 		state.codegraph.clusterId = "";
 		state.codegraph.focusId = "";
 		state.codegraph.focusSubgraph = null;
