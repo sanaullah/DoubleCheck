@@ -196,7 +196,22 @@ test("overview cards include complexity, summary, and explore CTA", () => {
 
 	const invoices = view.nodes.find((n) => n.id === "c2");
 	assert.equal(invoices.summaryOrigin, "deterministic");
-	assert.match(invoices.summary, /in the .+ area/);
+	// This asserted /in the .+ area/, which only ever passed because the layer was
+	// fabricated from the card's index — the spec was testing the bug. `c2` has no
+	// layer, so the clause must not appear; a cluster that has one still gets it.
+	assert.match(invoices.summary, /Invoices — 2 files\./);
+	assert.equal(/in the .+ area/.test(invoices.summary), false, "no layer, no layer clause");
+
+	const layered = layout.buildClusterView(
+		{
+			nodes: [],
+			clusters: [{ id: "c9", label: "Ledger", fileCount: 2, layer: "application models", filePaths: [] }],
+			clusterEdges: [],
+			edges: []
+		},
+		{ overview: true }
+	);
+	assert.match(layered.nodes[0].summary, /in the application models area/);
 
 	const positioned = layout.layoutClusters(view);
 	assert.equal(positioned.overview, true);
@@ -613,19 +628,46 @@ test("the symbol level is drawable, not just listable", () => {
 	assert.match(view, /data-codegraph-depth="symbol"/, "the depth control offers it");
 });
 
-test("plain /codegraph stays on the run form and never reopens the last map", () => {
-	// The page silently reopened the newest saved snapshot for whatever project
-	// path was in the form, so "Start CodeGraph" looked like it had already run
-	// and offered no obvious way to begin a fresh one. Only an explicit ?run=
-	// opens a map; History's Open button is the way back to a saved one.
+test("plain /codegraph opens the saved map and still offers a fresh run", () => {
+	// This spec used to assert the opposite: that a bare /codegraph must never
+	// reopen the newest snapshot. The concern behind it was real and is preserved
+	// below — silently reopening a map "offered no obvious way to begin a fresh
+	// one". But withholding the map answered that concern by breaking the
+	// workspace's purpose: a project with 42 stored graphs greeted its reader with
+	// "No graph snapshot", and the only way back to a map was the dashboard.
+	//
+	// Both hold at once: open the map, say it is a saved one, and leave starting a
+	// new run in plain sight. So this now pins the arrival *and* the escape hatch.
 	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const view = readFileSync(new URL("../../app/views/main/codegraph.bxm", import.meta.url), "utf8");
 	const resume = ui.slice(ui.indexOf("async function resumeRunFromQuery"), ui.indexOf("function historyQueryParams"));
 
-	assert.match(resume, /if \(!resumeId\) return;/, "no run id means stay on the form");
-	assert.doesNotMatch(resume, /api\/v1\/codegraph\?projectPath/, "must not look up the newest saved map");
-	assert.doesNotMatch(resume, /elements\.projectPath\?\.value/, "must not read the form field to decide what to open");
+	assert.match(resume, /if \(!resumeId\) \{/, "no run id now takes a branch rather than returning");
+	assert.match(resume, /restoreProjectSnapshot\(\)/, "bare /codegraph asks for the newest saved map");
+	assert.match(ui, /api\/v1\/codegraph\?projectPath/, "through the project snapshot endpoint");
+	// The concern the old spec protected, kept as an assertion rather than a comment.
+	assert.match(view, /id="run-form"/, "the run form stays on the page");
+	assert.match(view, /id="codegraph-rebuild"/, "and Rebuild map is offered beside the opened map");
+	assert.match(ui, /openedFromSavedMap = true/, "the header says this is a saved map, not a run that just finished");
 	// History still routes here with an explicit id.
 	assert.match(ui, /\/\$\{runKind\}\?run=\$\{encodeURIComponent\(run\.id\)\}/);
+});
+
+test("the briefing renders on the depths that return early", () => {
+	// renderCodeGraphCanvas returns before renderCodeGraphProjectStrip for the
+	// "start" and "matrix" depths, and a run opens on "start" — so the pitch,
+	// domains, onboarding path and processes stayed hidden on every arrival, with
+	// their content already rendered underneath an unset `hidden` flag.
+	const ui = readFileSync(new URL("../../public/assets/app.js", import.meta.url), "utf8");
+	const start = ui.indexOf('if (depth === "start")');
+	assert.ok(start > 0, "the start depth branch exists");
+	// Both branches sit together; take the window that spans them rather than
+	// anchoring on a token that also appears elsewhere in the file.
+	const branches = ui.slice(start, start + 900);
+	assert.match(branches, /renderCodeGraphStartHere\(host\)/);
+	assert.match(branches, /renderCodeGraphMatrix\(host, snapshot\)/);
+	const strips = branches.match(/renderCodeGraphProjectStrip\(/g) || [];
+	assert.equal(strips.length, 2, "both early-returning depths render the briefing before returning");
 });
 
 test("unresolved references and starved kinds are stated, not folded into cap counts", () => {
@@ -671,4 +713,101 @@ test("the overview offers two non-diagram views and lands on the reading order",
 	assert.match(ui, /renderCodeGraphMatrix/);
 	// Below the diagonal is a cycle — the property that makes a DSM worth drawing.
 	assert.match(ui, /is-cycle/);
+});
+
+// ---------------------------------------------------------------------------
+// A field with no data renders no widget.
+//
+// `layerLabelOf` used to fall back to ["entry","config","domain","support",
+// "tests"][index % 5] — the card's draw position. Snapshot clusters carry
+// neither `layer` nor `layerLabel`, so every card on the Overview displayed a
+// layer derived from nothing, in the same styling as the real file count: a
+// 117-file core-services module read "entry", the repository layer read "tests".
+//
+// These are written against the general rule rather than the one field, because
+// the defect was not that this fallback was wrong — it was that a renderer was
+// allowed to invent a value at all.
+// ---------------------------------------------------------------------------
+
+const unlayeredSnapshot = {
+	nodes: [],
+	clusters: [
+		{ id: "c1", label: "Alpha", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] },
+		{ id: "c2", label: "Beta", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] },
+		{ id: "c3", label: "Gamma", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] },
+		{ id: "c4", label: "Delta", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] },
+		{ id: "c5", label: "Epsilon", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] },
+		{ id: "c6", label: "Zeta", fileCount: 9, symbolCount: 40, crossingEdges: 1, filePaths: [] }
+	],
+	clusterEdges: [],
+	edges: []
+};
+
+test("a cluster with no layer in the payload gets no layer label", () => {
+	const view = layout.buildClusterView(unlayeredSnapshot, { showAll: true });
+	const labels = view.nodes.map((n) => n.layerLabel);
+	assert.deepEqual(
+		labels,
+		labels.map(() => ""),
+		"no cluster carries a layer, so none may display one"
+	);
+	assert.equal(
+		view.nodes.every((n) => n.layer === undefined),
+		true,
+		"the numeric layer feeds the Layer layout's bands — it may not be positional either"
+	);
+});
+
+test("identical clusters render identically wherever they are drawn", () => {
+	// The regression in one assertion: six clusters with identical data differed
+	// only by array position, and position alone changed what the card claimed.
+	const view = layout.buildClusterView(unlayeredSnapshot, { showAll: true });
+	const claims = view.nodes.map((n) => [n.layerLabel, n.complexity, n.fileCount].join("|"));
+	assert.equal(
+		new Set(claims).size,
+		1,
+		"identical input must produce identical claims: " + JSON.stringify(claims)
+	);
+});
+
+test("a real layer on the payload is still shown", () => {
+	// The fix must not throw away true data along with the invented data.
+	const view = layout.buildClusterView(
+		{
+			nodes: [],
+			clusters: [{ id: "c1", label: "Alpha", fileCount: 3, layer: "application models", filePaths: [] }],
+			clusterEdges: [],
+			edges: []
+		},
+		{ showAll: true }
+	);
+	assert.equal(view.nodes[0].layerLabel, "application models");
+});
+
+test("the overview card omits chips it has no value for", () => {
+	const view = layout.buildClusterView(unlayeredSnapshot, { showAll: true });
+	const svg = layout.buildSvg(view, {});
+	assert.equal(
+		/class="cg-card-layer"/.test(svg),
+		false,
+		"no layer value means no layer element — not an empty one"
+	);
+	assert.match(svg, /class="cg-card-complexity"/, "complexity is real and still renders");
+	assert.match(svg, /class="cg-card-footer"/, "the file count is real and still renders");
+});
+
+test("every visible card claim traces to a payload value", () => {
+	// The general guard. Any chip added later that is derived from draw order
+	// rather than data fails this, because shuffling the input must not change
+	// what any card says about itself.
+	const shuffled = Object.assign({}, unlayeredSnapshot, {
+		clusters: unlayeredSnapshot.clusters.slice().reverse()
+	});
+	const a = layout.buildClusterView(unlayeredSnapshot, { showAll: true });
+	const b = layout.buildClusterView(shuffled, { showAll: true });
+	const claimsOf = (view) =>
+		view.nodes
+			.map((n) => [n.id, n.layerLabel, n.complexity, n.fileCount, n.summary].join("|"))
+			.sort();
+	assert.deepEqual(claimsOf(a), claimsOf(b), "a card's claims must not depend on its position");
 });

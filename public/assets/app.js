@@ -5916,12 +5916,23 @@ function paintCodeGraphCanvas(options = {}) {
 	// Two non-diagram overviews. The node-link overview is at its worst here —
 	// most nodes, least context — and it is the first thing a stranger sees, so
 	// neither of these has to compete with it for the same job.
+	// These two return early, and both used to return before the briefing was
+	// rendered — so the project pitch, domains, onboarding path and processes
+	// stayed hidden with the empty state left by the loading pass. Since a run
+	// now opens on "start", that meant the meaning layer was invisible on every
+	// arrival: the drawer said Briefing and the panel was blank.
 	if (depth === "start") {
 		renderCodeGraphStartHere(host);
+		renderCodeGraphBreadcrumb();
+		renderCodeGraphDepthControl();
+		renderCodeGraphProjectStrip(null);
 		return;
 	}
 	if (depth === "matrix") {
 		renderCodeGraphMatrix(host, snapshot);
+		renderCodeGraphBreadcrumb();
+		renderCodeGraphDepthControl();
+		renderCodeGraphProjectStrip(null);
 		return;
 	}
 	const viewSnapshot = codeGraphViewSnapshot(snapshot);
@@ -7486,12 +7497,22 @@ async function resumeRunFromQuery() {
 	if (state.activeRun || state.didAutoResume) return;
 	const params = new URLSearchParams(window.location.search);
 	const resumeId = params.get("run");
-	// Only an explicit run id opens a map. Plain /codegraph is a request to start
-	// one, so it stays on the form: silently reopening the newest saved snapshot
-	// made the page look like it had already run, and left no obvious way to
-	// begin a fresh one. History's Open button is the way back to a saved map,
-	// and it arrives here with ?run=.
-	if (!resumeId) return;
+	// Plain /codegraph used to stay on the form, because silently reopening the
+	// newest snapshot "made the page look like it had already run, and left no
+	// obvious way to begin a fresh one". That concern was real; withholding the
+	// map was the wrong answer to it. A project with 42 stored graphs greeted a
+	// reader with "No graph snapshot", and the only route back to a map was the
+	// dashboard's history table — for a workspace whose entire purpose is letting
+	// someone understand a project quickly.
+	//
+	// Both concerns are satisfiable: open the saved map *and* keep starting a new
+	// run obvious. `restoreProjectSnapshot` says which snapshot it opened and how
+	// old it is, and the create panel stays on the page beside it.
+	if (!resumeId) {
+		state.didAutoResume = true;
+		await restoreProjectSnapshot();
+		return;
+	}
 	state.didAutoResume = true;
 	try {
 		const payload = await request(`/api/v1/runs/${encodeURIComponent(resumeId)}`);
@@ -7508,6 +7529,37 @@ async function resumeRunFromQuery() {
 			elements.formMessage.textContent = error.message || "Could not open the requested run.";
 			elements.formMessage.dataset.tone = "danger";
 		}
+	}
+}
+
+/**
+ * Open the newest saved map for this project when /codegraph is loaded bare.
+ *
+ * `GET /api/v1/codegraph?projectPath=` has always returned exactly this — the
+ * newest usable snapshot plus its run — and nothing called it. The endpoint,
+ * its handler, its OpenAPI annotations and the feature row in
+ * application-features.md all shipped; the fetch did not.
+ *
+ * Silent on failure by design: no snapshot, an unreadable one, or a path the
+ * allowlist rejects all leave the page exactly as it was, on the run form. This
+ * must never be the reason a user cannot start a run.
+ */
+async function restoreProjectSnapshot() {
+	if (state.workspace !== "codegraph" || state.activeRun) return;
+	const projectPath = String(elements.projectPath?.value || "").trim();
+	if (!projectPath) return;
+	try {
+		const payload = await request(`/api/v1/codegraph?projectPath=${encodeURIComponent(projectPath)}`);
+		const run = payload?.data?.run;
+		if (!run?.id) return;
+		// The same flag the history Open button sets, so the header reads "Saved map
+		// of … · built Nh ago" rather than presenting this as a run that just
+		// finished in front of the user.
+		state.codegraph.openedFromSavedMap = true;
+		watchRun(run);
+	} catch (error) {
+		// A 404 here is the ordinary "no snapshot yet" case, not an error worth
+		// showing: the empty state already says it.
 	}
 }
 

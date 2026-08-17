@@ -32,12 +32,18 @@ class threadsafe {
 
 		var incoming = direction == "outgoing" ? [] : edgesFor( arguments.runId, nodeId, true, edgeLimit );
 		var outgoing = direction == "incoming" ? [] : edgesFor( arguments.runId, nodeId, false, edgeLimit );
-		var total = incoming.len() + outgoing.len();
+		var returned = incoming.len() + outgoing.len();
+		// `available` used to be the returned count, so the LIMIT above was
+		// invisible: the router node returns 60 of its 314 edges and the account
+		// said `omitted: 0, complete: true`. An unbounded COUNT(*) is the only
+		// thing that can tell a small node from a capped one.
+		var available = ( direction == "outgoing" ? 0 : edgeCountFor( arguments.runId, nodeId, true ) )
+			+ ( direction == "incoming" ? 0 : edgeCountFor( arguments.runId, nodeId, false ) );
 		return {
 			node        : nodeId,
 			incoming    : incoming,
 			outgoing    : outgoing,
-			completeness: countedAccount( total, "weight", arguments.runId )
+			completeness: countedAccount( returned, "weight", arguments.runId, available )
 		};
 	}
 
@@ -216,14 +222,40 @@ class threadsafe {
 			} );
 		}
 
+		// Both queries above are limited, so both totals have to be counted. At
+		// `limit=5` this endpoint returned 5 of 24 definitions and 5 of 130
+		// occurrences and called it complete — and reported `unresolvedInResult: 0`
+		// for a set whose unresolved occurrences had simply been cut off. The one
+		// endpoint whose purpose is honest unresolved reporting was the worst
+		// affected by this.
+		var totals = queryExecute(
+			"
+				SELECT
+					( SELECT COUNT(*) FROM review_symbols WHERE run_id = :runId AND lower( name ) = :name ) AS definitionTotal,
+					( SELECT COUNT(*) FROM review_dependencies
+						WHERE run_id = :runId AND ( lower( target ) = :name OR lower( target ) LIKE :dotted ESCAPE '\' ) ) AS occurrenceTotal
+			",
+			{
+				runId : arguments.runId,
+				name  : name,
+				dotted: "%." & replace( replace( replace( name, "\", "\\", "all" ), "%", "\%", "all" ), "_", "\_", "all" )
+			},
+			{ datasource: datasource }
+		);
+		var available = totals.recordCount
+			? val( totals.definitionTotal[ 1 ] ?: 0 ) + val( totals.occurrenceTotal[ 1 ] ?: 0 )
+			: definitions.len() + references.len();
+
 		var account = completeness().queryAccount(
 			definitions.len() + references.len(),
-			definitions.len() + references.len(),
+			available,
 			"file_path,line",
 			unresolvedFor( arguments.runId )
 		);
 		// Unlike every other endpoint, this one can report unresolved *within the
-		// answer*, because an occurrence is returned whether or not it bound.
+		// answer*, because an occurrence is returned whether or not it bound. It is
+		// scoped to what was returned, so it must not be read as the total when the
+		// result was cut — `state` says whether it was.
 		account.unresolvedInResult = unresolved;
 		return {
 			symbol      : name,
@@ -294,17 +326,41 @@ class threadsafe {
 		return completeness().queryAccount( 0, 0, "", 0, "empty" );
 	}
 
+	/**
+	 * An account for a query, with `available` counted rather than assumed.
+	 *
+	 * `available` defaults to `returned` only for the unbounded queries — those
+	 * that apply no LIMIT and therefore genuinely returned everything. Any query
+	 * with a LIMIT must pass its own counted total, or it will certify a truncated
+	 * answer as complete.
+	 */
 	private struct function countedAccount(
-		required numeric total,
+		required numeric returned,
 		required string rankedBy,
-		string runId = ""
+		string runId = "",
+		numeric available
 	) {
 		return completeness().queryAccount(
-			arguments.total,
-			arguments.total,
+			arguments.returned,
+			isNull( arguments.available ) ? arguments.returned : arguments.available,
 			arguments.rankedBy,
 			unresolvedFor( arguments.runId )
 		);
+	}
+
+	/** How many edges touch this node in one direction, ignoring any limit. */
+	private numeric function edgeCountFor(
+		required string runId,
+		required string nodeId,
+		required boolean incoming
+	) {
+		var matchColumn = arguments.incoming ? "to_node" : "from_node";
+		var record = queryExecute(
+			"SELECT COUNT(*) AS total FROM codegraph_edges WHERE run_id = :runId AND #matchColumn# = :nodeId",
+			{ runId: arguments.runId, nodeId: arguments.nodeId },
+			{ datasource: datasource }
+		);
+		return record.recordCount ? val( record.total[ 1 ] ?: 0 ) : 0;
 	}
 
 	/**
@@ -390,12 +446,46 @@ class threadsafe {
 	struct function onboarding( required string runId, required struct query ) {
 		var perSection = max( 3, min( 12, val( arguments.query.limit ?: 6 ) ) );
 
+		// Ranked, not alphabetical. `ORDER BY kind, path, symbol_name` answered "where
+		// does a request start" with the alphabetically first handler — on this
+		// repository: smoke, activate, create, delete, index, notFound, five of them
+		// from one AI-provider CRUD handler, with `notFound` presented as a place a
+		// request begins. It is the first screen a stranger sees.
+		//
+		// The ranking is structural and needs no new data: an entry point matters in
+		// proportion to how much of the application it reaches. `fan_out` on the
+		// owning file is that reach; a route that is actually wired scores above a
+		// bare action; and the hotspot of the file it lives in breaks ties toward the
+		// parts of the codebase everything else depends on.
+		// One entry per file until every file has had one. Ranking alone put all six
+		// entries in the single handler with the highest fan-out, which is a correct
+		// ranking and a useless orientation: "start here" wants breadth across the
+		// application, not the six actions of one module.
+		// A `route` symbol whose name is not a path is a mis-extraction, not an entry
+		// point: `.target` in CodeGraphMetricsService was being offered as a place a
+		// request begins. Four of 310 here — small, and all of them on the first
+		// screen because the other 306 live in two router files that the per-file
+		// spread deliberately limits.
 		var entryPoints = queryExecute(
 			"
+				WITH ranked AS (
+					SELECT n.node_id, n.path, n.symbol_name, n.kind, n.role, n.line, n.fan_in, n.fan_out,
+						COALESCE( f.fan_out, 0 ) AS fileReach,
+						COALESCE( f.hotspot, 0 ) AS fileHotspot,
+						ROW_NUMBER() OVER (
+							PARTITION BY n.path
+							ORDER BY n.fan_out DESC, n.fan_in DESC, n.symbol_name
+						) AS perFile
+					FROM codegraph_nodes n
+					LEFT JOIN codegraph_nodes f
+						ON f.run_id = n.run_id AND f.level = 'file' AND f.node_id = 'file:' || lower( n.path )
+					WHERE n.run_id = :runId AND n.level = 'symbol'
+						AND n.kind IN ( 'route', 'handler-action', 'lifecycle-hook' )
+						AND ( n.kind <> 'route' OR n.symbol_name LIKE '/%' )
+				)
 				SELECT node_id, path, symbol_name, kind, role, line, fan_in, fan_out
-				FROM codegraph_nodes
-				WHERE run_id = :runId AND level = 'symbol' AND kind IN ( 'route', 'handler-action', 'lifecycle-hook' )
-				ORDER BY kind, path, symbol_name
+				FROM ranked
+				ORDER BY perFile ASC, fileReach DESC, fileHotspot DESC, fan_out DESC, path, symbol_name
 				LIMIT :sectionLimit
 			",
 			{ runId: arguments.runId, sectionLimit: { value: perSection, sqltype: "INTEGER" } },

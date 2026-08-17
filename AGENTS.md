@@ -9,26 +9,27 @@ BoxLang, ColdFusion, and JavaScript. Keep changes focused on that product.
 
 Read only what the task needs:
 
-1. `readme.md` for product scope, setup, and supported languages.
+1. `README.md` for product scope, setup, and supported languages.
 2. `resources/docs/application-features.md` for purpose, shipped features, the
 	 AI contract, out of scope, **known gaps**, and measured language tiers.
-3. `resources/docs/technical-flow.md` for the technical map (review / modernize
-	 pipelines, HTTP surface, bootstrap).
+3. `resources/docs/technical-flow.md` for the technical map (Review / Modernize /
+	 CodeGraph pipelines, HTTP surface, bootstrap).
 4. The relevant code and tests (`app/models/README.md` when changing model-layer
 	 ownership or public APIs).
-5. `resources/docs/plans/modernize-inversion-plan.md` when doing Modernize work.
-	 Its Part 2 is a verified evidence base — every claim carries a `file:line`.
-	 Execute Part 4 in the order given by its execution graph, not document order.
 
-Narrower reference, load only when the task needs it:
-`prompt-system.md`, `cfml-llm-depth.md`, `boxlang-conventions.md`,
-`testing-commands.md`, `open-issues.md`.
+`resources/docs/README.md` indexes everything else — plans and narrower
+reference docs. Go through the index rather than remembering filenames; the
+plans change.
 
 Do not invent product claims when the README and code do not support them. A
 capability that cannot be pointed at in the UI, an export, or an API response
 does not get a feature row — it goes in Known gaps, or nowhere.
 
-**One live plan at a time.** When a plan is superseded, delete it — do not
+**Working from a plan:** read its status ledger first and trust nothing else in
+it about what is done. Prose earlier in a long plan describes the product as it
+was when that section was written. Verify against code before building on it.
+
+**One live plan per area.** When a plan is superseded, delete it — do not
 archive "just in case". A superseded document that stays readable will be read.
 
 Framework reference material and implementation skills live under `.agents/`.
@@ -114,9 +115,17 @@ Common commands:
 box install
 box run-script setup
 box server start
+box server restart
 box testbox run
-box run-script format
+box run-script test
 ```
+
+`box.json` defines `setup`, `postInstall`, `compile`, and `test`
+(`box testbox run` then `node --test tests/js/*.spec.mjs`). There is no `format`
+script.
+
+**BoxLang caches compiled classes.** After editing a `.bx`, `box server restart`
+before testing — otherwise the suite silently runs the old code.
 
 Do not overwrite an existing `.env`. Before handing off:
 

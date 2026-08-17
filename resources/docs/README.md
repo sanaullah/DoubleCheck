@@ -14,7 +14,7 @@ documentation tree in version control. `.superpowers/` is local scratch.
 | [technical-flow.md](technical-flow.md) | Technical implementation, project flow, Mermaid diagrams |
 | [plans/codegraph-domain-lens-design.md](plans/codegraph-domain-lens-design.md) | **Approved design** — CodeGraph meaning / Domain lens (LLM-required briefing) |
 | [plans/codegraph-remediation-plan.md](plans/codegraph-remediation-plan.md) | **Live plan** — CodeGraph remediation: verified defect register, capability gaps, ranking and elision enhancements. §2 carries the measured baseline from the completed graph-fidelity work |
-| [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | Prior Modernize inversion notes (kept for Part 2 evidence); not the active plan |
+| [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | **Live plan** — Modernize inversion: Part 0 is the status ledger (Steps 0–10 done, Step 11 `wip`, LLM-tier gates unrun), Part 2 the `file:line` evidence base |
 
 ## Reference — open only when the task needs it
 
@@ -37,7 +37,7 @@ Agent working rules: [`AGENTS.md`](../../AGENTS.md).
 1. **Product truth changes here first**, in the same PR as the behaviour change.
 2. **Every feature row needs visible output** — UI, export, or API response. No
    pointer, no row; it goes in Known gaps instead.
-3. **One live plan at a time.** Supersede by deleting, not archiving — a
+3. **One live plan per area.** Supersede by deleting, not archiving — a
    superseded document that stays readable will be read.
 4. New feature notes go in **one** file here. Never `superpowers/` trees, phased
    rebuild checklists, or dated per-task plan files.

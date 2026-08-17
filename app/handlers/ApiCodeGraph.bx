@@ -486,6 +486,24 @@ class extends="coldbox.system.RestHandler" {
 		if ( isNull( run ) ) return;
 		var level = codeGraphGraphRepository.readLevel( run.getId(), { level: "file", limit: 1500, edgeLimit: 4000 } );
 		var evaluated = architectureRuleService.evaluate( level.edges ?: [], architectureRuleService.defaultRules() );
+		// Rules are only as complete as the edges they were evaluated over. This
+		// read is bounded by `limit` and `edgeLimit`, and said nothing about it: a
+		// repository whose file edges exceed the cap would silently have its rules
+		// checked against a subset and report "passed".
+		var edgeAccount = isStruct( level.edgeCompleteness ?: "" ) ? level.edgeCompleteness : {};
+		var nodeAccount = isStruct( level.completeness ?: "" ) ? level.completeness : {};
+		evaluated[ "completeness" ] = {
+			returned : val( edgeAccount.returned ?: 0 ),
+			available: val( edgeAccount.available ?: 0 ),
+			omitted  : val( edgeAccount.omitted ?: 0 ),
+			rankedBy : "rule",
+			evaluatedOver: "file-level edges",
+			// Symbol, resource and directory edges are not checked yet, and a caller
+			// must not read "passed" as "no violation anywhere in the graph".
+			unevaluatedLevels: [ "symbol", "resource", "directory" ],
+			complete : !val( edgeAccount.omitted ?: 0 ) && !val( nodeAccount.omitted ?: 0 ),
+			state    : ( val( edgeAccount.omitted ?: 0 ) || val( nodeAccount.omitted ?: 0 ) ) ? "truncated" : "complete"
+		};
 		// Reporting, never a gate: this is a local desktop tool, not CI.
 		event.renderData( type = "json", data = { data: evaluated } );
 	}

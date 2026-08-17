@@ -173,14 +173,25 @@
 		return parts.join(" · ");
 	}
 
-	function layerLabelOf(cluster, index) {
+	/**
+	 * A cluster's layer, or "" when the payload does not carry one.
+	 *
+	 * This used to fall back to `["entry","config","domain","support","tests"][index % 5]`
+	 * — the card's *draw position*. Snapshot clusters carry neither `layer` nor
+	 * `layerLabel`, so every card on the Overview took that branch and displayed a
+	 * layer derived from nothing, in the same styling as the real file count. A
+	 * 117-file core-services module read "entry"; the repository layer read "tests".
+	 *
+	 * Callers must treat "" as "render nothing". A field with no data renders no
+	 * widget — inventing one is worse than omitting it, because the reader cannot
+	 * tell it apart from a measurement.
+	 */
+	function layerLabelOf(cluster) {
 		if (cluster && cluster.layerLabel) return String(cluster.layerLabel);
 		if (cluster && typeof cluster.layer === "string" && isNaN(Number(cluster.layer))) {
 			return String(cluster.layer).replace(/-/g, " ");
 		}
-		const labels = ["entry", "config", "domain", "support", "tests"];
-		const layer = typeof cluster.layer === "number" ? cluster.layer : index % labels.length;
-		return labels[Math.max(0, Math.min(labels.length - 1, layer))] || "module";
+		return "";
 	}
 
 	function summaryForCluster(cluster, summaries) {
@@ -189,7 +200,7 @@
 		const files =
 			Number(cluster && cluster.fileCount) ||
 			(Array.isArray(cluster && cluster.filePaths) ? cluster.filePaths.length : 0);
-		const layer = layerLabelOf(cluster, 0);
+		const layer = layerLabelOf(cluster);
 		if (Array.isArray(summaries)) {
 			const hit = summaries.find(
 				(s) =>
@@ -202,8 +213,10 @@
 		}
 		if (cluster && cluster.summary) return { text: String(cluster.summary), origin: "provided" };
 		const fileBit = files === 1 ? "1 file" : files + " files";
+		// The "in the X area" clause named the fabricated layer, and because this
+		// call passed index 0 every deterministic summary claimed "entry".
 		return {
-			text: label + " — " + fileBit + " in the " + layer + " area.",
+			text: layer ? label + " — " + fileBit + " in the " + layer + " area." : label + " — " + fileBit + ".",
 			origin: "deterministic"
 		};
 	}
@@ -532,8 +545,12 @@
 				id: String(c.id || c.key || "cluster-" + index),
 				label: c.label || c.name || c.key || c.id || "cluster",
 				kind: "cluster",
-				layer: typeof c.layer === "number" ? c.layer : index % 5,
-				layerLabel: layerLabelOf(c, index),
+				// Left undefined when the cluster has no real layer. It used to be
+				// `index % 5`, which fed numericLayer() and therefore placed modules
+				// into the Layer layout's five bands by draw position. numericLayer()
+				// already falls back to the component ordering, which is real.
+				layer: typeof c.layer === "number" ? c.layer : undefined,
+				layerLabel: layerLabelOf(c),
 				fileCount: fileCount,
 				symbolCount: c.symbolCount || 0,
 				crossingEdges: c.crossingEdges != null ? c.crossingEdges : 0,
@@ -769,7 +786,7 @@
 					path: "",
 					label: c.label || c.name || id,
 					kind: "cluster",
-					layer: typeof c.layer === "number" ? c.layer : 0,
+					layer: typeof c.layer === "number" ? c.layer : undefined,
 					fileCount: c.fileCount || 0
 				});
 			});
@@ -1325,8 +1342,11 @@
 
 	function buildOverviewCard(n, opts) {
 		const title = escapeXml(nodeLabel(n, opts));
-		const complexity = escapeXml(n.complexity || "simple");
-		const layer = escapeXml(String(n.layerLabel || "module"));
+		// `complexity` is computed by complexityOf() from files, crossings, symbols
+		// and cycle membership, so an absent value means the caller did not compute
+		// it — not that the module is simple. Both chips render only when real.
+		const complexity = n.complexity ? escapeXml(String(n.complexity)) : "";
+		const layer = n.layerLabel ? escapeXml(String(n.layerLabel)) : "";
 		const files = Number(n.fileCount) || 0;
 		const fileLabel = files === 1 ? "1 file" : files + " files";
 		const lines = wrapText(
@@ -1335,8 +1355,16 @@
 			DEFAULTS.overviewMaxSummaryLines
 		);
 		const summaryOrigin = n.summaryOrigin === "ai" ? "ai" : "deterministic";
+		// A missing complexity must not paint the "simple" green — colour is a claim
+		// too. Unknown gets a neutral accent.
 		const accent =
-			complexity === "complex" ? "#b45309" : complexity === "moderate" ? "#1d4ed8" : "#15803d";
+			complexity === "complex"
+				? "#b45309"
+				: complexity === "moderate"
+					? "#1d4ed8"
+					: complexity === "simple"
+						? "#15803d"
+						: "#94a3b8";
 		const textParts = lines
 			.map(function (line, i) {
 				return (
@@ -1383,20 +1411,24 @@
 			'" height="4" rx="2" ry="2" fill="' +
 			accent +
 			'"/>' +
-			'<text class="cg-card-complexity" x="' +
-			(n.x + 14) +
-			'" y="' +
-			(n.y + 28) +
-			'">' +
-			complexity +
-			"</text>" +
-			'<text class="cg-card-layer" x="' +
-			(n.x + n.w - 14) +
-			'" y="' +
-			(n.y + 28) +
-			'" text-anchor="end">' +
-			layer +
-			"</text>" +
+			(complexity
+				? '<text class="cg-card-complexity" x="' +
+					(n.x + 14) +
+					'" y="' +
+					(n.y + 28) +
+					'">' +
+					complexity +
+					"</text>"
+				: "") +
+			(layer
+				? '<text class="cg-card-layer" x="' +
+					(n.x + n.w - 14) +
+					'" y="' +
+					(n.y + 28) +
+					'" text-anchor="end">' +
+					layer +
+					"</text>"
+				: "") +
 			'<text class="cg-card-title" x="' +
 			(n.x + 14) +
 			'" y="' +
