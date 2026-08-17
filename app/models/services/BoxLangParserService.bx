@@ -6,7 +6,7 @@
 class threadsafe {
 	property name="codegraphParserStrategy" inject="coldbox:setting:codegraphParserStrategy";
 
-	variables.parserVersion = "boxlang-ast-parser-v8";
+	variables.parserVersion = "boxlang-ast-parser-v11";
 	variables.sourceScanner = new app.models.services.CfmlSourceScanner();
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 	variables.integrationDetector = new app.models.services.IntegrationDetector();
@@ -56,7 +56,12 @@ class threadsafe {
 			"/",
 			"all"
 		);
-		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		// A `handlers/` directory is ColdBox convention, not a language rule. Keying
+		// only on it meant a ColdFusion project that does not follow the layout —
+		// including ColdBox itself — produced zero handler-actions and therefore
+		// zero request flows, with nothing saying why. The file-name convention is
+		// the other half of the same signal and is just as explicit.
+		var isHandler = reFindNoCase( "(^|/)handlers/|handler\.(?:cfc|bx)$", normalizedPath ) > 0;
 		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.bx$", normalizedPath ) > 0;
 		var className = listFirst( listLast( normalizedPath, "/" ), "." );
 		extractSqlDependencies( dependencies, arguments.file.lines );
@@ -131,7 +136,7 @@ class threadsafe {
 							sourceLine
 						)
 					);
-				if ( isHandler && !isLifecycleFunction( declaredFunction ) ) {
+				if ( isHandler && !isLifecycleFunction( declaredFunction ) && isHandlerAction( declaredFunction ) ) {
 					symbols.append(
 							symbol(
 								"handler-action",
@@ -232,6 +237,7 @@ class threadsafe {
 
 			var viewMatch = match( "\b(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']", sourceLine );
 			if ( viewMatch.find() ) dependencies.append( dependency( "renders", viewMatch.group( 1 ), lineNumber, sourceLine ) );
+			addResponseDependency( dependencies, sourceLine, lineNumber );
 			extractResourceDependencies( dependencies, sourceLine, lineNumber );
 
 			var constructionMatch = match( "\bnew\s+([A-Za-z_][A-Za-z0-9_.$]*)", sourceLine );
@@ -325,7 +331,12 @@ class threadsafe {
 	 */
 	private void function walkAstSemantics( required any ast, required struct parsed, required struct file ) {
 		var normalizedPath = replace( arguments.file.filePath ?: "", "\", "/", "all" );
-		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		// A `handlers/` directory is ColdBox convention, not a language rule. Keying
+		// only on it meant a ColdFusion project that does not follow the layout —
+		// including ColdBox itself — produced zero handler-actions and therefore
+		// zero request flows, with nothing saying why. The file-name convention is
+		// the other half of the same signal and is just as explicit.
+		var isHandler = reFindNoCase( "(^|/)handlers/|handler\.(?:cfc|bx)$", normalizedPath ) > 0;
 		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.bx$", normalizedPath ) > 0;
 		var className = listFirst( listLast( normalizedPath, "/" ), "." );
 		walkAstNode( arguments.ast, arguments.parsed, isHandler, isTest, className );
@@ -361,7 +372,7 @@ class threadsafe {
 			var functionName = astText( astField( arguments.node, "name" ) );
 			if ( len( functionName ) ) {
 				appendAstSymbol( arguments.parsed.symbols, "function", functionName, line, endLine, evidence );
-				if ( arguments.isHandler && !isLifecycleFunction( functionName ) ) appendAstSymbol( arguments.parsed.symbols, "handler-action", functionName, line, endLine, evidence );
+				if ( arguments.isHandler && !isLifecycleFunction( functionName ) && isHandlerAction( functionName ) ) appendAstSymbol( arguments.parsed.symbols, "handler-action", functionName, line, endLine, evidence );
 				if ( arguments.isTest && reFindNoCase( "^test", functionName ) ) appendAstSymbol( arguments.parsed.symbols, "test", functionName, line, endLine, evidence );
 				addTypeDependency( arguments.parsed.dependencies, astText( astField( arguments.node, "type" ) ), line, evidence );
 				for ( var arg in ( isArray( astField( arguments.node, "args" ) ) ? astField( arguments.node, "args" ) : [] ) ) {
@@ -612,6 +623,27 @@ class threadsafe {
 		}
 	}
 
+	/**
+	 * Is this declaration an action a request can actually enter through?
+	 *
+	 * Being in a handler is not enough. A cold read of the ColdBox framework put
+	 * `_privateInvoker`, `init` and `onHandlerDIComplete` at the top of "start
+	 * here" under the reason *"a request starts here"* — three things a request
+	 * never starts at. The instrument check was satisfied because the entries had
+	 * paths and line numbers; only reading them showed they were wrong.
+	 *
+	 * Constructors, underscore-prefixed internals and the handler lifecycle hooks
+	 * are all reachable only by the framework, never by a route.
+	 */
+	private boolean function isHandlerAction( required string name ) {
+		var declared = trim( arguments.name );
+		if ( !len( declared ) || left( declared, 1 ) == "_" ) return false;
+		return !listFindNoCase(
+			"init,onDIComplete,onHandlerDIComplete,preHandler,postHandler,aroundHandler,preEvent,postEvent,aroundEvent,onMissingAction,onError,onInvalidHTTPMethod,onAuthorizationFailure",
+			declared
+		);
+	}
+
 	private boolean function isLifecycleFunction( required string name ) {
 		return listFindNoCase(
 				"onAppInit,onRequestStart,onRequestEnd,onSessionStart,onSessionEnd,onException",
@@ -665,6 +697,35 @@ class threadsafe {
 			if ( find( ".end()", text ) ) break;
 		}
 		return { text: text, endLine: endLine };
+	}
+
+	/**
+	 * What a request actually returns to its caller.
+	 *
+	 * G4: flows ended at whatever hop the traversal ran out on, so more than half
+	 * of them reported `sinkKind: unknown` — the reader could follow a request all
+	 * the way in and never learn what came back. A response is a terminal effect
+	 * like a table write is, and it is stated in the source: `renderData( type:
+	 * "json" )`, `relocate(`, `setNextEvent(`. The target records the shape, so a
+	 * flow can end "responds json" rather than trailing off.
+	 *
+	 * Deliberately shallow. Whether *this* branch is the one that runs is control
+	 * flow, which §16 lists as not statically provable here; the honest claim is
+	 * that the action can complete this way, and the flow says so.
+	 */
+	private void function addResponseDependency( required array dependencies, required string sourceLine, required numeric lineNumber ) {
+		var responseShape = responseShapeFor( arguments.sourceLine );
+		if ( !len( responseShape ) ) return;
+		arguments.dependencies.append( dependency( "responds", responseShape, arguments.lineNumber, arguments.sourceLine ) );
+	}
+
+	private string function responseShapeFor( required string sourceLine ) {
+		var redirectMatch = match( "\b(?:relocate|setNextEvent)\s*\(", arguments.sourceLine );
+		if ( redirectMatch.find() ) return "redirect";
+		var renderDataMatch = match( "\brenderData\s*\(", arguments.sourceLine );
+		if ( !renderDataMatch.find() ) return "";
+		var typeMatch = match( "\btype\s*[:=]\s*[""']([A-Za-z]+)[""']", arguments.sourceLine );
+		return typeMatch.find() ? lCase( typeMatch.group( 1 ) ) : "data";
 	}
 
 	private void function extractResourceDependencies( required array dependencies, required string sourceLine, required numeric lineNumber ) {

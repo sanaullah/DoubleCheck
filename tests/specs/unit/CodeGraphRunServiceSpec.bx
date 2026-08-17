@@ -211,13 +211,38 @@ class extends="testbox.system.BaseSpec" {
 
 				var result = service.execute(
 					new tests.resources.ScriptedModernizationRun( "run-cg-dirty", "codegraph", getTempDirectory() ),
-					{ scope: "full-git", files: [], repositoryRevision: "rev-dirty" },
+					// One file, because the subject is reuse rather than discovery: a
+					// full scan that finds nothing is now reported as `partial`, and
+					// asserting success on an empty full scan would be asserting the
+					// silently-empty run this guard exists to prevent.
+					{ scope: "full-git", files: [ { filePath: "app/models/Order.cfc", language: "CFML" } ], repositoryRevision: "rev-dirty" },
 					{ checkCancellation: () => false }
 				);
 
 				expect( result.status ).toBe( "succeeded" );
 				expect( reuseLookups ).toBe( 0 );
 				expect( persisted.saveCount ).toBe( 1 );
+			} );
+
+			it( "reports a full scan that discovered nothing instead of building an empty graph", () => {
+				// Pointing a run at a directory the repository ignores — a vendored
+				// framework under `lib/`, a generated tree — returned zero files, and
+				// the run built a snapshot with zero of everything and reported
+				// "CodeGraph snapshot generated". Every skip counter was zero too, so
+				// nothing in the product said why. An empty full scan is a result, and
+				// it has to be stated.
+				var persisted = { saveCount: 0, updateCount: 0, snapshot: {}, narrative: {} };
+				var service = executableService( persisted );
+
+				var result = service.execute(
+					new tests.resources.ScriptedModernizationRun( "run-cg-empty", "codegraph", getTempDirectory() ),
+					{ scope: "full-git", files: [], repositoryRevision: "rev-empty" },
+					{ checkCancellation: () => false }
+				);
+
+				expect( result.status ).toBe( "partial" );
+				expect( result.message ).toInclude( "No reviewable source files" );
+				expect( persisted.saveCount ).toBe( 0, "an empty scan must not persist a snapshot" );
 			} );
 
 			it( "changes the pre-scan reuse key when any parser version changes", () => {

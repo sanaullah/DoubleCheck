@@ -516,7 +516,14 @@ class threadsafe {
 		}
 
 		var gitFiles = gitRepositoryService.fullPaths( arguments.root, effectiveEntryLimit );
-		if ( gitFiles.available ) {
+		// Git listing is authoritative only when it lists something. Pointing a run
+		// at a directory that is inside a repository but *ignored* by it — a vendored
+		// framework under `lib/`, a generated tree — returned an empty file list, and
+		// the run went on to build an empty graph and report success with every skip
+		// counter at zero. Nothing in the product said why, because from the
+		// indexer's point of view the project genuinely had no files. Falling back to
+		// the filesystem walk is what a reader means by "analyse this folder".
+		if ( gitFiles.available && gitFiles.paths.len() ) {
 			return {
 				paths             : gitFiles.paths,
 				scope             : "full-git",
@@ -525,7 +532,15 @@ class threadsafe {
 				repositoryRevision: gitFiles.repositoryRevision
 			};
 		}
-		return discoverPaths( arguments.root, effectiveEntryLimit );
+		var walked = discoverPaths( arguments.root, effectiveEntryLimit );
+		if ( gitFiles.available ) {
+			// Keep the revision: the tree is still inside a repository, and reuse keys
+			// and co-change both depend on knowing which revision produced this scan.
+			walked.repositoryRevision = gitFiles.repositoryRevision;
+			walked.gitAvailable = true;
+			walked.scope = walked.paths.len() ? "full-walk-git-ignored" : walked.scope;
+		}
+		return walked;
 	}
 
 	private struct function discoverPaths( required any root, numeric entryLimit = 0 ) {

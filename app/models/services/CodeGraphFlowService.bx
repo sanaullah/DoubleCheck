@@ -74,7 +74,7 @@ class threadsafe {
 				var kinds = duplicate( path.edgeKinds );
 				var edgeSymbols = duplicate( path.edgeSymbols ?: [] );
 				if ( len( seed.routeId ?: "" ) ) { steps.prepend( seed.routeId ); kinds.prepend( "routes" ); edgeSymbols.prepend( "" ); }
-				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, edgeSymbols: edgeSymbols, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds ), depth: kinds.len() } );
+				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, edgeSymbols: edgeSymbols, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds, path.stoppedBy ?: "" ), depth: kinds.len() } );
 			}
 		}
 		var visible = [];
@@ -235,8 +235,11 @@ class threadsafe {
 	}
 
 	private numeric function compareRanked( required struct a, required struct b ) {
-		var aTyped = arguments.a.candidate.sinkKind != "unknown" ? 1 : 0;
-		var bTyped = arguments.b.candidate.sinkKind != "unknown" ? 1 : 0;
+		// Sink coverage means "ends in a named effect", not "ends in something other
+		// than the literal string unknown" — `depth-limited` is still not an effect.
+		var namedEffects = "table-read,table-write,http-call,scheduled-run,event-publish,config-read,view-render,response";
+		var aTyped = listFindNoCase( namedEffects, arguments.a.candidate.sinkKind ) > 0 ? 1 : 0;
+		var bTyped = listFindNoCase( namedEffects, arguments.b.candidate.sinkKind ) > 0 ? 1 : 0;
 		if ( aTyped != bTyped ) return aTyped > bTyped ? -1 : 1;
 		// Lower share first: a flow ending somewhere most flows already end
 		// explains less of the application than one ending somewhere rare.
@@ -268,13 +271,17 @@ class threadsafe {
 		for ( var dep in arguments.dependencies ) {
 			if ( !isStruct( dep ) ) continue;
 			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
-			if ( !listFindNoCase( "routes,injects,calls,renders,table-query,table-read,table-write,http,schedule,calls-api", kind ) ) continue;
+			if ( !listFindNoCase( "routes,injects,calls,renders,table-query,table-read,table-write,http,schedule,calls-api,responds", kind ) ) continue;
 			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: dep.source_file ?: "" );
 			var to = normalizePath( dep.targetFile ?: dep.target_file ?: "" );
 			if ( kind == "routes" ) { var route = normalizeRoute( dep.target ?: "" ); from = len( route ) ? "route:" & route : ""; }
 			if ( kind == "calls-api" ) { var api = normalizeRoute( dep.target ?: "" ); to = len( api ) ? "route:" & api : ""; }
 			if ( !len( to ) && listFindNoCase( "table-query,table-read,table-write", kind ) ) to = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
 			if ( !len( to ) && listFindNoCase( "http,schedule", kind ) ) to = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+			// A response is where a request ends. Without it the traversal walked past
+			// the action into whatever it happened to call next, and the flow reported
+			// no terminal at all.
+			if ( !len( to ) && kind == "responds" ) to = "response:" & lCase( trim( toString( dep.target ?: "data" ) ) );
 			if ( !len( from ) || !len( to ) || from == to || isTestPath( from ) || isTestPath( to ) ) continue;
 			var key = from & "\0" & to & "\0" & kind;
 			if ( seen.keyExists( key ) ) continue;
@@ -334,8 +341,10 @@ class threadsafe {
 		var explored = { count: 0 };
 		collectPaths( arguments.startFile, arguments.adjacency, arguments.maxDepth, steps, edgeKinds, edgeSymbols, visited, results, explored );
 		results.sort( ( a, b ) => {
-			var aTyped = sinkKind( a.edgeKinds ) != "unknown";
-			var bTyped = sinkKind( b.edgeKinds ) != "unknown";
+			// Prefer a path that ends in a named effect over one that merely stopped.
+			var terminals = "table-read,table-write,http-call,scheduled-run,event-publish,config-read,view-render,response";
+			var aTyped = listFindNoCase( terminals, sinkKind( a.edgeKinds, a.stoppedBy ?: "" ) ) > 0;
+			var bTyped = listFindNoCase( terminals, sinkKind( b.edgeKinds, b.stoppedBy ?: "" ) ) > 0;
 			if ( aTyped != bTyped ) return aTyped ? -1 : 1;
 			if ( a.edgeKinds.len() != b.edgeKinds.len() ) return a.edgeKinds.len() > b.edgeKinds.len() ? -1 : 1;
 			return compareNoCase( arrayToList( a.steps, "|" ), arrayToList( b.steps, "|" ) );
@@ -358,13 +367,17 @@ class threadsafe {
 		required struct explored
 	) {
 		if ( ++arguments.explored.count > 5000 ) return;
+		// Why a path stopped is part of the answer. "Ran out of depth" and "nothing
+		// leads anywhere from here" were both reported as an untyped sink, so more
+		// than half of the flows ended in `unknown` and a reader could not tell a
+		// budget limit from a genuine terminal.
 		if ( arguments.edgeKinds.len() >= arguments.maxDepth ) {
-			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
+			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "depth" } );
 			return;
 		}
 		var outbound = arguments.adjacency[ arguments.current ] ?: [];
 		if ( !outbound.len() ) {
-			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
+			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "leaf" } );
 			return;
 		}
 		var expanded = false;
@@ -381,7 +394,8 @@ class threadsafe {
 			arguments.steps.pop();
 			arguments.visited.delete( edge.to );
 		}
-		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ) } );
+		// Every onward edge led somewhere already on this path: a cycle, not a sink.
+		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "revisit" } );
 	}
 
 	/**
@@ -402,9 +416,26 @@ class threadsafe {
 		return symbols;
 	}
 
-	private string function sinkKind( required array kinds ) {
+	/**
+	 * What completes the flow.
+	 *
+	 * A typed last edge names the effect. When the last edge is a plain call the
+	 * flow has no effect of its own, and the honest terminal is *why the trace
+	 * ended*: it returned to its caller, it ran out of depth, or it looped. All
+	 * three used to read `unknown`, which is the one thing none of them is.
+	 */
+	private string function sinkKind( required array kinds, string stoppedBy = "" ) {
 		if ( !arguments.kinds.len() ) return "unknown";
-		return { "table-query": "table-read", "table-read": "table-read", "table-write": "table-write", "http": "http-call", "schedule": "scheduled-run", "emits": "event-publish", "reads-config": "config-read", "renders": "view-render" }[ lCase( trim( toString( arguments.kinds[ arguments.kinds.len() ] ) ) ) ] ?: "unknown";
+		var typed = {
+			"table-query": "table-read", "table-read": "table-read", "table-write": "table-write",
+			"http": "http-call", "schedule": "scheduled-run", "emits": "event-publish",
+			"reads-config": "config-read", "renders": "view-render", "responds": "response"
+		}[ lCase( trim( toString( arguments.kinds[ arguments.kinds.len() ] ) ) ) ] ?: "";
+		if ( len( typed ) ) return typed;
+		if ( arguments.stoppedBy == "depth" ) return "depth-limited";
+		if ( arguments.stoppedBy == "leaf" ) return "returns-to-caller";
+		if ( arguments.stoppedBy == "revisit" ) return "cycle";
+		return "unknown";
 	}
 
 	private string function flowId( required string file, required string symbol, required string signature ) { return "flow-" & lCase( hash( arguments.file & "|" & arguments.symbol & "|" & arguments.signature, "SHA-256" ) ); }

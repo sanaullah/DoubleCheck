@@ -97,7 +97,7 @@ not unified diff patches.
 | Desktop workspace | `/review` UI; create run, SSE progress, cancel |
 | Discovery | Working-tree / revision-diff / full scans with skip counts and truncation honesty |
 | Deterministic findings | Rules without an AI key (secrets, language-scoped SQL/dynamic-code/empty-catch, CFML lifecycle and queryparam patterns, and related packs) |
-| Architecture | BoxLang + CFML symbol/dependency graph; architecture explorer; optional AI fact enrichment with citation checks |
+| Architecture | BoxLang + CFML + JavaScript symbol/dependency graph (`ArchitectureIndexService` runs all three parsers); architecture explorer; optional AI fact enrichment with citation checks |
 | Planning | Bounded role plan and context packs (`symbol-range-artifact-refs-v3`); deterministic `emphasizeFiles` when crew planning is off |
 | Specialists | Allowlisted roles (security, correctness, architecture, testing, performance, boxlang-conventions, cfml-conventions); read-only tools; evidence-range validation |
 | Bulk AI fallback | When a provider is enabled but the planner produced no specialist tasks, a bounded bulk review runs instead — AI findings appear with no specialist board (`AIReviewService`) |
@@ -130,6 +130,10 @@ context leaves the machine for remote providers.
 **Success looks like**
 
 - A versioned plan with coverage, validation, and human accept/reject decisions
+- Boundaries derived from coupling evidence, then argued with by the model —
+  never invented by it
+- A written verdict and "start here" leading the export and the workspace, with
+  every claim's citations resolved and unsupported claims dropped and counted
 - Clear labels when scan truncation or missing schema makes the plan
   inference-limited
 - Continue / slice rebuild for partial work without widening scope
@@ -152,12 +156,14 @@ context leaves the machine for remote providers.
 | Inventory | Conservative CFML unit catalog and legacy evidence |
 | Schema packs | Optional sanitized evidence (`sql-ddl`, `structured-json-v1`, `migration-folder`); no DDL execution |
 | Signals / coverage | Deterministic coupling signals; honest repository/inventory/schema/LLM coverage |
-| Context | Bounded partitions for application / database / roadmap roles |
-| Proposal | Sharded LLM proposals merged into a versioned plan |
-| Validation | Structure, evidence, and safety gates; optional repair of invalid items |
-| Placement | Packaging suggestions: `main-app`, `coldbox-module`, `external-service` — grouping is folder-based today, see [Known gaps](#known-gaps) |
-| Map | Modular Monolith Map: node/edge diagram with click-through to a slice |
-| Risk / effort | Signal-weighted S/M/L/XL with named drivers, cross-referenced against this project's own review findings (UI only — see [Known gaps](#known-gaps)) |
+| Derived structure | Clusters come from a computed coupling graph — weighted modularity over structural edges, table co-access and shared scope state — before any model call. Migration order is longest-path depth over the cluster DAG, with cluster-level cycles condensed for ordering and **reported**, never silently broken (`ModernizationCouplingGraphService`, `ModernizationDerivedStructureService`) |
+| Context | Bounded partitions for application / database / roadmap roles, sharded against the derived clusters |
+| Proposal | Sharded LLM proposals merged into a versioned plan. The model no longer produces plan structure: placements carry `evidenceBasis: coupling-derived` / `provenanceClass: deterministically-derived`, and model narration overlays language only — it cannot move a capability between placements |
+| Judge / critic / brief | With a provider: verdicts on the derived boundaries and capability naming, an architecture critique argued against the plan's own evidence, then a written verdict. A verdict can only *raise* `decisionRequired`, never clear it; a critique naming an id absent from the plan is discarded; each stage soft-fails, keeping the derived plan (`ModernizationJudgementService`) |
+| Validation | Structure, evidence, and safety gates. Every placement citation is resolved against the run's inventory (`ModernizationCitationResolver`), so a ref to a file the run never indexed becomes a named warning; `citationValidity` is null — not 1.0 — when nothing was cited |
+| Placement | Packaging suggestions over the derived clusters: `main-app`, `coldbox-module`, `external-service` (`classifyDerivedClusters`). The decision selector additionally offers `background-worker` and `scheduled-service` as human overrides |
+| Map | Modular Monolith Map: node/edge diagram over the derived placements with click-through to a slice — see [Known gaps](#known-gaps) for what its edges do and do not show |
+| Risk / effort | Signal-weighted S/M/L/XL with named drivers, cross-referenced against this project's own review findings; in the UI and in the Markdown export's placement register |
 | Target profiles | BoxLang (`boxlang`, `modern`) and Lucee (`modern`, `flat`) |
 | Decisions | Accept / reject / clear per plan item; decision audit trail |
 | Continue / rebuild | Continue partial runs; rebuild one roadmap phase or item (`sliceRebuild`) |
@@ -219,13 +225,14 @@ run still completes; do not treat deterministic labels as business meaning.
 | Scan | BoxLang/CFML/JavaScript indexing (`cfc`/`cfm`/`bx`/`bxm`/`bxs`/`js`/`jsx`); bounded parser fallback is recorded |
 | Graph | Symbols + dependencies, routes, views, tables, HTTP/schedule resources; coupling metrics reuse Modernize services |
 | Roles | Per-node evidence-backed `entry` / `client` / `integration` / `orchestrator` / `domain` / `persistence` / `view` / `shared` / `test` legend, rendered from snapshot counts. Legend chips filter: one click dims every other role on the canvas and lists that role's files |
-| Flows | Route- and browser-seeded bounded paths in snapshot `flows[]`; each hop names the **symbol that owns the edge** (`OrderHandler.index`) or says file level; one flow per (entry, sink) with `variantCount`, selected for sink coverage rather than path depth |
+| Flows | Route- and browser-seeded bounded paths in snapshot `flows[]`; every flow names its terminal — a table read or write, a view render, an HTTP call, a scheduled run, a response shape (`renderData`/`relocate`), or why the trace stopped (`returns-to-caller`, `depth-limited`, `cycle`); each hop names the **symbol that owns the edge** (`OrderHandler.index`) or says file level; one flow per (entry, sink) with `variantCount`, selected for sink coverage rather than path depth |
 | Levels | The run is stored as rows in `codegraph_nodes` / `codegraph_edges` at `cluster` / `directory` / `file` / `symbol` / `resource` / `knowledge`, linked by `parentId`. `GET /codegraph/graph?level=&scope=` serves one level; `GET /codegraph/search?q=` finds nodes — including symbols — that the canvas never drew |
 | Resources | Routes, tables, configuration keys, events and outbound integrations are their own level, not files. Each carries its participants: who declares a route and which handler serves it, who reads a table and who writes it, which files read a setting |
 | Knowledge | With AI, domains, processes and risks are stored as nodes with `describes` / `affects` edges to the structure they explain, so "which risks touch this file" is a query. Every knowledge edge is marked `resolution: narrative`, `provenance: llm` — it is never evidence |
 | Completeness | Every capped collection reports `{ returned, available, omitted, rankedBy, complete, state }`, plus `unresolved` (run-level, with `unresolvedScope`) and `unsupported` — the behaviour static analysis cannot prove. The UI prints the loaded/available counts and names any relationship kind that produced nothing. Node truncation keeps the most connected files, not the alphabetically first |
 | Trace | Drawer tab: neighbours (what reaches this, what it reaches), type hierarchy, and table lineage by name. Each row carries kind, `file:line`, the source excerpt and a resolution badge, so a declaration and a name-match look different. Selecting a row moves the map |
 | Assess | Drawer tab: depth-bounded change impact grouped by hop, and architecture rules with per-violation evidence |
+| References | `GET /codegraph/references?symbol=` returns every occurrence of a name with its definitions, each marked `bound` or `unresolved` — the only endpoint that can report unresolved references *inside* its own answer rather than as a run-level count |
 | Query surface | `GET /codegraph/neighbours` (what calls this, what it calls), `/hierarchy` (extends / implements), `/lineage?table=` (readers and writers), `/impact?node=` (transitive callers, depth-bounded), `/onboarding` (where to start reading), `/diff?base=` (run over run), `/rules` (architecture fitness with violation evidence), `/mcp` (the same surface described as MCP tools) |
 | Clusters | Weighted modularity clusters with cohesion and crossing edges |
 | Issues | Cycles, orphans, layer violations, hotspot ranking, reachability gaps |
@@ -274,8 +281,10 @@ Do not build or claim:
 ## Known gaps
 
 Verified against code, not suspected. Tracked here rather than quietly, per the
-claim rule. Historical Modernize inversion notes remain in
-[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md). The live
+claim rule. The live Modernize plan is
+[`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md); its
+Part 0 ledger is the answer to "what is done?" (Steps 0–10 done, Step 11 `wip`,
+several LLM-tier gates still unrun). The live
 CodeGraph plan is
 [`plans/codegraph-remediation-plan.md`](plans/codegraph-remediation-plan.md);
 its §2 carries the measured baseline and §4 the verified defect register.
@@ -284,30 +293,31 @@ its §2 carries the measured baseline and §4 the verified defect register.
 
 | Gap | Detail | Fixed in |
 |---|---|---|
-| Grouping is folder-shaped, not coupling-shaped | Placement clustering keys on scope paths and folder inference, not a dependency graph | Steps 1–2 |
-| Small repositories get one cluster | Below `minUnitsForFolderInference` every unit lands in a single `ctx-modular-monolith-default` placement — a small repo gets no seams at all | Steps 1–2 |
-| Map edges are proposed groupings | The Modular Monolith Map is drawn from `target.contexts` / `target.extracts`, not computed dependencies. The picture is real; what it depicts is an assertion | Steps 1–3 |
-| Roadmap is a chain, not a DAG | Phase `dependencies` are assigned in shard-arrival order, so the sequence is not derived from what actually blocks what | Step 2 |
-| Every side-app candidate defers to the user | `external-service` placements always return `decisionRequired`, several gates `unknown`. Deliberate conservatism, but the product declines to answer its headline question | Step 8 |
+| ~~Grouping is folder-shaped, not coupling-shaped~~ **closed** | `deriveClusters` runs weighted modularity over the coupling graph; folder shape survives only in cluster *naming* and as the fallback when the graph has no nodes at all | Steps 1–2 |
+| ~~Small repositories get one cluster~~ **closed** | `minUnitsForFolderInference` no longer gates the live path — it now only guards the legacy `clusterUnitsForArchitecture` fallback used by roadmap synthesis when the provider left architecture decisions missing | Steps 1–2 |
+| Map draws membership, not dependency | The Modular Monolith Map's nodes are now derived clusters, but its only edges are `core → placement` spokes: `dependsOnContextIds`, the field it reads for cluster-to-cluster edges, is no longer produced by any service. The crossing edges and wave order that *are* computed never reach the picture | — |
+| ~~Roadmap is a chain, not a DAG~~ **closed** | `deriveWaveOrder` takes longest-path depth over the cluster DAG built from graph edges; cluster-level cycles are condensed for ordering and reported as findings | Step 2 |
+| Side-app candidates still defer on operational need | Gates now decide from derived evidence with `recommendation` / `confidence` / `basis` / `whatWouldChangeThis`, and `stay` / `do-not-extract` are first-class — measured 16.7% unknown on the extraction case, 0% where nothing is proposed. `operational-need` stays deliberately unanswerable from source, so those placements keep `decisionRequired` | Step 8 (gate met) |
 
 ### Defects
 
 | Gap | Detail | Fixed in |
 |---|---|---|
-| Decisions can spuriously conflict | Two divergent copies of the fingerprint-exclusion list mean placement canonicalization and gate evaluation hash the same item differently. Users see *"the modernization proposal changed; refresh before deciding"* on an item that did not change | Step 0 |
+| ~~Decisions can spuriously conflict~~ **closed** | `ModernizationIdentityService.volatileKeys()` / `withoutVolatileKeys()` is the single owner of the fingerprint-exclusion list; the three divergent copies are gone, and the gate now strips `legacyProjection` too | Step 0.4 |
 
 ### Visibility — computed but not surfaced
 
 | Gap | Detail | Fixed in |
 |---|---|---|
 | ~~Risk / effort not exported~~ **closed** | `riskLevel`, `effortSize`, `effortDrivers` and `relatedFindingCount` now appear in the Markdown export's placement register, with a spec asserting the columns are present | Step 7 |
-| Export leads with telemetry | The Markdown export opens with run metadata and 13 lines of coverage counters — including provider shard counts — before any finding | Step 7 |
+| ~~Export leads with telemetry~~ **closed** | The Markdown export now runs verdict → start here → roadmap → register → Appendices A–C, with run metadata, coverage counters and validation last in **Appendix D** | Step 7 |
 
 ### Measurement
 
 | Gap | Detail | Fixed in |
 |---|---|---|
-| No Modernize evaluation corpus | Review has a scored corpus with precision/recall/F1 thresholds; Modernize has unit fixtures only, so its quality is unmeasured — and the CFML tier cannot rise without one | Steps 2a, 6 |
+| **Comprehension is measured by instrument, not by a reader** | The 17 questions score **17/17** on DoubleCheck and **14/15 applicable** on the ColdBox framework, but both are instrument runs: they prove the surface returns each answer with `file:line` evidence. Whether a stranger *finds* the answer, and believes it, has never been observed. [`cold-read-protocol.md`](cold-read-protocol.md) is the runnable session; it needs a person, not code | — |
+| Modernize is measured deterministically only | `resources/evaluation-corpus/modernization-v1` (four scenarios + `baseline-llm-path.json`, scored by `tests/specs/integration/ModernizationCorpusSpec.bx`) closed the "no corpus" gap for the derived path. The **LLM and judge tiers have no thresholds**: `criticAccuracy`, `claimSupport` and `verdictSpecificity` need provider runs that have not happened, and single-run numbers from the four fixtures are known to vary by model. The CFML tier cannot rise on this corpus — it does not promote | Steps 5, 6, 9, 10 gates |
 | ~~No CodeGraph evaluation corpus~~ **closed** | Source-backed `resources/evaluation-corpus/codegraph-v1` scores expected routes, tables, flows, bounded paths, and stable deterministic domain labels through `tests/specs/integration/CodeGraphCorpusSpec.bx`; it does not promote a language tier | Step 17 |
 | ~~JS tests are ungated~~ **closed** | `tests/js/*.spec.mjs` runs via `box.json` `scripts.test` / `box run-script test` (`node --test tests/js/*.spec.mjs`) | — |
 
@@ -350,7 +360,7 @@ promotion happen — the `measured` flag is what makes the claim honest.
 | Install / config | [`readme.md`](../../readme.md) |
 | How Review / Modernize / CodeGraph are wired | [`technical-flow.md`](technical-flow.md) |
 | CodeGraph plan (live; baseline + defect register) | [`plans/codegraph-remediation-plan.md`](plans/codegraph-remediation-plan.md) |
-| Prior Modernize inversion notes | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
+| Modernize plan (live; status ledger + evidence base) | [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md) |
 | Open issues | [`open-issues.md`](open-issues.md) |
 | Prompt contract system | [`prompt-system.md`](prompt-system.md) |
 | Service and repository ownership | [`app/models/README.md`](../../app/models/README.md) |

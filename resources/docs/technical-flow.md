@@ -5,10 +5,11 @@ JavaScript**. Analysis and SQLite run on the developer’s machine.
 LLM specialists are optional for Review; Modernize requires an enabled provider.
 CodeGraph runs without AI for structure; the Domain lens (meaning) requires a
 provider.
-The source-backed acceptance corpus lives at
-`resources/evaluation-corpus/codegraph-v1`; its TestBox spec scores route/table
-flows, bounded paths, and repeated-run label stability without promoting a
-language tier.
+Source-backed acceptance corpora live under `resources/evaluation-corpus/`:
+`codegraph-v1` (`CodeGraphCorpusSpec`) scores route/table flows, bounded paths,
+and repeated-run label stability without promoting a language tier;
+`modernization-v1` (`ModernizationCorpusSpec`) scores derived boundaries against
+`step6-thresholds.json`.
 
 This document describes how the system is wired. Install and product summary live in
 [`readme.md`](../../readme.md). Purpose and shipped features (Review vs Modernize)
@@ -172,6 +173,8 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 |---|---|---|---|
 | GET | `/api/v1/health` | ApiHealth | Liveness |
 | GET | `/api/v1/capabilities` | ApiCapabilities | Feature flags for UI |
+| GET | `/api/v1/openapi` | ApiOpenApi | Generated contract as JSON |
+| GET | `/api/v1/openapi.yaml` | ApiOpenApi | Generated contract as YAML |
 | GET | `/api/v1/session` | ApiSession | Local session / principal |
 | GET | `/api/v1/projects` | ApiProjects | Local project list |
 | GET | `/api/v1/projects/tree` | ApiProjects | Project path tree |
@@ -218,6 +221,22 @@ Defined in `app/config/Router.bx`. Full contract: [`resources/apidocs/openapi.ya
 | POST | `/api/v1/runs/:id/codegraph/narrative` | ApiCodeGraph | Retry optional CodeGraph meaning layer |
 | PUT/DELETE | `/api/v1/runs/:id/codegraph/label` | ApiCodeGraph | Persist or clear a local user module label |
 
+Query surface over the levelled rows (all `ApiCodeGraph`, all served from
+`CodeGraphQueryRepository` unless noted; 409 when the snapshot predates levelled
+storage):
+
+| Method | Path | Role |
+|---|---|---|
+| GET | `/api/v1/runs/:id/codegraph/neighbours` | What reaches a node and what it reaches (`node`, `direction`, `limit`) |
+| GET | `/api/v1/runs/:id/codegraph/references` | Every occurrence of a symbol name with its definitions, each marked `bound` or `unresolved` |
+| GET | `/api/v1/runs/:id/codegraph/hierarchy` | What a node extends/implements and what does so to it |
+| GET | `/api/v1/runs/:id/codegraph/lineage` | Readers and writers of one `table` |
+| GET | `/api/v1/runs/:id/codegraph/impact` | Depth-bounded transitive callers (`node`, `depth` 1–6, `limit`) |
+| GET | `/api/v1/runs/:id/codegraph/onboarding` | Ranked starting points with a reason each |
+| GET | `/api/v1/runs/:id/codegraph/diff` | Node/edge deltas against a `base` run; 409 when the base has no levelled graph |
+| GET | `/api/v1/runs/:id/codegraph/rules` | `ArchitectureRuleService` over the file level, with per-violation evidence — reporting, never a gate |
+| GET | `/api/v1/runs/:id/codegraph/mcp` | The same surface described as MCP tools + contract (`CodeGraphMcpDescriptor`) |
+
 ### Providers & settings
 
 | Method | Path | Handler | Role |
@@ -245,8 +264,9 @@ routes, then branches after the shared scan into `ModernizationRunService`.
 
 `runKind=codegraph` follows the same pattern into `CodeGraphRunService`
 (parser-compatible Review graph adoption when available → index fallback →
-metrics/clusters/roles/flows → persist structure → optional narrative v2 →
-update narrative). Export is local through `ReportExportService`; Markdown and
+metrics/clusters/roles/flows → persist structure → levelled row projection →
+optional narrative v2 → update narrative). Export is local through
+`ReportExportService` (delegating to `CodeGraphDiagramService`); Markdown and
 JSON carry the snapshot, Mermaid renders a bounded flow, and SVG renders a
 bounded node canvas.
 
@@ -298,12 +318,24 @@ Phases after the shared scan:
 
 Services: `CodeGraphRunService` (pipeline; structure is persisted before optional meaning), `CodeGraphInventoryAdapter` +
 `CodeGraphMetricsService` (deterministic snapshot — roles on nodes, routes/resources,
-reachability, bounded co-change/churn, `flows[]` from handler/browser actions; reuses `ModernizationCouplingGraphService` /
-`ModernizationDerivedStructureService`), `CodeGraphNarrativeService` (optional
+reachability, bounded co-change/churn; reuses `ModernizationCouplingGraphService` /
+`ModernizationDerivedStructureService`), `CodeGraphFlowService` (reachability and
+handler/browser-seeded `flows[]`, one flow per (entry, sink) with its terminal
+named), `CodeGraphCentralityService` (rank), `CodeGraphCompletenessService`
+(every capped collection reports `{ returned, available, omitted, rankedBy,
+complete, state }` plus run-level `unresolved` / `unsupported`),
+`SyntheticNodeBuilder` (resource and knowledge nodes),
+`CodeGraphProjectionService` + `CodeGraphLevelProjector` (levelled rows),
+`CodeGraphQueryService` (subgraph, file edges, bounded paths, source windows),
+`CodeGraphDiagramService` (Mermaid/SVG), `CodeGraphMcpDescriptor` (agent tool
+descriptions), `CodeGraphNarrativeService` (optional
 Domain lens via `codegraph-narrative-v2`: pitch, domains, processes, onboarding,
 risk + backward-compatible summaries; soft-fails without mutating snapshot),
 `CodeGraphRepository` (SQLite `codegraph_snapshots`, per-cluster
-`codegraph_narrative_shards`, and project-scoped `codegraph_labels`). Narrative
+`codegraph_narrative_shards`, and project-scoped `codegraph_labels`),
+`CodeGraphGraphRepository` (levelled `codegraph_nodes` / `codegraph_edges` reads
+and writes) and `CodeGraphQueryRepository` (the neighbours / references /
+hierarchy / lineage / impact / onboarding / diff queries over those rows). Narrative
 shards are keyed by stable member composition plus cluster fingerprint; labels
 survive runs but a bounded startup sweep removes rows for missing local project
 paths. Payload paths are project-relative before optional provider egress, and
@@ -318,8 +350,12 @@ absent from snapshot). Subgraph drill-down:
 `GET /api/v1/runs/:id/codegraph/paths`. The explorer offers cluster, layer,
 swimlane, and radial layouts. Cited-edge source windows use
 `GET /api/v1/runs/:id/codegraph/source`; paths are repository-relative,
-size/line bounded, and source text is not persisted. Git history remains local
-and degrades to structural-only when unavailable.
+size/line bounded, and source text is not persisted. Everything the payload does
+not carry — neighbours, references, hierarchy, lineage, impact, onboarding,
+diff, rules — is a query against the levelled rows (see the CodeGraph query
+surface table above), which is also what the drawer's Trace and Assess tabs
+call. Git history remains local and degrades to structural-only when
+unavailable.
 
 ---
 
@@ -416,30 +452,39 @@ Docker providers. When a remote provider is selected, the UI requires an
 explicit egress acknowledgement; only bounded, redacted context leaves the
 machine.
 
-Pipeline contract: **`modernization-pipeline-v8`** (`ModernizationRunService`).
+Pipeline contract: **`modernization-pipeline-v9`** (`ModernizationRunService`).
 Full service list: [`app/models/README.md`](../../app/models/README.md) (Modernize workflow).
+Live plan: [`plans/modernize-inversion-plan.md`](plans/modernize-inversion-plan.md)
+(its Part 0 ledger is the answer to "what is done?").
 
-> **This section documents the current pipeline, which is being reworked.** The
-> proposal stage currently has the model produce plan structure (target units,
-> unit links, placements, phases) which deterministic code then reconciles and
-> repairs. That is being inverted: structure will be derived from a computed
-> coupling graph, and the model will judge and narrate it. Roles drop from seven
-> to five and the `modernization-architecture` and `modernization-repair` roles
-> are removed. Update this section when that lands — do not build new work on the
-> proposal-then-repair shape described above.
+**Structure is derived, then judged.** Clusters and migration order come from a
+computed coupling graph before any model call, so the model argues with a fixed
+structure rather than inventing one. The `modernization-architecture` and
+`modernization-repair` roles are gone with the repair round: an invalid item is a
+bug in derivation, not a prompt to retry. Agent roles are `modernization-`
+`application` / `database` / `roadmap` / `rebuild` / `judge` / `narrate` /
+`critic` / `brief` (`ModernizationAgentFactory`, `modernization-prompt-v6`).
 
 ### Stages after shared scan
 
-| Stage | Service(s) | What happens |
-|---|---|---|
-| Inventory | `ModernizationInventoryService` | Catalog CFML units and legacy evidence |
-| Schema | `ModernizationSchemaPackService` | Sanitize optional schema evidence (no DDL execution) |
-| Evidence / signals | `ModernizationEvidenceDiscoveryService`, `ModernizationSignalService` | Allowlisted config/migration evidence + coupling signals |
-| Coverage / context | `ModernizationCoverageService`, `ModernizationContextPackService` | Honest coverage + bounded context partitions |
-| Proposal | `ModernizationProposalService` | Sharded application / database / roadmap LLM proposals |
-| Validation / repair | `ModernizationValidationService` | Structure, evidence, and safety gates; optional repair of invalid items |
-| Roadmap / plan | `ModernizationRunService` | Assemble versioned plan snapshot + decisions |
-| Continue / rebuild | continue + `ModernizationSliceRebuildService` | Continue partial runs; rebuild one phase or item without widening scope |
+| % | Stage | Service(s) | What happens |
+|---|---|---|---|
+| 25 | Inventory | `ModernizationInventoryService` | Catalog CFML units and legacy evidence; no CFML scope fails the run |
+| 35 | Schema | `ModernizationSchemaPackService` | Sanitize optional schema evidence (no DDL execution) |
+| 42 | Evidence / signals | `ModernizationEvidenceDiscoveryService`, `ModernizationSignalService` | Allowlisted config/migration evidence + coupling signals, rolled up onto units |
+| 46 | Graph | `ModernizationCouplingGraphService` | Deterministic coupling graph, no provider |
+| 50 | Derived | `ModernizationDerivedStructureService` | `modernization-derived-v1`: clusters + wave order, before the context pack so shards have something to shard against |
+| — | Coverage / context | `ModernizationCoverageService`, `ModernizationContextPackService` | Honest coverage + bounded context partitions |
+| 58 | Proposal | `ModernizationProposalService` (+ `ModernizationRoadmapShardService` / `ModernizationRoadmapSynthesisService`) | Sharded application maps, then database and roadmap proposals |
+| 78 | Judge | `ModernizationJudgementService` | Model verdicts on the derived boundaries + capability naming; provider-only, contained — a failure keeps the derived structure |
+| 82 | Validation | `ModernizationValidationService` | Structure, evidence, and safety gates over the placed plan |
+| 84 / 86 | Critic / brief | `ModernizationJudgementService` | Architecture critique, then the verdict. Neither may change the plan; provider-only |
+| 94 | Roadmap / plan | `ModernizationRunService` | Assemble the bounded roadmap into the versioned plan snapshot + decisions |
+| — | Continue / rebuild | continue + `ModernizationSliceRebuildService` | Continue partial runs; rebuild one phase or item without widening scope |
+
+The accepted artifact is persisted (`state: needs-review`) before the
+cancellation boundary, so an interruption can leave gates open but cannot discard
+accepted fragments.
 
 ```mermaid
 sequenceDiagram
@@ -554,10 +599,15 @@ fingerprint, truncation flags, optional `narrative_cache_key` /
 `review_dependencies` — not duplicated into the snapshot blob.
 
 Alongside the blob, `CodeGraphProjectionService` writes the same run into
-`codegraph_nodes` and `codegraph_edges` at four levels — `cluster`,
-`directory`, `file`, `symbol` — linked by `parent_id`. The blob is what the
-canvas draws; the rows are what `/codegraph/graph` and `/codegraph/search`
-query, so drilling and searching reach nodes the canvas never received. Rows are
+`codegraph_nodes` and `codegraph_edges` at six levels — `cluster`, `directory`,
+`file`, `symbol`, plus `resource` (routes, tables, config keys, events,
+outbound integrations, with their participants) and `knowledge` (LLM domains,
+processes and risks joined to structure by `describes` / `affects` edges, always
+marked `resolution: narrative`, `provenance: llm` — never evidence) — linked by
+`parent_id`, with `codegraph_node_search` backing name lookup. The blob is what
+the canvas draws; the rows are what `/codegraph/graph`, `/codegraph/search` and
+the whole query surface read, so drilling and searching reach nodes the canvas
+never received. Rows are
 written **after** the structure save, so time-to-first-map does not pay for
 them; a projection failure leaves the snapshot usable and is reported on the run
 event stream rather than swallowed.
@@ -620,7 +670,13 @@ Full ownership tables: [`app/models/README.md`](../../app/models/README.md).
 | LLM calls | `SpecialistAgentGateway`, `AIChatGateway` |
 | Tool allowlist / redaction | `ControlledRepositoryToolService` |
 | Modernize pipeline | `ModernizationRunService` (+ services in models README) |
-| CodeGraph pipeline | `CodeGraphRunService`, `CodeGraphMetricsService`, `CodeGraphNarrativeService` |
+| Modernize derived structure | `ModernizationCouplingGraphService`, `ModernizationDerivedStructureService`, `ModernizationPlacementService` |
+| Modernize model commentary | `ModernizationJudgementService` (judge / narrate / critic / brief), `ModernizationAgentFactory` |
+| CodeGraph pipeline | `CodeGraphRunService`, `CodeGraphMetricsService`, `CodeGraphFlowService`, `CodeGraphNarrativeService` |
+| CodeGraph levelled rows | `CodeGraphProjectionService`, `CodeGraphLevelProjector`, `SyntheticNodeBuilder`, `CodeGraphGraphRepository` |
+| CodeGraph query endpoints | `CodeGraphQueryRepository` (neighbours / references / hierarchy / lineage / impact / onboarding / diff), `CodeGraphQueryService` (subgraph / edges / paths / source) |
+| CodeGraph caps & honesty | `CodeGraphCompletenessService`, `CodeGraphCentralityService` |
+| Agent (MCP) description | `CodeGraphMcpDescriptor` |
 | Baselines | `FindingBaselineService` |
 | Export formats | `ReportExportService` / `ModernizationExportService` |
 | Path allowlist / security | `SecurityContextService` |

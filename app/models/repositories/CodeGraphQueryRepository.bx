@@ -133,6 +133,107 @@ class threadsafe {
 	}
 
 	/**
+	 * Every occurrence of a name, bound or not — the anchor half of G5.
+	 *
+	 * `/neighbours` answers from the projected edge table, which by construction
+	 * holds only relationships that *resolved*. That makes the 11,000 unresolved
+	 * references invisible to every query while being counted in every response: a
+	 * number the reader cannot act on.
+	 *
+	 * An occurrence is what the parser actually saw — a file, a line, the symbol
+	 * that contains it, and the source text — and whether it bound to a definition
+	 * is an *attribute* of the occurrence rather than a condition for existing.
+	 * That is the Kythe separation this register has wanted since §12: the
+	 * reference is a fact, the binding is a claim about it.
+	 *
+	 * Matches the leaf of a dotted target, so `orderService.save` is found by
+	 * `save`. Definitions come from the symbol table, so a reader sees both where
+	 * a name is declared and where it is used.
+	 */
+	struct function references( required string runId, required struct query ) {
+		var name = lCase( trim( toString( arguments.query.symbol ?: "" ) ) );
+		var limit = max( 1, min( 500, val( arguments.query.limit ?: 100 ) ) );
+		if ( !len( name ) ) {
+			return { symbol: "", definitions: [], references: [], completeness: emptyAccount() };
+		}
+
+		var definitionRecords = queryExecute(
+			"
+				SELECT file_path, kind, name, line, end_line
+				FROM review_symbols
+				WHERE run_id = :runId AND lower( name ) = :name
+				ORDER BY file_path, line
+				LIMIT :rowLimit
+			",
+			{ runId: arguments.runId, name: name, rowLimit: { value: limit, sqltype: "INTEGER" } },
+			{ datasource: datasource }
+		);
+		var definitions = [];
+		for ( var row = 1; row <= definitionRecords.recordCount; row++ ) {
+			definitions.append( {
+				path   : definitionRecords.file_path[ row ],
+				kind   : definitionRecords.kind[ row ],
+				name   : definitionRecords.name[ row ],
+				line   : definitionRecords.line[ row ],
+				endLine: definitionRecords.end_line[ row ]
+			} );
+		}
+
+		// The leaf comparison is done in SQL so the scan stays one pass: a target is
+		// either the name itself or something ending in `.name`.
+		var occurrenceRecords = queryExecute(
+			"
+				SELECT source_file, kind, target, target_file, line, evidence, source_symbol
+				FROM review_dependencies
+				WHERE run_id = :runId
+					AND ( lower( target ) = :name OR lower( target ) LIKE :dotted ESCAPE '\' )
+				ORDER BY source_file, line
+				LIMIT :rowLimit
+			",
+			{
+				runId   : arguments.runId,
+				name    : name,
+				dotted  : "%." & replace( replace( replace( name, "\", "\\", "all" ), "%", "\%", "all" ), "_", "\_", "all" ),
+				rowLimit: { value: limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var references = [];
+		var unresolved = 0;
+		for ( var row = 1; row <= occurrenceRecords.recordCount; row++ ) {
+			var boundTo = trim( toString( occurrenceRecords.target_file[ row ] ?: "" ) );
+			if ( !len( boundTo ) ) unresolved++;
+			references.append( {
+				path         : occurrenceRecords.source_file[ row ],
+				kind         : occurrenceRecords.kind[ row ],
+				target       : occurrenceRecords.target[ row ],
+				line         : occurrenceRecords.line[ row ],
+				evidence     : occurrenceRecords.evidence[ row ],
+				withinSymbol : occurrenceRecords.source_symbol[ row ] ?: "",
+				boundTo      : boundTo,
+				// The honest per-occurrence class: this one bound, or it did not.
+				resolution   : len( boundTo ) ? "bound" : "unresolved"
+			} );
+		}
+
+		var account = completeness().queryAccount(
+			definitions.len() + references.len(),
+			definitions.len() + references.len(),
+			"file_path,line",
+			unresolvedFor( arguments.runId )
+		);
+		// Unlike every other endpoint, this one can report unresolved *within the
+		// answer*, because an occurrence is returned whether or not it bound.
+		account.unresolvedInResult = unresolved;
+		return {
+			symbol      : name,
+			definitions : definitions,
+			references  : references,
+			completeness: account
+		};
+	}
+
+	/**
 	 * What breaks if this node changes: everything that reaches it, transitively.
 	 *
 	 * Bounded by depth because an impact cone over a real codebase reaches most

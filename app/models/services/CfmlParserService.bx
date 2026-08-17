@@ -13,7 +13,7 @@ class {
 	// `\b` was intended, so neither could ever match, and the SQL read/write split
 	// was BoxLang-only. All three change what this parser extracts, so the version
 	// moves or the parse cache serves the old results.
-	variables.parserVersion = "cfml-symbol-parser-v8";
+	variables.parserVersion = "cfml-symbol-parser-v11";
 	variables.patternCache  = {};
 	variables.callTargetFilter = new app.models.services.CallTargetFilter();
 	variables.integrationDetector = new app.models.services.IntegrationDetector();
@@ -35,7 +35,12 @@ class {
 			"/",
 			"all"
 		);
-		var isHandler = reFindNoCase( "(^|/)handlers/", normalizedPath ) > 0;
+		// A `handlers/` directory is ColdBox convention, not a language rule. Keying
+		// only on it meant a ColdFusion project that does not follow the layout —
+		// including ColdBox itself — produced zero handler-actions and therefore
+		// zero request flows, with nothing saying why. The file-name convention is
+		// the other half of the same signal and is just as explicit.
+		var isHandler = reFindNoCase( "(^|/)handlers/|handler\.(?:cfc|bx)$", normalizedPath ) > 0;
 		var isTest = reFindNoCase( "(^|/)tests/|(?:spec|test)\.cfc$", normalizedPath ) > 0;
 		var isApplicationCfc = reFindNoCase( "(^|/)Application\.cfc$", normalizedPath ) > 0;
 		var className = listFirst( listLast( normalizedPath, "/" ), "." );
@@ -269,6 +274,18 @@ class {
 					} ) );
 				}
 			}
+			// G4: the same terminal-effect detection as the BoxLang parser. A flow
+			// that ends "responds json" is an answer; one that ends "unknown" is the
+			// traversal giving up, and the reader cannot tell those apart.
+			var redirectMatch = match( "\b(?:relocate|setNextEvent)\s*\(", sourceLine );
+			var renderDataMatch = match( "\brenderData\s*\(", sourceLine );
+			if ( redirectMatch.find() ) {
+				dependencies.append( dependency( "responds", "redirect", lineNumber, sourceLine ) );
+			} else if ( renderDataMatch.find() ) {
+				var responseTypeMatch = match( "\btype\s*[:=]\s*[""']([A-Za-z]+)[""']", sourceLine );
+				dependencies.append( dependency( "responds", responseTypeMatch.find() ? lCase( responseTypeMatch.group( 1 ) ) : "data", lineNumber, sourceLine ) );
+			}
+
 			var viewMatch = match( "\b(?:event\.)?setView\s*\(\s*[""']([^""']+)[""']|<cfinclude\s+template\s*=\s*[""']([^""']+\.cfm)[""']", sourceLine );
 			if ( viewMatch.find() ) {
 				var viewTarget = isNull( viewMatch.group( 1 ) ) ? viewMatch.group( 2 ) : viewMatch.group( 1 );
@@ -516,7 +533,7 @@ class {
 					arguments.sourceLine
 				)
 			);
-		if ( arguments.isHandler && !isLifecycleFunction( arguments.declaredFunction ) ) {
+		if ( arguments.isHandler && !isLifecycleFunction( arguments.declaredFunction ) && isHandlerAction( arguments.declaredFunction ) ) {
 			arguments.symbols.append(
 					symbol(
 						"handler-action",
@@ -634,6 +651,27 @@ class {
 					)
 				);
 		}
+	}
+
+	/**
+	 * Is this declaration an action a request can actually enter through?
+	 *
+	 * Being in a handler is not enough. A cold read of the ColdBox framework put
+	 * `_privateInvoker`, `init` and `onHandlerDIComplete` at the top of "start
+	 * here" under the reason *"a request starts here"* — three things a request
+	 * never starts at. The instrument check was satisfied because the entries had
+	 * paths and line numbers; only reading them showed they were wrong.
+	 *
+	 * Constructors, underscore-prefixed internals and the handler lifecycle hooks
+	 * are all reachable only by the framework, never by a route.
+	 */
+	private boolean function isHandlerAction( required string name ) {
+		var declared = trim( arguments.name );
+		if ( !len( declared ) || left( declared, 1 ) == "_" ) return false;
+		return !listFindNoCase(
+			"init,onDIComplete,onHandlerDIComplete,preHandler,postHandler,aroundHandler,preEvent,postEvent,aroundEvent,onMissingAction,onError,onInvalidHTTPMethod,onAuthorizationFailure",
+			declared
+		);
 	}
 
 	private boolean function isLifecycleFunction( required string name ) {

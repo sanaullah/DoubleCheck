@@ -2,7 +2,7 @@
 
 **Status: Phases 1–7, 9 and 10 complete (see §18–§24); Phases 8 and 11 proposed.**
 
-> **Read §31, §32 and §33 first.** §31 is an independent audit (2026-08-17) that found
+> **Read §31–§34 first.** §31 is an independent audit (2026-08-17) that found
 > the product was building *two* graphs and serving the weaker one to every query
 > endpoint, plus six live defects. §32 records the remediation, measured. Anything
 > earlier in this document describes the graph as it was before that pass —
@@ -12,7 +12,14 @@
 > consumes it. A row in the extraction table is not a capability; a green endpoint
 > is.** §33 closes the three items §32 left open, including the first run of the
 > Cold-Read Protocol (§2a) — **14 of 17, and read its honesty label**: it is an
-> instrument run, not a human cold read.
+> instrument run, not a human cold read. §34 closes G4, G5, test→symbol linkage
+> and §2a's second project: **17 of 17 on DoubleCheck, 14 of 15 applicable on the
+> ColdBox framework** — an unfamiliar ColdFusion codebase that surfaced two more
+> defects on contact. §35 adds a *reading* pass — prose, not endpoint checks —
+> which found three more defects inside questions the instrument had already
+> scored `yes`, including "a request starts here" pointing at constructors. **The
+> score did not move and the product got more truthful**, which is why a human
+> session is still the last open item.
 
 **Evidence base.** Every `file:line` was re-validated against the working tree on
 2026-08-16 (branch `dev3`, base `caf64b4`, worktree dirty and preserved). Counts
@@ -1972,3 +1979,240 @@ interpretive rows marked as interpretive.
 
 These are the three partials in §33.1 and they are capability work, not defects.
 Nothing in this section is a known-broken path.
+
+---
+
+## 34. The last four items (2026-08-17)
+
+§33 left four things open. All four are closed, and the second Cold-Read project
+found two more defects while closing them.
+
+**Cold-Read Protocol: 17 of 17 on DoubleCheck, 14 of 15 applicable on an
+unfamiliar ColdFusion project.** Suite: **735 passed / 0 failed / 0 errored / 1
+skipped**. JS: **35 / 0**.
+
+### 34.1 G4 — flows say what completes them
+
+`sinkKind` mapped the last edge to a terminal and returned `unknown` for
+everything else, so 17 of 31 flows ended in a word that describes three different
+situations. Two changes:
+
+- **`responds` is extracted.** `renderData( type: "json" )`, `relocate(`,
+  `setNextEvent(` are terminal effects stated in the source, in both parsers.
+  **189 rows**, and `response:` joins `route:` / `table:` / `config:` as a
+  resource entity, so "which actions return JSON" is a query.
+- **The traversal records why it stopped.** `depth-limited`, `returns-to-caller`
+  and `cycle` are distinct answers; all three used to read `unknown`, which is the
+  one thing none of them is.
+
+Measured: **32 of 32 flows now name a terminal** — response 12 · table-read 8 ·
+returns-to-caller 7 · http-call 2 · scheduled-run 2 · view-render 1. `unknown` no
+longer occurs. Sink-coverage ranking was corrected at the same time: it tested
+`!= "unknown"`, which would have counted `depth-limited` as a named effect.
+
+### 34.2 G5 — the anchor model, and `/references`
+
+The register asked for defines-vs-references since §12 quoted Kythe. Two halves:
+
+- **`defines` edges** — 5,349 of them, file → symbol, `resolution: exact`.
+  Containment says where a symbol lives; this says the file declares it.
+- **`GET /codegraph/references?symbol=`** — every *occurrence* of a name with its
+  definitions, each marked `bound` or `unresolved`.
+
+The second is the one that matters. Every other endpoint answers from the
+projected edge table, which by construction holds only relationships that
+resolved — so 11,528 unresolved references were counted in every response and
+visible in none. An occurrence is a fact; whether it bound is an attribute of it.
+Live:
+
+```
+symbol=normalizeAI
+  DEF function app/models/services/FindingService.bx:349
+  REF bound      app/models/services/AIReviewService.bx:73        in review
+  REF bound      app/models/services/SpecialistReviewService.bx:363 in assembleSuccess
+  REF unresolved tests/specs/unit/ReviewCoreServicesSpec.bx:22     in "creates stable evidence fingerprints…"
+```
+
+This is the only endpoint that can report `unresolvedInResult`, because it is the
+only one returning occurrences rather than resolved edges.
+
+### 34.3 Test → symbol linkage
+
+`deriveTestEdges` keyed on the file pair alone, so every test edge collapsed to
+"this spec exercises that file" and the symbol under test was discarded. Keyed on
+the target and the calling test symbol instead, carrying the attribution through:
+**594 test dependencies (was 201), 591 symbol-level `tests` edges (was 0)**, with
+the file level unchanged at 197 because the projection still de-duplicates pairs.
+
+### 34.4 §2a's second project — an unfamiliar ColdFusion codebase
+
+`lib/coldbox` is the ColdBox framework: **205 CFML files** written by someone
+else, never analysed, and available locally. Pointing a run at it found two
+defects before it answered a single question.
+
+**Defect one: a silently empty run.** `lib/**` is gitignored, so Git discovery
+returned no files, and the run built a graph with zero of everything and reported
+**"CodeGraph snapshot generated"** — with every skip counter at zero, so nothing
+said why. Two fixes: discovery falls back to the filesystem walk when the Git
+listing is empty (keeping the revision, which reuse and co-change need), and an
+empty **full** scan now returns `partial` with the reason. Scoped to full scans on
+purpose — an incremental scan legitimately finds nothing when nothing changed,
+and one existing spec was asserting exactly that.
+
+**Defect two: `handler-action` required a `handlers/` directory.** That is ColdBox
+convention, not a language rule, so a ColdFusion project not following the layout
+produced zero handler-actions and therefore **zero flows**, with nothing saying
+why. The file-name convention is the other half of the same signal. ColdBox went
+**0 → 22 handler-actions and 0 → 2 flows**; DoubleCheck's own numbers did not move.
+
+**The result, on a project the parsers were not written against:**
+
+| | ColdBox |
+|---|---|
+| files · symbols · clusters | 205 CFML + 9 JS · 2,981 · 60 |
+| `extends` | **50** — real inheritance, 17 resolved in-tree |
+| `/hierarchy` | `BaseProxy.cfc`: **11 descendants** |
+| `type-reference` · `emits` · `schedule` · `responds` | 1,737 · 104 · 142 · 22 |
+| Cold-Read | **14 yes of 15 applicable**, 2 n/a (no SQL, no tests in tree) |
+
+`BaseProxy.cfc` with 11 descendants is the evidence §33 said was missing: the
+hierarchy capability had only ever been demonstrated on a fixture, because
+DoubleCheck inherits solely from framework classes.
+
+### 34.5 Scores, and what they are
+
+| Project | Result |
+|---|---|
+| DoubleCheck | **17 of 17** |
+| ColdBox (unfamiliar CFML) | **14 of 15 applicable** · 2 n/a · 1 partial (Q4: routes and schedules present, no events) |
+
+**Both are instrument runs.** They prove the surface produces each answer with
+checkable evidence, on two projects, one of which the parsers were not written
+for. They are *not* human cold reads: nobody has watched a stranger try to find
+these endpoints, phrase a question the way the API expects, or decide whether to
+trust the answer. §2a asks for that too, and it is the one part still unrun —
+**quote these numbers as capability, never as comprehension.**
+
+What the second project proved is the narrower claim §2a actually rests on: point
+this tool at something it was not built against and defects surface immediately.
+Four have now been found that way — the backspace-byte detectors, the
+BoxLang-only read/write split, the missing `interface` symbol, and the two in
+§34.4 — none of which 735 passing specs could see.
+
+### 34.6 Still open
+
+- **A human cold read.** The only item on this list, and the only one that cannot
+  be closed by writing code. Everything except the person is now prepared:
+  [`cold-read-protocol.md`](../cold-read-protocol.md) is a runnable session sheet
+  with the rules, the recording table, the scoring convention and a prepared
+  unfamiliar-CFML target (`lib/coldbox`, 205 third-party ColdFusion files, known
+  to index — §34.4). Setup is five minutes and the session is capped at thirty.
+
+  The reason it had never run was not difficulty. §2a described an intention
+  rather than a procedure, so there was nothing to pick up. There is now.
+
+  **The ColdBox session is bookable today by anyone here, including the people who
+  built DoubleCheck** — it is the *target* that has to be unfamiliar, and nobody
+  has read ColdBox's internals. The DoubleCheck session still needs an outside
+  reader.
+- Q4 is partial on ColdBox because the framework publishes no events of the shape
+  the detector recognises. Absence of data or absence of capability is not settled;
+  a third project would decide it.
+
+---
+
+## 35. A reading pass, and what it found that querying did not (2026-08-17)
+
+§34 closed G4, G5 and test→symbol linkage. The remaining item — the human half of
+§2a — cannot be closed by writing code, so two things were done instead: the
+protocol was made runnable, and the *reading* half was taken as far as a
+non-human reader can take it.
+
+### 35.1 The distinction that matters
+
+| | What it proves | Status |
+|---|---|---|
+| **Instrument run** | The endpoint returns an answer with `file:line` evidence | Done — §34 |
+| **Reading pass** | The answer, *read as prose*, is the right answer to the question | This section |
+| **Human session** | A stranger *finds* the answer, and believes it | **Still open** |
+
+The middle row is new here and it is not a formality. The instrument scored
+ColdBox's Q3 as **yes — 6 entry points with paths and line numbers**. Reading those
+six entries showed the top three were `_privateInvoker`, `init` and
+`onHandlerDIComplete`, under the reason *"a request starts here"*. Every
+assertion the instrument made was true. The answer was still wrong.
+
+### 35.2 Three defects, all found by reading rather than querying
+
+**1 · "A request starts here" pointed at things a request never starts at.**
+`isHandler` had just been broadened to the `*Handler.cfc` naming convention
+(§34.4), which made every public method of a handler base class an action —
+including constructors, underscore-prefixed internals and the framework's own
+lifecycle hooks. New `isHandlerAction()` in both parsers excludes `init`,
+`_`-prefixed names and the handler hook set (`preHandler`, `aroundHandler`,
+`onMissingAction`, `onError`, …). ColdBox's entry points went from 22 to **12**,
+and the ones that remain are RestHandler's genuine REST-convention entries —
+`onInvalidRoute`, `onAuthenticationFailure`, `onEntityNotFoundException`.
+
+This was also wrong on **DoubleCheck itself**: `preHandler` in every API handler
+was being counted as a place a request begins. Verified after the fix —
+**150 → 143 handler-actions**, and a query for `init`, `_`-prefixed names and the
+hook set returns none. The seven removed are the `preHandler` declarations.
+
+**2 · Q16 could not answer its own second half.** The question is "which
+components matter most, **and why**". `rankRationale` shipped with E9 and was
+attached to `snapshot.nodes` — not to `hotspots[]`, which is the view that
+answers the question. A reader opening Hotspots got a ranked list of paths and no
+reasons. The instrument scored it `yes` because it read the rationale off the
+*nodes* array, which no reader does. Now on every hotspot entry
+(`codegraph-snapshot-v3`):
+
+```
+system/web/Controller.cfc      13 callers · 1 dependency · 10 crossing edges
+system/async/AsyncManager.cfc  2 callers · 6 dependencies · in a cycle · 6 crossing edges
+```
+
+**3 · Q1 is weak without a provider, and it is the first question asked.** With
+no AI key the answer to "what is this application" is 60 clusters labelled after
+their largest file — `Baseproxy`, `Cachefactory`, `Consumer`, `Layout`. Nothing
+says "a web MVC framework". `application-features.md` already warns that cluster
+keys are evidence labels rather than business domains, so this is documented
+rather than hidden — but a cold reader meets it at question one, before any
+warning has been read. Recorded, not fixed: naming a project without a model is
+not something the structural layer can honestly do.
+
+### 35.3 What reading well looks like
+
+Not everything was friction. These read correctly first time, with no
+interpretation needed:
+
+```
+cycles     binder.cfc → mapping.cfc → injector.cfc → provider.cfc     (a real IoC cycle)
+hierarchy  BaseProxy.cfc is extended by 11: BiConsumer, BiFunction,
+           Comparator, Consumer, Function, Predicate, …               (the async proxy spine)
+impact     system/web/Controller.cfc → 13 dependents
+```
+
+A reader who had never opened ColdBox could state from those three that it is a
+framework built around a central `Controller`, a wired IoC container with a
+known cycle, and a Java-interop proxy hierarchy — without reading a line of it.
+
+### 35.4 Honest status of the score
+
+ColdBox's instrument score is unchanged at **14 of 15 applicable**, because every
+one of the three findings above sat *inside* a question the instrument already
+scored `yes`. That is the entire point of this section: **the score did not move,
+and the product got materially more truthful.** A number that cannot move in
+response to a wrong answer is not measuring correctness.
+
+Which is also the argument for the last open item. A reading pass catches answers
+that are wrong. Only a human catches answers that are right and unfindable, or
+right and disbelieved.
+
+### 35.5 Still open
+
+- **A human cold-read session.** [`cold-read-protocol.md`](../cold-read-protocol.md)
+  is the runnable sheet; `lib/coldbox` is a prepared unfamiliar-CFML target; setup
+  is five minutes and the session is capped at thirty. The ColdBox session is
+  bookable by anyone here — it is the *target* that must be unfamiliar. The
+  DoubleCheck session still needs an outside reader.

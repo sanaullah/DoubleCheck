@@ -23,6 +23,7 @@ documentation tree in version control. `.superpowers/` is local scratch.
 | [prompt-system.md](prompt-system.md) | Versioned prompt contract system — implemented and live |
 | [cfml-llm-depth.md](cfml-llm-depth.md) | ColdFusion LLM depth (`cfml-conventions`) |
 | [boxlang-conventions.md](boxlang-conventions.md) | BoxLang/CFML style in this repo |
+| [cold-read-protocol.md](cold-read-protocol.md) | **Runnable session sheet** — can a stranger understand a project from CodeGraph alone? Rules, recording table, prepared unfamiliar-CFML target |
 | [testing-commands.md](testing-commands.md) | `box testbox run`, `node --test tests/js/`, reporters |
 | [open-issues.md](open-issues.md) | Reported but not yet planned |
 | [images/](images/) | UI screenshots used by the public readme |
