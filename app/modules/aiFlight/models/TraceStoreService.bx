@@ -1,0 +1,1660 @@
+/**
+ * Module-owned SQLite store for Langfuse-inspired traces.
+ * Uses BoxLang queryExecute with an inline sqlite datasource (bx-sqlite).
+ */
+
+@singleton
+class {
+	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="dbPath" type="string";
+
+	property name="lastAbandonAt" type="numeric" default="0";
+
+	function onDIComplete() {
+		variables.dbPath = resolveDbPath();
+		variables.lastAbandonAt = 0;
+	}
+
+	string function getDbPath() {
+		return variables.dbPath;
+	}
+
+	void function ensureSchema() {
+		variables.dbPath = resolveDbPath();
+		ensureDatabaseFile( variables.dbPath );
+		var definition = schemaDefinition();
+		for ( var tableDefinition in definition.tables ) {
+			executeUpdate( tableDefinition.sql );
+		}
+		migrateSchema();
+		repairOrphanedRows();
+		for ( var indexDefinition in definition.indexes ) {
+			executeUpdate( indexDefinition.sql );
+		}
+		validateSchema( definition );
+	}
+
+	/**
+	 * The complete AI Flight schema. Keep table and index definitions together
+	 * so the module's local database has one authoritative source.
+	 */
+	private struct function schemaDefinition() {
+		return {
+			tables: [
+				{
+					name: "schema_meta",
+					sql : "
+						CREATE TABLE IF NOT EXISTS schema_meta (
+							key TEXT PRIMARY KEY,
+							value TEXT NOT NULL
+						)
+					"
+				},
+				{
+					name: "traces",
+					sql : "
+						CREATE TABLE IF NOT EXISTS traces (
+							id TEXT PRIMARY KEY,
+							name TEXT NOT NULL DEFAULT '',
+							session_id TEXT,
+							user_id TEXT,
+							environment TEXT NOT NULL DEFAULT '',
+							started_at TEXT NOT NULL,
+							ended_at TEXT,
+							status TEXT NOT NULL DEFAULT 'running',
+							provider TEXT,
+							model TEXT,
+							input_preview TEXT,
+							output_preview TEXT,
+							total_tokens INTEGER NOT NULL DEFAULT 0,
+							prompt_tokens INTEGER NOT NULL DEFAULT 0,
+							completion_tokens INTEGER NOT NULL DEFAULT 0,
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							error_message TEXT,
+							metadata_json TEXT NOT NULL DEFAULT '{}'
+						)
+					"
+				},
+				{
+					name: "observations",
+					sql : "
+						CREATE TABLE IF NOT EXISTS observations (
+							id TEXT PRIMARY KEY,
+							trace_id TEXT NOT NULL,
+							parent_observation_id TEXT,
+							type TEXT NOT NULL,
+							name TEXT NOT NULL DEFAULT '',
+							start_time TEXT NOT NULL,
+							end_time TEXT,
+							duration_ms INTEGER NOT NULL DEFAULT 0,
+							status TEXT NOT NULL DEFAULT 'running',
+							model TEXT,
+							provider TEXT,
+							input_text TEXT,
+							output_text TEXT,
+							usage_json TEXT NOT NULL DEFAULT '{}',
+							level TEXT NOT NULL DEFAULT 'DEFAULT',
+							source_event TEXT NOT NULL DEFAULT '',
+							payload_json TEXT NOT NULL DEFAULT '{}',
+							FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
+						)
+					"
+				},
+				{
+					name: "scores",
+					sql : "
+						CREATE TABLE IF NOT EXISTS scores (
+							id TEXT PRIMARY KEY,
+							trace_id TEXT NOT NULL,
+							observation_id TEXT,
+							name TEXT NOT NULL,
+							data_type TEXT NOT NULL,
+							value TEXT NOT NULL,
+							comment TEXT NOT NULL DEFAULT '',
+							created_at TEXT NOT NULL,
+							updated_at TEXT NOT NULL,
+							FOREIGN KEY (trace_id) REFERENCES traces(id) ON DELETE CASCADE
+						)
+					"
+				}
+			],
+			indexes: [
+				{ name: "idx_observations_trace", sql: "CREATE INDEX IF NOT EXISTS idx_observations_trace ON observations(trace_id, start_time)" },
+				{ name: "idx_scores_trace_name", sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_trace_name ON scores(trace_id, name)" },
+				{ name: "idx_scores_trace", sql: "CREATE INDEX IF NOT EXISTS idx_scores_trace ON scores(trace_id)" },
+				{ name: "idx_traces_started", sql: "CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at DESC)" }
+			]
+		};
+	}
+
+	struct function createTrace( required struct data ) {
+		var id = len( arguments.data.id ?: "" ) ? arguments.data.id : createUUID();
+		var nowIso = isoNow();
+		var environment = trim( toString( arguments.data.environment ?: "" ) );
+		if ( !len( environment ) ) {
+			environment = trim( toString( moduleSettings.environment ?: "local" ) );
+		}
+		if ( !len( environment ) ) {
+			environment = "local";
+		}
+		executeUpdate(
+			"
+				INSERT INTO traces (
+					id, name, session_id, user_id, environment, started_at, status,
+					provider, model, input_preview, metadata_json
+				) VALUES (
+					:id, :name, :session_id, :user_id, :environment, :started_at, :status,
+					:provider, :model, :input_preview, :metadata_json
+				)
+			",
+			{
+				id  : { value: id, cfsqltype: "varchar" },
+				name: {
+					value    : toString( arguments.data.name ?: "trace" ),
+					cfsqltype: "varchar"
+				},
+				session_id: {
+					value    : toString( arguments.data.sessionId ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.sessionId ?: "" )
+				},
+				user_id: {
+					value    : toString( arguments.data.userId ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.userId ?: "" )
+				},
+				environment: { value: environment, cfsqltype: "varchar" },
+				started_at : {
+					value    : arguments.data.startedAt ?: nowIso,
+					cfsqltype: "varchar"
+				},
+				status: {
+					value    : arguments.data.status ?: "running",
+					cfsqltype: "varchar"
+				},
+				provider: {
+					value    : toString( arguments.data.provider ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.provider ?: "" )
+				},
+				model: {
+					value    : toString( arguments.data.model ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.model ?: "" )
+				},
+				input_preview: {
+					value    : toString( arguments.data.inputPreview ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.inputPreview ?: "" )
+				},
+				metadata_json: {
+					value    : jsonSerialize( arguments.data.metadata ?: {} ),
+					cfsqltype: "varchar"
+				}
+			}
+		);
+		pruneIfNeeded();
+		return getTrace( id );
+	}
+
+	struct function upsertObservation( required struct data ) {
+		var id = len( arguments.data.id ?: "" ) ? arguments.data.id : createUUID();
+		var existing = getObservation( id );
+		if ( existing.count() ) {
+			return updateObservation( id, arguments.data );
+		}
+		var nowIso = isoNow();
+		executeUpdate(
+			"
+				INSERT INTO observations (
+					id, trace_id, parent_observation_id, type, name,
+					start_time, end_time, duration_ms, status, model, provider,
+					input_text, output_text, usage_json, level, source_event, payload_json
+				) VALUES (
+					:id, :trace_id, :parent_observation_id, :type, :name,
+					:start_time, :end_time, :duration_ms, :status, :model, :provider,
+					:input_text, :output_text, :usage_json, :level, :source_event, :payload_json
+				)
+			",
+			{
+				id                   : { value: id, cfsqltype: "varchar" },
+				trace_id             : { value: arguments.data.traceId, cfsqltype: "varchar" },
+				parent_observation_id: {
+					value    : toString( arguments.data.parentObservationId ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.parentObservationId ?: "" )
+				},
+				type: {
+					value    : arguments.data.type ?: "event",
+					cfsqltype: "varchar"
+				},
+				name: {
+					value    : toString( arguments.data.name ?: "" ),
+					cfsqltype: "varchar"
+				},
+				start_time: {
+					value    : arguments.data.startTime ?: nowIso,
+					cfsqltype: "varchar"
+				},
+				end_time: {
+					value    : toString( arguments.data.endTime ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.endTime ?: "" )
+				},
+				duration_ms: {
+					value    : int( val( arguments.data.durationMs ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				status: {
+					value    : arguments.data.status ?: "running",
+					cfsqltype: "varchar"
+				},
+				model: {
+					value    : toString( arguments.data.model ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.model ?: "" )
+				},
+				provider: {
+					value    : toString( arguments.data.provider ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.provider ?: "" )
+				},
+				input_text: {
+					value    : toString( arguments.data.inputText ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.inputText ?: "" )
+				},
+				output_text: {
+					value    : toString( arguments.data.outputText ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( arguments.data.outputText ?: "" )
+				},
+				usage_json: {
+					value    : jsonSerialize( arguments.data.usage ?: {} ),
+					cfsqltype: "varchar"
+				},
+				level: {
+					value    : arguments.data.level ?: "DEFAULT",
+					cfsqltype: "varchar"
+				},
+				source_event: {
+					value    : toString( arguments.data.sourceEvent ?: "" ),
+					cfsqltype: "varchar"
+				},
+				payload_json: {
+					value    : jsonSerialize( arguments.data.payload ?: {} ),
+					cfsqltype: "varchar"
+				}
+			}
+		);
+		return getObservation( id );
+	}
+
+	struct function updateObservation( required string id, required struct data ) {
+		var current = getObservation( arguments.id );
+		if ( !current.count() ) {
+			return {};
+		}
+		var merged = duplicate( current );
+		for ( var key in [
+			"endTime",
+			"durationMs",
+			"status",
+			"model",
+			"provider",
+			"inputText",
+			"outputText",
+			"level",
+			"name"
+		] ) {
+			if ( structKeyExists( arguments.data, key ) ) {
+				merged[ key ] = arguments.data[ key ];
+			}
+		}
+		if ( structKeyExists( arguments.data, "usage" ) && isStruct( arguments.data.usage ) ) {
+			var usage = isStruct( merged.usage ) ? merged.usage : {};
+			usage.append( arguments.data.usage, true );
+			merged.usage = usage;
+		}
+		if ( structKeyExists( arguments.data, "payload" ) ) {
+			merged.payload = arguments.data.payload;
+		}
+		executeUpdate(
+			"
+				UPDATE observations SET
+					end_time = :end_time,
+					duration_ms = :duration_ms,
+					status = :status,
+					model = :model,
+					provider = :provider,
+					input_text = :input_text,
+					output_text = :output_text,
+					usage_json = :usage_json,
+					level = :level,
+					name = :name,
+					payload_json = :payload_json
+				WHERE id = :id
+			",
+			{
+				id      : { value: arguments.id, cfsqltype: "varchar" },
+				end_time: {
+					value    : toString( merged.endTime ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( merged.endTime ?: "" )
+				},
+				duration_ms: {
+					value    : int( val( merged.durationMs ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				status: { value: merged.status ?: "running", cfsqltype: "varchar" },
+				model : {
+					value    : toString( merged.model ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( merged.model ?: "" )
+				},
+				provider: {
+					value    : toString( merged.provider ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( merged.provider ?: "" )
+				},
+				input_text: {
+					value    : toString( merged.inputText ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( merged.inputText ?: "" )
+				},
+				output_text: {
+					value    : toString( merged.outputText ?: "" ),
+					cfsqltype: "varchar",
+					null     : !len( merged.outputText ?: "" )
+				},
+				usage_json: {
+					value    : jsonSerialize( merged.usage ?: {} ),
+					cfsqltype: "varchar"
+				},
+				level: { value: merged.level ?: "DEFAULT", cfsqltype: "varchar" },
+				name : {
+					value    : toString( merged.name ?: "" ),
+					cfsqltype: "varchar"
+				},
+				payload_json: {
+					value    : jsonSerialize( merged.payload ?: {} ),
+					cfsqltype: "varchar"
+				}
+			}
+		);
+		return getObservation( arguments.id );
+	}
+
+	struct function completeTrace(
+		required string id,
+		string status        = "ok",
+		string outputPreview = "",
+		string errorMessage  = "",
+		numeric durationMs   = 0,
+		struct usage         = {}
+	) {
+		var trace = getTrace( arguments.id );
+		if ( !trace.count() ) {
+			return {};
+		}
+		var ended = isoNow();
+		var prompt = int( val( arguments.usage.promptTokens ?: trace.promptTokens ) );
+		var completion = int(
+			val(
+				arguments.usage.completionTokens ?: trace.completionTokens
+			)
+		);
+		var total = int( val( arguments.usage.totalTokens ?: trace.totalTokens ) );
+		if ( !total && ( prompt || completion ) ) {
+			total = prompt + completion;
+		}
+		// Late success after timeout cleanup: clear the timeout note when finishing ok.
+		var errMsg = arguments.errorMessage;
+		if ( arguments.status == "ok" && !len( trim( errMsg ) ) ) {
+			errMsg = "";
+		}
+		executeUpdate(
+			"
+				UPDATE traces SET
+					ended_at = :ended_at,
+					status = :status,
+					output_preview = COALESCE(NULLIF(:output_preview, ''), output_preview),
+					error_message = :error_message,
+					duration_ms = :duration_ms,
+					prompt_tokens = :prompt_tokens,
+					completion_tokens = :completion_tokens,
+					total_tokens = :total_tokens
+				WHERE id = :id
+			",
+			{
+				id            : { value: arguments.id, cfsqltype: "varchar" },
+				ended_at      : { value: ended, cfsqltype: "varchar" },
+				status        : { value: arguments.status, cfsqltype: "varchar" },
+				output_preview: { value: arguments.outputPreview, cfsqltype: "varchar" },
+				error_message : {
+					value    : errMsg,
+					cfsqltype: "varchar",
+					null     : !len( errMsg )
+				},
+				duration_ms: {
+					value    : int( arguments.durationMs ?: val( trace.durationMs ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				prompt_tokens    : { value: prompt, cfsqltype: "integer" },
+				completion_tokens: { value: completion, cfsqltype: "integer" },
+				total_tokens     : { value: total, cfsqltype: "integer" }
+			}
+		);
+		return getTrace( arguments.id );
+	}
+
+	void function addTraceUsage( required string id, required struct usage ) {
+		var trace = getTrace( arguments.id );
+		if ( !trace.count() ) {
+			return;
+		}
+		executeUpdate(
+			"
+				UPDATE traces SET
+					prompt_tokens = prompt_tokens + :prompt_tokens,
+					completion_tokens = completion_tokens + :completion_tokens,
+					total_tokens = total_tokens + :total_tokens,
+					provider = COALESCE(NULLIF(:provider, ''), provider),
+					model = COALESCE(NULLIF(:model, ''), model)
+				WHERE id = :id
+			",
+			{
+				id           : { value: arguments.id, cfsqltype: "varchar" },
+				prompt_tokens: {
+					value    : int( val( arguments.usage.promptTokens ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				completion_tokens: {
+					value    : int( val( arguments.usage.completionTokens ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				total_tokens: {
+					value    : int( val( arguments.usage.totalTokens ?: 0 ) ),
+					cfsqltype: "integer"
+				},
+				provider: {
+					value    : toString( arguments.usage.provider ?: "" ),
+					cfsqltype: "varchar"
+				},
+				model: {
+					value    : toString( arguments.usage.model ?: "" ),
+					cfsqltype: "varchar"
+				}
+			}
+		);
+	}
+
+	array function listTraces(
+		numeric limit         = 50,
+		string status         = "",
+		string search         = "",
+		boolean hasTools      = false,
+		boolean hasErrors     = false,
+		string model          = "",
+		string userId         = "",
+		string environment    = "",
+		string obsType        = "",
+		numeric minDurationMs = 0,
+		numeric maxDurationMs = 0,
+		numeric minCost       = 0,
+		string feedback       = ""
+	) {
+		abandonStaleRunningTraces( force = false );
+		var sql = "
+			SELECT t.*,
+				( SELECT COUNT(*) FROM observations o WHERE o.trace_id = t.id ) AS observation_count,
+				( SELECT CAST(json_extract(o.usage_json, '$.cost') AS REAL)
+					FROM observations o
+					WHERE o.trace_id = t.id
+						AND json_extract(o.usage_json, '$.cost') IS NOT NULL
+					ORDER BY o.rowid DESC
+					LIMIT 1
+				) AS cost,
+				( SELECT s.value FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_value,
+				( SELECT s.comment FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_comment,
+				( SELECT s.updated_at FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_updated_at
+			FROM traces t
+			WHERE 1 = 1
+		";
+		var params = {};
+		if ( len( arguments.status ) ) {
+			sql &= " AND t.status = :status";
+			params.status = { value: arguments.status, cfsqltype: "varchar" };
+		}
+		if ( len( trim( arguments.search ) ) ) {
+			sql &= " AND (
+				t.name LIKE :search OR
+				IFNULL(t.input_preview,'') LIKE :search OR
+				IFNULL(t.output_preview,'') LIKE :search OR
+				IFNULL(t.model,'') LIKE :search
+			)";
+			params.search = {
+				value    : "%" & trim( arguments.search ) & "%",
+				cfsqltype: "varchar"
+			};
+		}
+		if ( arguments.hasTools ) {
+			sql &= " AND EXISTS ( SELECT 1 FROM observations o WHERE o.trace_id = t.id AND o.type = 'tool' )";
+		}
+		if ( arguments.hasErrors ) {
+			sql &= " AND (
+				t.status = 'error' OR
+				EXISTS ( SELECT 1 FROM observations o WHERE o.trace_id = t.id AND o.level = 'ERROR' )
+			)";
+		}
+		if ( len( trim( arguments.model ) ) ) {
+			sql &= " AND LOWER(IFNULL(t.model,'')) LIKE :model";
+			params.model = {
+				value    : lCase( trim( arguments.model ) ) & "%",
+				cfsqltype: "varchar"
+			};
+		}
+		if ( len( trim( arguments.userId ) ) ) {
+			sql &= " AND t.user_id = :user_id";
+			params.user_id = { value: trim( arguments.userId ), cfsqltype: "varchar" };
+		}
+		if ( len( trim( arguments.environment ) ) ) {
+			sql &= " AND t.environment = :environment";
+			params.environment = {
+				value    : trim( arguments.environment ),
+				cfsqltype: "varchar"
+			};
+		}
+		if ( len( trim( arguments.obsType ) ) ) {
+			sql &= " AND EXISTS ( SELECT 1 FROM observations o WHERE o.trace_id = t.id AND o.type = :obs_type )";
+			params.obs_type = { value: trim( arguments.obsType ), cfsqltype: "varchar" };
+		}
+		if ( val( arguments.minDurationMs ) > 0 ) {
+			sql &= " AND t.duration_ms >= :min_duration";
+			params.min_duration = {
+				value    : int( val( arguments.minDurationMs ) ),
+				cfsqltype: "integer"
+			};
+		}
+		if ( val( arguments.maxDurationMs ) > 0 ) {
+			sql &= " AND t.duration_ms <= :max_duration";
+			params.max_duration = {
+				value    : int( val( arguments.maxDurationMs ) ),
+				cfsqltype: "integer"
+			};
+		}
+		if ( val( arguments.minCost ) > 0 ) {
+			sql &= " AND IFNULL((
+				SELECT CAST(json_extract(o.usage_json, '$.cost') AS REAL)
+				FROM observations o
+				WHERE o.trace_id = t.id
+					AND json_extract(o.usage_json, '$.cost') IS NOT NULL
+				ORDER BY o.rowid DESC
+				LIMIT 1
+			), 0) >= #val( arguments.minCost )#";
+		}
+		var fb = lCase( trim( arguments.feedback ) );
+		if ( fb == "up" || fb == "down" ) {
+			sql &= " AND EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback' AND s.value = :feedback_value
+			)";
+			params.feedback_value = { value: fb, cfsqltype: "varchar" };
+		} else if ( fb == "any" ) {
+			sql &= " AND EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback'
+			)";
+		} else if ( fb == "none" ) {
+			sql &= " AND NOT EXISTS (
+				SELECT 1 FROM scores s
+				WHERE s.trace_id = t.id AND s.name = 'feedback'
+			)";
+		}
+		// rowid is insert order — more reliable than started_at string sort
+		sql &= " ORDER BY t.rowid DESC LIMIT :limit";
+		params.limit = {
+			value    : max( 1, min( 200, int( arguments.limit ) ) ),
+			cfsqltype: "integer"
+		};
+		var q = executeQuery( sql, params );
+		var rows = [];
+		for ( var row in q ) {
+			rows.append( mapTraceRow( row ) );
+		}
+		return rows;
+	}
+
+	/**
+	 * All-time and today totals (traces, tokens, cost) - a local spend/usage
+	 * at-a-glance summary. Cost is opportunistic: only traces whose provider
+	 * response included a cost figure (e.g. OpenRouter) contribute to it.
+	 */
+	struct function getStats() {
+		var todayStart = dateTimeFormat(
+			createDateTime(
+				year( now() ),
+				month( now() ),
+				day( now() ),
+				0,
+				0,
+				0
+			),
+			"iso"
+		);
+		var q = executeQuery(
+			"
+				SELECT
+					COUNT(*) AS trace_count,
+					SUM(total_tokens) AS total_tokens,
+					SUM(IFNULL(cost, 0)) AS total_cost,
+					SUM(CASE WHEN started_at >= :today_start THEN 1 ELSE 0 END) AS today_trace_count,
+					SUM(CASE WHEN started_at >= :today_start THEN total_tokens ELSE 0 END) AS today_tokens,
+					SUM(CASE WHEN started_at >= :today_start THEN IFNULL(cost, 0) ELSE 0 END) AS today_cost,
+					SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+				FROM (
+					SELECT t.*,
+						( SELECT CAST(json_extract(o.usage_json, '$.cost') AS REAL)
+							FROM observations o
+							WHERE o.trace_id = t.id
+								AND json_extract(o.usage_json, '$.cost') IS NOT NULL
+							ORDER BY o.rowid DESC
+							LIMIT 1
+						) AS cost
+					FROM traces t
+				)
+			",
+			{ today_start: { value: todayStart, cfsqltype: "varchar" } }
+		);
+		return {
+			traceCount     : int( val( q.trace_count ?: 0 ) ),
+			totalTokens    : int( val( q.total_tokens ?: 0 ) ),
+			totalCost      : numberFormat( val( q.total_cost ?: 0 ), "0.000000" ) * 1,
+			todayTraceCount: int( val( q.today_trace_count ?: 0 ) ),
+			todayTokens    : int( val( q.today_tokens ?: 0 ) ),
+			todayCost      : numberFormat( val( q.today_cost ?: 0 ), "0.000000" ) * 1,
+			errorCount     : int( val( q.error_count ?: 0 ) )
+		};
+	}
+
+	array function listSessions( numeric limit = 50 ) {
+		var q = executeQuery(
+			"
+				SELECT
+					IFNULL(NULLIF(session_id, ''), id) AS session_key,
+					COUNT(*) AS trace_count,
+					SUM(total_tokens) AS total_tokens,
+					SUM(prompt_tokens) AS prompt_tokens,
+					SUM(completion_tokens) AS completion_tokens,
+					MAX(started_at) AS last_started_at,
+					MIN(started_at) AS first_started_at,
+					SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+					SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_count
+				FROM traces
+				GROUP BY IFNULL(NULLIF(session_id, ''), id)
+				ORDER BY MAX(rowid) DESC
+				LIMIT :limit
+			",
+			{
+				limit: {
+					value    : max( 1, min( 200, int( arguments.limit ) ) ),
+					cfsqltype: "integer"
+				}
+			}
+		);
+		var rows = [];
+		for ( var row in q ) {
+			var sessionId = toString( row.session_key ?: "" );
+			var memberTraces = listTracesForSession( sessionId, 20 );
+			rows.append(
+					{
+						id              : sessionId,
+						traceCount      : int( val( row.trace_count ?: 0 ) ),
+						totalTokens     : int( val( row.total_tokens ?: 0 ) ),
+						promptTokens    : int( val( row.prompt_tokens ?: 0 ) ),
+						completionTokens: int( val( row.completion_tokens ?: 0 ) ),
+						lastStartedAt   : row.last_started_at ?: "",
+						firstStartedAt  : row.first_started_at ?: "",
+						errorCount      : int( val( row.error_count ?: 0 ) ),
+						runningCount    : int( val( row.running_count ?: 0 ) ),
+						status          : int( val( row.running_count ?: 0 ) )
+							? "running"
+							: ( int( val( row.error_count ?: 0 ) ) ? "error" : "ok" ),
+						traces: memberTraces
+					}
+				);
+		}
+		return rows;
+	}
+
+	array function listTracesForSession( required string sessionId, numeric limit = 50 ) {
+		var q = executeQuery(
+			"
+				SELECT t.*,
+					( SELECT COUNT(*) FROM observations o WHERE o.trace_id = t.id ) AS observation_count,
+					( SELECT CAST(json_extract(o.usage_json, '$.cost') AS REAL)
+						FROM observations o
+						WHERE o.trace_id = t.id
+							AND json_extract(o.usage_json, '$.cost') IS NOT NULL
+						ORDER BY o.rowid DESC
+						LIMIT 1
+					) AS cost,
+					( SELECT s.value FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_value,
+					( SELECT s.comment FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_comment,
+					( SELECT s.updated_at FROM scores s WHERE s.trace_id = t.id AND s.name = 'feedback' LIMIT 1 ) AS feedback_updated_at
+				FROM traces t
+				WHERE IFNULL(NULLIF(t.session_id, ''), t.id) = :session_id
+				ORDER BY t.rowid DESC
+				LIMIT :limit
+			",
+			{
+				session_id: { value: arguments.sessionId, cfsqltype: "varchar" },
+				limit     : {
+					value    : max( 1, min( 200, int( arguments.limit ) ) ),
+					cfsqltype: "integer"
+				}
+			}
+		);
+		var rows = [];
+		for ( var row in q ) {
+			rows.append( mapTraceRow( row ) );
+		}
+		return rows;
+	}
+
+	struct function getTrace( required string id ) {
+		var q = executeQuery(
+			"SELECT * FROM traces WHERE id = :id",
+			{ id: { value: arguments.id, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return {};
+		}
+		return mapTraceRow( q );
+	}
+
+	array function listObservations( required string traceId ) {
+		var q = executeQuery(
+			"
+				SELECT * FROM observations
+				WHERE trace_id = :trace_id
+				ORDER BY start_time ASC, rowid ASC
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		var rows = [];
+		for ( var row in q ) {
+			rows.append( mapObservationRow( row ) );
+		}
+		return rows;
+	}
+
+	struct function getObservation( required string id ) {
+		var q = executeQuery(
+			"SELECT * FROM observations WHERE id = :id",
+			{ id: { value: arguments.id, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return {};
+		}
+		return mapObservationRow( q );
+	}
+
+	struct function getTraceDetail( required string id ) {
+		var trace = getTrace( arguments.id );
+		if ( !trace.count() ) {
+			return {};
+		}
+		trace.observations = listObservations( arguments.id );
+		return trace;
+	}
+
+	array function getObservationTree( required string traceId ) {
+		var all = listObservations( arguments.traceId );
+		if ( !arrayLen( all ) ) {
+			return [];
+		}
+		var byId = {};
+		var roots = [];
+		for ( var obs in all ) {
+			byId[ obs.id ] = obs;
+			obs.children = [];
+		}
+		for ( var obs in all ) {
+			if ( len( obs.parentObservationId ?: "" ) ) {
+				if ( structKeyExists( byId, obs.parentObservationId ) ) {
+					byId[ obs.parentObservationId ].children.append( obs );
+				}
+			} else {
+				roots.append( obs );
+			}
+		}
+		return roots;
+	}
+
+	array function filterObservations( required string traceId, required struct filters ) {
+		var all = listObservations( arguments.traceId );
+		if ( !arrayLen( all ) ) {
+			return [];
+		}
+		var filtered = [];
+		for ( var obs in all ) {
+			if ( applyObservationFilters( obs, arguments.filters ) ) {
+				filtered.append( obs );
+			}
+		}
+		return filtered;
+	}
+
+	private boolean function applyObservationFilters( required struct obs, required struct filters ) {
+		if ( len( filters.obsType ?: "" ) && filters.obsType != obs.type ) {
+			return false;
+		}
+		if ( len( filters.obsStatus ?: "" ) && filters.obsStatus != obs.status ) {
+			return false;
+		}
+		if ( filters.minDurationMs > 0 && val( obs.durationMs ?: 0 ) < filters.minDurationMs ) {
+			return false;
+		}
+		if ( filters.maxDurationMs > 0 && val( obs.durationMs ?: 0 ) > filters.maxDurationMs ) {
+			return false;
+		}
+		if ( filters.hasError && obs.status != "error" ) {
+			return false;
+		}
+		if ( len( filters.searchText ?: "" ) ) {
+			var searchLower = lCase( filters.searchText );
+			var searchIn = lCase( ( obs.name ?: "" ) & " " & ( obs.inputText ?: "" ) & " " & ( obs.outputText ?: "" ) );
+			if ( !findNoCase( searchLower, searchIn ) ) {
+				return false;
+			}
+		}
+		if ( len( filters.tool ?: "" ) && filters.tool != obs.name ) {
+			return false;
+		}
+		if ( len( filters.model ?: "" ) && filters.model != obs.model ) {
+			return false;
+		}
+		return true;
+	}
+
+	struct function getTraceMetrics( required string traceId ) {
+		var trace = getTrace( arguments.traceId );
+		if ( !trace.count() ) {
+			return {};
+		}
+		var obs = listObservations( arguments.traceId );
+		var byType = {};
+		var byModel = {};
+		var totalTokens = val( trace.totalTokens ?: 0 );
+		var totalCost = val( trace.cost ?: 0 );
+
+		for ( var o in obs ) {
+			var type = o.type ?: "event";
+			var model = o.model ?: "unknown";
+			var obsTokens = val( o.usage.totalTokens ?: 0 );
+			var obsCost = val( o.usage.cost ?: 0 );
+			var obsDuration = val( o.durationMs ?: 0 );
+
+			if ( !structKeyExists( byType, type ) ) {
+				byType[ type ] = {
+					type: type,
+					count: 0,
+					totalTokens: 0,
+					totalCost: 0,
+					totalDuration: 0,
+					avgDuration: 0
+				};
+			}
+			byType[ type ].count++;
+			byType[ type ].totalTokens += obsTokens;
+			byType[ type ].totalCost += obsCost;
+			byType[ type ].totalDuration += obsDuration;
+
+			if ( !structKeyExists( byModel, model ) ) {
+				byModel[ model ] = {
+					model: model,
+					count: 0,
+					totalTokens: 0,
+					totalCost: 0
+				};
+			}
+			byModel[ model ].count++;
+			byModel[ model ].totalTokens += obsTokens;
+			byModel[ model ].totalCost += obsCost;
+		}
+
+		for ( var type in byType ) {
+			var count = byType[ type ].count ?: 1;
+			byType[ type ].avgDuration = int( byType[ type ].totalDuration / count );
+		}
+
+		var typeMetrics = [];
+		for ( var type in byType ) {
+			typeMetrics.append( byType[ type ] );
+		}
+
+		var modelMetrics = [];
+		for ( var model in byModel ) {
+			modelMetrics.append( byModel[ model ] );
+		}
+
+		return {
+			trace: trace,
+			summary: {
+				totalDuration: trace.durationMs ?: 0,
+				totalTokens: totalTokens,
+				totalCost: totalCost,
+				avgCostPerTrace: totalTokens > 0 ? totalCost / totalTokens : 0,
+				observationCount: arrayLen( obs )
+			},
+			byType: typeMetrics,
+			byModel: modelMetrics
+		};
+	}
+
+	array function getTraceErrors( required string traceId ) {
+		var obs = listObservations( arguments.traceId );
+		var errors = [];
+		for ( var o in obs ) {
+			if ( o.status == "error" || o.status == "abandoned" ) {
+				errors.append( {
+					id: o.id,
+					type: o.type,
+					name: o.name,
+					status: o.status,
+					errorMessage: o.errorMessage ?: "",
+					durationMs: o.durationMs,
+					startTime: o.startTime,
+					model: o.model,
+					provider: o.provider
+				} );
+			}
+		}
+		return errors;
+	}
+
+	string function exportTrace( required struct trace, required array observations, required string format ) {
+		if ( arguments.format == "json" ) {
+			return exportTraceJson( arguments.trace, arguments.observations );
+		} else if ( arguments.format == "csv" ) {
+			return exportTraceCsv( arguments.trace, arguments.observations );
+		} else if ( arguments.format == "markdown" ) {
+			return exportTraceMarkdown( arguments.trace, arguments.observations );
+		}
+		return "";
+	}
+
+	private string function exportTraceJson( required struct trace, required array observations ) {
+		var exported = duplicate( arguments.trace );
+		exported.observations = arguments.observations;
+		return jsonSerialize( exported );
+	}
+
+	private string function exportTraceCsv( required struct trace, required array observations ) {
+		var lines = [];
+		lines.append( "traceId,type,name,status,durationMs,startTime,model,provider,inputPreview,outputPreview,totalTokens,cost" );
+		for ( var o in arguments.observations ) {
+			var row = csvValue( o.id ?: "" ) & "," &
+				csvValue( o.type ?: "" ) & "," &
+				csvValue( o.name ?: "" ) & "," &
+				csvValue( o.status ?: "" ) & "," &
+				val( o.durationMs ?: 0 ) & "," &
+				csvValue( o.startTime ?: "" ) & "," &
+				csvValue( o.model ?: "" ) & "," &
+				csvValue( o.provider ?: "" ) & "," &
+				csvValue( left( o.inputText ?: "", 100 ) ) & "," &
+				csvValue( left( o.outputText ?: "", 100 ) ) & "," &
+				val( o.usage.totalTokens ?: 0 ) & "," &
+				val( o.usage.cost ?: 0 );
+			lines.append( row );
+		}
+		return arrayToList( lines, chr(10) );
+	}
+
+	private string function exportTraceMarkdown( required struct trace, required array observations ) {
+		var md = [];
+		md.append( 'Trace Export' );
+		md.append( '=' );
+		md.append( '' );
+		md.append( 'Trace ID: ' & ( arguments.trace.id ?: '' ) );
+		md.append( 'Name: ' & ( arguments.trace.name ?: 'Untitled' ) );
+		md.append( 'Status: ' & ( arguments.trace.status ?: 'unknown' ) );
+		md.append( 'Started: ' & ( arguments.trace.startedAt ?: 'unknown' ) );
+		md.append( 'Duration: ' & val( arguments.trace.durationMs ?: 0 ) & ' ms' );
+		md.append( 'Total Tokens: ' & val( arguments.trace.totalTokens ?: 0 ) );
+		md.append( 'Cost: $' & val( arguments.trace.cost ?: 0 ) );
+		md.append( '' );
+		md.append( 'Observations (' & arrayLen( arguments.observations ) & ')' );
+		md.append( '-' );
+		md.append( '' );
+		for ( var o in arguments.observations ) {
+			md.append( 'Step: ' & ( o.name ?: o.type ?: 'Step' ) );
+			md.append( '  Type: ' & ( o.type ?: 'event' ) );
+			md.append( '  Status: ' & ( o.status ?: 'unknown' ) );
+			md.append( '  Duration: ' & val( o.durationMs ?: 0 ) & ' ms' );
+			md.append( '  Model: ' & ( o.model ?: 'N/A' ) );
+			md.append( '  Tokens: ' & val( o.usage.totalTokens ?: 0 ) );
+			if ( len( o.inputText ?: '' ) ) {
+				md.append( '  Input: ' & left( o.inputText, 200 ) );
+			}
+			if ( len( o.outputText ?: '' ) ) {
+				md.append( '  Output: ' & left( o.outputText, 200 ) );
+			}
+			md.append( '' );
+		}
+		return arrayToList( md, chr(10) );
+	}
+
+	private string function csvValue( required string val ) {
+		return '"' & replace( arguments.val, '"', '""', "all" ) & '"';
+	}
+
+	struct function upsertFeedback(
+		required string traceId,
+		required string value,
+		string comment = ""
+	) {
+		var normalized = lCase( trim( arguments.value ) );
+		if ( !listFindNoCase( "up,down", normalized ) ) {
+			throw(
+				type    = "AiFlight.InvalidFeedback",
+				message = "Feedback value must be up or down"
+			);
+		}
+		var trace = getTrace( arguments.traceId );
+		if ( !trace.count() ) {
+			return {};
+		}
+		var note = trim( toString( arguments.comment ?: "" ) );
+		var nowIso = isoNow();
+		var existing = executeQuery(
+			"
+				SELECT id, created_at
+				FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( existing.recordCount ) {
+			executeUpdate(
+				"
+					UPDATE scores
+					SET value = :value,
+						data_type = 'categorical',
+						comment = :comment,
+						updated_at = :updated_at,
+						observation_id = NULL
+					WHERE id = :id
+				",
+				{
+					id        : { value: existing.id, cfsqltype: "varchar" },
+					value     : { value: normalized, cfsqltype: "varchar" },
+					comment   : { value: note, cfsqltype: "varchar" },
+					updated_at: { value: nowIso, cfsqltype: "varchar" }
+				}
+			);
+		} else {
+			executeUpdate(
+				"
+					INSERT INTO scores (
+						id, trace_id, observation_id, name, data_type, value, comment, created_at, updated_at
+					) VALUES (
+						:id, :trace_id, NULL, 'feedback', 'categorical', :value, :comment, :created_at, :updated_at
+					)
+				",
+				{
+					id        : { value: createUUID(), cfsqltype: "varchar" },
+					trace_id  : { value: arguments.traceId, cfsqltype: "varchar" },
+					value     : { value: normalized, cfsqltype: "varchar" },
+					comment   : { value: note, cfsqltype: "varchar" },
+					created_at: { value: nowIso, cfsqltype: "varchar" },
+					updated_at: { value: nowIso, cfsqltype: "varchar" }
+				}
+			);
+		}
+		return {
+			value    : normalized,
+			comment  : note,
+			updatedAt: nowIso
+		};
+	}
+
+	boolean function clearFeedback( required string traceId ) {
+		var existing = executeQuery(
+			"
+				SELECT id FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( !existing.recordCount ) {
+			return false;
+		}
+		executeUpdate(
+			"DELETE FROM scores WHERE id = :id",
+			{ id: { value: existing.id, cfsqltype: "varchar" } }
+		);
+		return true;
+	}
+
+	boolean function deleteTrace( required string id ) {
+		var existing = getTrace( arguments.id );
+		if ( !existing.count() ) {
+			return false;
+		}
+		executeUpdate(
+			"DELETE FROM traces WHERE id = :id",
+			{ id: { value: arguments.id, cfsqltype: "varchar" } }
+		);
+		return true;
+	}
+
+	struct function getSession( required string sessionId ) {
+		var sid = trim( arguments.sessionId );
+		if ( !len( sid ) ) {
+			return {};
+		}
+		var q = executeQuery(
+			"
+				SELECT
+					IFNULL(NULLIF(session_id, ''), id) AS session_key,
+					COUNT(*) AS trace_count,
+					SUM(total_tokens) AS total_tokens,
+					SUM(prompt_tokens) AS prompt_tokens,
+					SUM(completion_tokens) AS completion_tokens,
+					MAX(started_at) AS last_started_at,
+					MIN(started_at) AS first_started_at,
+					SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count,
+					SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_count
+				FROM traces
+				WHERE IFNULL(NULLIF(session_id, ''), id) = :session_id
+				GROUP BY IFNULL(NULLIF(session_id, ''), id)
+			",
+			{ session_id: { value: sid, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return {};
+		}
+		var row = q;
+		return {
+			id              : toString( row.session_key ?: sid ),
+			traceCount      : int( val( row.trace_count ?: 0 ) ),
+			totalTokens     : int( val( row.total_tokens ?: 0 ) ),
+			promptTokens    : int( val( row.prompt_tokens ?: 0 ) ),
+			completionTokens: int( val( row.completion_tokens ?: 0 ) ),
+			lastStartedAt   : row.last_started_at ?: "",
+			firstStartedAt  : row.first_started_at ?: "",
+			errorCount      : int( val( row.error_count ?: 0 ) ),
+			runningCount    : int( val( row.running_count ?: 0 ) ),
+			status          : int( val( row.running_count ?: 0 ) ) ? "running" : ( int( val( row.error_count ?: 0 ) ) ? "error" : "ok" ),
+			traces: listTracesForSession( sid, 100 )
+		};
+	}
+
+	/**
+	 * Latest open trace for a session (running or abandoned — for late closes after timeout).
+	 */
+	struct function findLatestRunningTrace( string sessionId = "", string name = "" ) {
+		var sql = "
+			SELECT t.*,
+				( SELECT COUNT(*) FROM observations o WHERE o.trace_id = t.id ) AS observation_count
+			FROM traces t
+			WHERE t.status IN ( 'running', 'abandoned' )
+		";
+		var params = {};
+		if ( len( trim( arguments.sessionId ) ) ) {
+			sql &= " AND IFNULL(NULLIF(t.session_id, ''), t.id) = :session_id";
+			params.session_id = { value: trim( arguments.sessionId ), cfsqltype: "varchar" };
+		}
+		if ( len( trim( arguments.name ) ) ) {
+			sql &= " AND t.name = :name";
+			params.name = { value: trim( arguments.name ), cfsqltype: "varchar" };
+		}
+		sql &= " ORDER BY CASE t.status WHEN 'running' THEN 0 ELSE 1 END, t.rowid DESC LIMIT 1";
+		var q = executeQuery( sql, params );
+		if ( !q.recordCount ) {
+			return {};
+		}
+		return mapTraceRow( q );
+	}
+
+	struct function findRunningGeneration( required string traceId ) {
+		var q = executeQuery(
+			"
+				SELECT * FROM observations
+				WHERE trace_id = :trace_id
+					AND type = 'generation'
+					AND status IN ( 'running', 'abandoned' )
+				ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, rowid DESC
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return {};
+		}
+		return mapObservationRow( q );
+	}
+
+	/**
+	 * Close long-running traces (and open observations) as abandoned — not error.
+	 * Real AI failures still use status error. Also abandons empty running shells
+	 * (0 observations) after 1 minute.
+	 */
+	numeric function abandonStaleRunningTraces( boolean force = true ) {
+		var minutes = int( val( moduleSettings.staleRunningMinutes ?: 5 ) );
+		if ( minutes < 1 ) {
+			return 0;
+		}
+		var nowTick = getTickCount();
+		if ( !arguments.force && ( nowTick - int( val( variables.lastAbandonAt ?: 0 ) ) ) < 30000 ) {
+			return 0;
+		}
+		variables.lastAbandonAt = nowTick;
+		var cutoff = dateTimeFormat(
+			dateAdd(
+				"n",
+				-minutes,
+				now()
+			),
+			"iso"
+		);
+		var emptyCutoff = dateTimeFormat(
+			dateAdd(
+				"n",
+				-1,
+				now()
+			),
+			"iso"
+		);
+		var ended = isoNow();
+		var staleMsg = "Timed out: no close event within #minutes# minutes (still open)";
+		var emptyMsg = "Timed out: empty trace (no steps) after 1 minute";
+		executeUpdate(
+			"
+				UPDATE observations SET
+					status = 'abandoned',
+					end_time = COALESCE(NULLIF(end_time, ''), :ended_at),
+					level = 'WARNING'
+				WHERE status = 'running'
+					AND trace_id IN (
+						SELECT id FROM traces
+						WHERE status = 'running'
+							AND (
+								started_at < :cutoff
+								OR (
+									started_at < :empty_cutoff
+									AND ( SELECT COUNT(*) FROM observations o WHERE o.trace_id = traces.id ) = 0
+								)
+							)
+					)
+			",
+			{
+				ended_at    : { value: ended, cfsqltype: "varchar" },
+				cutoff      : { value: cutoff, cfsqltype: "varchar" },
+				empty_cutoff: { value: emptyCutoff, cfsqltype: "varchar" }
+			}
+		);
+		var before = executeQuery(
+			"
+				SELECT COUNT(*) AS c FROM traces
+				WHERE status = 'running'
+					AND (
+						started_at < :cutoff
+						OR (
+							started_at < :empty_cutoff
+							AND ( SELECT COUNT(*) FROM observations o WHERE o.trace_id = traces.id ) = 0
+						)
+					)
+			",
+			{
+				cutoff      : { value: cutoff, cfsqltype: "varchar" },
+				empty_cutoff: { value: emptyCutoff, cfsqltype: "varchar" }
+			}
+		);
+		var count = int( val( before.c ?: 0 ) );
+		if ( count < 1 ) {
+			return 0;
+		}
+		executeUpdate(
+			"
+				UPDATE traces SET
+					status = 'abandoned',
+					ended_at = :ended_at,
+					error_message = COALESCE(
+						NULLIF(error_message, ''),
+						CASE
+							WHEN ( SELECT COUNT(*) FROM observations o WHERE o.trace_id = traces.id ) = 0
+								AND started_at >= :cutoff
+							THEN :empty_message
+							ELSE :stale_message
+						END
+					)
+				WHERE status = 'running'
+					AND (
+						started_at < :cutoff
+						OR (
+							started_at < :empty_cutoff
+							AND ( SELECT COUNT(*) FROM observations o WHERE o.trace_id = traces.id ) = 0
+						)
+					)
+			",
+			{
+				ended_at     : { value: ended, cfsqltype: "varchar" },
+				empty_message: { value: emptyMsg, cfsqltype: "varchar" },
+				stale_message: { value: staleMsg, cfsqltype: "varchar" },
+				cutoff       : { value: cutoff, cfsqltype: "varchar" },
+				empty_cutoff : { value: emptyCutoff, cfsqltype: "varchar" }
+			}
+		);
+		return count;
+	}
+
+	private void function migrateSchema() {
+		var hasEnvironment = false;
+		try {
+			var cols = executeQuery( "PRAGMA table_info(traces)" );
+			for ( var col in cols ) {
+				if ( toString( col.name ?: "" ) == "environment" ) {
+					hasEnvironment = true;
+					break;
+				}
+			}
+		} catch (any e) {
+			hasEnvironment = false;
+		}
+		if ( !hasEnvironment ) {
+			try {
+				executeUpdate(
+					"ALTER TABLE traces ADD COLUMN environment TEXT NOT NULL DEFAULT ''"
+				);
+			} catch (any e) {
+				log.warn( "AiFlight: could not add traces.environment: #e.message#" );
+			}
+		}
+		executeUpdate(
+			"
+				INSERT OR REPLACE INTO schema_meta(key, value)
+				VALUES ('version', '3')
+			"
+		);
+	}
+
+	/**
+	 * Older runs could prune traces while SQLite foreign keys were disabled,
+	 * leaving observations or scores whose trace no longer exists. Remove only
+	 * those unreachable child rows before validating the store.
+	 */
+	private void function repairOrphanedRows() {
+		var orphanedObservations = executeQuery(
+			"
+				SELECT COUNT(*) AS count
+				FROM observations
+				WHERE NOT EXISTS (
+					SELECT 1 FROM traces WHERE traces.id = observations.trace_id
+				)
+			"
+		);
+		var observationCount = int( val( orphanedObservations.count[ 1 ] ?: 0 ) );
+		if ( observationCount ) {
+			executeUpdate(
+				"
+					DELETE FROM observations
+					WHERE NOT EXISTS (
+						SELECT 1 FROM traces WHERE traces.id = observations.trace_id
+					)
+				"
+			);
+		}
+
+		var orphanedScores = executeQuery(
+			"
+				SELECT COUNT(*) AS count
+				FROM scores
+				WHERE NOT EXISTS (
+					SELECT 1 FROM traces WHERE traces.id = scores.trace_id
+				)
+			"
+		);
+		var scoreCount = int( val( orphanedScores.count[ 1 ] ?: 0 ) );
+		if ( scoreCount ) {
+			executeUpdate(
+				"
+					DELETE FROM scores
+					WHERE NOT EXISTS (
+						SELECT 1 FROM traces WHERE traces.id = scores.trace_id
+					)
+				"
+			);
+		}
+
+		if ( observationCount || scoreCount ) {
+			log.warn(
+				"AiFlight removed #observationCount + scoreCount# orphaned rows (#observationCount# observations, #scoreCount# scores)"
+			);
+		}
+	}
+
+	private void function validateSchema( required struct definition ) {
+		var objects = executeQuery(
+			"
+				SELECT type, name
+				FROM sqlite_master
+				WHERE type IN ('table', 'index')
+					AND name NOT LIKE 'sqlite_%'
+			"
+		);
+		var found = {};
+		for ( var object in objects ) {
+			found[ lCase( toString( object.type ) ) & ":" & lCase( toString( object.name ) ) ] = true;
+		}
+
+		var issues = [];
+		for ( var tableDefinition in arguments.definition.tables ) {
+			if ( !structKeyExists( found, "table:" & lCase( tableDefinition.name ) ) ) {
+				issues.append( "missing table " & tableDefinition.name );
+			}
+		}
+		for ( var indexDefinition in arguments.definition.indexes ) {
+			if ( !structKeyExists( found, "index:" & lCase( indexDefinition.name ) ) ) {
+				issues.append( "missing index " & indexDefinition.name );
+			}
+		}
+
+		var integrity = executeQuery( "PRAGMA integrity_check" );
+		if ( !integrity.recordCount || compareNoCase( toString( integrity.integrity_check[ 1 ] ), "ok" ) != 0 ) {
+			issues.append( "PRAGMA integrity_check failed" );
+		}
+
+		var foreignKeys = executeQuery( "SELECT * FROM pragma_foreign_key_check" );
+		if ( foreignKeys.recordCount ) {
+			issues.append( "PRAGMA foreign_key_check found violations" );
+		}
+
+		if ( issues.len() ) {
+			throw(
+				type   = "AiFlight.SchemaUnavailable",
+				message = "The AI Flight SQLite schema is incomplete or invalid: " & arrayToList( issues, "; " )
+			);
+		}
+	}
+
+	private any function feedbackFromTraceId( required string traceId ) {
+		var q = executeQuery(
+			"
+				SELECT value, comment, updated_at
+				FROM scores
+				WHERE trace_id = :trace_id AND name = 'feedback'
+				LIMIT 1
+			",
+			{ trace_id: { value: arguments.traceId, cfsqltype: "varchar" } }
+		);
+		if ( !q.recordCount ) {
+			return javaCast( "null", "" );
+		}
+		return {
+			value    : toString( q.value ?: "" ),
+			comment  : toString( q.comment ?: "" ),
+			updatedAt: toString( q.updated_at ?: "" )
+		};
+	}
+
+	private void function pruneIfNeeded() {
+		var maxTraces = int( val( moduleSettings.maxTraces ?: 500 ) );
+		if ( maxTraces < 1 ) {
+			return;
+		}
+		var countQuery = executeQuery( "SELECT COUNT(*) AS total FROM traces" );
+		if ( countQuery.total[ 1 ] <= maxTraces ) {
+			return;
+		}
+		executeUpdate(
+			"
+				DELETE FROM traces
+				WHERE id IN (
+					SELECT id FROM traces
+					ORDER BY started_at DESC
+					LIMIT -1 OFFSET :keep
+				)
+			",
+			{ keep: { value: maxTraces, cfsqltype: "integer" } }
+		);
+	}
+
+	private struct function mapTraceRow( required any row ) {
+		var result = {
+			id              : row.id,
+			name            : row.name ?: "",
+			sessionId       : row.session_id ?: "",
+			userId          : row.user_id ?: "",
+			environment     : row.environment ?: "",
+			startedAt       : row.started_at ?: "",
+			endedAt         : row.ended_at ?: "",
+			status          : row.status ?: "running",
+			provider        : row.provider ?: "",
+			model           : row.model ?: "",
+			inputPreview    : row.input_preview ?: "",
+			outputPreview   : row.output_preview ?: "",
+			totalTokens     : int( val( row.total_tokens ?: 0 ) ),
+			promptTokens    : int( val( row.prompt_tokens ?: 0 ) ),
+			completionTokens: int( val( row.completion_tokens ?: 0 ) ),
+			durationMs      : int( val( row.duration_ms ?: 0 ) ),
+			cost            : isNumeric( row.cost ?: "" ) ? val( row.cost ) : "",
+			errorMessage    : row.error_message ?: "",
+			metadata        : tryDeserialize( row.metadata_json ?: "{}" ),
+			observationCount: int( val( row.observation_count ?: 0 ) )
+		};
+		var feedback = javaCast( "null", "" );
+		if ( len( trim( toString( row.feedback_value ?: "" ) ) ) ) {
+			feedback = {
+				value    : toString( row.feedback_value ),
+				comment  : toString( row.feedback_comment ?: "" ),
+				updatedAt: toString( row.feedback_updated_at ?: "" )
+			};
+		} else if ( !structKeyExists( row, "feedback_value" ) ) {
+			feedback = feedbackFromTraceId( toString( row.id ) );
+		}
+		result.feedback = feedback;
+		return result;
+	}
+
+	private struct function mapObservationRow( required any row ) {
+		return {
+			id                 : row.id,
+			traceId            : row.trace_id,
+			parentObservationId: row.parent_observation_id ?: "",
+			type               : row.type,
+			name               : row.name ?: "",
+			startTime          : row.start_time ?: "",
+			endTime            : row.end_time ?: "",
+			durationMs         : int( val( row.duration_ms ?: 0 ) ),
+			status             : row.status ?: "running",
+			model              : row.model ?: "",
+			provider           : row.provider ?: "",
+			inputText          : row.input_text ?: "",
+			outputText         : row.output_text ?: "",
+			usage              : tryDeserialize( row.usage_json ?: "{}" ),
+			level              : row.level ?: "DEFAULT",
+			sourceEvent        : row.source_event ?: "",
+			payload            : tryDeserialize( row.payload_json ?: "{}" )
+		};
+	}
+
+	private any function tryDeserialize( required string raw ) {
+		try {
+			return jsonDeserialize( arguments.raw );
+		} catch (any e) {
+			return {};
+		}
+	}
+
+	private string function resolveDbPath() {
+		var configured = trim( moduleSettings.dbPath ?: "" );
+		if ( !len( configured ) ) {
+			// cfmapping works from /app/modules or /app/modules_app (or ForgeBox extract)
+			configured = expandPath( "/aiFlight/.db/ai-flight.db" );
+		}
+		try {
+			return createObject( "java", "java.io.File" ).init( configured ).getCanonicalPath();
+		} catch (any e) {
+			return configured;
+		}
+	}
+
+	private void function ensureDatabaseFile( required string path ) {
+		var dir = getDirectoryFromPath( arguments.path );
+		if ( !directoryExists( dir ) ) {
+			directoryCreate(
+				dir,
+				true,
+				true
+			);
+		}
+		if ( !fileExists( arguments.path ) ) {
+			fileWrite( arguments.path, "" );
+		}
+	}
+
+	private string function isoNow() {
+		return dateTimeFormat( now(), "iso" );
+	}
+
+	private struct function queryOptions() {
+		var databasePath = variables.dbPath.replace(
+			"\",
+			"/",
+			"all"
+		);
+		// SQLite foreign_keys is connection-local. Put both settings in the
+		// JDBC URL so every inline pooled connection receives them.
+		return {
+			datasource: {
+				driver: "sqlite",
+				url   : "jdbc:sqlite:#databasePath#?foreign_keys=on&busy_timeout=5000"
+			}
+		};
+	}
+
+	private any function executeQuery( required string sql, struct params = {} ) {
+		return queryExecute(
+			arguments.sql,
+			arguments.params,
+			queryOptions()
+		);
+	}
+
+	private numeric function executeUpdate( required string sql, struct params = {} ) {
+		queryExecute(
+			arguments.sql,
+			arguments.params,
+			queryOptions()
+		);
+		return 0;
+	}
+}

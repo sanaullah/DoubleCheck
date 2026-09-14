@@ -1,0 +1,152 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "ContextPackRenderer", () => {
+			it(
+				"prioritizes emphasized-scanned-file ranges over lower-priority reasons under budget",
+				() => {
+					var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
+					renderer.$property(
+						"secretRedactionService",
+						"variables",
+						new app.models.services.SecretRedactionService()
+					);
+					var emphasizedPath = "emphasized/file.bx";
+					var impactPath = "impact/file.bx";
+					var emphasizedLines = [];
+					var impactLines = [];
+					for ( var index = 1; index <= 20; index++ ) {
+						emphasizedLines.append( repeatString( "x", 50 ) );
+						impactLines.append( repeatString( "y", 50 ) );
+					}
+					var files = [
+						{
+							filePath   : emphasizedPath,
+							contentHash: "hash-emphasized",
+							lines      : emphasizedLines
+						},
+						{
+							filePath   : impactPath,
+							contentHash: "hash-impact",
+							lines      : impactLines
+						}
+					];
+					var task = {
+						role   : "security",
+						context: {
+							files: [
+								{
+									filePath   : impactPath,
+									contentHash: "hash-impact",
+									reason     : "impact-cone",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "impact-cone"]
+										}
+									]
+								},
+								{
+									filePath   : emphasizedPath,
+									contentHash: "hash-emphasized",
+									reason     : "emphasized-scanned-file",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "emphasized-scanned-file"]
+										}
+									]
+								}
+							]
+						}
+					};
+					var result = renderer.render( task, files, 600 );
+
+					expect( result.includedRanges ).notToBeEmpty();
+					expect( result.includedRanges[ 1 ].reason ).toBe( "emphasized-scanned-file" );
+					expect(
+						result.includedRanges.map( ( item ) => item.reason )
+					).notToInclude( "impact-cone" );
+					expect(
+						result.omittedRanges.map( ( item ) => item.reason )
+					).toInclude( "impact-cone" );
+				}
+			);
+
+			it(
+				"does not let emphasized-scanned-file outrank a changed-line range under budget",
+				() => {
+					var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
+					renderer.$property(
+						"secretRedactionService",
+						"variables",
+						new app.models.services.SecretRedactionService()
+					);
+					var emphasizedPath = "emphasized/file.bx";
+					var changedPath = "changed/file.bx";
+					var emphasizedLines = [];
+					var changedLines = [];
+					for ( var index = 1; index <= 20; index++ ) {
+						emphasizedLines.append( repeatString( "x", 50 ) );
+						changedLines.append( repeatString( "y", 50 ) );
+					}
+					var files = [
+						{
+							filePath   : emphasizedPath,
+							contentHash: "hash-emphasized",
+							lines      : emphasizedLines
+						},
+						{
+							filePath   : changedPath,
+							contentHash: "hash-changed",
+							lines      : changedLines
+						}
+					];
+					var task = {
+						role   : "security",
+						context: {
+							files: [
+								{
+									filePath   : changedPath,
+									contentHash: "hash-changed",
+									reason     : "changed-line",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "changed-line"]
+										}
+									]
+								},
+								{
+									filePath   : emphasizedPath,
+									contentHash: "hash-emphasized",
+									reason     : "emphasized-scanned-file",
+									ranges     : [
+										{
+											startLine: 1,
+											endLine  : 20,
+											reasons  : [ "emphasized-scanned-file"]
+										}
+									]
+								}
+							]
+						}
+					};
+					var result = renderer.render( task, files, 600 );
+
+					expect( result.includedRanges ).notToBeEmpty();
+					expect( result.includedRanges[ 1 ].reason ).toBe( "changed-line" );
+					expect(
+						result.includedRanges.map( ( item ) => item.reason )
+					).notToInclude( "emphasized-scanned-file" );
+					expect(
+						result.omittedRanges.map( ( item ) => item.reason )
+					).toInclude( "emphasized-scanned-file" );
+				}
+			);
+		} );
+	}
+}

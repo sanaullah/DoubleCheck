@@ -1,0 +1,511 @@
+/** Deterministic request-flow extraction and reachability analysis. */
+@singleton
+class threadsafe {
+	property name="architectureModelService" inject="ArchitectureModelService";
+
+	function init() {
+		if ( isNull( variables.architectureModelService ?: javacast( "null", "" ) ) ) variables.architectureModelService = new app.models.services.ArchitectureModelService();
+		return this;
+	}
+
+	struct function reachability( required array nodes, required struct inventory, required array dependencies ) {
+		var nodePaths = {};
+		for ( var node in arguments.nodes ) {
+			if ( isSyntheticNode( node ) ) continue;
+			var path = normalizePath( node.id ?: node.path ?: "" );
+			if ( len( path ) ) nodePaths[ path ] = node;
+		}
+		var adjacency = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+			var to = normalizePath( dep.targetFile ?: "" );
+			if ( !len( from ) || !len( to ) || !nodePaths.keyExists( from ) || !nodePaths.keyExists( to ) ) continue;
+			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
+			if ( !adjacency[ from ].contains( to ) ) adjacency[ from ].append( to );
+		}
+		var entries = {};
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var path = normalizePath( unit.filePath ?: "" );
+			if ( nodePaths.keyExists( path ) && listFindNoCase( "handler-action,lifecycle-hook,route", lCase( toString( unit.unitType ?: "" ) ) ) ) entries[ path ] = true;
+		}
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "routes" && len( normalizePath( dep.targetFile ?: "" ) ) ) entries[ normalizePath( dep.targetFile ) ] = true;
+			if ( listFindNoCase( "calls-api,schedule", kind ) && nodePaths.keyExists( from ) ) entries[ from ] = true;
+		}
+		for ( var path in nodePaths ) if ( lCase( listLast( path, "/" ) ) == "application.bx" ) entries[ path ] = true;
+		if ( !entries.count() ) return { unreachable: [], summary: { available: false, reason: "no-entry-points", entryCount: 0, reachableCount: 0, unreachableCount: 0, testOnlyCount: 0 } };
+		var reachable = walk( entries, adjacency );
+		var testEntries = {};
+		for ( var path in nodePaths ) if ( isTestPath( path ) ) testEntries[ path ] = true;
+		var testReachable = walk( testEntries, adjacency );
+		var unreachable = [];
+		var testOnlyCount = 0;
+		for ( var path in nodePaths ) {
+			if ( isTestPath( path ) || reachable.keyExists( path ) ) continue;
+			var reason = testReachable.keyExists( path ) ? "test-only" : "unreachable";
+			if ( reason == "test-only" ) testOnlyCount++;
+			unreachable.append( { id: path, path: nodePaths[ path ].path ?: path, component: nodePaths[ path ].component ?: "other", role: nodePaths[ path ].role ?: "unknown", reason: reason } );
+		}
+		unreachable.sort( ( a, b ) => compareNoCase( a.path, b.path ) );
+		return { unreachable: unreachable, summary: { available: true, entryCount: entries.count(), reachableCount: reachable.count(), unreachableCount: unreachable.len(), testOnlyCount: testOnlyCount } };
+	}
+
+	array function extract(
+		required struct inventory,
+		required any graph,
+		required struct caps,
+		required struct reviewGraph,
+		required struct truncation,
+		struct visibleNodes = {},
+		struct clusterOf = {}
+	) {
+		var maxDepth = max( 1, val( arguments.caps.flowMaxDepth ?: 6 ) );
+		var adjacency = buildAdjacency( arguments.reviewGraph.dependencies ?: [] );
+		var candidates = [];
+		for ( var seed in collectSeeds( arguments.inventory, arguments.graph, arguments.reviewGraph.dependencies ?: [] ) ) {
+			for ( var path in topPaths( seed.fileId, adjacency, maxDepth, 3 ) ) {
+				if ( path.steps.len() < 2 ) continue;
+				var steps = duplicate( path.steps );
+				var kinds = duplicate( path.edgeKinds );
+				var edgeSymbols = duplicate( path.edgeSymbols ?: [] );
+				if ( len( seed.routeId ?: "" ) ) { steps.prepend( seed.routeId ); kinds.prepend( "routes" ); edgeSymbols.prepend( "" ); }
+				candidates.append( { entryFile: len( seed.routeId ?: "" ) ? seed.routeId : seed.fileId, entrySymbol: seed.symbol, routeId: seed.routeId ?: "", steps: steps, edgeKinds: kinds, edgeSymbols: edgeSymbols, sinkFile: steps[ steps.len() ], sinkKind: sinkKind( kinds, path.stoppedBy ?: "" ), depth: kinds.len() } );
+			}
+		}
+		var visible = [];
+		for ( var candidate in candidates ) {
+			if ( arguments.visibleNodes.count() ) {
+				var allVisible = true;
+				for ( var step in candidate.steps ) if ( !arguments.visibleNodes.keyExists( normalizePath( step ) ) ) allVisible = false;
+				if ( !allVisible ) continue;
+			}
+			visible.append( candidate );
+		}
+		return selectFlows( visible, arguments.caps, arguments.truncation, arguments.clusterOf, adjacency );
+	}
+
+	/**
+	 * A process list should cover the application's surface, not enumerate
+	 * variants of its deepest walk. Depth-first ranking produced 55 flows that
+	 * all drained into one infrastructure table; this selects for distinct
+	 * (entry, sink) pairs instead and spreads the list across sinks.
+	 */
+	private array function selectFlows(
+		required array candidates,
+		required struct caps,
+		required struct truncation,
+		required struct clusterOf,
+		struct adjacency = {}
+	) {
+		if ( !arguments.candidates.len() ) return [];
+		// A sink most candidates reach is infrastructure, not a destination.
+		var sinkTotals = {};
+		for ( var candidate in arguments.candidates ) sinkTotals[ candidate.sinkFile ] = ( sinkTotals[ candidate.sinkFile ] ?: 0 ) + 1;
+
+		// One listed flow per (entry, sink): the same process reached by a
+		// slightly different chain is a variant, not a second process.
+		var groups = {};
+		var order = [];
+		for ( var candidate in arguments.candidates ) {
+			var groupKey = candidate.entryFile & "\0" & candidate.sinkFile;
+			var signature = arrayToList( candidate.steps, "|" );
+			if ( !groups.keyExists( groupKey ) ) {
+				groups[ groupKey ] = { best: candidate, signatures: {}, variantCount: 0 };
+				order.append( groupKey );
+			}
+			var group = groups[ groupKey ];
+			if ( !group.signatures.keyExists( signature ) ) {
+				group.signatures[ signature ] = true;
+				group.variantCount++;
+			}
+			if ( preferCandidate( candidate, group.best ) ) group.best = candidate;
+		}
+
+		var total = arguments.candidates.len();
+		var ranked = [];
+		for ( var groupKey in order ) {
+			var group = groups[ groupKey ];
+			ranked.append( {
+				key         : groupKey,
+				candidate   : group.best,
+				variantCount: group.variantCount,
+				sinkShare   : ( sinkTotals[ group.best.sinkFile ] ?: 1 ) / total
+			} );
+		}
+		ranked.sort( ( a, b ) => compareRanked( a, b ) );
+
+		// Round-robin by sink: every sink gets its best flow before any sink
+		// gets a second. With three or more distinct sinks no single sink can
+		// dominate the list.
+		var bySink = {};
+		var sinkOrder = [];
+		for ( var entry in ranked ) {
+			var sink = entry.candidate.sinkFile;
+			if ( !bySink.keyExists( sink ) ) { bySink[ sink ] = []; sinkOrder.append( sink ); }
+			bySink[ sink ].append( entry );
+		}
+		var rounds = [];
+		var roundIndex = 1;
+		var moreRounds = true;
+		while ( moreRounds ) {
+			moreRounds = false;
+			for ( var sink in sinkOrder ) {
+				var bucket = bySink[ sink ];
+				if ( bucket.len() < roundIndex ) continue;
+				rounds.append( bucket[ roundIndex ] );
+				moreRounds = true;
+			}
+			roundIndex++;
+		}
+
+		// Ordering alone does not stop one sink dominating; it only spreads it
+		// through the list. Hold every sink to a third of the list.
+		//
+		// Solve the list length directly rather than filling and re-filling until
+		// it converges: for a list of k, each sink may contribute ceil( k / 3 ),
+		// so the largest honest k is the largest one the sinks can actually
+		// supply. Monotonic in k, so binary search finds it in O(n log n) instead
+		// of the O(n^2) repeated-pass fill.
+		var enforceSinkShare = sinkOrder.len() >= 3;
+		var target = rounds.len();
+		if ( enforceSinkShare ) {
+			var supply = ( k ) => {
+				var perSinkCap = max( 1, ceiling( k / 3 ) );
+				var total = 0;
+				for ( var sink in sinkOrder ) total += min( bySink[ sink ].len(), perSinkCap );
+				return total;
+			};
+			var low = 0;
+			var high = rounds.len();
+			while ( low < high ) {
+				var mid = ceiling( ( low + high ) / 2 );
+				if ( supply( mid ) >= mid ) low = mid; else high = mid - 1;
+			}
+			target = low;
+		}
+		var perSinkCap = enforceSinkShare ? max( 1, ceiling( target / 3 ) ) : rounds.len();
+		var accepted = [];
+		var perSink = {};
+		for ( var entry in rounds ) {
+			if ( accepted.len() >= target ) break;
+			var sink = entry.candidate.sinkFile;
+			if ( ( perSink[ sink ] ?: 0 ) >= perSinkCap ) continue;
+			perSink[ sink ] = ( perSink[ sink ] ?: 0 ) + 1;
+			accepted.append( entry );
+		}
+		if ( accepted.len() < rounds.len() ) markTruncated( arguments.truncation, "flowSinkDiversity" );
+
+		var flows = [];
+		var perCluster = {};
+		var maxPerCluster = max( 1, val( arguments.caps.maxFlowsPerCluster ?: 4 ) );
+		for ( var entry in accepted ) {
+			var candidate = entry.candidate;
+			var clusterKey = "__unclustered__";
+			for ( var step in candidate.steps ) {
+				var cluster = arguments.clusterOf[ normalizePath( step ) ] ?: "";
+				if ( len( cluster ) ) { clusterKey = cluster; break; }
+			}
+			if ( ( perCluster[ clusterKey ] ?: 0 ) >= maxPerCluster ) { markTruncated( arguments.truncation, "maxFlowsPerCluster" ); continue; }
+			perCluster[ clusterKey ] = ( perCluster[ clusterKey ] ?: 0 ) + 1;
+			var signature = arrayToList( candidate.steps, "|" );
+			flows.append( {
+				id          : flowId( candidate.entryFile, candidate.entrySymbol, signature ),
+				entryFile   : candidate.entryFile,
+				entrySymbol : candidate.entrySymbol,
+				steps       : duplicate( candidate.steps ),
+				stepSymbols : stepSymbolsFor( candidate.steps, candidate.edgeSymbols ?: [] ),
+				// The same chain as an array of edges rather than an array of nodes,
+				// each carrying where it was seen. `steps` alone cannot be inspected:
+				// a reader could see that a request reaches a table and never which
+				// line proves it.
+				hops        : hopsFor( candidate, arguments.adjacency ),
+				sinkFile    : candidate.sinkFile,
+				edgeKinds   : duplicate( candidate.edgeKinds ),
+				sinkKind    : candidate.sinkKind,
+				routeId     : candidate.routeId,
+				variantCount: entry.variantCount
+			} );
+		}
+		return flows;
+	}
+
+	/** Within one (entry, sink) group the shortest chain is the clearest story. */
+	private boolean function preferCandidate( required struct candidate, required struct current ) {
+		if ( arguments.candidate.steps.len() != arguments.current.steps.len() ) return arguments.candidate.steps.len() < arguments.current.steps.len();
+		return compareNoCase( arrayToList( arguments.candidate.steps, "|" ), arrayToList( arguments.current.steps, "|" ) ) < 0;
+	}
+
+	private numeric function compareRanked( required struct a, required struct b ) {
+		// Sink coverage means "ends in a named effect", not "ends in something other
+		// than the literal string unknown" — `depth-limited` is still not an effect.
+		var namedEffects = "table-read,table-write,http-call,scheduled-run,event-publish,config-read,view-render,response";
+		var aTyped = listFindNoCase( namedEffects, arguments.a.candidate.sinkKind ) > 0 ? 1 : 0;
+		var bTyped = listFindNoCase( namedEffects, arguments.b.candidate.sinkKind ) > 0 ? 1 : 0;
+		if ( aTyped != bTyped ) return aTyped > bTyped ? -1 : 1;
+		// Lower share first: a flow ending somewhere most flows already end
+		// explains less of the application than one ending somewhere rare.
+		var aShare = round( arguments.a.sinkShare * 1000 );
+		var bShare = round( arguments.b.sinkShare * 1000 );
+		if ( aShare != bShare ) return aShare < bShare ? -1 : 1;
+		if ( arguments.a.candidate.depth != arguments.b.candidate.depth ) return arguments.a.candidate.depth > arguments.b.candidate.depth ? -1 : 1;
+		var byEntry = compareNoCase( arguments.a.candidate.entryFile, arguments.b.candidate.entryFile );
+		if ( byEntry != 0 ) return byEntry;
+		var bySymbol = compareNoCase( arguments.a.candidate.entrySymbol, arguments.b.candidate.entrySymbol );
+		return bySymbol != 0 ? bySymbol : compareNoCase( arguments.a.candidate.sinkFile, arguments.b.candidate.sinkFile );
+	}
+
+	private struct function walk( required struct seeds, required struct adjacency ) {
+		var visited = {};
+		var queue = [];
+		for ( var seed in arguments.seeds ) { visited[ seed ] = true; queue.append( seed ); }
+		var index = 1;
+		while ( index <= queue.len() ) {
+			var current = queue[ index++ ];
+			for ( var next in ( arguments.adjacency[ current ] ?: [] ) ) if ( !visited.keyExists( next ) ) { visited[ next ] = true; queue.append( next ); }
+		}
+		return visited;
+	}
+
+	private struct function buildAdjacency( required array dependencies ) {
+		var adjacency = {};
+		var seen = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( !listFindNoCase( "routes,injects,calls,renders,table-query,table-read,table-write,http,schedule,calls-api,responds", kind ) ) continue;
+			var from = normalizePath( dep.sourceFile ?: dep.filePath ?: dep.source_file ?: "" );
+			var to = normalizePath( dep.targetFile ?: dep.target_file ?: "" );
+			if ( kind == "routes" ) { var route = normalizeRoute( dep.target ?: "" ); from = len( route ) ? "route:" & route : ""; }
+			if ( kind == "calls-api" ) { var api = normalizeRoute( dep.target ?: "" ); to = len( api ) ? "route:" & api : ""; }
+			if ( !len( to ) && listFindNoCase( "table-query,table-read,table-write", kind ) ) to = "table:" & lCase( trim( toString( dep.target ?: "" ) ) );
+			if ( !len( to ) && listFindNoCase( "http,schedule", kind ) ) to = kind & ":" & lCase( trim( toString( dep.target ?: kind ) ) );
+			// A response is where a request ends. Without it the traversal walked past
+			// the action into whatever it happened to call next, and the flow reported
+			// no terminal at all.
+			if ( !len( to ) && kind == "responds" ) to = "response:" & lCase( trim( toString( dep.target ?: "data" ) ) );
+			if ( !len( from ) || !len( to ) || from == to || isTestPath( from ) || isTestPath( to ) ) continue;
+			var key = from & "\0" & to & "\0" & kind;
+			if ( seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			if ( !adjacency.keyExists( from ) ) adjacency[ from ] = [];
+			// The edge carries the symbol that owns it, so a hop can name the
+			// method that made the call rather than restating the file name.
+			// Line and evidence travel with the edge so a flow hop can be opened at
+			// its source. A flow used to carry only `steps` (paths) and
+			// `stepSymbols`, which made the product's central promise — following a
+			// request end to end — the one answer with no `file:line` behind it.
+			adjacency[ from ].append( {
+				to          : to,
+				kind        : kind,
+				sourceSymbol: trim( toString( dep.sourceSymbol ?: "" ) ),
+				line        : val( dep.line ?: 0 ),
+				evidence    : left( trim( toString( dep.evidence ?: "" ) ), 240 )
+			} );
+		}
+		for ( var from in adjacency ) adjacency[ from ].sort( ( a, b ) => { var byTo = compareNoCase( a.to, b.to ); return byTo != 0 ? byTo : compareNoCase( a.kind, b.kind ); } );
+		return adjacency;
+	}
+
+	private array function collectSeeds( required struct inventory, required any graph, array dependencies = [] ) {
+		var seeds = [];
+		var seen = {};
+		var handlerFiles = {};
+		for ( var dep in arguments.dependencies ) {
+			if ( !isStruct( dep ) ) continue;
+			var kind = lCase( trim( toString( dep.kind ?: "" ) ) );
+			if ( kind == "routes" ) {
+				var handler = normalizePath( dep.targetFile ?: "" );
+				var route = normalizeRoute( dep.target ?: "" );
+				if ( len( handler ) && len( route ) ) { seeds.append( { fileId: handler, symbol: trim( toString( dep.action ?: dep.target ?: "" ) ), routeId: "route:" & route } ); handlerFiles[ handler ] = true; }
+			} else if ( kind == "calls-api" ) {
+				var client = normalizePath( dep.sourceFile ?: dep.filePath ?: "" );
+				if ( len( client ) && !isTestPath( client ) ) seeds.append( { fileId: client, symbol: "" } );
+			}
+		}
+		for ( var unit in ( arguments.inventory.units ?: [] ) ) {
+			if ( lCase( trim( toString( unit.unitType ?: "" ) ) ) != "handler-action" ) continue;
+			var file = normalizePath( unit.filePath ?: "" );
+			var symbol = trim( toString( unit.symbolName ?: "" ) );
+			var key = file & "\0" & symbol;
+			if ( !len( file ) || seen.keyExists( key ) ) continue;
+			seen[ key ] = true; handlerFiles[ file ] = true; seeds.append( { fileId: file, symbol: symbol } );
+		}
+		var canonical = arguments.inventory.canonicalPaths ?: {};
+		for ( var node in arguments.graph.getNodes() ) {
+			var file = normalizePath( node.id ?: node.filePath ?: "" );
+			if ( !len( file ) || handlerFiles.keyExists( file ) ) continue;
+			var path = canonical[ file ] ?: ( node.filePath ?: file );
+			if ( !listFindNoCase( "http-handlers,entry-points", architectureModelService.classifyFile( path ) ) ) continue;
+			var key = file & "\0";
+			if ( !seen.keyExists( key ) ) { seen[ key ] = true; seeds.append( { fileId: file, symbol: "" } ); }
+		}
+		seeds.sort( ( a, b ) => { var byFile = compareNoCase( a.fileId, b.fileId ); return byFile != 0 ? byFile : compareNoCase( a.symbol, b.symbol ); } );
+		return seeds;
+	}
+
+	private array function topPaths( required string startFile, required struct adjacency, required numeric maxDepth, numeric maxResults = 3 ) {
+		var results = [];
+		var steps = [ arguments.startFile ];
+		var edgeKinds = [];
+		var edgeSymbols = [];
+		var visited = { "#arguments.startFile#": true };
+		var explored = { count: 0 };
+		collectPaths( arguments.startFile, arguments.adjacency, arguments.maxDepth, steps, edgeKinds, edgeSymbols, visited, results, explored );
+		results.sort( ( a, b ) => {
+			// Prefer a path that ends in a named effect over one that merely stopped.
+			var terminals = "table-read,table-write,http-call,scheduled-run,event-publish,config-read,view-render,response";
+			var aTyped = listFindNoCase( terminals, sinkKind( a.edgeKinds, a.stoppedBy ?: "" ) ) > 0;
+			var bTyped = listFindNoCase( terminals, sinkKind( b.edgeKinds, b.stoppedBy ?: "" ) ) > 0;
+			if ( aTyped != bTyped ) return aTyped ? -1 : 1;
+			if ( a.edgeKinds.len() != b.edgeKinds.len() ) return a.edgeKinds.len() > b.edgeKinds.len() ? -1 : 1;
+			return compareNoCase( arrayToList( a.steps, "|" ), arrayToList( b.steps, "|" ) );
+		} );
+		var out = [];
+		var seen = {};
+		for ( var result in results ) { var key = arrayToList( result.steps, "|" ); if ( seen.keyExists( key ) ) continue; seen[ key ] = true; out.append( result ); if ( out.len() >= max( 1, val( arguments.maxResults ) ) ) break; }
+		return out;
+	}
+
+	private void function collectPaths(
+		required string current,
+		required struct adjacency,
+		required numeric maxDepth,
+		required array steps,
+		required array edgeKinds,
+		required array edgeSymbols,
+		required struct visited,
+		required array results,
+		required struct explored
+	) {
+		if ( ++arguments.explored.count > 5000 ) return;
+		// Why a path stopped is part of the answer. "Ran out of depth" and "nothing
+		// leads anywhere from here" were both reported as an untyped sink, so more
+		// than half of the flows ended in `unknown` and a reader could not tell a
+		// budget limit from a genuine terminal.
+		if ( arguments.edgeKinds.len() >= arguments.maxDepth ) {
+			arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "depth" } );
+			return;
+		}
+		var outbound = arguments.adjacency[ arguments.current ] ?: [];
+		if ( !outbound.len() ) {
+			if ( arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "leaf" } );
+			return;
+		}
+		var expanded = false;
+		for ( var edge in outbound ) {
+			if ( arguments.visited[ edge.to ] ?: false ) continue;
+			expanded = true;
+			arguments.visited[ edge.to ] = true;
+			arguments.steps.append( edge.to );
+			arguments.edgeKinds.append( edge.kind );
+			arguments.edgeSymbols.append( edge.sourceSymbol ?: "" );
+			collectPaths( edge.to, arguments.adjacency, arguments.maxDepth, arguments.steps, arguments.edgeKinds, arguments.edgeSymbols, arguments.visited, arguments.results, arguments.explored );
+			arguments.edgeSymbols.pop();
+			arguments.edgeKinds.pop();
+			arguments.steps.pop();
+			arguments.visited.delete( edge.to );
+		}
+		// Every onward edge led somewhere already on this path: a cycle, not a sink.
+		if ( !expanded && arguments.steps.len() > 1 ) arguments.results.append( { steps: duplicate( arguments.steps ), edgeKinds: duplicate( arguments.edgeKinds ), edgeSymbols: duplicate( arguments.edgeSymbols ), stoppedBy: "revisit" } );
+	}
+
+	/**
+	 * The symbol at each hop is the one that owns the outgoing edge, resolved by
+	 * line containment when the dependency was indexed
+	 * (`review_dependencies.source_symbol`).
+	 *
+	 * It is deliberately empty rather than approximated: the previous
+	 * implementation returned the file's first declaration, which for a class
+	 * file is the class name and therefore restates the path. An empty entry
+	 * means "file level", and the UI says so.
+	 */
+	/**
+	 * The flow as a list of edges, each with where it was seen.
+	 *
+	 * `steps` is a list of nodes and cannot be inspected: a reader could see that
+	 * a request reaches `review_runs` and never which line proved it. A hop names
+	 * both ends, the relationship, the symbol that owns it, and the `file:line`
+	 * plus source text the parser matched.
+	 *
+	 * A hop whose edge cannot be found in the adjacency is returned with
+	 * `resolution: "unresolved"` and no line, rather than omitted — a gap in a
+	 * trace is part of the trace.
+	 */
+	private array function hopsFor( required struct candidate, required struct adjacency ) {
+		var hops = [];
+		var steps = arguments.candidate.steps ?: [];
+		var kinds = arguments.candidate.edgeKinds ?: [];
+		for ( var index = 1; index < steps.len(); index++ ) {
+			var from = steps[ index ];
+			var to = steps[ index + 1 ];
+			var kind = index <= kinds.len() ? kinds[ index ] : "";
+			var matched = { line: 0, evidence: "", sourceSymbol: "" };
+			var found = false;
+			for ( var edge in ( arguments.adjacency[ from ] ?: [] ) ) {
+				if ( edge.to == to && ( !len( kind ) || edge.kind == kind ) ) {
+					matched = edge;
+					found = true;
+					break;
+				}
+			}
+			hops.append( {
+				from      : from,
+				to        : to,
+				kind      : kind,
+				symbol    : trim( toString( matched.sourceSymbol ?: "" ) ),
+				line      : val( matched.line ?: 0 ),
+				evidence  : trim( toString( matched.evidence ?: "" ) ),
+				resolution: found ? "exact" : "unresolved"
+			} );
+		}
+		return hops;
+	}
+
+	private array function stepSymbolsFor( required array steps, required array edgeSymbols ) {
+		var symbols = [];
+		for ( var index = 1; index <= arguments.steps.len(); index++ ) {
+			symbols.append( index <= arguments.edgeSymbols.len() ? trim( toString( arguments.edgeSymbols[ index ] ?: "" ) ) : "" );
+		}
+		return symbols;
+	}
+
+	/**
+	 * What completes the flow.
+	 *
+	 * A typed last edge names the effect. When the last edge is a plain call the
+	 * flow has no effect of its own, and the honest terminal is *why the trace
+	 * ended*: it returned to its caller, it ran out of depth, or it looped. All
+	 * three used to read `unknown`, which is the one thing none of them is.
+	 */
+	private string function sinkKind( required array kinds, string stoppedBy = "" ) {
+		if ( !arguments.kinds.len() ) return "unknown";
+		var typed = {
+			"table-query": "table-read", "table-read": "table-read", "table-write": "table-write",
+			"http": "http-call", "schedule": "scheduled-run", "emits": "event-publish",
+			"reads-config": "config-read", "renders": "view-render", "responds": "response"
+		}[ lCase( trim( toString( arguments.kinds[ arguments.kinds.len() ] ) ) ) ] ?: "";
+		if ( len( typed ) ) return typed;
+		if ( arguments.stoppedBy == "depth" ) return "depth-limited";
+		if ( arguments.stoppedBy == "leaf" ) return "returns-to-caller";
+		if ( arguments.stoppedBy == "revisit" ) return "cycle";
+		return "unknown";
+	}
+
+	private string function flowId( required string file, required string symbol, required string signature ) { return "flow-" & lCase( hash( arguments.file & "|" & arguments.symbol & "|" & arguments.signature, "SHA-256" ) ); }
+	private boolean function isSyntheticNode( required struct node ) { return reFindNoCase( "^(route|table|http|schedule|config|event):", toString( arguments.node.id ?: "" ) ) > 0; }
+	private boolean function isTestPath( required string path ) { return reFind( "(^|/)(tests?|specs?)(/|$)", lCase( replace( arguments.path, "\", "/", "all" ) ) ) > 0; }
+	private string function normalizePath( required any path ) { return pathNormalizer().path( arguments.path ); }
+	private string function normalizeRoute( required any target ) { return pathNormalizer().route( arguments.target ); }
+	private void function markTruncated( required struct truncation, required string reason ) { arguments.truncation.truncated = true; if ( !arguments.truncation.reasons.contains( arguments.reason ) ) arguments.truncation.reasons.append( arguments.reason ); }
+	private any function pathNormalizer() {
+		if ( isNull( variables.graphPathNormalizer ?: javacast( "null", "" ) ) ) {
+			variables.graphPathNormalizer = new app.models.services.GraphPathNormalizer();
+		}
+		return variables.graphPathNormalizer;
+	}
+}

@@ -1,0 +1,450 @@
+/**
+ * Git plumbing for working-tree and revision-diff file lists used by the scanner.
+ */
+
+@singleton
+class {
+
+	struct function inspect( required any root ) {
+		try {
+			var repository = executeText( arguments.root, [ "rev-parse", "--show-toplevel"] );
+			if ( repository.exitCode != 0 || !len( repository.output ) ) {
+				return {
+					available         : false,
+					repositoryRoot    : "",
+					repositoryRevision: ""
+				};
+			}
+			var revision = resolveRevision( arguments.root, "HEAD" );
+			return {
+				available         : true,
+				repositoryRoot    : repository.output,
+				repositoryRevision: revision.valid ? revision.resolved : ""
+			};
+		} catch (any unavailableGit) {
+			return {
+				available         : false,
+				repositoryRoot    : "",
+				repositoryRevision: ""
+			};
+		}
+	}
+
+	struct function workingTreePaths( required any root, required numeric maxEntries ) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: ""
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=no"],
+			arguments.maxEntries * 2
+		);
+		if ( result.exitCode != 0 ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: repository.repositoryRevision
+			};
+		}
+
+		var paths = [];
+		var index = 1;
+		while ( index <= result.tokens.len() && paths.len() < arguments.maxEntries ) {
+			var entry = result.tokens[ index ];
+			index++;
+			if ( len( entry ) < 4 ) {
+				continue;
+			}
+			var status = left( entry, 2 );
+			var relativePath = mid(
+				entry,
+				4,
+				len( entry ) - 3
+			);
+			paths.append( arguments.root.getPath() & "/" & relativePath );
+			if ( ( findNoCase( "R", status ) || findNoCase( "C", status ) ) && index <= result.tokens.len() ) {
+				index++;
+			}
+		}
+		return {
+			available         : true,
+			paths             : paths,
+			truncated         : result.truncated || paths.len() >= arguments.maxEntries,
+			repositoryRevision: repository.repositoryRevision
+		};
+	}
+
+	struct function fullPaths( required any root, required numeric maxEntries ) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				repositoryRevision: ""
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+			arguments.maxEntries
+		);
+		var rootPath = arguments.root.getPath();
+		return {
+			available         : result.exitCode == 0,
+			paths             : result.exitCode == 0 ? result.tokens.map( ( path ) => rootPath & "/" & path ) : [],
+			truncated         : result.truncated,
+			repositoryRevision: repository.repositoryRevision
+		};
+	}
+
+	/**
+	 * Bounded commit history for CodeGraph's optional temporal signal. Each
+	 * commit is returned as `{ id, author, authoredAt, files[] }`; callers can
+	 * degrade to structural-only when Git is absent or the history is shallow.
+	 */
+	struct function commitFilePairs(
+		required any root,
+		numeric maxCommits = 500,
+		numeric maxEntries = 20000
+	) {
+		var repository = inspect( arguments.root );
+		if ( !repository.available ) {
+			return { available: false, commits: [], truncated: false, repositoryRevision: "", reason: "git-unavailable" };
+		}
+		var commitLimit = max( 1, int( arguments.maxCommits ) );
+		var entryLimit = max( 1, int( arguments.maxEntries ) );
+		var tokenLimit = max( 100, entryLimit + ( commitLimit * 3 ) );
+		var result = executeTokens(
+			arguments.root,
+			[ "log", "--no-renames", "--format=%H%x00%an%x00%aI", "--name-only", "-z", "--max-count=#commitLimit#" ],
+			tokenLimit
+		);
+		if ( result.exitCode != 0 ) {
+			return {
+				available         : false,
+				commits           : [],
+				truncated         : result.truncated,
+				repositoryRevision: repository.repositoryRevision,
+				reason            : "git-history-failed"
+			};
+		}
+
+		var commits = [];
+		var current = {};
+		var metadataIndex = 0;
+		var entryCount = 0;
+		var entryBoundReached = false;
+		for ( var token in result.tokens ) {
+			if ( reFind( "^[a-fA-F0-9]{40,64}$", token ) ) {
+				if ( current.keyExists( "id" ) ) commits.append( current );
+				if ( commits.len() >= commitLimit ) break;
+				current = { id: lCase( token ), author: "", authoredAt: "", files: [] };
+				metadataIndex = 0;
+				continue;
+			}
+			if ( !current.keyExists( "id" ) ) continue;
+			if ( metadataIndex == 0 ) {
+				current.author = token;
+				metadataIndex++;
+				continue;
+			}
+			if ( metadataIndex == 1 ) {
+				current.authoredAt = token;
+				metadataIndex++;
+				continue;
+			}
+			if ( len( token ) ) {
+				var filePath = trim( replace( token, "\\", "/", "all" ) );
+				if ( !len( filePath ) ) continue;
+				if ( current.files.contains( filePath ) ) continue;
+				if ( entryCount >= entryLimit ) {
+					entryBoundReached = true;
+					break;
+				}
+				current.files.append( filePath );
+				entryCount++;
+			}
+		}
+		if ( current.keyExists( "id" ) && commits.len() < commitLimit ) commits.append( current );
+		return {
+			available         : true,
+			commits           : commits,
+			truncated         : result.truncated || entryBoundReached,
+			repositoryRevision: repository.repositoryRevision,
+			reason            : ( result.truncated || entryBoundReached ) ? "history-cap" : ""
+		};
+	}
+
+	struct function revisionPaths(
+		required any root,
+		required string baseRevision,
+		required numeric maxEntries,
+		string headRevision = "HEAD"
+	) {
+		var base = resolveRevision( arguments.root, arguments.baseRevision );
+		var head = resolveRevision( arguments.root, arguments.headRevision );
+		var repository = inspect( arguments.root );
+		if ( !base.valid || !head.valid ) {
+			return {
+				available         : false,
+				paths             : [],
+				truncated         : false,
+				baseRevision      : base.valid ? base.resolved : "",
+				headRevision      : head.valid ? head.resolved : "",
+				repositoryRevision: head.valid ? head.resolved : "",
+				error             : !base.valid ? "The base revision could not be resolved" : "The head revision could not be resolved"
+			};
+		}
+		var result = executeTokens(
+			arguments.root,
+			[ "diff", "--name-only", "-z", "--diff-filter=ACMRTUXB", "#base.resolved#...#head.resolved#"],
+			arguments.maxEntries
+		);
+		var rootPath = arguments.root.getPath();
+		return {
+			available         : result.exitCode == 0,
+			paths             : result.exitCode == 0 ? result.tokens.map( ( path ) => rootPath & "/" & path ) : [],
+			truncated         : result.truncated,
+			baseRevision      : base.resolved,
+			headRevision      : head.resolved,
+			repositoryRevision: head.resolved,
+			error             : result.exitCode == 0 ? "" : "Git revision diff failed"
+		};
+	}
+
+	struct function readBlob(
+		required any root,
+		required string revision,
+		required string relativePath,
+		required numeric maxBytes
+	) {
+		var safePath = replace(
+			arguments.relativePath,
+			"\",
+			"/",
+			"all"
+		);
+		if (
+			!reFind( "^[a-fA-F0-9]{40,64}$", arguments.revision ) || !len( safePath ) || left( safePath, 1 ) == "/" ||
+					find( char( 0 ), safePath ) ||
+				listToArray( safePath, "/" ).contains( ".." )
+		) {
+			return {
+				available: false,
+				oversized: false,
+				content  : "",
+				sizeBytes: 0
+			};
+		}
+
+		try {
+			var objectName = "#lCase( arguments.revision )#:#safePath#";
+			var sizeResult = executeText( arguments.root, [ "cat-file", "-s", objectName] );
+			if ( sizeResult.exitCode != 0 || !isNumeric( sizeResult.output ) ) {
+				return {
+					available: false,
+					oversized: false,
+					content  : "",
+					sizeBytes: 0
+				};
+			}
+			var sizeBytes = inputBaseN( sizeResult.output, 10 );
+			if ( sizeBytes > arguments.maxBytes ) {
+				return {
+					available: false,
+					oversized: true,
+					content  : "",
+					sizeBytes: sizeBytes
+				};
+			}
+
+			var process = startGit( arguments.root, [ "cat-file", "blob", objectName] );
+			var bytes = process.getInputStream().readNBytes( javaCast( "int", arguments.maxBytes + 1 ) );
+			var exitCode = process.waitFor();
+			if ( exitCode != 0 || bytes.len() > arguments.maxBytes ) {
+				return {
+					available: false,
+					oversized: bytes.len() > arguments.maxBytes,
+					content  : "",
+					sizeBytes: bytes.len()
+				};
+			}
+			var content = createObject( "java", "java.lang.String" ).init( bytes,
+					createObject( "java", "java.nio.charset.StandardCharsets" ).UTF_8 ).toString();
+			return {
+				available: true,
+				oversized: false,
+				content  : content,
+				sizeBytes: sizeBytes
+			};
+		} catch (any unavailableBlob) {
+			return {
+				available: false,
+				oversized: false,
+				content  : "",
+				sizeBytes: 0
+			};
+		}
+	}
+
+	/**
+	 * Parses `git diff -U0` hunk headers to find new-side (post-change) line
+	 * ranges for a single file, so context packs can prefer changed lines.
+	 * Never throws on Git failure; returns available: false instead.
+	 */
+	struct function changedLineRanges(
+		required any root,
+		required string relativePath,
+		string baseRevision = "HEAD",
+		string headRevision = ""
+	) {
+		var safePath = replace(
+			arguments.relativePath,
+			"\",
+			"/",
+			"all"
+		);
+		if (
+			!len( safePath ) || left( safePath, 1 ) == "/" || find( char( 0 ), safePath ) ||
+				listToArray( safePath, "/" ).contains( ".." )
+		) {
+			return { available: false, ranges: [], truncated: false };
+		}
+		var base = resolveRevision( arguments.root, arguments.baseRevision );
+		if ( !base.valid ) {
+			return { available: false, ranges: [], truncated: false };
+		}
+		var head = "";
+		if ( len( arguments.headRevision ) ) {
+			var resolvedHead = resolveRevision( arguments.root, arguments.headRevision );
+			if ( !resolvedHead.valid ) {
+				return { available: false, ranges: [], truncated: false };
+			}
+			head = resolvedHead.resolved;
+		}
+		try {
+			var diffArguments = len( head )
+				? [
+					"diff",
+					"-U0",
+					"--diff-filter=ACMRTUXB",
+					"#base.resolved#...#head#",
+					"--",
+					safePath
+				]
+				: [ "diff", "-U0", base.resolved, "--", safePath];
+			var result = executeText( arguments.root, diffArguments );
+			if ( result.exitCode != 0 ) {
+				return { available: false, ranges: [], truncated: false };
+			}
+			return {
+				available: true,
+				ranges   : parseHunkRanges( result.output ),
+				truncated: false
+			};
+		} catch (any unavailableGit) {
+			return { available: false, ranges: [], truncated: false };
+		}
+	}
+
+	private array function parseHunkRanges( required string diffOutput ) {
+		var ranges = [];
+		var hunkMatcher = match(
+			"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
+			arguments.diffOutput
+		);
+		while ( hunkMatcher.find() ) {
+			var startLine = int( val( hunkMatcher.group( 1 ) ) );
+			var lengthGroup = hunkMatcher.group( 2 );
+			var lineCount = isNull( lengthGroup ) ? 1 : int( val( lengthGroup ) );
+			if ( lineCount <= 0 || startLine <= 0 ) {
+				continue;
+			}
+			ranges.append( { startLine: startLine, endLine: startLine + lineCount - 1 } );
+		}
+		return ranges;
+	}
+
+	private any function match( required string expression, required string source ) {
+		return createObject( "java", "java.util.regex.Pattern" )
+			.compile(
+				arguments.expression,
+				createObject( "java", "java.util.regex.Pattern" ).MULTILINE
+			)
+			.matcher( arguments.source );
+	}
+
+	private struct function resolveRevision( required any root, required string revision ) {
+		var candidate = trim( arguments.revision );
+		if ( !len( candidate ) || left( candidate, 1 ) == "-" || !reFind( "^[A-Za-z0-9._/@{}~^:+-]+$", candidate ) ) {
+			return { valid: false, resolved: "" };
+		}
+		try {
+			var result = executeText( arguments.root, [ "rev-parse", "--verify", "#candidate#^{commit}"] );
+			return {
+				valid   : result.exitCode == 0 && reFind( "^[a-fA-F0-9]{40,64}$", result.output ),
+				resolved: result.exitCode == 0 ? lCase( result.output ) : ""
+			};
+		} catch (any unavailableGit) {
+			return { valid: false, resolved: "" };
+		}
+	}
+
+	private struct function executeText( required any root, required array gitArguments ) {
+		var process = startGit( arguments.root, arguments.gitArguments );
+		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( "\\A" );
+		var output = scanner.hasNext() ? cleanOutput( scanner.next() ) : "";
+		scanner.close();
+		var exitCode = process.waitFor();
+		return { exitCode: exitCode, output: output };
+	}
+
+	private struct function executeTokens( required any root, required array gitArguments, required numeric maxTokens ) {
+		var process = startGit( arguments.root, arguments.gitArguments );
+		var scanner = createObject( "java", "java.util.Scanner" ).init( process.getInputStream(), "UTF-8" ).useDelimiter( char( 0 ) );
+		var tokens = [];
+		var truncated = false;
+		while ( scanner.hasNext() ) {
+			if ( tokens.len() >= arguments.maxTokens ) {
+				truncated = true;
+				process.destroyForcibly();
+				break;
+			}
+			var token = cleanOutput( scanner.next(), false );
+			if ( len( token ) ) {
+				tokens.append( token );
+			}
+		}
+		scanner.close();
+		var exitCode = process.waitFor();
+		return {
+			exitCode : truncated ? 0 : exitCode,
+			tokens   : tokens,
+			truncated: truncated
+		};
+	}
+
+	/** Git stderr is merged to avoid process deadlocks; remove warning lines so
+	 * local config warnings cannot corrupt revision ids or NUL-delimited paths. */
+	private string function cleanOutput( required string output, boolean trimValue = true ) {
+		var cleaned = reReplace( arguments.output, "(?m)^warning:.*(?:\\r?\\n|$)", "", "all" );
+		return arguments.trimValue ? trim( cleaned ) : cleaned;
+	}
+
+	private any function startGit( required any root, required array gitArguments ) {
+		var command = [ "git", "-C", arguments.root.getPath()];
+		command.append( arguments.gitArguments, true );
+		return createObject( "java", "java.lang.ProcessBuilder" )
+			.init( javaCast( "string[]", command ) )
+			.redirectErrorStream( true )
+			.start();
+	}
+}

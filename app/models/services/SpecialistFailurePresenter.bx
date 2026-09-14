@@ -1,0 +1,122 @@
+/**
+ * Turns a specialist failure into something a person can read, and records it.
+ *
+ * Split out of SpecialistReviewService (Part 5 Track A). That service
+ * orchestrates specialist runs — prepare, dispatch, await, assemble. This one
+ * answers a different question: when something went wrong, what do we show and
+ * what do we log?
+ *
+ * `previewText` truncates and redacts before anything is displayed or written,
+ * which is why redaction lives here rather than at each call site.
+ */
+@singleton
+class threadsafe {
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="log" inject="logbox:logger:{this}";
+	property name="observabilityEnabled" inject="coldbox:setting:observabilityEnabled";
+	property name="observabilityPreviewCharacters" inject="coldbox:setting:observabilityPreviewCharacters";
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) {
+			variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		}
+		return this;
+	}
+
+	// Absent means ON, matching the service this split out of: silently
+	// disabling previews would hide failure detail exactly when it is needed.
+	private any function observabilityEnabledSetting() {
+		return isNull( variables.observabilityEnabled ?: javacast( "null", "" ) ) ? true : variables.observabilityEnabled;
+	}
+
+	private any function observabilityPreviewSetting() {
+		return isNull( variables.observabilityPreviewCharacters ?: javacast( "null", "" ) ) ? 1600 : variables.observabilityPreviewCharacters;
+	}
+
+	private boolean function isTrue( required any value ) {
+		if ( isBoolean( arguments.value ) ) return arguments.value;
+		return [ "true", "yes", "1" ].contains( lCase( trim( toString( arguments.value ) ) ) );
+	}
+	public string function friendlyFailureMessage( required any error ) {
+		if ( ( arguments.error.type ?: "" ) == "SpecialistCircuitOpen" ) {
+			return "Specialist provider circuit is open";
+		}
+		var raw = trim( toString( arguments.error.message ?: "" ) );
+		if ( !len( raw ) ) {
+			return "Specialist review unavailable";
+		}
+		if ( findNoCase( "tool-call markup", raw ) || findNoCase( "<|tool_call", raw ) || findNoCase( "functions.read_", raw ) ) {
+			return "Specialist review unavailable: model returned tool-call markup instead of JSON. Retrying with embedded source context.";
+		}
+		if ( findNoCase( "not valid JSON", raw ) ) {
+			return "Specialist review unavailable: model response was not valid JSON (often truncated by reasoning-token use — raise max tokens per task)";
+		}
+		if ( findNoCase( "response is empty", raw ) || findNoCase( "empty after retry", raw ) ) {
+			return "Specialist review unavailable: model returned empty content (reasoning models need a higher token budget)";
+		}
+		if ( findNoCase( "circuit is open", raw ) ) {
+			return "Specialist provider circuit is open";
+		}
+		if (
+			findNoCase( "exceed_context_size", raw ) || findNoCase( "exceeds the available context size", raw ) ||
+				findNoCase( "n_ctx", raw )
+		) {
+			return "Specialist review unavailable: prompt exceeds the model context window. Raise AI_CONTEXT_WINDOW / server context size, or lower max tokens per task and plan context budgets.";
+		}
+		return "Specialist review unavailable: " & left( raw, 160 );
+	}
+
+
+	public string function previewText( required any body ) {
+		if ( !isTrue( observabilityEnabledSetting() ) ) {
+			return "";
+		}
+		if ( isSimpleValue( arguments.body ) ) {
+			var simple = toString( arguments.body );
+			var limit = max(
+				200,
+				isNumeric( observabilityPreviewSetting() ) ? int( val( observabilityPreviewSetting() ) ) : 1600
+			);
+			if ( len( simple ) > limit ) {
+				return left( simple, limit ) & char( 10 ) & "[truncated]";
+			}
+			return simple;
+		}
+		if ( isStruct( arguments.body ) ) {
+			var lines = [];
+			for ( var key in arguments.body ) {
+				var value = arguments.body[ key ];
+				if ( isNull( value ) || isSimpleValue( value ) ) {
+					lines.append( "#key#: #isNull( value ) ? "" : value#" );
+				} else if ( isArray( value ) ) {
+					lines.append( "#key#: [array:#arrayLen( value )#]" );
+				} else {
+					lines.append( "#key#: [complex]" );
+				}
+			}
+			var text = lines.toList( char( 10 ) );
+			var maxChars = max(
+				200,
+				isNumeric( observabilityPreviewSetting() ) ? int( val( observabilityPreviewSetting() ) ) : 1600
+			);
+			if ( len( text ) > maxChars ) {
+				return left( text, maxChars ) & char( 10 ) & "[truncated]";
+			}
+			return text;
+		}
+		return "[complex payload]";
+	}
+
+	public void function logSpecialistError( required string message, required any error, struct context = {} ) {
+		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
+			return;
+		}
+		var detail = duplicate( arguments.context );
+		detail.type = arguments.error.type ?: "";
+		detail.message = secretRedactionService.redactText( arguments.error.message ?: "" );
+		detail.stackTrace = secretRedactionService.redactText( arguments.error.stackTrace ?: "" );
+		log.error( arguments.message, detail );
+	}
+
+}
+

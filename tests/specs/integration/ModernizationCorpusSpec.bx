@@ -1,0 +1,452 @@
+/**
+ * Deterministic tier of the modernization corpus.
+ *
+ * Calls the derivation services directly — inventory -> coupling graph — rather
+ * than executing a modernize run, because a keyless run is impossible and the
+ * run lifecycle adds nothing to what is being measured.
+ *
+ * Predicate kinds that need clustering, placement or gates land in Step 2. This
+ * spec asserts they are *declared* and reports them as pending, so the manifest
+ * cannot quietly claim coverage the code does not yet have.
+ */
+class extends="coldbox.system.testing.BaseTestCase" {
+
+	function run() {
+		describe( "Modernization corpus — deterministic tier", () => {
+
+			var evaluationService = getInstance( "EvaluationService" );
+			var inventoryService = getInstance( "ModernizationInventoryService" );
+			var graphService = getInstance( "ModernizationCouplingGraphService" );
+
+			var corpusPath = getInstance( dsl = "coldbox:setting:modernizationCorpusPath" );
+			var corpus = evaluationService.loadCorpus( corpusPath );
+
+			var caseById = {};
+			for ( var corpusCase in corpus.cases ) caseById[ corpusCase.id ] = corpusCase;
+
+			var graphFor = ( id ) => {
+				var subject = caseById[ id ];
+				return graphService.build( inventoryService.build( { files: subject.files } ) );
+			};
+
+			var norm = ( path ) => lCase( replace( path, "\", "/", "all" ) );
+
+			// resources both files touch
+			var sharedResources = ( graph, a, b ) => {
+				var shared = [];
+				for ( var key in graph.getMetrics().coAccess ) {
+					var files = graph.getMetrics().coAccess[ key ];
+					if ( files.contains( norm( a ) ) && files.contains( norm( b ) ) ) shared.append( key );
+				}
+				shared.sort( ( x, y ) => compareNoCase( x, y ) );
+				return shared;
+			};
+
+			// Predicate kinds this tier can evaluate today.
+			var supportedKinds = [ "co-access-shared", "co-access-disjoint", "shared-state-shared", "cycle-reported" ];
+
+			it( "loads without changing EvaluationService.loadCorpus", () => {
+				expect( corpus.version ).toBe( "modernization-corpus-v1" );
+				expect( corpus.cases ).toHaveLength( 4 );
+			} );
+
+			it( "declares every case the plan requires", () => {
+				for ( var required in [ "false-seam", "separable-domain", "below-inference-threshold", "cyclic-boundary" ] ) {
+					expect( caseById ).toHaveKey( required );
+				}
+			} );
+
+			it( "must never promote a language capability tier", () => {
+				// A modernize gate run writing language_capabilities would
+				// overwrite the review-measured tier behind /api/v1/capabilities.
+				var raw = jsonDeserialize( fileRead( corpusPath & "/manifest.json", "UTF-8" ) );
+				expect( raw.promotesLanguageTier ).toBeFalse();
+				expect( raw.corpusKind ).toBe( "modernize" );
+			} );
+
+			describe( "false-seam — the decisive case", () => {
+
+				it( "shows at least four shared tables between the two folders", () => {
+					var graph = graphFor( "false-seam" );
+					var shared = sharedResources( graph, "app/reporting/ReportingService.cfc", "app/billing/BillingService.cfc" );
+
+					expect( shared.len() ).toBeGTE(
+						4,
+						"reporting and billing must share >= 4 resources, found: " & shared.toList( ", " )
+					);
+				} );
+
+				it( "shows both folders touching the same application and session scope", () => {
+					var graph = graphFor( "false-seam" );
+					for ( var scope in [ "scope.application", "scope.session" ] ) {
+						expect( graph.getMetrics().sharedState ).toHaveKey( scope );
+						expect( graph.getMetrics().sharedState[ scope ].len() ).toBeGTE(
+							2,
+							scope & " must be touched by more than one file"
+						);
+					}
+				} );
+
+				it( "is NOT separable by structural edges alone — which is the trap", () => {
+					// The two services never reference each other. A clusterer
+					// reading only call edges, or only folders, sees a clean
+					// seam. Only co-access and shared state reveal otherwise.
+					var graph = graphFor( "false-seam" );
+					var cohesionOfReporting = graphService.cohesion( graph, [ "app/reporting/ReportingService.cfc" ] );
+
+					expect( cohesionOfReporting.crossingEdges ).toBe(
+						0,
+						"if this ever becomes non-zero the fixture no longer tests what it claims"
+					);
+					expect( sharedResources( graph, "app/reporting/ReportingService.cfc", "app/billing/BillingService.cfc" ).len() ).toBeGT( 0 );
+				} );
+			} );
+
+			describe( "separable-domain", () => {
+
+				it( "shares no resource between notifications and orders", () => {
+					var graph = graphFor( "separable-domain" );
+					var shared = sharedResources( graph, "app/notifications/NotificationService.cfc", "app/orders/OrderService.cfc" );
+
+					expect( shared ).toBeEmpty( "expected no shared resource, found: " & shared.toList( ", " ) );
+				} );
+
+				it( "keeps the notifications pair coupled to each other", () => {
+					var graph = graphFor( "separable-domain" );
+					var inside = graphService.cohesion( graph, [
+						"app/notifications/NotificationService.cfc",
+						"app/notifications/NotificationQueue.cfc"
+					] );
+
+					expect( inside.internalEdges ).toBeGTE( 1 );
+					expect( inside.crossingEdges ).toBe( 0 );
+					expect( inside.cohesion ).toBe( 1 );
+				} );
+			} );
+
+			describe( "below-inference-threshold", () => {
+
+				it( "stays under the folder-inference threshold", () => {
+					var inventory = inventoryService.build( { files: caseById[ "below-inference-threshold" ].files } );
+
+					expect( inventory.units.len() ).toBeLT(
+						24,
+						"fixture must stay below minUnitsForFolderInference or it stops testing 2.3"
+					);
+				} );
+
+				it( "still exposes two disjoint domains in the graph", () => {
+					var graph = graphFor( "below-inference-threshold" );
+					var shared = sharedResources( graph, "app/CatalogService.cfc", "app/ShippingService.cfc" );
+					expect( shared ).toBeEmpty();
+
+					var catalog = graphService.cohesion( graph, [ "app/CatalogService.cfc", "app/PricingRules.cfc" ] );
+					var shipping = graphService.cohesion( graph, [ "app/ShippingService.cfc", "app/CarrierGateway.cfc" ] );
+
+					expect( catalog.internalEdges ).toBeGTE( 1 );
+					expect( catalog.crossingEdges ).toBe( 0 );
+					expect( shipping.internalEdges ).toBeGTE( 1 );
+					expect( shipping.crossingEdges ).toBe( 0 );
+				} );
+			} );
+
+			describe( "cyclic-boundary", () => {
+
+				it( "reports the order/invoice cycle", () => {
+					var graph = graphFor( "cyclic-boundary" );
+
+					expect( graph.getMetrics().cycles ).notToBeEmpty( "the planted cycle was not detected" );
+					var members = graph.cycleMembersFor( "app/orders/OrderService.cfc" );
+					expect( members ).toInclude( "app/invoicing/InvoiceService.cfc" );
+				} );
+
+				it( "records the dynamic include as unresolved rather than inventing an edge", () => {
+					var inventory = inventoryService.build( { files: caseById[ "cyclic-boundary" ].files } );
+					var kinds = [];
+					for ( var item in inventory.unresolved ) kinds.append( item.kind ?: "" );
+
+					expect( kinds ).toInclude( "dynamic-include" );
+				} );
+			} );
+
+			describe( "derived clustering — the four known-correct verdicts", () => {
+
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+
+				var clustersFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					return derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+				};
+				var clusterHolding = ( clusters, filePath ) => {
+					for ( var cluster in clusters ) {
+						if ( cluster.filePaths.contains( norm( filePath ) ) ) return cluster;
+					}
+					return {};
+				};
+
+				it( "false-seam: reporting and billing land in ONE cluster and stay", () => {
+					var clusters = clustersFor( "false-seam" );
+					var reporting = clusterHolding( clusters, "app/reporting/ReportingService.cfc" );
+					var billing = clusterHolding( clusters, "app/billing/BillingService.cfc" );
+
+					expect( reporting ).notToBeEmpty( "reporting was not placed in any cluster" );
+					expect( reporting.id ).toBe(
+						billing.id,
+						"reporting and billing share four tables and session state; folder-shaped clustering splits them"
+					);
+					expect( reporting.placementType ).notToBe( "external-service" );
+					expect( reporting.placementType ).toBe( "main-app" );
+					// Coupling reaches across every candidate boundary here, so
+					// the whole scope collapses to one cluster. "Nothing crosses
+					// the boundary" is then vacuously true, which is why
+					// spansWholeSystem has to veto extractability.
+					expect( reporting.boundaryEvidence.spansWholeSystem ).toBeTrue();
+					expect( reporting.boundaryEvidence.isolated ).toBeFalse();
+				} );
+
+				it( "separable-domain: notifications separate from orders, and isolated", () => {
+					var clusters = clustersFor( "separable-domain" );
+					var notifications = clusterHolding( clusters, "app/notifications/NotificationService.cfc" );
+					var orders = clusterHolding( clusters, "app/orders/OrderService.cfc" );
+
+					expect( notifications ).notToBeEmpty();
+					expect( orders ).notToBeEmpty();
+					expect( notifications.id ).notToBe( orders.id, "notifications and orders share nothing and must not merge" );
+
+					// The queue collaborates with the service, so it comes along.
+					expect( notifications.filePaths ).toInclude( "app/notifications/notificationqueue.cfc" );
+					expect( notifications.boundaryEvidence.isolated ).toBeTrue(
+						"nothing crosses the notifications boundary, so it is separable"
+					);
+					// It owns an outbound HTTP integration, so it is already
+					// behaving as a service rather than merely being separable.
+					// This is the verdict the LLM baseline scores 0.0 on.
+					expect( notifications.placementType ).toBe( "external-service" );
+					expect( notifications.boundaryEvidence.externalIntegration ).notToBeEmpty();
+
+					// Orders is separable too, but has no outbound integration,
+					// so the weaker claim is the honest one.
+					expect( orders.placementType ).toBe( "coldbox-module" );
+				} );
+
+				it( "below-inference-threshold: two clusters despite being under the threshold", () => {
+					var clusters = clustersFor( "below-inference-threshold" );
+					var catalog = clusterHolding( clusters, "app/CatalogService.cfc" );
+					var shipping = clusterHolding( clusters, "app/ShippingService.cfc" );
+
+					expect( clusters.len() ).toBeGTE( 2, "the degenerate single-default-cluster branch is still running" );
+					expect( catalog.id ).notToBe( shipping.id );
+					expect( catalog.filePaths ).toInclude( "app/pricingrules.cfc" );
+					expect( shipping.filePaths ).toInclude( "app/carriergateway.cfc" );
+				} );
+
+				it( "cyclic-boundary: the cycle keeps both halves together and unextractable", () => {
+					var clusters = clustersFor( "cyclic-boundary" );
+					var orders = clusterHolding( clusters, "app/orders/OrderService.cfc" );
+
+					expect( orders ).notToBeEmpty();
+					expect( orders.filePaths ).toInclude( "app/invoicing/invoiceservice.cfc" );
+					expect( orders.placementType ).notToBe( "external-service" );
+				} );
+
+				it( "is deterministic across repeated derivations", () => {
+					expect( jsonSerialize( clustersFor( "false-seam" ) ) ).toBe( jsonSerialize( clustersFor( "false-seam" ) ) );
+				} );
+			} );
+
+			describe( "Step 3b stop conditions", () => {
+
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+				var baseline = jsonDeserialize( fileRead( corpusPath & "/baseline-llm-path.json", "UTF-8" ) );
+
+				var verdictFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					var clusters = derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+					var extracted = [];
+					for ( var cluster in clusters ) {
+						if ( cluster.placementType == "external-service" ) extracted.append( cluster.domainKey );
+					}
+					return { clusters: clusters, extracted: extracted };
+				};
+
+				it( "1: false-seam is rejected — the decisive gate", () => {
+					var verdict = verdictFor( "false-seam" );
+					expect( verdict.extracted ).toBeEmpty(
+						"nothing in false-seam may be proposed for extraction, found: " & verdict.extracted.toList( ", " )
+					);
+				} );
+
+				it( "2: below-inference-threshold yields real seams, not one default cluster", () => {
+					expect( verdictFor( "below-inference-threshold" ).clusters.len() ).toBeGTE( 2 );
+				} );
+
+				it( "3: cyclic-boundary reports the cycle and blocks extraction", () => {
+					var inventory = inventoryService.build( { files: caseById[ "cyclic-boundary" ].files } );
+					var graph = graphService.build( inventory );
+
+					expect( graph.getMetrics().cycles ).notToBeEmpty();
+					expect( verdictFor( "cyclic-boundary" ).extracted ).toBeEmpty();
+				} );
+
+				it( "4: separable-domain IS extracted — the load-bearing condition", () => {
+					// The baseline extracts nothing anywhere, so a precision-only
+					// comparison is passed by refusing everything. This is the
+					// condition that cannot be satisfied by silence.
+					expect( verdictFor( "separable-domain" ).extracted ).notToBeEmpty(
+						"the derived path must be able to say yes, not only no"
+					);
+				} );
+
+				it( "5: seamRecall beats the captured LLM baseline", () => {
+					var baselineRecall = baseline.cases[ "separable-domain" ].seamRecall;
+					var derivedExtracted = verdictFor( "separable-domain" ).extracted.len();
+
+					expect( baselineRecall ).toBe( 0, "baseline should have missed the separable domain" );
+					expect( derivedExtracted ).toBeGT(
+						baselineRecall,
+						"the inversion must improve recall, not just avoid regressing precision"
+					);
+				} );
+
+				it( "5b: precision does not regress — no extraction where the fixture forbids one", () => {
+					// Only false-seam and cyclic-boundary declare "must not
+					// extract". below-inference-threshold is deliberately NOT in
+					// this list: its shipping domain has its own datasource, its
+					// own tables and its own carrier integration, so proposing it
+					// is the correct answer, not a false positive. Its manifest
+					// asks for two seams, not for silence.
+					var falseExtractions = 0;
+					for ( var id in [ "false-seam", "cyclic-boundary" ] ) {
+						falseExtractions += verdictFor( id ).extracted.len();
+					}
+					expect( falseExtractions ).toBe( 0 );
+				} );
+			} );
+
+			describe( "gates decide what is decidable", () => {
+
+				var gateService = getInstance( "ModernizationGateService" );
+				var derived = getInstance( "ModernizationDerivedStructureService" );
+				var placementService = getInstance( "ModernizationPlacementService" );
+
+				var gatedFor = ( id ) => {
+					var inventory = inventoryService.build( { files: caseById[ id ].files } );
+					var clusters = derived.deriveClusters( graphService.build( inventory ), inventory.units, [] );
+					var plan = { target: { units: [], placements: [] } };
+					for ( var cluster in clusters ) {
+						plan.target.placements.append( {
+							id: cluster.id,
+							name: cluster.name,
+							placementType: cluster.placementType,
+							targetUnitIds: cluster.targetUnitIds,
+							boundaryEvidence: cluster.boundaryEvidence
+						} );
+					}
+					return gateService.evaluatePlan( plan, {} );
+				};
+
+				var gateNamed = ( placement, gateId ) => {
+					for ( var entry in ( placement.gates ?: [] ) ) if ( entry.id == gateId ) return entry;
+					return {};
+				};
+
+				it( "answers data-ownership from the co-access matrix, naming the shared tables", () => {
+					var gated = gatedFor( "false-seam" );
+					var placement = gated.target.placements[ 1 ];
+					var dataGate = gateNamed( placement, "data-ownership" );
+
+					expect( dataGate.basis ).toInclude( "co-access" );
+					expect( dataGate.confidence ).toBe( "high" );
+					expect( dataGate.whatWouldChangeThis ).notToBeEmpty(
+						"a recommendation nobody can challenge is an assertion, not a finding"
+					);
+				} );
+
+				it( "says stay, with evidence, instead of asking the user", () => {
+					var gated = gatedFor( "false-seam" );
+					var placement = gated.target.placements[ 1 ];
+
+					expect( [ "stay", "do-not-extract" ] ).toInclude(
+						placement.recommendation,
+						"a plan where everything is extractable reads as a generator"
+					);
+					expect( placement.decisionRequired ).toBeFalse(
+						"a confident refusal backed by shared state is a decision the tool already made"
+					);
+				} );
+
+				it( "leaves operational-need unknown as an explicit open question", () => {
+					// Scaling, availability, ownership and release cadence are
+					// organisational facts absent from every repository. Answering
+					// them from code would be inventing them.
+					var gated = gatedFor( "separable-domain" );
+					var extracted = {};
+					for ( var placement in gated.target.placements ) {
+						if ( placement.placementType == "external-service" ) extracted = placement;
+					}
+					expect( extracted ).notToBeEmpty( "separable-domain must produce an extraction candidate" );
+
+					var operational = gateNamed( extracted, "operational-need" );
+					expect( operational.status ).toBe( "unknown" );
+					expect( operational.openQuestion ).toBeTrue();
+					expect( operational.basis ).toBe( "not source-derivable" );
+					expect( operational.whatWouldChangeThis ).notToBeEmpty();
+					expect( extracted.decisionRequired ).toBeTrue(
+						"an unanswered open question is exactly when to ask the user"
+					);
+				} );
+
+				it( "keeps unknownRate above zero where a real question exists", () => {
+					// Zero everywhere would mean the product started inventing
+					// organisational facts.
+					var gated = gatedFor( "separable-domain" );
+					var total = 0;
+					var unknown = 0;
+					for ( var placement in gated.target.placements ) {
+						for ( var entry in ( placement.gates ?: [] ) ) {
+							total++;
+							if ( entry.status == "unknown" ) unknown++;
+						}
+					}
+					expect( unknown ).toBeGT( 0, "the organisational question must survive" );
+					expect( unknown / total ).toBeLT( 0.5, "but most gates must now decide" );
+				} );
+			} );
+
+			it( "covers every signal group across the four cases", () => {
+				var signalService = getInstance( "ModernizationSignalService" );
+				var groups = {};
+				for ( var id in caseById ) {
+					var signals = signalService.build( inventoryService.build( { files: caseById[ id ].files } ) );
+					for ( var signal in ( signals.signals ?: [] ) ) groups[ signal.group ] = true;
+				}
+
+				// runtime-hints needs a ColdBox config file, which these
+				// fixtures deliberately do not have; the rest must all appear.
+				for ( var required in [
+					"outbound-integration",
+					"include-call-coupling",
+					"datasource-table-coupling",
+					"security-session",
+					"application-lifecycle-state"
+				] ) {
+					expect( groups ).toHaveKey( required, "no fixture produces the " & required & " signal group" );
+				}
+			} );
+
+			it( "declares the Step 2 predicates without pretending they are checked", () => {
+				var pending = [];
+				for ( var id in caseById ) {
+					for ( var expectation in caseById[ id ].expected ) {
+						if ( !supportedKinds.contains( expectation.kind ) ) pending.append( id & ":" & expectation.kind );
+					}
+				}
+
+				// Clustering, placement and gates arrive in Step 2. Until then
+				// these are declared intent, not coverage.
+				expect( pending ).notToBeEmpty();
+				debug( "Pending until Step 2 -> " & pending.toList( ", " ) );
+			} );
+		} );
+	}
+}

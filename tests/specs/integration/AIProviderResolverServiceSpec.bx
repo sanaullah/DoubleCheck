@@ -1,0 +1,86 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe( "AIProviderResolverService", () => {
+			beforeEach( () => setup() );
+
+			it( "falls back to the env-derived connection when no profile has ever been added", () => {
+				var resolver = getInstance( "AIProviderResolverService" );
+				var resolved = resolver.resolve( "", "test-resolver-no-profiles" );
+
+				expect( resolved.profileId ).toBe( "" );
+				expect( len( resolved.provider ) ).toBeGT( 0 );
+			} );
+
+			it( "resolves the active profile's connection info when one exists", () => {
+				var profileService = getInstance( "AIProviderProfileService" );
+				var resolver = getInstance( "AIProviderResolverService" );
+				var tenantId = "test-resolver-active-profile";
+				try {
+					var created = profileService.create( tenantId, {
+						name    : "Resolver Test Profile",
+						provider: "openai-compatible",
+						baseUrl : "https://models.example.invalid/v1",
+						model   : "resolver-test-model",
+						apiKey  : "sk-resolvertest",
+						contextWindow: 64000
+					} );
+
+					var resolved = resolver.resolve( "", tenantId );
+
+					expect( resolved.profileId ).toBe( created.id );
+					expect( resolved.provider ).toBe( "openai-compatible" );
+					expect( resolved.baseURL ).toBe( "https://models.example.invalid/v1" );
+					expect( resolved.model ).toBe( "resolver-test-model" );
+					expect( resolved.contextWindow ).toBe( 64000 );
+					// resolve() reads the unmasked repository row directly, not the
+					// service's masked() output, so the real key must round-trip.
+					expect( resolved.apiKey ).toBe( "sk-resolvertest" );
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "resolves a specific non-active profile by id without changing which one is active", () => {
+				var profileService = getInstance( "AIProviderProfileService" );
+				var resolver = getInstance( "AIProviderResolverService" );
+				var tenantId = "test-resolver-specific-profile";
+				try {
+					var active = profileService.create( tenantId, { name: "Active", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } );
+					var other = profileService.create( tenantId, { name: "Other", provider: "openai-compatible", baseUrl: "https://b.example.invalid/v1", model: "m2", apiKey: "k2" } );
+
+					var resolved = resolver.resolve( other.id, tenantId );
+
+					expect( resolved.profileId ).toBe( other.id );
+					expect( resolved.model ).toBe( "m2" );
+					expect( profileService.get( tenantId, active.id ).isActive ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "classifies a localhost profile base URL as local", () => {
+				var profileService = getInstance( "AIProviderProfileService" );
+				var resolver = getInstance( "AIProviderResolverService" );
+				var tenantId = "test-resolver-local-profile";
+				try {
+					var created = profileService.create( tenantId, { name: "Local", provider: "ollama", baseUrl: "http://localhost:11434/v1", model: "llama3", apiKey: "" } );
+
+					var resolved = resolver.resolve( "", tenantId );
+
+					expect( resolved.isLocal ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+		} );
+	}
+}

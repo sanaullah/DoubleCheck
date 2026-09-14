@@ -1,0 +1,374 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"CFML symbol parsing",
+			() => {
+				it(
+					"uses BoxAST positions and dependency evidence for a source-backed CFC",
+					() => {
+						var sourceRoot = getTempDirectory() & "doublecheck-cfml-ast-" & replace( lCase( createUUID() ), "-", "", "all" );
+						var sourcePath = sourceRoot & "/Legacy.cfc";
+						var lines = [
+							"<cfcomponent name=""Legacy"" extends=""Base"">",
+							"<cfproperty name=""service"" inject=""Service"">",
+							"<cffunction name=""run"">",
+							"<cfreturn queryExecute(""SELECT * FROM orders"")>",
+							"</cffunction>",
+							"</cfcomponent>"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						directoryCreate( sourceRoot, true, true );
+						fileWrite( sourcePath, content, "UTF-8" );
+						try {
+							var parser = new app.models.services.CfmlParserService();
+							var parsed = parser.parse(
+								{
+									filePath    : "app/Legacy.cfc",
+									absolutePath : sourcePath,
+									language    : "CFML",
+									contentHash : lCase( hash( content, "SHA-256" ) ),
+									content     : content,
+									lines      : lines
+								}
+							);
+							var functions = parsed.symbols.filter( ( item ) => item.kind == "function" );
+							var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+							expect( parsed.parseStrategy ).toBe( "ast" );
+						expect( functions.len() ).toBeGT( 0 );
+						expect( functions[ 1 ].endLine ).toBeGT( functions[ 1 ].line );
+							expect( dependencyKinds ).toInclude( "injects" );
+							// `SELECT * FROM orders` is a read. This asserted `table-query`
+						// only because the CFML parser had never applied G3's split;
+						// the undifferentiated kind now survives solely for statements
+						// whose direction genuinely cannot be determined.
+						expect( dependencyKinds ).toInclude( "table-read" );
+						} finally {
+							if ( directoryExists( sourceRoot ) ) directoryDelete( sourceRoot, true, true );
+						}
+					}
+				);
+
+				it(
+					"keeps corpus-wide AST symbols and dependencies as a superset of regex",
+					() => {
+						var repositoryRoot = new java:java.io.File(
+							getDirectoryFromPath( getCurrentTemplatePath() ),
+							"../../.."
+						).getCanonicalFile();
+						var roots = [
+							new java:java.io.File( repositoryRoot, "resources" ),
+							new java:java.io.File( repositoryRoot, "tests/fixtures" )
+						];
+						var paths = [];
+						for ( var root in roots ) {
+							if ( !root.exists() ) continue;
+							paths.append(
+								directoryList( root.getPath(), true, "path" )
+									.filter( ( path ) => reFindNoCase( "\.(?:cfc|cfm)$", path ) > 0 ),
+								true
+							);
+						}
+						paths.sort( "textnocase" );
+
+						var semanticSet = ( items ) => {
+							var out = {};
+							for ( var item in items ) {
+								var key = lCase( trim( toString( item.kind ?: "" ) ) & "|" & trim( toString( item.name ?: item.target ?: "" ) ) );
+								if ( len( key ) ) out[ key ] = true;
+							}
+							return out;
+						};
+						var parser = new app.models.services.CfmlParserService();
+						var regressions = [];
+						var fallbacks = [];
+						var regexMs = 0;
+						var astMs = 0;
+						for ( var path in paths ) {
+							var sourceFile = new java:java.io.File( path ).getCanonicalFile();
+							var content = fileRead( sourceFile.getPath(), "UTF-8" );
+							var lines = listToArray( replace( content, char( 13 ), "", "all" ), char( 10 ), true, true );
+							var relativePath = replace(
+								sourceFile.getPath().substring( repositoryRoot.getPath().len() + 1 ),
+								"\",
+								"/",
+								"all"
+							);
+							var started = getTickCount();
+							var regexParsed = parser.parse( {
+								filePath: relativePath,
+								language: "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								lines: lines
+							} );
+							regexMs += getTickCount() - started;
+							started = getTickCount();
+							var astParsed = parser.parse( {
+								filePath: relativePath,
+								absolutePath: sourceFile.getPath(),
+								language: "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								content: content,
+								lines: lines
+							} );
+							astMs += getTickCount() - started;
+							if ( astParsed.parseStrategy != "ast" ) fallbacks.append( relativePath );
+							var astSymbols = semanticSet( astParsed.symbols );
+							var astDependencies = semanticSet( astParsed.dependencies );
+							for ( var key in semanticSet( regexParsed.symbols ) ) {
+								if ( !astSymbols.keyExists( key ) ) regressions.append( "#relativePath# symbol #key#" );
+							}
+							for ( var key in semanticSet( regexParsed.dependencies ) ) {
+								if ( !astDependencies.keyExists( key ) ) regressions.append( "#relativePath# dependency #key#" );
+							}
+						}
+						fileWrite(
+							getTempDirectory() & "doublecheck-codegraph-cfml-parser-parity.json",
+							jsonSerialize( { files: paths.len(), regexMs: regexMs, astMs: astMs, fallbacks: fallbacks, regressions: regressions } ),
+							"UTF-8"
+						);
+
+						expect( paths.len() ).toBeGT( 0 );
+						expect( regressions ).toBe( [] );
+						expect( fallbacks ).toBe( [] );
+					}
+				);
+
+				it(
+					"extracts symbols and dependencies from a tag-based component",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"<cfcomponent name=""UserGateway"" extends=""app.models.BaseGateway"" implements=""app.models.IGateway"">",
+							"<cfproperty name=""datasource"" type=""string"">",
+							"<cffunction name=""findUser"" access=""public"" returntype=""query"">",
+							"<cfargument name=""id"" type=""numeric"" required=""true"">",
+							"<cfset var result = queryExecute( ""SELECT * FROM users"" )>",
+							"<cfinclude template=""partials/audit.cfm"">",
+							"<cfreturn result>",
+							"</cffunction>",
+							"</cfcomponent>"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "app/models/UserGateway.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var symbolKinds = parsed.symbols.map( ( item ) => item.kind );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+						var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+						expect( parsed.parserVersion ).toBe( parser.getVersion() );
+						expect( symbolNames ).toInclude( "UserGateway" );
+						expect( symbolKinds ).toInclude( "class" );
+						expect( symbolNames ).toInclude( "findUser" );
+						expect( symbolKinds ).toInclude( "function" );
+						expect( symbolNames ).toInclude( "datasource" );
+						expect( symbolKinds ).toInclude( "property" );
+						expect( dependencyTargets ).toInclude( "app.models.BaseGateway" );
+						expect( dependencyKinds ).toInclude( "extends" );
+						expect( dependencyTargets ).toInclude( "app.models.IGateway" );
+						expect( dependencyKinds ).toInclude( "implements" );
+						expect( dependencyTargets ).toInclude( "partials/audit.cfm" );
+						expect( dependencyKinds ).toInclude( "includes" );
+					}
+				);
+
+				it(
+					"extracts symbols from a script-based component",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"component extends=""app.models.BaseModel"" {",
+							"    property name=""total"" type=""numeric"";",
+							"    function calculateTotal( required numeric quantity ) {",
+							"        var gateway = new app.models.PricingGateway();",
+							"        return gateway.priceFor( arguments.quantity );",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "app/models/Cart.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+						var dependencyKinds = parsed.dependencies.map( ( item ) => item.kind );
+
+						expect( symbolNames ).toInclude( "Cart" );
+						expect( symbolNames ).toInclude( "calculateTotal" );
+						expect( dependencyTargets ).toInclude( "app.models.BaseModel" );
+						expect( dependencyKinds ).toInclude( "extends" );
+						expect( dependencyTargets ).toInclude( "app.models.PricingGateway" );
+						expect( dependencyKinds ).toInclude( "constructs" );
+					}
+				);
+
+				it(
+					"tags Application.cfc lifecycle methods distinctly from regular functions",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"component {",
+							"    function onApplicationStart() {",
+							"        return true;",
+							"    }",
+							"    function onError( exception, eventName ) {",
+							"        writeLog( type=""error"", text=exception.message );",
+							"    }",
+							"    function helperMethod() {",
+							"        return true;",
+							"    }",
+							"}"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "Application.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var lifecycleNames = parsed.symbols
+							.filter( ( item ) => item.kind == "lifecycle-hook" )
+							.map( ( item ) => item.name );
+
+						expect( lifecycleNames ).toInclude( "onApplicationStart" );
+						expect( lifecycleNames ).toInclude( "onError" );
+						expect( lifecycleNames ).notToInclude( "helperMethod" );
+					}
+				);
+
+				it(
+					"extracts name, extends, and implements when component attributes wrap across lines",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						var lines = [
+							"<cfcomponent",
+							"    name=""UserGateway""",
+							"    extends=""app.models.BaseGateway""",
+							"    implements=""app.models.IGateway"">",
+							"<cffunction",
+							"    name=""findUser"">",
+							"</cffunction>",
+							"</cfcomponent>"
+						];
+						var content = arrayToList( lines, char( 10 ) );
+						var parsed = parser.parse(
+								{
+									filePath   : "app/models/UserGateway.cfc",
+									language   : "CFML",
+									contentHash: lCase( hash( content, "SHA-256" ) ),
+									content    : content,
+									lines      : lines
+								}
+							);
+						var symbolNames = parsed.symbols.map( ( item ) => item.name );
+						var dependencyTargets = parsed.dependencies.map( ( item ) => item.target );
+
+						expect( symbolNames ).toInclude( "UserGateway" );
+						expect( symbolNames ).toInclude( "findUser" );
+						expect( dependencyTargets ).toInclude( "app.models.BaseGateway" );
+						expect( dependencyTargets ).toInclude( "app.models.IGateway" );
+					}
+				);
+
+				it(
+					"routes, renders and splits table access on a ColdBox-style CFC",
+					() => {
+						// G14's acceptance test, written against the syntax a real
+						// ColdFusion project uses rather than against the detector. The
+						// CFML corpus case produced zero `routes` and zero `renders` while
+						// the same syntax in a `.bx` file produced both — a supported
+						// language answering "how does a route reach a handler" with
+						// nothing.
+						var routerLines = [
+							"component {",
+							"    function configure() {",
+							"        route( ""/api/v1/invoices"" ).withAction( ""index"" ).toHandler( ""InvoiceHandler"" ).end();",
+							"    }",
+							"}"
+						];
+						var handlerLines = [
+							"component {",
+							"    property name=""invoiceService"" inject=""InvoiceService"";",
+							"    function index( event, rc, prc ) {",
+							"        event.setView( ""invoices/show"" );",
+							"    }",
+							"}"
+						];
+						var repositoryLines = [
+							"component {",
+							"    function findAll() {",
+							"        return queryExecute( ""SELECT * FROM invoices"" );",
+							"    }",
+							"    function markPaid( required numeric invoiceId ) {",
+							"        return queryExecute( ""UPDATE invoices SET paid = 1 WHERE id = :id"", { id: arguments.invoiceId } );",
+							"    }",
+							"}"
+						];
+						var parser = new app.models.services.CfmlParserService();
+						var parseLines = ( path, lines ) => {
+							var content = arrayToList( lines, char( 10 ) );
+							return parser.parse( {
+								filePath   : path,
+								language   : "CFML",
+								contentHash: lCase( hash( content, "SHA-256" ) ),
+								content    : content,
+								lines      : lines
+							} );
+						};
+
+						var router = parseLines( "app/config/Router.cfc", routerLines );
+						var routeSymbols = router.symbols.filter( ( item ) => item.kind == "route" );
+						var routeDependencies = router.dependencies.filter( ( item ) => item.kind == "routes" );
+						expect( routeSymbols.len() ).toBeGT( 0, "a CFML router must yield route symbols" );
+						expect( routeDependencies.len() ).toBeGT( 0, "a CFML router must yield routes dependencies" );
+						expect( routeDependencies[ 1 ].target ).toBe( "/api/v1/invoices" );
+
+						var handler = parseLines( "app/handlers/InvoiceHandler.cfc", handlerLines );
+						var renders = handler.dependencies.filter( ( item ) => item.kind == "renders" );
+						expect( renders.len() ).toBeGT( 0, "setView in a CFC must yield a renders dependency" );
+						expect( renders[ 1 ].target ).toBe( "invoices/show" );
+
+						// G3 split reads from writes so lineage can state direction. It
+						// shipped for BoxLang only; a CFML repository saw one undifferentiated
+						// kind and `/lineage` could not say who writes a table.
+						var repository = parseLines( "app/repositories/InvoiceRepository.cfc", repositoryLines );
+						var accessKinds = repository.dependencies
+							.filter( ( item ) => listFindNoCase( "table-read,table-write,table-query", item.kind ) )
+							.map( ( item ) => item.kind );
+						expect( accessKinds ).toInclude( "table-read" );
+						expect( accessKinds ).toInclude( "table-write" );
+					}
+				);
+
+				it(
+					"only supports CFML files",
+					() => {
+						var parser = new app.models.services.CfmlParserService();
+						expect( parser.supports( { language: "CFML" } ) ).toBeTrue();
+						expect( parser.supports( { language: "BoxLang" } ) ).toBeFalse();
+						expect( parser.supports( { language: "JavaScript" } ) ).toBeFalse();
+					}
+				);
+			}
+		);
+	}
+
+}

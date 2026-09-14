@@ -1,0 +1,100 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+	function beforeAll() { super.beforeAll(); }
+	function afterAll() { super.afterAll(); }
+
+	function run() {
+		describe( "Review directory file picker", () => {
+			beforeEach( () => {
+				setup();
+				prepareMock( getInstance( "ReviewRunService" ) ).$property(
+						"workerEnabled",
+						"variables",
+						false
+					);
+			} );
+
+			it( "lists reviewable files under a project path for the right-hand tree", () => {
+				var fixture = createFixture();
+				try {
+					var event = this.get( "/api/v1/projects/tree", { projectPath: fixture.path } );
+					expect( event.getResponse() ).toHaveStatus( 200 );
+					var body = jsonDeserialize( event.getRenderedContent() );
+					var paths = body.data.files.map( ( file ) => file.filePath );
+					expect( paths.some( ( path ) => right( path, 11 ) == "src/main.bx" ) ).toBeTrue();
+					expect( paths.some( ( path ) => findNoCase( "/vendor/", "/" & path ) ) ).toBeFalse();
+				} finally {
+					removeFixture( fixture.path );
+				}
+			} );
+
+			it( "rejects a missing projectPath", () => {
+				// ApiProjects.tree() delegates straight to authorizeProjectPath and
+				// translates its ValidationException into a 422 the same way every
+				// other handler in this app does (see ApiRuns.validationError).
+				expect(
+					() => getInstance( "SecurityContextService" ).authorizeProjectPath(
+							getInstance( "SecurityContextService" ).defaultContext(),
+							"default",
+							""
+						)
+				).toThrow( type = "ValidationException" );
+			} );
+
+			it( "persists the selected files so a review run only scans that subset", () => {
+				var fixture = createFixture();
+				try {
+					var run = getInstance( "ReviewRunService" ).create(
+							{
+								projectPath  : fixture.path,
+								mode         : "full",
+								selectedFiles: [ "src/main.bx"]
+							},
+							getInstance( "SecurityContextService" ).defaultContext()
+						);
+					expect( run.getMemento().input.selectedFiles ).toBe( [ "src/main.bx"] );
+				} finally {
+					removeFixture( fixture.path );
+				}
+			} );
+
+			it( "leaves input empty when selectedFiles is omitted (scans everything)", () => {
+				var fixture = createFixture();
+				try {
+					var run = getInstance( "ReviewRunService" ).create(
+							{ projectPath: fixture.path, mode: "full" },
+							getInstance( "SecurityContextService" ).defaultContext()
+						);
+					expect( run.getMemento().input ).toBeStruct();
+					expect( run.getMemento().input.count() ).toBe( 0 );
+				} finally {
+					removeFixture( fixture.path );
+				}
+			} );
+		} );
+	}
+
+	private struct function createFixture() {
+		var path = getTempDirectory() & "doublecheck-picker-" & replace(
+			lCase( createUUID() ),
+			"-",
+			"",
+			"all"
+		);
+		directoryCreate( path & "/src", true, true );
+		directoryCreate( path & "/vendor", true, true );
+		fileWrite( path & "/src/main.bx", "function run() {}" );
+		fileWrite( path & "/vendor/lib.bx", "function lib() {}" );
+		return { path: path };
+	}
+
+	private void function removeFixture( required string path ) {
+		var canonical = createObject( "java", "java.io.File" ).init( arguments.path ).getCanonicalFile();
+		var tempRoot = createObject( "java", "java.io.File" ).init( getTempDirectory() ).getCanonicalFile();
+		if (
+			canonical.toPath().startsWith( tempRoot.toPath() ) && findNoCase( "doublecheck-picker-", canonical.getName() ) == 1 &&
+				directoryExists( canonical.getPath() )
+		) {
+			directoryDelete( canonical.getPath(), true );
+		}
+	}
+}

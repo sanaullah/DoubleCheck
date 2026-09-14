@@ -1,0 +1,2 @@
+CREATE TABLE orders (id BIGSERIAL PRIMARY KEY, sku TEXT NOT NULL);
+CREATE UNIQUE INDEX uq_orders_sku ON orders(sku);

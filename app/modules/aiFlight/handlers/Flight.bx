@@ -1,0 +1,884 @@
+/**
+ * Langfuse-style explorer for ai-flight traces.
+ */
+class {
+	property name="store" inject="TraceStoreService@aiFlight";
+
+	property name="listener" inject="AiFlightListener@aiFlight";
+
+	property name="filterService" inject="FilterService@aiFlight";
+
+	property name="searchService" inject="SearchService@aiFlight";
+
+	property name="costAnalyticsService" inject="CostAnalyticsService@aiFlight";
+
+	property name="benchmarkingService" inject="BenchmarkingService@aiFlight";
+
+	property name="anomalyDetectionService" inject="AnomalyDetectionService@aiFlight";
+
+	property name="datasetService" inject="DatasetService@aiFlight";
+
+	property name="abTestingService" inject="ABTestingService@aiFlight";
+
+	property name="debugService" inject="DebugService@aiFlight";
+
+	property name="batchService" inject="BatchService@aiFlight";
+
+	property name="webhookService" inject="WebhookService@aiFlight";
+
+	property name="visualizationService" inject="VisualizationService@aiFlight";
+
+	property name="dataQualityService" inject="DataQualityService@aiFlight";
+
+	property name="notificationService" inject="NotificationService@aiFlight";
+
+	property name="moduleSettings" inject="coldbox:moduleSettings:aiFlight";
+
+	function preHandler( event, rc, prc ) {
+		if ( !flag( moduleSettings.viewerEnabled ?: true ) ) {
+			event.renderData(
+					type       = "plain",
+					data       = "ai-flight viewer disabled",
+					statusCode = 404
+				);
+			event.noRender();
+			return;
+		}
+		prc.pollSeconds = int( val( moduleSettings.pollSeconds ?: 2 ) );
+		prc.moduleEntry = "aiflight";
+
+		// Host toModuleRouting does not always apply module defaultLayout — force ours
+		// so DoubleCheck Main.bxm + app.js do not wrap this explorer.
+		if ( !reFindNoCase( "^api", event.getCurrentAction() ) ) {
+			event.setLayout( name = "Flight", module = "aiFlight" );
+		} else {
+			event.noLayout();
+		}
+	}
+
+	function index( event, rc, prc ) {
+		prc.pageTitle = "AiFlight";
+		prc.traces = store.listTraces( argumentCollection = listFilterArgs( rc ) );
+		prc.filters = filterStruct( rc );
+		prc.selectedTraceId = trim( rc.id ?: "" );
+		event.setView( "flight/index" );
+	}
+
+	function trace( event, rc, prc ) {
+		// Old deep links → same workspace with hash (no separate page)
+		var id = trim( rc.id ?: "" );
+		relocate( url = "/aiflight/##trace/#urlEncodedFormat( id )#" );
+	}
+
+	function apiSessions( event, rc, prc ) {
+		event.renderData(
+				type = "json",
+				data = { sessions: store.listSessions( limit = int( val( rc.limit ?: 50 ) ) ) }
+			);
+	}
+
+	function apiSession( event, rc, prc ) {
+		var detail = store.getSession( trim( rc.id ?: "" ) );
+		if ( !detail.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = detail );
+	}
+
+	function apiTraces( event, rc, prc ) {
+		var rows = store.listTraces( argumentCollection = listFilterArgs( rc ) );
+		event.renderData( type = "json", data = { traces: rows } );
+	}
+
+	function apiTracesFilteredByObservations( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_traceId" },
+					statusCode = 400
+				);
+			return;
+		}
+		var trace = store.getTrace( traceId );
+		if ( !trace.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		var filters = {
+			obsType      : trim( rc.obsType ?: "" ),
+			obsStatus    : trim( rc.obsStatus ?: "" ),
+			minDurationMs: val( rc.minDurationMs ?: 0 ),
+			maxDurationMs: val( rc.maxDurationMs ?: 0 ),
+			searchText   : trim( rc.searchText ?: "" ),
+			tool         : trim( rc.tool ?: "" ),
+			model        : trim( rc.model ?: "" ),
+			hasError     : flag( rc.hasError ?: false )
+		};
+		var filteredObs = store.filterObservations( traceId, filters );
+		event.renderData( type = "json", data = { trace: trace, observations: filteredObs, filters: filters } );
+	}
+
+	function apiTraceMetrics( event, rc, prc ) {
+		var traceId = trim( rc.id ?: "" );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_id" },
+					statusCode = 400
+				);
+			return;
+		}
+		var trace = store.getTrace( traceId );
+		if ( !trace.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		var metrics = store.getTraceMetrics( traceId );
+		event.renderData( type = "json", data = metrics );
+	}
+
+	function apiTraceErrors( event, rc, prc ) {
+		var traceId = trim( rc.id ?: "" );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_id" },
+					statusCode = 400
+				);
+			return;
+		}
+		var trace = store.getTrace( traceId );
+		if ( !trace.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		var errors = store.getTraceErrors( traceId );
+		event.renderData( type = "json", data = { trace: trace, errors: errors } );
+	}
+
+	function apiTraceExport( event, rc, prc ) {
+		var traceId = trim( rc.id ?: "" );
+		var format = lCase( trim( rc.format ?: "json" ) );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_id" },
+					statusCode = 400
+				);
+			return;
+		}
+		if ( !listFindNoCase( "json,csv,markdown", format ) ) {
+			format = "json";
+		}
+		var trace = store.getTrace( traceId );
+		if ( !trace.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		var obs = store.listObservations( traceId );
+		var exported = store.exportTrace( trace, obs, format );
+		var filename = "trace_" & dateFormat( now(), "yyyymmdd_hhmmss" ) & "." & ( format == "markdown" ? "md" : format );
+		var contentType = format == "json" ? "application/json" : ( format == "csv" ? "text/csv" : "text/markdown" );
+		event.setHTTPHeader( name = "Content-Disposition", value = 'attachment; filename="' & filename & '"' );
+		event.setHTTPHeader( name = "Content-Type", value = contentType );
+		event.renderData( type = "plain", data = exported, statusCode = 200 );
+	}
+
+	function apiTrace( event, rc, prc ) {
+		var detail = store.getTraceDetail( trim( rc.id ?: "" ) );
+		if ( !detail.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = detail );
+	}
+
+	function apiTraceObservationTree( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_traceId" },
+					statusCode = 400
+				);
+			return;
+		}
+		var trace = store.getTrace( traceId );
+		if ( !trace.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		var obsTree = store.getObservationTree( traceId );
+		event.renderData( type = "json", data = { trace: trace, observationTree: obsTree } );
+	}
+
+	function apiObservation( event, rc, prc ) {
+		var obsId = trim( rc.obsId ?: rc.id ?: "" );
+		if ( !len( obsId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_obsId" },
+					statusCode = 400
+				);
+			return;
+		}
+		var obs = store.getObservation( obsId );
+		if ( !obs.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = obs );
+	}
+
+	function apiTraceFeedback( event, rc, prc ) {
+		var id = trim( rc.id ?: "" );
+		var method = uCase( event.getHTTPMethod() );
+		if ( method == "PUT" || method == "POST" ) {
+			return putTraceFeedback( event, rc, prc, id );
+		}
+		if ( method == "DELETE" ) {
+			return deleteTraceFeedback( event, rc, prc, id );
+		}
+		event.renderData(
+				type       = "json",
+				data       = { error: "method_not_allowed" },
+				statusCode = 405
+			);
+	}
+
+	function apiStats( event, rc, prc ) {
+		event.renderData( type = "json", data = store.getStats() );
+	}
+
+	function apiStatus( event, rc, prc ) {
+		listener.registerWithRuntime();
+		event.renderData(
+				type = "json",
+				data = {
+					listener: listener.getStatus(),
+					dbPath  : store.getDbPath(),
+					traces  : arrayLen( store.listTraces( limit = 1 ) )
+				}
+			);
+	}
+
+	/**
+	 * Dev probe: fire synthetic bx-ai announces and return resulting traces.
+	 */
+	function apiProbe( event, rc, prc ) {
+		listener.registerWithRuntime();
+		var before = arrayLen( store.listTraces( limit = 50 ) );
+
+		// 1) Direct invoke — proves persist path
+		listener.onAIChatRequest(
+				{
+					dataPacket: {
+						model   : "probe-model",
+						messages: [ { role: "user", content: "direct hello" }]
+					},
+					provider: "probe-direct"
+				}
+			);
+		listener.onAIChatResponse(
+				{
+					response: "direct world",
+					provider: "probe-direct",
+					model   : "probe-model"
+				}
+			);
+		var afterDirect = arrayLen( store.listTraces( limit = 50 ) );
+
+		// 2) Via BoxAnnounce — proves interceptor bus
+		BoxAnnounce(
+			"onAIChatRequest",
+			{
+				dataPacket: {
+					model   : "probe-model",
+					messages: [ { role: "user", content: "announce hello" }]
+				},
+				provider: "probe-announce"
+			}
+		);
+		BoxAnnounce(
+			"onAIChatResponse",
+			{
+				response: "announce world",
+				provider: "probe-announce",
+				model   : "probe-model"
+			}
+		);
+		var afterAnnounce = arrayLen( store.listTraces( limit = 50 ) );
+
+		event.renderData(
+				type = "json",
+				data = {
+					before       : before,
+					afterDirect  : afterDirect,
+					afterAnnounce: afterAnnounce,
+					traces       : store.listTraces( limit = 5 ),
+					listener     : listener.getStatus()
+				}
+			);
+	}
+
+	function apiSaveFilter( event, rc, prc ) {
+		var body = event.getHTTPContent( json = true );
+		var name = trim( body.name ?: rc.name ?: "" );
+		var filterDef = body.filterDef ?: {};
+		if ( !len( name ) || !filterDef.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_name_or_filterDef" },
+					statusCode = 400
+				);
+			return;
+		}
+		var result = filterService.saveFilter( name, filterDef );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiListSavedFilters( event, rc, prc ) {
+		var filters = filterService.listSavedFilters();
+		event.renderData( type = "json", data = { filters: filters } );
+	}
+
+	function apiCohortAnalysis( event, rc, prc ) {
+		var filters1 = {
+			status       : trim( rc.status1 ?: "" ),
+			q            : trim( rc.q1 ?: "" ),
+			model        : trim( rc.model1 ?: "" ),
+			environment  : trim( rc.environment1 ?: "" )
+		};
+		var filters2 = {
+			status       : trim( rc.status2 ?: "" ),
+			q            : trim( rc.q2 ?: "" ),
+			model        : trim( rc.model2 ?: "" ),
+			environment  : trim( rc.environment2 ?: "" )
+		};
+		var stats = filterService.getCohortStats( filters1, filters2 );
+		event.renderData( type = "json", data = stats );
+	}
+
+	function apiSearch( event, rc, prc ) {
+		var query = trim( rc.q ?: "" );
+		if ( !len( query ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_q" },
+					statusCode = 400
+				);
+			return;
+		}
+		var limit = int( val( rc.limit ?: 50 ) );
+		var offset = int( val( rc.offset ?: 0 ) );
+		var results = searchService.search( query, { limit: limit, offset: offset } );
+		event.renderData( type = "json", data = results );
+	}
+
+	function apiSearchSuggestions( event, rc, prc ) {
+		var prefix = trim( rc.prefix ?: "" );
+		if ( !len( prefix ) ) {
+			event.renderData( type = "json", data = { suggestions: [] } );
+			return;
+		}
+		var limit = int( val( rc.limit ?: 10 ) );
+		var suggestions = searchService.getSearchSuggestions( prefix, limit );
+		event.renderData( type = "json", data = { suggestions: suggestions } );
+	}
+
+	function apiSaveSearchQuery( event, rc, prc ) {
+		var name = trim( rc.name ?: "" );
+		var query = trim( rc.q ?: "" );
+		if ( !len( name ) || !len( query ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_name_or_q" },
+					statusCode = 400
+				);
+			return;
+		}
+		var result = searchService.saveSearchQuery( name, query );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiRecentSearches( event, rc, prc ) {
+		var limit = int( val( rc.limit ?: 5 ) );
+		var searches = searchService.getRecentSearches( limit );
+		event.renderData( type = "json", data = { searches: searches } );
+	}
+
+	function apiObservationFeedback( event, rc, prc ) {
+		var method = uCase( event.getHTTPMethod() );
+		var obsId = trim( rc.obsId ?: rc.id ?: "" );
+
+		if ( !len( obsId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_obsId" },
+					statusCode = 400
+				);
+			return;
+		}
+
+		if ( method == "PUT" || method == "POST" ) {
+			var body = {};
+			try {
+				body = event.getHTTPContent( json = true );
+			} catch (any e) {
+				body = rc;
+			}
+
+			var rating = int( val( body.rating ?: rc.rating ?: 0 ) );
+			var feedback = toString( body.feedback ?: rc.feedback ?: "" );
+			var signal = toString( body.signal ?: rc.signal ?: "" );
+
+			// Signal types: copied, resubmitted, time_spent, quality_issue, helpful
+			if ( rating >= 1 && rating <= 5 ) {
+				// Store rating feedback
+				store.upsertObservationFeedback( obsId, rating, feedback, signal );
+			}
+
+			event.renderData( type = "json", data = { success: true } );
+			return;
+		}
+
+		if ( method == "DELETE" ) {
+			store.clearObservationFeedback( obsId );
+			event.renderData( type = "json", data = {}, statusCode = 204 );
+			return;
+		}
+
+		event.renderData(
+				type       = "json",
+				data       = { error: "method_not_allowed" },
+				statusCode = 405
+			);
+	}
+
+	function apiFeedbackStats( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		if ( len( traceId ) ) {
+			var stats = store.getTraceFeedbackStats( traceId );
+			event.renderData( type = "json", data = stats );
+		} else {
+			var globalStats = store.getGlobalFeedbackStats();
+			event.renderData( type = "json", data = globalStats );
+		}
+	}
+
+	function apiCostAnalytics( event, rc, prc ) {
+		var filters = {
+			period: trim( rc.period ?: "day" ),
+			startDate: len( rc.startDate ?: "" ) ? parseDateTime( rc.startDate ) : dateAdd( "d", -30, now() ),
+			endDate: len( rc.endDate ?: "" ) ? parseDateTime( rc.endDate ) : now()
+		};
+		var analytics = costAnalyticsService.getCostAnalytics( filters );
+		event.renderData( type = "json", data = analytics );
+	}
+
+	function apiCostPerRequest( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: rc.id ?: "" );
+		if ( !len( traceId ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "missing_traceId" },
+					statusCode = 400
+				);
+			return;
+		}
+		var costs = costAnalyticsService.getCostPerRequest( traceId );
+		event.renderData( type = "json", data = costs );
+	}
+
+	function apiCostComparison( event, rc, prc ) {
+		var models = [];
+		try {
+			models = event.getHTTPContent( json = true ).models ?: [];
+		} catch (any e) {
+			models = [];
+		}
+		var comparison = costAnalyticsService.compareCosts( models );
+		event.renderData( type = "json", data = comparison );
+	}
+
+	function apiCostForecast( event, rc, prc ) {
+		var days = int( val( rc.days ?: 30 ) );
+		var forecast = costAnalyticsService.forecastCosts( days );
+		event.renderData( type = "json", data = forecast );
+	}
+
+	function apiBudgetStatus( event, rc, prc ) {
+		var period = int( val( rc.period ?: 1 ) );
+		var status = costAnalyticsService.getBudgetStatus( period );
+		event.renderData( type = "json", data = status );
+	}
+
+	function apiCostEfficiency( event, rc, prc ) {
+		var metrics = costAnalyticsService.getEfficiencyMetrics();
+		event.renderData( type = "json", data = metrics );
+	}
+
+	function apiLatencyBenchmarks( event, rc, prc ) {
+		var filters = {
+			period: trim( rc.period ?: "day" ),
+			days: int( val( rc.days ?: 30 ) )
+		};
+		var benchmarks = benchmarkingService.getLatencyBenchmarks( filters );
+		event.renderData( type = "json", data = benchmarks );
+	}
+
+	function apiTokenEfficiency( event, rc, prc ) {
+		var filters = {
+			period: trim( rc.period ?: "day" ),
+			days: int( val( rc.days ?: 30 ) )
+		};
+		var efficiency = benchmarkingService.getTokenEfficiency( filters );
+		event.renderData( type = "json", data = efficiency );
+	}
+
+	function apiQualityTrends( event, rc, prc ) {
+		var filters = {
+			period: trim( rc.period ?: "day" ),
+			days: int( val( rc.days ?: 30 ) )
+		};
+		var trends = benchmarkingService.getQualityTrends( filters );
+		event.renderData( type = "json", data = trends );
+	}
+
+	function apiBaselineComparison( event, rc, prc ) {
+		var baseline = trim( rc.baseline ?: "week_ago" );
+		var comparison = benchmarkingService.compareToBaseline( baseline );
+		event.renderData( type = "json", data = comparison );
+	}
+
+	function apiCostAttribution( event, rc, prc ) {
+		var filters = {};
+		var attribution = benchmarkingService.getCostAttribution( filters );
+		event.renderData( type = "json", data = attribution );
+	}
+
+	function apiCostForecast2( event, rc, prc ) {
+		var days = int( val( rc.days ?: 30 ) );
+		var model = trim( rc.model ?: "linear" );
+		var forecast = benchmarkingService.forecastCosts( days, model );
+		event.renderData( type = "json", data = forecast );
+	}
+
+	function apiRateCard( event, rc, prc ) {
+		var rates = benchmarkingService.getRateCard();
+		event.renderData( type = "json", data = rates );
+	}
+
+	function apiRateHistory( event, rc, prc ) {
+		var history = benchmarkingService.getRateHistory();
+		event.renderData( type = "json", data = { history: history } );
+	}
+
+	function apiDetectAnomalies( event, rc, prc ) {
+		var options = {
+			lookbackDays: int( val( rc.lookbackDays ?: 7 ) ),
+			sensitivity: trim( rc.sensitivity ?: "normal" ),
+			metrics: rc.metrics ?: "latency,cost,quality"
+		};
+		var result = anomalyDetectionService.detectAnomalies( options );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiCreateAlertRule( event, rc, prc ) {
+		var body = event.getHTTPContent( json = true );
+		var config = {
+			name: trim( body.name ?: "" ),
+			metric: trim( body.metric ?: "" ),
+			condition: trim( body.condition ?: "" ),
+			threshold: val( body.threshold ?: 0 ),
+			action: trim( body.action ?: "in_app" ),
+			enabled: body.enabled ?: true
+		};
+		var result = anomalyDetectionService.createAlertRule( config );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiListAlertRules( event, rc, prc ) {
+		var rules = anomalyDetectionService.listAlertRules();
+		event.renderData( type = "json", data = { rules: rules } );
+	}
+
+	function apiAnomalyStats( event, rc, prc ) {
+		var days = int( val( rc.days ?: 7 ) );
+		var stats = anomalyDetectionService.getAnomalyStats( days );
+		event.renderData( type = "json", data = stats );
+	}
+
+	function apiAnomalyTrend( event, rc, prc ) {
+		var days = int( val( rc.days ?: 30 ) );
+		var trend = anomalyDetectionService.getAnomalyTrend( days );
+		event.renderData( type = "json", data = trend );
+	}
+
+	function apiCreateDataset( event, rc, prc ) {
+		var body = event.getHTTPContent( json = true );
+		var name = trim( body.name ?: "" );
+		var description = trim( body.description ?: "" );
+		var filters = body.filters ?: {};
+		if ( !len( name ) ) {
+			event.renderData( type = "json", data = { error: "missing_name" }, statusCode = 400 );
+			return;
+		}
+		var result = datasetService.createDataset( name, filters, description );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiListDatasets( event, rc, prc ) {
+		var limit = int( val( rc.limit ?: 50 ) );
+		var datasets = datasetService.listDatasets( limit );
+		event.renderData( type = "json", data = { datasets: datasets } );
+	}
+
+	function apiEvaluateTrace( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		var evaluatorId = trim( rc.evaluatorId ?: "" );
+		if ( !len( traceId ) || !len( evaluatorId ) ) {
+			event.renderData( type = "json", data = { error: "missing_params" }, statusCode = 400 );
+			return;
+		}
+		var result = datasetService.evaluateTrace( traceId, evaluatorId );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiCreateABTest( event, rc, prc ) {
+		var body = event.getHTTPContent( json = true );
+		var name = trim( body.name ?: "" );
+		var variants = body.variants ?: [];
+		if ( !len( name ) || !variants.len() ) {
+			event.renderData( type = "json", data = { error: "missing_params" }, statusCode = 400 );
+			return;
+		}
+		var result = abTestingService.createTest( name, variants );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiGetActiveTests( event, rc, prc ) {
+		var tests = abTestingService.getActiveTests();
+		event.renderData( type = "json", data = { tests: tests } );
+	}
+
+	function apiCompareVariants( event, rc, prc ) {
+		var testId = trim( rc.testId ?: "" );
+		if ( !len( testId ) ) {
+			event.renderData( type = "json", data = { error: "missing_testId" }, statusCode = 400 );
+			return;
+		}
+		var comparison = abTestingService.compareVariants( testId );
+		event.renderData( type = "json", data = comparison );
+	}
+
+	function apiEndABTest( event, rc, prc ) {
+		var testId = trim( rc.testId ?: "" );
+		var winner = trim( rc.winner ?: "" );
+		if ( !len( testId ) ) {
+			event.renderData( type = "json", data = { error: "missing_testId" }, statusCode = 400 );
+			return;
+		}
+		var result = abTestingService.endTest( testId, winner );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiReplayTrace( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		var overrides = event.getHTTPContent( json = true ).overrides ?: {};
+		if ( !len( traceId ) ) {
+			event.renderData( type = "json", data = { error: "missing_traceId" }, statusCode = 400 );
+			return;
+		}
+		var result = debugService.replayTrace( traceId, overrides );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiStateDiff( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		var diffs = debugService.getStateDiff( traceId );
+		event.renderData( type = "json", data = diffs );
+	}
+
+	function apiSubmitBatchJob( event, rc, prc ) {
+		var operation = trim( rc.operation ?: "" );
+		var params = event.getHTTPContent( json = true ).params ?: {};
+		if ( !len( operation ) ) {
+			event.renderData( type = "json", data = { error: "missing_operation" }, statusCode = 400 );
+			return;
+		}
+		var result = batchService.submitBatchJob( operation, params );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiGetBatchStatus( event, rc, prc ) {
+		var jobId = trim( rc.jobId ?: "" );
+		var status = batchService.getBatchJobStatus( jobId );
+		event.renderData( type = "json", data = status );
+	}
+
+	function apiRegisterWebhook( event, rc, prc ) {
+		var url = trim( rc.url ?: "" );
+		var events = rc.events ?: [ "*" ];
+		if ( !len( url ) ) {
+			event.renderData( type = "json", data = { error: "missing_url" }, statusCode = 400 );
+			return;
+		}
+		var result = webhookService.registerWebhook( url, events );
+		event.renderData( type = "json", data = result );
+	}
+
+	function apiListWebhooks( event, rc, prc ) {
+		var webhooks = webhookService.listWebhooks();
+		event.renderData( type = "json", data = { webhooks: webhooks } );
+	}
+
+	function apiGetFlameGraph( event, rc, prc ) {
+		var traceId = trim( rc.traceId ?: "" );
+		var graph = visualizationService.generateFlameGraph( traceId );
+		event.renderData( type = "json", data = graph );
+	}
+
+	function apiGetDataQuality( event, rc, prc ) {
+		var report = dataQualityService.getDataQualityReport();
+		event.renderData( type = "json", data = report );
+	}
+
+	function apiSendNotification( event, rc, prc ) {
+		var channel = trim( rc.channel ?: "in_app" );
+		var message = event.getHTTPContent( json = true ).message ?: {};
+		var result = { success: true };
+		event.renderData( type = "json", data = result );
+	}
+
+	private boolean function flag( required any value ) {
+		return listFindNoCase( "true,yes,1,on", toString( arguments.value ) ) > 0;
+	}
+
+	private function putTraceFeedback( event, rc, prc, required string id ) {
+		var body = {};
+		try {
+			body = event.getHTTPContent( json = true );
+		} catch (any e) {
+			body = {};
+		}
+		if ( !isStruct( body ) || !body.count() ) {
+			body = rc;
+		}
+		var value = trim( toString( body.value ?: rc.value ?: "" ) );
+		var comment = toString( body.comment ?: rc.comment ?: "" );
+		try {
+			var feedback = store.upsertFeedback( id, value, comment );
+		} catch ("AiFlight.InvalidFeedback" e) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "invalid_value", message: e.message },
+					statusCode = 400
+				);
+			return;
+		}
+		if ( !feedback.count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData( type = "json", data = { feedback: feedback } );
+	}
+
+	private function deleteTraceFeedback( event, rc, prc, required string id ) {
+		if ( !store.getTrace( id ).count() ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		if ( !store.clearFeedback( id ) ) {
+			event.renderData(
+					type       = "json",
+					data       = { error: "not_found" },
+					statusCode = 404
+				);
+			return;
+		}
+		event.renderData(
+				type       = "json",
+				data       = {},
+				statusCode = 204
+			);
+	}
+
+	private struct function filterStruct( required struct rc ) {
+		return {
+			status       : trim( arguments.rc.status ?: "" ),
+			q            : trim( arguments.rc.q ?: "" ),
+			hasTools     : flag( arguments.rc.hasTools ?: false ),
+			hasErrors    : flag( arguments.rc.hasErrors ?: false ),
+			model        : trim( arguments.rc.model ?: "" ),
+			userId       : trim( arguments.rc.userId ?: "" ),
+			environment  : trim( arguments.rc.environment ?: "" ),
+			obsType      : trim( arguments.rc.obsType ?: "" ),
+			minDurationMs: trim( arguments.rc.minDurationMs ?: "" ),
+			maxDurationMs: trim( arguments.rc.maxDurationMs ?: "" ),
+			minCost      : trim( arguments.rc.minCost ?: "" ),
+			feedback     : trim( arguments.rc.feedback ?: "" )
+		};
+	}
+
+	private struct function listFilterArgs( required struct rc ) {
+		var f = filterStruct( arguments.rc );
+		return {
+			limit        : int( val( arguments.rc.limit ?: 50 ) ),
+			status       : f.status,
+			search       : f.q,
+			hasTools     : f.hasTools,
+			hasErrors    : f.hasErrors,
+			model        : f.model,
+			userId       : f.userId,
+			environment  : f.environment,
+			obsType      : f.obsType,
+			minDurationMs: val( f.minDurationMs ),
+			maxDurationMs: val( f.maxDurationMs ),
+			minCost      : val( f.minCost ),
+			feedback     : f.feedback
+		};
+	}
+}

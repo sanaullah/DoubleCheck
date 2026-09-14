@@ -1,0 +1,873 @@
+/**
+ * Canonical placement contract for Modernize v2.
+ *
+ * The provider may still return the v1 context/extract vocabulary. This
+ * service converts that vocabulary into one owning placement per target unit,
+ * gives each placement a stable identity, and exposes a compatibility
+ * projection for older callers. The persisted plan remains one JSON artifact;
+ * contexts/extracts are explicitly marked as a legacy projection.
+ */
+@singleton
+class threadsafe {
+	property name="identityService" inject="ModernizationIdentityService";
+	property name="modernizationTargetPathService" inject="ModernizationTargetPathService";
+
+	variables.version = "modernization-placement-v1";
+	variables.planVersion = "modernization-plan-v2";
+	variables.maxPlacements = 48;
+
+	function init() {
+		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) variables.identityService = new app.models.services.ModernizationIdentityService();
+		return this;
+	}
+
+	string function planVersion() {
+		return variables.planVersion;
+	}
+
+	string function placementVersion() {
+		return variables.version;
+	}
+
+	/**
+	 * Whether a placement stays inside the monolith.
+	 *
+	 * Pure derivation from `placementType`, and the sole owner of that rule. The
+	 * same expression was inlined in five places, which is how the volatile-key
+	 * list in section 2.7 came to disagree with itself. Step 3b stops persisting
+	 * the value entirely; until then, at least everything computes it the same
+	 * way.
+	 */
+	boolean function staysInMonolith( required any placementType ) {
+		return ![ "external-service" ].contains( lCase( trim( toString( arguments.placementType ?: "" ) ) ) );
+	}
+
+	/**
+	 * Promote a generated plan to the canonical v2 contract.
+	 */
+	struct function canonicalize( required struct plan, struct evidence = {} ) {
+		var output = duplicate( arguments.plan );
+		output = repairStringifiedPhaseCollections( output );
+		var target = isStruct( output.target ?: "" ) ? output.target : {};
+		target.units = isArray( target.units ?: "" ) ? target.units : [];
+		var rawPlacements = isArray( target.placements ?: "" ) ? target.placements : [];
+		var hadCanonicalPlacements = rawPlacements.len() > 0;
+
+		var normalized = normalizePlacements( rawPlacements, target.units, arguments.plan, arguments.evidence );
+		var coverage = assignUnownedUnits( normalized, target.units, arguments.plan, arguments.evidence );
+		normalized = coverage.placements;
+
+		// A placement owning nothing is a lane with no cargo: it blocks validation
+		// and tells a reader nothing. Providers emit these when a named grouping
+		// loses all its units to alias resolution or de-duplication.
+		var owned = [];
+		for ( var candidatePlacement in normalized ) {
+			if ( !isStruct( candidatePlacement ) ) continue;
+			if ( isArray( candidatePlacement.targetUnitIds ?: "" ) && candidatePlacement.targetUnitIds.len() ) owned.append( candidatePlacement );
+		}
+		normalized = owned;
+		target.placements = normalized;
+		applyModulePackagingPaths( normalized, target.units, output );
+		target.placementContractVersion = variables.version;
+		output.target = target;
+		output.version = variables.planVersion;
+		output.schemaVersion = variables.planVersion;
+		output.placementContractVersion = variables.version;
+		output.placementCoverage = coverage.summary;
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.placementContract = {
+			version: variables.version,
+			planVersion: variables.planVersion,
+			source: hadCanonicalPlacements ? "provider-v2" : "derived"
+		};
+		output.metadata.placementSummary = placementSummary( normalized );
+		return output;
+	}
+
+	/**
+	 * Adapt a persisted artifact for API/UI reads without changing its
+	 * historical schemaVersion, fingerprint, or stored source semantics.
+	 */
+	/**
+	 * Restores roadmap phase collections that reached the plan as text.
+	 *
+	 * A phase field can arrive stringified — `"[\n    phase-media-player\n]"` is
+	 * BoxLang's array toString(), not JSON — and a stored plan in that shape
+	 * breaks the workspace outright: the UI's `(phase.dependencies || [])` guard
+	 * is useless because a non-empty string is truthy, so `.forEach` throws and
+	 * nothing renders.
+	 *
+	 * This runs inside canonicalize() so generation, post-repair, and read all
+	 * get it, which means plans already persisted in the broken shape load again
+	 * without a rebuild. Arrays of objects (migrationSteps) cannot be recovered
+	 * from that notation, so they are emptied rather than guessed at, and the
+	 * loss is recorded on the phase.
+	 */
+	private struct function repairStringifiedPhaseCollections( required struct plan ) {
+		if ( !isArray( arguments.plan.roadmapPhases ?: "" ) ) return arguments.plan;
+		var tokenFields = [ "dependencies", "unitIds", "routeIds", "dbFindingIds", "transitionIds", "sampleIds", "componentIds", "exitCriteria", "risks", "assumptions" ];
+		var objectFields = [ "migrationSteps" ];
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) ) continue;
+			var repaired = [];
+			for ( var field in tokenFields ) {
+				if ( !structKeyExists( phase, field ) || isArray( phase[ field ] ) ) continue;
+				phase[ field ] = tokensFromStringifiedArray( phase[ field ] );
+				repaired.append( field );
+			}
+			for ( var objectField in objectFields ) {
+				if ( !structKeyExists( phase, objectField ) || isArray( phase[ objectField ] ) ) continue;
+				phase[ objectField ] = [];
+				repaired.append( objectField );
+			}
+			if ( repaired.len() ) phase.repairedCollections = repaired;
+		}
+		return arguments.plan;
+	}
+
+	/** Splits BoxLang/provider array-ish text back into bounded tokens. */
+	private array function tokensFromStringifiedArray( required any value ) {
+		if ( isArray( arguments.value ) ) return duplicate( arguments.value );
+		if ( !isSimpleValue( arguments.value ) ) return [];
+		var text = trim( toString( arguments.value ) );
+		if ( !len( text ) ) return [];
+		text = reReplace( text, "^[[:space:]]*\[|\][[:space:]]*$", "", "all" );
+		text = replace( text, '"', "", "all" );
+		text = reReplace( text, "[,\r\n]+", ",", "all" );
+		var output = [];
+		for ( var item in listToArray( text, "," ) ) {
+			var normalized = trim( item );
+			if ( !len( normalized ) ) continue;
+			var duplicated = false;
+			for ( var existing in output ) if ( compareNoCase( toString( existing ), normalized ) == 0 ) { duplicated = true; break; }
+			if ( !duplicated ) output.append( normalized );
+		}
+		return output;
+	}
+
+	/**
+	 * One plan version, one read path.
+	 *
+	 * This used to branch: v2 artifacts canonicalized, older ones canonicalized
+	 * *and* had their pre-v2 identity preserved so a historical decision stream
+	 * still matched. With the legacy projection gone there is one shape, so the
+	 * branch collapsed to the same call twice.
+	 */
+	struct function adaptForRead( required struct plan ) {
+		return this.canonicalize( arguments.plan, {} );
+	}
+
+	array function getPlacements( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		return isArray( target.placements ?: "" ) ? target.placements : [];
+	}
+
+	/**
+	 * Re-fingerprint placements after deterministic gates have been attached.
+	 */
+	struct function refreshFingerprints( required struct plan ) {
+		var output = duplicate( arguments.plan );
+		var target = isStruct( output.target ?: "" ) ? output.target : {};
+		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
+			if ( !isStruct( placement ) ) continue;
+			placement.itemFingerprint = identityService.itemFingerprint(
+				"placement",
+				identityService.withoutVolatileKeys( placement )
+			);
+		}
+		output.target = target;
+		return output;
+	}
+
+	private array function normalizePlacements(
+		required array rawPlacements,
+		required array units,
+		required struct plan,
+		required struct evidence
+	) {
+		var output = [];
+		var seenIds = {};
+		var limit = min( variables.maxPlacements, arguments.rawPlacements.len() );
+		for ( var index = 1; index <= limit; index++ ) {
+			var raw = arguments.rawPlacements[ index ];
+			if ( !isStruct( raw ) ) continue;
+			var placement = duplicate( raw );
+			var unitIds = normalizeIds( placement.targetUnitIds ?: placement.unitIds ?: [] );
+			placement.targetUnitIds = unitIds;
+			placement.unitIds = unitIds;
+			placement.placementType = normalizePlacementType( placement.placementType ?: placement.packaging ?: ( placement.stayInMonolith ?: "main-app" ) );
+			placement.packaging = placement.packaging ?: packagingFor( placement.placementType );
+			placement.evidenceBasis = lCase( trim( placement.evidenceBasis ?: "provider-suggested" ) );
+			// "coupling-derived" is the strongest basis there is: membership came
+			// from structural edges, table co-access and shared scope rather than
+			// from anyone's suggestion. Without it in this list a derived verdict
+			// was silently relabelled "provider-suggested" — the artifact then
+			// credited the model for a decision the graph made, which is a
+			// provenance lie in the direction that matters most.
+			if ( ![ "coupling-derived", "explicit-seam", "domain-clustering", "provider-suggested", "conservative-default" ].contains( placement.evidenceBasis ) ) placement.evidenceBasis = "provider-suggested";
+			placement.evidenceRefs = normalizeEvidenceRefs( placement.evidenceRefs ?: placement.evidence ?: [] );
+			// An id is a content hash, never a label. Falling back to it printed
+			// "add46fccc0a6e039d273ad806476b60568f1c…" as a lane name on the map
+			// whenever the provider omitted a name. The domainKey is the human
+			// concept behind the lane ("core-application", "data-access"), so
+			// humanize that instead and keep ids out of the display path.
+			placement.name = trim( placement.name ?: placement.title ?: "" );
+			if ( !len( placement.name ) || isPlacementIdLike( placement.name ) ) {
+				var domainLabel = humanizeDomainKey( trim( toString( placement.domainKey ?: "" ) ) );
+				placement.name = len( domainLabel ) && !isPlacementIdLike( domainLabel ) ? domainLabel : "Capability";
+			}
+			placement.purpose = trim( placement.purpose ?: placement.reason ?: placement.recommendation ?: "" );
+			placement.recommendation = trim( placement.recommendation ?: placement.purpose ?: "Keep the capability in the new main application until stronger boundary evidence exists." );
+			placement.sourceItemType = placement.sourceItemType ?: ( placement.placementType == "external-service" ? "extract" : "context" );
+			placement.sourceItemId = placement.sourceItemId ?: placement.id ?: placement.itemId ?: "";
+			placement.id = stablePlacementId( placement, units );
+			if ( seenIds.keyExists( placement.id ) ) {
+				placement.id = placement.id & "-" & index;
+			}
+			seenIds[ placement.id ] = true;
+			placement.newProposal = placement.newProposal ?: false;
+			placement.provenanceClass = placement.provenanceClass ?: ( placement.evidenceBasis == "conservative-default" ? "deterministically-derived" : "provider-suggested" );
+			placement.itemFingerprint = stableFingerprint( placement );
+			output.append( placement );
+		}
+		return output;
+	}
+
+	private struct function assignUnownedUnits(
+		required array placements,
+		required array units,
+		required struct plan,
+		required struct evidence
+	) {
+		var ownerByUnit = {};
+		var duplicates = [];
+		for ( var placement in arguments.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			var uniqueIds = [];
+			for ( var unitId in normalizeIds( placement.targetUnitIds ?: [] ) ) {
+				if ( ownerByUnit.keyExists( unitId ) ) {
+					duplicates.append( unitId );
+					continue;
+				}
+				ownerByUnit[ unitId ] = placement.id ?: "";
+				uniqueIds.append( unitId );
+			}
+			placement.targetUnitIds = uniqueIds;
+			placement.unitIds = uniqueIds;
+		}
+
+		var unitIds = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitIds.append( unitId );
+		}
+		var unassigned = [];
+		for ( var unitId in unitIds ) if ( !ownerByUnit.keyExists( unitId ) ) unassigned.append( unitId );
+		var gapFilledUnitIds = duplicate( unassigned );
+		if ( unassigned.len() ) {
+			var deterministic = deterministicGapPlacements(
+				unassigned,
+				arguments.units,
+				arguments.plan,
+				arguments.evidence,
+				max( 0, variables.maxPlacements - arguments.placements.len() - 1 )
+			);
+			arguments.placements.append( deterministic.modules, true );
+			var fallback = findMainAppPlacement( arguments.placements );
+			if ( deterministic.mainAppUnitIds.len() && isNull( fallback ) ) {
+				fallback = defaultPlacement( deterministic.mainAppUnitIds, arguments.units, arguments.plan, arguments.evidence );
+				arguments.placements.append( fallback );
+			} else if ( deterministic.mainAppUnitIds.len() ) {
+				var mergedIds = normalizeIds( fallback.targetUnitIds ?: [] );
+				for ( var gapUnitId in deterministic.mainAppUnitIds ) if ( !mergedIds.contains( gapUnitId ) ) mergedIds.append( gapUnitId );
+				fallback.targetUnitIds = mergedIds;
+				fallback.unitIds = fallback.targetUnitIds;
+				fallback.gapFilledUnitIds = normalizeIds( ( fallback.gapFilledUnitIds ?: [] ).append( deterministic.mainAppUnitIds, true ) );
+				fallback.coverageSource = "provider-plus-deterministic-gap-fill";
+				fallback.itemFingerprint = stableFingerprint( fallback );
+			}
+		}
+		var assigned = {};
+		for ( var placement in arguments.placements ) for ( var unitId in normalizeIds( placement.targetUnitIds ?: [] ) ) assigned[ unitId ] = true;
+		var remainingUnassigned = [];
+		for ( var unitId in unitIds ) if ( !assigned.keyExists( unitId ) ) remainingUnassigned.append( unitId );
+		return {
+			placements: arguments.placements,
+			summary: {
+				version: variables.version,
+				totalUnits: unitIds.len(),
+				assignedUnits: assigned.count(),
+				unassignedUnitIds: remainingUnassigned,
+				gapFilledUnitIds: gapFilledUnitIds,
+				duplicateUnitIds: uniqueStrings( duplicates ),
+				coverageSource: gapFilledUnitIds.len() ? "provider-plus-deterministic-gap-fill" : "provider",
+				complete: remainingUnassigned.len() == 0 && duplicates.len() == 0
+			}
+		};
+	}
+
+	/**
+	 * Turn repeated source-directory ownership into conservative ColdBox module
+	 * candidates. This is a packaging hint, not an extraction claim: external
+	 * services remain provider/evidence gated, while shared and small groups stay
+	 * in the main application.
+	 */
+	private struct function deterministicGapPlacements(
+		required array unitIds,
+		required array units,
+		required struct plan,
+		required struct evidence,
+		required numeric moduleLimit
+	) {
+		var allowed = {};
+		for ( var unitId in arguments.unitIds ) allowed[ unitId ] = true;
+		var groups = {};
+		var mainIds = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !len( unitId ) || !allowed.keyExists( unitId ) ) continue;
+			var domainKey = sourceDomainKey( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" );
+			if ( !len( domainKey ) ) {
+				mainIds.append( unitId );
+				continue;
+			}
+			if ( !groups.keyExists( domainKey ) ) groups[ domainKey ] = { domainKey: domainKey, units: [], refs: [] };
+			groups[ domainKey ].units.append( unitId );
+			for ( var ref in normalizeEvidenceRefs( unit.evidenceRefs ?: [] ) ) {
+				if ( groups[ domainKey ].refs.len() < 6 ) groups[ domainKey ].refs.append( ref );
+			}
+		}
+
+		var candidates = groups.keyArray().map( ( key ) => groups[ key ] );
+		candidates.sort( ( a, b ) => {
+			if ( a.units.len() != b.units.len() ) return b.units.len() - a.units.len();
+			return compareNoCase( a.domainKey, b.domainKey );
+		} );
+		var modules = [];
+		for ( var candidate in candidates ) {
+			// A repeated three-unit source boundary is enough to propose a module
+			// review, but never enough to claim an independent service boundary.
+			if ( candidate.units.len() < 3 || modules.len() >= arguments.moduleLimit ) {
+				mainIds.append( candidate.units, true );
+				continue;
+			}
+			var name = moduleDisplayName( candidate.domainKey, candidate.units, arguments.units );
+			var item = {
+				name: name,
+				domainKey: candidate.domainKey,
+				moduleSlug: moduleSlugFor( candidate.domainKey ),
+				purpose: "Keep this repeated feature directory cohesive behind a ColdBox module boundary.",
+				recommendation: "Create a ColdBox module candidate; validate routes, dependencies, and shared data before committing the boundary.",
+				placementType: "coldbox-module",
+				packaging: "coldbox-module",
+				targetUnitIds: duplicate( candidate.units ),
+				unitIds: duplicate( candidate.units ),
+				evidenceRefs: duplicate( candidate.refs ),
+				evidenceBasis: "domain-clustering",
+				provenanceClass: "deterministically-derived",
+				coverageSource: "deterministic-gap-fill",
+				gapFilledUnitIds: duplicate( candidate.units ),
+				stayInMonolith: false,
+				decisionRequired: true,
+				validationStatus: "needs-review",
+				uncertainty: [ "Directory cohesion is observed; runtime, route, dependency, and data ownership still require validation." ],
+				newProposal: true,
+				proposalReason: "Repeated source-directory ownership provides a reviewable module seam."
+			};
+			item.id = stablePlacementId( item, arguments.units );
+			item.itemFingerprint = stableFingerprint( item );
+			modules.append( item );
+		}
+		return { modules: modules, mainAppUnitIds: normalizeIds( mainIds ) };
+	}
+
+	private string function sourceDomainKey( required any sourcePath ) {
+		var path = lCase( replace( trim( toString( arguments.sourcePath ) ), "\", "/", "all" ) );
+		path = reReplace( path, "^\./|/+", "/", "all" );
+		path = reReplace( path, "^/", "" );
+		if ( !len( path ) || reFindNoCase( "(^|/)(application\.|config/|includes?/|layouts?/|interceptors?/|shared/|common/)", path ) ) return "";
+		var parts = listToArray( path, "/" );
+		if ( parts.len() < 2 ) return "";
+		var first = parts[ 1 ];
+		if ( [ "web", "weboffice", "legacy", "src" ].contains( first ) && parts.len() >= 3 ) return first & "/" & parts[ 2 ];
+		return first;
+	}
+
+	/**
+	 * Moves units of a ColdBox-module placement under `modules/<slug>/`.
+	 *
+	 * Declaring a placement `coldbox-module` while its units still target
+	 * `app/handlers/...` is not a ColdBox module — it is the monolith with a
+	 * label. A live run had 49 units in that contradictory state, so the plan
+	 * told an implementer to build a module and then handed them main-app paths.
+	 *
+	 * Only the leading `app/` segment is rewritten; the layer folders underneath
+	 * (handlers, views, models/services) are ColdBox module conventions too, so
+	 * they carry over unchanged. Units already under `modules/` are left alone.
+	 */
+	private void function applyModulePackagingPaths( required array placements, required array units, struct plan = {} ) {
+		var pathRemap = {};
+		var unitsById = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitsById[ unitId ] = unit;
+		}
+		for ( var placement in arguments.placements ) {
+			if ( !isStruct( placement ) ) continue;
+			if ( lCase( trim( toString( placement.placementType ?: "" ) ) ) != "coldbox-module" ) continue;
+			var slug = trim( toString( placement.moduleSlug ?: "" ) );
+			if ( !len( slug ) ) slug = moduleSlugFor( toString( placement.domainKey ?: placement.name ?: "" ) );
+			if ( !len( slug ) ) continue;
+			placement.moduleSlug = slug;
+			placement.moduleRoot = "modules/" & slug;
+			for ( var unitId in ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds : [] ) ) {
+				var unit = unitsById[ trim( toString( unitId ) ) ] ?: {};
+				if ( !isStruct( unit ) || !unit.count() ) continue;
+				var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+				if ( !len( targetPath ) || left( lCase( targetPath ), 8 ) == "modules/" ) continue;
+				var remainder = reReplaceNoCase( targetPath, "^app/", "", "one" );
+				if ( !len( remainder ) || remainder == targetPath && left( lCase( targetPath ), 4 ) == "app/" ) continue;
+				unit.targetPath = "modules/" & slug & "/" & remainder;
+				unit.modulePackaging = { slug: slug, previousTargetPath: targetPath };
+				pathRemap[ lCase( targetPath ) ] = unit.targetPath;
+			}
+		}
+		// Roadmap steps cite target paths directly; a rewrite that skips them
+		// leaves every affected step pointing at a file that no longer exists.
+		if ( !pathRemap.count() || !isArray( arguments.plan.roadmapPhases ?: "" ) ) return;
+		for ( var phase in arguments.plan.roadmapPhases ) {
+			if ( !isStruct( phase ) || !isArray( phase.migrationSteps ?: "" ) ) continue;
+			for ( var step in phase.migrationSteps ) {
+				if ( !isStruct( step ) || !isStruct( step.targetRef ?: "" ) ) continue;
+				var stepPath = lCase( replace( trim( toString( step.targetRef.targetPath ?: "" ) ), "\", "/", "all" ) );
+				if ( len( stepPath ) && pathRemap.keyExists( stepPath ) ) step.targetRef.targetPath = pathRemap[ stepPath ];
+			}
+		}
+	}
+
+	/** True when a value is an opaque identifier rather than something readable. */
+	private boolean function isPlacementIdLike( required string value ) {
+		var candidate = trim( arguments.value );
+		if ( len( candidate ) >= 24 && reFind( "^[0-9a-fA-F]+$", candidate ) ) return true;
+		return reFindNoCase( "^placement-[0-9a-f]{8,}$", candidate ) > 0;
+	}
+
+	private string function humanizeDomainKey( required string domainKey ) {
+		var value = replace( listLast( arguments.domainKey, "/" ), "_", " ", "all" );
+		value = replace( value, "-", " ", "all" );
+		// Legacy folders are overwhelmingly camelCase ("userHome", "myPlaylist").
+		// Without this split the label reads "Userhome", which matches neither the
+		// folder on disk nor how anyone refers to the feature.
+		value = reReplace( value, "([a-z0-9])([A-Z])", "\1 \2", "all" );
+		value = reReplace( trim( value ), "[[:space:]]+", " ", "all" );
+		return reReplace( value, "\b([a-z])", "\u\1", "all" );
+	}
+
+	/** ColdBox module slug for a legacy domain directory. */
+	private string function moduleSlugFor( required string domainKey ) {
+		var leaf = listLast( arguments.domainKey, "/" );
+		return lCase( reReplace( leaf, "[^A-Za-z0-9]+", "", "all" ) );
+	}
+
+	/**
+	 * Names a module candidate after what its units do, not after the folder.
+	 *
+	 * "Userhome module candidate" tells a reviewer nothing the directory listing
+	 * did not, and reads badly beside the provider-authored lanes ("Artist
+	 * exploration and PDF/PPT generation"). The layers actually present in the
+	 * group are observable, so the label can say whether the seam is pages,
+	 * services, or both while still naming the legacy domain it came from.
+	 */
+	private string function moduleDisplayName( required string domainKey, required array unitIds, required array allUnits ) {
+		var domain = humanizeDomainKey( arguments.domainKey );
+		var owned = {};
+		for ( var unitId in arguments.unitIds ) owned[ trim( toString( unitId ) ) ] = true;
+		var layers = {};
+		for ( var unit in arguments.allUnits ) {
+			if ( !isStruct( unit ) ) continue;
+			if ( !owned.keyExists( trim( toString( unit.id ?: unit.itemId ?: "" ) ) ) ) continue;
+			var layer = lCase( trim( toString( unit.layer ?: "" ) ) );
+			if ( len( layer ) ) layers[ layer ] = true;
+		}
+		var hasScreens = layers.keyExists( "view" ) || layers.keyExists( "handler" ) || layers.keyExists( "layout" );
+		var hasDomainLogic = layers.keyExists( "service" ) || layers.keyExists( "model" );
+		if ( hasScreens && hasDomainLogic ) return "#domain# pages and services";
+		if ( hasDomainLogic ) return "#domain# services and models";
+		if ( hasScreens ) return "#domain# pages";
+		return "#domain# feature area";
+	}
+
+	private struct function defaultPlacement( required array unitIds, required array units, required struct plan, required struct evidence ) {
+		var refs = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !arguments.unitIds.contains( unitId ) ) continue;
+			for ( var ref in normalizeEvidenceRefs( unit.evidenceRefs ?: [] ) ) if ( refs.len() < 6 ) refs.append( ref );
+		}
+		var item = {
+			id: "placement-main-app-default",
+			name: "New main application",
+			purpose: "Conservative default for units without an evidenced extraction boundary.",
+			recommendation: "Keep this behavior in the new ColdBox main application until module or service boundaries are proven.",
+			placementType: "main-app",
+			packaging: "centralized",
+			targetUnitIds: duplicate( arguments.unitIds ),
+			unitIds: duplicate( arguments.unitIds ),
+			evidenceRefs: refs,
+			evidenceBasis: "conservative-default",
+			provenanceClass: "deterministically-derived",
+			coverageSource: "deterministic-gap-fill",
+			gapFilledUnitIds: duplicate( arguments.unitIds ),
+			stayInMonolith: true,
+			newProposal: true,
+			proposalReason: "No provider architecture group covered these target units."
+		};
+		item.id = stablePlacementId( item, arguments.units );
+		item.itemFingerprint = stableFingerprint( item );
+		return item;
+	}
+
+	private any function findMainAppPlacement( required array placements ) {
+		for ( var placement in arguments.placements ) {
+			if ( isStruct( placement ) && normalizePlacementType( placement.placementType ?: placement.packaging ?: "" ) == "main-app" ) return placement;
+		}
+		return javacast( "null", "" );
+	}
+
+	private string function stablePlacementId( required struct placement, required array units ) {
+		var ids = normalizeIds( arguments.placement.targetUnitIds ?: [] );
+		ids.sort( "textnocase" );
+		var domainKey = lCase( reReplace( trim( arguments.placement.domainKey ?: "" ), "[^a-zA-Z0-9_-]", "-", "all" ) );
+		var seed = { targetUnitIds: ids, domainKey: domainKey, placementContractVersion: variables.version };
+		if ( !ids.len() ) seed.sourceId = arguments.placement.sourceItemId ?: arguments.placement.id ?: "";
+		return "placement-" & left( identityService.itemId( "placement", seed ), 24 );
+	}
+
+	private string function stableFingerprint( required struct placement ) {
+		return identityService.itemFingerprint(
+			"placement",
+			identityService.withoutVolatileKeys( arguments.placement )
+		);
+	}
+
+	private string function normalizePlacementType( required any value ) {
+		var normalized = lCase( trim( toString( arguments.value ) ) );
+		if ( [ "centralized", "main-app", "main_app", "monolith", "application" ].contains( normalized ) ) return "main-app";
+		if ( [ "coldbox-module", "coldbox_module", "module", "hmvc-module" ].contains( normalized ) ) return "coldbox-module";
+		if ( [ "background-worker", "background_worker", "worker", "job-worker" ].contains( normalized ) ) return "background-worker";
+		if ( [ "scheduled-service", "scheduled_service", "scheduled-task", "scheduled", "cron" ].contains( normalized ) ) return "scheduled-service";
+		if ( [ "external-service", "microservice", "side-app", "extract", "service" ].contains( normalized ) ) return "external-service";
+		return "main-app";
+	}
+
+	private string function packagingFor( required string placementType ) {
+		var normalized = normalizePlacementType( arguments.placementType );
+		if ( normalized == "coldbox-module" ) return "coldbox-module";
+		if ( normalized == "external-service" ) return "external-service";
+		if ( normalized == "background-worker" || normalized == "scheduled-service" ) return "worker";
+		return "centralized";
+	}
+
+	private array function normalizeIds( required any value ) {
+		var output = [];
+		var values = isArray( arguments.value ) ? arguments.value : [];
+		for ( var value in values ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) && !output.contains( normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	private array function normalizeEvidenceRefs( required any value ) {
+		var output = [];
+		var values = isArray( arguments.value ) ? arguments.value : [];
+		for ( var ref in values ) {
+			if ( isStruct( ref ) ) {
+				var item = duplicate( ref );
+				item.filePath = replace( trim( item.filePath ?: item.path ?: "" ), "\", "/", "all" );
+				if ( len( item.filePath ) || len( trim( toString( item.id ?: "" ) ) ) ) output.append( item );
+			} else if ( isSimpleValue( ref ) && len( trim( toString( ref ) ) ) ) {
+				output.append( trim( toString( ref ) ) );
+			}
+			if ( output.len() >= 6 ) break;
+		}
+		return output;
+	}
+
+	private array function uniqueStrings( required array values ) {
+		var output = [];
+		for ( var value in arguments.values ) {
+			var normalized = trim( toString( value ) );
+			if ( len( normalized ) && !output.contains( normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	private struct function placementSummary( required array placements ) {
+		var counts = { "main-app": 0, "coldbox-module": 0, "external-service": 0 };
+		var unknownGates = 0;
+		var failedGates = 0;
+		for ( var placement in arguments.placements ) {
+			var type = normalizePlacementType( placement.placementType ?: placement.packaging ?: "" );
+			counts[ type ] = ( counts[ type ] ?: 0 ) + 1;
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				var status = lCase( trim( gate.status ?: "" ) );
+				if ( status == "unknown" ) unknownGates++;
+				if ( status == "fail" ) failedGates++;
+			}
+		}
+		return { total: arguments.placements.len(), counts: counts, unknownGates: unknownGates, failedGates: failedGates };
+	}
+
+	// ------------------------------------------------------------------
+	// Target-path derivation, moved from ModernizationProposalService.
+	//
+	// This service is now the SOLE owner of what a unit's target path is.
+	// Previously the proposal derived a path and canonicalize() independently
+	// rewrote it, so two files decided one invariant and could disagree --
+	// the dual-ownership bug Step 12 exists to prevent recurring.
+	// ------------------------------------------------------------------
+
+	public string function fallbackLayerForSource( required string sourcePath, required struct unit ) {
+		var path = lCase( replace( arguments.sourcePath, "\", "/", "all" ) );
+		if ( reFindNoCase( "(^|/)Application\.(?:cfc|bx)$", path ) ) return "config";
+		if ( find( "/handlers/", "/" & path ) ) return "handler";
+		if ( find( "/models/", "/" & path ) || find( "/components/", "/" & path ) ) return "service";
+		if ( find( "/views/", "/" & path ) || find( "/layouts/", "/" & path ) || listLast( path, "." ) == "cfm" || listLast( path, "." ) == "bxm" ) return "view";
+		var observed = lCase( trim( scalarString( arguments.unit.layer ?: arguments.unit.unitType ?: "" ) ) );
+		return observed == "page" ? "view" : "service";
+	}
+
+
+	public array function normalizeTargetUnits( required array units, required struct input ) {
+		var target = isStruct( arguments.input.target ?: "" ) ? arguments.input.target : {};
+		var runtime = lCase( trim( scalarString( target.runtime ?: arguments.input.targetRuntime ?: "boxlang" ) ) );
+		var profile = lCase( trim( scalarString( target.layoutProfile ?: arguments.input.targetProfile ?: "modern" ) ) );
+		var output = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var copy = duplicate( unit );
+			// Shard merges sometimes leave path-like fields as arrays (multi-file
+			// units). Coerce before trim() — a raw Array crashes packaging.
+			var sourcePath = trim( scalarString( copy.sourcePath ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.sourceFile ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.legacyPath ?: "" ) );
+			if ( !len( sourcePath ) ) sourcePath = trim( scalarString( copy.filePath ?: "" ) );
+			if ( !len( sourcePath ) ) {
+				var idHint = trim( scalarString( copy.id ?: "" ) );
+				if ( find( "/", idHint ) || reFindNoCase( "\.(cfm|cfc|bx|bxm|js)$", idHint ) ) sourcePath = idHint;
+			}
+			sourcePath = replace( sourcePath, "\", "/", "all" );
+			var rawSourceMarker = trim( scalarString( copy.sourcePath ?: "" ) );
+			if ( reFindNoCase( "\(new\)|new proposal|new-proposal", sourcePath ) || reFindNoCase( "\(new\)", rawSourceMarker ) ) {
+				sourcePath = reReplaceNoCase( sourcePath, "\s*\(new\)\s*", "", "all" );
+				copy.newProposal = true;
+				if ( !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) copy.proposalReason = "Provider marked this target as a new scaffold without a legacy source file";
+			}
+			if ( len( sourcePath ) ) copy.sourcePath = sourcePath;
+			var candidate = trim( scalarString( copy.targetPath ?: "" ) );
+			if ( !len( candidate ) ) candidate = trim( scalarString( copy.pathHint ?: "" ) );
+			var sourceIsApplication = reFindNoCase( "(^|/)Application[.](?:cfc|bx)$", sourcePath ) > 0;
+			if ( sourceIsApplication ) {
+				var applicationLayer = lCase( trim( scalarString( copy.layer ?: copy.kind ?: copy.proposedRole ?: "config" ) ) );
+				var parentName = !find( "/", sourcePath )
+					? "Root"
+					: listGetAt( sourcePath, max( 1, listLen( sourcePath, "/" ) - 1 ), "/" );
+				parentName = reReplace( parentName, "[^A-Za-z0-9]", "", "all" );
+				if ( !len( parentName ) ) parentName = "Nested";
+				var classExtension = runtime == "boxlang" ? ".bx" : ".cfc";
+				if ( !find( "/", sourcePath ) && [ "config", "application", "bootstrap", "" ].contains( applicationLayer ) ) {
+					candidate = "Application" & classExtension;
+				} else if ( applicationLayer == "interceptor" ) {
+					candidate = "app/interceptors/#parentName#ApplicationLifecycle#classExtension#";
+				} else if ( [ "service", "model" ].contains( applicationLayer ) ) {
+					candidate = "app/models/services/#parentName#ApplicationLifecycleService#classExtension#";
+				} else {
+					candidate = "app/config/#parentName#ApplicationLifecycle#classExtension#";
+				}
+				if ( find( "/", sourcePath ) ) {
+					copy.proposalReason = "Nested Application lifecycle must be decomposed into ColdBox config, interceptor, and service concerns; verify this placeholder mapping";
+					copy.validationStatus = "needs-review";
+				}
+			}
+			candidate = targetPaths().normalizeLayerExtension( candidate, copy, runtime );
+			if ( !targetPaths().legalModernTargetPath( candidate, runtime, profile ) || !targetPaths().targetPathMatchesLayer( candidate, copy ) ) copy.targetPath = targetPaths().deriveTargetPath( copy, sourcePath, runtime, profile );
+			else copy.targetPath = candidate;
+			copy.targetPath = targetPaths().normalizeLayerExtension( copy.targetPath, copy, runtime );
+			var evidenceRef = trim( scalarString( copy.evidenceRef ?: "" ) );
+			if ( len( evidenceRef ) && !structKeyExists( copy, "evidenceRefs" ) && evidenceRef != "new-proposal" ) copy.evidenceRefs = [ { filePath: copy.sourcePath ?: sourcePath, extractionMethod: "provider-reference" } ];
+			if ( !len( trim( scalarString( copy.sourcePath ?: "" ) ) ) && !( copy.newProposal ?: false ) && !( copy.explicitProposal ?: false ) && !len( trim( scalarString( copy.proposalReason ?: "" ) ) ) ) {
+				copy.newProposal = true;
+				copy.proposalReason = "Provider proposed a scaffold target without a legacy source path";
+			}
+			ensureIdentity( copy, "target-unit" );
+			output.append( copy );
+		}
+		return targetPaths().ensureUniqueTargetPaths( output, runtime, profile );
+	}
+
+
+	/**
+	 * Target-path shaping moved to ModernizationTargetPathService (Step 11).
+	 * These delegate so `normalizeTargetUnits` -- which also settles identity and
+	 * therefore stays here -- did not have to change.
+	 */
+	private any function targetPaths() {
+		if ( !isNull( variables.modernizationTargetPathService ?: javacast( "null", "" ) ) ) return variables.modernizationTargetPathService;
+		variables.modernizationTargetPathService = new app.models.services.ModernizationTargetPathService();
+		return variables.modernizationTargetPathService;
+	}
+
+	
+
+	
+
+	
+
+	
+
+	
+
+	private string function scalarString( required any value ) {
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			return "";
+		}
+		return "";
+	}
+
+	private void function ensureIdentity( required struct item, required string kind ) {
+		var id = trim( scalarString( arguments.item.id ?: "" ) );
+		if ( !len( id ) ) id = trim( scalarString( arguments.item.itemId ?: "" ) );
+		if ( !len( id ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
+		else arguments.item.id = id;
+		var fingerprint = trim( scalarString( arguments.item.itemFingerprint ?: "" ) );
+		if ( !len( fingerprint ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+		else arguments.item.itemFingerprint = fingerprint;
+	}
+
+	/**
+	 * Promote derived clusters to the plan's canonical placements.
+	 *
+	 * A cluster and a placement describe the same thing -- one owning decision
+	 * over a set of target units -- so this is a projection, not a merge. The
+	 * derived verdict wins outright: it is computed from structural edges, table
+	 * co-access and shared scope, and it carries the evidence for itself.
+	 *
+	 * The provider's own contexts/extracts are left in place for the legacy
+	 * projection until Step 3b removes them, but they no longer decide anything.
+	 */
+	public struct function applyDerivedPlacements( required struct plan, required array clusters ) {
+		if ( !arguments.clusters.len() ) return arguments.plan;
+		var output = arguments.plan;
+		output.target = isStruct( output.target ?: "" ) ? output.target : {};
+
+		// Bind by source path, not by id.
+		//
+		// A derived cluster owns *inventory* units -- real files on disk. A
+		// placement owns *target* units -- the proposed new shape. The two id
+		// spaces do not overlap, so matching ids yields nothing, every placement
+		// owns nothing, and canonicalize() drops them all and falls back to the
+		// conservative default. The plan then reads "derived" while showing the
+		// generic answer, which is worse than showing no derivation at all.
+		//
+		// A target unit records the sourcePath it came from, and a cluster
+		// records the file paths it spans, so the source path is the join.
+		var unitsByPath = {};
+		for ( var unit in ( isArray( output.target.units ?: "" ) ? output.target.units : [] ) ) {
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( !len( unitId ) ) continue;
+			var sourcePath = lCase( replace( trim( toString( unit.sourcePath ?: unit.sourceFile ?: unit.filePath ?: "" ) ), "\", "/", "all" ) );
+			if ( !len( sourcePath ) ) continue;
+			if ( !unitsByPath.keyExists( sourcePath ) ) unitsByPath[ sourcePath ] = [];
+			unitsByPath[ sourcePath ].append( unitId );
+		}
+
+		var placements = [];
+		for ( var cluster in arguments.clusters ) {
+			var ownedIds = [];
+			for ( var filePath in ( cluster.filePaths ?: [] ) ) {
+				for ( var mapped in ( unitsByPath[ lCase( filePath ) ] ?: [] ) ) {
+					if ( !ownedIds.contains( mapped ) ) ownedIds.append( mapped );
+				}
+			}
+			// A cluster that maps to no target unit has nothing to place. Leaving
+			// it in would produce an empty lane that canonicalize() strips anyway.
+			if ( !ownedIds.len() ) continue;
+			placements.append( {
+				id              : cluster.id,
+				// canonicalize() recomputes `id` from the placement's content, so
+				// anything that needs to find this placement again by its *cluster*
+				// identity has to carry that id separately. The judge keys its
+				// verdicts on the cluster id, and joining on `id` silently missed
+				// every one -- the same id-space confusion documented above for
+				// applyDerivedPlacements, one layer later.
+				derivedClusterId: cluster.id,
+				name            : cluster.name,
+				domainKey       : cluster.domainKey,
+				placementType   : cluster.placementType,
+				purpose         : cluster.purpose,
+				recommendation  : cluster.rationale,
+				targetUnitIds   : ownedIds,
+				evidenceBasis   : "coupling-derived",
+				provenanceClass : "deterministically-derived",
+				boundaryEvidence: cluster.boundaryEvidence ?: {},
+				filePaths       : cluster.filePaths ?: []
+			} );
+		}
+		output.target.placements = placements;
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.placementSource = "derived";
+		return output;
+	}
+
+	/**
+	 * Overlay model-supplied language onto derived placements.
+	 *
+	 * Language only. `placementType`, `targetUnitIds`, `boundaryEvidence` and
+	 * `evidenceBasis` are derived from coupling data and are not writable from
+	 * here — a narration that tried to move a capability into a different
+	 * placement would silently undo the derivation, which is the exact failure
+	 * the inversion exists to prevent. A narration for an unknown clusterId is
+	 * dropped rather than creating a placement out of prose.
+	 */
+	struct function applyNarrations( required struct plan, array narrations = [] ) {
+		if ( !arguments.narrations.len() ) return arguments.plan;
+		var output = arguments.plan;
+		output.target = isStruct( output.target ?: "" ) ? output.target : {};
+		var placements = isArray( output.target.placements ?: "" ) ? output.target.placements : [];
+		if ( !placements.len() ) return output;
+
+		var byId = {};
+		for ( var narration in arguments.narrations ) {
+			var clusterId = trim( toString( narration.clusterId ?: "" ) );
+			if ( len( clusterId ) ) byId[ clusterId ] = narration;
+		}
+
+		var narrated = 0;
+		for ( var placement in placements ) {
+			var match = byId[ trim( toString( placement.id ?: "" ) ) ] ?: {};
+			if ( !isStruct( match ) || !match.count() ) continue;
+			var name = trim( toString( match.name ?: "" ) );
+			var purpose = trim( toString( match.purpose ?: "" ) );
+			if ( len( name ) ) placement.name = name;
+			if ( len( purpose ) ) placement.purpose = purpose;
+			if ( isArray( match.migrationSteps ?: "" ) && match.migrationSteps.len() ) placement.migrationSteps = match.migrationSteps;
+			if ( isArray( match.samples ?: "" ) && match.samples.len() ) placement.samples = match.samples;
+			// The boundary stays deterministically derived; only its wording came
+			// from the model, and the plan should say so rather than implying the
+			// model chose the boundary.
+			placement.narrationSource = "provider";
+			narrated = narrated + 1;
+		}
+
+		output.metadata = isStruct( output.metadata ?: "" ) ? output.metadata : {};
+		output.metadata.narratedPlacements = narrated;
+		return output;
+	}
+}

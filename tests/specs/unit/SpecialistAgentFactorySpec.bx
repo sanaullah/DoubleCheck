@@ -1,0 +1,137 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"SpecialistAgentFactory briefs",
+			() => {
+				var factory = "";
+
+				beforeEach(
+					() => {
+						factory = new app.models.services.SpecialistAgentFactory();
+						factory.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", model: "test-model" } );
+					}
+				);
+
+				it(
+					"keeps dynamic task briefs out of the immutable specialist contract",
+					() => {
+						var definition = factory.definition( sampleTask( "Inspect string-built SQL only." ) );
+
+						expect( definition.instructions ).toInclude( "read-only" );
+						expect( definition.instructions ).toInclude( "POLICY_CONTRACT" );
+						expect( definition.instructions ).toInclude( "OUTPUT_SCHEMA" );
+						expect( definition.instructions ).notToInclude( "TASK BRIEF" );
+						expect( definition.instructions ).notToInclude( "Inspect string-built SQL only." );
+					}
+				);
+
+				it(
+					"omits TASK BRIEF when no brief is provided",
+					() => {
+						var definition = factory.definition( sampleTask( "" ) );
+
+						expect( definition.instructions ).toInclude( "read-only" );
+						expect( definition.instructions ).notToInclude( "TASK BRIEF" );
+					}
+				);
+
+				it(
+					"includes brief in the specialist input context JSON",
+					() => {
+						var input = factory.input( sampleTask( "Focus on empty catch blocks." ) );
+
+						expect( input ).toInclude( "Focus on empty catch blocks." );
+						expect( input ).toInclude( """brief""" );
+					}
+				);
+
+				it(
+					"uses specialist-prompt-v5 and registry-backed CF-specific instructions only for cfml-conventions",
+					() => {
+						var cfDef = factory.definition( roleTask( "cfml-conventions" ) );
+						expect( cfDef.version ).toBe( "specialist-prompt-v5" );
+						expect( cfDef.provenance.promptVersion ).toBe( "specialist-prompt-v5" );
+						expect( cfDef.provenance.promptId ).toBe( "specialist.cfml-conventions" );
+						expect( cfDef.provenance.outputSchema ).toBe( "specialist-findings-v1" );
+						expect( len( cfDef.provenance.promptHash ) ).toBe( 64 );
+						expect( cfDef.instructions ).toInclude( "modernization" );
+						expect( cfDef.instructions ).toInclude( "Never assume ColdBox" );
+
+						var secDef = factory.definition( roleTask( "security" ) );
+						expect( secDef.version ).toBe( "specialist-prompt-v5" );
+						expect( secDef.instructions ).notToInclude( "Never assume ColdBox" );
+						expect( secDef.instructions ).notToInclude( "CFML / BoxLang fix rules" );
+					}
+				);
+
+				it(
+					"keeps boxlang-conventions focused on BoxLang/ColdBox contracts",
+					() => {
+						var bxDef = factory.definition( roleTask( "boxlang-conventions" ) );
+						expect( bxDef.instructions ).toInclude( "BoxLang" );
+						expect( bxDef.instructions ).notToInclude( "equal weight" );
+						expect( bxDef.instructions ).notToInclude( "Never assume ColdBox" );
+						expect( bxDef.instructions ).notToInclude( "CFML / BoxLang fix rules" );
+					}
+				);
+
+				it(
+					"does not gate cfml-conventions to defects-only reporting",
+					() => {
+						var cfDef = factory.definition( roleTask( "cfml-conventions" ) );
+						expect( cfDef.instructions ).toInclude( "evidence-backed incremental modernization findings" );
+						expect( cfDef.instructions ).notToInclude( "Report only concrete defects" );
+						expect( cfDef.instructions ).notToInclude( "why this is a real defect" );
+						expect( cfDef.instructions ).toInclude( "evidence-backed explanation for this finding" );
+
+						var secDef = factory.definition( roleTask( "security" ) );
+						expect( secDef.instructions ).toInclude( "Report only concrete defects" );
+						expect( secDef.instructions ).notToInclude( "evidence-backed incremental modernization findings" );
+						expect( secDef.instructions ).notToInclude( "why this is a real defect" );
+						expect( secDef.instructions ).toInclude( "evidence-backed explanation for this finding" );
+					}
+				);
+			}
+		);
+	}
+
+	private struct function roleTask( required string role ) {
+		return {
+			id       : "task-role",
+			role     : arguments.role,
+			objective: "",
+			brief    : "",
+			budget   : { maxTokens: 500, maxIterations: 2 },
+			context  : {
+				changedSymbols     : [],
+				impactCount        : 0,
+				architectureFactIds: [],
+				files              : []
+			}
+		};
+	}
+
+	private struct function sampleTask( required string brief ) {
+		return {
+			id       : "task-1",
+			role     : "security",
+			objective: "Review for security defects",
+			brief    : arguments.brief,
+			budget   : { maxTokens: 1000, maxIterations: 4 },
+			context  : {
+				changedSymbols     : [],
+				impactCount        : 0,
+				architectureFactIds: [],
+				files              : [
+					{
+						filePath   : "app/handlers/Orders.cfc",
+						contentHash: "abc",
+						language   : "CFML",
+						ranges     : [ { startLine: 1, endLine: 10 }]
+					}
+				]
+			}
+		};
+	}
+}

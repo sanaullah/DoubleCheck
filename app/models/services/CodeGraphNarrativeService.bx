@@ -1,0 +1,798 @@
+/**
+ * Optional LLM narrative for deterministic CodeGraph snapshots.
+ * Never mutates the snapshot; failures return { used:false, error:... }.
+ *
+ * @see ArchitectureEnrichmentService
+ * @see CodeGraphRunService
+ * @see AIChatGateway
+ */
+
+@singleton
+class threadsafe {
+	property name="chatGateway" inject="AIChatGateway";
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+	property name="maxClusters" inject="coldbox:setting:codegraphNarrativeMaxClusters";
+	property name="maxHotspots" inject="coldbox:setting:codegraphNarrativeMaxHotspots";
+	property name="maxFlows" inject="coldbox:setting:codegraphNarrativeMaxFlows";
+	property name="maxCycles" inject="coldbox:setting:codegraphNarrativeMaxCycles";
+	property name="maxPromptCharacters" inject="coldbox:setting:codegraphNarrativeMaxCharacters";
+	property name="sectionReserve" inject="coldbox:setting:codegraphNarrativeSectionReserve";
+	property name="log" inject="logbox:logger:{this}";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="promptCompiler" inject="PromptCompiler";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+	property name="codeGraphRepository" inject="CodeGraphRepository";
+	property name="narrativeNormalizer" inject="CodeGraphNarrativeNormalizer";
+
+	variables.narrativeVersion = "codegraph-narrative-v2";
+	variables.maxClusters = 24;
+	variables.maxHotspots = 20;
+	variables.maxFlows = 24;
+	variables.maxCycles = 12;
+	variables.maxPromptCharacters = 30000;
+	variables.sectionReserve = 1200;
+
+	boolean function isEnabled() {
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	/** True when the repository can persist per-cluster narrative shards. */
+	boolean function usesShards() {
+		return hasShardRepository();
+	}
+
+	string function cacheKey( required struct snapshot, string projectPath = "" ) {
+		return stableHash(
+			lCase( trim( arguments.projectPath ) ) & "|" &
+			trim( toString( arguments.snapshot.fingerprint ?: "" ) ) & "|" &
+			signature()
+		);
+	}
+
+	/**
+	 * Produce an optional narrative blob for a deterministic snapshot.
+	 * Does not mutate arguments.snapshot.
+	 */
+	struct function narrate( required struct snapshot, string projectPath = "", boolean reuseShards = true ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		if ( clusters.len() && len( trim( arguments.projectPath ) ) && hasShardRepository() ) {
+			return narrateSharded( arguments.snapshot, arguments.projectPath, arguments.reuseShards );
+		}
+		return narrateSingle( arguments.snapshot, arguments.projectPath );
+	}
+
+	private struct function narrateSingle( required struct snapshot, string projectPath = "" ) {
+		var resolved = aiProviderResolver.resolve();
+		var empty = disabledResult( resolved, "" );
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ) {
+			return empty;
+		}
+
+		var evidence = {};
+		var payload = {};
+		try {
+			evidence = buildEvidenceContext( arguments.snapshot, arguments.projectPath );
+			if ( !evidence.hasEvidence ) {
+				return disabledResult( resolved, "" );
+			}
+			payload = buildPayload( resolved, arguments.snapshot, evidence, arguments.projectPath );
+			evidence.validationContext = payload.validationContext;
+		} catch ( any compileError ) {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				log.error(
+					"AI CodeGraph narrative evidence compile failed",
+					{
+						type      : compileError.type ?: "",
+						message   : secretRedactionService.redactText( compileError.message ?: "" ),
+						provider  : resolved.provider,
+						model     : resolved.model,
+						stackTrace: secretRedactionService.redactText( compileError.stackTrace ?: "" )
+					}
+				);
+			}
+			return mergeNarrativeResult(
+				resolved,
+				emptyNarrativeContent(),
+				{},
+				0,
+				false,
+				"CodeGraph narrative unavailable"
+			);
+		}
+
+		var activePackage = payload.promptPackage;
+		var response = "";
+		var attempts = 0;
+		try {
+			assertDistinctSystem( resolved.provider ?: "" );
+			while ( attempts < 2 ) {
+				attempts++;
+				try {
+					response = chatGateway.chat(
+						activePackage.messages,
+						buildParams( resolved ),
+						buildOptions( resolved )
+					);
+					var acceptedResponse = getValidator().sanitizeValid(
+						response,
+						"codegraph-narrative-v2",
+						evidence.validationContext
+					);
+					response = acceptedResponse.value;
+					if ( acceptedResponse.rejectedItems.len() ) {
+						activePackage.provenance.rejectedItems = duplicate( acceptedResponse.rejectedItems );
+					}
+					break;
+				} catch ( any attemptError ) {
+					if ( attempts >= 2 || !isRepairablePromptError( attemptError ) ) rethrow;
+					if ( isStruct( attemptError.data ?: "" ) && isArray( attemptError.data.reasonCodes ?: "" ) ) {
+						activePackage.provenance.validationReasonCodes = duplicate( attemptError.data.reasonCodes );
+					}
+					activePackage = getCompiler().compileRepair(
+						activePackage,
+						attemptError.message ?: "output validation failure"
+					);
+				}
+			}
+			var normalizer = isNull( variables.narrativeNormalizer ?: javacast( "null", "" ) )
+				? new app.models.services.CodeGraphNarrativeNormalizer()
+				: variables.narrativeNormalizer;
+			var normalized = normalizer.normalize( response, evidence );
+			return mergeNarrativeResult( resolved, normalized, activePackage.provenance, attempts, true, "", true, {
+				coverage       : payload.coverage ?: {},
+				trimmedSections: payload.trimmedSections ?: []
+			} );
+		} catch ( any error ) {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				log.error(
+					"AI CodeGraph narrative failed",
+					{
+						type      : error.type ?: "",
+						message   : secretRedactionService.redactText( error.message ?: "" ),
+						provider  : resolved.provider,
+						model     : resolved.model,
+						stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+					}
+				);
+			}
+			return mergeNarrativeResult(
+				resolved,
+				emptyNarrativeContent(),
+				activePackage.provenance ?: {},
+				attempts,
+				false,
+				trim( toString( error.message ?: "CodeGraph narrative unavailable" ) )
+			);
+		}
+	}
+
+	/** Per-cluster narrative shards keep unchanged domain names stable across commits. */
+	private struct function narrateSharded( required struct snapshot, required string projectPath, boolean reuseShards = true ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var maxClusterCount = max( 1, int( numericSetting( variables.maxClusters, 24 ) ) );
+		var combined = {
+			used            : false,
+			enabled         : true,
+			version         : variables.narrativeVersion,
+			provider        : "",
+			model           : "",
+			error           : "",
+			pitch           : {},
+			domains         : [],
+			processes       : [],
+			onboarding      : [],
+			risk            : [],
+			summaries       : [],
+			promptProvenance: { shards: [] },
+			attempts        : 0,
+			coverage        : {
+				clusters: { included: 0, available: 0 },
+				hotspots: { included: 0, available: 0 },
+				flows   : { included: 0, available: 0 },
+				cycles  : { included: 0, available: 0 }
+			},
+			trimmedSections : []
+		};
+		var failures = [];
+		// The cap used to slice `clusters` in stored order, which is cluster-id
+		// (hash) order — so which domains got named was decided by a hash. On this
+		// repository that dropped modules of 20, 14 and 13 files while narrating
+		// nine of 2 files, and 23% of the codebase went unnamed for no stated
+		// reason. Order by size first; the array itself keeps id order for the
+		// fingerprint, so this sorts a copy.
+		var ordered = [];
+		for ( var candidate in clusters ) if ( isStruct( candidate ) ) ordered.append( candidate );
+		ordered.sort( ( a, b ) => {
+			var aFiles = val( a.fileCount ?: 0 );
+			var bFiles = val( b.fileCount ?: 0 );
+			if ( aFiles != bFiles ) return aFiles > bFiles ? -1 : 1;
+			var aSymbols = val( a.symbolCount ?: 0 );
+			var bSymbols = val( b.symbolCount ?: 0 );
+			if ( aSymbols != bSymbols ) return aSymbols > bSymbols ? -1 : 1;
+			// Total tiebreak so the selection is deterministic across runs.
+			return compareNoCase( toString( a.id ?: "" ), toString( b.id ?: "" ) );
+		} );
+		if ( ordered.len() > maxClusterCount ) {
+			combined.trimmedSections.append( "clusters" );
+			// "clusters were trimmed" without saying which is the drop this plan
+			// keeps finding. Name them, smallest-first, so a reader can see the
+			// omission is by size rather than arbitrary.
+			combined[ "omittedClusters" ] = [];
+			for ( var position = maxClusterCount + 1; position <= ordered.len(); position++ ) {
+				combined.omittedClusters.append( {
+					id       : toString( ordered[ position ].id ?: "" ),
+					label    : toString( ordered[ position ].label ?: "" ),
+					fileCount: val( ordered[ position ].fileCount ?: 0 )
+				} );
+			}
+		}
+		for ( var index = 1; index <= min( ordered.len(), maxClusterCount ); index++ ) {
+			var cluster = ordered[ index ];
+			if ( !isStruct( cluster ) ) continue;
+			var key = "";
+			var fingerprint = "";
+			try {
+				key = codeGraphRepository.clusterKey( cluster );
+				fingerprint = codeGraphRepository.clusterFingerprint( cluster );
+			} catch ( any shardContractError ) {
+				return narrateSingle( arguments.snapshot, arguments.projectPath );
+			}
+			var piece = javacast( "null", "" );
+			var reused = false;
+			if ( arguments.reuseShards ) {
+				try {
+					piece = codeGraphRepository.findNarrativeShard( arguments.projectPath, key, fingerprint );
+					reused = !isNull( piece ) && isStruct( piece ) && ( piece.used ?: false );
+				} catch ( any cacheError ) {
+					piece = javacast( "null", "" );
+				}
+			}
+			if ( !reused ) {
+				piece = narrateSingle( shardSnapshot( arguments.snapshot, cluster ), arguments.projectPath );
+				if ( isStruct( piece ) && ( piece.used ?: false ) ) {
+					try { codeGraphRepository.saveNarrativeShard( arguments.projectPath, key, fingerprint, piece ); } catch ( any saveError ) {}
+				}
+			}
+			if ( !isStruct( piece ) || !( piece.used ?: false ) ) {
+				if ( isStruct( piece ) && len( trim( toString( piece.error ?: "" ) ) ) ) failures.append( piece.error );
+				continue;
+			}
+			combined.used = true;
+			combined.provider = combined.provider ?: piece.provider ?: "";
+			combined.model = combined.model ?: piece.model ?: "";
+			combined.attempts += val( piece.attempts ?: 0 );
+			combined.promptProvenance.shards.append( { clusterKey: key, reused: reused, provenance: piece.promptProvenance ?: {} } );
+			appendNarrativeItems( combined.domains, piece.domains ?: [], "clusterId" );
+			appendNarrativeItems( combined.processes, piece.processes ?: [], "flowId" );
+			appendNarrativeItems( combined.onboarding, piece.onboarding ?: [], "refId" );
+			appendNarrativeItems( combined.risk, piece.risk ?: [], "refId" );
+			appendNarrativeItems( combined.summaries, piece.summaries ?: [], "clusterId" );
+			if ( !combined.pitch.count() && isStruct( piece.pitch ?: "" ) ) combined.pitch = duplicate( piece.pitch );
+			mergeCoverage( combined.coverage, piece.coverage ?: {} );
+			for ( var section in ( piece.trimmedSections ?: [] ) ) if ( !combined.trimmedSections.contains( section ) ) combined.trimmedSections.append( section );
+		}
+		combined.coverage.clusters.available = clusters.len();
+		combined.coverage.clusters.included = min( combined.coverage.clusters.included, clusters.len() );
+		for ( var section in [ "hotspots", "flows", "cycles" ] ) {
+			var available = isArray( arguments.snapshot[ section ] ?: "" ) ? arguments.snapshot[ section ].len() : 0;
+			combined.coverage[ section ].available = available;
+			combined.coverage[ section ].included = min( combined.coverage[ section ].included, available );
+		}
+		if ( failures.len() ) combined.error = "Some narrative shards were unavailable";
+		if ( !combined.used && !failures.len() ) return narrateSingle( arguments.snapshot, arguments.projectPath );
+		return combined;
+	}
+
+	private struct function shardSnapshot( required struct snapshot, required struct cluster ) {
+		var snapshotValue = arguments.snapshot;
+		var clusterValue = arguments.cluster;
+		var clusterIdValue = toString( clusterValue.id ?: "" );
+		var members = {};
+		for ( var path in ( isArray( clusterValue.filePaths ?: "" ) ? clusterValue.filePaths : [] ) ) members[ normalizePath( path ) ] = true;
+		var shard = duplicate( snapshotValue );
+		shard.clusters = [ clusterValue ];
+		shard.nodes = ( isArray( snapshotValue.nodes ?: "" ) ? snapshotValue.nodes : [] ).filter( ( node ) => isStruct( node ) && ( toString( node.clusterId ?: "" ) == clusterIdValue || members.keyExists( normalizePath( node.path ?: node.id ?: "" ) ) ) );
+		shard.hotspots = ( isArray( snapshotValue.hotspots ?: "" ) ? snapshotValue.hotspots : [] ).filter( ( item ) => isStruct( item ) && ( toString( item.clusterId ?: "" ) == clusterIdValue || members.keyExists( normalizePath( item.path ?: item.id ?: "" ) ) ) );
+		shard.flows = ( isArray( snapshotValue.flows ?: "" ) ? snapshotValue.flows : [] ).filter( ( flow ) => {
+			if ( !isStruct( flow ) ) return false;
+			for ( var step in ( isArray( flow.steps ?: "" ) ? flow.steps : [] ) ) if ( members.keyExists( normalizePath( step ) ) ) return true;
+			return false;
+		} );
+		shard.cycles = ( isArray( snapshotValue.cycles ?: "" ) ? snapshotValue.cycles : [] ).filter( ( cycle ) => {
+			if ( !isArray( cycle ) ) return false;
+			for ( var member in cycle ) if ( members.keyExists( normalizePath( member ) ) ) return true;
+			return false;
+		} );
+		return shard;
+	}
+
+	private void function appendNarrativeItems( required array target, required array items, required string idField ) {
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var id = trim( toString( item[ arguments.idField ] ?: "" ) );
+			var itemKey = id;
+			if ( arguments.idField == "refId" ) itemKey = lCase( trim( toString( item.refType ?: "" ) ) ) & ":" & id;
+			var alreadyPresent = false;
+			for ( var existing in arguments.target ) {
+				var existingId = trim( toString( existing[ arguments.idField ] ?: "" ) );
+				var existingKey = existingId;
+				if ( arguments.idField == "refId" ) existingKey = lCase( trim( toString( existing.refType ?: "" ) ) ) & ":" & existingId;
+				if ( existingKey == itemKey && len( id ) ) alreadyPresent = true;
+			}
+			if ( !alreadyPresent ) arguments.target.append( duplicate( item ) );
+		}
+	}
+
+	private void function mergeCoverage( required struct target, required struct source ) {
+		for ( var section in [ "clusters", "hotspots", "flows", "cycles" ] ) {
+			var row = isStruct( arguments.source[ section ] ?: "" ) ? arguments.source[ section ] : {};
+			arguments.target[ section ].included += val( row.included ?: 0 );
+			arguments.target[ section ].available += val( row.available ?: 0 );
+		}
+	}
+
+	private boolean function hasShardRepository() {
+		if ( isNull( variables.codeGraphRepository ?: javacast( "null", "" ) ) ) return false;
+		try {
+			return len( trim( toString( variables.codeGraphRepository.clusterKey( { id: "codegraph-shard-probe", filePaths: [] } ) ) ) ) > 0;
+		} catch ( any ignored ) {
+			return false;
+		}
+	}
+
+	private struct function disabledResult( required struct resolved, required string error ) {
+		return mergeNarrativeResult( arguments.resolved, emptyNarrativeContent(), {}, 0, false, arguments.error, false );
+	}
+
+	private struct function emptyNarrativeContent() {
+		return {
+			pitch      : {},
+			domains    : [],
+			processes  : [],
+			onboarding : [],
+			risk       : [],
+			summaries  : []
+		};
+	}
+
+	private struct function mergeNarrativeResult(
+		required struct resolved,
+		required struct content,
+		required struct promptProvenance,
+		required numeric attempts,
+		required boolean used,
+		required string error,
+		boolean enabled = true,
+		struct metadata = {}
+	) {
+		return {
+			used             : arguments.used,
+			enabled          : arguments.enabled,
+			version          : variables.narrativeVersion,
+			provider         : arguments.resolved.provider,
+			model            : arguments.resolved.model,
+			error            : arguments.error,
+			pitch            : arguments.content.pitch ?: {},
+			domains          : isArray( arguments.content.domains ?: "" ) ? arguments.content.domains : [],
+			processes        : isArray( arguments.content.processes ?: "" ) ? arguments.content.processes : [],
+			onboarding       : isArray( arguments.content.onboarding ?: "" ) ? arguments.content.onboarding : [],
+			risk             : isArray( arguments.content.risk ?: "" ) ? arguments.content.risk : [],
+			summaries        : isArray( arguments.content.summaries ?: "" ) ? arguments.content.summaries : [],
+			promptProvenance : arguments.promptProvenance,
+			attempts         : arguments.attempts
+			,coverage        : arguments.metadata.coverage ?: {}
+			,trimmedSections : arguments.metadata.trimmedSections ?: []
+		};
+	}
+
+	private struct function buildEvidenceContext( required struct snapshot, string projectPath = "" ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var nodes = isArray( arguments.snapshot.nodes ?: "" ) ? arguments.snapshot.nodes : [];
+		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
+		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
+		var rawCycles = isArray( arguments.snapshot.cycles ?: "" ) ? arguments.snapshot.cycles : [];
+		var cycleRecords = presentCycles( rawCycles );
+
+		return {
+			hasEvidence  : clusters.len() || hotspots.len() || flows.len() || cycleRecords.len(),
+			cycleRecords : cycleRecords,
+			roleCounts   : roleCountsFromNodes( nodes ),
+			projectPath  : arguments.projectPath
+		};
+	}
+
+	private struct function buildPayload(
+		required struct resolved,
+		required struct snapshot,
+		required struct evidence,
+		string projectPath = ""
+	) {
+		var projectPathValue = arguments.projectPath;
+		var maxClusterCount = numericSetting( variables.maxClusters, 24 );
+		var maxHotspotCount = numericSetting( variables.maxHotspots, 20 );
+		var maxFlowCount = numericSetting( variables.maxFlows, 24 );
+		var maxCycleCount = numericSetting( variables.maxCycles, 12 );
+		var maximumCharacters = numericSetting( variables.maxPromptCharacters, 30000 );
+		var window = isNumeric( arguments.resolved.contextWindow )
+			? max( 1024, int( val( arguments.resolved.contextWindow ) ) )
+			: 128000;
+		maximumCharacters = min( maximumCharacters, max( 1000, int( window * .75 * 2 ) ) );
+		var sectionBudgets = sectionBudgetMap( maximumCharacters );
+
+		var clusterRecords = [];
+		var hotspotRecords = [];
+		var flowRecords = [];
+		var cycleRecords = [];
+		var trimmedSections = [];
+		var sectionCharacters = { clusters: 0, hotspots: 0, flows: 0, cycles: 0 };
+
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		for ( var cluster in clusters ) {
+			if ( !isStruct( cluster ) ) continue;
+			if ( clusterRecords.len() >= maxClusterCount ) {
+				appendTrimmedSection( trimmedSections, "clusters" );
+				break;
+			}
+			var paths = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
+			var samplePaths = [];
+			for ( var pathIndex = 1; pathIndex <= min( 6, paths.len() ); pathIndex++ ) {
+				samplePaths.append( paths[ pathIndex ] );
+			}
+			var record = {
+				id           : cluster.id ?: "",
+				label        : cluster.label ?: "",
+				fileCount    : val( cluster.fileCount ?: 0 ),
+				symbolCount  : val( cluster.symbolCount ?: 0 ),
+				cohesion     : cluster.cohesion ?: "",
+				crossingEdges: val( cluster.crossingEdges ?: 0 ),
+				filePaths    : samplePaths.map( ( path ) => relativePath( path, projectPathValue ) )
+			};
+			var encoded = jsonSerialize( record );
+			if ( sectionCharacters.clusters + len( encoded ) > sectionBudgets.clusters ) {
+				appendTrimmedSection( trimmedSections, "clusters" );
+				break;
+			}
+			clusterRecords.append( record );
+			sectionCharacters.clusters += len( encoded );
+		}
+
+		var hotspots = isArray( arguments.snapshot.hotspots ?: "" ) ? arguments.snapshot.hotspots : [];
+		for ( var hotspot in hotspots ) {
+			if ( !isStruct( hotspot ) ) continue;
+			if ( hotspotRecords.len() >= maxHotspotCount ) {
+				appendTrimmedSection( trimmedSections, "hotspots" );
+				break;
+			}
+			var record = {
+				id           : relativePath( hotspot.id ?: hotspot.path ?: "", projectPathValue ),
+				path         : relativePath( hotspot.path ?: hotspot.id ?: "", projectPathValue ),
+				hotspotScore : hotspot.hotspotScore ?: "",
+				fanIn        : val( hotspot.fanIn ?: 0 ),
+				fanOut       : val( hotspot.fanOut ?: 0 ),
+				clusterId    : hotspot.clusterId ?: "",
+				inCycle      : hotspot.inCycle ?: false
+			};
+			var encoded = jsonSerialize( record );
+			if ( sectionCharacters.hotspots + len( encoded ) > sectionBudgets.hotspots ) {
+				appendTrimmedSection( trimmedSections, "hotspots" );
+				break;
+			}
+			hotspotRecords.append( record );
+			sectionCharacters.hotspots += len( encoded );
+		}
+
+		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
+		for ( var flow in flows ) {
+			if ( !isStruct( flow ) ) continue;
+			if ( flowRecords.len() >= maxFlowCount ) {
+				appendTrimmedSection( trimmedSections, "flows" );
+				break;
+			}
+			var steps = isArray( flow.steps ?: "" ) ? flow.steps : [];
+			var sampleSteps = [];
+			for ( var stepIndex = 1; stepIndex <= min( 8, steps.len() ); stepIndex++ ) {
+				sampleSteps.append( relativePath( steps[ stepIndex ], arguments.projectPath ) );
+			}
+			var record = {
+				id          : flow.id ?: "",
+				entryFile   : relativePath( flow.entryFile ?: "", arguments.projectPath ),
+				entrySymbol : flow.entrySymbol ?: "",
+				sinkFile    : relativePath( flow.sinkFile ?: "", arguments.projectPath ),
+				steps       : sampleSteps,
+				stepSymbols : isArray( flow.stepSymbols ?: "" ) ? flow.stepSymbols : [],
+				sinkKind    : flow.sinkKind ?: "unknown",
+				routeId     : flow.routeId ?: ""
+			};
+			var encoded = jsonSerialize( record );
+			if ( sectionCharacters.flows + len( encoded ) > sectionBudgets.flows ) {
+				appendTrimmedSection( trimmedSections, "flows" );
+				break;
+			}
+			flowRecords.append( record );
+			sectionCharacters.flows += len( encoded );
+		}
+
+		for ( var cycle in ( arguments.evidence.cycleRecords ?: [] ) ) {
+			if ( cycleRecords.len() >= maxCycleCount ) {
+				appendTrimmedSection( trimmedSections, "cycles" );
+				break;
+			}
+			var members = isArray( cycle.members ?: "" ) ? cycle.members : [];
+			var sampleMembers = [];
+			for ( var memberIndex = 1; memberIndex <= min( 12, members.len() ); memberIndex++ ) {
+				sampleMembers.append( relativePath( members[ memberIndex ], arguments.projectPath ) );
+			}
+			var record = {
+				id      : cycle.id ?: "",
+				members : sampleMembers
+			};
+			var encoded = jsonSerialize( record );
+			if ( sectionCharacters.cycles + len( encoded ) > sectionBudgets.cycles ) {
+				appendTrimmedSection( trimmedSections, "cycles" );
+				break;
+			}
+			cycleRecords.append( record );
+			sectionCharacters.cycles += len( encoded );
+		}
+
+		var compiled = getCompiler().compile(
+			"codegraph-narrative",
+			{
+				task: {
+					clusterCount : clusterRecords.len(),
+					hotspotCount : hotspotRecords.len(),
+					flowCount    : flowRecords.len(),
+					cycleCount   : cycleRecords.len(),
+					fingerprint  : arguments.snapshot.fingerprint ?: ""
+				},
+				evidence: {
+					clusters   : clusterRecords,
+					hotspots   : hotspotRecords,
+					flows      : flowRecords,
+					cycles     : cycleRecords,
+					roleCounts : arguments.evidence.roleCounts ?: {}
+				}
+			},
+			{ provider: arguments.resolved.provider, model: arguments.resolved.model }
+		);
+		return {
+			messages           : compiled.messages,
+			provenance         : compiled.provenance,
+			promptPackage      : compiled,
+			coverage           : {
+				clusters: { included: clusterRecords.len(), available: clusters.len() },
+				hotspots: { included: hotspotRecords.len(), available: hotspots.len() },
+				flows   : { included: flowRecords.len(), available: flows.len() },
+				cycles  : { included: cycleRecords.len(), available: arguments.evidence.cycleRecords.len() }
+			},
+			trimmedSections   : trimmedSections,
+			validationContext  : validationContextFromRecords(
+				clusterRecords,
+				hotspotRecords,
+				flowRecords,
+				cycleRecords
+			)
+		};
+	}
+
+	private struct function validationContextFromRecords(
+		required array clusterRecords,
+		required array hotspotRecords,
+		required array flowRecords,
+		required array cycleRecords
+	) {
+		var allowedClusterIds = [];
+		var allowedNodeIds = [];
+		var allowedFlowIds = [];
+		var allowedHotspotIds = [];
+		var allowedCycleIds = [];
+
+		for ( var cluster in arguments.clusterRecords ) {
+			var clusterId = trim( toString( cluster.id ?: "" ) );
+			if ( len( clusterId ) ) allowedClusterIds.append( clusterId );
+		}
+		for ( var hotspot in arguments.hotspotRecords ) {
+			var hotspotId = trim( toString( hotspot.id ?: hotspot.path ?: "" ) );
+			if ( len( hotspotId ) ) {
+				allowedHotspotIds.append( hotspotId );
+				if ( !allowedNodeIds.contains( hotspotId ) ) allowedNodeIds.append( hotspotId );
+			}
+			var hotspotPath = trim( toString( hotspot.path ?: "" ) );
+			if ( len( hotspotPath ) && !allowedNodeIds.contains( hotspotPath ) ) {
+				allowedNodeIds.append( hotspotPath );
+			}
+		}
+		for ( var flow in arguments.flowRecords ) {
+			var flowId = trim( toString( flow.id ?: "" ) );
+			if ( len( flowId ) ) allowedFlowIds.append( flowId );
+			var steps = isArray( flow.steps ?: "" ) ? flow.steps : [];
+			for ( var step in steps ) {
+				var nodeId = trim( toString( step ) );
+				if ( len( nodeId ) && !allowedNodeIds.contains( nodeId ) ) allowedNodeIds.append( nodeId );
+			}
+		}
+		for ( var cycle in arguments.cycleRecords ) {
+			var cycleId = trim( toString( cycle.id ?: "" ) );
+			if ( len( cycleId ) ) allowedCycleIds.append( cycleId );
+			var members = isArray( cycle.members ?: "" ) ? cycle.members : [];
+			for ( var member in members ) {
+				var memberId = trim( toString( member ) );
+				if ( len( memberId ) && !allowedNodeIds.contains( memberId ) ) allowedNodeIds.append( memberId );
+			}
+		}
+
+		return {
+			allowedClusterIds : allowedClusterIds,
+			allowedNodeIds    : allowedNodeIds,
+			allowedFlowIds    : allowedFlowIds,
+			allowedHotspotIds : allowedHotspotIds,
+			allowedCycleIds   : allowedCycleIds
+		};
+	}
+
+	private array function presentCycles( required array cycles ) {
+		var output = [];
+		for ( var cycle in arguments.cycles ) {
+			if ( !isArray( cycle ) || !cycle.len() ) continue;
+			var members = [];
+			for ( var member in cycle ) {
+				var normalized = normalizePath( member );
+				if ( len( normalized ) && !members.contains( normalized ) ) members.append( normalized );
+			}
+			if ( !members.len() ) continue;
+			members.sort( ( a, b ) => compareNoCase( a, b ) );
+			output.append( {
+				id      : cycleId( members ),
+				members : members
+			} );
+		}
+		output.sort( ( a, b ) => compareNoCase( a.id, b.id ) );
+		return output;
+	}
+
+	private string function cycleId( required array members ) {
+		return "cycle-" & left( lCase( hash( arguments.members.toList( "|" ), "SHA-256" ) ), 8 );
+	}
+
+	private string function relativePath( required any path, string projectPath = "" ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		if ( !len( value ) ) return "";
+		var root = replace( trim( toString( arguments.projectPath ?: "" ) ), "\", "/", "all" );
+		while ( len( root ) > 1 && right( root, 1 ) == "/" ) root = left( root, len( root ) - 1 );
+		if ( len( root ) && ( lCase( value ) == lCase( root ) || left( lCase( value ), len( root ) + 1 ) == lCase( root & "/" ) ) ) {
+			return mid( value, len( root ) + 2, len( value ) );
+		}
+		if ( reFindNoCase( "^[A-Za-z]:/", value ) || left( value, 1 ) == "/" ) {
+			var markers = [ "app/", "public/", "tests/", "resources/", "config/", "modules/" ];
+			var best = 0;
+			for ( var marker in markers ) {
+				var found = findNoCase( "/" & marker, value );
+				if ( found && ( !best || found < best ) ) best = found + 1;
+			}
+			if ( best ) return mid( value, best, len( value ) );
+			return "<external>/" & listLast( value, "/" );
+		}
+		return value;
+	}
+
+	private struct function sectionBudgetMap( required numeric maximumCharacters ) {
+		var reserve = numericSetting( variables.sectionReserve, 1200 );
+		var sectionCount = 4;
+		var minimum = min( reserve, max( 1, int( arguments.maximumCharacters / sectionCount ) ) );
+		var remaining = max( 0, arguments.maximumCharacters - ( minimum * sectionCount ) );
+		var weights = { clusters: 0.35, hotspots: 0.2, flows: 0.3, cycles: 0.15 };
+		return {
+			clusters: int( minimum + ( remaining * weights.clusters ) ),
+			hotspots: int( minimum + ( remaining * weights.hotspots ) ),
+			flows   : int( minimum + ( remaining * weights.flows ) ),
+			cycles  : max( minimum, arguments.maximumCharacters - int( minimum + ( remaining * weights.clusters ) ) - int( minimum + ( remaining * weights.hotspots ) ) - int( minimum + ( remaining * weights.flows ) ) )
+		};
+	}
+
+	private void function appendTrimmedSection( required array sections, required string section ) {
+		if ( !arguments.sections.contains( arguments.section ) ) arguments.sections.append( arguments.section );
+	}
+
+	private struct function roleCountsFromNodes( required array nodes ) {
+		var counts = {};
+		for ( var node in arguments.nodes ) {
+			if ( !isStruct( node ) ) continue;
+			var role = trim( toString( node.role ?: "unknown" ) );
+			if ( !len( role ) ) role = "unknown";
+			counts[ role ] = ( counts.keyExists( role ) ? counts[ role ] : 0 ) + 1;
+		}
+		return counts;
+	}
+
+	private struct function listToLookup( required array values ) {
+		var lookup = {};
+		for ( var value in arguments.values ) lookup[ value ] = true;
+		return lookup;
+	}
+
+	private string function normalizePath( required string path ) {
+		return lCase( replace( trim( arguments.path ), "\", "/", "all" ) );
+	}
+
+	private boolean function isRepairablePromptError( required any error ) {
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		return findNoCase( "promptoutputvalidation", typeName ) > 0
+			|| findNoCase( "json", typeName ) > 0
+			|| findNoCase( "parse", message ) > 0
+			|| findNoCase( "json", message ) > 0;
+	}
+
+	private void function assertDistinctSystem( required string provider ) {
+		if ( !( getCompiler().capabilities( arguments.provider ).distinctSystem ?: true ) ) {
+			throw(
+				type = "AIProviderCapabilityException",
+				message = "Provider cannot preserve the immutable prompt system contract"
+			);
+		}
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) {
+			return variables.promptOutputValidator;
+		}
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private struct function buildParams( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow )
+			? max( 1024, int( val( arguments.resolved.contextWindow ) ) )
+			: 128000;
+		var capabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+		var outputCap = isNumeric( capabilities.maxOutputTokens ?: "" ) ? int( capabilities.maxOutputTokens ) : 2000;
+		var params = {
+			temperature : 0,
+			max_tokens  : min( outputCap, min( 8192, max( 1024, int( window * .15 ) ) ) )
+		};
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
+		}
+		structAppend(
+			params,
+			getCompiler().structuredOutput( "codegraph-narrative", arguments.resolved.provider ?: "" ),
+			true
+		);
+		return params;
+	}
+
+	private struct function buildOptions( required struct resolved ) {
+		var options = {
+			provider     : arguments.resolved.provider,
+			apiKey       : arguments.resolved.apiKey,
+			returnFormat : "json",
+			timeout      : arguments.resolved.timeout
+		};
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
+		}
+		return options;
+	}
+
+	private string function signature() {
+		var resolved = aiProviderResolver.resolve();
+		return variables.narrativeVersion & ":" & (
+			chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ? "enabled" : "disabled"
+		) & ":" & lCase( resolved.provider ) & ":" & lCase( resolved.model );
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableHash( required string value ) {
+		return lCase( hash( arguments.value, "SHA-256" ) );
+	}
+}

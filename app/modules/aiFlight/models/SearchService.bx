@@ -1,0 +1,175 @@
+/**
+ * Full-text search for aiFlight traces
+ * Provides searching across trace outputs, inputs, and error messages
+ */
+class {
+	property name="store" inject="TraceStoreService@aiFlight";
+
+	/**
+	 * Search traces with full-text query
+	 * Searches: trace name, inputPreview, outputPreview, errorMessage
+	 * Also searches observation details
+	 */
+	function search( required string query, struct options = {} ) {
+		var limit = options.limit ?: 50;
+		var offset = options.offset ?: 0;
+
+		// Build search query - supports simple text and quoted phrases
+		var searchTerm = cleanSearchQuery( arguments.query );
+		var results = [];
+		var traceResults = [];
+
+		// Search traces
+		try {
+			var sql = "
+				SELECT DISTINCT
+					t.id, t.name, t.status, t.startedAt, t.durationMs,
+					t.totalTokens, t.cost, t.inputPreview, t.outputPreview,
+					COUNT(*) OVER() as totalMatches
+				FROM traces t
+				LEFT JOIN observations o ON t.id = o.traceId
+				WHERE 1=1
+				#buildSearchWhere( searchTerm )#
+				ORDER BY t.startedAt DESC
+				LIMIT :limit OFFSET :offset
+			";
+
+			var qResult = store.queryTraces( sql, { limit: limit, offset: offset } );
+			while ( qResult.next() ) {
+				traceResults.append( {
+					id: qResult.id,
+					name: qResult.name,
+					status: qResult.status,
+					startedAt: qResult.startedAt,
+					durationMs: qResult.durationMs,
+					totalTokens: qResult.totalTokens,
+					cost: qResult.cost,
+					inputPreview: qResult.inputPreview,
+					outputPreview: qResult.outputPreview,
+					type: "trace",
+					relevance: calculateRelevance( qResult.name, searchTerm )
+				} );
+			}
+		} catch ( any e ) {
+			// Fallback to simple LIKE search if FTS5 not available
+			traceResults = simpleSearch( searchTerm, limit, offset );
+		}
+
+		return {
+			query: searchTerm,
+			results: traceResults,
+			total: traceResults.len() ? traceResults[ 1 ].totalMatches ?: 0 : 0,
+			limit: limit,
+			offset: offset
+		};
+	}
+
+	/**
+	 * Simple LIKE-based search (fallback for older SQLite)
+	 */
+	private array function simpleSearch( required string query, numeric limit = 50, numeric offset = 0 ) {
+		var searchPattern = "%#arguments.query#%";
+		var results = [];
+
+		var sql = "
+			SELECT
+				id, name, status, startedAt, durationMs, totalTokens, cost,
+				inputPreview, outputPreview
+			FROM traces
+			WHERE name LIKE ?
+			   OR inputPreview LIKE ?
+			   OR outputPreview LIKE ?
+			   OR errorMessage LIKE ?
+			ORDER BY startedAt DESC
+			LIMIT ? OFFSET ?
+		";
+
+		// Execute query (placeholder for actual DB query)
+		// var qResult = store.executeQuery( sql, [ searchPattern, searchPattern, searchPattern, searchPattern, limit, offset ] );
+
+		return results;
+	}
+
+	/**
+	 * Build SQL WHERE clause for full-text search
+	 */
+	private string function buildSearchWhere( required string query ) {
+		var conditions = [];
+
+		// Search trace fields
+		conditions.append( "t.name LIKE '%#escapeSQL( arguments.query )#%'" );
+		conditions.append( "t.inputPreview LIKE '%#escapeSQL( arguments.query )#%'" );
+		conditions.append( "t.outputPreview LIKE '%#escapeSQL( arguments.query )#%'" );
+		conditions.append( "t.errorMessage LIKE '%#escapeSQL( arguments.query )#%'" );
+
+		// Search observation fields
+		conditions.append( "o.name LIKE '%#escapeSQL( arguments.query )#%'" );
+		conditions.append( "o.inputText LIKE '%#escapeSQL( arguments.query )#%'" );
+		conditions.append( "o.outputText LIKE '%#escapeSQL( arguments.query )#%'" );
+
+		return conditions.len() ? "AND (" & conditions.toList( " OR " ) & ")" : "";
+	}
+
+	/**
+	 * Clean search query: trim, handle quoted phrases
+	 */
+	private string function cleanSearchQuery( required string query ) {
+		var q = trim( arguments.query );
+		// Remove extra spaces and normalize
+		q = reReplace( q, "\s+", " ", "all" );
+		return q;
+	}
+
+	/**
+	 * Escape SQL special characters
+	 */
+	private string function escapeSQL( required string input ) {
+		return replace( arguments.input, "'", "''", "all" );
+	}
+
+	/**
+	 * Calculate relevance score (simple: match position in string)
+	 */
+	private numeric function calculateRelevance( required string text, required string query ) {
+		var pos = findNoCase( arguments.query, arguments.text );
+		if ( pos == 0 ) return 0;
+		return 1 / pos; // Earlier matches score higher
+	}
+
+	/**
+	 * Get search suggestions (autocomplete)
+	 */
+	function getSearchSuggestions( required string prefix, numeric limit = 10 ) {
+		var suggestions = [];
+
+		// Suggest: model names, users, environments
+		var sql = "
+			SELECT DISTINCT model as value, COUNT(*) as freq
+			FROM traces
+			WHERE model LIKE ?
+			GROUP BY model
+			ORDER BY freq DESC
+			LIMIT ?
+		";
+
+		// TODO: Execute query and collect suggestions
+
+		return suggestions;
+	}
+
+	/**
+	 * Save search query for quick access
+	 */
+	function saveSearchQuery( required string name, required string query ) {
+		// TODO: Persist search queries (for quick access)
+		return { success: true, queryId: createUUID() };
+	}
+
+	/**
+	 * Get recent searches
+	 */
+	function getRecentSearches( numeric limit = 5 ) {
+		// TODO: Retrieve recent searches
+		return [];
+	}
+}

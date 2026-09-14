@@ -1,0 +1,900 @@
+/**
+ * Modernize stages after the shared repository scan. ReviewRunService owns
+ * queueing, leases, status transitions, and SSE; this service owns only the
+ * evidence/proposal artifact lifecycle.
+ */
+@singleton
+class threadsafe {
+	property name="modernizationPolicyService" inject="ModernizationPolicyService";
+	property name="schemaPackService" inject="ModernizationSchemaPackService";
+	property name="inventoryService" inject="ModernizationInventoryService";
+	property name="evidenceDiscoveryService" inject="ModernizationEvidenceDiscoveryService";
+	property name="signalService" inject="ModernizationSignalService";
+	property name="couplingGraphService" inject="ModernizationCouplingGraphService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="coverageService" inject="ModernizationCoverageService";
+	property name="contextPackService" inject="ModernizationContextPackService";
+	property name="proposalService" inject="ModernizationProposalService";
+	property name="judgementService" inject="ModernizationJudgementService";
+	property name="validationService" inject="ModernizationValidationService";
+property name="modernizationRepository" inject="ModernizationRepository";
+property name="modernizationDecisionService" inject="ModernizationDecisionService";
+property name="modernizationRiskService" inject="ModernizationRiskService";
+property name="modernizationPlacementService" inject="ModernizationPlacementService";
+property name="modernizationGateService" inject="ModernizationGateService";
+	property name="runRepository" inject="ReviewRunRepository";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="eventService" inject="ReviewEventService";
+	property name="log" inject="logbox:logger:{this}";
+
+	// v4: the inventory resolver changes dependency records and signal precision
+	// as well as the v3 range join, so a v3 "evidence" checkpoint would restore a
+	// pre-join inventory wholesale and silently bring back noisy construction
+	// signals on every rerun. v3 checkpoints are therefore not reusable.
+	// v9: the pipeline now derives a coupling graph and cluster/wave structure
+	// before the context pack. A v8 checkpoint set has no "graph" or "derived"
+	// stage, and its "context" checkpoint was written at a different point in
+	// the ladder, so reusing one would resume into a pipeline that no longer
+	// exists.
+	variables.pipelineContractVersion = "modernization-pipeline-v9";
+
+	/**
+	 * Executes the evidence-first Modernize pipeline, reusing compatible
+	 * checkpoints and persisting each bounded artifact before later stages.
+	 */
+	struct function execute(required any run, required struct scan, struct callbacks = {}) {
+		var runId = arguments.run.getId();
+		var pipelineCallbacks = arguments.callbacks;
+		var input = duplicate( arguments.run.getInput() ?: {} );
+		var inputFingerprint = ( arguments.run.getPolicy() ?: {} ).fingerprint ?: lCase( hash( jsonSerialize( input ), "SHA-256" ) );
+		var sourceFingerprint = sourceFingerprint( arguments.scan );
+		var pipelineStartedAt = getTickCount();
+		var priorCheckpoints = modernizationRepository.getCheckpoints( runId );
+		var result = {
+			schemaVersion: "modernization-plan-v1",
+			coverage: {}, inventory: {}, schemaEvidence: {}, signals: [], target: { units: [], contexts: [], extracts: [] },
+			unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: [],
+			validation: {}, decisions: [], errors: [], checkpoints: []
+		};
+		// Declared outside try so a post-proposal failure can retain the built plan
+		// instead of wiping it with an empty shell on persist-on-fail.
+		var plan = {};
+		var proposal = {};
+		try {
+			checkCancellation( arguments.callbacks );
+			emit( arguments.callbacks, 25, "modernization-inventory", "Cataloging CFML units and legacy evidence" );
+			var inventoryCheckpoint = reusableCheckpoint( priorCheckpoints, "inventory", inputFingerprint, sourceFingerprint );
+			var inventory = !isNull( inventoryCheckpoint ) ? ( inventoryCheckpoint.payload.value ?: inventoryCheckpoint.payload ) : inventoryService.build( arguments.scan );
+			result.inventory = inventory;
+			checkpoint( runId, "inventory", inventory, 30, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			if ( inventory.noModernizationScope ?: false ) {
+				result.errors.append( { stage: "inventory", message: "No CFML files were found in the selected scope" } );
+				return terminal( result, "failed", "No CFML modernization scope was found", "failed" );
+			}
+			checkCancellation( arguments.callbacks );
+
+			emit( arguments.callbacks, 35, "modernization-schema", "Sanitizing optional schema evidence" );
+			var storedSchema = modernizationRepository.getSchemaPack( runId );
+			var schemaCheckpoint = reusableCheckpoint( priorCheckpoints, "schema", inputFingerprint, sourceFingerprint );
+			var schemaCheckpointValue = !isNull( schemaCheckpoint ) ? ( schemaCheckpoint.payload.value ?: schemaCheckpoint.payload ) : {};
+			var schemaPack = !isNull( storedSchema )
+				? ( storedSchema.sanitized ?: storedSchema )
+				: ( isStruct( schemaCheckpointValue ) && schemaCheckpointValue.count() ? schemaCheckpointValue : schemaPackFromInput( input, arguments.run.getProjectPath() ) );
+			result.schemaEvidence = schemaPack ?: { coverage: "absent", objects: [], routines: [], unresolved: [] };
+			if ( isNull( storedSchema ) && isStruct( schemaPack ) && schemaPack.count() ) {
+				modernizationRepository.saveSchemaPack( runId, {
+					sourceKind: schemaPack.sourceKind ?: "attached-dump",
+					format: schemaPack.format ?: "sql-ddl",
+					relativePath: schemaPack.relativePath ?: "",
+					contentHash: schemaPack.contentHash ?: "",
+					packVersion: schemaPack.version ?: "modernization-schema-pack-v1",
+					metadata: { coverage: schemaPack.coverage ?: "", redactions: schemaPack.redactions ?: {}, dmlRemoved: schemaPack.dmlRemoved ?: 0 },
+					sanitized: schemaPack
+				} );
+			}
+			checkpoint( runId, "schema", result.schemaEvidence, 38, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
+			var extraEvidence = evidenceDiscoveryService.discover(
+				arguments.run.getProjectPath(),
+				{ relativePaths: input.evidencePaths ?: [], migrationPaths: input.migrationPaths ?: [] }
+			);
+			result.evidence = extraEvidence;
+			if ( isArray( extraEvidence.routeEvidence ?: "" ) ) result.inventory.routeEvidence = ( result.inventory.routeEvidence ?: [] ).append( extraEvidence.routeEvidence, true );
+			var signals = signalService.build( inventory, schemaPack ?: {}, extraEvidence );
+			result.signals = signals.signals ?: signals;
+			// Backfill the unit-level rollup the unit schema always declared but
+			// nothing ever populated. Mutates the plan's inventory in place, the
+			// same post-checkpoint pattern the routeEvidence append above uses.
+			linkSignalsToInventory( result.inventory, result.signals );
+			emit( arguments.callbacks, 42, "modernization-signals", "Deriving modernization coupling signals" );
+
+			// --- derived structure ---------------------------------------------
+			// Deterministic, no provider. Runs before the context pack so clusters
+			// are available to shard against, and before any model call so the
+			// model judges a structure rather than inventing one.
+			emit( arguments.callbacks, 46, "modernization-graph", "Computing the coupling graph" );
+			var graphCheckpoint = reusableCheckpoint( priorCheckpoints, "graph", inputFingerprint, sourceFingerprint );
+			var graphCheckpointValue = !isNull( graphCheckpoint ) ? ( graphCheckpoint.payload.value ?: graphCheckpoint.payload ) : {};
+			var couplingGraph = isStruct( graphCheckpointValue ) && isStruct( graphCheckpointValue.graph ?: "" ) && ( ( graphCheckpointValue.graph.nodes ?: [] ).len() )
+				? new app.models.domain.CouplingGraph( graphCheckpointValue.graph )
+				: couplingGraphService.build( inventory );
+			checkpoint( runId, "graph", { graph: couplingGraph.getMemento() }, 46, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
+			emit( arguments.callbacks, 50, "modernization-derived", "Deriving clusters and migration order" );
+			var derivedClusters = derivedStructureService.deriveClusters(
+				couplingGraph,
+				inventory.units ?: [],
+				isArray( input.scopePaths ?: "" ) ? input.scopePaths : []
+			);
+			var waveOrder = derivedStructureService.deriveWaveOrder( couplingGraph, derivedClusters );
+			result.derived = {
+				version  : "modernization-derived-v1",
+				clusters : derivedClusters,
+				waveOrder: waveOrder.getMemento(),
+				// The graph is large and recomputable, so only its shape travels
+				// with the plan. Nothing derived is stored or fingerprinted (4.0).
+				graph    : {
+					version          : couplingGraph.getVersion(),
+					fingerprint      : couplingGraph.getFingerprint(),
+					nodeCount        : couplingGraph.getNodes().len(),
+					edgeCount        : couplingGraph.getEdges().len(),
+					cycles           : couplingGraph.getMetrics().cycles ?: [],
+					truncated        : couplingGraph.truncated(),
+					truncationReasons: couplingGraph.getTruncationReasons()
+				}
+			};
+			checkpoint( runId, "derived", { derived: result.derived }, 50, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			checkCancellation( arguments.callbacks );
+
+			var contextCheckpoint = reusableCheckpoint( priorCheckpoints, "context", inputFingerprint, sourceFingerprint );
+			var contextCheckpointValue = !isNull( contextCheckpoint ) ? ( contextCheckpoint.payload.value ?: contextCheckpoint.payload ) : {};
+			var context = isStruct( contextCheckpointValue ) && isStruct( contextCheckpointValue.context ?: "" )
+				? contextCheckpointValue.context
+				: contextPackService.build( arguments.scan, inventory, result.signals, { schemaPack: schemaPack ?: {}, extraEvidence: extraEvidence, input: input } );
+				result.contexts = context.contexts ?: context;
+				checkpoint( runId, "context", { inventory: inventory.fingerprint ?: "", signals: result.signals, context: context }, 54, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+				checkCancellation( arguments.callbacks );
+
+				var evidenceCheckpoint = reusableCheckpoint( priorCheckpoints, "evidence", inputFingerprint, sourceFingerprint );
+				var evidenceCheckpointValue = !isNull( evidenceCheckpoint ) ? ( evidenceCheckpoint.payload.value ?: evidenceCheckpoint.payload ) : {};
+				var coverage = isStruct( evidenceCheckpointValue ) && isStruct( evidenceCheckpointValue.coverage ?: "" )
+					? evidenceCheckpointValue.coverage
+					: coverageService.assess( arguments.scan, inventory, schemaPack ?: {}, context, {} );
+				result.coverage = coverage;
+				checkCancellation( arguments.callbacks );
+			var scopedPaths = isArray( input.scopePaths ?: "" ) ? duplicate( input.scopePaths ) : [];
+			var evidence = {
+				inventory: inventory,
+				schemaEvidence: schemaPack ?: {},
+				signals: result.signals,
+				coverage: coverage,
+				context: context,
+				extraEvidence: extraEvidence,
+				scopePaths: scopedPaths,
+				// Derived clusters travel with the evidence so shard construction
+				// can key to them: each shard then has a coherent subject instead
+				// of an arbitrary slice of a path list.
+				derived: result.derived,
+				input: { scopePaths: duplicate( scopedPaths ) }
+			};
+			if ( isStruct( evidenceCheckpointValue ) && evidenceCheckpointValue.count() && isStruct( evidenceCheckpointValue.inventory ?: "" ) ) {
+				evidence = evidenceCheckpointValue;
+				evidence.scopePaths = scopedPaths;
+				if ( !isStruct( evidence.input ?: "" ) ) evidence.input = {};
+				evidence.input.scopePaths = duplicate( scopedPaths );
+			}
+			checkpoint( runId, "evidence", evidence, 56, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+
+			checkCancellation( arguments.callbacks );
+			emit( arguments.callbacks, 58, "modernization-proposal", "Generating sharded application maps, then database and roadmap proposals" );
+			try {
+				var startMsg = "Modernize run #runId#: starting proposal stage";
+				if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( startMsg );
+			} catch ( any ignored ) {}
+			var proposalInput = duplicate( input );
+				proposalInput.runId = runId;
+				proposalInput.budgets = arguments.run.getBudgets() ?: {};
+			proposalInput.sourceRevision = arguments.scan.repositoryRevision ?: "";
+			proposalInput.sourceFingerprint = sourceFingerprint;
+			proposalInput.startedAt = pipelineStartedAt;
+			var proposalCheckpoint = reusableCheckpoint( priorCheckpoints, "proposal", inputFingerprint, sourceFingerprint );
+			var proposalCheckpointValue = !isNull( proposalCheckpoint ) ? ( proposalCheckpoint.payload.value ?: proposalCheckpoint.payload ) : {};
+			var shardProgressCheckpoint = findCheckpoint( priorCheckpoints, "proposal-shards", inputFingerprint, sourceFingerprint );
+			var proposalOptions = {
+				isCancelled: () => isCancelled( pipelineCallbacks ),
+				onObservation: ( observation ) => {
+					if ( structKeyExists( pipelineCallbacks, "onObservation" ) && isCustomFunction( pipelineCallbacks.onObservation ) ) pipelineCallbacks.onObservation( observation );
+				},
+				onShardComplete: ( progress ) => {
+					try {
+						checkpoint(
+							runId,
+							"proposal-shards",
+							{
+								ok: true,
+								partial: true,
+								fragment: progress.fragment ?: {},
+								outcomes: progress.outcomes ?: [],
+								accepted: progress.accepted ?: 0,
+								failed: progress.failed ?: 0,
+								omitted: progress.omitted ?: 0,
+								outputCharacters: progress.outputCharacters ?: 0,
+								costUsd: progress.costUsd ?: 0
+							},
+							60,
+							{ inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint }
+						);
+					} catch ( any ignored ) {}
+				}
+			};
+			if ( !isNull( shardProgressCheckpoint ) ) {
+				var shardProgressValue = shardProgressCheckpoint.payload.value ?: shardProgressCheckpoint.payload;
+				if ( isStruct( shardProgressValue ) && ( shardProgressValue.accepted ?: 0 ) > 0 ) {
+					proposalOptions.resumeFrom = {
+						fragment: shardProgressValue.fragment ?: {},
+						outcomes: shardProgressValue.outcomes ?: [],
+						accepted: shardProgressValue.accepted ?: 0,
+						failed: shardProgressValue.failed ?: 0,
+						omitted: shardProgressValue.omitted ?: 0,
+						outputCharacters: shardProgressValue.outputCharacters ?: 0,
+						costUsd: shardProgressValue.costUsd ?: 0
+					};
+				}
+			}
+			proposal = isStruct( proposalCheckpointValue ) && structKeyExists( proposalCheckpointValue, "plan" )
+				? proposalCheckpointValue
+				: proposalService.propose(
+					runId,
+					proposalInput,
+					evidence,
+					proposalOptions
+				);
+			checkpoint( runId, "proposal", proposal, 76, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			if ( !( proposal.ok ?: false ) ) {
+				result.errors.append( proposal.errors ?: [], true );
+				modernizationRepository.savePlan(
+					runId,
+					{
+						version: "modernization-plan-v1",
+						schemaVersion: "modernization-plan-v1",
+						state: "failed",
+						metadata: {
+							runId: runId,
+							privacy: input.privacy ?: {},
+							sourceProfile: isStruct( input.source ?: "" ) ? duplicate( input.source ) : {},
+							targetProfile: isStruct( input.target ?: "" ) ? duplicate( input.target ) : {},
+							remoteProviderDisclosure: ( input.privacy.remoteProvider ?: false ) ? "Bounded, redacted modernization context may be sent to the configured remote provider." : "Modernization provider execution is configured as local; no remote egress is expected."
+						},
+						coverage: result.coverage,
+						assumptions: [],
+						inventory: result.inventory,
+						schemaEvidence: result.schemaEvidence,
+						signals: result.signals,
+						target: result.target,
+						unitLinks: [],
+						dbFindings: [],
+						dbTransitions: [],
+						routeContracts: [],
+						roadmapPhases: [],
+						samples: [],
+						validation: { blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors },
+						decisions: [],
+						errors: result.errors
+					},
+					{ blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors },
+					result.coverage
+				);
+				return terminal( result, "failed", "Modernization proposal was not generated", "failed" );
+			}
+			plan = proposal.plan ?: {};
+			// The derived structure is computed before the provider runs, so it
+			// has to be attached to the artifact that is actually persisted --
+			// `result` is in-memory only, and getResult() rehydrates from the
+			// stored plan.
+			plan.derived = result.derived;
+			// Derivation supplies the placements. This is the inversion itself:
+			// the boundary decision comes from coupling evidence, and the model's
+			// contribution is naming and narration on top of it. Without this the
+			// derived structure is only an advisory field beside a provider-made
+			// decision, and every line of identifier reconciliation that exists to
+			// make provider-invented ids resolve is still load-bearing.
+			plan = placementServiceInstance().applyDerivedPlacements( plan, derivedClusters );
+			// Model commentary on a decided structure. Before the gates (a verdict can
+			// lower gate confidence), after placements (there must be something fixed
+			// to argue with). metadata.provider comes from agentGateway.isEnabled(),
+			// so with no key nothing is called. Contained: commentary must never cost
+			// the plan.
+			if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
+				emit( arguments.callbacks, 78, "modernization-judge", "Judging derived boundaries and naming capabilities" );
+				try {
+					var judgement = judgementService.judgeAndNarrate(
+						runId,
+						result.derived,
+						input.target ?: {},
+						input.budgets ?: {},
+						{ maxDurationMs: 120000 }
+					);
+					plan = placementServiceInstance().applyNarrations( plan, judgement.narrations );
+					plan.judgement = {
+						verdicts: judgement.verdicts,
+						errors  : judgement.errors,
+						ran     : judgement.ran
+					};
+				} catch ( any judgementError ) {
+					// On the plan, not just `result.errors`, which is never persisted —
+					// a silently failing role reads as one that ran and found nothing.
+					plan.judgement = { verdicts: [], errors: [ { role: "modernization-judge", message: trim( toString( judgementError.message ?: "judge/narrate failed" ) ) } ], ran: false };
+					result.errors.append( { stage: "modernization-judge", role: "modernization-judge", message: trim( toString( judgementError.message ?: "judge/narrate failed" ) ) } );
+					if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( "Modernize run #runId#: judge/narrate failed, keeping derived structure: #( judgementError.message ?: '' )#" );
+				}
+			}
+			plan = mergeSourceModernizeCoverage( arguments.run, plan );
+			var placementService = placementServiceInstance();
+			var gateService = gateServiceInstance();
+			// Promote the provider's legacy context/extract vocabulary to the
+			// canonical v2 placement artifact before the first validation/save.
+			// The adapter is deterministic, bounded, and keeps a marked legacy
+			// projection so existing consumers can coexist during rollout.
+			plan = placementService.canonicalize( plan, evidence );
+			plan = gateService.evaluatePlan( plan, evidence );
+			plan = placementService.refreshFingerprints( plan );
+			plan.schemaVersion = placementService.planVersion();
+			plan.metadata = plan.metadata ?: {};
+			plan.metadata.runId = runId;
+			plan.metadata.privacy = input.privacy ?: {};
+			plan.metadata.remoteProviderDisclosure = ( input.privacy.remoteProvider ?: false )
+				? "Bounded, redacted modernization context may be sent to the configured remote provider."
+				: "Modernization provider execution is configured as local; no remote egress is expected.";
+				coverage = isStruct( plan.coverage ?: "" ) ? plan.coverage : coverage;
+				result.coverage = coverage;
+				plan.coverage = coverage;
+				emit( arguments.callbacks, 82, "modernization-validation", "Checking proposal structure, evidence, and safety gates" );
+				var validation = validationService.validate( plan, { inventory: inventory, schemaPack: schemaPack ?: {}, context: context } );
+				plan.validation = validation;
+				// Critic and brief run after merge, placement, gates and validation:
+				// they judge the architecture that was decided, not a draft, and
+				// schema problems are already caught by the time they speak. Neither
+				// may change the plan. The brief is last, deliberately — a confident
+				// narrative over a weak model is fluent nonsense.
+				if ( ( plan.metadata.provider ?: "" ) == "enabled" ) {
+					emit( arguments.callbacks, 84, "modernization-critic", "Reviewing the plan's architecture against its own evidence" );
+					try {
+					var critique = judgementService.critique( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
+					plan.critique = {
+						critiques: critique.critiques,
+						errors   : critique.errors,
+						ran      : critique.ran
+					};
+					emit( arguments.callbacks, 86, "modernization-brief", "Writing the verdict" );
+					var brief = judgementService.brief( runId, plan, input.target ?: {}, input.budgets ?: {}, { maxDurationMs: 90000 } );
+					plan.brief = {
+						verdict         : brief.verdict,
+						startHere       : brief.startHere,
+						claims          : brief.claims,
+						droppedClaims   : brief.droppedClaims,
+						citationValidity: brief.citationValidity,
+						errors          : brief.errors,
+						ran             : brief.ran
+					};
+					} catch ( any narrativeError ) {
+						plan.critique = { critiques: [], errors: [ { role: "modernization-critic", message: trim( toString( narrativeError.message ?: "critic/brief failed" ) ) } ], ran: false };
+						result.errors.append( { stage: "modernization-critic-brief", role: "modernization-critic", message: trim( toString( narrativeError.message ?: "critic/brief failed" ) ) } );
+						if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) log.info( "Modernize run #runId#: critic/brief failed, keeping the plan: #( narrativeError.message ?: '' )#" );
+					}
+				}
+				// Persist the accepted artifact before any repair/cancellation
+				// boundary. A later interruption may leave validation gates open,
+				// but must not discard already accepted provider fragments.
+				plan.state = "needs-review";
+				modernizationRepository.savePlan( runId, plan, validation, coverage );
+				// The repair round is gone with the repair role. It existed to ask the
+				// model to fix its own invalid structure; structure now comes from the
+				// coupling graph, so an invalid item is a bug in derivation to be fixed
+				// here, not a prompt to be retried. Validation still reports it.
+				emit( arguments.callbacks, 94, "modernization-roadmap", "Assembling the bounded modernization roadmap" );
+				checkCancellation( arguments.callbacks );
+								var planState = validation.ok ? "needs-review" : "needs-review";
+								// A newly generated artifact always starts in the separate human-review
+								// state.  Do not let ModernizationRepository's generic default of
+								// `generated` hide blocking validation or imply acceptance.
+								plan.state = planState;
+								modernizationRepository.savePlan( runId, plan, validation, coverage );
+			checkpoint( runId, "validation", { plan: plan, validation: validation }, 90, { inputFingerprint: inputFingerprint, sourceFingerprint: sourceFingerprint } );
+			carryForwardDecisions( arguments.run, plan );
+			// Carry-forward may satisfy every required item on an unchanged rerun.
+			// Read the persisted state back so this terminal payload agrees with the
+			// state that will be returned after the next result fetch.
+			var persistedPlan = modernizationRepository.getPlan( runId );
+			if ( !isNull( persistedPlan ) ) planState = persistedPlan.state ?: planState;
+			result = flattenPlan( plan, result );
+			result.validation = validation;
+			result.planState = planState;
+			result.decisions = modernizationRepository.listDecisions( runId );
+			result.decisionEvents = modernizationRepository.listDecisionEvents( runId );
+			if ( proposal.partial ) result.errors.append( proposal.errors ?: [], true );
+			if ( isArray( proposal.notes ?: "" ) && proposal.notes.len() ) result.generationNotes = proposal.notes;
+			else if ( isArray( plan.generationNotes ?: "" ) && plan.generationNotes.len() ) result.generationNotes = plan.generationNotes;
+			if ( isArray( proposal.errors ?: "" ) ) result.generationErrors = proposal.errors;
+			else if ( isArray( plan.generationErrors ?: "" ) ) result.generationErrors = plan.generationErrors;
+			var repositoryTruncated = ( arguments.scan.discoveryTruncated ?: false ) || ( coverage.repository.truncation ?: false );
+			var cfmlScopeComplete = !!( coverage.repository.modernizationLanguagesComplete ?: false );
+			// Asset/JS scan truncation must not keep a usable CFML plan in "partial" forever.
+			var hardTruncation = repositoryTruncated && !cfmlScopeComplete;
+			var terminalStatus = ( validation.blocking ?: 0 ) > 0 || hardTruncation || ( proposal.partial ?: false ) ? "partial" : "succeeded";
+			var message = terminalStatus == "partial" ? "Modernization plan retained with review gates" : "Modernization plan generated; review decisions are required";
+			checkCancellation( arguments.callbacks );
+			return terminal( result, terminalStatus, message, planState );
+		} catch ( "RunCancelled" error ) {
+			try {
+				var retained = modernizationRepository.getPlan( runId );
+				if ( !isNull( retained ) ) {
+					var retainedPlan = duplicate( retained.plan ?: {} );
+					var retainedCoverage = markIncompleteCoverage( retained.coverage ?: retainedPlan.coverage ?: result.coverage ?: {}, "cancelled" );
+					retainedPlan.coverage = retainedCoverage;
+					retainedPlan.state = "needs-review";
+					retainedPlan.generationErrors = isArray( retainedPlan.generationErrors ?: "" ) ? retainedPlan.generationErrors : [];
+					retainedPlan.generationErrors.append( { stage: "modernization", message: "cancelled", provenanceClass: "not-observed" } );
+					modernizationRepository.savePlan( runId, retainedPlan, retained.validation ?: retainedPlan.validation ?: {}, retainedCoverage );
+					result = flattenPlan( retainedPlan, result );
+					result.coverage = retainedCoverage;
+					result.validation = retained.validation ?: retainedPlan.validation ?: {};
+					result.errors.append( { stage: "modernization", message: "cancelled" } );
+				}
+			} catch ( any ignored ) {
+				// Checkpoints still preserve deterministic work if plan retention
+				// itself is unavailable during cancellation.
+			}
+			return terminal( result, "cancelled", "Modernization run cancelled; accepted fragments were retained with incomplete coverage", "needs-review" );
+		} catch ( any error ) {
+			if ( findNoCase( "LeaseLostException", error.type ?: "" ) ) rethrow;
+			var failureMessage = secretRedactionService.redactText( error.message ?: "Modernization run failed" );
+			var failureType = toString( error.type ?: "" );
+			var failureTrace = toString( error.stackTrace ?: error.detail ?: "" );
+			if ( len( trim( failureType ) ) ) failureMessage &= " [" & failureType & "]";
+			if ( len( trim( failureTrace ) ) ) failureMessage &= " @ " & left( replace( replace( failureTrace, char( 13 ), " ", "all" ), char( 10 ), " ", "all" ), 500 );
+			try {
+				log.error(
+					"Modernization run #runId# failed: #failureMessage#",
+					{ runId: runId, errorType: failureType, errorMessage: failureMessage, stackTrace: failureTrace }
+				);
+			} catch ( any ignored ) {}
+			result.errors.append( { stage: "modernization", message: failureMessage } );
+			// Prefer retaining a successfully built proposal (in-memory, already
+			// persisted, or proposal checkpoint) when a later stage throws. An empty
+			// shell wipe discards hours of shard work and forces a full re-run.
+			try {
+				var failureValidation = { blocking: 1, warnings: 0, ok: false, validationLevel: "blocking", messages: result.errors };
+				var retainedPlan = retainPlanAfterFailure( runId, plan, proposal, result, failureMessage );
+				modernizationRepository.savePlan(
+					runId,
+					retainedPlan,
+					isStruct( retainedPlan.validation ?: "" ) ? retainedPlan.validation : failureValidation,
+					retainedPlan.coverage ?: result.coverage ?: {}
+				);
+				if ( isStruct( retainedPlan.target ?: "" ) ) result = flattenPlan( retainedPlan, result );
+				result.validation = retainedPlan.validation ?: failureValidation;
+			} catch ( any ignored ) {}
+			return terminal( result, "failed", "Modernization run failed: " & failureMessage, "needs-review" );
+		}
+	}
+
+	struct function getResult(required string runId) {
+		var stored = modernizationRepository.getPlan( arguments.runId );
+		if ( isNull( stored ) ) return { schemaVersion: "modernization-plan-v1", validation: {}, coverage: {}, decisions: [], decisionEvents: [] };
+		var result = duplicate( stored.plan ?: {} );
+		result = placementServiceInstance().adaptForRead( result );
+		result.schemaVersion = result.schemaVersion ?: stored.planVersion;
+		result.validation = stored.validation ?: result.validation ?: {};
+		result.coverage = stored.coverage ?: result.coverage ?: {};
+		try {
+			result.coverage = coverageService.enrichRoadCoverage( result.coverage, result );
+		} catch ( any ignored ) {
+			// Road coverage is additive; never fail result assembly.
+		}
+		result.planState = stored.state;
+		result.planFingerprint = stored.fingerprint;
+		result.decisions = modernizationRepository.listDecisions( arguments.runId );
+		result.decisionEvents = modernizationRepository.listDecisionEvents( arguments.runId );
+		// Checkpoint payloads contain cumulative stage snapshots and can be larger
+		// than the final plan many times over. They are execution artifacts, not
+		// part of the normal plan contract. Keep only the timeline metadata on the
+		// result endpoint; trace/debug callers can use the checkpoint repository
+		// directly when they explicitly need a payload.
+		result.checkpoints = modernizationRepository.getCheckpoints( arguments.runId ).map( ( item ) => {
+			return {
+				runId     : item.runId ?: arguments.runId,
+				stage     : item.stage ?: "",
+				status    : item.status ?: "unknown",
+				progress  : val( item.progress ?: 0 ),
+				updatedAt : item.updatedAt ?: "",
+				hasPayload: isStruct( item.payload ?: "" ) && item.payload.count() > 0
+			};
+		} );
+		try {
+			var run = runRepository.find( arguments.runId );
+			if ( !isNull( run ) ) {
+				result = modernizationRiskService.enrich( result, run.getProjectPath(), run.getTenantId(), run.getProjectId() );
+			}
+		} catch ( any ignored ) {
+			// Risk/effort badges are additive; never fail result assembly.
+		}
+		result = enrichGenerationSummary( result, arguments.runId );
+		return result;
+	}
+
+	private struct function enrichGenerationSummary( required struct result, required string runId ) {
+		var summary = isStruct( arguments.result.generationSummary ?: "" ) ? duplicate( arguments.result.generationSummary ) : {};
+		var errors = isArray( arguments.result.generationErrors ?: "" ) ? arguments.result.generationErrors : [];
+		if ( !( summary.status ?: "" ).len() ) {
+			summary.status = errors.len() ? "partial_failure" : "succeeded";
+			summary.stage = summary.stage ?: ( errors.len() ? "proposal_generation" : "proposal_generation" );
+			summary.errorType = summary.errorType ?: ( errors.len() ? ( errors[ 1 ].errorType ?: "" ) : "" );
+			summary.message = summary.message ?: ( errors.len() ? ( errors[ 1 ].message ?: "" ) : "" );
+			summary.retryable = structKeyExists( summary, "retryable" ) ? !!summary.retryable : errors.len() > 0;
+			summary.completedStages = isArray( summary.completedStages ?: "" ) ? summary.completedStages : [];
+			summary.incompleteStages = isArray( summary.incompleteStages ?: "" ) ? summary.incompleteStages : [];
+		}
+		if ( !( summary.checkpointId ?: "" ).len() ) summary.checkpointId = arguments.runId & ":proposal";
+		arguments.result.generationSummary = summary;
+		return arguments.result;
+	}
+
+	void function cancelRun(required string runId) {
+		proposalService.cancelRun( arguments.runId );
+	}
+
+	/**
+	 * Rolls range-joined signals up onto their inventory units, populating the
+	 * signalIds/touchedTables/touchedColumns fields the unit record has always
+	 * declared but nothing ever filled.
+	 *
+	 * Takes the inventory STRUCT deliberately: BoxLang passes a bare array
+	 * argument by value, so a `required array units` signature would mutate a
+	 * copy, change nothing, and still pass every test. Reached through the
+	 * struct it is the same object the plan later persists.
+	 *
+	 * signalIds holds distinct sorted signalId slugs (not per-hit record
+	 * hashes), matching the convention ModernizationContextPackService already
+	 * uses for partition signalIds — human-mappable, and immune to count
+	 * inflation from a signal being attributed to both a function and its
+	 * containing component.
+	 */
+	private void function linkSignalsToInventory( required struct inventory, required array signals ) {
+		var units = isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [];
+		if ( !units.len() || !arguments.signals.len() ) return;
+		var owners = {};
+		for ( var signal in arguments.signals ) {
+			if ( !isStruct( signal ) ) continue;
+			var signalId = trim( signal.signalId ?: "" );
+			if ( !len( signalId ) ) continue;
+			var refs = signal.evidenceRefs ?: [];
+			var target = trim( toString( ( isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? ( refs[ 1 ].target ?: "" ) : "" ) ) );
+			for ( var unitId in ( isArray( signal.unitIds ?: "" ) ? signal.unitIds : [] ) ) {
+				var key = trim( toString( unitId ) );
+				if ( !len( key ) ) continue;
+				if ( !owners.keyExists( key ) ) owners[ key ] = { ids: {}, tables: {}, columns: {} };
+				owners[ key ].ids[ signalId ] = true;
+				if ( len( target ) && signalId == "sql.table-ref" ) owners[ key ].tables[ target ] = true;
+				if ( len( target ) && signalId == "sql.column-ref" ) owners[ key ].columns[ target ] = true;
+			}
+		}
+		for ( var index = 1; index <= units.len(); index++ ) {
+			var unitId = trim( units[ index ].id ?: units[ index ].itemId ?: "" );
+			if ( !len( unitId ) || !owners.keyExists( unitId ) ) continue;
+			var owner = owners[ unitId ];
+			units[ index ].signalIds = owner.ids.keyArray().sort( "textnocase" );
+			var tableNames = owner.tables.keyArray().sort( "textnocase" );
+			var columnNames = owner.columns.keyArray().sort( "textnocase" );
+			units[ index ].touchedTables = tableNames.len() > 20 ? tableNames.slice( 1, 20 ) : tableNames;
+			units[ index ].touchedColumns = columnNames.len() > 40 ? columnNames.slice( 1, 40 ) : columnNames;
+		}
+	}
+
+	private struct function schemaPackFromInput(required struct input, required string projectPath) {
+		var descriptor = arguments.input.schemaPack ?: {};
+		if ( !isStruct( descriptor ) || ( descriptor.sourceKind ?: "none" ) == "none" ) {
+			return schemaPackService.discover( arguments.projectPath );
+		}
+		if ( structKeyExists( descriptor, "sanitizedText" ) || structKeyExists( descriptor, "tables" ) ) return descriptor;
+		return schemaPackService.ingest( descriptor, arguments.projectPath );
+	}
+
+	private struct function flattenPlan(required struct plan, required struct current) {
+		for ( var key in arguments.plan.keyArray() ) arguments.current[ key ] = arguments.plan[ key ];
+		return arguments.current;
+	}
+
+	/**
+	 * Prefer an in-memory post-proposal plan, then a durable save, then the
+	 * proposal checkpoint. Only fall back to an empty shell when nothing usable
+	 * was produced — validation/gate exceptions must not wipe shard work.
+	 */
+	private struct function retainPlanAfterFailure(
+		required string runId,
+		required any plan,
+		required any proposal,
+		required struct result,
+		required string failureMessage
+	) {
+		var failureValidation = {
+			blocking: 1,
+			warnings: 0,
+			ok: false,
+			validationLevel: "blocking",
+			messages: arguments.result.errors ?: [ { stage: "modernization", message: arguments.failureMessage } ]
+		};
+		var candidate = {};
+		if ( planHasRetainedContent( arguments.plan ) ) {
+			candidate = duplicate( arguments.plan );
+		} else {
+			try {
+				var existing = modernizationRepository.getPlan( arguments.runId );
+				if ( !isNull( existing ) && planHasRetainedContent( existing.plan ?: {} ) ) {
+					candidate = duplicate( existing.plan );
+					if ( !isStruct( candidate.validation ?: "" ) && isStruct( existing.validation ?: "" ) ) {
+						candidate.validation = duplicate( existing.validation );
+					}
+				}
+			} catch ( any ignored ) {}
+		}
+		if ( !planHasRetainedContent( candidate ) && isStruct( arguments.proposal ?: "" ) && planHasRetainedContent( arguments.proposal.plan ?: {} ) ) {
+			candidate = duplicate( arguments.proposal.plan );
+		}
+		if ( !planHasRetainedContent( candidate ) ) {
+			try {
+				var checkpoints = modernizationRepository.getCheckpoints( arguments.runId );
+				for ( var checkpointItem in checkpoints ) {
+					if ( ( checkpointItem.stage ?: "" ) != "proposal" ) continue;
+					var payload = checkpointItem.payload ?: {};
+					var value = structKeyExists( payload, "value" ) ? payload.value : payload;
+					if ( isStruct( value ) && planHasRetainedContent( value.plan ?: {} ) ) {
+						candidate = duplicate( value.plan );
+						break;
+					}
+				}
+			} catch ( any ignored ) {}
+		}
+		if ( !planHasRetainedContent( candidate ) ) {
+			return {
+				version: "modernization-plan-v1",
+				schemaVersion: "modernization-plan-v1",
+				state: "needs-review",
+				metadata: { runId: arguments.runId },
+				coverage: arguments.result.coverage ?: {},
+				inventory: arguments.result.inventory ?: {},
+				schemaEvidence: arguments.result.schemaEvidence ?: {},
+				signals: arguments.result.signals ?: [],
+				target: arguments.result.target ?: { units: [] },
+				unitLinks: [],
+				dbFindings: [],
+				dbTransitions: [],
+				routeContracts: [],
+				roadmapPhases: [],
+				samples: [],
+				validation: failureValidation,
+				decisions: [],
+				errors: arguments.result.errors ?: []
+			};
+		}
+		candidate.state = "needs-review";
+		candidate.metadata = isStruct( candidate.metadata ?: "" ) ? candidate.metadata : {};
+		candidate.metadata.runId = arguments.runId;
+		candidate.coverage = isStruct( candidate.coverage ?: "" ) ? candidate.coverage : ( arguments.result.coverage ?: {} );
+		candidate.validation = failureValidation;
+		candidate.generationErrors = isArray( candidate.generationErrors ?: "" ) ? candidate.generationErrors : [];
+		candidate.generationErrors.append( {
+			stage: "modernization-validation",
+			message: arguments.failureMessage,
+			provenanceClass: "not-observed"
+		} );
+		candidate.errors = isArray( candidate.errors ?: "" ) ? candidate.errors : [];
+		candidate.errors.append( arguments.result.errors ?: [], true );
+		return candidate;
+	}
+
+	private boolean function planHasRetainedContent( required any plan ) {
+		if ( !isStruct( arguments.plan ) ) return false;
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		if ( isArray( target.units ?: "" ) && target.units.len() ) return true;
+		if ( isArray( target.placements ?: "" ) && target.placements.len() ) return true;
+		if ( isArray( arguments.plan.roadmapPhases ?: "" ) && arguments.plan.roadmapPhases.len() ) return true;
+		if ( isArray( arguments.plan.unitLinks ?: "" ) && arguments.plan.unitLinks.len() ) return true;
+		if ( isArray( arguments.plan.routeContracts ?: "" ) && arguments.plan.routeContracts.len() ) return true;
+		return false;
+	}
+
+	private void function checkpoint(required string runId, required string stage, required any payload, required numeric progress, struct provenance = {}) {
+			var status = checkpointStatusForPayload( arguments.payload );
+			arguments.provenance.pipelineContractVersion = variables.pipelineContractVersion;
+			modernizationRepository.saveCheckpoint( arguments.runId, arguments.stage, { status: status, progress: arguments.progress, payload: { value: arguments.payload, provenance: arguments.provenance } } );
+		}
+
+	string function checkpointStatusForPayload( required any payload ) {
+		if ( isStruct( arguments.payload ) && structKeyExists( arguments.payload, "ok" ) && !arguments.payload.ok ) return "failed";
+		if ( isStruct( arguments.payload ) && ( arguments.payload.partial ?: false ) ) return "partial";
+		return "succeeded";
+	}
+
+	private any function reusableCheckpoint(required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint) {
+		for ( var item in arguments.checkpoints ) {
+			if ( ( item.stage ?: "" ) != arguments.stage || ( item.status ?: "" ) != "succeeded" ) continue;
+			var payload = item.payload ?: {};
+			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
+			if (
+				( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint
+				&& ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint
+				&& ( provenance.pipelineContractVersion ?: "" ) == variables.pipelineContractVersion
+			) return item;
+		}
+		return javacast( "null", "" );
+	}
+
+	private any function findCheckpoint( required array checkpoints, required string stage, required string inputFingerprint, required string sourceFingerprint ) {
+		for ( var item in arguments.checkpoints ) {
+			if ( ( item.stage ?: "" ) != arguments.stage ) continue;
+			if ( ![ "succeeded", "partial" ].contains( item.status ?: "" ) ) continue;
+			var payload = item.payload ?: {};
+			var provenance = isStruct( payload.provenance ?: "" ) ? payload.provenance : {};
+			if (
+				( provenance.inputFingerprint ?: "" ) == arguments.inputFingerprint
+				&& ( provenance.sourceFingerprint ?: "" ) == arguments.sourceFingerprint
+				&& ( provenance.pipelineContractVersion ?: "" ) == variables.pipelineContractVersion
+			) return item;
+		}
+		return javacast( "null", "" );
+	}
+		private string function sourceFingerprint(required struct scan) {
+			var parts = [ "revision:" & ( arguments.scan.repositoryRevision ?: "" ) ];
+			for ( var file in arguments.scan.files ?: [] ) parts.append( ( file.filePath ?: file.path ?: "" ) & ":" & ( file.contentHash ?: hash( file.content ?: "", "SHA-256" ) ) );
+		parts.sort( "textnocase" );
+		return lCase( hash( parts.toList( "|" ), "SHA-256" ) );
+	}
+	private void function carryForwardDecisions( required any run, required struct plan ) {
+		var sourceRunId = trim( arguments.run.getSourceRunId() ?: "" );
+		if ( !len( sourceRunId ) ) return;
+		var sourceDecisions = modernizationRepository.listDecisions( sourceRunId );
+		for ( var prior in sourceDecisions ) {
+			var current = findPlanItem( arguments.plan, prior.itemType ?: "", prior.itemId ?: "" );
+			if ( isNull( current ) || trim( current.itemFingerprint ?: "" ) != trim( prior.itemFingerprint ?: "" ) ) continue;
+			var saved = modernizationRepository.upsertDecision( arguments.run.getId(), {
+				itemType: prior.itemType, itemId: prior.itemId, decision: prior.decision,
+				selectedOption: prior.selectedOption ?: prior.selected_option ?: "",
+				note: prior.note ?: "", itemFingerprint: prior.itemFingerprint ?: "", decidedBy: prior.decidedBy ?: "carried-forward"
+			} );
+			modernizationRepository.appendDecisionEvent( arguments.run.getId(), {
+				itemType: prior.itemType, itemId: prior.itemId, action: "carried-forward",
+				decision: saved, actor: "carried-forward", sourceRunId: sourceRunId
+			} );
+		}
+		modernizationDecisionService.refreshState( arguments.run.getId() );
+	}
+
+	/**
+	 * When continuing omitted coverage, keep prior accepted units/placements/
+	 * routes so the estate plan accumulates across waves instead of replacing.
+	 */
+	private struct function mergeSourceModernizeCoverage( required any run, required struct plan ) {
+		var sourceRunId = trim( arguments.run.getSourceRunId() ?: "" );
+		if ( !len( sourceRunId ) ) return arguments.plan;
+		var sourceRecord = modernizationRepository.getPlan( sourceRunId );
+		if ( isNull( sourceRecord ) || !isStruct( sourceRecord ) ) return arguments.plan;
+		var sourcePlan = isStruct( sourceRecord.plan ?: "" ) ? sourceRecord.plan : ( isStruct( sourceRecord ) ? sourceRecord : {} );
+		if ( !isStruct( sourcePlan.target ?: "" ) ) return arguments.plan;
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], placements: [], contexts: [], extracts: [] };
+		arguments.plan.target.units = mergeById( isArray( sourcePlan.target.units ?: "" ) ? sourcePlan.target.units : [], isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] );
+		arguments.plan.target.placements = mergeById( isArray( sourcePlan.target.placements ?: "" ) ? sourcePlan.target.placements : [], isArray( arguments.plan.target.placements ?: "" ) ? arguments.plan.target.placements : [] );
+		arguments.plan.target.contexts = mergeById( isArray( sourcePlan.target.contexts ?: "" ) ? sourcePlan.target.contexts : [], isArray( arguments.plan.target.contexts ?: "" ) ? arguments.plan.target.contexts : [] );
+		arguments.plan.target.extracts = mergeById( isArray( sourcePlan.target.extracts ?: "" ) ? sourcePlan.target.extracts : [], isArray( arguments.plan.target.extracts ?: "" ) ? arguments.plan.target.extracts : [] );
+		arguments.plan.unitLinks = mergeById( isArray( sourcePlan.unitLinks ?: "" ) ? sourcePlan.unitLinks : [], isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [] );
+		arguments.plan.routeContracts = mergeById( isArray( sourcePlan.routeContracts ?: "" ) ? sourcePlan.routeContracts : [], isArray( arguments.plan.routeContracts ?: "" ) ? arguments.plan.routeContracts : [] );
+		arguments.plan.dbFindings = mergeById( isArray( sourcePlan.dbFindings ?: "" ) ? sourcePlan.dbFindings : [], isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [] );
+		arguments.plan.dbTransitions = mergeById( isArray( sourcePlan.dbTransitions ?: "" ) ? sourcePlan.dbTransitions : [], isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [] );
+		arguments.plan.samples = mergeById( isArray( sourcePlan.samples ?: "" ) ? sourcePlan.samples : [], isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [] );
+		arguments.plan.roadmapPhases = mergeById( isArray( sourcePlan.roadmapPhases ?: "" ) ? sourcePlan.roadmapPhases : [], isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [] );
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.continuedFromRunId = sourceRunId;
+		arguments.plan.metadata.coverageAccumulated = true;
+		var priorUnits = isArray( sourcePlan.target.units ?: "" ) ? sourcePlan.target.units.len() : 0;
+		var nextUnits = isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units.len() : 0;
+		arguments.plan.metadata.accumulatedUnitCount = nextUnits;
+		arguments.plan.metadata.priorUnitCount = priorUnits;
+		return arguments.plan;
+	}
+
+	private array function mergeById( required array prior, required array next ) {
+		var output = [];
+		var seen = {};
+		var appendItem = ( item ) => {
+			if ( !isStruct( arguments.item ) ) return;
+			var key = trim( arguments.item.id ?: arguments.item.itemId ?: "" );
+			if ( !len( key ) ) {
+				output.append( arguments.item );
+				return;
+			}
+			if ( seen.keyExists( lCase( key ) ) ) return;
+			seen[ lCase( key ) ] = true;
+			output.append( arguments.item );
+		};
+		for ( var item in arguments.next ) appendItem( item );
+		for ( var item in arguments.prior ) appendItem( item );
+		return output;
+	}
+	private any function findPlanItem( required struct plan, required string itemType, required string itemId ) {
+		var map = { "target-unit": "target.units", "unit-link": "unitLinks", "route-contract": "routeContracts", "db-finding": "dbFindings", "db-transition": "dbTransitions", "roadmap-phase": "roadmapPhases", "sample": "samples", "placement": "target.placements" };
+		if ( !map.keyExists( arguments.itemType ) ) return javacast( "null", "" );
+		var path = map[ arguments.itemType ];
+		var parts = path.listToArray( "." );
+		var owner = parts.len() == 2 ? ( isStruct( arguments.plan[ parts[ 1 ] ] ?: "" ) ? arguments.plan[ parts[ 1 ] ] : {} ) : arguments.plan;
+		var key = parts[ parts.len() ];
+		var values = isArray( owner[ key ] ?: "" ) ? owner[ key ] : [];
+		for ( var item in values ) if ( ( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+		return javacast( "null", "" );
+	}
+	private any function placementServiceInstance() {
+		if ( !isNull( variables.modernizationPlacementService ?: javacast( "null", "" ) ) ) return variables.modernizationPlacementService;
+		variables.modernizationPlacementService = new app.models.services.ModernizationPlacementService();
+		if ( isNull( variables.modernizationPlacementService.identityService ?: javacast( "null", "" ) ) ) variables.modernizationPlacementService.identityService = new app.models.services.ModernizationIdentityService();
+		return variables.modernizationPlacementService;
+	}
+	private any function gateServiceInstance() {
+		if ( !isNull( variables.modernizationGateService ?: javacast( "null", "" ) ) ) return variables.modernizationGateService;
+		variables.modernizationGateService = new app.models.services.ModernizationGateService();
+		if ( isNull( variables.modernizationGateService.identityService ?: javacast( "null", "" ) ) ) variables.modernizationGateService.identityService = new app.models.services.ModernizationIdentityService();
+		return variables.modernizationGateService;
+	}
+	private void function emit(required struct callbacks, required numeric progress, required string phase, required string message) {
+		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) arguments.callbacks.renewLease();
+		if ( structKeyExists( arguments.callbacks, "transition" ) && isCustomFunction( arguments.callbacks.transition ) ) arguments.callbacks.transition( arguments.progress, arguments.phase, arguments.message );
+		var eventName = {
+			"modernization-schema": "modernization.schema",
+			"modernization-inventory": "modernization.inventory",
+			"modernization-signals": "modernization.signals",
+				"modernization-proposal": "modernization.proposal.progress",
+				"modernization-validation": "modernization.validation",
+				"modernization-repair": "modernization.repair",
+				"modernization-roadmap": "modernization.roadmap"
+		}[ arguments.phase ] ?: "";
+		if ( len( eventName ) ) {
+			try {
+				if ( len( trim( arguments.callbacks.runId ?: "" ) ) ) eventService.publish( arguments.callbacks.runId, eventName, { progress: arguments.progress, phase: arguments.phase, message: arguments.message, runKind: arguments.callbacks.runKind ?: "modernize" } );
+			} catch ( any ignored ) {
+				// Lifecycle progress remains owned by ReviewRunService; event detail
+				// is best effort for direct service tests and recovery paths.
+			}
+		}
+		if ( structKeyExists( arguments.callbacks, "renewLease" ) && isCustomFunction( arguments.callbacks.renewLease ) ) arguments.callbacks.renewLease();
+	}
+	private void function checkCancellation(required struct callbacks) {
+		if ( isCancelled( arguments.callbacks ) ) throw( type = "RunCancelled", message = "Modernization run cancelled" );
+	}
+	private boolean function isCancelled(required struct callbacks) {
+		return structKeyExists( arguments.callbacks, "checkCancellation" ) && isCustomFunction( arguments.callbacks.checkCancellation ) && arguments.callbacks.checkCancellation();
+	}
+	private struct function terminal(required struct result, required string status, required string message, required string planState) {
+		arguments.result.status = arguments.status;
+		arguments.result.message = arguments.message;
+		arguments.result.planState = arguments.planState;
+		return arguments.result;
+	}
+	private struct function markIncompleteCoverage( required struct coverage, required string reason ) {
+		var result = duplicate( arguments.coverage );
+		result.complete = false;
+		result.status = "incomplete";
+		result.llm = isStruct( result.llm ?: "" ) ? result.llm : {};
+		result.llm.complete = false;
+		result.llm.status = "incomplete";
+		result.llm.gaps = isArray( result.llm.gaps ?: "" ) ? result.llm.gaps : [];
+		if ( !result.llm.gaps.some( ( item ) => isStruct( item ) && ( item.reason ?: "" ) == arguments.reason ) ) {
+			result.llm.gaps.append( {
+				kind: "run-interruption",
+				status: "incomplete",
+				reason: arguments.reason,
+				provenanceClass: "not-observed"
+			} );
+		}
+		return result;
+	}
+
+}

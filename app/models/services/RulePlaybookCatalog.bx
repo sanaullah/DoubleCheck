@@ -1,0 +1,146 @@
+/**
+ * Static how-to playbooks keyed by finding ruleId (deterministic + specialist guidance).
+ */
+
+@singleton
+class {
+	variables.playbooks = {
+		"secrets/hardcoded-credential": {
+			steps: [
+				"Stop embedding credentials, API keys, or tokens in source.",
+				"Move the secret to an environment variable or secret manager.",
+				"Rotate the exposed value if it may already be compromised.",
+				"Reload configuration from the secure store at runtime."
+			],
+			example: "password = getSystemSetting( ""DB_PASSWORD"" )"
+		},
+		"execution/dynamic-code": {
+			steps: [
+				"Identify what the dynamic execution is trying to dispatch.",
+				"Replace eval / new Function with an explicit allow-listed map of handlers.",
+				"Validate inputs before calling the chosen handler.",
+				"Prefer parsers or typed commands over executing arbitrary strings."
+			],
+			example: "handlers[ command ]( payload ) // command must be allow-listed"
+		},
+		"database/query-interpolation": {
+			steps: [
+				"Keep SQL text free of ##value## or string-concatenated user data.",
+				"Use named query parameters and a parameter value struct.",
+				"Confirm the parameter type matches the column expectation.",
+				"Re-run the query path with hostile input to verify it stays bound."
+			],
+			example: "queryExecute( ""SELECT * FROM users WHERE id = :id"", { id: { value: userId, cfsqltype: ""cf_sql_integer"" } } )"
+		},
+		"errors/empty-catch": {
+			steps: [
+				"Decide which failures are expected versus unexpected.",
+				"Handle expected cases explicitly (fallback, user message, retry).",
+				"Log unexpected exceptions with enough context to diagnose.",
+				"Rethrow or re-raise unexpected failures so callers are not left with silent corruption."
+			],
+			example: "JS: catch (e) { console.error(e); throw e; }  |  BoxLang/CF: catch ( any e ) { writeLog( type=""error"", text=e.message ); rethrow; }"
+		},
+		"maintenance/open-marker": {
+			steps: [
+				"Confirm whether the TODO/FIXME still describes unfinished work.",
+				"Either complete the work or open a tracked issue with owner and context.",
+				"Replace the bare marker with a ticket reference, or remove it when done.",
+				"Avoid leaving markers that hide known defects from review."
+			],
+			example: "// TODO BOX-123: validate empty cart before checkout"
+		},
+		"modernization/encode-for-url": {
+			steps: [
+				"Locate values written into query strings, form actions, or location URLs.",
+				"Replace htmlFormat (or raw concatenation) with encodeForURL() / URLEncodedFormat on older CF.",
+				"Confirm the surrounding markup does not nest cfoutput inside the attribute or URL.",
+				"Re-test the link or redirect with reserved characters in the value."
+			],
+			example: "<a href=""page.cfm?id=##encodeForURL( trim( id ) )##"">"
+		},
+		"modernization/encode-for-html": {
+			steps: [
+				"Identify untrusted values rendered into HTML body text or attributes.",
+				"Use encodeForHTML() for body text and encodeForHTMLAttribute() for attributes.",
+				"Do not use htmlFormat as a URL encoder; keep URL encoding separate.",
+				"Verify the page still renders correctly after encoding."
+			],
+			example: "<p>##encodeForHTML( userComment )##</p>"
+		},
+		"modernization/cfoutput-nesting": {
+			steps: [
+				"Find nested <cfoutput> tags inside attributes, URLs, or already-open output regions.",
+				"Collapse to a single output region or use ##expression## inside one cfoutput.",
+				"Prefer encodeForURL / encodeForHTML* inside the expression rather than nested tags.",
+				"If a safe rewrite is unclear, leave a textual suggestion only — do not invent markup."
+			],
+			example: "<a href=""detail.cfm?id=##encodeForURL( id )##"">##encodeForHTML( label )##</a>"
+		},
+		"cfml/evaluate-dynamic": {
+			steps: [
+				"Identify evaluate(), dynamic includes, or string-built invocations of untrusted input.",
+				"Replace with an explicit allow-listed dispatch map or typed API.",
+				"Validate and constrain any remaining dynamic path segments.",
+				"Add a regression test that hostile input cannot reach executable evaluation."
+			],
+			example: "handlers[ command ]( args ) // command must be allow-listed"
+			},
+			"cfml/query-missing-queryparam": {
+				steps: [
+					"Locate the interpolated value(s) inside the <cfquery> block.",
+					"Wrap each one in <cfqueryparam value=""##value##"" cfsqltype=""...""> instead of concatenating it into the SQL text.",
+					"Pick the cfsqltype that matches the column (cf_sql_integer, cf_sql_varchar, etc.).",
+					"Re-run the query path with a hostile value to confirm it stays bound, not executed."
+				],
+				example: "<cfquery name=""q"">SELECT * FROM users WHERE id = <cfqueryparam value=""##url.id##"" cfsqltype=""cf_sql_integer""></cfquery>"
+			},
+			"cfml/unscoped-variable": {
+				steps: [
+					"Find the assignment inside <cffunction> that has no var/local scope.",
+					"Prefix it with var (or local.) so it is private to the current function call.",
+					"Check nearby assignments in the same function for the same gap.",
+					"Re-test under concurrent requests if the function is on a hot path."
+				],
+				example: "<cfset var total = 0>"
+			},
+			"cfml/dynamic-include-path": {
+				steps: [
+					"Identify the interpolated value inside the cfinclude/cfmodule template path.",
+					"Replace it with a lookup against an allow-listed set of template names.",
+					"Reject or default any value that does not match the allow-list.",
+					"Re-test with a path-traversal style value to confirm it is rejected."
+				],
+				example: "<cfinclude template=""##allowedTemplates[ section ]##"">"
+			},
+			"cfml/deprecated-cflock-scope": {
+				steps: [
+					"Decide what resource the lock is actually protecting.",
+					"Add scope=""..."" for a request/session/application-wide resource, or name=""..."" for a named critical section.",
+					"Keep the locked block as small as possible.",
+					"Confirm unrelated requests are no longer serialized by the same implicit lock."
+				],
+				example: "<cflock scope=""session"" timeout=""10"" type=""exclusive"">...</cflock>"
+			},
+			"cfml/application-lifecycle-gap": {
+				steps: [
+					"Open Application.cfc and confirm which lifecycle methods are defined.",
+					"Add onError to log/handle uncaught request failures instead of the default error page.",
+					"Add onSessionEnd if session-scoped resources need explicit cleanup.",
+					"Keep both handlers side-effect-safe since they can run outside a normal request context."
+				],
+				example: "function onError( exception, eventName ) { writeLog( type=""error"", text=exception.message ); }"
+			}
+	};
+
+	/**
+	 * @return Playbook struct with steps (and optional example), or null when unknown
+	 */
+	any function get( required string ruleId ) {
+		var key = trim( arguments.ruleId );
+		if ( !len( key ) || !variables.playbooks.keyExists( key ) ) {
+			return javacast( "null", "" );
+		}
+		return duplicate( variables.playbooks[ key ] );
+	}
+}

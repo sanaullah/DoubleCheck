@@ -1,0 +1,772 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"Specialist agents and controlled tools",
+			() => {
+				it(
+					"materializes authorized source packs for chat-only reviews",
+					() => {
+						var fixture = toolFixture();
+						var renderer = contextRenderer();
+						var pack = renderer.render(
+								fixture.task,
+								fixture.files,
+								4000
+							);
+						fixture.service.recordContextPack( fixture.session, pack );
+
+						expect( pack.text ).toInclude( "app/models/Example.bx" );
+						expect( pack.text ).toInclude( "2|" );
+						expect( pack.text ).notToInclude( "real-secret-value" );
+						expect( pack.includedRanges ).toHaveLength( 1 );
+						expect( pack.characters ).toBe( len( pack.text ) );
+						expect( fixture.session.evidenceCharacters ).toBe( pack.characters );
+						expect( fixture.service.audit( fixture.session )[ 1 ].toolName ).toBe( "context_pack" );
+					}
+				);
+
+				it(
+					"truncates context only at complete line boundaries",
+					() => {
+						var fixture = toolFixture();
+						var pack = contextRenderer().render(
+								fixture.task,
+								fixture.files,
+								70
+							);
+
+						expect( pack.characters ).toBeLTE( 70 );
+						expect( pack.truncated ).toBeTrue();
+						expect( pack.text ).notToInclude( "[truncated]" );
+						if ( len( pack.text ) ) {
+							var finalLine = listLast( pack.text, char( 10 ) );
+							expect( reFind( "^[0-9]+\| ", finalLine ) ).toBeGT( 0 );
+						}
+					}
+				);
+
+				it(
+					"rejects stale context artifacts before rendering",
+					() => {
+						var fixture = toolFixture();
+						fixture
+							.task
+							.context
+							.files[ 1 ].contentHash = "stale";
+
+						expect(
+							() => contextRenderer().render(
+									fixture.task,
+									fixture.files,
+									4000
+								)
+						).toThrow( type = "ContextPackPolicyException" );
+					}
+				);
+
+				it(
+					"detects proprietary tool-call markup and prefers chat with context for openai-compatible providers",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( {
+									provider: "openai-compatible",
+									model   : "moonshotai/kimi-k2.7-code"
+								} )
+							);
+						makePublic( gateway, "shouldPreferChatWithContext" );
+						// Response interpretation moved to SpecialistResponseParser
+						// (Part 5 Track A) and is public there, so no makePublic needed.
+						var parser = new app.models.services.SpecialistResponseParser();
+
+						expect( gateway.shouldPreferChatWithContext() ).toBeTrue();
+						expect(
+							parser.containsToolCallMarkup(
+									"<|tool_calls_section_begin|><|tool_call_begin|>functions.read_file:0"
+								)
+						).toBeTrue();
+						expect(
+							parser.sanitizeErrorSnippet(
+									"Specialist response is not valid JSON: <|tool_call_begin|>functions.read_file"
+								)
+						).toBe( "[tool-call markup omitted]" );
+						expect(
+							() => parser.assertNotToolCallMarkup( "<|tool_call_begin|>functions.read_file:0" )
+						).toThrow( type = "SpecialistToolMarkupException" );
+					}
+				);
+
+				it(
+					"boosts provider max_tokens for reasoning-heavy models like kimi",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						var resolverStub = new tests.resources.StubAIProviderResolver( { model: "moonshotai/kimi-k2.7-code" } );
+						gateway.$property( "aiProviderResolver", "variables", resolverStub );
+						// Model-class and token ceilings are owned by SpecialistChatFitter.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = resolverStub;
+
+						expect( fitter.isReasoningHeavyModel() ).toBeTrue();
+						expect( fitter.providerMaxTokens( 3000 ) ).toBe( 12000 );
+						expect( fitter.providerMaxTokens( 3000, 6 ) ).toBe( 18000 );
+
+						resolverStub.set( { model: "gpt-4.1-mini" } );
+						expect( fitter.isReasoningHeavyModel() ).toBeFalse();
+						expect( fitter.providerMaxTokens( 3000 ) ).toBe( 3000 );
+					}
+				);
+
+				it(
+					"fits chat prompts and completion tokens into the model context window",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "ornith-1.0-9b" } )
+							);
+						makePublic( gateway, "contextPackCharacterBudget" );
+						// Token budgeting and prompt fitting are owned by
+						// SpecialistChatFitter (Part 5 Track A) and public there, so
+						// this targets the owner with the same stubbed resolver.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "ornith-1.0-9b" } );
+
+						expect( fitter.completionTokenBudget( 6000 ) ).toBeLTE( 2048 );
+						expect( fitter.retryCompletionTokenBudget( 6000, 2048 ) ).toBe( 3072 );
+						expect( gateway.contextPackCharacterBudget( 2000, 2000 ) ).toBeLTE( 8192 * 2 );
+						expect( gateway.contextPackCharacterBudget( 2000, 2000 ) ).toBeGTE( 1000 );
+
+						var hugePack = repeatString( "code line" & char( 10 ), 8000 );
+						var fitted = fitter.fitChatPrompt(
+								"system instructions",
+								"task payload",
+								hugePack,
+								6000
+							);
+						expect( fitted.maxTokens ).toBeLTE( 2048 );
+						expect( fitted.truncated ).toBeTrue();
+						expect( fitted.systemPrompt ).toBe( "system instructions" );
+						expect( fitted.userPrompt ).toInclude( "[truncated]" );
+						var estimatedTokens = int(
+								( len( fitted.systemPrompt ) + len( fitted.userPrompt ) ) / 2
+							) +
+							fitted.maxTokens;
+						expect( estimatedTokens ).toBeLTE( 8192 );
+
+						var retryFitted = fitter.fitChatPrompt(
+								"compact JSON system instructions",
+								fitted.userPrompt,
+								"",
+								fitter.retryCompletionTokenBudget( 6000, 2048 ),
+								.375
+							);
+						expect( retryFitted.maxTokens ).toBe( 3072 );
+						var retryEstimatedTokens = int(
+								( len( retryFitted.systemPrompt ) + len( retryFitted.userPrompt ) ) / 2
+							) +
+							retryFitted.maxTokens;
+						expect( retryEstimatedTokens ).toBeLTE( 8192 );
+
+						var requiredFooter = char( 10 ) & "BEGIN_REPAIR_REQUEST" & char( 10 ) & "Repair serialization only." & char( 10 ) & "END_REPAIR_REQUEST";
+						var repairFitted = fitter.fitChatPrompt(
+								"immutable role and schema contract",
+								repeatString( "dynamic task data", 4000 ),
+								"",
+								1000,
+								.25,
+								requiredFooter
+							);
+						expect( repairFitted.systemPrompt ).toBe( "immutable role and schema contract" );
+						expect( repairFitted.userPrompt ).toInclude( "BEGIN_REPAIR_REQUEST" );
+						expect( repairFitted.userPrompt ).toInclude( "END_REPAIR_REQUEST" );
+					}
+				);
+
+				it(
+					"uses the canonical message field in chat-only contracts",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { model: "test-model" } )
+							);
+						// chatOnlyInstructions is owned by SpecialistChatFitter.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { model: "test-model" } );
+
+						var instructions = fitter.chatOnlyInstructions( { instructions: "OUTPUT_SCHEMA: specialist-findings-v1" } );
+						expect( instructions ).toInclude( "use message, never detail" );
+						expect( instructions ).notToInclude( "title, detail" );
+					}
+				);
+
+				it(
+					"keeps fitted user text available for tool-markup JSON retries",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { contextWindow: 8192 } )
+							);
+						// fitChatPrompt is owned by SpecialistChatFitter (Part 5 Track A).
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192 } );
+						var fitted = fitter.fitChatPrompt(
+								"system",
+								"task-body",
+								"## a.bx:1-2" & char( 10 ) & "1| x",
+								500
+							);
+						var fittedUserPrompt = fitted.userPrompt;
+						var retryUser = fittedUserPrompt & char( 10 ) & "Previous invalid output contained tool-call markup. Return JSON only.";
+						expect( retryUser ).toInclude( "task-body" );
+						expect( retryUser ).toInclude( "Return JSON only" );
+					}
+				);
+
+				it(
+					"reports the actual fitted completion budget for JSON retries",
+					() => {
+						var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+						gateway.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "test-model" } )
+							);
+						gateway.$property(
+								"observabilityEnabled",
+								"variables",
+								true
+							);
+						gateway.$property(
+								"observabilityPreviewCharacters",
+								"variables",
+								800
+							);
+						var chatStub = new tests.resources.DeterministicAIChatGateway( "{""summary"":""ok"",""findings"":[]}" );
+						gateway.$property(
+								"chatGateway",
+								"variables",
+								chatStub
+							);
+						// ensureChatJsonResponse is owned by SpecialistChatFitter
+						// (Part 5 Track A); give it the same stubs the gateway had.
+						var fitter = new app.models.services.SpecialistChatFitter();
+						fitter.aiProviderResolver = new tests.resources.StubAIProviderResolver( { contextWindow: 8192, model: "test-model" } );
+						fitter.chatGateway = chatStub;
+						var progressEvents = [];
+
+						var response = fitter.ensureChatJsonResponse(
+								"not-json",
+								[
+									{ role: "system", content: "ORIGINAL ROLE CONTRACT" & char( 10 ) & "OUTPUT_SCHEMA: specialist-findings-v1" },
+									{ role: "user", content: "Review this source." }
+								],
+								{ max_tokens: 2048 },
+								{},
+								{ maxTokens: 6000 },
+								( detail ) => progressEvents.append( detail ),
+								"Chat review"
+							);
+
+						expect( response ).toInclude( """findings"":[]" );
+						expect( progressEvents ).toHaveLength( 1 );
+						expect( progressEvents[ 1 ].message ).toInclude( "increased completion budget" );
+						expect( progressEvents[ 1 ]
+								.observe
+								.meta
+								.retryMaxTokens ).toBe( 3072 );
+						expect( progressEvents[ 1 ]
+								.observe
+								.meta
+								.requestedRetryMaxTokens ).toBe( 3072 );
+						var retryRequest = chatStub.getRequests()[ 1 ];
+						expect( retryRequest.prompt[ 1 ].content ).toInclude( "ORIGINAL ROLE CONTRACT" );
+						expect( retryRequest.prompt[ 1 ].content ).toInclude( "OUTPUT_SCHEMA: specialist-findings-v1" );
+						expect( retryRequest.prompt[ 2 ].content ).toInclude( "BEGIN_REPAIR_REQUEST" );
+						expect( retryRequest.prompt[ 2 ].content ).toInclude( "Do not add findings" );
+					}
+				);
+
+				it(
+					"allows only authorized indexed ranges and redacts secrets",
+					() => {
+						var fixture = toolFixture();
+						var output = fixture.service.execute(
+								fixture.session,
+								"read_indexed_range",
+								{
+									filePath : "app/models/Example.bx",
+									startLine: 2,
+									endLine  : 3
+								}
+							);
+
+						expect( output.lines ).toHaveLength( 2 );
+						expect( output.lines[ 2 ].text ).toBe( "[REDACTED SENSITIVE CONTENT]" );
+						expect( jsonSerialize( fixture.service.audit( fixture.session ) ) ).notToInclude( "real-secret-value" );
+					}
+				);
+
+				it(
+					"rejects traversal, out-of-range, unknown, and repeated calls",
+					() => {
+						var traversal = toolFixture();
+						expect(
+							() => traversal.service.execute(
+									traversal.session,
+									"read_indexed_range",
+									{
+										filePath : "../outside.bx",
+										startLine: 2,
+										endLine  : 2
+									}
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var outside = toolFixture();
+						expect(
+							() => outside.service.execute(
+									outside.session,
+									"read_indexed_range",
+									{
+										filePath : "app/models/Example.bx",
+										startLine: 1,
+										endLine  : 1
+									}
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var unknown = toolFixture();
+						expect(
+							() => unknown.service.execute(
+									unknown.session,
+									"write_file",
+									{}
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var repeated = toolFixture();
+						repeated.service.execute(
+								repeated.session,
+								"search_indexed_code",
+								{ query: "return" }
+							);
+						expect(
+							() => repeated.service.execute(
+									repeated.session,
+									"search_indexed_code",
+									{ query: "return" }
+								)
+						).toThrow( type = "ToolPolicyException" );
+					}
+				);
+
+				it(
+					"rejects malformed calls, tool timeouts, iteration overruns, and cumulative output overruns",
+					() => {
+						var malformed = toolFixture();
+						expect(
+							() => malformed.service.execute(
+									malformed.session,
+									"read_indexed_range",
+									{ filePath: "app/models/Example.bx" }
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var timed = toolFixture();
+						timed.service.$property(
+								"toolTimeoutMs",
+								"variables",
+								1
+							);
+						timed.service.$(
+								method   = "dispatch",
+								callback = ( toolSession, toolName, input ) => {
+									sleep( 10 );
+									return [];
+								}
+							);
+						expect(
+							() => timed.service.execute(
+									timed.session,
+									"search_indexed_code",
+									{ query: "return" }
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var iterations = toolFixture();
+						iterations.session.callLimit = 1;
+						iterations.service.execute(
+								iterations.session,
+								"search_indexed_code",
+								{ query: "return" }
+							);
+						expect(
+							() => iterations.service.execute(
+									iterations.session,
+									"search_indexed_code",
+									{ query: "function" }
+								)
+						).toThrow( type = "ToolPolicyException" );
+
+						var outputBound = toolFixture();
+						outputBound.session.outputLimit = 60;
+						var bounded = outputBound.service.execute(
+								outputBound.session,
+								"read_indexed_range",
+								{
+									filePath : "app/models/Example.bx",
+									startLine: 2,
+									endLine  : 3
+								}
+							);
+						expect( bounded.truncated ).toBeTrue();
+						expect( outputBound.session.outputCharacters ).toBeLTE( 60 );
+						expect(
+							() => outputBound.service.execute(
+									outputBound.session,
+									"search_indexed_code",
+									{ query: "function" }
+								)
+						).toThrow( type = "ToolPolicyException" );
+					}
+				);
+
+				it(
+					"builds prompts without source bodies and filters findings to task ranges",
+					() => {
+						var fixture = toolFixture();
+						var factory = prepareMock( new app.models.services.SpecialistAgentFactory() );
+						factory.$property(
+								"aiProviderResolver",
+								"variables",
+								new tests.resources.StubAIProviderResolver( { provider: "fake", model: "fake-model" } )
+							);
+						var definition = factory.definition( fixture.task );
+						var input = factory.input( fixture.task );
+
+						expect( definition.role ).toBe( "security" );
+						expect( definition.maxTokens ).toBe( 500 );
+						expect( input ).notToInclude( "real-secret-value" );
+						expect( input ).toInclude( fixture.task.id );
+
+						var service = specialistFixture(
+							{
+								summary : "One valid issue.",
+								findings: [
+									{
+										title     : "Valid issue",
+										message   : "Anchored inside the authorized range.",
+										filePath  : "app/models/Example.bx",
+										startLine : 2,
+										endLine   : 2,
+										severity  : "high",
+										confidence: .9
+									},
+									{
+										title    : "Outside range",
+										message  : "Must be rejected.",
+										filePath : "app/models/Example.bx",
+										startLine: 1,
+										endLine  : 1
+									}
+								]
+							},
+							fixture
+						);
+						var result = service.review(
+								{ tasks: [ fixture.task] },
+								fixture.files,
+								fixture.graph,
+								{
+									provenance: {
+										policyFingerprint: "policy-fingerprint",
+										budgetFingerprint: "budget-fingerprint",
+										planFingerprint  : "plan-fingerprint",
+										analyzerVersion  : "parser-version"
+									}
+								}
+							);
+
+						expect( result.results ).toHaveLength( 1 );
+						expect( result.findings ).toHaveLength( 1 );
+						expect( result.results[ 1 ].status ).toBe( "succeeded" );
+						expect( result.findings[ 1 ].source ).toBe( "specialist/security" );
+						expect( result.findings[ 1 ].provenance.promptVersion ).toBe( "specialist-prompt-v5" );
+						expect( result.findings[ 1 ].provenance.promptId ).toBe( "specialist.security" );
+						expect( len( result.findings[ 1 ].provenance.promptHash ) ).toBe( 64 );
+						expect( result.findings[ 1 ].provenance.policyFingerprint ).toBe( "policy-fingerprint" );
+						expect( result.findings[ 1 ].provenance.analyzerVersion ).toBe( "parser-version" );
+					}
+				);
+
+				it(
+					"turns malformed provider output into a bounded failed result",
+					() => {
+						var fixture = toolFixture();
+						var service = specialistFixture( "not structured", fixture );
+						var result = service.review(
+								{ tasks: [ fixture.task] },
+								fixture.files,
+								fixture.graph
+							);
+
+						expect( result.results[ 1 ].status ).toBe( "failed" );
+						expect( result.results[ 1 ].error ).toInclude( "Specialist review unavailable" );
+						expect( result.results[ 1 ].error ).toInclude( "not structured" );
+						expect( result.failedTasks ).toBe( 1 );
+					}
+				);
+
+				it(
+					"accepts a structured no-tool result",
+					() => {
+						var fixture = toolFixture();
+						var service = specialistFixture( { summary: "No defects found.", findings: [] }, fixture );
+						var result = service.review(
+								{ tasks: [ fixture.task] },
+								fixture.files,
+								fixture.graph
+							);
+
+						expect( result.results[ 1 ].status ).toBe( "succeeded" );
+						expect( result.findings ).toBeEmpty();
+					}
+				);
+
+				it(
+					"streams observability payloads through onProgress",
+					() => {
+						var fixture = toolFixture();
+						var service = specialistFixture( { summary: "No defects found.", findings: [] }, fixture );
+						service.$property(
+								"observabilityEnabled",
+								"variables",
+								true
+							);
+						service.$property(
+								"observabilityPreviewCharacters",
+								"variables",
+								800
+							);
+						var observed = [];
+						var payloads = [];
+						service.review(
+								{ tasks: [ fixture.task] },
+								fixture.files,
+								fixture.graph,
+								{
+									onProgress: ( task, detail, force ) => {
+										if ( structKeyExists( detail, "observe" ) && isStruct( detail.observe ) ) {
+											observed.append( detail.observe.kind );
+											payloads.append( detail.observe );
+										}
+									}
+								}
+							);
+						expect( observed.len() ).toBeGT( 0 );
+						expect( arrayFindNoCase( observed, "agent" ) ).toBeGT( 0 );
+						expect( arrayFindNoCase( observed, "response" ) ).toBeGT( 0 );
+						var agentObs = payloads.filter(
+								( item ) => {
+									return ( item.kind ?: "" ) == "agent";
+								}
+							);
+						expect( agentObs.len() ).toBeGT( 0 );
+						expect( len( agentObs[ 1 ].input ?: agentObs[ 1 ].preview ?: "" ) ).toBeGT( 0 );
+						var responseObs = payloads.filter(
+								( item ) => {
+									return ( item.kind ?: "" ) == "response";
+								}
+							);
+						expect( responseObs.len() ).toBeGT( 0 );
+						expect(
+							len( responseObs[ 1 ].output ?: responseObs[ 1 ].preview ?: "" )
+						).toBeGT( 0 );
+						expect( responseObs[ 1 ].observationType ?: "" ).toBe( "span" );
+					}
+				);
+			}
+		);
+	}
+
+	private struct function toolFixture() {
+		var service = prepareMock( new app.models.services.ControlledRepositoryToolService() );
+		service.$property(
+				"maxCalls",
+				"variables",
+				8
+			);
+		service.$property(
+				"maxOutputCharacters",
+				"variables",
+				12000
+			);
+		service.$property(
+				"maxSearchMatches",
+				"variables",
+				20
+			);
+		service.$property(
+				"toolTimeoutMs",
+				"variables",
+				2000
+			);
+		service.$property(
+				"secretRedactionService",
+				"variables",
+				new app.models.services.SecretRedactionService()
+			);
+		service.$property(
+				"budgetEnforcementEnabled",
+				"variables",
+				true
+			);
+		var content = [ "class {", "  function run() { return true; }", "  apiKey = ""real-secret-value"";", "}"];
+		var file = {
+			filePath   : "app/models/Example.bx",
+			language   : "BoxLang",
+			contentHash: lCase( hash( content.toList( char( 10 ) ), "SHA-256" ) ),
+			lines      : content
+		};
+		var task = {
+			id       : lCase( hash( "specialist-task", "SHA-256" ) ),
+			role     : "security",
+			objective: "Review security boundaries.",
+			budget   : {
+				maxFiles     : 1,
+				maxCharacters: 200,
+				maxTokens    : 500
+			},
+			context: {
+				changedSymbols     : [],
+				impactCount        : 0,
+				architectureFactIds: [],
+				files              : [
+					{
+						filePath   : file.filePath,
+						contentHash: file.contentHash,
+						language   : file.language,
+						ranges     : [
+							{
+								id       : "range-1",
+								startLine: 2,
+								endLine  : 3
+							}
+						]
+					}
+				]
+			}
+		};
+		var graph = {
+			symbols     : [],
+			dependencies: [],
+			impacts     : []
+		};
+		return {
+			service: service,
+			task   : task,
+			files  : [ file],
+			graph  : graph,
+			session: service.createSession(
+					task,
+					[ file],
+					graph
+				)
+		};
+	}
+
+	private any function specialistFixture( required any response, required struct fixture ) {
+		var gateway = prepareMock( new app.models.services.SpecialistAgentGateway() );
+		var stubbedResponse = arguments.response;
+		gateway.$( "isEnabled", true );
+		gateway.$( "run", stubbedResponse );
+		// SpecialistReviewService now calls runAsyncRetry() (not run()) in
+		// production - stub it the same way run() is stubbed above, just
+		// wrapped in an already-completed future so the .handle()/.thenCompose()
+		// chain in SpecialistReviewService has a real future to work with.
+		gateway.$(
+				method   = "runAsyncRetry",
+				callback = ( definition, tools, input, executorName, control, onProgress, contextPack, runId ) => {
+					return futureNew( stubbedResponse );
+				}
+			);
+		gateway.$( "contextPackCharacterBudget", 4000 );
+		gateway.$( "getProviderKey", "fake" );
+		var factory = prepareMock( new app.models.services.SpecialistAgentFactory() );
+		factory.$property(
+				"aiProviderResolver",
+				"variables",
+				new tests.resources.StubAIProviderResolver( { provider: "fake", model: "fake-model" } )
+			);
+		var service = prepareMock( new app.models.services.SpecialistReviewService() );
+		service.$property(
+				"gateway",
+				"variables",
+				gateway
+			);
+		service.$property(
+				"factory",
+				"variables",
+				factory
+			);
+		service.$property(
+				"toolService",
+				"variables",
+				arguments.fixture.service
+			);
+		service.$property(
+				"contextPackRenderer",
+				"variables",
+				contextRenderer()
+			);
+		service.$property(
+				"findingService",
+				"variables",
+				new app.models.services.FindingService()
+			);
+		service.$property(
+				"maxFindings",
+				"variables",
+				20
+			);
+		service.$property(
+				"maxSummaryCharacters",
+				"variables",
+				2000
+			);
+		service.$property(
+				"observabilityEnabled",
+				"variables",
+				true
+			);
+		service.$property(
+				"observabilityPreviewCharacters",
+				"variables",
+				800
+			);
+		service.$property(
+				"aiProviderResolver",
+				"variables",
+				new tests.resources.StubAIProviderResolver()
+			);
+		return service;
+	}
+
+	private any function contextRenderer() {
+		var renderer = prepareMock( new app.models.services.ContextPackRenderer() );
+		renderer.$property(
+				"secretRedactionService",
+				"variables",
+				new app.models.services.SecretRedactionService()
+			);
+		return renderer;
+	}
+}

@@ -1,0 +1,798 @@
+/**
+ * Executes one specialist via aiAgent tools or chat+embedded context; retries and circuit breaker.
+ * Fits prompts to AI_CONTEXT_WINDOW for local models.
+ *
+ * @see AIChatGateway
+ * @see SpecialistReviewService
+ */
+import ortus.boxlang.runtime.async.BoxFuture;
+
+@singleton
+class threadsafe {
+	property name="chatGateway" inject="AIChatGateway";
+
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+	property name="promptCompiler" inject="PromptCompiler";
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+
+	property name="maxRetries" inject="coldbox:setting:specialistMaxRetries";
+
+	property name="retryBackoffMs" inject="coldbox:setting:specialistRetryBackoffMs";
+
+	property name="circuitFailureThreshold" inject="coldbox:setting:specialistCircuitFailureThreshold";
+
+	property name="circuitCooldownMs" inject="coldbox:setting:specialistCircuitCooldownMs";
+
+	property name="observabilityEnabled" inject="coldbox:setting:observabilityEnabled";
+
+	property name="observabilityPreviewCharacters" inject="coldbox:setting:observabilityPreviewCharacters";
+
+	property name="aiTelemetryExtractor" inject="AiTelemetryExtractor";
+	property name="log" inject="logbox:logger:{this}";
+	property name="specialistObservationService" inject="SpecialistObservationService";
+	// Dense source/code often tokenizes near ~2 characters per token.
+	variables.charsPerToken = 2;
+	variables.promptSafetyTokens = 512;
+
+	variables.circuits = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+
+	/**
+	 * Telemetry extraction moved to AiTelemetryExtractor (Part 5). These delegate
+	 * so the call sites in this file did not change and there is one
+	 * implementation of each.
+	 */
+	private any function telemetry() {
+		if ( !isNull( variables.aiTelemetryExtractor ?: javacast( "null", "" ) ) ) return variables.aiTelemetryExtractor;
+		variables.aiTelemetryExtractor = new app.models.services.AiTelemetryExtractor();
+		return variables.aiTelemetryExtractor;
+	}
+
+	/**
+	 * Observation emitting and redaction moved to SpecialistObservationService
+	 * (Part 5 Track A). Explicit signatures, NOT `argumentCollection = arguments`:
+	 * the call sites pass positionally, and a positional `arguments` struct has
+	 * numeric keys that never bind to named parameters -- the payload came back
+	 * null with no error. That cost this extraction one full revert.
+	 */
+	private any function observations() {
+		if ( !isNull( variables.specialistObservationService ?: javacast( "null", "" ) ) ) return variables.specialistObservationService;
+		variables.specialistObservationService = new app.models.services.SpecialistObservationService();
+		return variables.specialistObservationService;
+	}
+
+	private string function redactSecrets( required string text ) {
+		return observations().redactSecrets( arguments.text );
+	}
+	/**
+	 * Response interpretation moved to SpecialistResponseParser (Part 5 Track A).
+	 * Explicit signatures, never `argumentCollection = arguments`: the call sites
+	 * pass positionally and numeric keys do not bind to named parameters.
+	 */
+	/**
+	 * Prompt fitting and JSON repair moved to SpecialistChatFitter
+	 * (Part 5 Track A). Explicit signatures throughout -- the call sites pass
+	 * positionally and `argumentCollection` would not bind.
+	 */
+	private any function responseParser() {
+		if ( !isNull( variables.specialistResponseParser ?: javacast( "null", "" ) ) ) return variables.specialistResponseParser;
+		variables.specialistResponseParser = new app.models.services.SpecialistResponseParser();
+		return variables.specialistResponseParser;
+	}
+	private any function chatFitter() {
+		if ( !isNull( variables.specialistChatFitter ?: javacast( "null", "" ) ) ) return variables.specialistChatFitter;
+		var fitter = new app.models.services.SpecialistChatFitter();
+		// Share this gateway's collaborators rather than letting the fitter build
+		// its own. Specs inject a StubAIProviderResolver here; a fitter that
+		// constructed a real resolver would silently bypass the stub and reach
+		// for live provider config.
+		if ( !isNull( variables.aiProviderResolver ?: javacast( "null", "" ) ) ) fitter.aiProviderResolver = variables.aiProviderResolver;
+		if ( !isNull( variables.chatGateway ?: javacast( "null", "" ) ) ) fitter.chatGateway = variables.chatGateway;
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) fitter.promptCompiler = variables.promptCompiler;
+		variables.specialistChatFitter = fitter;
+		return variables.specialistChatFitter;
+	}
+
+	private boolean function isReasoningHeavyModel() { return chatFitter().isReasoningHeavyModel(); }
+	private boolean function isOutputValidationError( required any error ) {
+		return chatFitter().isOutputValidationError( arguments.error );
+	}
+
+	private string function appendRepairRequest( required string input, required any error ) {
+		return chatFitter().appendRepairRequest( arguments.input, arguments.error );
+	}
+	private numeric function numericContextWindow() { return chatFitter().numericContextWindow(); }
+	private numeric function providerMaxTokens( required numeric requested, numeric multiplier = 0 ) { return chatFitter().providerMaxTokens( arguments.requested, arguments.multiplier ); }
+	private numeric function completionTokenBudget( required numeric requested, numeric windowFraction = .25 ) { return chatFitter().completionTokenBudget( arguments.requested, arguments.windowFraction ); }
+	private struct function normalizeResponse( required any response ) {
+		return responseParser().normalizeResponse( arguments.response );
+	}
+
+	private struct function extractUsage( required any ctx ) {
+		return telemetry().extractUsage( arguments.ctx );
+	}
+
+	boolean function isEnabled() {
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	any function run(
+		required struct definition,
+		required array tools,
+		required string input,
+		struct control      = {},
+		function onProgress = ( detail ) => {
+
+		},
+		string contextPack  = "",
+		string runId        = ""
+	) {
+		// Resolved once per call (not cached on this singleton) so concurrent
+		// specialist tasks on different pool threads never cross-contaminate
+		// each other's provider/key - see AIProviderResolverService.
+		var resolved = aiProviderResolver.resolve();
+		if ( !isStruct( arguments.definition.provenance ?: "" ) && isStruct( arguments.definition.promptPackage ?: "" ) && isStruct( arguments.definition.promptPackage.provenance ?: "" ) ) arguments.definition.provenance = duplicate( arguments.definition.promptPackage.provenance );
+		var invocation = buildInvocationContext( arguments.definition, arguments.runId, resolved );
+		var params = invocation.params;
+		var options = invocation.options;
+		assertAvailable();
+		var attempts = 0;
+		var response = "";
+		var activeInput = arguments.input;
+		while ( attempts <= numericSetting( maxRetries, 2 ) ) {
+			assertNotCancelled( arguments.control );
+			attempts++;
+			try {
+				response = executeOneAttempt(
+					arguments.definition,
+					arguments.tools,
+					activeInput,
+					params,
+					options,
+					arguments.control,
+					arguments.onProgress,
+					arguments.contextPack,
+					resolved,
+					attempts
+				);
+				recordSuccess();
+				break;
+			} catch ("RunCancelled" cancelled) {
+				rethrow;
+			} catch (any error) {
+				if ( isOutputValidationError( error ) ) {
+					if ( isStruct( error.data ?: "" ) && isArray( error.data.reasonCodes ?: "" ) && isStruct( arguments.definition.provenance ?: "" ) ) arguments.definition.provenance.validationReasonCodes = duplicate( error.data.reasonCodes );
+					activeInput = appendRepairRequest( activeInput, error );
+				}
+				var classification = classifyFailure( error, attempts, numericSetting( maxRetries, 2 ) );
+				if ( !classification.isTransient ) {
+					logProviderFailure(
+						"Specialist provider request failed",
+						error,
+						attempts,
+						false
+					);
+					rethrow;
+				}
+				if ( classification.exhausted ) {
+					logProviderFailure(
+						"Specialist provider retries exhausted",
+						error,
+						attempts,
+						false
+					);
+					recordFailure();
+					rethrow;
+				}
+				logProviderFailure(
+					"Transient specialist provider failure; retrying",
+					error,
+					attempts,
+					true
+				);
+				waitForRetry( attempts, arguments.control );
+				// Parallel sibling failures may open the circuit mid-retry.
+				// Keep the underlying provider error instead of masking it.
+				if ( state().openUntil.get() > currentTimeMillis() ) {
+					rethrow;
+				}
+			}
+		}
+		var normalized = normalizeResponse( response );
+		var acceptedResponse = getValidator().sanitizeValid( normalized, specialistSchemaId( arguments.definition ), specialistValidationContext( arguments.definition ) );
+		normalized = acceptedResponse.value;
+		if ( acceptedResponse.rejectedItems.len() && isStruct( arguments.definition.provenance ?: "" ) ) arguments.definition.provenance.rejectedItems = duplicate( acceptedResponse.rejectedItems );
+		if ( !isStruct( normalized ) || !isArray( normalized.findings ?: "" ) ) {
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not structured after normalization"
+			);
+		}
+		normalized._execution = {
+			attempts: attempts,
+			provider: resolved.provider,
+			streamed: true
+		};
+		return normalized;
+	}
+
+	/**
+	 * Non-blocking counterpart to run(): identical retry/backoff/circuit-breaker
+	 * policy (shared via buildInvocationContext/executeOneAttempt/classifyFailure/
+	 * backoffDelayMs), but backoff waits are scheduled off the bounded
+	 * `executorName` pool via BoxFuture.delayedExecutor() instead of blocking a
+	 * pool thread in sleep() - see run() for the blocking equivalent, kept
+	 * unchanged for direct/test callers.
+	 *
+	 * Resolves to the same normalized response shape run() returns. Rejects with
+	 * the original provider/cancellation error - callers must unwrap it via
+	 * unwrapAsyncError() (it crosses several BoxLang/Java interop boundaries on
+	 * the way out of the future chain and arrives wrapped otherwise).
+	 */
+	any function runAsyncRetry(
+		required struct definition,
+		required array tools,
+		required string input,
+		required string executorName,
+		struct control      = {},
+		function onProgress = ( detail ) => {
+
+		},
+		string contextPack  = "",
+		string runId        = ""
+	) {
+		var resolved = aiProviderResolver.resolve();
+		var validationDefinition = arguments.definition;
+		if ( !isStruct( validationDefinition.provenance ?: "" ) && isStruct( validationDefinition.promptPackage ?: "" ) && isStruct( validationDefinition.promptPackage.provenance ?: "" ) ) validationDefinition.provenance = duplicate( validationDefinition.promptPackage.provenance );
+		var invocation = buildInvocationContext( arguments.definition, arguments.runId, resolved );
+		assertAvailable();
+		return attemptAsync(
+			arguments.definition,
+			arguments.tools,
+			arguments.input,
+			invocation.params,
+			invocation.options,
+			arguments.control,
+			arguments.onProgress,
+			arguments.contextPack,
+			resolved,
+			1,
+			arguments.executorName
+		).handle( ( value, error ) => {
+			if ( !isNull( error ) ) {
+				throw( object = unwrapAsyncError( error ) );
+			}
+			var normalized = normalizeResponse( value.response );
+			var acceptedResponse = getValidator().sanitizeValid( normalized, specialistSchemaId( validationDefinition ), specialistValidationContext( validationDefinition ) );
+			normalized = acceptedResponse.value;
+			if ( acceptedResponse.rejectedItems.len() && isStruct( validationDefinition.provenance ?: "" ) ) validationDefinition.provenance.rejectedItems = duplicate( acceptedResponse.rejectedItems );
+			if ( !isStruct( normalized ) || !isArray( normalized.findings ?: "" ) ) {
+				throw(
+					type    = "SpecialistResultException",
+					message = "Specialist response is not structured after normalization"
+				);
+			}
+			normalized._execution = {
+				attempts: value.attempts,
+				provider: resolved.provider,
+				streamed: true
+			};
+			return futureNew( normalized );
+		} ).thenCompose( ( f ) => f );
+	}
+
+	/**
+	 * One attempt plus, on a retryable failure, a delayed self-resubmission -
+	 * recursive future chain driving the same policy run() drives with a
+	 * blocking loop. Flattened via .thenCompose() at each hop since neither
+	 * .handle() nor asyncRun() auto-unwrap a closure that returns a future.
+	 */
+	private any function attemptAsync(
+		required struct definition,
+		required array tools,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required function onProgress,
+		required string contextPack,
+		required struct resolved,
+		required numeric attempt,
+		required string executorName
+	) {
+		var currentDefinition = arguments.definition;
+		var currentTools = arguments.tools;
+		var currentInput = arguments.input;
+		var currentParams = arguments.params;
+		var currentOptions = arguments.options;
+		var currentControl = arguments.control;
+		var currentProgress = arguments.onProgress;
+		var currentContextPack = arguments.contextPack;
+		var currentResolved = arguments.resolved;
+		var currentAttempt = arguments.attempt;
+		var currentExecutorName = arguments.executorName;
+		var maxRetriesValue = numericSetting( maxRetries, 2 );
+
+		return asyncRun( () => {
+			assertNotCancelled( currentControl );
+			var response = executeOneAttempt(
+				currentDefinition,
+				currentTools,
+				currentInput,
+				currentParams,
+				currentOptions,
+				currentControl,
+				currentProgress,
+				currentContextPack,
+				currentResolved,
+				currentAttempt
+			);
+			return { response: response, attempts: currentAttempt };
+		}, currentExecutorName ).handle( ( value, error ) => {
+			if ( isNull( error ) ) {
+				recordSuccess();
+				return futureNew( value );
+			}
+			var cause = unwrapAsyncError( error );
+			if ( ( cause.type ?: "" ) == "RunCancelled" ) {
+				throw( object = cause );
+			}
+			var classification = classifyFailure( cause, currentAttempt, maxRetriesValue );
+			if ( !classification.isTransient ) {
+				logProviderFailure( "Specialist provider request failed", cause, currentAttempt, false );
+				throw( object = cause );
+			}
+			if ( classification.exhausted ) {
+				logProviderFailure( "Specialist provider retries exhausted", cause, currentAttempt, false );
+				recordFailure();
+				throw( object = cause );
+			}
+			// Spike-confirmed: cancelling the outer future does NOT stop an
+			// already-scheduled delayed retry, so cancellation must be checked
+			// here explicitly rather than relied upon via future.cancel().
+			if ( currentControl.keyExists( "cancelled" ) && currentControl.cancelled ) {
+				throw( type = "RunCancelled", message = "Specialist task cancelled" );
+			}
+			logProviderFailure( "Transient specialist provider failure; retrying", cause, currentAttempt, true );
+			var retryInput = isOutputValidationError( cause ) ? appendRepairRequest( currentInput, cause ) : currentInput;
+			if ( isOutputValidationError( cause ) && isStruct( cause.data ?: "" ) && isArray( cause.data.reasonCodes ?: "" ) && isStruct( currentDefinition.provenance ?: "" ) ) currentDefinition.provenance.validationReasonCodes = duplicate( cause.data.reasonCodes );
+			// Parallel sibling failures may open the circuit mid-retry.
+			// Keep the underlying provider error instead of masking it.
+			if ( state().openUntil.get() > currentTimeMillis() ) {
+				throw( object = cause );
+			}
+			var delayedExecutor = BoxFuture.delayedExecutor(
+				backoffDelayMs( currentAttempt ),
+				"milliseconds",
+				executorGet( currentExecutorName ).executor()
+			);
+			return asyncRun(
+				() => attemptAsync(
+					currentDefinition,
+					currentTools,
+					retryInput,
+					currentParams,
+					currentOptions,
+					currentControl,
+					currentProgress,
+					currentContextPack,
+					currentResolved,
+					currentAttempt + 1,
+					currentExecutorName
+				),
+				delayedExecutor
+			).thenCompose( ( f ) => f );
+		} ).thenCompose( ( f ) => f );
+	}
+
+	/**
+	 * Walks a future's exceptional cause chain past the BoxLang/Java interop
+	 * wrapper exceptions (CompletionException, ExecutionException, and the
+	 * BoxRuntimeException BoxLang's proxy layer adds around a closure that
+	 * throws) to the original error runAsyncRetry()'s attempts threw - the same
+	 * shape run()'s synchronous catch blocks see natively. Bounded and
+	 * defensive since the exact wrapping depth varies by call path (confirmed
+	 * empirically: 2 hops from inside a .handle() callback, 3 hops from a
+	 * top-level .get()).
+	 */
+	any function unwrapAsyncError( required any error ) {
+		var current = arguments.error;
+		var hops = 0;
+		while ( hops < 8 ) {
+			var className = "";
+			try {
+				className = current.getClass().getName();
+			} catch ( any ignoredClass ) {
+				return current;
+			}
+			var message = "";
+			try {
+				message = toString( current.message ?: "" );
+			} catch ( any ignoredMessage ) {
+				message = "";
+			}
+			var isWrapper = className == "java.util.concurrent.CompletionException" ||
+				className == "java.util.concurrent.ExecutionException" ||
+				( className == "ortus.boxlang.runtime.types.exceptions.BoxRuntimeException" && findNoCase( "Error invoking", message ) > 0 );
+			if ( !isWrapper ) {
+				return current;
+			}
+			var next = "";
+			try {
+				next = current.getCause();
+			} catch ( any ignoredCause ) {
+				return current;
+			}
+			if ( isNull( next ) || isSimpleValue( next ) ) {
+				return current;
+			}
+			current = next;
+			hops++;
+		}
+		return current;
+	}
+
+	/** Shared by run() and runAsyncRetry() so their provider/model/timeout setup can't drift apart. */
+	private struct function buildInvocationContext( required struct definition, required string runId, required struct resolved ) {
+		var params = {
+			temperature: 0,
+			max_tokens : providerMaxTokens( arguments.definition.maxTokens )
+		};
+		var contractId = specialistContractId( arguments.definition );
+		if ( len( contractId ) ) {
+			var capabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+			if ( !( capabilities.distinctSystem ?: true ) ) throw( type = "SpecialistProviderCapabilityException", message = "Provider cannot preserve the immutable specialist system contract" );
+			structAppend( params, getCompiler().structuredOutput( contractId, arguments.resolved.provider ?: "" ), true );
+		}
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
+		}
+		var options = {
+			provider     : arguments.resolved.provider,
+			apiKey       : arguments.resolved.apiKey,
+			timeout      : arguments.resolved.timeout,
+			returnFormat : "single",
+			threadId     : arguments.definition.taskId,
+			// Correlates every LLM call this specialist task makes back to the
+			// review run that triggered it, so AiFlight groups them as one
+			// session instead of unrelated traces (conversationId powers the
+			// agent path's own interceptData; tenantId/usageMetadata power the
+			// plain chat fallback path via AiChatRequest - see AiFlightListener).
+			conversationId: arguments.runId,
+			tenantId      : arguments.runId,
+			usageMetadata : {
+				runId : arguments.runId,
+				taskId: arguments.definition.taskId,
+				role  : arguments.definition.role
+			}
+		};
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
+		}
+		return { params: params, options: options };
+	}
+
+	/** Self-contained (no args) so external callers like SpecialistReviewService.ensureExecutor() are unaffected. */
+	/**
+	 * Circuit breaker, backoff and error classification moved to
+	 * ProviderResilienceService (Part 5 Track A). The breaker keys on this
+	 * gateway's provider so a future Modernize-side breaker stays separate.
+	 */
+	private any function resilience() {
+		if ( !isNull( variables.providerResilienceService ?: javacast( "null", "" ) ) ) return variables.providerResilienceService;
+		var service = new app.models.services.ProviderResilienceService();
+		// Propagate this gateway's tuning. Specs inject circuitFailureThreshold
+		// and circuitCooldownMs *here* to make the breaker trip quickly; a
+		// resilience service that read only its own injected settings would
+		// silently ignore them and the circuit would never open under test.
+		if ( !isNull( variables.circuitFailureThreshold ?: javacast( "null", "" ) ) ) service.circuitFailureThreshold = variables.circuitFailureThreshold;
+		if ( !isNull( variables.circuitCooldownMs ?: javacast( "null", "" ) ) ) service.circuitCooldownMs = variables.circuitCooldownMs;
+		if ( !isNull( variables.retryBackoffMs ?: javacast( "null", "" ) ) ) service.retryBackoffMs = variables.retryBackoffMs;
+		variables.providerResilienceService = service;
+		return variables.providerResilienceService;
+	}
+
+	struct function circuitStatus() {
+		resilience().useProviderKey( getProviderKey() );
+		return resilience().circuitStatus();
+	}
+
+	private void function waitForRetry( required numeric attempt, required struct control ) {
+		resilience().waitForRetry( arguments.attempt, arguments.control );
+	}
+
+	private numeric function backoffDelayMs( required numeric attempt ) {
+		return resilience().backoffDelayMs( arguments.attempt );
+	}
+
+	private struct function classifyFailure( required any error, required numeric attempt, required numeric maxRetries ) {
+		return resilience().classifyFailure( arguments.error, arguments.attempt, arguments.maxRetries );
+	}
+
+	private void function assertAvailable() {
+		resilience().useProviderKey( getProviderKey() );
+		resilience().assertAvailable();
+	}
+
+	private void function recordSuccess() {
+		resilience().useProviderKey( getProviderKey() );
+		resilience().recordSuccess();
+	}
+
+	private void function recordFailure() {
+		resilience().useProviderKey( getProviderKey() );
+		resilience().recordFailure();
+	}
+
+	private struct function state() {
+		resilience().useProviderKey( getProviderKey() );
+		return resilience().state();
+	}
+
+	private numeric function currentTimeMillis() {
+		return resilience().currentTimeMillis();
+	}
+
+	string function getProviderKey() {
+		return lCase( trim( aiProviderResolver.resolve().provider ) );
+	}
+
+
+	void function resetCircuit() {
+		var state = state();
+		state.failures.set( 0 );
+		state.openUntil.set( 0 );
+	}
+
+	/**
+	 * Character budget for authorized source excerpts when embedding into chat.
+	 * Leaves room for system/task text and completion tokens inside the window.
+	 */
+	numeric function contextPackCharacterBudget( numeric reservedPromptCharacters = 0, numeric requestedMaxTokens = 3000 ) {
+		var window = numericContextWindow();
+		var completion = completionTokenBudget( arguments.requestedMaxTokens );
+		var reservedTokens = max(
+			0,
+			int(
+				arguments.reservedPromptCharacters / variables.charsPerToken
+			)
+		);
+		var availableTokens = window - completion - variables.promptSafetyTokens - reservedTokens;
+		return max( 1000, availableTokens * variables.charsPerToken );
+	}
+
+
+
+
+	/**
+	 * The chat fallback path moved to SpecialistChatInvoker (Part 5 Track A).
+	 * This gateway keeps the policy -- try the agent path, fall back to chat --
+	 * and the invoker owns how a chat call is made. Collaborators are propagated
+	 * so specs that stub them on this gateway still take effect.
+	 */
+	// Agent path -> SpecialistAgentInvoker. Collaborators propagated so specs
+	// stubbing them here (StubAIProviderResolver) still take effect.
+	private any function agentInvoker() {
+		if ( !isNull( variables.specialistAgentInvoker ?: javacast( "null", "" ) ) ) return variables.specialistAgentInvoker;
+		var invoker = new app.models.services.SpecialistAgentInvoker();
+		if ( !isNull( variables.aiProviderResolver ?: javacast( "null", "" ) ) ) invoker.aiProviderResolver = variables.aiProviderResolver;
+		if ( !isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) invoker.secretRedactionService = variables.secretRedactionService;
+		if ( !isNull( variables.specialistChatInvoker ?: javacast( "null", "" ) ) ) invoker.specialistChatInvoker = variables.specialistChatInvoker;
+		else invoker.specialistChatInvoker = chatInvoker();
+		variables.specialistAgentInvoker = invoker;
+		return variables.specialistAgentInvoker;
+	}
+
+	private any function invokeAgent(
+		required struct definition,
+		required array tools,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required function onProgress,
+		string contextPack = "",
+		struct resolved     = aiProviderResolver.resolve()
+	) {
+		return agentInvoker().invokeAgent(
+			arguments.definition, arguments.tools, arguments.input, arguments.params,
+			arguments.options, arguments.control, arguments.onProgress, arguments.contextPack, arguments.resolved
+		);
+	}
+	private any function chatInvoker() {
+		if ( !isNull( variables.specialistChatInvoker ?: javacast( "null", "" ) ) ) return variables.specialistChatInvoker;
+		var invoker = new app.models.services.SpecialistChatInvoker();
+		if ( !isNull( variables.chatGateway ?: javacast( "null", "" ) ) ) invoker.chatGateway = variables.chatGateway;
+		if ( !isNull( variables.aiProviderResolver ?: javacast( "null", "" ) ) ) invoker.aiProviderResolver = variables.aiProviderResolver;
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) invoker.promptCompiler = variables.promptCompiler;
+		if ( !isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) invoker.secretRedactionService = variables.secretRedactionService;
+		variables.specialistChatInvoker = invoker;
+		return variables.specialistChatInvoker;
+	}
+
+	private any function invokeChatFallback(
+		required struct definition,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required any agentError,
+		function onProgress = ( detail ) => {},
+		string contextPack  = ""
+	) {
+		return chatInvoker().invokeChatFallback(
+			arguments.definition, arguments.input, arguments.params, arguments.options,
+			arguments.control, arguments.agentError, arguments.onProgress, arguments.contextPack
+		);
+	}
+	private void function assertNotCancelled( required struct control ) {
+		if ( arguments.control.keyExists( "cancelled" ) && arguments.control.cancelled ) {
+			throw(
+				type    = "RunCancelled",
+				message = "Specialist task cancelled"
+			);
+		}
+	}
+
+
+	/** Exponential backoff formula shared by the blocking (run()) and future-chained (runAsyncRetry()) retry drivers. */
+
+	/**
+	 * One provider attempt: progress callback + the chat-with-context-vs-agent
+	 * dispatch. Shared by run() (blocking loop) and runAsyncRetry() (future chain) so
+	 * both drivers execute attempts identically.
+	 */
+	private any function executeOneAttempt(
+		required struct definition,
+		required array tools,
+		required string input,
+		required struct params,
+		required struct options,
+		required struct control,
+		required function onProgress,
+		required string contextPack,
+		required struct resolved,
+		required numeric attempt
+	) {
+		arguments.onProgress(
+				{
+					stage  : "provider-attempt",
+					attempt: arguments.attempt
+				}
+			);
+		// Kimi / many openai-compatible models emit proprietary tool-call
+		// markup instead of OpenAI tool_calls. Prefer chat + embedded
+		// authorized source so reviews stay structured JSON.
+		var providerCapabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+		var candidate = ( ( arguments.tools.len() && !( providerCapabilities.tools ?: false ) ) || ( shouldPreferChatWithContext() && len( trim( arguments.contextPack ) ) ) )
+			? invokeChatFallback(
+				arguments.definition,
+				arguments.input,
+				arguments.params,
+				arguments.options,
+				arguments.control,
+				{
+					type   : "PreferChatWithContext",
+					message: "Using chat with embedded authorized source"
+				},
+				arguments.onProgress,
+				arguments.contextPack,
+				true,
+				arguments.resolved
+			)
+			: invokeAgent(
+				arguments.definition,
+				arguments.tools,
+				arguments.input,
+				arguments.params,
+				arguments.options,
+				arguments.control,
+				arguments.onProgress,
+				arguments.contextPack,
+				arguments.resolved
+			);
+		var acceptedCandidate = getValidator().sanitizeValid( candidate, specialistSchemaId( arguments.definition ), specialistValidationContext( arguments.definition ) );
+		if ( acceptedCandidate.rejectedItems.len() && isStruct( arguments.definition.provenance ?: "" ) ) arguments.definition.provenance.rejectedItems = duplicate( acceptedCandidate.rejectedItems );
+		return acceptedCandidate.value;
+		}
+
+	/**
+	 * Pure failure classification shared by run() and runAsyncRetry() - decides
+	 * whether an attempt's error is transient and whether retries are exhausted,
+	 * without logging or mutating circuit-breaker state (callers do that, since
+	 * the two drivers log/side-effect at different points around this decision).
+	 */
+
+
+
+
+
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 0, int( val( arguments.value ) ) ) : arguments.fallback;
+	}
+
+
+	private string function specialistContractId( required struct definition ) {
+		if ( len( trim( arguments.definition.promptId ?: "" ) ) ) return arguments.definition.promptId;
+		if ( isStruct( arguments.definition.promptPackage ?: "" ) && len( trim( arguments.definition.promptPackage.promptId ?: "" ) ) ) return arguments.definition.promptPackage.promptId;
+		var role = lCase( trim( arguments.definition.role ?: "" ) );
+		return len( role ) && [ "security", "correctness", "architecture", "testing", "performance", "boxlang-conventions", "cfml-conventions" ].contains( role ) ? "specialist." & role : "";
+	}
+
+	private string function specialistSchemaId( required struct definition ) {
+		if ( isSimpleValue( arguments.definition.outputSchema ?: "" ) && len( trim( arguments.definition.outputSchema ?: "" ) ) ) return arguments.definition.outputSchema;
+		if ( isStruct( arguments.definition.promptPackage ?: "" ) && len( trim( arguments.definition.promptPackage.outputSchema ?: "" ) ) ) return arguments.definition.promptPackage.outputSchema;
+		return "specialist-findings-v1";
+	}
+
+	private struct function specialistValidationContext( required struct definition ) {
+		var allowed = [];
+		var context = arguments.definition.inputContext ?: {};
+		if ( isStruct( arguments.definition.task ?: "" ) ) context = arguments.definition.task.context ?: context;
+		if ( isArray( context.files ?: "" ) ) allowed = context.files.map( ( item ) => item.filePath ?: "" );
+		return { allowedFilePaths: allowed };
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private boolean function shouldPreferChatWithContext() {
+		var resolved = aiProviderResolver.resolve();
+		var name = lCase( trim( resolved.provider ) );
+		if (
+			listFindNoCase(
+				"openai-compatible,nanogpt,nano-gpt,openrouter,together,groq",
+				name
+			)
+		) {
+			return true;
+		}
+		var modelName = lCase( trim( resolved.model ) );
+		return findNoCase( "kimi", modelName ) > 0 || findNoCase( "moonshot", modelName ) > 0;
+	}
+
+
+
+
+	private void function logProviderFailure(
+		required string message,
+		required any error,
+		required numeric attempt,
+		boolean warning = false
+	) {
+		if ( isNull( variables.log ?: javacast( "null", "" ) ) ) {
+			return;
+		}
+		var resolved = aiProviderResolver.resolve();
+		var detail = {
+			type      : arguments.error.type ?: "",
+			message   : redactSecrets( arguments.error.message ?: "" ),
+			provider  : resolved.provider,
+			model     : resolved.model,
+			attempt   : arguments.attempt,
+			stackTrace: redactSecrets( arguments.error.stackTrace ?: "" )
+		};
+		if ( arguments.warning ) {
+			log.warn( arguments.message, detail );
+		} else {
+			log.error( arguments.message, detail );
+		}
+	}
+
+	private boolean function isTrue( required any value ) {
+		if ( isBoolean( arguments.value ) ) {
+			return arguments.value;
+		}
+		return listFindNoCase( "true,1,yes,on", trim( toString( arguments.value ) ) ) > 0;
+	}
+}

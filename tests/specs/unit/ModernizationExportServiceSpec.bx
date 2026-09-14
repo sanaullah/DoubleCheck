@@ -1,0 +1,161 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "ModernizationExportService", () => {
+			var service = "";
+			var run = "";
+			var result = "";
+
+			beforeEach( () => {
+				service = new app.models.services.ModernizationExportService();
+				run = { id: "modernize1", projectPath: "C:/legacy-shop", mode: "full", runKind: "modernize", status: "succeeded" };
+				result = {
+					schemaVersion: "modernization-plan-v1",
+					planFingerprint: repeatString( "a", 64 ),
+					planState: "needs-review",
+					summary: "Plan with an evidence-backed route transition.",
+					coverage: {
+						schema: { coverage: "inference-limited" },
+						banners: [ "Attach a schema pack for stronger proposals." ],
+						status: "incomplete",
+						llm: {
+							status: "incomplete",
+							completed: 1,
+							failed: 1,
+							omitted: 0,
+							gaps: [ { kind: "application-shard", reason: "provider-failed", paths: [ "legacy/admin.cfm" ] } ]
+						},
+						road: { onRoad: 1, notYetSliced: 4, sourceStackNote: "" }
+					},
+					inventory: {
+						units: [
+							{ id: "legacy-1", filePath: "order.cfm", unitType: "page", symbolName: "order" },
+							{ id: "legacy-2", filePath: "Order.cfc", unitType: "class", symbolName: "Order" }
+						],
+						dependencies: [
+							{ id: "dep-1", filePath: "Order.cfc", kind: "extends", target: "app.models.BaseModel" }
+						]
+					},
+					target: { units: [ { id: "target-1", path: "app/handlers/Orders.bx", targetPath: "app/handlers/Orders.bx", validationStatus: "warning", provenanceClass: "provider-suggested" } ] },
+					routeContracts: [ { id: "route-1", method: "GET", legacyPath: "/order.cfm", targetRoute: "/orders", rollbackNote: "Flip route back to order.cfm", validationStatus: "valid", provenanceClass: "provider-suggested" } ],
+					dbFindings: [],
+					dbTransitions: [],
+					samples: [ { targetPath: "app/handlers/Orders.bx", language: "boxlang", code: "class { function index(){} }" } ],
+					roadmapPhases: [
+						{
+							id: "phase-1",
+							name: "Orders coexist slice",
+							pattern: "coexist-route",
+							goal: "Dual-route orders behind ColdBox",
+							parityIntent: "Same response shape for GET /order.cfm",
+							unitIds: [ "target-1" ],
+							routeIds: [ "route-1" ],
+							exitCriteria: [ "Route returns matching payload", "Legacy file still present" ],
+							rollback: "Point /orders back to order.cfm",
+							implementerPrompt: "Implement Orders.bx behind coexist routing.",
+							provenanceClass: "provider-suggested"
+						}
+					],
+					validation: { status: "warning", blocking: 0, warnings: 1 },
+					decisions: []
+				};
+			} );
+
+			it( "exports bounded Markdown and coverage banners", () => {
+				var report = service.export( run, result, "markdown" );
+				expect( report.format ).toBe( "markdown" );
+				expect( report.fileName ).toBe( "doublecheck-modernization-modernize1.md" );
+				expect( report.content ).toInclude( "Modernization Assessment" );
+				expect( report.content ).toInclude( "order.cfm" );
+				expect( report.content ).toInclude( "Attach a schema pack" );
+				expect( report.content ).toInclude( "provider-failed" );
+				expect( report.content ).toInclude( "provider-suggested" );
+			} );
+
+			it( "opens with the verdict and closes with telemetry", () => {
+				var content = service.export( run, result, "markdown" ).content;
+				var verdictAt = findNoCase( '## The verdict', content );
+				var roadAt = findNoCase( '## Solution road', content );
+				var phaseAt = findNoCase( 'Orders coexist slice', content );
+				var legacyAt = findNoCase( '## Appendix A', content );
+				var telemetryAt = findNoCase( '## Appendix D', content );
+				expect( verdictAt ).toBeGT( 0 );
+				expect( roadAt ).toBeGT( verdictAt );
+				expect( phaseAt ).toBeGT( roadAt );
+				expect( legacyAt ).toBeGT( phaseAt );
+				// The whole point of section 2.9: run identifiers and shard counts are
+				// the last thing shown, not the first.
+				expect( telemetryAt ).toBeGT( legacyAt );
+				expect( findNoCase( '- **Run:** ', content ) ).toBeGT( legacyAt );
+				// Static prose identical on every run trains readers to skip the top.
+				expect( content ).notToInclude( "Strangler coexistence" );
+				expect( content ).toInclude( "On road" );
+				expect( content ).toInclude( "Not yet sliced" );
+				expect( content ).toInclude( "coexist-route" );
+				expect( content ).toInclude( "Flip route back to order.cfm" );
+				expect( content ).toInclude( "Exit criteria" );
+				expect( content ).toInclude( "Implement Orders.bx behind coexist routing." );
+			} );
+
+			it( "renders Start here after canonicalize has rewritten the placement id", () => {
+				// The defect this guards: wave order is keyed on cluster ids, but
+				// canonicalize() recomputes `id`, so the join missed and the whole
+				// section vanished from the export. No spec caught it — only reading
+				// a real exported document did.
+				var narrative = new app.models.services.ModernizationAssessmentNarrative();
+				var lines = [];
+				narrative.appendStartHere(
+					lines,
+					{ derived: { waveOrder: { order: [ { clusterId: "ctx-derived-a1", wave: 0, dependsOn: [] } ] } } },
+					[ { id: "placement-id-rewritten", derivedClusterId: "ctx-derived-a1", name: "Order Pricing", purpose: "Prices orders." } ]
+				);
+				var text = lines.toList( " " );
+				expect( text ).toInclude( "Start here" );
+				expect( text ).toInclude( "Order Pricing" );
+			} );
+
+			it( "renders legacy catalog rows with real inventory field names and extends evidence", () => {
+				var content = service.export( run, result, "markdown" ).content;
+				var legacySection = mid( content, findNoCase( '## Appendix A', content ), findNoCase( '## Appendix B', content ) - findNoCase( '## Appendix A', content ) );
+				expect( legacySection ).toInclude( "**path:** Order.cfc" );
+				expect( legacySection ).toInclude( "**kind:** class" );
+				expect( legacySection ).toInclude( "**name:** Order" );
+				expect( legacySection ).toInclude( "**extends:** app.models.BaseModel" );
+			} );
+
+			it( "labels route contract fields in plain language instead of raw keys", () => {
+				var content = service.export( run, result, "markdown" ).content;
+				// `##` is an escaped literal `#` in BoxLang strings, so this matches
+				// the two leading hashes of the `### ...` sub-heading.
+				var routesSection = mid( content, findNoCase( '#### Route contracts', content ), findNoCase( '#### Database findings', content ) - findNoCase( '#### Route contracts', content ) );
+				expect( routesSection ).toInclude( "**Legacy URL:** /order.cfm" );
+				expect( routesSection ).toInclude( "**Target route:** /orders" );
+				expect( routesSection ).toInclude( "**Validation:** valid" );
+				expect( routesSection ).toInclude( "**Evidence basis:** provider-suggested" );
+				expect( routesSection ).notToInclude( "**legacyPath:**" );
+				expect( routesSection ).notToInclude( "**provenanceClass:**" );
+			} );
+
+			it( "exports the versioned JSON plan", () => {
+				var payload = jsonDeserialize( service.export( run, result, "json" ).content );
+				// This calls export() directly, which does not canonicalize, so the
+				// artifact keeps the schemaVersion it was stored with. Only the
+				// read path (adaptForRead) promotes to the single v2 shape.
+				expect( payload.schemaVersion ).toBe( "modernization-plan-v1" );
+				expect( payload.run.runKind ).toBe( "modernize" );
+				expect( payload.routeContracts ).toHaveLength( 1 );
+			} );
+
+			it( "exports SARIF validation and coverage gates without recasting proposals as findings", () => {
+				var report = service.export( run, result, "sarif" );
+				var payload = jsonDeserialize( report.content );
+				expect( report.contentType ).toBe( "application/sarif+json" );
+				expect( payload.version ).toBe( "2.1.0" );
+				expect( payload.runs[ 1 ].invocations[ 1 ].properties.planFingerprint ).toBe( repeatString( "a", 64 ) );
+				expect( payload.runs[ 1 ].invocations[ 1 ].properties.coverageStatus ).toBe( "incomplete" );
+				expect( payload.runs[ 1 ].invocations[ 1 ].executionSuccessful ).toBeFalse();
+				expect( payload.runs[ 1 ].results ).notToBeEmpty();
+			} );
+		} );
+	}
+}

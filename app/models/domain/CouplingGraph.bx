@@ -1,0 +1,123 @@
+/**
+ * The derived coupling graph: holds the structure and answers questions about
+ * it. It does not compute it — `ModernizationCouplingGraphService` does, and
+ * remains the single owner of that computation.
+ *
+ * Larger than the mementos beside it (a real graph holds thousands of edges),
+ * which the Domain objects section of `app/models/README.md` explicitly allows
+ * for derived structural types. The constraint those types keep instead is that
+ * they stay computation-free: everything here is a lookup or a filter over data
+ * already held.
+ *
+ * Nodes are files, not units. A dependency resolves to a target *file*; nothing
+ * in the inventory says which unit inside it is used, so `fanIn`/`fanOut` are
+ * keyed by file path. Each edge carries `sourceUnitIds` for attribution back to
+ * the units responsible.
+ *
+ * @see ModernizationCouplingGraphService
+ */
+class accessors="true" {
+
+	property name="version" type="string";
+	property name="nodes" type="array";
+	property name="edges" type="array";
+	property name="metrics" type="struct";
+	property name="truncated" type="boolean";
+	property name="truncationReasons" type="array";
+	property name="fingerprint" type="string";
+
+	function init( required struct data ) {
+		variables.version = arguments.data.version ?: "";
+		variables.nodes = arguments.data.nodes ?: [];
+		variables.edges = arguments.data.edges ?: [];
+		variables.metrics = arguments.data.metrics ?: {};
+		variables.truncated = arguments.data.truncated ?: false;
+		variables.truncationReasons = arguments.data.truncationReasons ?: [];
+		variables.fingerprint = arguments.data.fingerprint ?: "";
+		return this;
+	}
+
+	struct function getMemento() {
+		return {
+			version          : variables.version,
+			nodes            : duplicate( variables.nodes ),
+			edges            : duplicate( variables.edges ),
+			metrics          : duplicate( variables.metrics ),
+			truncated        : variables.truncated,
+			truncationReasons: duplicate( variables.truncationReasons ),
+			fingerprint      : variables.fingerprint
+		};
+	}
+
+	/** How many files depend on this one. */
+	numeric function fanIn( required string filePath ) {
+		return val( variables.metrics.fanIn[ normalize( arguments.filePath ) ] ?: 0 );
+	}
+
+	/** How many files this one depends on. */
+	numeric function fanOut( required string filePath ) {
+		return val( variables.metrics.fanOut[ normalize( arguments.filePath ) ] ?: 0 );
+	}
+
+	boolean function hasEdge( required string fromFilePath, required string toFilePath ) {
+		var from = normalize( arguments.fromFilePath );
+		var to = normalize( arguments.toFilePath );
+		for ( var edge in variables.edges ) {
+			if ( edge.fromFile == from && edge.toFile == to ) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Edges with exactly one endpoint inside the candidate boundary — the
+	 * coupling a boundary would have to cut.
+	 */
+	array function edgesCrossing( required array memberFilePaths ) {
+		var members = {};
+		for ( var path in arguments.memberFilePaths ) {
+			var key = normalize( path );
+			if ( len( key ) ) members[ key ] = true;
+		}
+		var crossing = [];
+		for ( var edge in variables.edges ) {
+			var fromInside = members.keyExists( edge.fromFile );
+			var toInside = members.keyExists( edge.toFile );
+			if ( fromInside != toInside ) crossing.append( edge );
+		}
+		return crossing;
+	}
+
+	/** True when a cap was hit. A capped graph must never read as complete. */
+	boolean function truncated() {
+		return variables.truncated;
+	}
+
+	/** Files in a cycle with this one. Non-empty means it cannot be cut out. */
+	array function cycleMembersFor( required string filePath ) {
+		var key = normalize( arguments.filePath );
+		for ( var cycle in ( variables.metrics.cycles ?: [] ) ) {
+			if ( cycle.contains( key ) ) return cycle;
+		}
+		return [];
+	}
+
+	/** Files sharing a datasource or table with this one. */
+	array function coAccessPeers( required string filePath ) {
+		var key = normalize( arguments.filePath );
+		var peers = {};
+		for ( var resource in ( variables.metrics.coAccess ?: {} ) ) {
+			var files = variables.metrics.coAccess[ resource ];
+			if ( !files.contains( key ) ) continue;
+			for ( var peer in files ) if ( peer != key ) peers[ peer ] = true;
+		}
+		var output = structKeyArray( peers );
+		arraySort( output, "textnocase" );
+		return output;
+	}
+
+	private string function normalize( required any path ) {
+		var value = replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return lCase( value );
+	}
+}

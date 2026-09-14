@@ -1,0 +1,101 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization human decisions", () => {
+			it( "requires accepted decisions for mandatory route and migration items", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: { units: [] }, unitLinks: [], dbFindings: [],
+					dbTransitions: [ { id: "migration-1", itemFingerprint: "migration-fp" } ],
+					routeContracts: [ { id: "route-1", itemFingerprint: "route-fp" } ],
+					roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp" } ], samples: []
+				} );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				var first = service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", decision: "accepted" } );
+				expect( first.state.required ).toBe( 3 );
+				expect( first.state.accepted ).toBe( 1 );
+				expect( first.state.state ).toBe( "needs-review" );
+				service.decide( run, "migration-1", { itemType: "db-transition", itemFingerprint: "migration-fp", decision: "accepted" } );
+				var complete = service.decide( run, "phase-1", { itemType: "roadmap-phase", itemFingerprint: "phase-fp", decision: "accepted" } );
+				expect( complete.state.state ).toBe( "accepted" );
+				expect( repo.planRecord.plan.state ).toBe( "accepted" );
+			} );
+
+			it( "rejects stale artifact fingerprints and records clear events", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = { target: { units: [] }, unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [ { id: "route-1", itemFingerprint: "route-fp" } ], roadmapPhases: [], samples: [] } );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				expect( () => service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", planFingerprint: "old", decision: "accepted" } ) ).toThrow( type = "ModernizationDecisionConflict" );
+				service.decide( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", decision: "accepted" } );
+				var cleared = service.clear( run, "route-1", { itemType: "route-contract", itemFingerprint: "route-fp", planFingerprint: "plan-fp" } );
+				expect( cleared.events.some( ( item ) => item.action == "cleared" ) ).toBeTrue();
+			} );
+
+			it( "clears decisions whose rebuilt item fingerprint changed", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: { units: [] }, unitLinks: [], dbFindings: [], dbTransitions: [],
+					routeContracts: [ { id: "route-1", itemFingerprint: "route-new" } ],
+					roadmapPhases: [], samples: []
+				} );
+				repo.decisions = [ {
+					itemType: "route-contract", itemId: "route-1", itemFingerprint: "route-old", decision: "accepted"
+				} ];
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var result = service.clearStaleDecisions( "run-1" );
+				expect( result.cleared ).toBe( 1 );
+				expect( repo.listDecisions( "run-1" ) ).toBeEmpty();
+				expect( repo.listDecisionEvents( "run-1" ).some( ( item ) => item.action == "cleared-stale" ) ).toBeTrue();
+			} );
+
+			it( "decides on packaging contexts and extracts without counting them as required", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: {
+						units: [],
+						contexts: [ { id: "ctx-1", itemFingerprint: "ctx-fp", packaging: "coldbox-module" } ],
+						extracts: [ { id: "ext-1", itemFingerprint: "ext-fp" } ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [], samples: []
+				} );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				var contextResult = service.decide( run, "ctx-1", { itemType: "context", itemFingerprint: "ctx-fp", decision: "accepted" } );
+				expect( contextResult.state.required ).toBe( 0 );
+				expect( contextResult.state.accepted ).toBe( 0 );
+				var extractResult = service.decide( run, "ext-1", { itemType: "extract", itemFingerprint: "ext-fp", decision: "rejected" } );
+				expect( extractResult.state.required ).toBe( 0 );
+				var decisions = repo.listDecisions( run.getId() );
+				expect( decisions.some( ( d ) => d.itemType == "context" && d.itemId == "ctx-1" && d.decision == "accepted" ) ).toBeTrue();
+				expect( decisions.some( ( d ) => d.itemType == "extract" && d.itemId == "ext-1" && d.decision == "rejected" ) ).toBeTrue();
+				expect( () => service.decide( run, "ctx-1", { itemType: "context", itemFingerprint: "stale-fp", decision: "accepted" } ) ).toThrow( type = "ModernizationDecisionConflict" );
+				var cleared = service.clear( run, "ext-1", { itemType: "extract", itemFingerprint: "ext-fp", planFingerprint: "plan-fp" } );
+				expect( cleared.decisions.some( ( d ) => d.itemType == "extract" && d.itemId == "ext-1" ) ).toBeFalse();
+			} );
+
+			it( "cascades roadmap-phase acceptance to linked target units and routes", () => {
+				var repo = new tests.resources.ScriptedModernizationDecisionRepository( plan = {
+					target: { units: [ { id: "tu-1", itemFingerprint: "tu-fp" } ] },
+					unitLinks: [],
+					dbFindings: [],
+					dbTransitions: [],
+					routeContracts: [ { id: "rc-1", itemFingerprint: "rc-fp" } ],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "phase-fp", currentSlice: true,
+						unitIds: [ "tu-1" ], routeIds: [ "rc-1" ], sampleIds: [], dbFindingIds: [], transitionIds: []
+					} ],
+					samples: []
+				} );
+				var service = new app.models.services.ModernizationDecisionService();
+				service.modernizationRepository = repo;
+				var run = new tests.resources.ScriptedModernizationRun();
+				service.decide( run, "phase-1", { itemType: "roadmap-phase", itemFingerprint: "phase-fp", decision: "accepted" } );
+				var decisions = repo.listDecisions( run.getId() );
+				expect( decisions.len() ).toBeGTE( 3 );
+				expect( decisions.some( ( d ) => d.itemId == "tu-1" && d.decision == "accepted" ) ).toBeTrue();
+				expect( decisions.some( ( d ) => d.itemId == "rc-1" && d.decision == "accepted" ) ).toBeTrue();
+			} );
+		} );
+	}
+}

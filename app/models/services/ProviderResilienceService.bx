@@ -1,0 +1,132 @@
+/**
+ * Circuit breaker, backoff and provider-error classification.
+ *
+ * Named by Part 5 Track A, and taken for a reason beyond line count: the
+ * Modernize gateway has **no breaker at all**, so a repeatedly failing provider
+ * is retried on every run. Owning this in one place lets both gateways share
+ * it.
+ *
+ * `bx-ai`'s `RetryMiddleware` covers backoff and retry, but has no breaker
+ * concept — that is why this stays in DoubleCheck rather than delegating to the
+ * module.
+ *
+ * The breaker's state lives here in full. It was not split from the gateway:
+ * every function that reads or writes `variables.circuits` moved together, so
+ * there is exactly one owner of that map.
+ */
+@singleton
+class threadsafe {
+	property name="log" inject="logbox:logger:{this}";
+	property name="retryBackoffMs" inject="coldbox:setting:specialistRetryBackoffMs";
+	property name="circuitFailureThreshold" inject="coldbox:setting:specialistCircuitFailureThreshold";
+	property name="circuitCooldownMs" inject="coldbox:setting:specialistCircuitCooldownMs";
+
+	variables.circuits = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init();
+
+	// The key a breaker is tracked under. Callers pass their own provider key so
+	// the Specialist and Modernize gateways can share this service without
+	// sharing a breaker.
+	variables.defaultProviderKey = "default";
+
+	/**
+	 * Which breaker this call belongs to. Set by the owning gateway via
+	 * useProviderKey() so two gateways sharing this service do not share a
+	 * breaker.
+	 */
+	string function providerKey() {
+		return len( trim( variables.activeProviderKey ?: "" ) ) ? variables.activeProviderKey : variables.defaultProviderKey;
+	}
+
+	void function useProviderKey( required string key ) {
+		variables.activeProviderKey = trim( arguments.key );
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? val( arguments.value ) : arguments.fallback;
+	}
+	struct function circuitStatus() {
+		var state = state();
+		return {
+			failures : state.failures.get(),
+			openUntil: state.openUntil.get(),
+			open     : state.openUntil.get() > currentTimeMillis()
+		};
+	}
+
+	public void function waitForRetry( required numeric attempt, required struct control ) {
+		var remaining = backoffDelayMs( arguments.attempt );
+		while ( remaining > 0 ) {
+			if ( isStruct( arguments.control ?: "" ) && isCustomFunction( arguments.control.isCancelled ?: "" ) && arguments.control.isCancelled() ) throw( type = "RunCancelled", message = "Provider wait cancelled" );
+			var slice = min( 50, remaining );
+			sleep( slice );
+			remaining -= slice;
+		}
+	}
+
+	public numeric function backoffDelayMs( required numeric attempt ) {
+		return numericSetting( retryBackoffMs, 100 ) * ( 2 ^ ( arguments.attempt - 1 ) );
+	}
+
+	public struct function classifyFailure( required any error, required numeric attempt, required numeric maxRetries ) {
+		var transientFailure = isTransientProviderError( arguments.error );
+		return {
+			isTransient: transientFailure,
+			exhausted  : transientFailure && arguments.attempt > arguments.maxRetries
+		};
+	}
+
+	public void function assertAvailable() {
+		if ( state().openUntil.get() > currentTimeMillis() ) {
+			throw(
+				type    = "SpecialistCircuitOpen",
+				message = "Specialist provider circuit is open"
+			);
+		}
+	}
+
+	public void function recordSuccess() {
+		var state = state();
+		state.failures.set( 0 );
+		state.openUntil.set( 0 );
+	}
+
+	public void function recordFailure() {
+		var state = state();
+		var failures = state.failures.incrementAndGet();
+		if ( failures >= numericSetting( circuitFailureThreshold, 3 ) ) {
+			state.openUntil.set(
+					currentTimeMillis() + numericSetting( circuitCooldownMs, 30000 )
+				);
+		}
+	}
+
+	public struct function state() {
+		var key = providerKey();
+		var fresh = {
+			failures : createObject( "java", "java.util.concurrent.atomic.AtomicInteger" ).init( 0 ),
+			openUntil: createObject( "java", "java.util.concurrent.atomic.AtomicLong" ).init( 0 )
+		};
+		var existing = variables.circuits.putIfAbsent( key, fresh );
+		return isNull( existing ) ? fresh : existing;
+	}
+
+	public numeric function currentTimeMillis() {
+		return createObject( "java", "java.lang.System" ).currentTimeMillis();
+	}
+
+	public boolean function isTransientProviderError( required any error ) {
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		return findNoCase( "providerfailure", typeName ) > 0 || findNoCase( "promptoutputvalidation", typeName ) > 0 || findNoCase( "connection failure", message ) > 0 ||
+											findNoCase( "failed to parse json", message ) > 0 ||
+										findNoCase( "deserializing response", message ) > 0 ||
+									findNoCase( "timeout", message ) > 0 ||
+								findNoCase( "timed out", message ) > 0 ||
+							findNoCase( "429", message ) > 0 ||
+						findNoCase( "rate limit", message ) > 0 ||
+					findNoCase( "temporarily", message ) > 0 ||
+				findNoCase( "tool-call markup", message ) > 0 ||
+			findNoCase( "connection", typeName ) > 0;
+	}
+}
+

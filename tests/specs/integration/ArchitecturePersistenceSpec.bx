@@ -1,0 +1,320 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Architecture graph persistence",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"reuses cached parser output and persists run-specific graphs",
+					() => {
+						var marker = lCase( createUUID() );
+						var content = "class {" & char( 10 ) & "property name=""service"" inject=""ReviewService"";" & char( 10 ) & "function test#left( marker,
+							8 )#() {}" & char( 10 ) & "}";
+						var file = {
+							filePath   : "app/models/Fixture.bx",
+							language   : "BoxLang",
+							contentHash: lCase( hash( content, "SHA-256" ) ),
+							content    : content,
+							lines      : listToArray(
+								content,
+								char( 10 ),
+								true,
+								true
+							)
+						};
+						var firstRunId = lCase( createUUID() );
+						var secondRunId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var indexService = getInstance( "ArchitectureIndexService" );
+						var graphRepository = getInstance( "AnalysisGraphRepository" );
+
+						try {
+							for ( var runId in [ firstRunId, secondRunId] ) {
+								runRepository.create(
+										{
+											id          : runId,
+											projectPath : expandPath( "/app" ),
+											mode        : "full",
+											baseRevision: "",
+											headRevision: "",
+											status      : "running",
+											progress    : 0,
+											currentPhase: "test",
+											message     : "Architecture persistence test",
+											createdAt   : nowValue,
+											updatedAt   : nowValue
+										}
+									);
+							}
+
+							var first = indexService.index( firstRunId, [ file] );
+							var second = indexService.index( secondRunId, [ file] );
+							var graph = graphRepository.getGraph( secondRunId );
+
+							expect( first.parserExecutions ).toBe( 1 );
+							expect( first.cacheHits ).toBe( 0 );
+							expect( second.parserExecutions ).toBe( 0 );
+							expect( second.cacheHits ).toBe( 1 );
+							expect( graph.symbols.len() ).toBeGT( 0 );
+							expect( graph.dependencies.len() ).toBe( 1 );
+							expect( graph.summary.cacheHits ).toBe( 1 );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id IN ( :firstRunId, :secondRunId )",
+								{
+									firstRunId : firstRunId,
+									secondRunId: secondRunId
+								}
+							);
+							queryExecute(
+								"DELETE FROM analysis_artifact_cache WHERE content_hash = :contentHash",
+								{ contentHash: file.contentHash }
+							);
+						}
+					}
+				);
+
+				it(
+					"resolves test relationships and persists changed-symbol impacts",
+					() => {
+						var marker = lCase( createUUID() );
+						var projectPath = "C:/doublecheck-impact-#marker#";
+						var firstRunId = lCase( createUUID() );
+						var secondRunId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var indexService = getInstance( "ArchitectureIndexService" );
+						var graphRepository = getInstance( "AnalysisGraphRepository" );
+						var serviceFile = sourceFile(
+							"app/models/ReviewService.bx",
+							[ "class {", "function review() { return true; }", "}"]
+						);
+						var testFile = sourceFile(
+							"tests/specs/ReviewServiceSpec.bx",
+							[
+								"class extends=""testbox.system.BaseSpec"" {",
+								"property name=""reviewService"" inject=""ReviewService"";",
+								"function run() {",
+								"describe( ""ReviewService"", () => {",
+								"it( ""reviews"", () => reviewService.review() );",
+								"} );",
+								"}",
+								"}"
+							]
+						);
+
+						try {
+							runRepository.create(
+									{
+										id          : firstRunId,
+										projectPath : projectPath,
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "",
+										status      : "running",
+										progress    : 0,
+										currentPhase: "test",
+										message     : "Baseline graph",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+							indexService.index( firstRunId, [ serviceFile, testFile] );
+							runRepository.updateState(
+									id           = firstRunId,
+									status       = "succeeded",
+									progress     = 100,
+									currentPhase = "complete",
+									message      = "Baseline complete",
+									completedAt  = dateTimeFormat( now(), "iso" )
+								);
+
+							runRepository.create(
+									{
+										id          : secondRunId,
+										projectPath : projectPath,
+										mode        : "working-tree",
+										baseRevision: "",
+										headRevision: "",
+										status      : "running",
+										progress    : 0,
+										currentPhase: "test",
+										message     : "Changed graph",
+										createdAt   : dateTimeFormat(
+											dateAdd(
+												"s",
+												1,
+												now()
+											),
+											"iso"
+										),
+										updatedAt: nowValue
+									}
+								);
+							var changedService = sourceFile(
+								"app/models/ReviewService.bx",
+								[ "class {", "function review() { return false; }", "}"]
+							);
+							var metrics = indexService.index( secondRunId, [ changedService] );
+							var graph = graphRepository.getGraph( secondRunId );
+							var baselineGraph = graphRepository.getGraph( firstRunId );
+
+							expect( metrics.baselineRunId ).toBe( firstRunId );
+							expect( metrics.impactCount ).toBeGT( 0 );
+							expect( baselineGraph
+									.dependencies
+									.filter(
+										( edge ) => edge.kind == "tests" && edge.targetFile == "app/models/ReviewService.bx"
+									)
+									.len() ).toBeGT( 0 );
+							expect( graph.impacts.len() ).toBeGT( 0 );
+							expect( graph.impacts[ 1 ].changedSymbol ).notToBeEmpty();
+							expect( graph.impacts[ 1 ].impactedFile ).toBe( "tests/specs/ReviewServiceSpec.bx" );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id IN ( :firstRunId, :secondRunId )",
+								{
+									firstRunId : firstRunId,
+									secondRunId: secondRunId
+								}
+							);
+							queryExecute(
+								"DELETE FROM analysis_artifact_cache WHERE content_hash IN ( :serviceHash, :changedServiceHash, :testHash )",
+								{
+									serviceHash       : serviceFile.contentHash,
+									changedServiceHash: changedService.contentHash,
+									testHash          : testFile.contentHash
+								}
+							);
+						}
+					}
+				);
+				it(
+					"skips duplicate symbol and dependency ids when persisting a run graph",
+					() => {
+						var runId = lCase( createUUID() );
+						var nowValue = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var graphRepository = getInstance( "AnalysisGraphRepository" );
+						var sharedDependencyId = lCase( hash( "dup-dep", "SHA-256" ) );
+						var sharedSymbolId = lCase( hash( "dup-sym", "SHA-256" ) );
+
+						try {
+							runRepository.create(
+									{
+										id          : runId,
+										projectPath : expandPath( "/app" ),
+										mode        : "full",
+										baseRevision: "",
+										headRevision: "",
+										status      : "running",
+										progress    : 0,
+										currentPhase: "test",
+										message     : "Duplicate graph id test",
+										createdAt   : nowValue,
+										updatedAt   : nowValue
+									}
+								);
+
+							graphRepository.replaceRunGraph(
+									runId,
+									[
+										{
+											filePath     : "app/models/One.bx",
+											contentHash  : "hash-one",
+											parserVersion: "test-parser",
+											symbols      : [
+												{
+													id      : sharedSymbolId,
+													kind    : "class",
+													name    : "One",
+													line    : 1,
+													evidence: "class One"
+												}
+											],
+											dependencies: [
+												{
+													id        : sharedDependencyId,
+													kind      : "injects",
+													target    : "SharedService",
+													targetFile: "",
+													line      : 2,
+													evidence  : "inject SharedService"
+												}
+											]
+										},
+										{
+											filePath     : "app/models/Two.bx",
+											contentHash  : "hash-two",
+											parserVersion: "test-parser",
+											symbols      : [
+												{
+													id      : sharedSymbolId,
+													kind    : "class",
+													name    : "Two",
+													line    : 1,
+													evidence: "class Two"
+												}
+											],
+											dependencies: [
+												{
+													id        : sharedDependencyId,
+													kind      : "injects",
+													target    : "SharedService",
+													targetFile: "",
+													line      : 2,
+													evidence  : "inject SharedService again"
+												}
+											]
+										}
+									],
+									[],
+									{
+										parserVersion   : "test-parser",
+										filesAnalyzed   : 2,
+										parserExecutions: 2,
+										cacheHits       : 0,
+										symbolCount     : 1,
+										dependencyCount : 1,
+										impactCount     : 0,
+										baselineRunId   : ""
+									}
+								);
+
+							var graph = graphRepository.getGraph( runId );
+							expect( graph.symbols.len() ).toBe( 1 );
+							expect( graph.dependencies.len() ).toBe( 1 );
+						} finally {
+							queryExecute(
+								"DELETE FROM review_runs WHERE id = :runId",
+								{ runId: runId }
+							);
+						}
+					}
+				);
+			}
+		);
+	}
+
+	private struct function sourceFile( required string filePath, required array lines ) {
+		var content = arrayToList( arguments.lines, char( 10 ) );
+		return {
+			filePath   : arguments.filePath,
+			language   : "BoxLang",
+			contentHash: lCase( hash( content, "SHA-256" ) ),
+			content    : content,
+			lines      : arguments.lines
+		};
+	}
+}

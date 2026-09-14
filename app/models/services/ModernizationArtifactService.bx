@@ -1,0 +1,761 @@
+/**
+ * Artifact normalization for a modernization plan: samples, database
+ * transitions, and the naming/path utilities they depend on.
+ *
+ * Split out of ModernizationProposalService, which was three services wearing
+ * one filename (Step 11). This half is the one with no run state at all —
+ * every function here is a pure transform from plan fragments to plan
+ * fragments, which is why it moves first and moves verbatim.
+ *
+ * ProposalService keeps thin delegating wrappers for the handful of utilities
+ * its other half still calls, so there is one implementation of each rather
+ * than a copy on both sides.
+ */
+@singleton
+class threadsafe {
+	public string function pathHaystackForUnits( required array units ) {
+		var words = [];
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			words.append( lCase( toString( unit.sourcePath ?: "" ) ) );
+			words.append( lCase( toString( unit.targetPath ?: "" ) ) );
+		}
+		return reReplace( words.toList( " " ), "[^a-z0-9]+", " ", "all" );
+	}
+
+	/** Whole-token match of a schema object name inside a path haystack. */
+	public boolean function objectMatchesHaystack( required any objectName, required string haystack ) {
+		if ( !isSimpleValue( arguments.objectName ) ) return false;
+		var needle = lCase( reReplace( toString( arguments.objectName ), "[^A-Za-z0-9]+", "", "all" ) );
+		// Two-character object names match far too much to be evidence.
+		if ( len( needle ) < 3 ) return false;
+		return reFindNoCase( "(^|[^a-z0-9])" & needle & "([^a-z0-9]|$)", arguments.haystack ) > 0;
+	}
+
+	/** Every schema object a db finding or transition names. */
+	public array function objectNamesForDbItem( required struct item ) {
+		var objects = [];
+		if ( len( trim( toString( arguments.item.objectRef ?: "" ) ) ) ) objects.append( toString( arguments.item.objectRef ) );
+		for ( var touched in ( isArray( arguments.item.objectsTouched ?: "" ) ? arguments.item.objectsTouched : [] ) ) {
+			if ( isSimpleValue( touched ) && len( trim( toString( touched ) ) ) ) objects.append( toString( touched ) );
+		}
+		return objects;
+	}
+
+
+	public string function normalizeLegacyPath( required any path ) {
+		return replace( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ), "//", "/", "all" );
+	}
+
+	public string function handlerNameForDomain( required string domain ) {
+		var cleaned = reReplace( arguments.domain, "[^A-Za-z0-9]+", " ", "all" );
+		var words = [];
+		for ( var word in listToArray( cleaned, " " ) ) {
+			var token = trim( word );
+			if ( len( token ) ) words.append( uCase( left( token, 1 ) ) & right( token, len( token ) - 1 ) );
+		}
+		return words.len() ? words.toList( "" ) : "Main";
+	}
+
+	/** Action name for a page, taken from its proposed handler file name. */
+	public string function actionNameFromTargetPath( required string targetPath, required string sourcePath ) {
+		var base = listLast( arguments.targetPath, "/" );
+		base = listFirst( base, "." );
+		if ( !len( trim( base ) ) ) {
+			base = listFirst( listLast( normalizeLegacyPath( arguments.sourcePath ), "/" ), "." );
+		}
+		base = reReplace( trim( base ), "[^A-Za-z0-9]+", "", "all" );
+		if ( !len( base ) ) return "";
+		return lCase( left( base, 1 ) ) & right( base, len( base ) - 1 );
+	}
+
+	public void function ensureMigrationSkeleton( required struct transition ) {
+		var existing = arguments.transition.migrationCode ?: "";
+		if ( isSimpleValue( existing ) && reFindNoCase( "function\s+up\s*\(", toString( existing ) ) ) return;
+		var sample = arguments.transition.sampleMigration ?: "";
+		if ( isSimpleValue( sample ) && reFindNoCase( "function\s+up\s*\(", toString( sample ) ) ) {
+			arguments.transition.migrationCode = toString( sample );
+			return;
+		}
+		var upBody = "";
+		var downBody = "";
+		if ( isStruct( sample ) ) {
+			upBody = trim( toString( sample.up ?: sample.forward ?: "" ) );
+			downBody = trim( toString( sample.down ?: sample.rollback ?: sample.reverse ?: "" ) );
+		} else if ( isSimpleValue( sample ) ) {
+			upBody = trim( toString( sample ) );
+		}
+		if ( !len( downBody ) ) downBody = trim( toString( arguments.transition.rollback ?: "" ) );
+		if ( !len( upBody ) && !len( downBody ) ) return;
+		var objectLabel = "";
+		if ( isArray( arguments.transition.objectsTouched ?: "" ) && arguments.transition.objectsTouched.len() ) {
+			objectLabel = toString( arguments.transition.objectsTouched[ 1 ] );
+		}
+		var indent = ( body, fallback ) => {
+			var text = len( trim( arguments.body ) ) ? trim( arguments.body ) : arguments.fallback;
+			var lines = [];
+			for ( var line in listToArray( replace( text, char( 13 ), "", "all" ), char( 10 ), true, false ) ) {
+				lines.append( "        " & line );
+			}
+			return lines.toList( char( 10 ) );
+		};
+		arguments.transition.migrationCode = "component {" & char( 10 ) &
+			"    function up( schema, query ) {" & char( 10 ) &
+			indent( upBody, "// review expand step for `" & objectLabel & "` before running" ) & char( 10 ) &
+			"    }" & char( 10 ) &
+			"    function down( schema, query ) {" & char( 10 ) &
+			indent( downBody, "// review rollback for `" & objectLabel & "` before running" ) & char( 10 ) &
+			"    }" & char( 10 ) & "}";
+		arguments.transition.migrationCodeProvenance = "wrapped-provider-statements";
+	}
+
+	/**
+	 * Guarantees a cfmigrations-shaped migration path.
+	 *
+	 * `migrationPath` is unreliable provider output — observed as a bare
+	 * directory and, in another run, as the literal operation name ("expand") —
+	 * and the validator requires a `YYYY_MM_DD_HHMMSS` filename. The synthesized
+	 * name is derived from the transition's own order and object so it stays
+	 * stable across runs; a wall-clock stamp would churn item fingerprints.
+	 */
+	public void function ensureMigrationPath( required struct transition, required numeric position ) {
+		var current = replace( trim( toString( arguments.transition.migrationPath ?: "" ) ), "\", "/", "all" );
+		if ( len( current ) && reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\.bx$", current ) ) return;
+		var order = isNumeric( arguments.transition.order ?: "" ) ? int( arguments.transition.order ) : arguments.position;
+		var operation = reReplace( lCase( toString( arguments.transition.operation ?: "change" ) ), "[^a-z0-9]+", "_", "all" );
+		var objectName = "";
+		if ( isArray( arguments.transition.objectsTouched ?: "" ) && arguments.transition.objectsTouched.len() ) {
+			objectName = reReplace( lCase( toString( arguments.transition.objectsTouched[ 1 ] ) ), "[^a-z0-9]+", "_", "all" );
+		}
+		var slug = trim( operation & ( len( objectName ) ? "_" & objectName : "" ) );
+		if ( !len( slug ) ) slug = "migration";
+		arguments.transition.migrationPath = "resources/database/migrations/2025_01_01_" &
+			right( "00000" & max( 0, order ), 6 ) & "_" & slug & ".bx";
+		arguments.transition.migrationPathProvenance = "derived-from-order-and-object";
+	}
+
+	public array function normalizeDbTransitions( required any transitions ) {
+		var output = isArray( arguments.transitions ) ? arguments.transitions : [];
+		var allowedOps = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
+		var opAliases = {
+			"expand-contract": "expand",
+			"expand_contract": "expand",
+			"migrate": "switch",
+			"migration": "switch",
+			"alter": "expand",
+			"add": "expand",
+			"create": "expand",
+			"drop": "contract",
+			"remove": "contract",
+			"delete": "contract",
+			// Providers reach for their own vocabulary. One live run returned
+			// "verify" 23 times and "capture" once, and every transition then
+			// tripped the invalid-operation gate.
+			"verify": "switch",
+			"validate": "switch",
+			"check": "switch",
+			"capture": "expand",
+			"introduce": "expand",
+			"extend": "expand",
+			"populate": "backfill",
+			"seed": "backfill",
+			"copy": "backfill",
+			"migrate-data": "backfill",
+			"cutover-traffic": "switch",
+			"retire": "contract",
+			"cleanup": "contract",
+			"clean-up": "contract",
+			"back-fill": "backfill",
+			"cutover": "switch",
+			"forwardonly": "forward-only",
+			"forward only": "forward-only"
+		};
+		for ( var transition in output ) {
+			if ( !isStruct( transition ) ) continue;
+			transition.evidenceRefs = normalizeProviderList( transition.evidenceRefs ?: transition.evidence ?: [] );
+			transition.objectsTouched = normalizeProviderList( transition.objectsTouched ?: transition.objects ?: [] );
+			ensureMigrationSkeleton( transition );
+			var operation = lCase( trim( toString( transition.operation ?: transition.phase ?: "" ) ) );
+			if ( len( operation ) && !allowedOps.contains( operation ) ) {
+				operation = opAliases[ operation ] ?: operation;
+			}
+			if ( len( operation ) && allowedOps.contains( operation ) ) {
+				transition.operation = operation;
+			} else {
+				// Empty drafts and unrecognized provider vocabulary land here alike.
+				// Passing an unknown verb through unchanged only moved the failure to
+				// the validator, which flagged every transition as invalid. Expand is
+				// the non-destructive default; the flag keeps the inference visible
+				// and records what the provider actually said.
+				if ( len( operation ) ) transition.operationProvided = operation;
+				transition.operation = "expand";
+				transition.operationInferred = true;
+			}
+			var path = replace( trim( scalarString( transition.migrationPath ?: transition.filePath ?: "" ) ), "\", "/", "all" );
+			if ( !len( path ) ) continue;
+			var fileName = listLast( path, "/" );
+			var nameWithoutExtension = listFirst( fileName, "." );
+			var timestampDigits = reReplace( left( nameWithoutExtension, 20 ), "[^0-9]", "", "all" );
+			if ( len( timestampDigits ) < 14 ) continue;
+			var slug = reReplace( nameWithoutExtension, "^[0-9_]+_?", "", "one" );
+			slug = lCase( reReplace( slug, "[^a-zA-Z0-9_-]", "_", "all" ) );
+			if ( !len( slug ) ) slug = "modernization_change";
+			var directory = listLen( path, "/" ) > 1
+				? listDeleteAt( path, listLen( path, "/" ), "/" ) & "/"
+				: "";
+			transition.migrationPath = directory &
+				mid( timestampDigits, 1, 4 ) & "_" &
+				mid( timestampDigits, 5, 2 ) & "_" &
+				mid( timestampDigits, 7, 2 ) & "_" &
+				mid( timestampDigits, 9, 6 ) & "_" &
+				slug & ".bx";
+		}
+		// Expand/backfill/switch/contract only means anything in sequence, and the
+		// gate requires `order` to be monotonic. Providers return repeated or
+		// out-of-sequence numbers, so renumber densely while preserving the
+		// relative order they asked for — the ordering is the provider's
+		// intent; only the numbering is unreliable.
+		var ordered = [];
+		for ( var orderedItem in output ) if ( isStruct( orderedItem ) ) ordered.append( orderedItem );
+		var originalIndex = {};
+		for ( var indexPosition = 1; indexPosition <= ordered.len(); indexPosition++ ) {
+			originalIndex[ indexPosition ] = ordered[ indexPosition ];
+		}
+		ordered.sort( ( a, b ) => {
+			var left = isNumeric( a.order ?: "" ) ? val( a.order ) : 999999;
+			var right = isNumeric( b.order ?: "" ) ? val( b.order ) : 999999;
+			return left == right ? 0 : ( left < right ? -1 : 1 );
+		} );
+		for ( var sequence = 1; sequence <= ordered.len(); sequence++ ) {
+			ordered[ sequence ].order = sequence;
+		}
+
+		// Last-resort pass: the loop above repairs a recoverable path, but skips a
+		// transition whose path is absent or carries no timestamp digits at all
+		// (observed as a bare directory, and as the literal operation name).
+		// Synthesize one so the cfmigrations gate is satisfiable.
+		var transitionPosition = 0;
+		for ( var pending in ordered ) {
+			transitionPosition++;
+			ensureMigrationPath( pending, transitionPosition );
+		}
+		return ordered;
+	}
+
+	/**
+	 * Provider (and repair) output is untrusted and can return an array where a
+	 * scalar string is expected. Coerces to a plain string so callers can trim()
+	 * it safely instead of crashing on a type mismatch.
+	 */
+	public string function scalarString( required any value ) {
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			return "";
+		}
+		return "";
+	}
+
+	public array function normalizeProviderList( required any value ) {
+		if ( isArray( arguments.value ) ) return duplicate( arguments.value );
+		if ( !isSimpleValue( arguments.value ) ) return [];
+		var text = trim( toString( arguments.value ) );
+		if ( !len( text ) ) return [];
+		text = reReplace( text, "^[[:space:]]*\[|\][[:space:]]*$", "", "all" );
+		text = replace( text, '"', "", "all" );
+		text = reReplace( text, "[,\r\n]+", ",", "all" );
+		var output = [];
+		for ( var item in listToArray( text, "," ) ) {
+			var normalized = trim( item );
+			if ( len( normalized ) && !arrayContainsNoCase( output, normalized ) ) output.append( normalized );
+		}
+		return output;
+	}
+
+	/**
+	 * Turns a legacy source path into a route path the validator accepts.
+	 *
+	 * `safeRoutePath()` requires a leading "/", no ".." anywhere, and no "//".
+	 * Legacy CFML navigation is full of relative hops ("../login/login.cfm"), so
+	 * a derived path has to be resolved rather than just slash-prefixed —
+	 * otherwise deriving the path trades a dropped route for a blocking
+	 * validation error. Returns "" when nothing safe can be produced.
+	 */
+	public string function safeRoutePathFrom( required string sourcePath ) {
+		var normalized = replace( trim( arguments.sourcePath ), "\", "/", "all" );
+		if ( !len( normalized ) ) return "";
+		var resolved = [];
+		for ( var segment in listToArray( normalized, "/" ) ) {
+			var cleaned = trim( segment );
+			if ( !len( cleaned ) || cleaned == "." ) continue;
+			if ( cleaned == ".." ) {
+				// Pop the parent this hop escapes; a hop above the root is simply
+				// dropped, which keeps the remaining path inside the application.
+				if ( resolved.len() ) resolved.deleteAt( resolved.len() );
+				continue;
+			}
+			resolved.append( cleaned );
+		}
+		if ( !resolved.len() ) return "";
+		var candidate = "/" & resolved.toList( "/" );
+		// Defensive: never hand back something the gate would reject.
+		if ( find( "..", candidate ) || reFind( "^//", candidate ) ) return "";
+		return candidate;
+	}
+
+	public array function linkDatabaseWorkToPhases(
+		required struct plan,
+		required array phases,
+		required struct unitsById,
+		array errors = []
+	) {
+		if ( !arguments.phases.len() ) return arguments.phases;
+		var findings = isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [];
+		var transitions = isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [];
+		if ( !findings.len() && !transitions.len() ) return arguments.phases;
+
+		var haystacks = [];
+		for ( var phase in arguments.phases ) {
+			var phaseUnits = [];
+			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) {
+				var unit = arguments.unitsById[ trim( toString( unitId ) ) ] ?: {};
+				if ( isStruct( unit ) && unit.count() ) phaseUnits.append( unit );
+			}
+			var label = reReplace( lCase( trim( toString( phase.name ?: "" ) ) & " " & trim( toString( phase.goal ?: "" ) ) ), "[^a-z0-9]+", " ", "all" );
+			haystacks.append( label & " " & pathHaystackForUnits( phaseUnits ) );
+		}
+
+		var linkedFindings = 0;
+		var linkedTransitions = 0;
+		var attachOrphan = 0;
+		var buckets = [
+			{ items: findings, field: "dbFindingIds" },
+			{ items: transitions, field: "transitionIds" }
+		];
+		for ( var bucket in buckets ) {
+			for ( var item in bucket.items ) {
+				if ( !isStruct( item ) ) continue;
+				var itemId = trim( toString( item.id ?: item.itemId ?: "" ) );
+				if ( !len( itemId ) ) continue;
+				// Already scheduled by the provider — leave it alone.
+				var alreadyScheduled = false;
+				for ( var existing in arguments.phases ) {
+					if ( arrayContainsNoCase( isArray( existing[ bucket.field ] ?: "" ) ? existing[ bucket.field ] : [], itemId ) ) {
+						alreadyScheduled = true;
+						break;
+					}
+				}
+				if ( alreadyScheduled ) continue;
+				var matchedIndex = 0;
+				for ( var objectName in objectNamesForDbItem( item ) ) {
+					for ( var haystackIndex = 1; haystackIndex <= haystacks.len(); haystackIndex++ ) {
+						if ( objectMatchesHaystack( objectName, haystacks[ haystackIndex ] ) ) {
+							matchedIndex = haystackIndex;
+							break;
+						}
+					}
+					if ( matchedIndex ) break;
+				}
+				if ( !matchedIndex ) {
+					matchedIndex = 1;
+					attachOrphan++;
+				}
+				if ( !isArray( arguments.phases[ matchedIndex ][ bucket.field ] ?: "" ) ) arguments.phases[ matchedIndex ][ bucket.field ] = [];
+				arguments.phases[ matchedIndex ][ bucket.field ].append( itemId );
+				if ( bucket.field == "transitionIds" ) linkedTransitions++;
+				else linkedFindings++;
+			}
+		}
+
+		if ( linkedFindings || linkedTransitions ) {
+			arguments.errors.append( {
+				role: "modernization-roadmap",
+				message: "linked-database-work-to-phases",
+				severity: "info",
+				findings: linkedFindings,
+				transitions: linkedTransitions,
+				unmatchedAttachedToFirstPhase: attachOrphan
+			} );
+		}
+		return arguments.phases;
+	}
+
+	public array function validIds( required any values, required struct lookup ) {
+		var output = [];
+		if ( !isArray( arguments.values ) ) return output;
+		for ( var value in arguments.values ) {
+			var key = trim( toString( value ) );
+			if ( len( key ) && arguments.lookup.keyExists( key ) && !arrayContainsNoCase( output, key ) ) output.append( key );
+		}
+		return output;
+	}
+
+	public array function dedupeSimpleValues( required any values ) {
+		var output = [];
+		var seen = {};
+		if ( !isArray( arguments.values ) ) return output;
+		for ( var value in arguments.values ) {
+			var text = trim( isSimpleValue( value ) ? toString( value ) : jsonSerialize( value ) );
+			var key = lCase( text );
+			if ( !len( key ) || seen.keyExists( key ) ) continue;
+			seen[ key ] = true;
+			output.append( value );
+		}
+		return output;
+	}
+
+	public array function normalizeSamples( required array samples, required any runtime ) {
+		var runtimeName = lCase( trim( isStruct( arguments.runtime ) ? ( arguments.runtime.runtime ?: "" ) : toString( arguments.runtime ) ) );
+		var output = [];
+		for ( var sample in arguments.samples ) {
+			if ( !isStruct( sample ) ) continue;
+			var copy = duplicate( sample );
+			if ( !structKeyExists( copy, "code" ) ) copy.code = copy.sampleCode ?: copy.body ?: "";
+			var kind = lCase( trim( scalarString( copy.sampleKind ?: copy.kind ?: "" ) ) );
+			var path = replace( trim( scalarString( copy.targetPath ?: copy.path ?: "" ) ), "\", "/", "all" );
+			if ( runtimeName == "boxlang" && kind != "migration" && len( path ) ) {
+				var isView = findNoCase( "/views/", "/" & path ) || findNoCase( "/layouts/", "/" & path );
+				path = reReplaceNoCase( path, "\.(?:cfc|cfm|cfml|bx|bxm)$", isView ? ".bxm" : ".bx" );
+				copy.targetPath = path;
+				copy.language = "boxlang";
+			}
+			output.append( copy );
+		}
+		return output;
+	}
+
+	public array function dedupeById( required array items ) {
+		var seen = {};
+		var output = [];
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var id = trim( item.id ?: item.itemId ?: "" );
+			if ( len( id ) && seen.keyExists( id ) ) continue;
+			if ( len( id ) ) seen[ id ] = true;
+			output.append( item );
+		}
+		return output;
+	}
+
+	public boolean function arrayContainsNoCase( required array values, required string needle ) {
+		for ( var value in arguments.values ) if ( compareNoCase( toString( value ), arguments.needle ) == 0 ) return true;
+		return false;
+	}
+
+	public string function normalizeEvidencePath( required any path ) {
+		return lCase( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ) );
+	}
+
+	public array function ensureCurrentSlice( required array phases ) {
+		var list = [];
+		for ( var phase in arguments.phases ) if ( isStruct( phase ) ) list.append( duplicate( phase ) );
+		if ( !list.len() ) return list;
+		var hasCurrent = false;
+		for ( var phase in list ) if ( phase.currentSlice ?: false ) { hasCurrent = true; break; }
+		if ( hasCurrent ) return list;
+		var pick = 0;
+		for ( var index = 1; index <= list.len(); index++ ) {
+			var candidate = list[ index ];
+			var linked = ( isArray( candidate.unitIds ?: "" ) && candidate.unitIds.len() ) || ( isArray( candidate.routeIds ?: "" ) && candidate.routeIds.len() );
+			var pattern = lCase( trim( candidate.pattern ?: "" ) );
+			if ( linked && ( pattern == "vertical-slice" || pattern == "coexist-route" || findNoCase( "slice", pattern ) ) ) { pick = index; break; }
+			if ( !pick && linked ) pick = index;
+		}
+		if ( !pick ) pick = 1;
+		list[ pick ].currentSlice = true;
+		return list;
+	}
+
+	public array function currentSliceSamples( required array samples, required array phases, array units = [] ) {
+		var currentPhaseIds = {};
+		var allowedSampleIds = {};
+		var currentUnitIds = {};
+		for ( var phase in arguments.phases ) {
+			if ( !isStruct( phase ) || !( phase.currentSlice ?: false ) ) continue;
+			currentPhaseIds[ phase.id ?: phase.itemId ?: "" ] = true;
+			for ( var sampleId in ( isArray( phase.sampleIds ?: "" ) ? phase.sampleIds : [] ) ) allowedSampleIds[ trim( sampleId ) ] = true;
+			for ( var unitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : ( isArray( phase.targetUnitIds ?: "" ) ? phase.targetUnitIds : [] ) ) ) {
+				currentUnitIds[ trim( toString( unitId ) ) ] = true;
+			}
+		}
+		var output = [];
+		for ( var sample in arguments.samples ) {
+			if ( !isStruct( sample ) ) continue;
+			var phaseId = sample.phaseId ?: sample.roadmapPhaseId ?: "";
+			var sampleId = trim( sample.id ?: sample.itemId ?: "" );
+			if ( sample.currentSlice ?: false || ( len( phaseId ) && currentPhaseIds.keyExists( phaseId ) ) || ( len( sampleId ) && allowedSampleIds.keyExists( sampleId ) ) ) {
+				output.append( sample );
+				continue;
+			}
+			// Keep provider samples that already relate to current-slice units
+			// even when phases omitted sampleIds (common on roadmap shards).
+			var related = isArray( sample.relatedItemIds ?: "" ) ? sample.relatedItemIds : [];
+			var relatedToCurrent = false;
+			for ( var relatedId in related ) {
+				if ( currentUnitIds.keyExists( trim( toString( relatedId ) ) ) ) {
+					relatedToCurrent = true;
+					break;
+				}
+			}
+			if ( relatedToCurrent ) output.append( sample );
+		}
+		return output;
+	}
+
+	/**
+	 * Promote inline targetUnit.sampleCode into the samples collection when
+	 * providers returned code on units but left samples empty.
+	 */
+	public array function liftUnitSampleCode( required array samples, required array units ) {
+		var output = isArray( arguments.samples ) ? duplicate( arguments.samples ) : [];
+		var seenPaths = {};
+		for ( var existing in output ) {
+			var path = lCase( replace( trim( toString( existing.targetPath ?: existing.path ?: "" ) ), "\", "/", "all" ) );
+			if ( len( path ) ) seenPaths[ path ] = true;
+		}
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var code = trim( toString( unit.sampleCode ?: "" ) );
+			if ( !len( code ) ) continue;
+			var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+			if ( !len( targetPath ) || seenPaths.keyExists( lCase( targetPath ) ) ) continue;
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			output.append( {
+				id: "lifted-sample-#left( hash( targetPath & "|" & unitId, 'SHA-256' ), 12 )#",
+				sampleKind: "app",
+				targetPath: targetPath,
+				language: reFindNoCase( "\.(bx|bxm)$", targetPath ) ? "boxlang" : "cfml",
+				code: left( code, 4000 ),
+				relatedItemIds: len( unitId ) ? [ unitId ] : [],
+				irreversible: false,
+				provenanceClass: "provider-suggested"
+			} );
+			seenPaths[ lCase( targetPath ) ] = true;
+			if ( output.len() >= 40 ) break;
+		}
+		return output;
+	}
+
+	/**
+	 * When current-slice phases have units but samples were pruned or never
+	 * returned, emit bounded deterministic skeletons labeled honestly.
+	 */
+	public array function ensureActionableSamples( required struct plan, struct samplePolicy = {}, array errors = [] ) {
+		var samples = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [];
+		if ( samples.len() ) return samples;
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var unitsById = {};
+		for ( var unit in ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [] ) ) {
+			var unitId = trim( toString( unit.id ?: unit.itemId ?: "" ) );
+			if ( len( unitId ) ) unitsById[ unitId ] = unit;
+		}
+		var maxSamples = isNumeric( arguments.samplePolicy.maxFiles ?: "" ) ? max( 1, min( 8, int( arguments.samplePolicy.maxFiles ) ) ) : 6;
+		var generated = [];
+		for ( var phase in phases ) {
+			if ( !isStruct( phase ) || !( phase.currentSlice ?: false ) ) continue;
+			var phaseId = trim( toString( phase.id ?: phase.itemId ?: "" ) );
+			for ( var rawUnitId in ( isArray( phase.unitIds ?: "" ) ? phase.unitIds : [] ) ) {
+				if ( generated.len() >= maxSamples ) break;
+				var id = trim( toString( rawUnitId ) );
+				if ( !len( id ) || !unitsById.keyExists( id ) ) continue;
+				var unit = unitsById[ id ];
+				var targetPath = replace( trim( toString( unit.targetPath ?: "" ) ), "\", "/", "all" );
+				if ( !len( targetPath ) ) continue;
+				var layer = lCase( trim( toString( unit.layer ?: unit.kind ?: "handler" ) ) );
+				var isView = [ "view", "layout" ].contains( layer ) || findNoCase( "/views/", "/" & targetPath );
+				var language = reFindNoCase( "\.(bx|bxm)$", targetPath ) ? "boxlang" : "cfml";
+				var nl = char( 10 );
+				var skeleton = language == "boxlang"
+					? ( isView ? "<bx:output>#nl#  <!--- Deterministic sample skeleton for #targetPath# — not observed source. --->#nl#</bx:output>" : "class {#nl#  // Deterministic sample skeleton for #targetPath# — not observed source.#nl#}" )
+					: ( isView ? "<cfoutput>#nl#  <!--- Deterministic sample skeleton for #targetPath# — not observed source. --->#nl#</cfoutput>" : "component {#nl#  // Deterministic sample skeleton for #targetPath# — not observed source.#nl#}" );
+				var sampleId = "synth-sample-#left( hash( phaseId & "|" & id, 'SHA-256' ), 12 )#";
+				generated.append( {
+					id: sampleId,
+					sampleKind: isView ? "view" : "app",
+					targetPath: targetPath,
+					language: language,
+					code: skeleton,
+					relatedItemIds: [ id ],
+					irreversible: false,
+					phaseId: phaseId,
+					currentSlice: true,
+					provenanceClass: "deterministically-derived"
+				} );
+			}
+			if ( generated.len() ) {
+				phase.sampleIds = generated.map( ( item ) => item.id );
+			}
+		}
+		if ( generated.len() ) {
+			arguments.errors.append( {
+				role: "modernization",
+				message: "synthesized-current-slice-samples",
+				severity: "info",
+				count: generated.len()
+			} );
+			arguments.plan.samples = generated;
+			return generated;
+		}
+		return samples;
+	}
+
+	/**
+	 * Deterministic database fragment from observed schemaEvidence when the
+	 * provider truncates or fails. Labeled provenanceClass so UI/validation
+	 * never pretends these were model-authored.
+	 */
+
+	/**
+	 * Pure helpers shared by ProposalService and the shard cluster. Moved here
+	 * so both call one implementation instead of keeping a copy each.
+	 */
+	public struct function copyGatewayOptions( struct options = {} ) {
+		var output = {};
+		var keys = [
+			"allowedEvidenceIds", "allowedFactIds", "allowedFilePaths", "budgets",
+			"isCancelled", "maxDurationMs", "maxRetries", "model", "onObservation",
+			"role", "startedAt", "useSkillAgent"
+		];
+		for ( var key in keys ) {
+			if ( !structKeyExists( arguments.options, key ) ) continue;
+			var value = arguments.options[ key ];
+			output[ key ] = isStruct( value ) || isArray( value ) ? duplicate( value ) : value;
+		}
+		return output;
+	}
+
+	public struct function exceptionDiagnostics( required any error ) {
+		if ( isStruct( arguments.error.data ?: "" ) ) return duplicate( arguments.error.data );
+		var detail = trim( toString( arguments.error.detail ?: "" ) );
+		if ( len( detail ) && isJSON( detail ) ) {
+			var parsed = jsonDeserialize( detail );
+			if ( isStruct( parsed ) ) return parsed;
+		}
+		return {};
+	}
+
+	public array function boundedArray(required any value, required numeric limit) {
+		return isArray( arguments.value ) && arguments.value.len() ? arguments.value.slice( 1, min( arguments.limit, arguments.value.len() ) ) : [];
+	}
+
+	public array function boundedStructArray(required any value, required numeric limit, array errors = [], string collection = "items") {
+		var output = [];
+		var rejected = 0;
+		for ( var item in boundedArray( arguments.value, arguments.limit ) ) {
+			if ( isStruct( item ) ) output.append( item );
+			else rejected++;
+		}
+		if ( rejected ) arguments.errors.append( { role: "provider-contract", collection: arguments.collection, message: "ignored-non-object-items", severity: "info", count: rejected } );
+		return output;
+	}
+
+	public boolean function validFragment(required string role, required any payload) {
+		if ( !isStruct( arguments.payload ) ) return false;
+		if ( arguments.role == "modernization-repair" ) return structKeyExists( arguments.payload, "replacements" ) && isArray( arguments.payload.replacements );
+		var keys = arguments.role == "modernization-application"
+			? [ "targetUnits", "units", "unitLinks", "routeContracts", "contexts", "extracts", "samples" ]
+			: ( arguments.role == "modernization-database"
+				? [ "dbFindings", "dbTransitions", "samples" ]
+			: ( arguments.role == "modernization-architecture" ? [ "placements", "contexts", "extracts" ] : [ "roadmapPhases", "phases", "samples", "assumptions" ] ) );
+		var present = false;
+		for ( var key in keys ) {
+			if ( !structKeyExists( arguments.payload, key ) ) continue;
+			present = true;
+			if ( !isArray( arguments.payload[ key ] ) ) return false;
+		}
+		return present;
+	}
+
+	public struct function providerRoleError( required string role, required struct response, numeric shard = 0 ) {
+		var entry = {
+			role: arguments.role,
+			message: arguments.response.error ?: ( arguments.response.ok ?: false ? "malformed-role-output" : "provider-failed" )
+		};
+		if ( len( trim( arguments.response.errorType ?: "" ) ) ) entry.errorType = arguments.response.errorType;
+		if ( structKeyExists( arguments.response, "retryable" ) ) entry.retryable = !!arguments.response.retryable;
+		if ( arguments.shard > 0 ) entry.shard = arguments.shard;
+		return entry;
+	}
+
+	public string function inferErrorType( required string message ) {
+		var lower = lCase( arguments.message );
+		if ( findNoCase( "request_timeout", lower ) || findNoCase( "timed out", lower ) || findNoCase( "request timeout", lower ) ) return "request_timeout";
+		if ( findNoCase( "budget-exceeded", lower ) || findNoCase( "budget_exceeded", lower ) ) return "budget_exceeded";
+		if ( findNoCase( "cost-budget", lower ) ) return "cost_budget_exceeded";
+		if ( findNoCase( "prompt budget", lower ) || findNoCase( "prompt-preflight", lower ) ) return "prompt_budget_exceeded";
+		if ( findNoCase( "truncated", lower ) ) return "truncated_json";
+		return len( trim( arguments.message ) ) ? "provider_error" : "";
+	}
+
+	/**
+	 * Deterministic database fragment for when the provider role fails or is
+	 * absent. Synthesis of findings, transitions and samples is this service's
+	 * concern, so it lives here rather than in the orchestrator.
+	 */
+	public struct function synthesizeDatabaseFragment( required any schemaEvidence ) {
+		var schema = isStruct( arguments.schemaEvidence ) ? arguments.schemaEvidence : {};
+		var tables = [];
+		if ( isArray( schema.tables ?: "" ) ) tables = schema.tables;
+		else if ( isArray( schema.objects ?: "" ) ) tables = schema.objects;
+		else if ( isStruct( schema.database ?: "" ) && isArray( schema.database.tables ?: "" ) ) tables = schema.database.tables;
+		if ( !tables.len() && ( schema.coverage ?: "absent" ) == "absent" ) {
+			return { dbFindings: [], dbTransitions: [], samples: [] };
+		}
+		var findings = [];
+		var transitions = [];
+		var order = 1;
+		for ( var table in tables ) {
+			if ( findings.len() >= 20 ) break;
+			var name = isStruct( table ) ? trim( toString( table.name ?: table.objectRef ?: "" ) ) : trim( toString( table ) );
+			if ( !len( name ) ) continue;
+			var slug = reReplace( lCase( name ), "[^a-z0-9]+", "_", "all" );
+			var findingId = "synth-db-finding-#slug#";
+			findings.append( {
+				id: findingId,
+				category: "coverage",
+				severity: "info",
+				objectRef: name,
+				problem: "Observed table `#name#` needs an expand/contract migration plan during strangler modernization.",
+				proposedChange: "Inventory readers/writers and stage an expand-contract migration for `#name#`.",
+				expandContract: "expand",
+				relatedLegacyUnitIds: [],
+				relatedTargetUnitIds: [],
+				evidenceRefs: [],
+				confidence: 0.45,
+				validationStatus: "needs-review",
+				provenanceClass: "deterministically-derived"
+			} );
+			transitions.append( {
+				id: "synth-db-transition-#slug#",
+				dbFindingId: findingId,
+				operation: "expand",
+				order: order++,
+				migrationPath: "resources/database/migrations/YYYY_MM_DD_HHMMSS_expand_#slug#.bx",
+				objectsTouched: [ name ],
+				sampleMigration: "component {" & char( 10 ) & "  function up( schema, query ) {" & char( 10 ) & "    // expand `" & name & "` — generated from observed DDL, not executed" & char( 10 ) & "  }" & char( 10 ) & "  function down( schema, query ) {" & char( 10 ) & "    // review before contracting `" & name & "`" & char( 10 ) & "  }" & char( 10 ) & "}",
+				rollback: "Review expand before any contract step for `#name#`.",
+				irreversible: false,
+				evidenceRefs: [],
+				provenanceClass: "deterministically-derived"
+			} );
+		}
+		if ( !findings.len() && ( schema.coverage ?: "" ) != "absent" ) {
+			findings.append( {
+				id: "synth-db-finding-schema-present",
+				category: "coverage",
+				severity: "info",
+				objectRef: "schema",
+				problem: "Schema evidence was observed but table names could not be enumerated for a provider fragment.",
+				proposedChange: "Retry the database stage with a smaller schema pack or raise max tokens.",
+				expandContract: "defer",
+				relatedLegacyUnitIds: [],
+				relatedTargetUnitIds: [],
+				evidenceRefs: [],
+				confidence: 0.3,
+				validationStatus: "needs-review",
+				provenanceClass: "deterministically-derived"
+			} );
+		}
+		return { dbFindings: findings, dbTransitions: transitions, samples: [] };
+	}
+}

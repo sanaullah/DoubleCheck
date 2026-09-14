@@ -1,0 +1,60 @@
+/**
+ * Step 11: the seam between ProposalService and ModernizationShardExecutor.
+ *
+ * Two things this split could break silently, and one of them is why the
+ * previous attempt was reverted:
+ *
+ *  1. ~17 specs stub the gateway on ProposalService and call propose(). If the
+ *     executor resolved its own gateway from WireBox, the stub would never
+ *     reach the provider call and those specs would pass while testing nothing.
+ *  2. cancelRun() writes a registry on ProposalService. If the executor kept a
+ *     second one, cancelled runs would keep dispatching shards.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Shard executor seam", () => {
+
+			it( "propagates a stubbed collaborator into the executor", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				var marker = new app.models.services.ModernizationAgentFactory();
+				service.agentFactory = marker;
+				makePublic( service, "shardExecutor" );
+
+				// Resolution happens after the stub is set, which is the whole
+				// reason the existing specs keep working.
+				expect( service.shardExecutor().agentFactory ).toBe( marker );
+			} );
+
+			it( "shares one cancellation registry, not two", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				service.agentGateway = { cancelRun: ( runId ) => {} };
+				makePublic( service, "shardExecutor" );
+				var executor = service.shardExecutor();
+				makePublic( executor, "isCancelled" );
+
+				expect( executor.isCancelled( "run-1", {} ) ).toBeFalse();
+
+				// cancelRun() writes on ProposalService; the executor must see it,
+				// or an in-flight shard keeps running after a cancel.
+				service.cancelRun( "run-1" );
+
+				expect( executor.isCancelled( "run-1", {} ) ).toBeTrue( "cancellation did not cross the extraction boundary" );
+			} );
+
+			it( "resolves the same executor instance on repeated use", () => {
+				var service = new app.models.services.ModernizationProposalService();
+				makePublic( service, "shardExecutor" );
+				expect( service.shardExecutor() ).toBe( service.shardExecutor() );
+			} );
+
+			it( "keeps the budget constants at their real magnitudes", () => {
+				// A previous attempt retyped two of these an order of magnitude
+				// wrong. They were copied this time; this pins them.
+				var executor = new app.models.services.ModernizationShardExecutor();
+				makePublic( executor, "laterStageReserveMs" );
+				expect( executor.laterStageReserveMs( 3600000, 4 ) ).toBeGTE( 300000 );
+			} );
+		} );
+	}
+}

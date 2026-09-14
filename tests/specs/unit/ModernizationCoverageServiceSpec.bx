@@ -1,0 +1,145 @@
+class extends="testbox.system.BaseSpec" {
+    function run() {
+        describe( "Modernization coverage", () => {
+        it( "reports truncation and schema coverage honestly", () => {
+            var result = new app.models.services.ModernizationCoverageService().assess(
+                { files: [ { filePath: "index.cfm", language: "ColdFusion", sizeBytes: 12 } ], skipped: { limit: 1, oversized: 2 }, scope: "full" },
+                { files: [ { filePath: "index.cfm" } ], units: [], unresolved: [] },
+                { source: "inferred-from-sql-only", format: "sql-ddl", coverage: "partial-ddl", tables: [ { name: "orders" } ], unresolved: [ { reason: "dynamic" } ] }
+            );
+            expect( result.repository.truncation ).toBeTrue();
+            expect( result.schema.coverage ).toBe( "partial-ddl" );
+            expect( result.banners.len() ).toBeGT( 0 );
+        } );
+
+        it( "counts candidates and reports extensions separately from languages", () => {
+            var result = new app.models.services.ModernizationCoverageService().assess(
+                { candidateCount: 4, files: [ { filePath: "index.cfm", language: "ColdFusion", sizeBytes: 12 }, { filePath: "app/main.bx", language: "BoxLang", sizeBytes: 8 } ], skipped: { oversized: 1 }, discoveryTruncated: true, scope: "full" },
+                { files: [ { filePath: "index.cfm" } ], units: [], unresolved: [] },
+                { coverage: "absent" }
+            );
+            expect( result.repository.candidates ).toBe( 4 );
+            expect( result.repository.supportedExtensions.keyExists( "cfm" ) ).toBeTrue();
+            expect( result.repository.supportedLanguages.keyExists( "ColdFusion" ) ).toBeTrue();
+            expect( result.repository.truncation ).toBeTrue();
+        } );
+
+        it( "counts legacy units on the road versus not yet sliced", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var coverage = service.assess( scan = { files: [] }, inventory = { units: [ { id: "lu-1" }, { id: "lu-2" }, { id: "lu-3" } ] }, schemaPack = { coverage: "absent" }, context = {}, llm = {} );
+            coverage = service.enrichRoadCoverage( coverage, {
+                inventory: { units: [ { id: "lu-1" }, { id: "lu-2" }, { id: "lu-3" } ] },
+                unitLinks: [ { legacyUnitId: "lu-1" } ],
+                roadmapPhases: [ { id: "p1", unitIds: [ "tu-1" ], pattern: "coexist-route" } ],
+                target: { units: [ { id: "tu-1", legacyUnitIds: [ "lu-1" ] } ] },
+                signals: [ { code: "coldbox.present" } ]
+            } );
+            expect( coverage.road.onRoad ).toBe( 1 );
+            expect( coverage.road.notYetSliced ).toBe( 2 );
+            expect( len( coverage.road.sourceStackNote ?: "" ) ).toBeGT( 0 );
+            // This fixture's provider/shard status reads complete (no llm data
+            // means nothing failed or was omitted), which would otherwise mask
+            // that 2 of 3 legacy units are still not linked to the target plan.
+            expect( coverage.complete ).toBeTrue();
+            expect(
+                coverage.banners.some( ( banner ) => findNoCase( "not yet linked to the target plan", banner ) > 0 )
+            ).toBeTrue();
+        } );
+
+        it( "does not add a road-coverage banner when everything on the road is actually linked", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var coverage = service.assess( scan = { files: [] }, inventory = { units: [ { id: "lu-1" } ] }, schemaPack = { coverage: "absent" }, context = {}, llm = {} );
+            coverage = service.enrichRoadCoverage( coverage, {
+                inventory: { units: [ { id: "lu-1" } ] },
+                unitLinks: [ { legacyUnitId: "lu-1" } ],
+                target: { units: [ { id: "tu-1", legacyUnitIds: [ "lu-1" ] } ] }
+            } );
+            expect( coverage.road.notYetSliced ).toBe( 0 );
+            expect(
+                coverage.banners.some( ( banner ) => findNoCase( "not yet linked to the target plan", banner ) > 0 )
+            ).toBeFalse();
+        } );
+
+        it( "marks modernization languages complete when CFML candidates are fully indexed", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var result = service.assess(
+                {
+                    candidateCount: 100,
+                    candidateLanguages: { CFML: 10, JavaScript: 90 },
+                    files: [
+                        { filePath: "a.cfm", language: "CFML", sizeBytes: 10 },
+                        { filePath: "b.cfc", language: "CFML", sizeBytes: 10 }
+                    ],
+                    skipped: { limit: 80 },
+                    discoveryTruncated: true,
+                    scope: "full"
+                },
+                { files: [ { filePath: "a.cfm" }, { filePath: "b.cfc" } ], units: [], unresolved: [] },
+                { coverage: "absent" }
+            );
+            // Only 2 CFML files in scan.files but candidateLanguages says 10 — incomplete
+            expect( result.repository.modernizationLanguagesComplete ).toBeFalse();
+            result = service.assess(
+                {
+                    candidateCount: 100,
+                    candidateLanguages: { CFML: 2, JavaScript: 98 },
+                    files: [
+                        { filePath: "a.cfm", language: "CFML", sizeBytes: 10 },
+                        { filePath: "b.cfc", language: "CFML", sizeBytes: 10 },
+                        { filePath: "c.js", language: "JavaScript", sizeBytes: 10 }
+                    ],
+                    skipped: { limit: 97 },
+                    discoveryTruncated: true,
+                    scope: "full"
+                },
+                { files: [ { filePath: "a.cfm" }, { filePath: "b.cfc" } ], units: [], unresolved: [] },
+                { coverage: "absent" }
+            );
+            expect( result.repository.modernizationLanguagesComplete ).toBeTrue();
+            expect( result.repository.jsTruncated ).toBeTrue();
+        } );
+
+        it( "does not report prepared partitions as completed without usage evidence", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var coverage = service.assess(
+                scan = { files: [] },
+                inventory = { units: [] },
+                schemaPack = { coverage: "absent" },
+                context = { truncated: true, summary: { omittedPartitions: 2, files: 4, lineCount: 10 }, characters: 100 },
+                llm = { planned: 4, completed: 0, partitions: 4 }
+            );
+            coverage = service.enrichRoadCoverage( coverage, {
+                inventory: { units: [] },
+                target: { units: [ { id: "tu-1", targetPath: "app/handlers/a.cfc" } ] },
+                roadmapPhases: [ { id: "p1" } ]
+            } );
+            expect( coverage.llm.completed ).toBe( 0 );
+            expect( coverage.llm.status ).toBe( "incomplete" );
+            expect( coverage.complete ).toBeFalse();
+        } );
+
+        it( "distinguishes not-observed facts from scanner uncertainty", () => {
+            var service = new app.models.services.ModernizationCoverageService();
+            var completeScan = service.assess(
+                scan = { files: [ { filePath: "index.cfm", language: "CFML" } ], candidateLanguages: { CFML: 1 } },
+                inventory = { files: [ { filePath: "index.cfm" } ], units: [], routeEvidence: [], unresolved: [] },
+                schemaPack = { coverage: "absent" },
+                context = {},
+                llm = {}
+            );
+            expect( completeScan.observations.routes.state ).toBe( "not-observed" );
+            expect( completeScan.observations.routes.provenanceClass ).toBe( "not-observed" );
+
+            var uncertainScan = service.assess(
+                scan = { files: [ { filePath: "index.cfm", language: "CFML" } ], candidateLanguages: { CFML: 2 }, discoveryTruncated: true },
+                inventory = { files: [ { filePath: "index.cfm" } ], units: [], routeEvidence: [], unresolved: [] },
+                schemaPack = { coverage: "absent" },
+                context = {},
+                llm = {}
+            );
+            expect( uncertainScan.observations.routes.state ).toBe( "needs-review" );
+            expect( uncertainScan.observations.routes.provenanceClass ).toBe( "not-observed" );
+        } );
+        } );
+    }
+}

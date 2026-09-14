@@ -1,0 +1,142 @@
+/**
+ * Resolves a modernization evidence ref to something that actually exists.
+ *
+ * Until now the modernize side only ever checked that an `evidenceRefs` array
+ * was *present* — `isArray( refs ) && refs.len()` (section 2.16). A model that
+ * emitted `[{ filePath: "app/Anything.cfc", startLine: 1, endLine: 2 }]` passed
+ * every check in the pipeline. That is not a citation check; it is a check that
+ * the model remembered to write the word.
+ *
+ * This resolves a ref against the inventory the run actually built:
+ *
+ *   ref -> inventory unit or file -> file path + line range
+ *
+ * A ref is `resolved` only when its file is one the run inventoried and its
+ * line range fits inside that file. Everything else is reported with a reason,
+ * because "the citation is wrong" and "the plan cited nothing" are different
+ * failures and a metric that merges them hides the one that matters.
+ *
+ * This is the mechanism the judge-and-narrate half of the plan relies on to
+ * stay honest, so it is deliberately strict: unknown shapes do not resolve.
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * Resolve a single ref.
+	 *
+	 * Returns { resolved, reason, filePath, startLine, endLine }. `reason` is
+	 * empty when resolved, and otherwise names the specific failure so a caller
+	 * can report it rather than printing a bare percentage.
+	 */
+	struct function resolve( required any ref, required struct inventory ) {
+		var index = fileIndex( arguments.inventory );
+		return resolveAgainstIndex( arguments.ref, index );
+	}
+
+	/**
+	 * Resolve every ref carried by a set of items and summarise.
+	 *
+	 * `citationValidity` is resolved / total, and is **null when there are no
+	 * refs at all** rather than 1.0. A plan that cites nothing must not score
+	 * as perfectly cited — that is exactly the vacuous gate section 2.16
+	 * describes.
+	 */
+	struct function resolveAll( required array items, required struct inventory, string refKey = "evidenceRefs" ) {
+		var index = fileIndex( arguments.inventory );
+		var total = 0;
+		var resolved = 0;
+		var failures = [];
+
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var refs = item[ arguments.refKey ] ?: [];
+			if ( !isArray( refs ) ) continue;
+			for ( var ref in refs ) {
+				total = total + 1;
+				var outcome = resolveAgainstIndex( ref, index );
+				if ( outcome.resolved ) {
+					resolved = resolved + 1;
+					continue;
+				}
+				failures.append( {
+					itemId  : trim( toString( item.id ?: item.itemId ?: "" ) ),
+					filePath: outcome.filePath,
+					reason  : outcome.reason
+				} );
+			}
+		}
+
+		return {
+			total           : total,
+			resolved        : resolved,
+			unresolved      : total - resolved,
+			citationValidity: total ? ( resolved / total ) : javacast( "null", "" ),
+			failures        : failures
+		};
+	}
+
+	/**
+	 * Path -> line count, from whichever shape the inventory carries.
+	 *
+	 * Files are the authority because they know their length. Units are folded
+	 * in as well so a ref to an inventoried unit's file still resolves when the
+	 * run recorded units without a file list; in that case the length is
+	 * unknown and any positive line range inside it is accepted, which is the
+	 * honest answer rather than a fabricated bound.
+	 */
+	private struct function fileIndex( required struct inventory ) {
+		var index = {};
+		for ( var file in ( isArray( arguments.inventory.files ?: "" ) ? arguments.inventory.files : [] ) ) {
+			var filePath = normalizePath( isStruct( file ) ? ( file.filePath ?: file.path ?: "" ) : file );
+			if ( !len( filePath ) ) continue;
+			var lineCount = 0;
+			if ( isStruct( file ) ) {
+				if ( isArray( file.lines ?: "" ) ) lineCount = file.lines.len();
+				else if ( isNumeric( file.lineCount ?: "" ) ) lineCount = int( file.lineCount );
+				else if ( isNumeric( file.totalLines ?: "" ) ) lineCount = int( file.totalLines );
+			}
+			// A later record must not shorten a file an earlier one measured.
+			index[ filePath ] = max( lineCount, val( index[ filePath ] ?: 0 ) );
+		}
+		for ( var unit in ( isArray( arguments.inventory.units ?: "" ) ? arguments.inventory.units : [] ) ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitPath = normalizePath( unit.filePath ?: unit.sourcePath ?: "" );
+			if ( !len( unitPath ) || index.keyExists( unitPath ) ) continue;
+			index[ unitPath ] = 0;
+		}
+		return index;
+	}
+
+	private struct function resolveAgainstIndex( required any ref, required struct index ) {
+		var failure = ( reason, filePath = "" ) => ( { resolved: false, reason: arguments.reason, filePath: arguments.filePath, startLine: 0, endLine: 0 } );
+
+		if ( !isStruct( arguments.ref ) ) {
+			// An id-shaped ref cannot be resolved to a file and line without the
+			// record it points at, and silently accepting it is how the old
+			// presence-only check let anything through.
+			return failure( isSimpleValue( arguments.ref ) && len( trim( toString( arguments.ref ) ) ) ? "unresolvable-id-reference" : "malformed-reference" );
+		}
+
+		var filePath = normalizePath( arguments.ref.filePath ?: arguments.ref.path ?: arguments.ref.sourcePath ?: "" );
+		if ( !len( filePath ) ) return failure( "missing-file-path" );
+		if ( !arguments.index.keyExists( filePath ) ) return failure( "file-not-in-inventory", filePath );
+
+		var startLine = val( arguments.ref.startLine ?: arguments.ref.line ?: 0 );
+		var endLine = val( arguments.ref.endLine ?: startLine );
+		if ( startLine < 1 ) return failure( "missing-line-range", filePath );
+		if ( endLine < startLine ) return failure( "inverted-line-range", filePath );
+
+		var lineCount = val( arguments.index[ filePath ] );
+		// lineCount 0 means the run inventoried the file without recording its
+		// length. The file is real, so the range is accepted rather than failed
+		// on a bound that was never measured.
+		if ( lineCount > 0 && endLine > lineCount ) return failure( "line-range-past-end-of-file", filePath );
+
+		return { resolved: true, reason: "", filePath: filePath, startLine: startLine, endLine: endLine };
+	}
+
+	private string function normalizePath( required any path ) {
+		return lCase( reReplace( replace( trim( toString( arguments.path ) ), "\", "/", "all" ), "^\./", "" ) );
+	}
+}

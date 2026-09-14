@@ -1,0 +1,488 @@
+/**
+ * Deterministic findings, AI finding normalization, fingerprinting, and deduplication.
+ */
+
+@singleton
+class threadsafe {
+	property name="findingSolutionService" inject="FindingSolutionService";
+	variables.severities = [ "critical", "high", "medium", "low", "info"];
+
+	function init() {
+		if (
+			isNull(
+				variables.findingSolutionService ?: javacast( "null", "" )
+			)
+		) {
+			variables.findingSolutionService = new app.models.services.FindingSolutionService();
+		}
+		return this;
+	}
+
+	/**
+	 * Runs the deterministic rule set over scanned files. This path never needs
+	 * an AI provider and returns findings with source evidence for later gates.
+	 */
+	array function deterministic( required array files ) {
+		var findings = [];
+		for ( var file in arguments.files ) {
+			var language = file.language ?: "";
+			var allowJsDynamic = language == "JavaScript";
+			var allowCfSql = language == "CFML" || language == "BoxLang";
+				var allowEmptyCatch = allowJsDynamic || allowCfSql;
+				var isCfml = language == "CFML";
+				var inCfQueryBlock = false;
+				var cfQueryHasInterpolation = false;
+				var cfQueryHasParam = false;
+				var cfQueryStartLine = 0;
+				var cfQueryOpenLine = 0;
+				var cfQueryEvidence = "";
+				var inCfFunctionBlock = false;
+				var inScriptFunctionBlock = false;
+				var scriptFunctionDepth = 0;
+				if ( isCfml && reFindNoCase( "Application\.cfc$", file.filePath ) ) {
+					var applicationSource = arrayToList( file.lines, char( 10 ) );
+					var missingHooks = [];
+					if ( !reFindNoCase( "\bfunction\s+onError\b|<cffunction\s+name\s*=\s*[""']onError[""']", applicationSource ) ) {
+						missingHooks.append( "onError" );
+					}
+					if ( !reFindNoCase( "\bfunction\s+onSessionEnd\b|<cffunction\s+name\s*=\s*[""']onSessionEnd[""']", applicationSource ) ) {
+						missingHooks.append( "onSessionEnd" );
+					}
+					if ( missingHooks.len() ) {
+						findings.append(
+								build(
+									category   = "maintainability",
+									ruleId     = "cfml/application-lifecycle-gap",
+									severity   = "info",
+									confidence = .7,
+									title      = "Application.cfc is missing lifecycle hooks",
+									message    = "Application.cfc does not define " & missingHooks.toList( ", " ) & ", so failures or session teardown in these phases go unhandled.",
+									filePath   = file.filePath,
+									startLine  = 1,
+									endLine    = 1,
+									evidence   = file.lines.len() ? trim( file.lines[ 1 ] ) : "",
+									suggestion = "Add the missing lifecycle method(s) so errors and session cleanup are handled explicitly instead of falling through to defaults.",
+									source     = "deterministic"
+								)
+							);
+					}
+				}
+			for ( var lineNumber = 1; lineNumber <= file.lines.len(); lineNumber++ ) {
+				var sourceLine = file.lines[ lineNumber ];
+				var evidence = trim( sourceLine );
+				if ( !len( evidence ) ) {
+					continue;
+				}
+
+				if (
+					reFindNoCase(
+						"(api[_-]?key|password|secret|access[_-]?token)\s*[:=]\s*['""][^'""]{8,}['""]",
+						sourceLine
+					)
+				) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "secrets/hardcoded-credential",
+								severity   = "high",
+								confidence = .98,
+								title      = "Possible hardcoded credential",
+								message    = "A credential-like value appears to be embedded directly in source.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Move the value to an environment variable or secret manager and rotate it if it is active.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( allowJsDynamic && reFindNoCase( "\b(eval|new\s+Function)\s*\(", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "execution/dynamic-code",
+								severity   = "high",
+								confidence = .9,
+								title      = "Dynamic code execution",
+								message    = "Dynamic execution can turn untrusted input into executable code.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Replace dynamic execution with an explicit parser or allow-listed dispatch.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( allowCfSql && reFindNoCase( "\bqueryExecute\s*\(", sourceLine ) && reFind( "##[^##]+##", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "security",
+								ruleId     = "database/query-interpolation",
+								severity   = "high",
+								confidence = .99,
+								title      = "SQL contains string interpolation",
+								message    = "The SQL text interpolates a value instead of binding it as a query parameter.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Replace interpolation with a named query parameter and a parameter value struct.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( allowEmptyCatch && reFindNoCase( "catch\s*\([^)]*\)\s*\{\s*\}", sourceLine ) ) {
+					findings.append(
+							build(
+								category   = "reliability",
+								ruleId     = "errors/empty-catch",
+								severity   = "medium",
+								confidence = .96,
+								title      = "Empty exception handler",
+								message    = "The exception is discarded, hiding failures and making diagnosis difficult.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Handle the expected failure or log and rethrow unexpected exceptions.",
+								source     = "deterministic"
+							)
+						);
+				}
+				if ( isCfml ) {
+					if ( reFindNoCase( "<cfquery\b", sourceLine ) ) {
+						inCfQueryBlock = true;
+						cfQueryStartLine = lineNumber;
+						cfQueryOpenLine = lineNumber;
+						cfQueryEvidence = evidence;
+						cfQueryHasInterpolation = false;
+						cfQueryHasParam = false;
+					}
+					if ( inCfQueryBlock ) {
+						if ( reFindNoCase( "<cfqueryparam\b", sourceLine ) ) {
+							cfQueryHasParam = true;
+						}
+						// The opening tag line often interpolates only tag attributes
+						// (e.g. datasource="#dsn#"), not SQL text, so require a SQL
+						// verb on that specific line; any later line in the block is
+						// SQL body and counts on its own (queries commonly split the
+						// verb and the interpolated clause across lines).
+						var looksLikeSqlBody = lineNumber != cfQueryOpenLine ||
+							reFindNoCase( "\b(SELECT|INSERT|UPDATE|DELETE)\b", sourceLine );
+						if ( looksLikeSqlBody && reFind( "##[^##]+##", sourceLine ) ) {
+							cfQueryHasInterpolation = true;
+						}
+						if ( reFindNoCase( "</cfquery>", sourceLine ) ) {
+							if ( cfQueryHasInterpolation && !cfQueryHasParam ) {
+								findings.append(
+										build(
+											category   = "security",
+											ruleId     = "cfml/query-missing-queryparam",
+											severity   = "high",
+											confidence = .9,
+											title      = "SQL query interpolates a value without cfqueryparam",
+											message    = "The <cfquery> block binds a value with string interpolation and never uses <cfqueryparam>, leaving the query open to injection.",
+											filePath   = file.filePath,
+											startLine  = cfQueryStartLine,
+											endLine    = lineNumber,
+											evidence   = cfQueryEvidence,
+											suggestion = "Wrap the interpolated value in <cfqueryparam value=""##value##"" cfsqltype=""cf_sql_..."">  instead of concatenating it into the SQL text.",
+											source     = "deterministic"
+										)
+									);
+							}
+							inCfQueryBlock = false;
+						}
+					}
+
+					if ( reFindNoCase( "<cffunction\b", sourceLine ) ) {
+						inCfFunctionBlock = true;
+					}
+					// Script functions have no closing tag to key off, so track brace
+					// depth from the opening "function ... {" line back to 0 instead.
+					if ( !inScriptFunctionBlock && reFindNoCase( "^\s*(?:(?:public|private|package|remote|static|final)\s+)*(?:[A-Za-z_][A-Za-z0-9_.$]*\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*\{", sourceLine ) ) {
+						inScriptFunctionBlock = true;
+						scriptFunctionDepth = braceDelta( sourceLine );
+					} else if ( inScriptFunctionBlock ) {
+						scriptFunctionDepth += braceDelta( sourceLine );
+						if ( scriptFunctionDepth <= 0 ) {
+							inScriptFunctionBlock = false;
+						}
+					}
+					if (
+						( inCfFunctionBlock && reFindNoCase( "<cfset\s+(?!var\b)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) ) ||
+						( inScriptFunctionBlock && reFindNoCase( "^\s*(?!var\s)[a-zA-Z_][a-zA-Z0-9_]*\s*=(?!=)", sourceLine ) )
+					) {
+						findings.append(
+								build(
+									category   = "reliability",
+									ruleId     = "cfml/unscoped-variable",
+									severity   = "medium",
+									confidence = .75,
+									title      = "Function assigns a variable without var scoping",
+									message    = "The assignment inside the function has no var/local scope, so it leaks into a shared scope and can be overwritten by concurrent requests.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Prefix the assignment with var (or local.) so it stays private to this function call.",
+									source     = "deterministic"
+								)
+							);
+					}
+					if ( reFindNoCase( "</cffunction>", sourceLine ) ) {
+						inCfFunctionBlock = false;
+					}
+
+					// Script: include "path/#value#.cfm";
+					if ( reFindNoCase( "^\s*include\s+[""'][^""']*##[^""']*##[^""']*[""']", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "security",
+									ruleId     = "cfml/dynamic-include-path",
+									severity   = "high",
+									confidence = .85,
+									title      = "Include path is built from an interpolated value",
+									message    = "The include path is assembled with an interpolated value, which can let an attacker include an unintended file.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Resolve the target against an allow-listed set of template names instead of interpolating untrusted input into the path.",
+									source     = "deterministic"
+								)
+							);
+					}
+
+					if ( reFindNoCase( "<cf(include|module)\b", sourceLine ) ) {
+						var includeTag = joinTagLines( file.lines, lineNumber );
+						if ( reFindNoCase( "template\s*=\s*[""'][^""']*##[^""']*##", includeTag.text ) ) {
+							findings.append(
+									build(
+										category   = "security",
+										ruleId     = "cfml/dynamic-include-path",
+										severity   = "high",
+										confidence = .85,
+										title      = "Include/module path is built from an interpolated value",
+										message    = "The template path is assembled with an interpolated value, which can let an attacker include an unintended file.",
+										filePath   = file.filePath,
+										startLine  = lineNumber,
+										endLine    = includeTag.endLine,
+										evidence   = evidence,
+										suggestion = "Resolve the target against an allow-listed set of template names instead of interpolating untrusted input into the path.",
+										source     = "deterministic"
+									)
+								);
+						}
+					}
+
+					if ( reFindNoCase( "<cflock\b", sourceLine ) ) {
+						var cflockTag = joinTagLines( file.lines, lineNumber );
+						if ( !reFindNoCase( "\b(scope|name)\s*=", cflockTag.text ) ) {
+							findings.append(
+									build(
+										category   = "reliability",
+										ruleId     = "cfml/deprecated-cflock-scope",
+										severity   = "medium",
+										confidence = .8,
+										title      = "cflock is missing an explicit scope or name",
+										message    = "The <cflock> tag has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
+										filePath   = file.filePath,
+										startLine  = lineNumber,
+										endLine    = cflockTag.endLine,
+										evidence   = evidence,
+										suggestion = "Add scope=""..."" or name=""..."" so the lock covers only the resource it protects.",
+										source     = "deterministic"
+									)
+								);
+						}
+					}
+
+					// Script: lock scope="session" timeout="10" { ... }
+					if ( reFindNoCase( "^\s*lock\b[^{]*\{", sourceLine ) && !reFindNoCase( "\b(scope|name)\s*=", sourceLine ) ) {
+						findings.append(
+								build(
+									category   = "reliability",
+									ruleId     = "cfml/deprecated-cflock-scope",
+									severity   = "medium",
+									confidence = .8,
+									title      = "lock is missing an explicit scope or name",
+									message    = "The lock statement has neither scope nor name, so it falls back to a broad implicit lock that can serialize unrelated requests.",
+									filePath   = file.filePath,
+									startLine  = lineNumber,
+									endLine    = lineNumber,
+									evidence   = evidence,
+									suggestion = "Add scope=""..."" or name=""..."" so the lock covers only the resource it protects.",
+									source     = "deterministic"
+								)
+							);
+					}
+				}
+
+				var markerComment = reFindNoCase( "^\s*(//|/\*|\*|<!--).*\b(TODO|FIXME)\b", sourceLine ) ||
+					( left( evidence, 1 ) == char( 35 ) && reFindNoCase( "\b(TODO|FIXME)\b", sourceLine ) );
+				if ( markerComment ) {
+					findings.append(
+							build(
+								category   = "maintainability",
+								ruleId     = "maintenance/open-marker",
+								severity   = "info",
+								confidence = 1,
+								title      = "Open maintenance marker",
+								message    = "The reviewed source contains an unresolved TODO or FIXME marker.",
+								filePath   = file.filePath,
+								startLine  = lineNumber,
+								endLine    = lineNumber,
+								evidence   = evidence,
+								suggestion = "Resolve the marker or link it to tracked work with enough context.",
+								source     = "deterministic"
+							)
+						);
+				}
+			}
+		}
+		return deduplicate( findings );
+	}
+
+	array function normalizeAI( required any response, required array files ) {
+		var candidates = [];
+		if ( isStruct( arguments.response ) && isArray( arguments.response.findings ?: "" ) ) {
+			candidates = arguments.response.findings;
+		} else if ( isArray( arguments.response ) ) {
+			candidates = arguments.response;
+		}
+		var indexedFiles = {};
+		arguments.files.each( ( file ) => indexedFiles[ lCase( file.filePath ) ] = file );
+		var findings = [];
+
+		for ( var candidate in candidates ) {
+			if ( !isStruct( candidate ) ) {
+				continue;
+			}
+			var filePath = normalizePath( candidate.filePath ?: "" );
+			if ( !len( filePath ) || !indexedFiles.keyExists( lCase( filePath ) ) ) {
+				continue;
+			}
+			var file = indexedFiles[ lCase( filePath ) ];
+			var startLine = isNumeric( candidate.startLine ?: "" ) ? int( candidate.startLine ) : 0;
+			var endLine = isNumeric( candidate.endLine ?: "" ) ? int( candidate.endLine ) : startLine;
+			if ( startLine < 1 || startLine > file.lines.len() || endLine < startLine || endLine > file.lines.len() ) {
+				continue;
+			}
+			var evidence = trim( file.lines[ startLine ] );
+			if ( !len( evidence ) || !len( trim( candidate.title ?: "" ) ) || !len( trim( candidate.message ?: "" ) ) ) {
+				continue;
+			}
+			var severity = lCase( candidate.severity ?: "medium" );
+			if ( !variables.severities.contains( severity ) ) {
+				severity = "medium";
+			}
+			var confidence = isNumeric( candidate.confidence ?: "" ) ? min( 1, max( 0, candidate.confidence ) ) : .7;
+			findings.append(
+					build(
+						category          = lCase( candidate.category ?: "quality" ),
+						ruleId            = candidate.ruleId ?: "ai/review",
+						severity          = severity,
+						confidence        = confidence,
+						title             = trim( candidate.title ),
+						message           = trim( candidate.message ),
+						filePath          = file.filePath,
+						startLine         = startLine,
+						endLine           = endLine,
+						evidence          = evidence,
+						suggestion        = trim( candidate.suggestion ?: "" ),
+						source            = "bx-ai",
+						candidateFixPatch = candidate.fixPatch ?: javacast( "null", "" )
+					)
+				);
+		}
+		return deduplicate( findings );
+	}
+
+	array function deduplicate( required array findings ) {
+		var seen = {};
+		var result = [];
+		for ( var finding in arguments.findings ) {
+			if ( !seen.keyExists( finding.fingerprint ) ) {
+				seen[ finding.fingerprint ] = true;
+				result.append( finding );
+			}
+		}
+		return result;
+	}
+
+	/**
+		 * Tag attributes commonly wrap across lines (e.g. `<cflock` on one line,
+		 * `scope="..."` on the next). Joins from startLine up to the line that
+		 * closes the tag with `>`, bounded by maxLookahead, so attribute checks
+		 * don't miss/misfire on wrapped tags.
+		 */
+		private numeric function braceDelta( required string sourceLine ) {
+			return len( reMatch( "\{", arguments.sourceLine ) ) - len( reMatch( "\}", arguments.sourceLine ) );
+		}
+
+		private struct function joinTagLines( required array lines, required numeric startLine, numeric maxLookahead = 5 ) {
+			var text = "";
+			var endLine = arguments.startLine;
+			var limit = min( arguments.startLine + arguments.maxLookahead, arguments.lines.len() );
+			for ( var i = arguments.startLine; i <= limit; i++ ) {
+				text &= " " & arguments.lines[ i ];
+				endLine = i;
+				if ( find( ">", arguments.lines[ i ] ) ) {
+					break;
+				}
+			}
+			return { text: text, endLine: endLine };
+		}
+
+		private struct function build(
+		required string category,
+		required string ruleId,
+		required string severity,
+		required numeric confidence,
+		required string title,
+		required string message,
+		required string filePath,
+		required numeric startLine,
+		required numeric endLine,
+		required string evidence,
+		required string suggestion,
+		required string source,
+		any candidateFixPatch = javacast( "null", "" )
+	) {
+		var fingerprint = lCase(
+			hash( lCase( arguments.category ) & "|" & lCase( arguments.ruleId ) & "|" & lCase( normalizePath( arguments.filePath ) ) & "|" & arguments.startLine & "|" & trim( arguments.evidence ),
+				"SHA-256" )
+		);
+		return findingSolutionService.enrich(
+				{
+					id         : lCase( createUUID() ),
+					fingerprint: fingerprint,
+					category   : lCase( arguments.category ),
+					ruleId     : arguments.ruleId,
+					severity   : lCase( arguments.severity ),
+					confidence : arguments.confidence,
+					title      : arguments.title,
+					message    : arguments.message,
+					filePath   : normalizePath( arguments.filePath ),
+					startLine  : arguments.startLine,
+					endLine    : arguments.endLine,
+					evidence   : arguments.evidence,
+					suggestion : arguments.suggestion,
+					source     : arguments.source
+				},
+				arguments.candidateFixPatch
+			);
+	}
+
+	private string function normalizePath( required string path ) {
+		return replace(
+			arguments.path,
+			"\",
+			"/",
+			"all"
+		);
+	}
+}

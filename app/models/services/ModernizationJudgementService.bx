@@ -1,0 +1,374 @@
+/**
+ * The model's job after the inversion: judge the derived boundaries, narrate
+ * them, criticise the finished plan, and write the verdict.
+ *
+ * Split from ModernizationProposalService (Step 11). None of these decide
+ * structure — the clustering is deterministic and each role is told so
+ * explicitly. They add judgement and language on top of a plan that already
+ * exists, which is why they live apart from the service that builds it.
+ *
+ * Every one is optional: with no provider configured the plan is returned
+ * unchanged, which is the no-key path the product promises.
+ */
+@singleton
+class threadsafe {
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="modernizationArtifactService" inject="ModernizationArtifactService";
+	property name="citationResolver" inject="ModernizationCitationResolver";
+
+	// judge/narrate batching. 3 keeps a batch inside the schemas' maxItems of 4
+	// with room for a retry that returns one extra, and keeps a truncated
+	// response from costing more than three clusters' worth of narration.
+	variables.judgeBatchSize = 3;
+	variables.maxClusterPathsInPrompt = 12;
+	variables.maxBriefSignals = 24;
+
+	private any function artifactService() {
+		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
+		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
+		return variables.modernizationArtifactService;
+	}
+
+	struct function judgeAndNarrate(
+		required string runId,
+		required struct derived,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { verdicts: [], narrations: [], errors: [], costUsd: 0, outputCharacters: 0, ran: false };
+		var clusters = isArray( arguments.derived.clusters ?: "" ) ? arguments.derived.clusters : [];
+		if ( !clusters.len() ) return outcome;
+
+		var batches = [];
+		var current = [];
+		for ( var cluster in clusters ) {
+			current.append( compactClusterForNarration( cluster ) );
+			if ( current.len() >= variables.judgeBatchSize ) {
+				batches.append( current );
+				current = [];
+			}
+		}
+		if ( current.len() ) batches.append( current );
+
+		var waveOrder = isStruct( arguments.derived.waveOrder ?: "" ) ? arguments.derived.waveOrder : {};
+		var startedAt = getTickCount();
+		var maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 120000;
+
+		// Called straight through rather than dispatched onto the shard pool.
+		//
+		// The pool exists for application sharding, where a repository fans out to
+		// dozens of calls and concurrency is the difference between minutes and
+		// hours. Judge/narrate is a handful of calls over already-compacted
+		// cluster records — a few batches, two roles each — so the pool bought
+		// nothing and cost a live provider run: routing through
+		// `dispatchShardTask` sends the request through the *executor's* gateway
+		// and future machinery, and a failure inside that closure surfaced as an
+		// opaque "Failed to serialize object" with no usable stack.
+		//
+		// Straight calls also mean this service no longer depends on the executor
+		// at all, which is the honest shape: it judges a finished structure.
+		var pending = [];
+		for ( var batch in batches ) {
+			for ( var role in [ "modernization-judge", "modernization-narrate" ] ) {
+				var evidence = { clusters: batch, waveOrder: waveOrder };
+				var promptRequest = agentFactory.build( role, arguments.runtime, evidence, arguments.budgets );
+				var roleOptions = artifactService().copyGatewayOptions( arguments.options );
+				roleOptions.budgets = duplicate( arguments.budgets );
+				roleOptions.startedAt = getTickCount();
+				roleOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				// One retry: these are cheap, optional calls.
+				roleOptions.maxRetries = 1;
+				roleOptions.role = role;
+				pending.append( { role: role, promptRequest: promptRequest, options: roleOptions } );
+			}
+		}
+
+		for ( var item in pending ) {
+			var response = agentGateway.run( arguments.runId, item.promptRequest, item.options );
+			outcome.ran = true;
+			outcome.costUsd = outcome.costUsd + val( response.costUsd ?: 0 );
+			outcome.outputCharacters = outcome.outputCharacters + val( response.outputCharacters ?: 0 );
+			// The gateway returns the parsed result as `payload`. Reading `data` -- which
+			// does not exist -- is why every role looked like it returned nothing while
+			// the model was in fact answering well. The specs stubbed `data` too, so
+			// they agreed with the bug instead of catching it.
+			var fragment = isStruct( response.payload ?: "" ) ? response.payload : {};
+			if ( !( response.ok ?: false ) ) {
+				outcome.errors.append( { role: item.role, message: trim( toString( response.error ?: "provider-failed" ) ) } );
+				continue;
+			}
+			if ( item.role == "modernization-judge" ) {
+				for ( var verdict in ( isArray( fragment.verdicts ?: "" ) ? fragment.verdicts : [] ) ) {
+					// Nothing from a provider is assumed to be the declared type:
+					// clusterId has arrived as an array. isSimpleValue first, always.
+					if ( !isStruct( verdict ) ) continue;
+					if ( !isSimpleValue( verdict.clusterId ?: [] ) || !len( trim( toString( verdict.clusterId ?: "" ) ) ) ) continue;
+					// `worthIt` reads as a yes/no question and models answer it with a
+					// boolean, a string, or an array of reasons. Normalize whatever
+					// arrives instead of letting one field discard the batch — a
+					// strict schema here cost four runs' worth of verdicts.
+					if ( verdict.keyExists( "worthIt" ) ) {
+						var worth = isSimpleValue( verdict.worthIt ) ? lCase( trim( toString( verdict.worthIt ) ) ) : "";
+						verdict.worthIt = [ "true", "yes" ].contains( worth ) ? "yes" : ( [ "false", "no" ].contains( worth ) ? "no" : "unclear" );
+					}
+					outcome.verdicts.append( verdict );
+				}
+			} else {
+				for ( var narration in ( isArray( fragment.narrations ?: "" ) ? fragment.narrations : [] ) ) {
+					if ( isStruct( narration ) && isSimpleValue( narration.clusterId ?: [] ) && len( trim( toString( narration.clusterId ?: "" ) ) ) ) outcome.narrations.append( narration );
+				}
+			}
+		}
+
+		return outcome;
+	}
+
+	/**
+	 * The verdict, written well — and only where it is grounded.
+	 *
+	 * Runs last. Every claim must carry an evidence ref that **resolves** against
+	 * the run's inventory, not merely one that is present: a brief citing a ref
+	 * that points at nothing is exactly the fluent nonsense this step is last to
+	 * avoid (§2.16). Unresolvable claims are dropped and counted, so the artifact
+	 * is honest about how much of the narrative survived.
+	 */
+	struct function brief(
+		required string runId,
+		required struct plan,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { verdict: "", startHere: "", claims: [], droppedClaims: 0, citationValidity: javacast( "null", "" ), errors: [], costUsd: 0, ran: false };
+		var projection = criticProjection( arguments.plan );
+		if ( !projection.placements.len() ) return outcome;
+		// Signals travel because every claim has to cite one, but only the top few
+		// -- the factory's character budget is not a substitute for sending less.
+		var planSignals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		projection.signals = planSignals.len() > variables.maxBriefSignals ? planSignals.slice( 1, variables.maxBriefSignals ) : planSignals;
+
+		var promptRequest = agentFactory.build( "modernization-brief", arguments.runtime, projection, arguments.budgets );
+		var briefOptions = artifactService().copyGatewayOptions( arguments.options );
+		briefOptions.budgets = duplicate( arguments.budgets );
+		briefOptions.startedAt = getTickCount();
+		briefOptions.maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 90000;
+		briefOptions.maxRetries = 1;
+		briefOptions.role = "modernization-brief";
+
+		var response = agentGateway.run( arguments.runId, promptRequest, briefOptions );
+		outcome.ran = true;
+		outcome.costUsd = val( response.costUsd ?: 0 );
+		if ( !( response.ok ?: false ) ) {
+			outcome.errors.append( { role: "modernization-brief", message: trim( toString( response.error ?: "provider-failed" ) ) } );
+			return outcome;
+		}
+
+		// The gateway returns the parsed result as `payload`. Reading `data` -- which
+			// does not exist -- is why every role looked like it returned nothing while
+			// the model was in fact answering well. The specs stubbed `data` too, so
+			// they agreed with the bug instead of catching it.
+			var fragment = isStruct( response.payload ?: "" ) ? response.payload : {};
+		var inventory = isStruct( arguments.plan.inventory ?: "" ) ? arguments.plan.inventory : {};
+		var resolver = citationResolverInstance();
+		var totalRefs = 0;
+		var resolvedRefs = 0;
+
+		for ( var claim in ( isArray( fragment.claims ?: "" ) ? fragment.claims : [] ) ) {
+			if ( !isStruct( claim ) || !len( trim( toString( claim.claim ?: "" ) ) ) ) continue;
+			var keptRefs = [];
+			for ( var ref in ( isArray( claim.evidenceRefs ?: "" ) ? claim.evidenceRefs : [] ) ) {
+				totalRefs = totalRefs + 1;
+				if ( !resolver.resolve( ref, inventory ).resolved ) continue;
+				resolvedRefs = resolvedRefs + 1;
+				keptRefs.append( ref );
+			}
+			// A claim with no surviving citation is unsupported prose. Dropping it
+			// is the point of running this role last.
+			if ( !keptRefs.len() ) {
+				outcome.droppedClaims = outcome.droppedClaims + 1;
+				continue;
+			}
+			claim.evidenceRefs = keptRefs;
+			outcome.claims.append( claim );
+		}
+
+		outcome.verdict = trim( toString( fragment.verdict ?: "" ) );
+		outcome.startHere = trim( toString( fragment.startHere ?: "" ) );
+		if ( totalRefs ) outcome.citationValidity = resolvedRefs / totalRefs;
+		return outcome;
+	}
+
+	private any function citationResolverInstance() {
+		if ( !isNull( variables.citationResolver ?: javacast( "null", "" ) ) ) return variables.citationResolver;
+		variables.citationResolver = new app.models.services.ModernizationCitationResolver();
+		return variables.citationResolver;
+	}
+
+	/**
+	 * Criticise a finished plan's architecture.
+	 *
+	 * Runs after merge, placement and gates, so it sees decisions rather than
+	 * drafts. It is given a compressed projection — ids, metrics, gate results,
+	 * wave order — and never the merged plan: that payload is the shape that
+	 * made the old unsharded architecture call time out.
+	 *
+	 * The critic has no authority to change anything. Everything it returns is
+	 * advice attached to the plan for a human (or a later rebuild) to act on.
+	 */
+	struct function critique(
+		required string runId,
+		required struct plan,
+		struct runtime = {},
+		struct budgets = {},
+		struct options = {}
+	) {
+		var outcome = { critiques: [], errors: [], costUsd: 0, ran: false };
+		var projection = criticProjection( arguments.plan );
+		if ( !projection.placements.len() ) return outcome;
+
+		var promptRequest = agentFactory.build( "modernization-critic", arguments.runtime, projection, arguments.budgets );
+		var criticOptions = artifactService().copyGatewayOptions( arguments.options );
+		criticOptions.budgets = duplicate( arguments.budgets );
+		criticOptions.startedAt = getTickCount();
+		criticOptions.maxDurationMs = isNumeric( arguments.options.maxDurationMs ?: "" ) ? val( arguments.options.maxDurationMs ) : 90000;
+		criticOptions.maxRetries = 1;
+		criticOptions.role = "modernization-critic";
+
+		var response = agentGateway.run( arguments.runId, promptRequest, criticOptions );
+		outcome.ran = true;
+		outcome.costUsd = val( response.costUsd ?: 0 );
+		if ( !( response.ok ?: false ) ) {
+			outcome.errors.append( { role: "modernization-critic", message: trim( toString( response.error ?: "provider-failed" ) ) } );
+			return outcome;
+		}
+
+		// The gateway returns the parsed result as `payload`. Reading `data` -- which
+			// does not exist -- is why every role looked like it returned nothing while
+			// the model was in fact answering well. The specs stubbed `data` too, so
+			// they agreed with the bug instead of catching it.
+			var fragment = isStruct( response.payload ?: "" ) ? response.payload : {};
+		var knownIds = {};
+		for ( var placement in projection.placements ) knownIds[ trim( toString( placement.id ?: "" ) ) ] = true;
+		for ( var critique in ( isArray( fragment.critiques ?: "" ) ? fragment.critiques : [] ) ) {
+			if ( !isStruct( critique ) ) continue;
+			// A critique of something that is not in the plan is not a critique.
+			if ( !isSimpleValue( critique.targetItemId ?: [] ) ) continue;
+			if ( !knownIds.keyExists( trim( toString( critique.targetItemId ?: "" ) ) ) ) continue;
+			if ( !len( trim( toString( critique.claim ?: "" ) ) ) ) continue;
+			outcome.critiques.append( critique );
+		}
+		return outcome;
+	}
+
+	/**
+	 * The compressed projection the critic sees: ids, metrics, gate results,
+	 * wave order. No prose, no source, no target unit catalog.
+	 */
+	private struct function criticProjection( required struct plan ) {
+		var target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : {};
+		var derived = isStruct( arguments.plan.derived ?: "" ) ? arguments.plan.derived : {};
+		var projection = { placements: [], gates: [], waveOrder: {}, graphMetrics: {} };
+
+		for ( var placement in ( isArray( target.placements ?: "" ) ? target.placements : [] ) ) {
+			var boundary = isStruct( placement.boundaryEvidence ?: "" ) ? placement.boundaryEvidence : {};
+			projection.placements.append( {
+				id             : placement.id ?: "",
+				name           : placement.name ?: "",
+				placementType  : placement.placementType ?: "",
+				recommendation : placement.recommendation ?: "",
+				unitCount      : ( isArray( placement.targetUnitIds ?: "" ) ? placement.targetUnitIds.len() : 0 ),
+				crossingEdges  : val( boundary.crossingEdges ?: 0 ),
+				sharedTables   : isArray( boundary.sharedTablesOutside ?: "" ) ? boundary.sharedTablesOutside : [],
+				sharedScopes   : isArray( boundary.sharedScopesOutside ?: "" ) ? boundary.sharedScopesOutside : [],
+				inCycle        : boundary.inCycleWithOutside ?: false,
+				isolated       : boundary.isolated ?: false,
+				decisionRequired: placement.decisionRequired ?: false
+			} );
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				projection.gates.append( {
+					placementId: placement.id ?: "",
+					id         : gate.id ?: "",
+					status     : gate.status ?: "",
+					confidence : gate.confidence ?: ""
+				} );
+			}
+		}
+
+		var waveOrder = isStruct( derived.waveOrder ?: "" ) ? derived.waveOrder : {};
+		var order = [];
+		for ( var entry in ( isArray( waveOrder.order ?: "" ) ? waveOrder.order : [] ) ) {
+			order.append( { clusterId: entry.clusterId ?: "", wave: val( entry.wave ?: 0 ), dependsOn: entry.dependsOn ?: [], inCycleWith: entry.inCycleWith ?: [] } );
+		}
+		projection.waveOrder = { order: order, maxWave: val( waveOrder.maxWave ?: 0 ) };
+
+		var graph = isStruct( derived.graph ?: "" ) ? derived.graph : {};
+		projection.graphMetrics = {
+			cycles   : ( isArray( graph.cycles ?: "" ) ? graph.cycles.len() : 0 ),
+			truncated: graph.truncated ?: false
+		};
+
+		// The judge has already argued with each boundary by the time the critic
+		// runs. Withholding those verdicts made the critic re-derive the same
+		// conclusion from scratch and, on the planted false-seam case, miss it
+		// entirely while the judge caught it. A disputed boundary is precisely
+		// what a critic should be pulling on.
+		var judgement = isStruct( arguments.plan.judgement ?: "" ) ? arguments.plan.judgement : {};
+		var verdicts = [];
+		for ( var verdict in ( isArray( judgement.verdicts ?: "" ) ? judgement.verdicts : [] ) ) {
+			if ( !isStruct( verdict ) || !isSimpleValue( verdict.clusterId ?: [] ) ) continue;
+			verdicts.append( {
+				clusterId : verdict.clusterId,
+				defensible: verdict.defensible ?: true,
+				confidence: verdict.confidence ?: "",
+				rationale : isSimpleValue( verdict.rationale ?: [] ) ? verdict.rationale : "",
+				worthIt   : isSimpleValue( verdict.worthIt ?: [] ) ? verdict.worthIt : ""
+			} );
+		}
+		if ( verdicts.len() ) projection.judgeVerdicts = verdicts;
+		return projection;
+	}
+
+	/**
+	 * Bounds one cluster for a judge/narrate prompt.
+	 *
+	 * A cluster can own thousands of files. What decides whether a boundary is
+	 * defensible is the boundary evidence, not the file list, so the list is
+	 * capped and a count carries the rest.
+	 */
+	private struct function compactClusterForNarration( required struct cluster ) {
+		var filePaths = isArray( arguments.cluster.filePaths ?: "" ) ? arguments.cluster.filePaths : [];
+		var boundary = isStruct( arguments.cluster.boundaryEvidence ?: "" ) ? arguments.cluster.boundaryEvidence : {};
+		return {
+			id           : arguments.cluster.id ?: "",
+			domainKey    : arguments.cluster.domainKey ?: "",
+			name         : arguments.cluster.name ?: "",
+			purpose      : arguments.cluster.purpose ?: "",
+			placementType: arguments.cluster.placementType ?: "",
+			rationale    : arguments.cluster.rationale ?: "",
+			fileCount    : filePaths.len(),
+			filePaths    : filePaths.len() > variables.maxClusterPathsInPrompt
+				? filePaths.slice( 1, variables.maxClusterPathsInPrompt )
+				: duplicate( filePaths ),
+			boundaryEvidence: {
+				crossingEdges      : val( boundary.crossingEdges ?: 0 ),
+				sharedTablesOutside: isArray( boundary.sharedTablesOutside ?: "" ) ? boundary.sharedTablesOutside : [],
+				sharedScopesOutside: isArray( boundary.sharedScopesOutside ?: "" ) ? boundary.sharedScopesOutside : [],
+				inCycleWithOutside : boundary.inCycleWithOutside ?: false,
+				spansWholeSystem   : boundary.spansWholeSystem ?: false,
+				isolated           : boundary.isolated ?: false,
+				externalIntegration: isArray( boundary.externalIntegration ?: "" ) ? boundary.externalIntegration : []
+			}
+		};
+	}
+
+	/**
+	 * Carries an optional per-run model override (immutable input, set from
+	 * ModernizationPolicyService.normalize()) into the gateway options struct so
+	 * every copied gateway-options struct below inherits it without
+	 * threading a new parameter through each role.
+	 */
+
+}
+

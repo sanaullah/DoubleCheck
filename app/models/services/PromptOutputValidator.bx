@@ -1,0 +1,454 @@
+/**
+ * Provider-independent structural and semantic output validation for prompt
+ * contracts. It intentionally validates the small JSON-schema subset used by
+ * local prompt resources and then applies evidence authorization checks.
+ */
+@singleton
+class threadsafe {
+	property name="promptRegistry" inject="PromptRegistry";
+
+	function init() {
+		if ( isNull( variables.promptRegistry ?: javacast( "null", "" ) ) ) variables.promptRegistry = new app.models.services.PromptRegistry();
+		return this;
+	}
+
+	struct function validate(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		var value = normalizeResponse( arguments.response );
+		var schema = promptRegistry.schema( arguments.schemaId );
+		var errors = [];
+		validateValue( value, schema, "$", errors );
+		validateEvidence( value, arguments.schemaId, arguments.context, errors );
+		var reasonCodes = [];
+		for ( var validationError in errors ) {
+			var code = validationError.code ?: "validation";
+			if ( !reasonCodes.contains( code ) ) reasonCodes.append( code );
+		}
+		return {
+			valid      : errors.len() == 0,
+			errors     : errors,
+			reasonCodes: reasonCodes
+		};
+	}
+
+	struct function validateStructure(
+		required any response,
+		required string schemaId
+	) {
+		var value = normalizeResponse( arguments.response );
+		var schema = promptRegistry.schema( arguments.schemaId );
+		var errors = [];
+		validateValue( value, schema, "$", errors );
+		return validationResult( value, errors, [] );
+	}
+
+	/**
+	 * Validate the complete structural contract, then quarantine top-level items
+	 * with unauthorized evidence while preserving their valid siblings.
+	 */
+	struct function sanitize(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		// The modernization-architecture compaction step is gone with its role:
+		// packaging decisions come from the coupling graph, so there is no
+		// oversized architecture response left to compact.
+		var structural = validateStructure( arguments.response, arguments.schemaId );
+		if ( !structural.valid || !isStruct( structural.value ) ) return structural;
+		var value = duplicate( structural.value );
+		var collections = itemCollections( value, arguments.schemaId );
+		var rejected = [];
+		for ( var collection in collections ) {
+			if ( !isArray( value[ collection ] ?: "" ) ) continue;
+			var accepted = [];
+			for ( var itemIndex = 1; itemIndex <= value[ collection ].len(); itemIndex++ ) {
+				var itemErrors = [];
+				var itemEnvelope = {};
+				itemEnvelope[ collection ] = [ value[ collection ][ itemIndex ] ];
+				validateEvidence( itemEnvelope, arguments.schemaId, arguments.context, itemErrors );
+				if ( itemErrors.len() ) {
+					rejected.append( {
+						collection: collection,
+						index: itemIndex,
+						errors: duplicate( itemErrors ),
+						reasonCodes: reasonCodesFor( itemErrors )
+					} );
+				} else {
+					accepted.append( value[ collection ][ itemIndex ] );
+				}
+			}
+			value[ collection ] = accepted;
+		}
+		var remainingErrors = [];
+		validateEvidence( value, arguments.schemaId, arguments.context, remainingErrors );
+		var result = validationResult( value, remainingErrors, rejected );
+		result.rejectedReasonCodes = reasonCodesForRejected( rejected );
+		return result;
+	}
+
+	struct function sanitizeValid(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		var result = sanitize( arguments.response, arguments.schemaId, arguments.context );
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
+		return result;
+	}
+
+	struct function assertValid(
+		required any response,
+		required string schemaId,
+		struct context = {}
+	) {
+		var result = validate( arguments.response, arguments.schemaId, arguments.context );
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
+		return result;
+	}
+
+	struct function assertStructureValid( required any response, required string schemaId ) {
+		var result = validateStructure( arguments.response, arguments.schemaId );
+		if ( !result.valid ) throwValidation( result, arguments.schemaId );
+		return result;
+	}
+
+	private struct function validationResult( required any value, required array errors, array rejectedItems = [] ) {
+		return {
+			valid: arguments.errors.len() == 0,
+			value: arguments.value,
+			errors: arguments.errors,
+			reasonCodes: reasonCodesFor( arguments.errors ),
+			rejectedItems: arguments.rejectedItems
+		};
+	}
+
+	private array function reasonCodesFor( required array errors ) {
+		var output = [];
+		for ( var validationError in arguments.errors ) {
+			var code = validationError.code ?: "validation";
+			if ( !output.contains( code ) ) output.append( code );
+		}
+		return output;
+	}
+
+	private array function reasonCodesForRejected( required array rejectedItems ) {
+		var output = [];
+		for ( var item in arguments.rejectedItems ) {
+			for ( var code in item.reasonCodes ?: [] ) if ( !output.contains( code ) ) output.append( code );
+		}
+		return output;
+	}
+
+	private array function itemCollections( required struct value, required string schemaId ) {
+		if ( listFindNoCase( "specialist-findings-v1,bulk-review-v1", arguments.schemaId ) ) return [ "findings" ];
+		if ( arguments.schemaId == "architecture-enrichment-v1" ) return [ "statements" ];
+		if ( arguments.schemaId == "codegraph-narrative-v1" ) return [ "summaries" ];
+		if ( arguments.schemaId == "codegraph-narrative-v2" ) return [ "domains", "processes", "onboarding", "risk", "summaries" ];
+		if ( findNoCase( "modernization-", arguments.schemaId ) == 1 ) {
+			var output = [];
+			for ( var key in arguments.value ) if ( isArray( arguments.value[ key ] ) ) output.append( key );
+			return output;
+		}
+		return [];
+	}
+
+	private void function throwValidation( required struct result, required string schemaId ) {
+		throw(
+			type = "PromptOutputValidationException",
+			message = "Output failed #arguments.schemaId# validation: #arguments.result.errors.map( ( item ) => item.message ).toList( '; ' )#",
+			data = arguments.result
+		);
+	}
+
+	private any function normalizeResponse( required any response ) {
+		if ( isStruct( arguments.response ) ) {
+			if ( structKeyExists( arguments.response, "content" ) && isSimpleValue( arguments.response.content ) ) return normalizeResponse( arguments.response.content );
+			return arguments.response;
+		}
+		if ( isArray( arguments.response ) ) return arguments.response;
+		var text = trim( toString( arguments.response ) );
+		if ( !len( text ) ) return javacast( "null", "" );
+		try {
+			return jsonDeserialize( text );
+		} catch ( any error ) {
+			return javacast( "null", "" );
+		}
+	}
+
+	private void function validateValue( required any value, required struct schema, required string path, required array errors ) {
+		if ( structKeyExists( arguments.schema, "$ref" ) ) {
+			try {
+				validateValue( arguments.value, resolveSchemaReference( arguments.schema[ "$ref" ] ), arguments.path, arguments.errors );
+			} catch ( any referenceError ) {
+				addError( arguments.errors, "schema-reference", "#arguments.path# uses an unresolved schema reference" );
+			}
+			return;
+		}
+		if ( structKeyExists( arguments.schema, "enum" ) && isArray( arguments.schema.enum ) && !arguments.schema.enum.contains( arguments.value ) ) {
+			addError( arguments.errors, "enum", "#arguments.path# is not an allowed value" );
+			return;
+		}
+		var expected = lCase( trim( arguments.schema.type ?: "" ) );
+		if ( expected == "object" ) {
+			if ( !isStruct( arguments.value ) ) {
+				addError( arguments.errors, "type", "#arguments.path# must be an object" );
+				return;
+			}
+			for ( var requiredKey in arguments.schema.required ?: [] ) {
+				if ( !structKeyExists( arguments.value, requiredKey ) || isNull( arguments.value[ requiredKey ] ) ) addError( arguments.errors, "required", "#arguments.path# is missing #requiredKey#" );
+			}
+			if ( isStruct( arguments.schema.properties ?: "" ) ) {
+				for ( var propertyName in arguments.schema.properties ) {
+					if ( structKeyExists( arguments.value, propertyName ) && !isNull( arguments.value[ propertyName ] ) && isStruct( arguments.schema.properties[ propertyName ] ) ) {
+						validateValue( arguments.value[ propertyName ], arguments.schema.properties[ propertyName ], arguments.path & "." & propertyName, arguments.errors );
+					}
+				}
+			}
+			if ( ( arguments.schema.additionalProperties ?: true ) == false ) {
+				for ( var actualKey in arguments.value ) {
+					if ( !isStruct( arguments.schema.properties ?: "" ) || !arguments.schema.properties.keyExists( actualKey ) ) addError( arguments.errors, "additional-property", "#arguments.path# contains unexpected #actualKey#" );
+				}
+			}
+			return;
+		}
+		if ( expected == "array" ) {
+			if ( !isArray( arguments.value ) ) {
+				addError( arguments.errors, "type", "#arguments.path# must be an array" );
+				return;
+			}
+			if ( isNumeric( arguments.schema.maxItems ?: "" ) && arguments.value.len() > val( arguments.schema.maxItems ) ) addError( arguments.errors, "max-items", "#arguments.path# exceeds maxItems" );
+			if ( isNumeric( arguments.schema.minItems ?: "" ) && arguments.value.len() < val( arguments.schema.minItems ) ) addError( arguments.errors, "min-items", "#arguments.path# is below minItems" );
+			if ( isStruct( arguments.schema.items ?: "" ) ) {
+				for ( var itemIndex = 1; itemIndex <= arguments.value.len(); itemIndex++ ) validateValue( arguments.value[ itemIndex ], arguments.schema.items, "#arguments.path#[#itemIndex#]", arguments.errors );
+			}
+			if ( ( arguments.schema.uniqueItems ?: false ) && hasDuplicateItems( arguments.value ) ) addError( arguments.errors, "unique-items", "#arguments.path# contains duplicate items" );
+			return;
+		}
+		if ( expected == "string" && ( !isSimpleValue( arguments.value ) || isNumeric( arguments.value ) || isBoolean( arguments.value ) ) ) addError( arguments.errors, "type", "#arguments.path# must be a string" );
+		if ( expected == "string" && isSimpleValue( arguments.value ) ) {
+			var stringLength = len( toString( arguments.value ) );
+			if ( isNumeric( arguments.schema.minLength ?: "" ) && stringLength < val( arguments.schema.minLength ) ) addError( arguments.errors, "min-length", "#arguments.path# is shorter than minLength" );
+			if ( isNumeric( arguments.schema.maxLength ?: "" ) && stringLength > val( arguments.schema.maxLength ) ) addError( arguments.errors, "max-length", "#arguments.path# exceeds maxLength" );
+			if ( len( trim( arguments.schema.pattern ?: "" ) ) && reFind( arguments.schema.pattern, toString( arguments.value ) ) == 0 ) addError( arguments.errors, "pattern", "#arguments.path# does not match pattern" );
+		}
+		if ( expected == "number" && !isNumeric( arguments.value ) ) addError( arguments.errors, "type", "#arguments.path# must be numeric" );
+		if ( expected == "integer" && ( !isNumeric( arguments.value ) || int( val( arguments.value ) ) != val( arguments.value ) ) ) addError( arguments.errors, "type", "#arguments.path# must be an integer" );
+		if ( expected == "boolean" && !isBoolean( arguments.value ) ) addError( arguments.errors, "type", "#arguments.path# must be boolean" );
+		if ( isNumeric( arguments.schema.minimum ?: "" ) && isNumeric( arguments.value ) && val( arguments.value ) < val( arguments.schema.minimum ) ) addError( arguments.errors, "minimum", "#arguments.path# is below minimum" );
+		if ( isNumeric( arguments.schema.maximum ?: "" ) && isNumeric( arguments.value ) && val( arguments.value ) > val( arguments.schema.maximum ) ) addError( arguments.errors, "maximum", "#arguments.path# is above maximum" );
+	}
+
+	private void function validateEvidence( required any value, required string schemaId, required struct context, required array errors ) {
+		if ( !isStruct( arguments.value ) ) return;
+		if ( listFindNoCase( "specialist-findings-v1,bulk-review-v1", arguments.schemaId ) && structKeyExists( arguments.value, "findings" ) && isArray( arguments.value.findings ) && structKeyExists( arguments.context, "allowedFilePaths" ) && isArray( arguments.context.allowedFilePaths ) ) {
+			var allowed = arguments.context.allowedFilePaths.map( ( item ) => normalizePath( item ) );
+			for ( var finding in arguments.value.findings ) {
+				if ( !isStruct( finding ) ) continue;
+				if ( len( trim( finding.filePath ?: "" ) ) && !allowed.contains( normalizePath( finding.filePath ) ) ) addError( arguments.errors, "unauthorized-evidence", "finding cites an unauthorized filePath" );
+				if ( isAbsoluteOrTraversal( finding.filePath ?: "" ) ) addError( arguments.errors, "invalid-evidence-path", "finding cites an absolute or traversing filePath" );
+				if ( isNumeric( finding.startLine ?: "" ) && isNumeric( finding.endLine ?: "" ) && val( finding.endLine ) < val( finding.startLine ) ) addError( arguments.errors, "invalid-evidence-range", "finding endLine precedes startLine" );
+				if ( structKeyExists( finding, "fixPatch" ) && isStruct( finding.fixPatch ) && isNumeric( finding.fixPatch.confidence ?: "" ) && val( finding.fixPatch.confidence ) < .8 ) addError( arguments.errors, "fix-patch-confidence", "fixPatch confidence must be at least 0.8" );
+			}
+		}
+		if ( arguments.schemaId == "architecture-enrichment-v1" && structKeyExists( arguments.value, "statements" ) && isArray( arguments.value.statements ) && structKeyExists( arguments.context, "allowedFactIds" ) && isArray( arguments.context.allowedFactIds ) ) {
+			for ( var statement in arguments.value.statements ) if ( isStruct( statement ) ) for ( var factId in statement.evidenceFactIds ?: [] ) if ( !arguments.context.allowedFactIds.contains( factId ) ) addError( arguments.errors, "unauthorized-evidence", "statement cites an unknown fact ID" );
+		}
+		if ( arguments.schemaId == "codegraph-narrative-v1" && structKeyExists( arguments.value, "summaries" ) && isArray( arguments.value.summaries ) ) {
+			var allowedClusters = isArray( arguments.context.allowedClusterIds ?: "" ) ? arguments.context.allowedClusterIds : [];
+			var allowedNodes = isArray( arguments.context.allowedNodeIds ?: "" ) ? arguments.context.allowedNodeIds : [];
+			for ( var summary in arguments.value.summaries ) {
+				if ( !isStruct( summary ) ) continue;
+				var clusterId = trim( toString( summary.clusterId ?: "" ) );
+				var nodeId = trim( toString( summary.nodeId ?: "" ) );
+				if ( len( clusterId ) && allowedClusters.len() && !allowedClusters.contains( clusterId ) ) {
+					addError( arguments.errors, "unauthorized-evidence", "summary cites an unknown clusterId" );
+				}
+				if ( len( nodeId ) && allowedNodes.len() && !allowedNodes.contains( nodeId ) ) {
+					addError( arguments.errors, "unauthorized-evidence", "summary cites an unknown nodeId" );
+				}
+			}
+		}
+		if ( arguments.schemaId == "codegraph-narrative-v2" ) {
+			validateCodegraphNarrativeV2Evidence( arguments.value, arguments.context, arguments.errors );
+		}
+		if ( findNoCase( "modernization-", arguments.schemaId ) && ( isArray( arguments.context.allowedEvidenceIds ?: "" ) || isArray( arguments.context.allowedFilePaths ?: "" ) ) ) {
+			validateModernizationEvidence( arguments.value, arguments.context, arguments.errors, "$." );
+		}
+	}
+
+	private void function addError( required array errors, required string code, required string message ) {
+		arguments.errors.append( { code: arguments.code, message: arguments.message } );
+	}
+
+	private struct function resolveSchemaReference( required string reference ) {
+		var rawReference = trim( arguments.reference );
+		var schemaId = listFirst( rawReference, char( 35 ) );
+		if ( !len( schemaId ) ) throw( type = "PromptSchemaReferenceException", message = "Schema reference has no document ID" );
+		var resolved = promptRegistry.schema( schemaId );
+		var fragment = listRest( rawReference, char( 35 ) );
+		if ( !len( fragment ) ) return resolved;
+		for ( var segment in replace( fragment, "~1", "/", "all" ).listToArray( "/" ) ) {
+			if ( !len( segment ) ) continue;
+			segment = replace( segment, "~0", "~", "all" );
+			if ( !isStruct( resolved ) || !structKeyExists( resolved, segment ) ) throw( type = "PromptSchemaReferenceException", message = "Schema reference path is missing" );
+			resolved = resolved[ segment ];
+		}
+		if ( !isStruct( resolved ) ) throw( type = "PromptSchemaReferenceException", message = "Schema reference does not resolve to an object" );
+		return resolved;
+	}
+
+	private struct function compactArchitectureCollections( required struct value ) {
+		if ( isArray( arguments.value.contexts ?: "" ) && arguments.value.contexts.len() > 30 ) {
+			arguments.value.contexts = arguments.value.contexts.slice( 1, 30 );
+		}
+		if ( isArray( arguments.value.extracts ?: "" ) && arguments.value.extracts.len() > 30 ) {
+			arguments.value.extracts = arguments.value.extracts.slice( 1, 30 );
+		}
+		return arguments.value;
+	}
+
+	private array function normalizeStringList( required any values ) {
+		var output = [];
+		var seen = {};
+		if ( !isArray( arguments.values ) ) {
+			if ( isSimpleValue( arguments.values ) && len( trim( toString( arguments.values ) ) ) ) {
+				var single = trim( toString( arguments.values ) );
+				return [ single ];
+			}
+			return output;
+		}
+		for ( var item in arguments.values ) {
+			if ( !isSimpleValue( item ) ) continue;
+			var text = trim( toString( item ) );
+			if ( !len( text ) || seen.keyExists( lCase( text ) ) ) continue;
+			seen[ lCase( text ) ] = true;
+			output.append( text );
+		}
+		return output;
+	}
+
+	private string function normalizePath( required any value ) {
+		return lCase( replace( trim( toString( arguments.value ) ), "\", "/", "all" ) );
+	}
+
+	private boolean function isAbsoluteOrTraversal( required any value ) {
+		var value = replace( trim( toString( arguments.value ) ), "\", "/", "all" );
+		return left( value, 1 ) == "/" || reFindNoCase( "^[A-Z]:/", value ) > 0 || find( "../", value ) > 0 || value == "..";
+	}
+
+	private boolean function hasDuplicateItems( required array values ) {
+		var seen = {};
+		for ( var item in arguments.values ) {
+			var key = jsonSerialize( item );
+			if ( seen.keyExists( key ) ) return true;
+			seen[ key ] = true;
+		}
+		return false;
+	}
+
+	private void function rejectUnauthorizedV2EvidenceId(
+		required string id,
+		required array allowedIds,
+		required array errors,
+		required string message
+	) {
+		var normalizedId = trim( toString( arguments.id ) );
+		if ( !len( normalizedId ) ) {
+			addError( arguments.errors, "unauthorized-evidence", arguments.message );
+			return;
+		}
+		if ( !arguments.allowedIds.len() || !arguments.allowedIds.contains( normalizedId ) ) {
+			addError( arguments.errors, "unauthorized-evidence", arguments.message );
+		}
+	}
+
+	private void function validateCodegraphNarrativeV2Evidence( required any value, required struct context, required array errors ) {
+		if ( !isStruct( arguments.value ) ) return;
+
+		var allowedClusters = isArray( arguments.context.allowedClusterIds ?: "" ) ? arguments.context.allowedClusterIds : [];
+		var allowedNodes = isArray( arguments.context.allowedNodeIds ?: "" ) ? arguments.context.allowedNodeIds : [];
+		var allowedFlows = isArray( arguments.context.allowedFlowIds ?: "" ) ? arguments.context.allowedFlowIds : [];
+		var allowedHotspots = isArray( arguments.context.allowedHotspotIds ?: "" ) ? arguments.context.allowedHotspotIds : [];
+		var allowedCycles = isArray( arguments.context.allowedCycleIds ?: "" ) ? arguments.context.allowedCycleIds : [];
+
+		if ( isArray( arguments.value.domains ?: "" ) ) {
+			for ( var domain in arguments.value.domains ) {
+				if ( !isStruct( domain ) ) continue;
+				rejectUnauthorizedV2EvidenceId( domain.clusterId ?: "", allowedClusters, arguments.errors, "domain cites an unknown clusterId" );
+			}
+		}
+
+		if ( isArray( arguments.value.processes ?: "" ) ) {
+			for ( var process in arguments.value.processes ) {
+				if ( !isStruct( process ) ) continue;
+				rejectUnauthorizedV2EvidenceId( process.flowId ?: "", allowedFlows, arguments.errors, "process cites an unknown flowId" );
+			}
+		}
+
+		if ( isArray( arguments.value.onboarding ?: "" ) ) {
+			for ( var step in arguments.value.onboarding ) {
+				if ( !isStruct( step ) ) continue;
+				var refType = lCase( trim( toString( step.refType ?: "" ) ) );
+				var refId = step.refId ?: "";
+				if ( refType == "cluster" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedClusters, arguments.errors, "onboarding step cites an unknown cluster id" );
+				}
+				if ( refType == "node" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedNodes, arguments.errors, "onboarding step cites an unknown node id" );
+				}
+				if ( refType == "flow" ) {
+					rejectUnauthorizedV2EvidenceId( refId, allowedFlows, arguments.errors, "onboarding step cites an unknown flow id" );
+				}
+			}
+		}
+
+		if ( isArray( arguments.value.risk ?: "" ) ) {
+			for ( var risk in arguments.value.risk ) {
+				if ( !isStruct( risk ) ) continue;
+				var riskType = lCase( trim( toString( risk.refType ?: "" ) ) );
+				var riskId = risk.refId ?: "";
+				if ( riskType == "hotspot" ) {
+					rejectUnauthorizedV2EvidenceId( riskId, allowedHotspots, arguments.errors, "risk item cites an unknown hotspot id" );
+				}
+				if ( riskType == "cycle" ) {
+					rejectUnauthorizedV2EvidenceId( riskId, allowedCycles, arguments.errors, "risk item cites an unknown cycle id" );
+				}
+			}
+		}
+
+		if ( isArray( arguments.value.summaries ?: "" ) ) {
+			for ( var summary in arguments.value.summaries ) {
+				if ( !isStruct( summary ) ) continue;
+				rejectUnauthorizedV2EvidenceId( summary.clusterId ?: "", allowedClusters, arguments.errors, "summary cites an unknown clusterId" );
+			}
+		}
+	}
+
+	private void function validateModernizationEvidence( required any value, required struct context, required array errors, required string path ) {
+		if ( isArray( arguments.value ) ) {
+			for ( var index = 1; index <= arguments.value.len(); index++ ) validateModernizationEvidence( arguments.value[ index ], arguments.context, arguments.errors, arguments.path & "[" & index & "]" );
+			return;
+		}
+		if ( !isStruct( arguments.value ) ) return;
+		var allowedIds = isArray( arguments.context.allowedEvidenceIds ?: "" ) ? arguments.context.allowedEvidenceIds : [];
+		var allowedPaths = isArray( arguments.context.allowedFilePaths ?: "" ) ? arguments.context.allowedFilePaths.map( ( item ) => normalizePath( item ) ) : [];
+		for ( var key in arguments.value ) {
+			var value = arguments.value[ key ];
+			var normalizedKey = lCase( trim( key ) );
+			if ( [ "evidenceRefs", "evidenceFactIds", "evidenceIds" ].contains( normalizedKey ) && isArray( value ) ) {
+				for ( var reference in value ) {
+					if ( isSimpleValue( reference ) && allowedIds.len() && !allowedIds.contains( toString( reference ) ) ) addError( arguments.errors, "unauthorized-evidence", "#arguments.path##key# cites an unknown evidence ID" );
+					if ( isStruct( reference ) && len( trim( reference.filePath ?: "" ) ) && allowedPaths.len() && !allowedPaths.contains( normalizePath( reference.filePath ) ) ) addError( arguments.errors, "unauthorized-evidence", "#arguments.path##key# cites an unauthorized filePath" );
+				}
+			}
+			if ( normalizedKey == "evidence" && isArray( value ) ) {
+				for ( var record in value ) if ( isStruct( record ) && len( trim( record.filePath ?: "" ) ) && allowedPaths.len() && !allowedPaths.contains( normalizePath( record.filePath ) ) ) addError( arguments.errors, "unauthorized-evidence", "#arguments.path#evidence cites an unauthorized filePath" );
+			}
+			validateModernizationEvidence( value, arguments.context, arguments.errors, arguments.path & key & "." );
+		}
+	}
+}

@@ -1,0 +1,278 @@
+/**
+ * Bulk bx-ai code review fallback when specialist agents are not configured.
+ * Caps prompt size to the model context window.
+ *
+ * @see FindingService
+ * @see AIChatGateway
+ */
+
+@singleton
+class threadsafe {
+	property name="findingService" inject="FindingService";
+
+	property name="chatGateway" inject="AIChatGateway";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+
+	property name="promptCompiler" inject="PromptCompiler";
+
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+
+	boolean function isEnabled( string profileId = "" ) {
+		var resolved = aiProviderResolver.resolve( arguments.profileId );
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	struct function review( required array files ) {
+		var resolved = aiProviderResolver.resolve();
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) || !arguments.files.len() ) {
+			return {
+				enabled       : false,
+				findings      : [],
+				summary       : "",
+				error         : "",
+				filesReviewed : 0,
+				charactersSent: 0
+			};
+		}
+		var payload = buildPayload( resolved, arguments.files );
+		assertDistinctSystem( resolved.provider ?: "" );
+		var activePackage = payload.promptPackage;
+		var response = "";
+		var attempts = 0;
+		try {
+			while ( attempts < 2 ) {
+				attempts++;
+				try {
+					response = chatGateway.chat(
+						activePackage.messages,
+						buildParams( resolved, "bulk-review" ),
+						buildOptions( resolved, "json" )
+					);
+					var acceptedResponse = getValidator().sanitizeValid(
+						response,
+						"bulk-review-v1",
+						{ allowedFilePaths: arguments.files.map( ( file ) => file.filePath ?: "" ) }
+					);
+					response = acceptedResponse.value;
+					if ( acceptedResponse.rejectedItems.len() ) activePackage.provenance.rejectedItems = duplicate( acceptedResponse.rejectedItems );
+					break;
+				} catch ( any attemptError ) {
+					if ( attempts >= 2 || !isRepairablePromptError( attemptError ) ) rethrow;
+					if ( isStruct( attemptError.data ?: "" ) && isArray( attemptError.data.reasonCodes ?: "" ) ) activePackage.provenance.validationReasonCodes = duplicate( attemptError.data.reasonCodes );
+					activePackage = getCompiler().compileRepair( activePackage, attemptError.message ?: "output validation failure" );
+				}
+			}
+			var normalizedResponse = coerceJsonObject( response );
+			return {
+				enabled       : true,
+				findings      : findingService.normalizeAI( normalizedResponse, arguments.files ),
+				summary       : isStruct( normalizedResponse ) ? trim( normalizedResponse.summary ?: "" ) : "",
+				error         : "",
+				filesReviewed : payload.filesReviewed,
+				charactersSent: payload.charactersSent,
+				promptProvenance: activePackage.provenance,
+				attempts      : attempts
+			};
+		} catch (any error) {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				log.error(
+						"Bulk AI review failed",
+						{
+							type      : error.type ?: "",
+							message   : secretRedactionService.redactText( error.message ?: "" ),
+							provider  : resolved.provider,
+							model     : resolved.model,
+							fileCount : payload.filesReviewed,
+							stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+						}
+					);
+			}
+			return {
+				enabled       : true,
+				findings      : [],
+				summary       : "",
+				error         : secretRedactionService.redactText( left( error.message ?: "Bulk AI review failed", 500 ) ),
+				filesReviewed : payload.filesReviewed,
+				charactersSent: payload.charactersSent,
+				promptProvenance: activePackage.provenance,
+				attempts      : attempts
+			};
+		}
+	}
+
+	/** profileId lets a Settings-panel "test connection" action target a saved-but-not-active profile. */
+	struct function smokeTest( string profileId = "", string tenantId = "default" ) {
+		var resolved = aiProviderResolver.resolve( arguments.profileId, arguments.tenantId );
+		if ( !chatGateway.isEnabled( resolved.apiKey, resolved.isLocal ) ) {
+			throw(
+				type    = "AIConfigurationException",
+				message = "OPENAI_API_KEY is not configured"
+			);
+		}
+		var startedAt = getTickCount();
+		var smokePackage = getCompiler().compile(
+				"provider-smoke",
+				{ task: { marker: "OK", responseFormat: "json" }, evidence: {} },
+				{ provider: resolved.provider, model: resolved.model }
+			);
+		assertDistinctSystem( resolved.provider ?: "" );
+		var prompt = smokePackage.messages;
+		var smokeParams = {
+			model      : resolved.model,
+			temperature: 0,
+			max_tokens : 64
+		};
+		structAppend( smokeParams, getCompiler().structuredOutput( "provider-smoke", resolved.provider ?: "" ), true );
+		var response = chatGateway.chat(
+				prompt,
+				smokeParams,
+				buildOptions( resolved, "json" )
+			);
+		getValidator().assertValid( response, "provider-smoke-v1" );
+		response = coerceJsonObject( response );
+		if ( !isStruct( response ) ) {
+			throw(
+				type    = "AIProviderResponseException",
+				message = "Provider smoke response was not a JSON object"
+			);
+		}
+		var marker = trim( toString( response.marker ?: "" ) );
+		var responseFormat = lCase( trim( toString( response.responseFormat ?: "" ) ) );
+		var promptCharacters = 0;
+		for ( var message in prompt ) promptCharacters += len( message.content ?: "" );
+		var responseCharacters = len( jsonSerialize( response ) );
+		var promptTokens = max( 1, int( promptCharacters / 4 ) );
+		var completionTokens = max( 1, int( responseCharacters / 4 ) );
+		return {
+			success         : marker == "OK" && responseFormat == "json",
+			provider        : resolved.provider,
+			model           : resolved.model,
+			baseHost        : len( resolved.baseURL ) ? createObject( "java", "java.net.URI" ).init( resolved.baseURL ).getHost() : "",
+			durationMs      : getTickCount() - startedAt,
+			responseFormat  : "json",
+			response        : response,
+			outputCharacters: responseCharacters,
+			usage           : {
+				promptTokens    : promptTokens,
+				completionTokens: completionTokens,
+				totalTokens     : promptTokens + completionTokens,
+				source          : "estimated-from-characters"
+			},
+			errorClass      : "",
+			promptProvenance: smokePackage.provenance
+		};
+	}
+
+	private struct function buildPayload( required struct resolved, required array files ) {
+		var source = "";
+		var filesReviewed = 0;
+		var omittedFiles = [];
+		var promptCap = promptCharacterBudget( arguments.resolved );
+		for ( var file in arguments.files ) {
+			var block = "FILE: " & file.filePath & " (" & file.language & ")" & char( 10 );
+			for ( var lineNumber = 1; lineNumber <= file.lines.len(); lineNumber++ ) {
+				block &= lineNumber & ": " & secretRedactionService.redactLine( file.lines[ lineNumber ] ) & char( 10 );
+			}
+			block &= "END FILE" & char( 10 ) & char( 10 );
+			if ( len( source ) + len( block ) > promptCap ) {
+				omittedFiles.append( file.filePath ?: "" );
+				break;
+			}
+			source &= block;
+			filesReviewed++;
+		}
+		var compiled = getCompiler().compile(
+			"bulk-review",
+			{
+				task    : { filesReviewed: filesReviewed, outputInstructions: "Review the supplied source for concrete defects and avoid style-only feedback." },
+				evidence: { source: source }
+			},
+			{ provider: arguments.resolved.provider, model: arguments.resolved.model }
+		);
+		compiled.truncation = { applied: omittedFiles.len() > 0, omitted: omittedFiles, boundaries: [ "complete-file" ] };
+		compiled.provenance.truncation = duplicate( compiled.truncation );
+		return {
+			messages      : compiled.messages,
+			filesReviewed : filesReviewed,
+			charactersSent: len( compiled.systemPrompt ) + len( compiled.userPrompt ),
+			provenance    : compiled.provenance,
+			promptPackage : compiled
+		};
+	}
+
+	private boolean function isRepairablePromptError( required any error ) {
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		return findNoCase( "promptoutputvalidation", typeName ) > 0 || findNoCase( "json", typeName ) > 0 || findNoCase( "parse", message ) > 0 || findNoCase( "json", message ) > 0;
+	}
+
+	private void function assertDistinctSystem( required string provider ) {
+		if ( !( getCompiler().capabilities( arguments.provider ).distinctSystem ?: true ) ) throw( type = "AIProviderCapabilityException", message = "Provider cannot preserve the immutable prompt system contract" );
+	}
+
+	private any function coerceJsonObject( required any response ) {
+		if ( isStruct( arguments.response ) ) {
+			if ( structKeyExists( arguments.response, "content" ) && isSimpleValue( arguments.response.content ) ) return coerceJsonObject( arguments.response.content );
+			return arguments.response;
+		}
+		if ( isSimpleValue( arguments.response ) ) {
+			try { return jsonDeserialize( trim( toString( arguments.response ) ) ); } catch ( any ignored ) { return arguments.response; }
+		}
+		return arguments.response;
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private struct function buildParams( required struct resolved, string contractId = "" ) {
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
+		var capabilities = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+		var outputCap = isNumeric( capabilities.maxOutputTokens ?: "" ) ? int( capabilities.maxOutputTokens ) : 3000;
+		var params = {
+			temperature: .1,
+			max_tokens : min( outputCap, min( 3000, max( 256, int( window * .25 ) ) ) )
+		};
+		if ( len( trim( arguments.resolved.model ) ) ) {
+			params.model = arguments.resolved.model;
+		}
+		if ( len( trim( arguments.contractId ) ) ) structAppend( params, getCompiler().structuredOutput( arguments.contractId, arguments.resolved.provider ?: "" ), true );
+		return params;
+	}
+
+	private numeric function promptCharacterBudget( required struct resolved ) {
+		var window = isNumeric( arguments.resolved.contextWindow ) ? max( 1024, int( val( arguments.resolved.contextWindow ) ) ) : 128000;
+		var profile = getCompiler().capabilities( arguments.resolved.provider ?: "" );
+		var configuredValue = isNumeric( arguments.resolved.maxPromptCharacters ) ? arguments.resolved.maxPromptCharacters : profile.maxPromptCharacters;
+		var configured = isNumeric( configuredValue ?: "" ) ? max( 1000, int( val( configuredValue ) ) ) : 60000;
+		// ~2 chars/token; reserve ~25% of the window for completion.
+		var fitted = max( 1000, int( window * .75 * 2 ) );
+		return min( configured, fitted );
+	}
+
+	private struct function buildOptions( required struct resolved, required string returnFormat ) {
+		var options = {
+			provider    : arguments.resolved.provider,
+			apiKey      : arguments.resolved.apiKey,
+			returnFormat: arguments.returnFormat,
+			timeout     : arguments.resolved.timeout
+		};
+		if ( len( trim( arguments.resolved.baseURL ) ) ) {
+			options.baseURL = arguments.resolved.baseURL;
+		}
+		return options;
+	}
+}

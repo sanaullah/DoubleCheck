@@ -1,0 +1,76 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraph ontology (Phase 4)", () => {
+
+			var projection = new app.models.services.CodeGraphProjectionService();
+			var repository = new app.models.repositories.CodeGraphRepository();
+
+			it( "gives every directory a parent so cluster to file is a real chain", () => {
+				// D27: directories were written as roots, so `app/` never listed
+				// `app/models/` and the middle of the navigation model was missing.
+				var projected = projection.project(
+					{
+						clusters   : [],
+						directories: [ { path: "app/models/services", fileCount: 2, fanInSum: 1, fanOutSum: 1 } ],
+						nodes      : [ { id: "app/models/services/a.bx", path: "app/models/services/a.bx", dir: "app/models/services" } ],
+						clusterEdges: []
+					},
+					{ symbols: [], dependencies: [] }
+				);
+				var byId = {};
+				for ( var node in projected.nodes ) byId[ node.id ] = node;
+
+				expect( byId ).toHaveKey( "dir:app", "ancestor directories must be materialised" );
+				expect( byId ).toHaveKey( "dir:app/models" );
+				expect( byId[ "dir:app/models" ].parentId ).toBe( "dir:app" );
+				expect( byId[ "dir:app/models/services" ].parentId ).toBe( "dir:app/models" );
+				expect( byId[ "dir:app" ].parentId ).toBe( "", "the top of the tree has no parent" );
+			} );
+
+			it( "labels every edge with how it was established", () => {
+				// G9: a declared relationship and a name match are not equally strong.
+				var projected = projection.project(
+					{
+						clusters   : [],
+						directories: [],
+						nodes      : [
+							{ id: "a.bx", path: "a.bx", dir: "" },
+							{ id: "b.bx", path: "b.bx", dir: "" }
+						],
+						clusterEdges: []
+					},
+					{
+						symbols     : [],
+						dependencies: [
+							{ sourceFile: "a.bx", targetFile: "b.bx", kind: "extends", target: "B", line: 1 },
+							{ sourceFile: "a.bx", targetFile: "b.bx", kind: "calls", target: "b.run", line: 2 }
+						]
+					}
+				);
+				var byKind = {};
+				for ( var edge in projected.edges ) byKind[ edge.groupKind ] = edge;
+
+				expect( byKind[ "extends" ].resolution ).toBe( "exact" );
+				expect( byKind[ "extends" ].confidence ).toBe( "high" );
+				expect( byKind[ "calls" ].resolution ).toBe( "heuristic" );
+				expect( byKind[ "calls" ].provenance ).toBe( "parser" );
+			} );
+
+			it( "keeps a cluster label key stable when the domain gains a file", () => {
+				// BD-4: keyed on exact membership, one new file orphaned the label.
+				var before = repository.clusterKey( { filePaths: [ "app/orders/a.bx", "app/orders/b.bx" ] } );
+				var after  = repository.clusterKey( { filePaths: [ "app/orders/a.bx", "app/orders/b.bx", "app/orders/c.bx" ] } );
+
+				expect( after ).toBe( before, "adding a file to a domain must not orphan its label" );
+			} );
+
+			it( "still separates genuinely different domains", () => {
+				var orders = repository.clusterKey( { filePaths: [ "app/orders/a.bx" ] } );
+				var billing = repository.clusterKey( { filePaths: [ "app/billing/a.bx" ] } );
+
+				expect( orders ).notToBe( billing );
+			} );
+		} );
+	}
+}

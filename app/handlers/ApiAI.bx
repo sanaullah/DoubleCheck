@@ -1,0 +1,94 @@
+/**
+ * REST: AI provider smoke test and specialist circuit status.
+ *
+ * @see AIReviewService
+ * @see SpecialistAgentGateway
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="aiReviewService" inject="AIReviewService";
+
+	property name="specialistGateway" inject="SpecialistAgentGateway";
+
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	/**
+	 * GET /api/v1/ai/smoke
+	 * Live provider connectivity check for local development. Optional
+	 * ?profileId= tests a specific saved provider profile without switching
+	 * the active one; omitted tests the currently active/default connection.
+	 */
+	function smoke( event, rc, prc ) {
+		var profileId = trim( rc.profileId ?: "" );
+		var resolved = aiProviderResolver.resolve( profileId );
+		if ( !aiReviewService.isEnabled( profileId ) ) {
+			event.renderData(
+					type       = "json",
+					statusCode = 503,
+					data       = {
+						data: {
+							success: false,
+							enabled: false,
+							message: "AI provider is not configured. Set OPENAI_API_KEY and OPENAI_API_BASE."
+						}
+					}
+				);
+			return;
+		}
+
+		specialistGateway.resetCircuit();
+		try {
+			var result = aiReviewService.smokeTest( profileId );
+			event.renderData(
+					type = "json",
+					data = {
+						data: {
+							success         : result.success,
+							enabled         : true,
+							provider        : result.provider,
+							model           : result.model,
+							baseHost        : result.baseHost,
+							durationMs      : result.durationMs,
+							responseFormat  : result.responseFormat,
+							response        : result.response,
+							outputCharacters: result.outputCharacters,
+							usage           : result.usage,
+							errorClass      : result.errorClass,
+							circuit         : specialistGateway.circuitStatus()
+						}
+					}
+				);
+		} catch (any error) {
+			log.error(
+					"AI connectivity test failed",
+					{
+						type      : error.type ?: "",
+						message   : secretRedactionService.redactText( error.message ?: "" ),
+						provider  : resolved.provider,
+						model     : resolved.model,
+						stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+					}
+				);
+			event.renderData(
+					type       = "json",
+					statusCode = 502,
+					data       = {
+						data: {
+							success   : false,
+							enabled   : true,
+							provider  : resolved.provider,
+							model     : resolved.model,
+							baseURL   : resolved.baseURL,
+							message   : error.message,
+							type      : error.type ?: "",
+							errorClass: error.type ?: "ProviderException",
+							circuit   : specialistGateway.circuitStatus()
+						}
+					}
+				);
+		}
+	}
+}

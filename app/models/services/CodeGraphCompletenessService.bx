@@ -1,0 +1,201 @@
+/**
+ * What a snapshot kept, out of what existed, and the ordering that decided it.
+ *
+ * `truncated` says only that something was lost somewhere. Every capped
+ * collection needs its own account, or a reader cannot tell a small repository
+ * from an amputated one. This service owns that account and the ranked
+ * selection that makes truncation defensible: keeping the most connected nodes
+ * rather than the alphabetically first.
+ *
+ * @see CodeGraphMetricsService
+ */
+
+@singleton
+class threadsafe {
+
+	/**
+	 * Keep the most connected nodes, then restore path order for presentation.
+	 *
+	 * Slicing a path-sorted array deletes whole late-alphabet directories, which
+	 * is how a repository could lose everything under `tests/` or `resources/`
+	 * and report only that it was "truncated".
+	 */
+	array function rankNodes( required array nodes, required numeric limit ) {
+		var ranked = duplicate( arguments.nodes );
+		ranked.sort( ( a, b ) => {
+			var aScore = val( a.hotspotScore ?: 0 );
+			var bScore = val( b.hotspotScore ?: 0 );
+			if ( aScore != bScore ) return aScore > bScore ? -1 : 1;
+			return compareNoCase( a.path ?: "", b.path ?: "" );
+		} );
+		ranked = ranked.slice( 1, min( arguments.limit, ranked.len() ) );
+		ranked.sort( ( a, b ) => compareNoCase( a.path ?: "", b.path ?: "" ) );
+		return ranked;
+	}
+
+	/**
+	 * Behaviour a symbol index cannot prove, whatever the cap is set to.
+	 *
+	 * Carried on every query response because "we returned nothing" and "this
+	 * cannot be answered by static analysis" are different answers, and only one
+	 * of them is fixed by a bigger limit or a rebuild.
+	 */
+	array function unsupported() {
+		return [ "dynamic component construction", "reflection", "runtime wiring", "dynamic SQL" ];
+	}
+
+	/**
+	 * The account a *query* response carries, as distinct from a snapshot's.
+	 *
+	 * `unresolved` is a run-level figure — references the parsers could not bind —
+	 * not a per-query one, and is labelled `unresolvedScope` so a caller cannot
+	 * mistake it for "unresolved within this result". Reporting it as 0 when it is
+	 * unknown would be the same lie as omitting it.
+	 */
+	struct function queryAccount(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy,
+		numeric unresolved = 0,
+		string state = ""
+	) {
+		var returnedCount = val( arguments.returned );
+		var availableCount = val( arguments.available );
+		var resolvedState = len( trim( arguments.state ) )
+			? arguments.state
+			: ( availableCount == 0 ? "empty" : ( availableCount <= returnedCount ? "complete" : "truncated" ) );
+		return {
+			returned      : returnedCount,
+			available     : availableCount,
+			omitted       : max( 0, availableCount - returnedCount ),
+			rankedBy      : arguments.rankedBy,
+			// The state is authoritative. Deriving `complete` from the counts as well
+			// let a caller that knew its traversal had been cut still be reported
+			// complete, because the rows it did return were all the rows it had.
+			complete      : resolvedState == "complete",
+			state         : resolvedState,
+			unresolved    : val( arguments.unresolved ),
+			unresolvedScope: "run",
+			unsupported   : unsupported()
+		};
+	}
+
+	/** One collection's account. */
+	struct function entry(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy
+	) {
+		var omitted = max( 0, val( arguments.available ) - val( arguments.returned ) );
+		return {
+			returned : val( arguments.returned ),
+			available: val( arguments.available ),
+			omitted  : omitted,
+			rankedBy : arguments.rankedBy,
+			complete : omitted == 0
+		};
+	}
+
+	/**
+	 * The coupling graph reports that it capped edges but not how many it
+	 * dropped, so `complete` carries the truth and `omitted` stays 0 rather than
+	 * inventing a count.
+	 */
+	struct function edges( required any graph ) {
+		var kept = arguments.graph.getEdges().len();
+		var capped = false;
+		try {
+			capped = arguments.graph.truncated();
+		} catch ( any ignored ) {
+			capped = false;
+		}
+		return {
+			returned : kept,
+			available: kept,
+			omitted  : 0,
+			rankedBy : "resolutionWeight",
+			complete : !capped
+		};
+	}
+
+	/**
+	 * The whole account for one snapshot.
+	 *
+	 * `loaded` carries what the SQL layer already measured for symbols and
+	 * dependencies — exact counts from the run summary, not estimates — so those
+	 * entries pass through rather than being recomputed less accurately here.
+	 */
+	/**
+	 * Which snapshot section each truncation reason belongs to.
+	 *
+	 * A reason is evidence that a specific cap fired. Without this mapping a
+	 * section whose candidate count was never supplied computed `available` from
+	 * its own returned length and certified itself complete — so the snapshot
+	 * could report `truncated: true` with `truncationReasons: [ maxHotspots,
+	 * maxFlowsPerCluster ]` while `hotspots` and `flows` both said `complete`.
+	 */
+	variables.reasonSections = {
+		maxNodes           : "nodes",
+		maxEdges           : "edges",
+		maxHotspots        : "hotspots",
+		maxOrphans         : "orphans",
+		maxLayerViolations : "layerViolations",
+		maxClusters        : "clusters",
+		maxFlowsPerCluster : "flows",
+		flowSinkDiversity  : "flows",
+		graphImpacts       : "dependencies",
+		graphLoad          : "dependencies",
+		couplingGraph      : "edges"
+	};
+
+	struct function report( required struct parts ) {
+		var loaded = isStruct( arguments.parts.loaded ?: "" ) ? arguments.parts.loaded : {};
+		var report = buildReport( arguments.parts, loaded );
+		// A cap that fired makes its section incomplete, whatever the section's own
+		// arithmetic concluded. `omitted` is left alone: the count is unknown here,
+		// and inventing one would be the same defect in the other direction.
+		for ( var reason in ( arguments.parts.truncationReasons ?: [] ) ) {
+			var section = variables.reasonSections[ trim( toString( reason ) ) ] ?: "";
+			if ( len( section ) && isStruct( report[ section ] ?: "" ) ) {
+				report[ section ].complete = false;
+				report[ section ].truncatedBy = trim( toString( reason ) );
+			}
+		}
+		return report;
+	}
+
+	private struct function buildReport( required struct parts, required struct loaded ) {
+		var loaded = arguments.loaded;
+		return {
+			nodes          : entry( arguments.parts.nodeCount, arguments.parts.availableNodes, arguments.parts.nodeRanking ),
+			edges          : edges( arguments.parts.graph ),
+			hotspots       : entry(
+				arguments.parts.hotspotCount,
+				min( arguments.parts.availableNodes, max( arguments.parts.hotspotCount, arguments.parts.orphanCandidateCount ) ),
+				"hotspotScore"
+			),
+			orphans        : entry( arguments.parts.orphanCount, arguments.parts.orphanCandidateCount, "path" ),
+			layerViolations: entry(
+				arguments.parts.layerViolationCount,
+				max( arguments.parts.layerViolationCount, arguments.parts.layerViolationCandidateCount ?: arguments.parts.layerViolationCount ),
+				"severity"
+			),
+			clusters       : entry(
+				arguments.parts.clusterCount ?: 0,
+				max( arguments.parts.clusterCount ?: 0, arguments.parts.availableClusters ?: 0 ),
+				"fileCount"
+			),
+			flows          : entry(
+				arguments.parts.flowCount,
+				max( arguments.parts.flowCount, arguments.parts.flowCandidateCount ?: arguments.parts.flowCount ),
+				"sinkCoverage"
+			),
+			symbols        : isStruct( loaded.symbols ?: "" )
+				? loaded.symbols
+				: entry( arguments.parts.symbolCount, arguments.parts.symbolCount, "file_path" ),
+			dependencies   : isStruct( loaded.dependencies ?: "" )
+				? loaded.dependencies
+				: entry( arguments.parts.dependencyCount, arguments.parts.dependencyCount, "kind_priority,source_file" )
+		};
+	}
+}

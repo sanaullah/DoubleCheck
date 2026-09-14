@@ -1,0 +1,686 @@
+/**
+ * SQLite persistence for BoxLang symbol/dependency graph artifacts per run.
+ */
+
+@singleton
+class threadsafe {
+	property name="datasource" inject="coldbox:setting:datasource";
+
+	property name="resultLimit" inject="coldbox:setting:graphResultLimit";
+
+	any function findCached( required string contentHash, required string parserVersion ) {
+		var record = queryExecute(
+			"
+				SELECT symbols, dependencies
+				FROM analysis_artifact_cache
+				WHERE content_hash = :contentHash
+					AND parser_version = :parserVersion
+			",
+			{
+				contentHash  : arguments.contentHash,
+				parserVersion: arguments.parserVersion
+			},
+			{ datasource: datasource }
+		);
+		if ( !record.recordCount ) {
+			return javacast( "null", "" );
+		}
+		return {
+			symbols     : jsonDeserialize( record.symbols[ 1 ] ),
+			dependencies: jsonDeserialize( record.dependencies[ 1 ] )
+		};
+	}
+
+	void function saveCached(
+		required string contentHash,
+		required string parserVersion,
+		required string language,
+		required struct parsed
+	) {
+		queryExecute(
+			"
+				INSERT INTO analysis_artifact_cache (
+					content_hash, parser_version, language, symbols,
+					dependencies, created_at
+				) VALUES (
+					:contentHash, :parserVersion, :language, :symbols,
+					:dependencies, :createdAt
+				)
+				ON CONFLICT ( content_hash, parser_version ) DO NOTHING
+			",
+			{
+				contentHash  : arguments.contentHash,
+				parserVersion: arguments.parserVersion,
+				language     : arguments.language,
+				symbols      : jsonSerialize( arguments.parsed.symbols ),
+				dependencies : jsonSerialize( arguments.parsed.dependencies ),
+				createdAt    : timestamp()
+			},
+			{ datasource: datasource }
+		);
+	}
+
+	void function replaceRunGraph(
+		required string runId,
+		required array parsedFiles,
+		required array impacts,
+		required struct metrics
+	) {
+		bx:transaction datasource="#datasource#" {
+			queryExecute(
+				"DELETE FROM review_impacts WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"DELETE FROM review_dependencies WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"DELETE FROM review_symbols WHERE run_id = :runId",
+				{ runId: arguments.runId },
+				{ datasource: datasource }
+			);
+			var seenSymbolIds = {};
+			var seenDependencyIds = {};
+			var seenImpactIds = {};
+			for ( var parsedFile in arguments.parsedFiles ) {
+				for ( var item in parsedFile.symbols ) {
+					if ( seenSymbolIds.keyExists( item.id ) ) {
+						continue;
+					}
+					seenSymbolIds[ item.id ] = true;
+					queryExecute(
+						"
+							INSERT INTO review_symbols (
+								id, run_id, file_path, content_hash, parser_version,
+								kind, name, line, evidence, end_line
+							) VALUES (
+								:id, :runId, :filePath, :contentHash, :parserVersion,
+								:kind, :name, :line, :evidence, :endLine
+							)
+						",
+						{
+							id           : item.id,
+							runId        : arguments.runId,
+							filePath     : parsedFile.filePath,
+							contentHash  : parsedFile.contentHash,
+							parserVersion: parsedFile.parserVersion,
+							kind         : item.kind,
+							name         : item.name,
+							line         : item.line,
+							evidence     : item.evidence,
+							endLine      : max( val( item.line ?: 1 ), val( item.endLine ?: item.line ?: 1 ) )
+						},
+						{ datasource: datasource }
+					);
+				}
+				for ( var edge in parsedFile.dependencies ) {
+					if ( seenDependencyIds.keyExists( edge.id ) ) {
+						continue;
+					}
+					seenDependencyIds[ edge.id ] = true;
+					queryExecute(
+						"
+							INSERT INTO review_dependencies (
+								id, run_id, source_file, content_hash, parser_version,
+								kind, target, target_file, line, evidence, end_line,
+								source_symbol_id, source_symbol
+							) VALUES (
+								:id, :runId, :sourceFile, :contentHash, :parserVersion,
+								:kind, :target, :targetFile, :line, :evidence, :endLine,
+								:sourceSymbolId, :sourceSymbol
+							)
+						",
+						{
+							id            : edge.id,
+							runId         : arguments.runId,
+							sourceFile    : parsedFile.filePath,
+							contentHash   : parsedFile.contentHash,
+							parserVersion : parsedFile.parserVersion,
+							kind          : edge.kind,
+							target        : edge.target,
+							targetFile    : edge.targetFile ?: "",
+							line          : edge.line,
+							evidence      : edge.evidence,
+							endLine       : max( val( edge.line ?: 1 ), val( edge.endLine ?: edge.line ?: 1 ) ),
+							sourceSymbolId: edge.sourceSymbolId ?: "",
+							sourceSymbol  : edge.sourceSymbol ?: ""
+						},
+						{ datasource: datasource }
+					);
+				}
+			}
+			for ( var impact in arguments.impacts ) {
+				if ( seenImpactIds.keyExists( impact.id ) ) {
+					continue;
+				}
+				seenImpactIds[ impact.id ] = true;
+				queryExecute(
+					"
+						INSERT INTO review_impacts (
+							id, run_id, changed_file, changed_symbol,
+							impacted_file, reason, depth, via_file
+						) VALUES (
+							:id, :runId, :changedFile, :changedSymbol,
+							:impactedFile, :reason, :depth, :viaFile
+						)
+					",
+					{
+						id           : impact.id,
+						runId        : arguments.runId,
+						changedFile  : impact.changedFile,
+						changedSymbol: impact.changedSymbol,
+						impactedFile : impact.impactedFile,
+						reason       : impact.reason,
+						depth        : impact.depth,
+						viaFile      : impact.viaFile
+					},
+					{ datasource: datasource }
+				);
+			}
+			queryExecute(
+				"
+					INSERT INTO review_graph_summaries (
+						run_id, parser_version, files_analyzed, parser_executions,
+						cache_hits, symbol_count, dependency_count, created_at,
+						impact_count, baseline_run_id
+					) VALUES (
+						:runId, :parserVersion, :filesAnalyzed, :parserExecutions,
+						:cacheHits, :symbolCount, :dependencyCount, :createdAt,
+						:impactCount, :baselineRunId
+					)
+					ON CONFLICT ( run_id ) DO UPDATE SET
+						parser_version = excluded.parser_version,
+						files_analyzed = excluded.files_analyzed,
+						parser_executions = excluded.parser_executions,
+						cache_hits = excluded.cache_hits,
+						symbol_count = excluded.symbol_count,
+						dependency_count = excluded.dependency_count,
+						impact_count = excluded.impact_count,
+						baseline_run_id = excluded.baseline_run_id,
+						created_at = excluded.created_at
+				",
+				{
+					runId           : arguments.runId,
+					parserVersion   : arguments.metrics.parserVersion,
+					filesAnalyzed   : arguments.metrics.filesAnalyzed,
+					parserExecutions: arguments.metrics.parserExecutions,
+					cacheHits       : arguments.metrics.cacheHits,
+					symbolCount     : arguments.metrics.symbolCount,
+					dependencyCount : arguments.metrics.dependencyCount,
+					impactCount     : arguments.metrics.impactCount,
+					baselineRunId   : arguments.metrics.baselineRunId,
+					createdAt       : timestamp()
+				},
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	struct function findBaselineGraph( required string runId, required numeric resultLimit ) {
+		var baseline = queryExecute(
+			"
+				SELECT previous_run.id
+				FROM review_runs current_run
+				INNER JOIN review_runs previous_run
+					ON previous_run.project_path = current_run.project_path
+				WHERE current_run.id = :runId
+					AND previous_run.id <> current_run.id
+					AND previous_run.mode = 'full'
+					AND previous_run.status IN ( 'succeeded', 'partial' )
+					AND EXISTS (
+						SELECT 1
+						FROM review_graph_summaries graph
+						WHERE graph.run_id = previous_run.id
+					)
+				ORDER BY COALESCE( previous_run.completed_at, previous_run.created_at ) DESC
+				LIMIT 1
+			",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		if ( !baseline.recordCount ) {
+			return { runId: "", symbols: [], dependencies: [] };
+		}
+		var baselineRunId = baseline.id[ 1 ];
+		return {
+			runId       : baselineRunId,
+			symbols     : loadSymbols( baselineRunId, arguments.resultLimit ),
+			dependencies: loadDependencies( baselineRunId, arguments.resultLimit )
+		};
+	}
+
+	/**
+	 * Find a completed indexed run for the same local project/revision. This is
+	 * used by CodeGraph to adopt Review's deterministic graph without adding a
+	 * second parser pass or a Review-side pipeline stage.
+	 */
+	string function findIndexedRun(
+		required string projectPath,
+		required string repositoryRevision,
+		string excludeRunId = "",
+		string parserVersion = ""
+	) {
+		if ( !len( trim( arguments.projectPath ) ) || !len( trim( arguments.repositoryRevision ) ) ) return "";
+		var record = queryExecute(
+			"
+				SELECT r.id
+				FROM review_runs r
+				INNER JOIN review_graph_summaries g ON g.run_id = r.id
+				WHERE r.project_path = :projectPath
+					AND r.id <> :excludeRunId
+					AND r.status IN ( 'succeeded', 'partial' )
+					AND ( :parserVersion = '' OR g.parser_version = :parserVersion )
+					AND (
+						 r.head_revision = :repositoryRevision
+						 OR EXISTS (
+							SELECT 1 FROM review_summaries s
+							WHERE s.run_id = r.id AND s.repository_revision = :repositoryRevision
+						 )
+					)
+				ORDER BY COALESCE( r.completed_at, r.created_at ) DESC
+				LIMIT 1
+			",
+			{
+				projectPath       : arguments.projectPath,
+				repositoryRevision: arguments.repositoryRevision,
+				excludeRunId      : arguments.excludeRunId,
+				parserVersion     : arguments.parserVersion
+			},
+			{ datasource: datasource }
+		);
+		return record.recordCount ? toString( record.id[ 1 ] ) : "";
+	}
+
+	/** Copy the indexed artifacts and graph summary to a new run id. */
+	void function adoptRunGraph( required string sourceRunId, required string targetRunId ) {
+		if ( !len( trim( arguments.sourceRunId ) ) || !len( trim( arguments.targetRunId ) ) ) return;
+		bx:transaction datasource="#datasource#" {
+			queryExecute( "DELETE FROM review_impacts WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute( "DELETE FROM review_dependencies WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute( "DELETE FROM review_symbols WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute( "DELETE FROM review_graph_summaries WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute(
+				"
+					INSERT INTO review_symbols ( id, run_id, file_path, content_hash, parser_version, kind, name, line, end_line, evidence )
+					SELECT id, :targetRunId, file_path, content_hash, parser_version, kind, name, line, end_line, evidence
+					FROM review_symbols WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO review_dependencies ( id, run_id, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol )
+					SELECT id, :targetRunId, source_file, content_hash, parser_version, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
+					FROM review_dependencies WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO review_impacts ( id, run_id, changed_file, changed_symbol, impacted_file, reason, depth, via_file )
+					SELECT id, :targetRunId, changed_file, changed_symbol, impacted_file, reason, depth, via_file
+					FROM review_impacts WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO review_graph_summaries (
+						run_id, parser_version, files_analyzed, parser_executions, cache_hits,
+						symbol_count, dependency_count, created_at, impact_count, baseline_run_id
+					)
+					SELECT :targetRunId, parser_version, files_analyzed, 0, cache_hits,
+						symbol_count, dependency_count, created_at, impact_count, :sourceRunId
+					FROM review_graph_summaries WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			// Adoption has to carry everything that shapes the served graph, not
+			// only the parser output. Without these two the reused run answers 409
+			// "snapshot predates levelled storage" and its search returns nothing —
+			// a false diagnosis whose remedy re-triggers reuse and never succeeds.
+			queryExecute( "DELETE FROM codegraph_edges WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute( "DELETE FROM codegraph_nodes WHERE run_id = :runId", { runId: arguments.targetRunId }, { datasource: datasource } );
+			queryExecute(
+				"
+					INSERT INTO codegraph_nodes (
+						run_id, node_id, level, parent_id, path, symbol_name, kind, role,
+						language, line, end_line, fan_in, fan_out, hotspot
+					)
+					SELECT :targetRunId, node_id, level, parent_id, path, symbol_name, kind, role,
+						language, line, end_line, fan_in, fan_out, hotspot
+					FROM codegraph_nodes WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+			queryExecute(
+				"
+					INSERT INTO codegraph_edges (
+						run_id, edge_id, level, from_node, to_node, group_kind,
+						kinds_json, occurrences, weight, resolution, line, evidence
+					)
+					SELECT :targetRunId, edge_id, level, from_node, to_node, group_kind,
+						kinds_json, occurrences, weight, resolution, line, evidence
+					FROM codegraph_edges WHERE run_id = :sourceRunId
+				",
+				{ sourceRunId: arguments.sourceRunId, targetRunId: arguments.targetRunId },
+				{ datasource: datasource }
+			);
+		}
+	}
+
+	struct function getGraph(
+		required string runId,
+		numeric resultLimit = 0,
+		numeric symbolLimit = 0,
+		numeric dependencyLimit = 0,
+		numeric impactLimit = 0
+	) {
+		// Keep the legacy positional argument as a shared limit for callers that
+		// still use it, while allowing CodeGraph to pass independent budgets.
+		var fallbackLimit = val( arguments.resultLimit ) > 0 ? val( arguments.resultLimit ) : val( variables.resultLimit );
+		var effectiveSymbolLimit = val( arguments.symbolLimit ) > 0 ? val( arguments.symbolLimit ) : fallbackLimit;
+		var effectiveDependencyLimit = val( arguments.dependencyLimit ) > 0 ? val( arguments.dependencyLimit ) : fallbackLimit;
+		var effectiveImpactLimit = val( arguments.impactLimit ) > 0 ? val( arguments.impactLimit ) : fallbackLimit;
+		var summary = queryExecute(
+			"SELECT * FROM review_graph_summaries WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var symbolRecords = queryExecute(
+			"
+				SELECT id, file_path, kind, name, line, end_line, evidence
+				FROM review_symbols
+				WHERE run_id = :runId
+				ORDER BY file_path, line, kind, name
+				LIMIT :symbolLimit
+			",
+			{
+				runId      : arguments.runId,
+				symbolLimit: { value: effectiveSymbolLimit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		// `calls` sorts last, below the unnamed structural kinds. It is the highest
+		// volume and least reliable relationship, and while it outranked `ELSE` it
+		// consumed the whole budget — `constructs`, `extends`, `type-reference`,
+		// `imports`, `includes` and `tests` all loaded zero rows on this repository.
+		var dependencyRecords = queryExecute(
+			"
+				SELECT id, source_file, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
+				FROM review_dependencies
+				WHERE run_id = :runId
+					AND NOT ( kind = 'calls' AND ( target_file IS NULL OR target_file = '' ) )
+				ORDER BY
+					CASE kind
+						WHEN 'calls-api' THEN 0
+						WHEN 'routes' THEN 1
+						WHEN 'injects' THEN 2
+						WHEN 'renders' THEN 3
+						WHEN 'table-query' THEN 4
+						WHEN 'table-read' THEN 4
+						WHEN 'table-write' THEN 4
+						WHEN 'http' THEN 5
+						WHEN 'schedule' THEN 5
+						WHEN 'calls' THEN 7
+						ELSE 6
+					END,
+					source_file, line, kind, target
+				LIMIT :dependencyLimit
+			",
+			{
+				runId      : arguments.runId,
+				dependencyLimit: { value: effectiveDependencyLimit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var impactRecords = queryExecute(
+			"
+				SELECT id, changed_file, changed_symbol, impacted_file,
+					reason, depth, via_file
+				FROM review_impacts
+				WHERE run_id = :runId
+				ORDER BY changed_file, changed_symbol, depth, impacted_file
+				LIMIT :impactLimit
+			",
+			{
+				runId      : arguments.runId,
+				impactLimit: { value: effectiveImpactLimit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var symbols = [];
+		for ( var row = 1; row <= symbolRecords.recordCount; row++ ) {
+			symbols.append(
+					{
+						id      : symbolRecords.id[ row ],
+						filePath: symbolRecords.file_path[ row ],
+						kind    : symbolRecords.kind[ row ],
+						name    : symbolRecords.name[ row ],
+						line    : symbolRecords.line[ row ],
+						endLine : symbolRecords.end_line[ row ],
+						evidence: symbolRecords.evidence[ row ]
+					}
+				);
+		}
+		var dependencies = [];
+		for ( var row = 1; row <= dependencyRecords.recordCount; row++ ) {
+			dependencies.append(
+					{
+						id            : dependencyRecords.id[ row ],
+						sourceFile    : dependencyRecords.source_file[ row ],
+						kind          : dependencyRecords.kind[ row ],
+						target        : dependencyRecords.target[ row ],
+						targetFile    : dependencyRecords.target_file[ row ],
+						line          : dependencyRecords.line[ row ],
+						endLine       : dependencyRecords.end_line[ row ],
+						evidence      : dependencyRecords.evidence[ row ],
+						sourceSymbolId: dependencyRecords.source_symbol_id[ row ],
+						sourceSymbol  : dependencyRecords.source_symbol[ row ]
+					}
+				);
+		}
+		var impacts = [];
+		for ( var row = 1; row <= impactRecords.recordCount; row++ ) {
+			impacts.append(
+					{
+						id           : impactRecords.id[ row ],
+						changedFile  : impactRecords.changed_file[ row ],
+						changedSymbol: impactRecords.changed_symbol[ row ],
+						impactedFile : impactRecords.impacted_file[ row ],
+						reason       : impactRecords.reason[ row ],
+						depth        : impactRecords.depth[ row ],
+						viaFile      : impactRecords.via_file[ row ]
+					}
+				);
+		}
+
+		// An unresolved call names no target file, so it can never become an edge at
+		// any level. Excluding it from the load frees the budget for the structural
+		// kinds it used to starve — but the count is reported, because "what could
+		// this tool not prove" is a real answer and deleting it would trade one
+		// silence for another.
+		var unresolvedCalls = queryExecute(
+			"SELECT COUNT(*) AS total FROM review_dependencies WHERE run_id = :runId AND kind = 'calls' AND ( target_file IS NULL OR target_file = '' )",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var unresolvedCount = val( unresolvedCalls.total[ 1 ] ?: 0 );
+		// `available` is the graph-eligible population, not every stored row.
+		// Counting the excluded rows here would report truncation on every run.
+		var eligibleDependencies = summary.recordCount
+			? max( dependencies.len(), val( summary.dependency_count[ 1 ] ) - unresolvedCount )
+			: dependencies.len();
+		// A kind the cap removed entirely is not a sample loss: nothing downstream
+		// can ever draw that relationship. Name it instead of leaving it to a sort.
+		var starvedKinds = eligibleDependencies > dependencies.len() ? starvedDependencyKinds( arguments.runId, dependencies ) : [];
+		var dependencyCompleteness = loadCompleteness( dependencies.len(), eligibleDependencies, "kind_priority,source_file" );
+		dependencyCompleteness.starvedKinds = starvedKinds;
+		dependencyCompleteness.unresolved = unresolvedCount;
+		return {
+			summary: summary.recordCount
+				? {
+					parserVersion   : summary.parser_version[ 1 ],
+					filesAnalyzed   : summary.files_analyzed[ 1 ],
+					parserExecutions: summary.parser_executions[ 1 ],
+					cacheHits       : summary.cache_hits[ 1 ],
+					symbolCount     : summary.symbol_count[ 1 ],
+					dependencyCount : summary.dependency_count[ 1 ],
+					impactCount     : summary.impact_count[ 1 ],
+					baselineRunId   : summary.baseline_run_id[ 1 ]
+				}
+				: {
+					parserVersion   : "",
+					filesAnalyzed   : 0,
+					parserExecutions: 0,
+					cacheHits       : 0,
+					symbolCount     : symbols.len(),
+					dependencyCount : dependencies.len(),
+					impactCount     : impacts.len(),
+					baselineRunId   : ""
+				},
+			symbols     : symbols,
+			dependencies: dependencies,
+			impacts     : impacts,
+			truncated   : summary.recordCount &&
+				(
+					summary.symbol_count[ 1 ] > symbols.len() || eligibleDependencies > dependencies.len() ||
+						summary.impact_count[ 1 ] > impacts.len()
+				),
+			truncationReasons: summary.recordCount ? [
+				(summary.symbol_count[ 1 ] > symbols.len() ? "graphSymbols" : ""),
+				(eligibleDependencies > dependencies.len() ? "graphDependencies" : ""),
+				(summary.impact_count[ 1 ] > impacts.len() ? "graphImpacts" : ""),
+				(starvedKinds.len() ? "dependencyKindStarved" : "")
+			].filter( ( reason ) => len( reason ) ) : [],
+			// The run summary already holds exact totals, so the loader can state
+			// what it dropped instead of only that it dropped something. Naming the
+			// ordering matters as much as the count: these LIMITs cut by file path,
+			// so what goes missing is a directory, not a sample.
+			completeness: {
+				symbols     : loadCompleteness( symbols.len(), summary.recordCount ? summary.symbol_count[ 1 ] : symbols.len(), "file_path,line" ),
+				dependencies: dependencyCompleteness,
+				impacts     : loadCompleteness( impacts.len(), summary.recordCount ? summary.impact_count[ 1 ] : impacts.len(), "changed_file,depth" )
+			}
+		};
+	}
+
+	/**
+	 * Kinds present in storage but wholly absent from the loaded set.
+	 *
+	 * The dependency LIMIT orders by kind priority, so a low-priority kind can be
+	 * removed in full rather than sampled. Measured before the call filter landed:
+	 * `constructs`, `extends`, `type-reference`, `imports`, `includes` and `tests`
+	 * all reached zero while 19,034 `calls` rows occupied the budget.
+	 */
+	private array function starvedDependencyKinds( required string runId, required array loaded ) {
+		var present = {};
+		for ( var dep in arguments.loaded ) present[ lCase( trim( toString( dep.kind ?: "" ) ) ) ] = true;
+		var records = queryExecute(
+			"SELECT DISTINCT kind FROM review_dependencies WHERE run_id = :runId",
+			{ runId: arguments.runId },
+			{ datasource: datasource }
+		);
+		var starved = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			var kind = lCase( trim( toString( records.kind[ row ] ) ) );
+			if ( len( kind ) && !present.keyExists( kind ) ) starved.append( kind );
+		}
+		starved.sort( ( a, b ) => compareNoCase( a, b ) );
+		return starved;
+	}
+
+	private struct function loadCompleteness(
+		required numeric returned,
+		required numeric available,
+		required string rankedBy
+	) {
+		var omitted = max( 0, val( arguments.available ) - val( arguments.returned ) );
+		return {
+			returned : val( arguments.returned ),
+			available: val( arguments.available ),
+			omitted  : omitted,
+			rankedBy : arguments.rankedBy,
+			complete : omitted == 0
+		};
+	}
+
+	private array function loadSymbols( required string runId, required numeric limit ) {
+		var records = queryExecute(
+			"
+				SELECT id, file_path, kind, name, line, end_line, evidence
+				FROM review_symbols
+				WHERE run_id = :runId
+				ORDER BY file_path, line, kind, name
+				LIMIT :resultLimit
+			",
+			{
+				runId      : arguments.runId,
+				resultLimit: { value: arguments.limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var items = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			items.append(
+					{
+						id      : records.id[ row ],
+						filePath: records.file_path[ row ],
+						kind    : records.kind[ row ],
+						name    : records.name[ row ],
+						line    : records.line[ row ],
+						endLine : records.end_line[ row ],
+						evidence: records.evidence[ row ]
+					}
+				);
+		}
+		return items;
+	}
+
+	private array function loadDependencies( required string runId, required numeric limit ) {
+		var records = queryExecute(
+			"
+				SELECT id, source_file, kind, target, target_file, line, end_line, evidence, source_symbol_id, source_symbol
+				FROM review_dependencies
+				WHERE run_id = :runId
+				ORDER BY source_file, line, kind, target
+				LIMIT :resultLimit
+			",
+			{
+				runId      : arguments.runId,
+				resultLimit: { value: arguments.limit, sqltype: "INTEGER" }
+			},
+			{ datasource: datasource }
+		);
+		var items = [];
+		for ( var row = 1; row <= records.recordCount; row++ ) {
+			items.append(
+					{
+						id        : records.id[ row ],
+						sourceFile: records.source_file[ row ],
+						kind      : records.kind[ row ],
+						target    : records.target[ row ],
+						targetFile: records.target_file[ row ],
+						line      : records.line[ row ],
+						endLine   : records.end_line[ row ],
+						evidence  : records.evidence[ row ],
+						sourceSymbolId: records.source_symbol_id[ row ],
+						sourceSymbol  : records.source_symbol[ row ]
+					}
+				);
+		}
+		return items;
+	}
+
+	private string function timestamp() {
+		return dateTimeFormat( now(), "iso" );
+	}
+}

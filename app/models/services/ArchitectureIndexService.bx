@@ -1,0 +1,717 @@
+/**
+ * Builds and stores the content-addressed symbol/dependency graph for a run,
+ * dispatching each file to whichever parser (BoxLang, CFML, JavaScript) supports it.
+ *
+ * @see BoxLangParserService
+ * @see CfmlParserService
+ * @see AnalysisGraphRepository
+ */
+
+@singleton
+class threadsafe {
+	property name="boxLangParserService" inject="BoxLangParserService";
+
+	property name="cfmlParserService" inject="CfmlParserService";
+
+	property name="javaScriptParserService" inject="JavaScriptParserService";
+
+	property name="graphRepository" inject="AnalysisGraphRepository";
+
+	property name="impactMaxDepth" inject="coldbox:setting:graphImpactMaxDepth";
+
+	property name="impactMaxNodes" inject="coldbox:setting:graphImpactMaxNodes";
+	variables.impactMaxDepth = 3;
+	variables.impactMaxNodes = 2000;
+	// Bump when materialize() changes what it derives from a parse. v2 attributes
+	// each dependency to the symbol whose body encloses it.
+	variables.indexVersion = "architecture-index-v2";
+
+	/**
+	 * Parses supported files, reuses content-addressed parser results, persists
+	 * the run graph, and calculates bounded impact data against the baseline.
+	 */
+	struct function index( required string runId, required array files ) {
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
+		var parsedFiles = [];
+		var usedParserVersions = [];
+		var metrics = {
+			parserVersion   : "",
+			filesAnalyzed   : 0,
+			parserExecutions: 0,
+			cacheHits       : 0,
+			symbolCount     : 0,
+			dependencyCount : 0,
+			impactCount     : 0,
+			baselineRunId   : ""
+		};
+
+		for ( var file in arguments.files ) {
+			var parser = resolveParser( parsers, file );
+			if ( isNull( parser ) ) {
+				continue;
+			}
+			var fileParserVersion = parser.getVersion();
+			if ( !usedParserVersions.contains( fileParserVersion ) ) {
+				usedParserVersions.append( fileParserVersion );
+			}
+			metrics.filesAnalyzed++;
+			var parsed = graphRepository.findCached( file.contentHash, fileParserVersion );
+			if ( isNull( parsed ) ) {
+				parsed = parser.parse( file );
+				graphRepository.saveCached(
+						contentHash   = file.contentHash,
+						parserVersion = fileParserVersion,
+						language      = file.language,
+						parsed        = parsed
+					);
+				metrics.parserExecutions++;
+			} else {
+				metrics.cacheHits++;
+			}
+			parsedFiles.append(
+					materialize(
+						file,
+						parsed,
+						fileParserVersion
+					)
+				);
+		}
+		metrics.parserVersion = indexSignature( usedParserVersions );
+
+		var baseline = graphRepository.findBaselineGraph( arguments.runId, numericSetting( variables.impactMaxNodes, 2000 ) );
+		metrics.baselineRunId = baseline.runId;
+
+		var currentSymbols = flattenSymbols( parsedFiles );
+		var currentDependencies = flattenDependencies( parsedFiles );
+		var allSymbols = baseline.symbols.duplicate();
+		allSymbols.append( currentSymbols, true );
+		var allDependencies = baseline.dependencies.duplicate();
+		allDependencies.append( currentDependencies, true );
+
+		resolveTargets( allSymbols, allDependencies, arguments.files );
+		var derivedTestEdges = deriveTestEdges( allDependencies );
+		allDependencies.append( derivedTestEdges, true );
+		persistCurrentResolution(
+			parsedFiles,
+			allDependencies,
+			derivedTestEdges
+		);
+
+		var impacts = len( baseline.runId )
+			? buildImpactCone(
+				parsedFiles.map( ( item ) => item.filePath ),
+				currentSymbols,
+				allDependencies
+			)
+			: [];
+
+		metrics.symbolCount = flattenSymbols( parsedFiles ).len();
+		metrics.dependencyCount = flattenDependencies( parsedFiles ).len();
+		metrics.impactCount = impacts.len();
+		graphRepository.replaceRunGraph(
+				arguments.runId,
+				parsedFiles,
+				impacts,
+				metrics
+			);
+		return metrics;
+	}
+
+	/** Parser-version contract used by a caller deciding whether a stored graph is adoptable. */
+	string function parserVersionFor( required array files ) {
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
+		var versions = [];
+		for ( var file in arguments.files ) {
+			var parser = resolveParser( parsers, file );
+			if ( isNull( parser ) ) continue;
+			var version = parser.getVersion();
+			if ( !versions.contains( version ) ) versions.append( version );
+		}
+		return indexSignature( versions );
+	}
+
+	/** Stable all-parser signature for pre-scan snapshot reuse. */
+	string function parserVersionSignature() {
+		var parsers = [];
+		if ( !isNull( boxLangParserService ?: javacast( "null", "" ) ) ) parsers.append( boxLangParserService );
+		if ( !isNull( cfmlParserService ?: javacast( "null", "" ) ) ) parsers.append( cfmlParserService );
+		if ( !isNull( javaScriptParserService ?: javacast( "null", "" ) ) ) parsers.append( javaScriptParserService );
+		var versions = [];
+		for ( var parser in parsers ) {
+			var version = parser.getVersion();
+			if ( !versions.contains( version ) ) versions.append( version );
+		}
+		return indexSignature( versions );
+	}
+
+	/**
+	 * Adoption contract for a stored graph.
+	 *
+	 * Parser versions alone are not enough: what `materialize` derives from a
+	 * parse — symbol attribution, ids — also decides whether stored rows are
+	 * usable. Without the index version in this signature, a run adopts rows
+	 * produced before a materializer change and silently serves the old shape.
+	 */
+	private string function indexSignature( required array versions ) {
+		var joined = arguments.versions.sort( "text" ).toList( "+" );
+		return len( joined ) ? joined & "+" & variables.indexVersion : variables.indexVersion;
+	}
+
+	array function buildImpactCone(
+		required array changedFiles,
+		required array graphSymbols,
+		required array graphDependencies
+	) {
+		var reverseEdges = {};
+		for ( var edge in arguments.graphDependencies ) {
+			if ( !edge.keyExists( "targetFile" ) || !len( edge.targetFile ) || edge.targetFile == edge.sourceFile ) {
+				continue;
+			}
+			if ( !reverseEdges.keyExists( edge.targetFile ) ) {
+				reverseEdges[ edge.targetFile ] = [];
+			}
+			reverseEdges[ edge.targetFile ].append( edge );
+		}
+
+		var symbolsByFile = {};
+		for ( var item in arguments.graphSymbols ) {
+			if ( !arrayFindNoCase( arguments.changedFiles, item.filePath ) ) {
+				continue;
+			}
+			if ( !listFindNoCase( "class,interface,function,handler-action", item.kind ) ) {
+				continue;
+			}
+			if ( !symbolsByFile.keyExists( item.filePath ) ) {
+				symbolsByFile[ item.filePath ] = [];
+			}
+			symbolsByFile[ item.filePath ].append( item.name );
+		}
+
+		var impacts = [];
+		var maximumDepth = numericSetting( variables.impactMaxDepth, 3 );
+		var maximumNodes = numericSetting( variables.impactMaxNodes, 2000 );
+		for ( var changedFile in arguments.changedFiles ) {
+			var seedSymbols = symbolsByFile.keyExists( changedFile ) ? symbolsByFile[ changedFile ] : [ changedFile];
+			for ( var changedSymbol in seedSymbols ) {
+				var queue = [ { file: changedFile, depth: 0 }];
+				var visited = { "#changedFile#": true };
+				while ( queue.len() && impacts.len() < maximumNodes ) {
+					var current = queue.shift();
+					if ( current.depth >= maximumDepth || !reverseEdges.keyExists( current.file ) ) {
+						continue;
+					}
+					for ( var edge in reverseEdges[ current.file ] ) {
+						if ( visited.keyExists( edge.sourceFile ) ) {
+							continue;
+						}
+						visited[ edge.sourceFile ] = true;
+						var depth = current.depth + 1;
+						impacts.append(
+								{
+									id: stableImpactId(
+										changedFile,
+										changedSymbol,
+										edge.sourceFile,
+										depth
+									),
+									changedFile  : changedFile,
+									changedSymbol: changedSymbol,
+									impactedFile : edge.sourceFile,
+									reason       : edge.kind,
+									depth        : depth,
+									viaFile      : current.file
+								}
+							);
+						queue.append( { file: edge.sourceFile, depth: depth } );
+						if ( impacts.len() >= maximumNodes ) {
+							break;
+						}
+					}
+				}
+				if ( impacts.len() >= maximumNodes ) {
+					break;
+				}
+			}
+			if ( impacts.len() >= maximumNodes ) {
+				break;
+			}
+		}
+		return impacts;
+	}
+
+	private any function resolveParser( required array parsers, required struct file ) {
+		for ( var parser in arguments.parsers ) {
+			if ( parser.supports( arguments.file ) ) {
+				return parser;
+			}
+		}
+		return javacast( "null", "" );
+	}
+
+	/**
+	 * Test seam for `resolveTargets`.
+	 *
+	 * Resolution decides what every edge in the graph points at, and it had two
+	 * defects that were only ever visible by running a full index and reading the
+	 * result. A seam is cheaper than a re-index and makes the rules assertable.
+	 */
+	void function resolveTargetsForTesting( required array symbols, required array dependencies, array files = [] ) {
+		resolveTargets( arguments.symbols, arguments.dependencies, arguments.files );
+	}
+
+	private void function resolveTargets( required array symbols, required array dependencies, array files = [] ) {
+		var typeFiles = {};
+		var propertiesByLocation = {};
+		var routeFiles = {};
+		var viewFiles = {};
+		// Callables declared in each file, for resolving a call that names no
+		// receiver. Without it an unqualified `myHelper()` could only be matched
+		// against *type* names, so every within-file call in the repository stayed
+		// unresolved: 0 same-file dependencies out of 3,310, and 78% of functions
+		// with no edge at all. Local resolution is the half of the problem that is
+		// cheap and certain — the callee is in the same file or it is not.
+		var localCallables = {};
+		// name → every file declaring a type of that name. `typeFiles` keeps only the
+		// last writer, so an ambiguous name resolved to whichever file happened to be
+		// parsed last and the edge carried no hint that a choice had been made.
+		// Measured on this repository: 14% of distinct symbol names are declared in
+		// more than one file (`run` in 116, `init` in 47), and 260 of 628 cross-file
+		// bare-name edges — 41% — named one of them.
+		var typeCandidates = {};
+		for ( var item in arguments.symbols ) {
+			if ( listFindNoCase( "class,interface", item.kind ) ) {
+				var typeKey = normalizeTarget( item.name );
+				typeFiles[ typeKey ] = item.filePath;
+				if ( !typeCandidates.keyExists( typeKey ) ) typeCandidates[ typeKey ] = [];
+				if ( !typeCandidates[ typeKey ].contains( item.filePath ) ) typeCandidates[ typeKey ].append( item.filePath );
+			}
+			if ( item.kind == "property" ) {
+				propertiesByLocation[ "#item.filePath#:#item.line#" ] = item.name;
+			}
+			if ( item.kind == "route" ) {
+				routeFiles[ normalizeRoute( item.name ) ] = item.filePath;
+			}
+			if ( listFindNoCase( "function,handler-action,lifecycle-hook,test", item.kind ) ) {
+				localCallables[ "#item.filePath#:#lCase( trim( item.name ) )#" ] = true;
+			}
+		}
+		for ( var file in arguments.files ) {
+			if ( !isStruct( file ) ) continue;
+			var viewPath = replace( trim( toString( file.filePath ?: "" ) ), "\", "/", "all" );
+			if ( reFindNoCase( "(^|/)views?/.*\.bxm$", viewPath ) ) {
+				var viewKey = reReplaceNoCase( viewPath, "^.*?/views?/", "" );
+				viewKey = reReplaceNoCase( viewKey, "\.bxm$", "" );
+				viewFiles[ lCase( viewKey ) ] = viewPath;
+			}
+		}
+
+		var aliases = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( edge.kind != "injects" ) {
+				continue;
+			}
+			var location = "#edge.sourceFile#:#edge.line#";
+			var targetFile = resolveTypeFile( edge.target, typeFiles );
+			if ( len( targetFile ) && propertiesByLocation.keyExists( location ) ) {
+				aliases[ "#edge.sourceFile#:#lCase( propertiesByLocation[ location ] )#" ] = targetFile;
+			}
+		}
+
+		// Which type names each file gives independent evidence of knowing about:
+		// it imports one, injects one, constructs one, extends one, or declares a
+		// parameter of that type. A bare receiver is only a type reference if the
+		// file shows some other sign of using that type.
+		//
+		// Without this, `if ( !flight.count() )` — where `flight` is a local struct —
+		// bound to `app/modules/aiFlight/handlers/Flight.bx` purely because a class
+		// of that name exists somewhere in the project, and became one of this
+		// repository's two architecture-rule violations. Neither violation was real.
+		var corroborated = {};
+		for ( var edge in arguments.dependencies ) {
+			if ( !listFindNoCase( "imports,injects,constructs,extends,implements,type-reference", edge.kind ) ) continue;
+			var referenced = normalizeTarget( edge.target ?: "" );
+			if ( len( referenced ) ) corroborated[ "#edge.sourceFile#:#referenced#" ] = true;
+		}
+
+		for ( var edge in arguments.dependencies ) {
+			var targetFile = edge.keyExists( "targetFile" ) ? edge.targetFile : "";
+			if ( edge.kind == "renders" && !len( targetFile ) ) {
+				var viewKey = lCase( reReplaceNoCase( trim( toString( edge.target ?: "" ) ), "^/", "" ) );
+				viewKey = reReplace( viewKey, "\.", "/", "all" );
+				viewKey = reReplaceNoCase( viewKey, "\.bxm$", "" );
+				if ( viewFiles.keyExists( viewKey ) ) targetFile = viewFiles[ viewKey ];
+			}
+			if ( edge.kind == "calls-api" && !len( targetFile ) ) {
+				var routeKey = normalizeRoute( edge.target ?: "" );
+				if ( routeFiles.keyExists( routeKey ) ) targetFile = routeFiles[ routeKey ];
+			}
+			if ( edge.kind == "routes" && !len( targetFile ) ) targetFile = resolveTypeFile( edge.handler ?: edge.target, typeFiles );
+			if ( !len( targetFile ) && edge.kind == "calls" ) {
+				var receiver = listFirst( edge.target, "." );
+				var aliasKey = "#edge.sourceFile#:#lCase( receiver )#";
+				if ( aliases.keyExists( aliasKey ) ) {
+					// An injected property whose type resolved: this is evidence, not a
+					// name match, so it binds without corroboration.
+					targetFile = aliases[ aliasKey ];
+				} else if ( corroborated.keyExists( "#edge.sourceFile#:#normalizeTarget( receiver )#" ) ) {
+					targetFile = resolveTypeFile( receiver, typeFiles, typeCandidates );
+					edge.candidateCount = candidateCountFor( receiver, typeCandidates );
+				} else {
+					// A receiver naming a type this file never imports, injects,
+					// constructs or extends is far more often a local variable. Left
+					// unresolved and counted, rather than bound to a same-named file.
+					edge.candidateCount = candidateCountFor( receiver, typeCandidates );
+				}
+				// Tried last of the three, so a receiver that names a real type still
+				// wins: `orderService.save()` is a call into another file even if this
+				// file also declares a `save`.
+				if ( !len( targetFile ) && localCallables.keyExists( "#edge.sourceFile#:#localCallName( edge.target )#" ) ) {
+					targetFile = edge.sourceFile;
+					edge.candidateCount = 1;
+				}
+			}
+			if ( !len( targetFile ) ) {
+				targetFile = resolveTypeFile( edge.target, typeFiles, typeCandidates );
+				if ( !edge.keyExists( "candidateCount" ) ) edge.candidateCount = candidateCountFor( edge.target, typeCandidates );
+			}
+			edge.targetFile = targetFile;
+		}
+	}
+
+	private array function deriveTestEdges( required array dependencies ) {
+		var derived = [];
+		var seen = {};
+		for ( var edge in arguments.dependencies ) {
+			if (
+				!isTestFile( edge.sourceFile ) || !edge.keyExists( "targetFile" ) || !len( edge.targetFile ) ||
+					isTestFile( edge.targetFile )
+			) {
+				continue;
+			}
+			// Keyed on the target *and* the calling test symbol, not just the file
+			// pair. Collapsing to one edge per file pair is what kept Q11 at file
+			// level: the graph could say "this spec exercises that service" and never
+			// which spec exercises which function. The symbol attribution is carried
+			// through from the originating call so the projection can pair both ends.
+			var key = "#edge.sourceFile#:#edge.targetFile#:#lCase( trim( toString( edge.target ?: "" ) ) )#:#edge.sourceSymbolId ?: ""#";
+			if ( seen.keyExists( key ) ) {
+				continue;
+			}
+			seen[ key ] = true;
+			derived.append(
+					{
+						id: stableId(
+							edge.sourceFile,
+							"dependency",
+							"tests",
+							edge.targetFile & "|" & toString( edge.target ?: "" ) & "|" & toString( edge.sourceSymbolId ?: "" ),
+							0
+						),
+						sourceFile    : edge.sourceFile,
+						kind          : "tests",
+						target        : edge.target,
+						targetFile    : edge.targetFile,
+						line          : edge.line,
+						evidence      : edge.evidence,
+						sourceSymbolId: edge.sourceSymbolId ?: "",
+						sourceSymbol  : edge.sourceSymbol ?: ""
+					}
+				);
+		}
+		return derived;
+	}
+
+	private void function persistCurrentResolution(
+		required array parsedFiles,
+		required array allDependencies,
+		required array derivedTestEdges
+	) {
+		var filesByPath = {};
+		for ( var parsedFile in arguments.parsedFiles ) {
+			filesByPath[ parsedFile.filePath ] = parsedFile;
+		}
+		for ( var edge in arguments.allDependencies ) {
+			if ( !filesByPath.keyExists( edge.sourceFile ) ) {
+				continue;
+			}
+			for ( var currentEdge in filesByPath[ edge.sourceFile ].dependencies ) {
+				if ( currentEdge.id == edge.id ) {
+					currentEdge.targetFile = edge.targetFile;
+					break;
+				}
+			}
+		}
+		for ( var edge in arguments.derivedTestEdges ) {
+			if ( !filesByPath.keyExists( edge.sourceFile ) ) {
+				continue;
+			}
+			var alreadyPresent = false;
+			for ( var currentEdge in filesByPath[ edge.sourceFile ].dependencies ) {
+				if ( currentEdge.id == edge.id ) {
+					alreadyPresent = true;
+					break;
+				}
+			}
+			if ( !alreadyPresent ) {
+				filesByPath[ edge.sourceFile ].dependencies.append( edge );
+			}
+		}
+	}
+
+	private array function flattenSymbols( required array parsedFiles ) {
+		var items = [];
+		for ( var parsedFile in arguments.parsedFiles ) {
+			for ( var item in parsedFile.symbols ) {
+				var copy = duplicate( item );
+				copy.filePath = parsedFile.filePath;
+				items.append( copy );
+			}
+		}
+		return items;
+	}
+
+	private array function flattenDependencies( required array parsedFiles ) {
+		var items = [];
+		for ( var parsedFile in arguments.parsedFiles ) {
+			for ( var item in parsedFile.dependencies ) {
+				var copy = duplicate( item );
+				copy.sourceFile = parsedFile.filePath;
+				items.append( copy );
+			}
+		}
+		return items;
+	}
+
+	private struct function materialize( required struct file, required struct parsed, required string parserVersion ) {
+		var symbols = [];
+		var seenSymbolIds = {};
+		var symbolOccurrences = {};
+		for ( var item in arguments.parsed.symbols ) {
+			var symbolItem = duplicate( item );
+			var symbolKey = lCase( trim( toString( item.kind ?: "symbol" ) ) & "|" & trim( toString( item.name ?: "" ) ) );
+			symbolOccurrences[ symbolKey ] = ( symbolOccurrences[ symbolKey ] ?: 0 ) + 1;
+			symbolItem.id = stableId(
+				arguments.file.filePath,
+				"symbol",
+				item.kind,
+				item.name,
+				symbolOccurrences[ symbolKey ]
+			);
+			if ( seenSymbolIds.keyExists( symbolItem.id ) ) {
+				continue;
+			}
+			seenSymbolIds[ symbolItem.id ] = true;
+			symbols.append( symbolItem );
+		}
+		var dependencies = [];
+		var seenDependencyIds = {};
+		var dependencyOccurrences = {};
+		// Built once per file so attribution is a lookup, not a scan of every
+		// symbol for every dependency.
+		var ownerByLine = symbolLineIndex( symbols );
+		for ( var item in arguments.parsed.dependencies ) {
+			var dependencyItem = duplicate( item );
+			var dependencyKey = lCase( trim( toString( item.kind ?: "dependency" ) ) & "|" & trim( toString( item.target ?: "" ) ) );
+			dependencyOccurrences[ dependencyKey ] = ( dependencyOccurrences[ dependencyKey ] ?: 0 ) + 1;
+			dependencyItem.id = stableId(
+				arguments.file.filePath,
+				"dependency",
+				item.kind,
+				item.target,
+				dependencyOccurrences[ dependencyKey ]
+			);
+			if ( seenDependencyIds.keyExists( dependencyItem.id ) ) {
+				continue;
+			}
+			seenDependencyIds[ dependencyItem.id ] = true;
+			dependencyItem.targetFile = "";
+			var owner = ownerByLine[ val( dependencyItem.line ?: 0 ) ] ?: { id: "", name: "" };
+			dependencyItem.sourceSymbolId = owner.id;
+			dependencyItem.sourceSymbol = owner.name;
+			dependencies.append( dependencyItem );
+		}
+		return {
+			filePath     : arguments.file.filePath,
+			contentHash  : arguments.file.contentHash,
+			parserVersion: arguments.parserVersion,
+			parseStrategy: arguments.parsed.parseStrategy ?: "",
+			symbols      : symbols,
+			dependencies : dependencies
+		};
+	}
+
+	/**
+	 * Line number to the innermost symbol whose body contains it.
+	 *
+	 * A class declaration spans the whole file, so without "innermost wins" every
+	 * dependency would attribute to the class and say nothing the file path did
+	 * not already say. Widest spans are written first and narrower ones overwrite
+	 * them, which leaves each line owned by the tightest enclosing symbol.
+	 *
+	 * Built once per file: attributing by scanning every symbol for every
+	 * dependency is O(symbols x dependencies), which a large generated file makes
+	 * expensive. This is O(sum of symbol spans) once, then O(1) per lookup.
+	 * Symbols with no usable end line cannot contain anything and are skipped
+	 * rather than guessed at.
+	 */
+	private struct function symbolLineIndex( required array symbols ) {
+		var spans = [];
+		for ( var symbol in arguments.symbols ) {
+			var start = val( symbol.line ?: 0 );
+			var finish = val( symbol.endLine ?: 0 );
+			if ( start <= 0 || finish < start ) continue;
+			spans.append( { start: start, finish: finish, span: finish - start, id: symbol.id ?: "", kind: trim( toString( symbol.kind ?: "" ) ), name: trim( toString( symbol.name ?: "" ) ) } );
+		}
+		spans.sort( ( a, b ) => {
+			if ( a.span != b.span ) return a.span > b.span ? -1 : 1;
+			if ( a.start != b.start ) return a.start > b.start ? 1 : -1;
+			// The parser emits `function` and `handler-action` for the same
+			// declaration, so span and start both tie. Sort is stable, which makes
+			// the winner deterministic but incidental — parser emission order.
+			// Name the choice instead of inheriting it.
+			var byKind = compareNoCase( a.kind ?: "", b.kind ?: "" );
+			return byKind != 0 ? byKind : compareNoCase( a.id ?: "", b.id ?: "" );
+		} );
+		var index = {};
+		for ( var entry in spans ) {
+			var owner = { id: entry.id, name: entry.name };
+			for ( var line = entry.start; line <= entry.finish; line++ ) index[ line ] = owner;
+		}
+		return index;
+	}
+
+	/**
+	 * The file declaring this type, or "" when that cannot be decided.
+	 *
+	 * An ambiguous name — declared in more than one file — resolves to nothing.
+	 * It used to resolve to whichever file was parsed last, silently, and the edge
+	 * was stored looking exactly like an unambiguous one. A guess presented as a
+	 * fact is the failure mode this register keeps recording; an unresolved
+	 * reference with a candidate count is a result the reader can act on.
+	 */
+	private string function resolveTypeFile(
+		required string target,
+		required struct typeFiles,
+		struct typeCandidates = {}
+	) {
+		if ( isExternalType( arguments.target ) ) return "";
+		var normalized = normalizeTarget( arguments.target );
+		if ( !arguments.typeFiles.keyExists( normalized ) ) return "";
+		if ( candidateCountFor( arguments.target, arguments.typeCandidates ) > 1 ) return "";
+		return arguments.typeFiles[ normalized ];
+	}
+
+	/** How many files declare a type of this name; 0 when unknown. */
+	private numeric function candidateCountFor( required string target, required struct typeCandidates ) {
+		var normalized = normalizeTarget( arguments.target );
+		if ( !arguments.typeCandidates.keyExists( normalized ) ) return 0;
+		return arguments.typeCandidates[ normalized ].len();
+	}
+
+	/**
+	 * Does this dotted name belong to a framework or the JDK rather than the repo?
+	 *
+	 * Resolution matches on the **leaf** of a dotted path, so
+	 * `coldbox.system.web.routing.Router` matched any file in the project named
+	 * `Router.bx` — and produced the repository's only `extends` edge, pointing at
+	 * an unrelated fixture and stored `resolution: exact, confidence: high`. A
+	 * wrong edge labelled proven is worse than a missing one, so a name rooted in a
+	 * known external namespace resolves to nothing and is reported unresolved.
+	 *
+	 * Deliberately a namespace-root test, not a path check: only the first segment
+	 * identifies the owner, and a project class may legitimately share a leaf name
+	 * with a framework one.
+	 */
+	private boolean function isExternalType( required string target ) {
+		var value = trim( listFirst( toString( arguments.target ), "@" ) );
+		if ( !find( ".", value ) ) return false;
+		// Framework and JDK roots only. `com` / `org` / `net` are deliberately absent:
+		// a project may root its own code there, and suppressing a real match costs
+		// more than the rare vendor-jar false positive this would also catch.
+		return listFindNoCase(
+			"coldbox,testbox,wirebox,logbox,cachebox,cbsecurity,java,javax,jakarta,sun",
+			listFirst( value, "." )
+		) > 0;
+	}
+
+	/**
+	 * The function name a call names, once the scope prefix is removed.
+	 *
+	 * `save()`, `this.save()` and `variables.save()` are the same callee. Anything
+	 * with a different receiver is not a local call and returns a name that cannot
+	 * match, rather than a wrong one.
+	 */
+	private string function localCallName( required any target ) {
+		var value = lCase( trim( toString( arguments.target ?: "" ) ) );
+		if ( !find( ".", value ) ) return value;
+		var receiver = listFirst( value, "." );
+		// A name no symbol can carry, so a non-local receiver cannot accidentally
+		// match a same-file callable.
+		return listFindNoCase( "this,variables", receiver ) && listLen( value, "." ) == 2 ? listLast( value, "." ) : "##not-a-local-call##";
+	}
+
+	private string function normalizeTarget( required string target ) {
+		var withoutModule = listFirst( trim( arguments.target ), "@" );
+		return lCase( listLast( withoutModule, "." ) );
+	}
+
+	private string function normalizeRoute( required any target ) {
+		var value = trim( toString( arguments.target ?: "" ) );
+		value = reReplace( value, "\?.*$", "" );
+		value = reReplace( value, ":([A-Za-z_][A-Za-z0-9_]*)", ":id", "all" );
+		while ( len( value ) > 1 && right( value, 1 ) == "/" ) value = left( value, len( value ) - 1 );
+		return lCase( value );
+	}
+
+	private boolean function isTestFile( required string filePath ) {
+		return reFindNoCase(
+				"(^|/)tests/|(?:spec|test)\.bx$",
+				replace(
+					arguments.filePath,
+					"\",
+					"/",
+					"all"
+				)
+			) >
+			0;
+	}
+
+	private numeric function numericSetting( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, val( arguments.value ) ) : arguments.fallback;
+	}
+
+	private string function stableImpactId(
+		required string changedFile,
+		required string changedSymbol,
+		required string impactedFile,
+		required numeric depth
+	) {
+		return lCase(
+			hash(
+				"#arguments.changedFile#:#arguments.changedSymbol#:#arguments.impactedFile#:#arguments.depth#",
+				"SHA-256"
+			)
+		);
+	}
+
+	private string function stableId(
+		required string filePath,
+		required string recordType,
+		required string kind,
+		required string name,
+		numeric occurrence = 0
+	) {
+		return lCase(
+			hash(
+				"#arguments.filePath#:#arguments.recordType#:#arguments.kind#:#arguments.name#:#arguments.occurrence#",
+				"SHA-256"
+			)
+		);
+	}
+}

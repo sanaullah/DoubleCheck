@@ -1,0 +1,238 @@
+/**
+ * Turns whatever a provider returned into a usable JSON object, or a clear
+ * failure.
+ *
+ * Split out of SpecialistAgentGateway (Part 5 Track A). The gateway decides
+ * *whether* to call, retry, or give up; this decides *what the answer means* —
+ * unwrapping envelopes, finding the JSON object inside prose, and refusing
+ * tool-call markup that a chat-only path must not accept.
+ *
+ * Pure: no provider, no run state, no persistence. It only ever reads a
+ * response and returns a value or throws.
+ */
+@singleton
+class threadsafe {
+	public struct function normalizeResponse( required any response ) {
+		if ( isNull( arguments.response ) ) {
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is empty"
+			);
+		}
+		if ( isStruct( arguments.response ) ) {
+			if ( hasReviewPayload( arguments.response ) ) {
+				if ( !isArray( arguments.response.findings ?: "" ) ) {
+					arguments.response.findings = [];
+				}
+				return arguments.response;
+			}
+			var nested = unwrapResponseEnvelope( arguments.response );
+			if ( !isNull( nested ) ) {
+				return normalizeResponse( nested );
+			}
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not structured (struct keys: #left( structKeyList( arguments.response ), 120 )#)"
+			);
+		}
+		if ( isSimpleValue( arguments.response ) ) {
+			var text = trim( toString( arguments.response ) );
+			if ( !len( text ) ) {
+				throw(
+					type    = "SpecialistResultException",
+					message = "Specialist response is empty"
+				);
+			}
+			assertNotToolCallMarkup( text );
+			var parsed = extractJsonObject( text );
+			if ( !isNull( parsed ) ) {
+				if ( !isArray( parsed.findings ?: "" ) ) {
+					parsed.findings = [];
+				}
+				if ( !structKeyExists( parsed, "summary" ) ) {
+					parsed.summary = "";
+				}
+				return parsed;
+			}
+			throw(
+				type    = "SpecialistResultException",
+				message = "Specialist response is not valid JSON: #left( sanitizeErrorSnippet( text ), 180 )#"
+			);
+		}
+		var asText = "";
+		try {
+			asText = trim( toString( arguments.response ) );
+		} catch (any ignoreObject) {
+			asText = "";
+		}
+		if ( len( asText ) && !reFindNoCase( "^\[?(object|class)\s", asText ) && left( asText, 1 ) != "@" ) {
+			return normalizeResponse( asText );
+		}
+		throw(
+			type    = "SpecialistResultException",
+			message = "Specialist response is not structured (#getMetadata( arguments.response ).name ?: "unknown"#)"
+		);
+	}
+
+	private boolean function hasReviewPayload( required struct response ) {
+		return isArray( arguments.response.findings ?: "" ) || structKeyExists( arguments.response, "summary" );
+	}
+
+	public any function unwrapResponseEnvelope( required struct response ) {
+		for ( var key in [
+			"content",
+			"text",
+			"output",
+			"output_text",
+			"result",
+			"response",
+			"data",
+			"raw"
+		] ) {
+			if (
+				structKeyExists( arguments.response, key ) && !isNull( arguments.response[ key ] ) &&
+					( isSimpleValue( arguments.response[ key ] ) || isStruct( arguments.response[ key ] ) )
+			) {
+				return arguments.response[ key ];
+			}
+		}
+		if ( isSimpleValue( arguments.response.message ?: "" ) ) {
+			return arguments.response.message;
+		}
+		if (
+			isStruct( arguments.response.message ?: "" ) &&
+				isSimpleValue(
+					arguments
+							.response
+							.message
+							.content ?:
+						""
+				)
+		) {
+			return arguments
+				.response
+				.message
+				.content;
+		}
+		if (
+			isArray( arguments.response.choices ?: "" ) &&
+				arguments
+					.response
+					.choices
+					.len()
+		) {
+			var choice = arguments.response.choices[ 1 ];
+			if ( isStruct( choice.message ?: "" ) && isSimpleValue( choice.message.content ?: "" ) ) {
+				return choice.message.content;
+			}
+			if ( isSimpleValue( choice.text ?: "" ) ) {
+				return choice.text;
+			}
+		}
+		return;
+	}
+
+	public any function extractJsonObject( required string raw ) {
+		var text = trim( arguments.raw );
+		if ( !len( text ) ) {
+			return;
+		}
+		text = reReplaceNoCase(
+			text,
+			"^```(?:json)?\s*",
+			""
+		);
+		text = reReplace(
+			text,
+			"\s*```$",
+			""
+		);
+		text = trim( text );
+		try {
+			var direct = jsonDeserialize( text );
+			if ( isStruct( direct ) ) {
+				return direct;
+			}
+		} catch (any ignoreDirect) {
+
+		}
+
+		var start = find( "{", text );
+		if ( start ) {
+			var end = 0;
+			for ( var index = len( text ); index >= start; index-- ) {
+				if (
+					mid(
+							text,
+							index,
+							1
+						) ==
+						"}"
+				) {
+					end = index;
+					break;
+				}
+			}
+			if ( end > start ) {
+				try {
+					var sliced = jsonDeserialize(
+						mid(
+							text,
+							start,
+							end - start + 1
+						)
+					);
+					if ( isStruct( sliced ) ) {
+						return sliced;
+					}
+				} catch (any ignoreSlice) {
+
+				}
+			}
+		}
+		return;
+	}
+
+	public void function assertNotToolCallMarkup( required any response ) {
+		var text = "";
+		if ( isSimpleValue( arguments.response ) ) {
+			text = toString( arguments.response );
+		} else {
+			try {
+				text = toString( arguments.response );
+			} catch (any ignoreCast) {
+				return;
+			}
+		}
+		if ( !len( trim( text ) ) ) {
+			return;
+		}
+		if ( containsToolCallMarkup( text ) ) {
+			throw(
+				type    = "SpecialistToolMarkupException",
+				message = "Model emitted proprietary tool-call markup instead of JSON review output"
+			);
+		}
+	}
+
+	public boolean function containsToolCallMarkup( required string text ) {
+		var value = arguments.text;
+		return findNoCase( "<|tool_calls_section_begin|>", value ) > 0 || findNoCase( "<|tool_call_begin|>", value ) > 0 ||
+					findNoCase( "<|tool_call_argument_begin|>", value ) > 0 ||
+				findNoCase( "<|tool_call_end|>", value ) > 0 ||
+			reFindNoCase(
+					"functions\.(read_file|read_indexed_range|search_indexed_code)\s*:",
+					value
+				) >
+				0;
+	}
+
+	public string function sanitizeErrorSnippet( required string text ) {
+		var value = arguments.text;
+		if ( containsToolCallMarkup( value ) ) {
+			return "[tool-call markup omitted]";
+		}
+		return value;
+	}
+}
+

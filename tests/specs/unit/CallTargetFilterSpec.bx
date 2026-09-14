@@ -1,0 +1,70 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CallTargetFilter", () => {
+
+			var filter = new app.models.services.CallTargetFilter();
+
+			it( "reads built-ins from the runtime rather than a hand-maintained list", () => {
+				// A copied list rots against the runtime it describes. If this is 0
+				// the filter has silently degraded to keywords and matchers only.
+				expect( filter.builtinCount() ).toBeGT( 100 );
+			} );
+
+			it( "filters the built-ins that dominated the dependency table", () => {
+				// Measured top unresolved targets before this filter existed.
+				for ( var builtin in [ "len", "trim", "toString", "lCase", "isStruct", "isArray", "val", "duplicate", "isNull", "structKeyExists", "replace", "javacast", "queryExecute", "findNoCase", "max", "char", "int" ] ) {
+					expect( filter.isNoise( builtin, "BoxLang" ) ).toBeTrue( "#builtin# should be filtered" );
+				}
+			} );
+
+			it( "filters TestBox matchers", () => {
+				for ( var matcher in [ "expect", "toBe", "toBeTrue", "toInclude", "describe", "it", "beforeEach" ] ) {
+					expect( filter.isNoise( matcher, "BoxLang" ) ).toBeTrue( "#matcher# should be filtered" );
+				}
+			} );
+
+			it( "filters language keywords including var", () => {
+				// `var` was captured 302 times as a call target on this repository.
+				for ( var keyword in [ "var", "if", "for", "while", "return", "new", "function" ] ) {
+					expect( filter.isNoise( keyword, "BoxLang" ) ).toBeTrue( "#keyword# should be filtered" );
+				}
+			} );
+
+			it( "keeps dotted targets because the receiver is how a call resolves to a file", () => {
+				// ArchitectureIndexService resolves targetFile from the receiver, so
+				// dropping these would delete the only calls that can become edges.
+				expect( filter.isNoise( "orderService.save", "BoxLang" ) ).toBeFalse();
+				expect( filter.isNoise( "reportRepository.findAll", "BoxLang" ) ).toBeFalse();
+			} );
+
+			it( "keeps project functions that are not built-ins", () => {
+				expect( filter.isNoise( "buildSnapshot", "BoxLang" ) ).toBeFalse();
+				expect( filter.isNoise( "resolveNarrative", "BoxLang" ) ).toBeFalse();
+			} );
+
+			it( "filters browser globals and their members for JavaScript", () => {
+				expect( filter.isNoise( "document.querySelector", "JavaScript" ) ).toBeTrue();
+				expect( filter.isNoise( "console.log", "JavaScript" ) ).toBeTrue();
+				expect( filter.isNoise( "JSON.parse", "JavaScript" ) ).toBeTrue();
+				expect( filter.isNoise( "String", "JavaScript" ) ).toBeTrue();
+				expect( filter.isNoise( "Number", "JavaScript" ) ).toBeTrue();
+			} );
+
+			it( "keeps project JavaScript calls", () => {
+				expect( filter.isNoise( "renderCodeGraph", "JavaScript" ) ).toBeFalse();
+				expect( filter.isNoise( "state.codegraph", "JavaScript" ) ).toBeFalse();
+			} );
+
+			it( "does not apply BoxLang built-ins to JavaScript", () => {
+				// `trim` is a BoxLang BIF and a plausible JavaScript helper name.
+				expect( filter.isNoise( "trim", "JavaScript" ) ).toBeFalse();
+			} );
+
+			it( "treats an empty target as noise", () => {
+				expect( filter.isNoise( "", "BoxLang" ) ).toBeTrue();
+				expect( filter.isNoise( "   ", "BoxLang" ) ).toBeTrue();
+			} );
+		} );
+	}
+}

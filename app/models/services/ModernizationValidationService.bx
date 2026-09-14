@@ -1,0 +1,508 @@
+/** Deterministic structural, evidence, syntax and safety gates for modernization plans. */
+@singleton
+class threadsafe {
+	property name="citationResolver" inject="ModernizationCitationResolver";
+
+	variables.allowedMethods = [ "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "UNKNOWN" ];
+	variables.allowedTransitionOperations = [ "expand", "backfill", "switch", "contract", "forward-only", "forward_only" ];
+	variables.allowedProvenanceClasses = [ "source-observed", "provider-suggested", "deterministically-derived", "not-observed" ];
+	// "coupling-derived" ranks above both: the boundary came from the graph.
+	variables.allowedEvidenceBasis = [ "coupling-derived", "explicit-seam", "domain-clustering" ];
+
+	private any function citationResolverInstance() {
+		if ( !isNull( variables.citationResolver ?: javacast( "null", "" ) ) ) return variables.citationResolver;
+		variables.citationResolver = new app.models.services.ModernizationCitationResolver();
+		return variables.citationResolver;
+	}
+
+	/**
+	 * Returns deterministic validation messages and blocking status for a
+	 * proposed plan; it does not execute SQL, edit source, or call an LLM.
+	 */
+	struct function validate( required struct plan, struct context = {} ) {
+		var messages = [];
+		var blocking = 0;
+		var warnings = 0;
+		var target = structKeyExists( arguments.plan, "target" ) && isStruct( arguments.plan.target ) ? arguments.plan.target : {};
+		var metadata = structKeyExists( arguments.plan, "metadata" ) && isStruct( arguments.plan.metadata ) ? arguments.plan.metadata : {};
+		var coverageData = structKeyExists( arguments.plan, "coverage" ) && isStruct( arguments.plan.coverage ) ? arguments.plan.coverage : {};
+		var inventoryData = structKeyExists( arguments.plan, "inventory" ) && isStruct( arguments.plan.inventory ) ? arguments.plan.inventory : {};
+		var runtime = structKeyExists( metadata, "runtime" ) && isStruct( metadata.runtime ) ? safeTrim( metadata.runtime.runtime ?: "" ) : ( structKeyExists( metadata, "runtime" ) ? safeTrim( metadata.runtime ?: "" ) : "" );
+		var requiresProvenance = isStruct( metadata.provenanceContract ?: "" ) && len( safeTrim( metadata.provenanceContract.version ?: "" ) ) > 0;
+		if ( !len( runtime ) ) runtime = safeTrim( target.runtime ?: "" );
+		runtime = lCase( runtime );
+		var profile = lCase( safeTrim( metadata.targetProfile ?: target.layoutProfile ?: "" ) );
+		var validationInventory = structKeyExists( arguments.context, "inventory" ) ? arguments.context.inventory : inventoryData;
+		var planUnitLinks = structKeyExists( arguments.plan, "unitLinks" ) && isArray( arguments.plan.unitLinks ) ? arguments.plan.unitLinks : [];
+		// Partial/synthesized plans still need review, but missing evidence and
+		// incomplete dbTransitions should not drown the gate summary in blockers.
+		var softEvidence = isSoftEvidencePlan( arguments.plan, arguments.context );
+		var evidenceLevelName = softEvidence ? "warning" : "blocking";
+
+		var planVersion = lCase( safeTrim( arguments.plan.schemaVersion ?: arguments.plan.version ?: "" ) );
+		var isV2 = planVersion == "modernization-plan-v2" || isArray( target.placements ?: "" );
+		if ( ![ "modernization-plan-v1", "modernization-plan-v2" ].contains( planVersion ) ) {
+			addMessage( messages, "contract", "blocking", "Plan schemaVersion must be modernization-plan-v1 or modernization-plan-v2" ); blocking++;
+		}
+		for ( var field in [ "version", "metadata", "coverage", "assumptions", "inventory", "schemaEvidence", "signals", "target", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples", "validation", "decisions" ] ) {
+			if ( !structKeyExists( arguments.plan, field ) ) { addMessage( messages, "contract", "blocking", "Missing top-level field: #field#" ); blocking++; }
+		}
+
+		var seen = {};
+		var seenTargetPaths = {};
+		var collections = isV2
+			? [ "target.units", "target.placements", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ]
+			: [ "target.units", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ];
+		for ( var collection in collections ) {
+			var parts = collection.listToArray( "." );
+			var owner = parts.len() == 2 ? ( structKeyExists( arguments.plan, parts[ 1 ] ) && isStruct( arguments.plan[ parts[ 1 ] ] ) ? arguments.plan[ parts[ 1 ] ] : {} ) : arguments.plan;
+			var key = parts[ parts.len() ];
+			var items = isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [];
+			for ( var item in items ) {
+				if ( !isStruct( item ) ) { addMessage( messages, collection, "blocking", "Item must be an object" ); blocking++; continue; }
+				var id = safeTrim( item.id ?: item.itemId ?: "" );
+				if ( !len( id ) ) { addMessage( messages, collection, "blocking", "Item is missing a stable id", id ); blocking++; }
+				else if ( seen.keyExists( id ) ) { addMessage( messages, collection, "blocking", "Duplicate id: #id#", id ); blocking++; }
+				else seen[ id ] = true;
+				var decisionCollection = [ "target.units", "target.placements", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ].contains( collection );
+				if ( !len( safeTrim( item.itemFingerprint ?: "" ) ) ) {
+					addMessage( messages, collection, decisionCollection ? "blocking" : "warning", "Item #id# has no itemFingerprint", id );
+					if ( decisionCollection ) blocking++; else warnings++;
+				}
+				var provenanceClass = lCase( safeTrim( item.provenanceClass ?: "" ) );
+				if ( requiresProvenance && !variables.allowedProvenanceClasses.contains( provenanceClass ) ) {
+					addMessage( messages, collection, "blocking", "Item #id# is missing a valid provenanceClass", id );
+					blocking++;
+				}
+				// Route contracts use an absolute URL path, while the generic
+				// collections use project-relative file paths. Do not run the
+				// relative-path gate against a route's URL.
+				var itemPath = safeTrim( item.targetPath ?: item.pathHint ?: ( collection == "routeContracts" ? "" : ( item.path ?: item.filePath ?: "" ) ) );
+					if ( collection != "routeContracts" && len( itemPath ) && !safeRelativePath( itemPath ) ) { addMessage( messages, collection, "blocking", "Item #id# contains an unsafe path", id ); blocking++; }
+				if ( collection == "target.placements" ) {
+					var placementType = lCase( safeTrim( item.placementType ?: item.packaging ?: "" ) );
+					if ( ![ "main-app", "coldbox-module", "external-service", "background-worker", "scheduled-service", "centralized", "worker" ].contains( placementType ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an unsupported placementType", id ); blocking++; }
+					if ( !isArray( item.targetUnitIds ?: item.unitIds ?: "" ) || !( item.targetUnitIds ?: item.unitIds ?: [] ).len() ) { addMessage( messages, collection, "blocking", "Placement #id# must own at least one target unit", id ); blocking++; }
+					if ( !isArray( item.evidenceRefs ?: "" ) || !item.evidenceRefs.len() ) { addMessage( messages, collection, "warning", "Placement #id# has no evidence references", id ); warnings++; }
+					else {
+						// Presence is not validity (section 2.16). A ref to a file the
+						// run never inventoried used to pass this gate unchallenged.
+						for ( var placementRef in item.evidenceRefs ) {
+							var refOutcome = citationResolverInstance().resolve( placementRef, validationInventory );
+							if ( refOutcome.resolved ) continue;
+							addMessage( messages, collection, "warning", "Placement #id# cites evidence that does not resolve: #refOutcome.reason##( len( refOutcome.filePath ) ? ' (' & refOutcome.filePath & ')' : '' )#", id );
+							warnings++;
+						}
+					}
+					if ( isArray( item.gates ?: "" ) ) {
+						for ( var gate in item.gates ) {
+							var gateId = safeTrim( gate.id ?: "architecture" );
+							var gateStatus = lCase( safeTrim( gate.status ?: "" ) );
+							if ( ![ "pass", "fail", "unknown" ].contains( gateStatus ) ) { addMessage( messages, collection, "blocking", "Placement #id# has an invalid gate status", id ); blocking++; }
+							else if ( gateStatus == "fail" ) { addMessage( messages, collection, "blocking", "Placement #id# has a failed #gateId# gate", id ); blocking++; }
+							else if ( gateStatus == "unknown" ) { addMessage( messages, collection, "warning", "Placement #id# has an unknown #gateId# gate", id ); warnings++; }
+						}
+					}
+				}
+				if ( collection == "target.units" ) {
+					if ( !len( itemPath ) ) { addMessage( messages, collection, "blocking", "Target unit #id# is missing targetPath", id ); blocking++; }
+					else {
+						var normalizedTargetPath = lCase( replace( itemPath, "\", "/", "all" ) );
+						// A ColdBox handler holds many actions, so several units legitimately
+						// share one handler file as long as each names a distinct action.
+						// Keying uniqueness on the path alone forced one handler per legacy
+						// page, which is not how a ColdBox application is laid out.
+						var unitAction = lCase( safeTrim( item.action ?: "" ) );
+						var targetPathKey = len( unitAction ) ? normalizedTargetPath & "##" & unitAction : normalizedTargetPath;
+						if ( seenTargetPaths.keyExists( targetPathKey ) ) {
+							var duplicateMessage = len( unitAction )
+								? "Target path #itemPath# action #unitAction# is proposed more than once"
+								: "Target path #itemPath# is proposed more than once";
+							addMessage( messages, collection, "blocking", duplicateMessage, id );
+							blocking++;
+						}
+						else seenTargetPaths[ targetPathKey ] = id;
+					}
+				}
+				if ( [ "unitLinks", "routeContracts", "dbFindings", "dbTransitions" ].contains( collection ) ) {
+					var refs = item.evidenceRefs ?: item.evidence ?: [];
+					if ( !isArray( refs ) || !refs.len() ) {
+						addMessage( messages, collection, evidenceLevelName, "Item #id# has no evidence references", id );
+						if ( softEvidence ) warnings++; else blocking++;
+					}
+				}
+			}
+		}
+		var contextIds = {};
+		for ( var contextItem in ( isArray( target.contexts ?: "" ) ? target.contexts : [] ) ) {
+			var contextId = safeTrim( contextItem.id ?: contextItem.itemId ?: "" );
+			if ( len( contextId ) ) contextIds[ contextId ] = true;
+			if ( !isArray( contextItem.evidenceRefs ?: contextItem.evidence ?: "" ) || !( contextItem.evidenceRefs ?: contextItem.evidence ?: [] ).len() ) {
+				addMessage( messages, "target.contexts", evidenceLevelName, "Context #contextId# must declare evidence references", contextId );
+				if ( softEvidence ) warnings++; else blocking++;
+			}
+			if ( structKeyExists( contextItem, "dataBoundary" ) && findNoCase( "secret", jsonSerialize( contextItem.dataBoundary ) ) ) { addMessage( messages, "target.contexts", "blocking", "Context #contextId# contains a secret data boundary", contextId ); blocking++; }
+				if ( lCase( safeTrim( contextItem.packaging ?: "" ) ) == "coldbox-module" && !variables.allowedEvidenceBasis.contains( lCase( safeTrim( contextItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.contexts", "warning", "Context #contextId# proposes a coldbox-module without a recognized evidenceBasis", contextId ); warnings++; }
+		}
+		for ( var extractItem in ( isArray( target.extracts ?: "" ) ? target.extracts : [] ) ) {
+			var extractId = safeTrim( extractItem.id ?: extractItem.itemId ?: "" );
+			var contextRef = safeTrim( extractItem.contextId ?: extractItem.context ?: "" );
+			if ( len( contextRef ) && !contextIds.keyExists( contextRef ) ) { addMessage( messages, "target.extracts", "blocking", "Extract #extractId# references an unknown context", extractId ); blocking++; }
+			if ( !len( safeTrim( extractItem.dataBoundary ?: extractItem.dataBoundaryNote ?: "" ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no data boundary declaration", extractId ); warnings++; }
+				if ( !variables.allowedEvidenceBasis.contains( lCase( safeTrim( extractItem.evidenceBasis ?: "" ) ) ) ) { addMessage( messages, "target.extracts", "warning", "Extract #extractId# has no recognized evidenceBasis", extractId ); warnings++; }
+		}
+		if ( isV2 ) {
+			var placementCoverage = isStruct( arguments.plan.placementCoverage ?: "" ) ? arguments.plan.placementCoverage : {};
+			var duplicateCoverageIds = isArray( placementCoverage.duplicateUnitIds ?: "" ) ? placementCoverage.duplicateUnitIds : [];
+			if ( duplicateCoverageIds.len() ) {
+				addMessage( messages, "target.placements", "blocking", "Placement coverage detected duplicate ownership for target units: #duplicateCoverageIds.toList( ', ' )#", "placement-coverage" );
+				blocking++;
+			}
+		}
+
+
+		var planRoutes = structKeyExists( arguments.plan, "routeContracts" ) && isArray( arguments.plan.routeContracts ) ? arguments.plan.routeContracts : [];
+		for ( var route in planRoutes ) {
+			var routeId = safeTrim( route.id ?: route.itemId ?: "" );
+			if ( !variables.allowedMethods.contains( uCase( safeTrim( route.method ?: "" ) ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route method is invalid", routeId ); blocking++; }
+			else if ( uCase( safeTrim( route.method ?: "" ) ) == "UNKNOWN" ) { addMessage( messages, "routeContracts", "warning", "Route method remains unknown and requires source verification", routeId ); warnings++; }
+			if ( !safeRoutePath( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route path must be a safe absolute application path", routeId ); blocking++; }
+			if ( !len( safeTrim( route.targetUnitId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a targetUnitId", routeId ); blocking++; }
+			if ( !len( safeTrim( route.unitLinkId ?: "" ) ) ) { addMessage( messages, "routeContracts", "blocking", "Route must reference a unitLinkId", routeId ); blocking++; }
+			for ( var requiredKey in [ "request", "response", "auth", "sideEffects", "rollback", "evidence" ] ) if ( !structKeyExists( route, requiredKey ) ) { addMessage( messages, "routeContracts", "blocking", "Route is missing #requiredKey#", routeId ); blocking++; }
+			if ( structKeyExists( route, "samplePath" ) && safeTrim( route.samplePath ?: "" ) != safeTrim( route.path ?: "" ) ) { addMessage( messages, "routeContracts", "blocking", "Route samplePath does not match its path", routeId ); blocking++; }
+			if ( !isArray( route.evidence ?: "" ) || !route.evidence.len() ) { addMessage( messages, "routeContracts", "blocking", "Route has no evidence references", routeId ); blocking++; }
+		}
+
+		var planSamples = structKeyExists( arguments.plan, "samples" ) && isArray( arguments.plan.samples ) ? arguments.plan.samples : [];
+		for ( var sample in planSamples ) {
+			var serializedSample = jsonSerialize( sample );
+			var sampleId = safeTrim( sample.id ?: sample.itemId ?: "" );
+			if ( !len( safeTrim( sample.sampleKind ?: "" ) ) || !len( safeTrim( sample.targetPath ?: sample.path ?: "" ) ) ) { addMessage( messages, "samples", "blocking", "Sample needs sampleKind and targetPath", sampleId ); blocking++; }
+			if ( !safeRelativePath( sample.targetPath ?: sample.path ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample path is unsafe", sampleId ); blocking++; }
+			if ( !isArray( sample.relatedItemIds ?: "" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare relatedItemIds", sampleId ); blocking++; }
+			if ( !structKeyExists( sample, "irreversible" ) ) { addMessage( messages, "samples", "blocking", "Sample must declare irreversible safety", sampleId ); blocking++; }
+			var sampleLanguage = lCase( safeTrim( sample.language ?: "" ) );
+			var sampleExtension = lCase( listLast( scalarString( sample.targetPath ?: sample.path ?: "" ), "." ) );
+			if ( sampleLanguage == "boxlang" && ![ "bx", "bxm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "BoxLang sample path must end in .bx or .bxm", sampleId ); blocking++; }
+			if ( sampleLanguage == "cfml" && ![ "cfc", "cfm" ].contains( sampleExtension ) ) { addMessage( messages, "samples", "blocking", "CFML sample path must end in .cfc or .cfm", sampleId ); blocking++; }
+			if ( sampleLanguage == "sql" && sampleExtension != "sql" ) { addMessage( messages, "samples", "blocking", "SQL sample path must end in .sql", sampleId ); blocking++; }
+			if ( findNoCase( "secret", serializedSample ) || reFindNoCase( "(?i)(api[_-]?key|password|authorization)\\s*[:=]", serializedSample ) ) { addMessage( messages, "samples", "blocking", "Sample contains a possible secret", sampleId ); blocking++; }
+			if ( len( serializedSample ) > 20000 ) { addMessage( messages, "samples", "blocking", "Sample exceeds the 20,000 character safety limit", sampleId ); blocking++; }
+		}
+
+		var planTransitions = structKeyExists( arguments.plan, "dbTransitions" ) && isArray( arguments.plan.dbTransitions ) ? arguments.plan.dbTransitions : [];
+		var schemaData = structKeyExists( arguments.context, "schemaPack" ) && isStruct( arguments.context.schemaPack )
+			? arguments.context.schemaPack
+			: ( isStruct( arguments.plan.schemaEvidence ?: "" ) ? arguments.plan.schemaEvidence : {} );
+		var databaseReport = validateDatabaseClaims( arguments.plan.dbFindings ?: [], schemaData, messages );
+		blocking += databaseReport.blocking;
+		warnings += databaseReport.warnings;
+		var transitionReport = validateTransitions( planTransitions, messages, softEvidence );
+		blocking += transitionReport.blocking;
+		warnings += transitionReport.warnings;
+		var phases = structKeyExists( arguments.plan, "roadmapPhases" ) && isArray( arguments.plan.roadmapPhases ) ? arguments.plan.roadmapPhases : [];
+		if ( !phases.len() ) { addMessage( messages, "roadmap", "warning", "No roadmap phases were generated" ); warnings++; }
+		var phaseIndex = {};
+		for ( var phasePosition = 1; phasePosition <= phases.len(); phasePosition++ ) phaseIndex[ phases[ phasePosition ].id ?: phases[ phasePosition ].itemId ?: "" ] = phasePosition;
+		for ( var phasePosition = 1; phasePosition <= phases.len(); phasePosition++ ) {
+			var phase = phases[ phasePosition ];
+			for ( var dependency in ( isArray( phase.dependencies ?: "" ) ? phase.dependencies : [] ) ) {
+				if ( !phaseIndex.keyExists( dependency ) ) { addMessage( messages, "roadmapPhases", "blocking", "Roadmap dependency #dependency# is unknown" ); blocking++; }
+				else if ( phaseIndex[ dependency ] >= phasePosition ) { addMessage( messages, "roadmapPhases", "blocking", "Roadmap dependency #dependency# must precede its phase" ); blocking++; }
+			}
+			for ( var requiredKey in [ "exitCriteria", "rollback", "parityIntent" ] ) if ( !structKeyExists( phase, requiredKey ) ) { addMessage( messages, "roadmapPhases", "warning", "Roadmap phase is missing #requiredKey#" ); warnings++; }
+		}
+		if ( ( coverageData.truncated ?: false ) == true || ( isStruct( coverageData.repository ?: "" ) && coverageData.repository.truncation ?: false ) == true ) { addMessage( messages, "coverage", "warning", "Repository or schema evidence was truncated" ); warnings++; }
+		if ( ( coverageData.unresolvedCount ?: 0 ) > 0 || ( isArray( inventoryData.unresolved ?: "" ) && inventoryData.unresolved.len() ) ) { addMessage( messages, "coverage", "warning", "Unresolved evidence remains visible in the plan" ); warnings++; }
+
+		var sampleContractReport = validateSampleContract( arguments.plan, messages );
+		warnings += sampleContractReport.warnings;
+
+		var actionabilityReport = validateActionability( arguments.plan, arguments.context, messages );
+		blocking += actionabilityReport.blocking;
+		warnings += actionabilityReport.warnings;
+
+		var level = blocking ? "blocking" : ( warnings ? "warning" : "structural" );
+		return {
+			ok: blocking == 0, blocking: blocking, warnings: warnings, blockingCount: blocking, warningCount: warnings,
+			counts: { blocking: blocking, warnings: warnings, total: messages.len() }, messages: messages,
+			validationLevel: level, status: level, overallStatus: level,
+			levels: { structural: blocking == 0 ? "structurally-valid" : "structurally-invalid", evidence: evidenceLevel( messages ), syntax: syntaxLevel( arguments.plan ), dialect: dialectLevel( arguments.plan ), human: "human-unreviewed" }
+		};
+	}
+
+	private struct function validateSampleContract( required struct plan, required array messages ) {
+		var report = { warnings: 0 };
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var currentPhase = {};
+		for ( var phase in phases ) {
+			if ( phase.currentSlice ?: false ) {
+				currentPhase = phase;
+				break;
+			}
+		}
+		if ( !structCount( currentPhase ) && phases.len() ) currentPhase = phases[ 1 ];
+		var sliceUnitIds = {};
+		for ( var unitId in ( isArray( currentPhase.unitIds ?: "" ) ? currentPhase.unitIds : [] ) ) {
+			sliceUnitIds[ safeTrim( unitId ) ] = true;
+		}
+		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		for ( var unit in targetUnits ) {
+			var id = safeTrim( unit.id ?: unit.itemId ?: "" );
+			if ( structCount( sliceUnitIds ) && !sliceUnitIds.keyExists( id ) ) continue;
+			var layer = lCase( safeTrim( unit.layer ?: unit.kind ?: "" ) );
+			if ( ![ "handler", "service" ].contains( layer ) ) continue;
+			var sample = toString( unit.sampleCode ?: "" );
+			if ( !len( safeTrim( sample ) ) ) continue;
+			var hasClass = reFindNoCase( "\b(class|component)\b", sample ) > 0;
+			var hasDi = reFindNoCase( "\bproperty\b", sample ) > 0 || findNoCase( "inject", sample ) > 0 || findNoCase( "no DI", sample ) > 0 || findNoCase( "no di", sample ) > 0;
+			if ( !hasClass || !hasDi ) {
+				addMessage( arguments.messages, "sample-contract", "warning", "Current-slice #layer# #id# sample should be a class/component skeleton with DI (or an explicit no DI note)", id );
+				report.warnings++;
+			}
+		}
+		return report;
+	}
+
+	private void function addMessage( required array messages, required string category, required string level, required string text, any itemId = "" ) {
+		var item = { category: arguments.category, level: arguments.level, message: arguments.text, validationLevel: arguments.level };
+		var normalizedId = safeTrim( arguments.itemId );
+		if ( len( normalizedId ) ) item.itemId = normalizedId;
+		arguments.messages.append( item );
+	}
+
+	private struct function validateDatabaseClaims( required any findings, required struct schema, required array messages ) {
+		var report = { blocking: 0, warnings: 0 };
+		if ( !isArray( arguments.findings ) ) return report;
+		var coverage = lCase( safeTrim( arguments.schema.coverage ?: "absent" ) );
+		var schemaObjects = {};
+		for ( var table in arguments.schema.tables ?: [] ) {
+			var tableName = lCase( safeTrim( table.name ?: "" ) );
+			if ( len( tableName ) ) schemaObjects[ tableName ] = true;
+		}
+		for ( var column in arguments.schema.columns ?: [] ) {
+			var columnName = lCase( safeTrim( column.name ?: "" ) );
+			var columnTable = lCase( safeTrim( column.table ?: "" ) );
+			if ( len( columnTable ) && len( columnName ) ) schemaObjects[ columnTable & "." & columnName ] = true;
+		}
+		for ( var collection in [ "constraints", "indexes", "routines" ] ) {
+			for ( var schemaItem in arguments.schema[ collection ] ?: [] ) {
+				var schemaName = lCase( safeTrim( schemaItem.name ?: "" ) );
+				if ( len( schemaName ) ) schemaObjects[ schemaName ] = true;
+			}
+		}
+		for ( var finding in arguments.findings ) {
+			if ( !isStruct( finding ) ) continue;
+			var findingId = safeTrim( finding.id ?: finding.itemId ?: "" );
+			var category = lCase( safeTrim( finding.category ?: "" ) );
+			var objectRef = lCase( safeTrim( finding.objectRef ?: "" ) );
+			var inferenceLimit = [ "coverage", "inference-limit", "inference_limit" ].contains( category )
+				|| [ "", "unknown", "none", "not-observed", "not_observed" ].contains( objectRef );
+			if ( coverage == "absent" ) {
+				if ( !inferenceLimit ) {
+					addMessage( arguments.messages, "dbFindings", "blocking", "Database finding #findingId# names an object even though DDL was not observed", findingId );
+					report.blocking++;
+				}
+				continue;
+			}
+			if ( [ "type", "constraint", "index", "design" ].contains( category ) && !schemaObjectMatches( objectRef, schemaObjects ) ) {
+				addMessage( arguments.messages, "dbFindings", "blocking", "Database finding #findingId# is not backed by an observed schema object", findingId );
+				report.blocking++;
+			}
+		}
+		return report;
+	}
+
+	private boolean function schemaObjectMatches( required string objectRef, required struct schemaObjects ) {
+		if ( !len( arguments.objectRef ) ) return false;
+		var normalized = reReplace( arguments.objectRef, "[^a-z0-9_.$-]+", " ", "all" );
+		for ( var schemaName in arguments.schemaObjects ) {
+			if ( normalized == schemaName || find( schemaName, normalized ) ) return true;
+		}
+		return false;
+	}
+
+	/** Check the common cross-collection IDs without assuming provider-specific
+	 * field names. Empty optional references remain valid; supplied references
+	 * must resolve to an item in the immutable plan artifact. */
+	private struct function validateActionability( required struct plan, required struct context, required array messages ) {
+		var report = { blocking: 0, warnings: 0 };
+		var metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		var summary = isStruct( arguments.plan.generationSummary ?: "" ) ? arguments.plan.generationSummary : {};
+		var incompleteStages = isArray( summary.incompleteStages ?: "" ) ? summary.incompleteStages : [];
+		var generationErrors = isArray( arguments.plan.generationErrors ?: "" ) ? arguments.plan.generationErrors : [];
+		var generationNotes = isArray( arguments.plan.generationNotes ?: "" ) ? arguments.plan.generationNotes : [];
+		var phases = isArray( arguments.plan.roadmapPhases ?: "" ) ? arguments.plan.roadmapPhases : [];
+		var samples = isArray( arguments.plan.samples ?: "" ) ? arguments.plan.samples : [];
+		var dbFindings = isArray( arguments.plan.dbFindings ?: "" ) ? arguments.plan.dbFindings : [];
+		var dbTransitions = isArray( arguments.plan.dbTransitions ?: "" ) ? arguments.plan.dbTransitions : [];
+		var migrationStepCount = 0;
+		for ( var phase in phases ) {
+			migrationStepCount += isArray( phase.migrationSteps ?: "" ) ? phase.migrationSteps.len() : 0;
+		}
+		var roadmapSynthesized = lCase( safeTrim( metadata.roadmapSource ?: summary.roadmapSource ?: "" ) ) == "synthesized";
+		var architectureSynthesized = lCase( safeTrim( metadata.architectureSource ?: summary.architectureSource ?: "" ) ) == "synthesized";
+		var databaseIncomplete = incompleteStages.contains( "database" )
+			|| generationErrors.some( ( item ) => ( item.role ?: "" ) == "modernization-database" && !isInformationalValidationMessage( item ) );
+		var schemaPresent = schemaEvidencePresent( arguments.plan, arguments.context );
+		var fallbackCount = 0;
+		var failedGapCount = 0;
+		for ( var note in generationNotes ) {
+			if ( ( note.message ?: "" ) == "inventory-coverage-fallback" ) fallbackCount = val( note.count ?: 0 );
+			if ( ( note.message ?: "" ) == "failed-shard-gaps-retained" ) failedGapCount = val( note.count ?: 0 );
+		}
+		var targetUnits = isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		var stubDominates = fallbackCount > 0 && targetUnits.len() > 0 && fallbackCount >= ceiling( targetUnits.len() * 0.25 );
+		var shardReport = isStruct( metadata.applicationShards ?: "" ) ? metadata.applicationShards : {};
+		var criticalShardFailures = val( shardReport.failed ?: 0 ) > 0 || failedGapCount > 0;
+
+		if ( phases.len() > 0 && samples.len() == 0 && migrationStepCount == 0 && ( roadmapSynthesized || ( databaseIncomplete && schemaPresent ) ) ) {
+			addMessage( arguments.messages, "actionability", "blocking", "Plan has no samples or migration steps while roadmap was synthesized or database remained incomplete with schema evidence" );
+			report.blocking++;
+		}
+		if ( architectureSynthesized && generationErrors.some( ( item ) => ( item.role ?: "" ) == "modernization-architecture" && !isInformationalValidationMessage( item ) ) ) {
+			addMessage( arguments.messages, "architecture", "blocking", "Architecture packaging was synthesized after provider or budget failure" );
+			report.blocking++;
+		} else if ( architectureSynthesized && roadmapSynthesized && samples.len() == 0 && migrationStepCount == 0 ) {
+			addMessage( arguments.messages, "actionability", "warning", "Architecture and roadmap were both synthesized without actionable samples or migration steps" );
+			report.warnings++;
+		}
+		if ( schemaPresent && databaseIncomplete && !dbFindings.len() && !dbTransitions.len() ) {
+			addMessage( arguments.messages, "database", "blocking", "Database stage failed or was empty despite observed schema evidence" );
+			report.blocking++;
+		}
+		if ( stubDominates && criticalShardFailures ) {
+			addMessage( arguments.messages, "coverage", "blocking", "Coverage-fallback stubs dominate after failed application shards; continue or retry before treating maps as complete" );
+			report.blocking++;
+		} else if ( failedGapCount > 0 ) {
+			addMessage( arguments.messages, "coverage", "warning", "Failed application shard paths remain as incomplete gaps for continue/resume" );
+			report.warnings++;
+		}
+		return report;
+	}
+
+	private boolean function schemaEvidencePresent( required struct plan, required struct context ) {
+		var schema = structKeyExists( arguments.context, "schemaPack" ) && isStruct( arguments.context.schemaPack )
+			? arguments.context.schemaPack
+			: ( isStruct( arguments.plan.schemaEvidence ?: "" ) ? arguments.plan.schemaEvidence : {} );
+		if ( !isStruct( schema ) || !schema.count() ) return false;
+		if ( ( schema.coverage ?: "absent" ) == "absent" ) return false;
+		if ( isArray( schema.objects ?: "" ) && schema.objects.len() ) return true;
+		if ( isArray( schema.tables ?: "" ) && schema.tables.len() ) return true;
+		if ( isStruct( schema.database ?: "" ) && isArray( schema.database.tables ?: "" ) && schema.database.tables.len() ) return true;
+		if ( isNumeric( schema.tableCount ?: "" ) && val( schema.tableCount ) > 0 ) return true;
+		return ( schema.coverage ?: "" ) == "partial-ddl" || ( schema.coverage ?: "" ) == "complete";
+	}
+
+	private boolean function isInformationalValidationMessage( required any item ) {
+		if ( !isStruct( arguments.item ) ) return false;
+		var severity = lCase( safeTrim( arguments.item.severity ?: "" ) );
+		if ( severity == "info" || severity == "note" ) return true;
+		var message = lCase( safeTrim( arguments.item.message ?: "" ) );
+		return left( message, 12 ) == "synthesized-" || message == "cost-reserved-for-roadmap";
+	}
+
+	private boolean function isColdBoxConventionPath( required any path ) {
+		var normalized = lCase( replace( safeTrim( arguments.path ), "\", "/", "all" ) );
+		return reFindNoCase( "(^|/)router\.(?:bx|cfc)$", normalized ) > 0
+			|| reFindNoCase( "(^|/)(?:coldbox|application)\.(?:bx|cfc)$", normalized ) > 0;
+	}
+
+	private boolean function safeRelativePath( required any path ) {
+		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
+		if ( !len( normalized ) || find( "..", normalized ) || reFind( "^(?:[A-Za-z]:|/|\\\\)", normalized ) ) return false;
+		return true;
+	}
+	private boolean function safeRoutePath( required any path ) {
+		var normalized = replace( safeTrim( arguments.path ), "\", "/", "all" );
+		return reFind( "^/", normalized ) && !find( "..", normalized ) && !reFind( "^//", normalized );
+	}
+
+	private struct function validateTransitions( required any transitions, required array messages, boolean softEvidence = false ) {
+		var output = { blocking: 0, warnings: 0 };
+		var previous = 0;
+		var softLevel = arguments.softEvidence ? "warning" : "blocking";
+		for ( var transition in ( isArray( arguments.transitions ) ? arguments.transitions : [] ) ) {
+			var operation = lCase( safeTrim( transition.operation ?: transition.phase ?: "" ) );
+			if ( !variables.allowedTransitionOperations.contains( operation ) ) {
+				// Unknown/empty ops on partial drafts are review items, not hard blockers.
+				addMessage( arguments.messages, "dbTransitions", softLevel, "Database transition has an invalid operation" );
+				if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+			}
+			var order = isNumeric( transition.order ?: "" ) ? int( transition.order ) : 0;
+			if ( order && order < previous ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition order must be monotonic" ); output.blocking++; }
+			if ( order ) previous = order;
+			if ( transition.irreversible ?: false || transition.forwardOnly ?: false ) { addMessage( arguments.messages, "dbTransitions", "warning", "Database transition is forward-only and requires rollback review" ); output.warnings++; }
+			if ( !structKeyExists( transition, "rollback" ) ) { addMessage( arguments.messages, "dbTransitions", "warning", "Database transition is missing rollback intent" ); output.warnings++; }
+			if ( reFindNoCase( "query[.]?execute", jsonSerialize( transition ) ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Database transition must not execute query text during validation" ); output.blocking++; }
+			var migrationText = toString( transition.migrationCode ?: transition.sampleMigration ?: transition.code ?: transition.migration ?: "" );
+			var migrationPath = toString( transition.migrationPath ?: transition.filePath ?: "" );
+			if ( len( migrationText ) || len( migrationPath ) ) {
+				var transitionId = transition.id ?: transition.itemId ?: "";
+				if ( len( migrationText ) && reFindNoCase( "(?:password|passwd|api[_-]?key|authorization|private[_-]?key)\\s*[:=]", migrationText ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration contains a possible secret", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !safeRelativePath( migrationPath ) ) { addMessage( arguments.messages, "dbTransitions", "blocking", "Migration path must remain inside the project", transitionId ); output.blocking++; }
+				if ( len( migrationPath ) && !reFind( "[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{6}.*\.bx$", replace( migrationPath, "\", "/", "all" ) ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration path must use a cfmigrations timestamp", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
+				if ( len( migrationText ) && !reFindNoCase( "function\s+up\s*\(", migrationText ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration is missing up(schema, query)", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
+				if ( len( migrationText ) && !reFindNoCase( "function\s+down\s*\(", migrationText ) ) {
+					addMessage( arguments.messages, "dbTransitions", softLevel, "Migration is missing down(schema, query)", transitionId );
+					if ( arguments.softEvidence ) output.warnings++; else output.blocking++;
+				}
+			}
+		}
+		return output;
+	}
+
+	/**
+	 * Partial coverage / synthesized packaging should stay needs-review without
+	 * drowning the gate summary in evidence blockers. Real structural failures
+	 * (unsafe paths, secrets, query.execute) remain blocking.
+	 */
+	private boolean function isSoftEvidencePlan( required struct plan, required struct context ) {
+		if ( arguments.context.softEvidence ?: false ) return true;
+		var metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		if ( ( metadata.architectureSource ?: "" ) == "synthesized" ) return true;
+		if ( ( metadata.roadmapSource ?: "" ) == "synthesized" ) return true;
+		if ( metadata.coverageAccumulated ?: false ) return true;
+		var summary = isStruct( arguments.plan.generationSummary ?: "" ) ? arguments.plan.generationSummary : {};
+		if ( ( summary.status ?: "" ) == "partial_failure" ) return true;
+		var coverage = isStruct( arguments.plan.coverage ?: "" ) ? arguments.plan.coverage : {};
+		if ( ( coverage.complete ?: true ) == false ) return true;
+		if ( isStruct( coverage.llm ?: "" ) && ( coverage.llm.complete ?: true ) == false ) return true;
+		return false;
+	}
+
+	private string function evidenceLevel( required array messages ) {
+		for ( var item in arguments.messages ) if ( [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "routeContracts", "dbFindings", "dbTransitions", "samples" ].contains( item.category ) && item.level == "blocking" ) return "evidence-unchecked";
+		return "evidence-grounded";
+	}
+	private string function syntaxLevel( required struct plan ) { return "syntax-unchecked"; }
+	private string function dialectLevel( required struct plan ) { return structKeyExists( arguments.plan, "dbTransitions" ) && isArray( arguments.plan.dbTransitions ) && arguments.plan.dbTransitions.len() ? "dialect-checked" : "dialect-unchecked"; }
+
+	/**
+	 * Coerce provider/shard-merged values to a single string before trim.
+	 * Arrays (common after shard merge) yield the first non-empty simple item.
+	 */
+	private string function scalarString( required any value ) {
+		if ( isNull( arguments.value ) ) return "";
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) {
+				if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			}
+			return "";
+		}
+		return "";
+	}
+
+	private string function safeTrim( required any value ) {
+		return trim( scalarString( arguments.value ) );
+	}
+
+}

@@ -1,0 +1,123 @@
+class extends="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe( "AIProviderProfileService", () => {
+			beforeEach( () => setup() );
+
+			it( "creates a profile, masks the api key, and auto-activates the first profile for a tenant", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantId = "test-profile-create";
+				try {
+					var created = service.create( tenantId, {
+						name    : "My OpenRouter",
+						provider: "openai-compatible",
+						baseUrl : "https://openrouter.ai/api/v1",
+						model   : "deepseek/deepseek-v4-flash",
+						apiKey  : "sk-1234567890abcdef"
+					} );
+
+					expect( created.name ).toBe( "My OpenRouter" );
+					expect( created.apiKey ).toBe( "****cdef" );
+					expect( created.hasApiKey ).toBeTrue();
+					expect( created.isActive ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "does not auto-activate a second profile added for the same tenant", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantId = "test-profile-second";
+				try {
+					var first = service.create( tenantId, { name: "First", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } );
+					var second = service.create( tenantId, { name: "Second", provider: "openai-compatible", baseUrl: "https://b.example.invalid/v1", model: "m2", apiKey: "k2" } );
+
+					expect( first.isActive ).toBeTrue();
+					expect( second.isActive ).toBeFalse();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "activate switches which single profile is active", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantId = "test-profile-activate";
+				try {
+					var first = service.create( tenantId, { name: "First", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } );
+					var second = service.create( tenantId, { name: "Second", provider: "openai-compatible", baseUrl: "https://b.example.invalid/v1", model: "m2", apiKey: "k2" } );
+
+					service.activate( tenantId, second.id );
+
+					expect( service.get( tenantId, first.id ).isActive ).toBeFalse();
+					expect( service.get( tenantId, second.id ).isActive ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "update leaves the stored api key untouched when apiKey is omitted from the input", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantId = "test-profile-update";
+				try {
+					var created = service.create( tenantId, { name: "First", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "sk-originalkey" } );
+
+					service.update( tenantId, created.id, { name: "Renamed", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1" } );
+
+					var reloaded = service.get( tenantId, created.id );
+					expect( reloaded.name ).toBe( "Renamed" );
+					expect( reloaded.apiKey ).toBe( "****lkey" );
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "deleting the active profile promotes a remaining profile to active", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantId = "test-profile-delete-active";
+				try {
+					var first = service.create( tenantId, { name: "First", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } );
+					var second = service.create( tenantId, { name: "Second", provider: "openai-compatible", baseUrl: "https://b.example.invalid/v1", model: "m2", apiKey: "k2" } );
+
+					service.delete( tenantId, first.id );
+
+					expect( service.get( tenantId, second.id ).isActive ).toBeTrue();
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id = :tenantId", { tenantId: tenantId } );
+				}
+			} );
+
+			it( "rejects a provider outside the allowlist", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				expect(
+					() => service.create( "test-profile-invalid-provider", { name: "Bad", provider: "not-a-real-provider", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } )
+				).toThrow( "ValidationException" );
+			} );
+
+			it( "throws a not-found error for an unknown profile id", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				expect( () => service.get( "test-profile-missing", "nonexistent-id" ) ).toThrow( "AIProviderProfileNotFound" );
+			} );
+
+			it( "keeps profiles scoped to their own tenant", () => {
+				var service = getInstance( "AIProviderProfileService" );
+				var tenantA = "test-profile-tenant-a";
+				var tenantB = "test-profile-tenant-b";
+				try {
+					var created = service.create( tenantA, { name: "Only in A", provider: "openai-compatible", baseUrl: "https://a.example.invalid/v1", model: "m1", apiKey: "k1" } );
+					expect( service.list( tenantB ) ).toHaveLength( 0 );
+					expect( () => service.get( tenantB, created.id ) ).toThrow( "AIProviderProfileNotFound" );
+				} finally {
+					queryExecute( "DELETE FROM ai_provider_profiles WHERE tenant_id IN ( :a, :b )", { a: tenantA, b: tenantB } );
+				}
+			} );
+		} );
+	}
+}

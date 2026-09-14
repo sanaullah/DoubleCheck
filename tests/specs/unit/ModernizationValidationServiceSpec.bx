@@ -1,0 +1,491 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization plan validation", () => {
+			it( "blocks malformed contracts and reports counts", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( { schemaVersion: "wrong", unitLinks: [] } );
+				expect( report.ok ).toBeFalse();
+				expect( report.blocking ).toBeGT( 0 );
+				expect( report.messages ).notToBeEmpty();
+			} );
+
+			it( "accepts a complete route contract with stable identity", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" }, coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-health", filePath: "legacy/health.cfm" } ] },
+					schemaEvidence: {},
+					target: { units: [ {
+						id: "target-health", itemFingerprint: "target-fp", targetPath: "app/handlers/Health.bx",
+						sourcePath: "legacy/health.cfm", legacyUnitIds: [ "legacy-health" ],
+						evidenceRefs: [ { filePath: "legacy/health.cfm" } ]
+					} ] },
+					unitLinks: [ {
+						id: "link-health", itemFingerprint: "link-fp", legacyUnitId: "legacy-health",
+						targetUnitId: "target-health", sourcePath: "legacy/health.cfm",
+						evidenceRefs: [ { filePath: "legacy/health.cfm" } ]
+					} ],
+					dbFindings: [], dbTransitions: [],
+					roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp", unitIds: [ "target-health" ], routeIds: [ "route-1" ] } ],
+					samples: [], validation: {}, decisions: [],
+					routeContracts: [ {
+						id: "route-1", itemFingerprint: "route-fp", method: "GET", path: "/health",
+						targetUnitId: "target-health", unitLinkId: "link-health",
+						request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {},
+						evidence: [ { filePath: "legacy/health.cfm" } ]
+					} ]
+				} );
+				expect( report.ok ).toBeTrue( jsonSerialize( report.messages ) );
+				expect( report.blocking ).toBe( 0 );
+			} );
+
+			it( "blocks unsafe target paths, duplicate identities and invalid migration phases", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1", metadata: { runtime: { runtime: "boxlang" } }, coverage: {}, inventory: { units: [] }, schemaEvidence: {},
+					target: { units: [ { id: "same", itemFingerprint: "fp", targetPath: "../escape.cfc" }, { id: "same", itemFingerprint: "fp2", targetPath: "app/ok.bx" } ] },
+					unitLinks: [], dbFindings: [], dbTransitions: [ { id: "migration-1", itemFingerprint: "m", operation: "drop-table", order: 1 } ], routeContracts: [], roadmapPhases: [], samples: []
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.blocking ).toBeGT( 2 );
+				expect( report.levels.dialect ).toBe( "dialect-checked" );
+			} );
+
+			it( "accepts a cfmigrations timestamp and inspects sampleMigration safety", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: {}, coverage: {}, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [ {
+						id: "finding-1", itemFingerprint: "finding-fp", evidenceRefs: [ "schema.sql##L1" ]
+					} ],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp", dbFindingId: "finding-1",
+						operation: "expand", order: 1,
+						migrationPath: "resources/database/migrations/2025_03_20_120000_change.bx",
+						evidenceRefs: [ "schema.sql##L1" ],
+						sampleMigration: "component { function up( schema, query ) { query.execute( ""ALTER TABLE test ADD x INT"" ); } function down( schema, query ) {} }"
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.messages.some( ( item ) => findNoCase( "cfmigrations timestamp", item.message ?: "" ) ) ).toBeFalse();
+				expect( report.messages.some( ( item ) => findNoCase( "must not execute query text", item.message ?: "" ) ) ).toBeTrue();
+			} );
+
+			it( "keeps unresolved and truncated coverage visible as warnings", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1", metadata: {}, coverage: { truncated: true, unresolvedCount: 2 }, assumptions: [], signals: [], inventory: { unresolved: [ { id: "u" } ] }, schemaEvidence: {}, target: { units: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], roadmapPhases: [ { id: "phase-1", itemFingerprint: "phase-fp" } ], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.ok ).toBeTrue();
+				expect( report.warnings ).toBeGT( 0 );
+				expect( report.messages.some( ( item ) => item.category == "coverage" ) ).toBeTrue();
+			} );
+
+			it( "accepts target units backed by legacy ids, source lists, and unit links", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [], signals: [], schemaEvidence: {},
+					inventory: { units: [
+						{ id: "lu-a", filePath: "legacy/a.cfm" },
+						{ id: "lu-b", filePath: "legacy/b.cfm" }
+					] },
+					target: { units: [
+						{
+							id: "tu-list", itemFingerprint: "tu-list-fp", targetPath: "app/handlers/List.bx",
+							sourcePath: "legacy/missing.cfm, legacy/a.cfm"
+						},
+						{
+							id: "tu-link", itemFingerprint: "tu-link-fp", targetPath: "app/handlers/Linked.bx",
+							sourcePath: "legacy/missing.cfm", legacyUnitIds: [ "lu-b" ]
+						}
+					], contexts: [], extracts: [] },
+					unitLinks: [ {
+						id: "link-b", itemFingerprint: "link-b-fp", legacyUnitId: "lu-b", targetUnitId: "tu-link",
+						evidenceRefs: [ { filePath: "legacy/b.cfm" } ]
+					} ],
+					dbFindings: [], dbTransitions: [], routeContracts: [],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "phase-fp", unitIds: [ "tu-list", "tu-link" ],
+						routeIds: [], sampleIds: [], dbFindingIds: [], transitionIds: []
+					} ],
+					samples: [], validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "target.units" && findNoCase( "not inventory-backed", item.message ?: "" )
+				) ).toBeFalse();
+				expect( report.blocking ).toBe( 0 );
+			} );
+
+			it( "warns when current-slice handler sample is a free function without class DI", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					schemaVersion: "modernization-plan-v1", version: "1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [],
+					inventory: { units: [ { id: "lu-1", path: "dashboard/crime.cfm" } ] },
+					schemaEvidence: {}, signals: [],
+					target: { units: [ {
+						id: "tu-1", targetPath: "app/handlers/Crime.bx", layer: "handler",
+						sourcePath: "dashboard/crime.cfm", legacyUnitIds: [ "lu-1" ],
+						evidenceRefs: [ { filePath: "dashboard/crime.cfm" } ],
+						itemFingerprint: "fp1", sampleCode: "function edit(event,rc,prc){}"
+					} ], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [],
+					roadmapPhases: [ { id: "p1", currentSlice: true, unitIds: [ "tu-1" ], itemFingerprint: "pfp" } ],
+					samples: [], validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some( ( m ) => ( m.category ?: "" ) == "sample-contract" ) ).toBeTrue();
+			} );
+
+			it( "blocks named schema claims when DDL was not observed", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1",
+					metadata: {},
+					coverage: {},
+					inventory: {},
+					schemaEvidence: { coverage: "absent" },
+					target: { units: [] },
+					unitLinks: [],
+					dbFindings: [ {
+						id: "db-invented",
+						itemFingerprint: "db-invented-fp",
+						category: "index",
+						objectRef: "orders.customer_id",
+						evidenceRefs: [ { filePath: "legacy/query.cfm" } ]
+					} ],
+					dbTransitions: [],
+					routeContracts: [],
+					roadmapPhases: [],
+					samples: []
+				} );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "dbFindings" && findNoCase( "DDL was not observed", item.message ?: "" )
+				) ).toBeTrue();
+			} );
+
+			it( "requires provenance classes when the plan declares the provenance contract", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					schemaVersion: "modernization-plan-v1",
+					metadata: { provenanceContract: { version: "modernization-provenance-v1" } },
+					coverage: {},
+					inventory: {},
+					schemaEvidence: {},
+					target: { units: [ { id: "tu-1", itemFingerprint: "tu-fp", targetPath: "app/handlers/Test.bx", newProposal: true, proposalReason: "test" } ] },
+					unitLinks: [],
+					dbFindings: [],
+					dbTransitions: [],
+					routeContracts: [],
+					roadmapPhases: [],
+					samples: []
+				} );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "target.units" && findNoCase( "provenanceClass", item.message ?: "" )
+				) ).toBeTrue();
+			} );
+
+
+
+
+			it( "does not warn a deterministically-derived (synthesized) roadmap phase for missing migration steps", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-crime", filePath: "legacy/crime.cfm" } ] },
+					schemaEvidence: {},
+					target: { units: [ { id: "target-crime", itemFingerprint: "fp-crime", targetPath: "app/handlers/Crime.bx" } ], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [ { id: "phase-crime", itemFingerprint: "fp-phase", unitIds: [ "target-crime" ], provenanceClass: "deterministically-derived" } ],
+					validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some(
+					( item ) => ( item.category ?: "" ) == "roadmapPhases" && findNoCase( "no migration guide", item.message ?: "" )
+				) ).toBeFalse();
+			} );
+
+
+
+			it( "allows ColdBox convention paths in migration steps when they are not phase units", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, targetProfile: "modern" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-crime", filePath: "legacy/crime.cfm" } ] },
+					schemaEvidence: {},
+					target: { units: [ { id: "target-crime", itemFingerprint: "fp-crime", targetPath: "app/handlers/Crime.bx" } ], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [ {
+						id: "phase-crime", itemFingerprint: "fp-phase", unitIds: [ "target-crime" ], provenanceClass: "provider-suggested",
+						migrationSteps: [ {
+							order: 1, action: "Add coexist route",
+							legacyRef: { filePath: "legacy/crime.cfm", symbolName: "listCrime" },
+							targetRef: { targetPath: "app/config/Router.bx", methodName: "configure" }
+						} ]
+					} ],
+					validation: {}, decisions: []
+				};
+				var report = service.validate( plan, { inventory: plan.inventory } );
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && findNoCase( "not among this phase's own units", item.message ?: "" ) ) ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "roadmapPhases" && findNoCase( "another roadmap phase", item.message ?: "" ) ) ).toBeFalse();
+			} );
+
+
+			it( "downgrades incomplete dbTransition evidence to warning on synthesized partial plans", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, architectureSource: "synthesized", roadmapSource: "synthesized" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [],
+					dbFindings: [ { id: "finding-1", itemFingerprint: "finding-fp" } ],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp", dbFindingId: "finding-1",
+						operation: "drop-table", order: 1
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: [],
+					generationSummary: { status: "partial_failure" }
+				} );
+				expect( report.ok ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "invalid operation", item.message ?: "" ) && ( item.level ?: "" ) == "warning" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "no evidence references", item.message ?: "" ) && ( item.level ?: "" ) == "warning" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "invalid operation", item.message ?: "" ) && ( item.level ?: "" ) == "blocking" ) ).toBeFalse();
+			} );
+
+			it( "still blocks query.execute secrets on soft-evidence plans", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { architectureSource: "synthesized" },
+					coverage: {}, assumptions: [], signals: [],
+					inventory: {}, schemaEvidence: {}, target: { units: [], contexts: [], extracts: [] },
+					unitLinks: [], dbFindings: [],
+					dbTransitions: [ {
+						id: "transition-1", itemFingerprint: "transition-fp",
+						operation: "expand", order: 1, evidenceRefs: [ "schema.sql##L1" ],
+						sampleMigration: "component { function up( schema, query ) { query.execute( ""ALTER TABLE test ADD x INT"" ); } function down( schema, query ) {} }"
+					} ],
+					routeContracts: [], roadmapPhases: [], samples: [], validation: {}, decisions: []
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => findNoCase( "must not execute query text", item.message ?: "" ) && ( item.level ?: "" ) == "blocking" ) ).toBeTrue();
+			} );
+
+			it( "does not throw when path/id/evidence fields are arrays after shard merge", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var plan = {
+					version: "modernization-plan-v1",
+					schemaVersion: [ "modernization-plan-v2", "modernization-plan-v2" ],
+					metadata: {
+						runtime: { runtime: [ "boxlang", "boxlang" ] },
+						targetProfile: [ "modern" ],
+						architectureSource: "synthesized",
+						provenanceContract: { version: [ "modernization-provenance-v1" ] }
+					},
+					coverage: { complete: false },
+					assumptions: [],
+					signals: [],
+					inventory: { units: [ { id: [ "legacy-health" ], filePath: [ "legacy/health.cfm" ] } ] },
+					schemaEvidence: {},
+					target: {
+						units: [ {
+							id: [ "target-health", "target-health" ],
+							itemId: [ "target-health" ],
+							itemFingerprint: [ "target-fp" ],
+							targetPath: [ "app/handlers/Health.bx", "app/handlers/Health.bx" ],
+							pathHint: [ "app/handlers/Health.bx" ],
+							sourcePath: [ "legacy/health.cfm" ],
+							provenanceClass: [ "provider-suggested" ],
+							proposalReason: [ "scaffold" ],
+							newProposal: true,
+							evidenceRefs: [ { filePath: [ "legacy/health.cfm" ] } ]
+						} ],
+						placements: [ {
+							id: [ "placement-main" ],
+							itemFingerprint: [ "placement-fp" ],
+							placementType: [ "main-app" ],
+							targetUnitIds: [ "target-health" ],
+							evidenceRefs: [ { filePath: "legacy/health.cfm" } ],
+							provenanceClass: [ "deterministically-derived" ],
+							gates: [ { id: [ "architecture" ], status: [ "pass" ] } ]
+						} ]
+					},
+					unitLinks: [ {
+						id: [ "link-health" ],
+						itemFingerprint: [ "link-fp" ],
+						legacyUnitId: [ "legacy-health" ],
+						targetUnitId: [ "target-health" ],
+						sourcePath: [ "legacy/health.cfm" ],
+						provenanceClass: [ "provider-suggested" ],
+						evidenceRefs: [ { filePath: [ "legacy/health.cfm" ] } ]
+					} ],
+					dbFindings: [],
+					dbTransitions: [],
+					routeContracts: [ {
+						id: [ "route-1" ],
+						itemFingerprint: [ "route-fp" ],
+						method: [ "GET" ],
+						path: [ "/health" ],
+						targetUnitId: [ "target-health" ],
+						unitLinkId: [ "link-health" ],
+						request: {}, response: {}, auth: {}, sideEffects: {}, rollback: {},
+						provenanceClass: [ "provider-suggested" ],
+						evidence: [ { filePath: [ "legacy/health.cfm" ] } ]
+					} ],
+					roadmapPhases: [ {
+						id: [ "phase-1" ],
+						itemFingerprint: [ "phase-fp" ],
+						unitIds: [ "target-health" ],
+						routeIds: [ "route-1" ],
+						provenanceClass: [ "provider-suggested" ],
+						classification: [ "migrate" ],
+						wave: [ 1 ],
+						exitCriteria: "done",
+						rollback: "revert",
+						parityIntent: "match"
+					} ],
+					samples: [],
+					validation: {},
+					decisions: []
+				};
+				var report = "";
+				try {
+					report = service.validate( plan, { inventory: plan.inventory } );
+				} catch ( any error ) {
+					fail( "validate threw on array-valued fields: #error.message#" );
+				}
+				expect( isStruct( report ) ).toBeTrue();
+				expect( structKeyExists( report, "ok" ) ).toBeTrue();
+				expect( structKeyExists( report, "blocking" ) ).toBeTrue();
+				expect( structKeyExists( report, "messages" ) ).toBeTrue();
+				expect( isArray( report.messages ) ).toBeTrue();
+				expect( structKeyExists( report, "validationLevel" ) ).toBeTrue();
+			} );
+
+			it( "blocks empty actionability when roadmap was synthesized", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, architectureSource: "synthesized", roadmapSource: "synthesized" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaEvidence: {},
+					target: {
+						units: [ { id: "target-1", itemFingerprint: "fp-1", targetPath: "app/handlers/A.bx", provenanceClass: "provider-suggested" } ],
+						placements: [ {
+							id: "placement-1", itemFingerprint: "fp-p", placementType: "main-app",
+							targetUnitIds: [ "target-1" ], evidenceRefs: [ { filePath: "legacy/a.cfm" } ],
+							provenanceClass: "deterministically-derived",
+							gates: [ { id: "architecture", status: "pass" } ]
+						} ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "fp-phase", unitIds: [ "target-1" ],
+						provenanceClass: "deterministically-derived",
+						exitCriteria: "done", rollback: "revert", parityIntent: "match"
+					} ],
+					validation: {}, decisions: [],
+					generationErrors: [ { role: "modernization-architecture", message: "budget-exceeded" }, { role: "modernization-roadmap", message: "budget-exceeded" } ],
+					generationSummary: { status: "partial_failure", incompleteStages: [ "architecture", "roadmap" ], roadmapSource: "synthesized" }
+				}, { inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] } } );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "actionability" && ( item.level ?: "" ) == "blocking" ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "architecture" && findNoCase( "synthesized after provider", item.message ?: "" ) ) ).toBeTrue();
+			} );
+
+			it( "blocks empty database stage when schema evidence is present", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate( {
+					version: "modernization-plan-v1", schemaVersion: "modernization-plan-v1",
+					metadata: { runtime: { runtime: "boxlang" }, roadmapSource: "provider" },
+					coverage: { complete: false }, assumptions: [], signals: [],
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaEvidence: { coverage: "partial-ddl", objects: [ { name: "songs" } ] },
+					target: {
+						units: [ { id: "target-1", itemFingerprint: "fp-1", targetPath: "app/handlers/A.bx", provenanceClass: "provider-suggested" } ],
+						placements: [ {
+							id: "placement-1", itemFingerprint: "fp-p", placementType: "main-app",
+							targetUnitIds: [ "target-1" ], evidenceRefs: [ { filePath: "legacy/a.cfm" } ],
+							provenanceClass: "provider-suggested",
+							gates: [ { id: "architecture", status: "pass" } ]
+						} ]
+					},
+					unitLinks: [], dbFindings: [], dbTransitions: [], routeContracts: [], samples: [ {
+						id: "sample-1", itemFingerprint: "fp-s", sampleKind: "handler", targetPath: "app/handlers/A.bx",
+						relatedItemIds: [ "target-1" ], irreversible: false, language: "boxlang", body: "class {}"
+					} ],
+					roadmapPhases: [ {
+						id: "phase-1", itemFingerprint: "fp-phase", unitIds: [ "target-1" ],
+						provenanceClass: "provider-suggested",
+						migrationSteps: [ {
+							order: 1, action: "map",
+							legacyRef: { filePath: "legacy/a.cfm" },
+							targetRef: { targetPath: "app/handlers/A.bx" }
+						} ],
+						exitCriteria: "done", rollback: "revert", parityIntent: "match"
+					} ],
+					validation: {}, decisions: [],
+					generationErrors: [ { role: "modernization-database", message: "empty_provider_response", errorType: "empty_provider_response" } ],
+					generationSummary: { status: "partial_failure", incompleteStages: [ "database" ] }
+				}, {
+					inventory: { units: [ { id: "legacy-1", filePath: "legacy/a.cfm" } ] },
+					schemaPack: { coverage: "partial-ddl", objects: [ { name: "songs" } ] }
+				} );
+				expect( report.ok ).toBeFalse();
+				expect( report.messages.some( ( item ) => ( item.category ?: "" ) == "database" && findNoCase( "schema evidence", item.message ?: "" ) ) ).toBeTrue();
+			} );
+
+			it( "resolves placement citations instead of only counting them", () => {
+				// Section 2.16: presence-only checks passed a citation to a file the
+				// run never inventoried. This is the gate that closes it.
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate(
+					{
+						schemaVersion: "modernization-plan-v2",
+						target: { placements: [ {
+							id: "ctx-derived-a1",
+							placementType: "main-app",
+							targetUnitIds: [ "tu-1" ],
+							evidenceRefs: [ { filePath: "app/Invented.cfc", startLine: 1, endLine: 2 } ]
+						} ] }
+					},
+					{ inventory: { files: [ { filePath: "app/orders/Orders.cfc", lineCount: 20 } ] } }
+				);
+
+				expect( report.messages.some( ( item ) => findNoCase( "does not resolve", item.message ?: "" ) ) ).toBeTrue();
+				expect( report.messages.some( ( item ) => findNoCase( "file-not-in-inventory", item.message ?: "" ) ) ).toBeTrue();
+			} );
+
+			it( "stays quiet when a placement cites a file the run really inventoried", () => {
+				var service = new app.models.services.ModernizationValidationService();
+				var report = service.validate(
+					{
+						schemaVersion: "modernization-plan-v2",
+						target: { placements: [ {
+							id: "ctx-derived-a1",
+							placementType: "main-app",
+							targetUnitIds: [ "tu-1" ],
+							evidenceRefs: [ { filePath: "app/orders/Orders.cfc", startLine: 3, endLine: 8 } ]
+						} ] }
+					},
+					{ inventory: { files: [ { filePath: "app/orders/Orders.cfc", lineCount: 20 } ] } }
+				);
+
+				expect( report.messages.some( ( item ) => findNoCase( "does not resolve", item.message ?: "" ) ) ).toBeFalse();
+			} );
+		} );
+	}
+}

@@ -1,0 +1,95 @@
+/**
+ * Migration order derived from the cluster dependency DAG.
+ *
+ * Holds and answers; `ModernizationDerivedStructureService` computes. Ordering
+ * is a property of the graph here, not a feature someone implemented: wave is
+ * longest-path depth, so a cluster can never share a wave with something it
+ * depends on.
+ *
+ * Cluster-level cycles are carried rather than hidden. Two clusters that call
+ * each other cannot be sequenced, and saying so is more useful than inventing
+ * an order.
+ *
+ * @see ModernizationDerivedStructureService
+ */
+class accessors="true" {
+
+	property name="version" type="string";
+	property name="order" type="array";
+	property name="maxWave" type="numeric";
+	property name="cycles" type="array";
+	property name="criticalPath" type="array";
+
+	function init( required struct data ) {
+		variables.version = arguments.data.version ?: "";
+		variables.order = arguments.data.order ?: [];
+		variables.maxWave = arguments.data.maxWave ?: 0;
+		variables.cycles = arguments.data.cycles ?: [];
+		variables.criticalPath = arguments.data.criticalPath ?: [];
+		return this;
+	}
+
+	struct function getMemento() {
+		return {
+			version     : variables.version,
+			order       : duplicate( variables.order ),
+			maxWave     : variables.maxWave,
+			cycles      : duplicate( variables.cycles ),
+			criticalPath: duplicate( variables.criticalPath )
+		};
+	}
+
+	/** Which wave a cluster migrates in. -1 when it is not in the plan. */
+	numeric function wave( required string clusterId ) {
+		for ( var entry in variables.order ) {
+			if ( entry.clusterId == arguments.clusterId ) return entry.wave;
+		}
+		return -1;
+	}
+
+	/**
+	 * True when `blocker` must be migrated before `blocked` — directly, or
+	 * through a chain of dependencies.
+	 */
+	boolean function blocks( required string blocker, required string blocked ) {
+		if ( arguments.blocker == arguments.blocked ) return false;
+		var seen = {};
+		var frontier = [ arguments.blocked ];
+		while ( frontier.len() ) {
+			var current = frontier[ frontier.len() ];
+			frontier.deleteAt( frontier.len() );
+			if ( seen.keyExists( current ) ) continue;
+			seen[ current ] = true;
+			for ( var entry in variables.order ) {
+				if ( entry.clusterId != current ) continue;
+				for ( var dependency in entry.dependsOn ) {
+					if ( dependency == arguments.blocker ) return true;
+					frontier.append( dependency );
+				}
+			}
+		}
+		return false;
+	}
+
+	/** Clusters in the given wave, in stable order. */
+	array function clustersInWave( required numeric wave ) {
+		var found = [];
+		for ( var entry in variables.order ) {
+			if ( entry.wave == arguments.wave ) found.append( entry.clusterId );
+		}
+		return found;
+	}
+
+	/** The chain that sets the length of the migration, dependencies first. */
+	array function criticalPath() {
+		return duplicate( variables.criticalPath );
+	}
+
+	/** True when this cluster cannot be sequenced against a peer. */
+	boolean function inCycle( required string clusterId ) {
+		for ( var cycle in variables.cycles ) {
+			if ( cycle.contains( arguments.clusterId ) ) return true;
+		}
+		return false;
+	}
+}

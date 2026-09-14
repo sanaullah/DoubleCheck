@@ -1,0 +1,368 @@
+/**
+ * LLM crew planner: proposes 2-4 catalog specialist roles with change-specific briefs.
+ *
+ * @see ReviewPlannerService
+ * @see AIChatGateway
+ */
+
+@singleton
+class threadsafe {
+	property name="chatGateway" inject="AIChatGateway";
+
+	property name="aiProviderResolver" inject="AIProviderResolverService";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	property name="secretRedactionService" inject="SecretRedactionService";
+
+	property name="promptCompiler" inject="PromptCompiler";
+
+	property name="promptOutputValidator" inject="PromptOutputValidator";
+	variables.plannerVersion = "crew-planner-v1";
+	variables.maxObjectiveCharacters = 240;
+	variables.maxBriefCharacters = 800;
+	variables.maxSummaryCharacters = 240;
+	variables.maxFactsInPrompt = 40;
+	variables.maxFilesInPrompt = 40;
+	variables.catalogRoles = [
+		"security",
+		"correctness",
+		"architecture",
+		"testing",
+		"performance",
+		"boxlang-conventions",
+		"cfml-conventions"
+	];
+
+	boolean function isEnabled() {
+		var resolved = aiProviderResolver.resolve();
+		return chatGateway.isEnabled( resolved.apiKey, resolved.isLocal );
+	}
+
+	struct function propose(
+		required app.models.domain.ArchitectureModel architectureModel,
+		required struct graph,
+		required array files,
+		struct options = {}
+	) {
+		if ( !isEnabled() ) {
+			return failure( "disabled" );
+		}
+		var authorizedRoles = normalizeAuthorizedRoles(
+			arguments.options.authorizedRoles ?: variables.catalogRoles
+		);
+		var taskLimit = numericLimit( arguments.options.taskLimit ?: 4, 4 );
+		var authorizedFilePaths = arguments
+			.files
+			.map( ( file ) => trim( file.filePath ?: "" ) )
+			.filter( ( path ) => len( path ) );
+		var payload = {};
+		var activePackage = {};
+		var response = "";
+		var attempts = 0;
+		try {
+			payload = buildMessages(
+						arguments.architectureModel.getMemento(),
+						arguments.graph,
+						arguments.files,
+						authorizedRoles,
+						left( trim( arguments.options.reviewGoal ?: "" ), 500 )
+					);
+			assertDistinctSystem( providerName() );
+			activePackage = payload.promptPackage;
+			while ( attempts < 2 ) {
+				attempts++;
+				try {
+					response = chatGateway.chat(
+						activePackage.messages,
+						buildParams(),
+						buildOptions( trim( arguments.options.runId ?: "" ) )
+					);
+					getValidator().assertValid( response, "crew-plan-v1" );
+					break;
+				} catch ( any attemptError ) {
+					if ( attempts >= 2 || !isRepairablePromptError( attemptError ) ) rethrow;
+					if ( isStruct( attemptError.data ?: "" ) && isArray( attemptError.data.reasonCodes ?: "" ) ) activePackage.provenance.validationReasonCodes = duplicate( attemptError.data.reasonCodes );
+					activePackage = getCompiler().compileRepair( activePackage, attemptError.message ?: "output validation failure" );
+				}
+			}
+			var result = validateAndClamp(
+				 normalizeRawResponse( response ),
+				authorizedRoles,
+				authorizedFilePaths,
+				taskLimit
+			);
+			result.promptProvenance = activePackage.provenance;
+			result.attempts = attempts;
+			return result;
+		} catch (any error) {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				log.error(
+						"AI crew planning failed; using deterministic roles",
+						{
+							type      : error.type ?: "",
+							message   : secretRedactionService.redactText( error.message ?: "" ),
+							stackTrace: secretRedactionService.redactText( error.stackTrace ?: "" )
+						}
+					);
+			}
+			return failure( error.message ?: "Crew planner unavailable", isStruct( activePackage ) && activePackage.count() && isStruct( activePackage.provenance ?: "" ) ? activePackage.provenance : {} );
+		}
+	}
+
+	struct function validateAndClamp(
+		required struct raw,
+		required array authorizedRoles,
+		required array authorizedFilePaths,
+		required numeric taskLimit
+	) {
+		var summary = left(
+			trim( arguments.raw.summary ?: "" ),
+			variables.maxSummaryCharacters
+		);
+		if ( !len( summary ) ) {
+			return failure( "missing summary" );
+		}
+		var authorized = arguments.authorizedRoles.map( ( role ) => lCase( trim( role ) ) );
+		var authorizedPaths = {};
+		for ( var path in arguments.authorizedFilePaths ) {
+			var key = normalizePath( path );
+			if ( len( key ) ) {
+				authorizedPaths[ key ] = path;
+			}
+		}
+		var seenRoles = {};
+		var tasks = [];
+		var rawTasks = isArray( arguments.raw.tasks ?: "" ) ? arguments.raw.tasks : [];
+		for ( var item in rawTasks ) {
+			if ( !isStruct( item ) ) {
+				continue;
+			}
+			var role = lCase( trim( item.role ?: "" ) );
+			if (
+				!len( role ) || !variables.catalogRoles.findNoCase( role ) || authorized.findNoCase( role ) == 0 ||
+					seenRoles.keyExists( role )
+			) {
+				continue;
+			}
+			seenRoles[ role ] = true;
+			var emphasizeFiles = [];
+			var rawFiles = isArray( item.emphasizeFiles ?: "" ) ? item.emphasizeFiles : [];
+			for ( var filePath in rawFiles ) {
+				var normalized = normalizePath( filePath );
+				if ( authorizedPaths.keyExists( normalized ) ) {
+					emphasizeFiles.append( authorizedPaths[ normalized ] );
+				}
+			}
+			tasks.append(
+					{
+						role          : role,
+						priority      : numericPriority( item.priority ?: 0 ),
+						objective     : left( trim( item.objective ?: "" ), variables.maxObjectiveCharacters ),
+						brief         : left( trim( item.brief ?: "" ), variables.maxBriefCharacters ),
+						emphasizeFiles: emphasizeFiles
+					}
+				);
+		}
+		if ( !tasks.len() ) {
+			return failure( "no valid tasks" );
+		}
+		tasks.sort( ( first, second ) => second.priority - first.priority );
+		var maxAllowed = min( 4, max( 1, int( arguments.taskLimit ) ) );
+		if ( tasks.len() > maxAllowed ) {
+			tasks = tasks.slice( 1, maxAllowed );
+		}
+		return {
+			ok     : true,
+			source : "llm",
+			summary: summary,
+			tasks  : tasks,
+			error  : ""
+		};
+	}
+
+	private struct function failure( required string error, struct provenance = {} ) {
+		return {
+			ok     : false,
+			source : "none",
+			summary: "",
+			tasks  : [],
+			error  : arguments.error,
+			promptProvenance: duplicate( arguments.provenance )
+		};
+	}
+
+	private struct function buildMessages(
+		required struct architecture,
+		required struct graph,
+		required array files,
+		required array authorizedRoles,
+		string reviewGoal = ""
+	) {
+		var factRecords = [];
+		var facts = isArray( arguments.architecture.facts ?: "" ) ? arguments.architecture.facts : [];
+		for ( var fact in facts ) {
+			if ( factRecords.len() >= variables.maxFactsInPrompt ) {
+				break;
+			}
+			factRecords.append(
+					{
+						id       : fact.id ?: "",
+						type     : fact.type ?: "",
+						statement: left( trim( fact.statement ?: "" ), 200 )
+					}
+				);
+		}
+		var fileRecords = [];
+		for ( var file in arguments.files ) {
+			if ( fileRecords.len() >= variables.maxFilesInPrompt ) {
+				break;
+			}
+			fileRecords.append(
+					{
+						filePath: file.filePath ?: "",
+						language: file.language ?: ""
+					}
+				);
+		}
+		var graphSymbols = arguments.graph.symbols ?: [];
+		var hasCfml = arguments.files.some( ( file ) => ( file.language ?: "" ) == "CFML" ) ||
+			graphSymbols.some( ( item ) => reFindNoCase( "\.(cfc|cfm)$", item.filePath ?: "" ) > 0 );
+		var hasBoxLang = arguments.files.some( ( file ) => ( file.language ?: "" ) == "BoxLang" ) ||
+			graphSymbols.some( ( item ) => reFindNoCase( "\.(bx|bxm|bxs)$", item.filePath ?: "" ) > 0 );
+		var hints = [];
+		if ( hasCfml ) {
+			hints.append(
+					"Prefer including cfml-conventions when CFML files are present."
+				);
+		}
+		if ( hasBoxLang ) {
+			hints.append(
+					"Prefer including boxlang-conventions when BoxLang symbols or files are present."
+				);
+		}
+		var compiled = getCompiler().compile(
+			"crew-planner",
+			{
+				task: {
+					instructions   : "Design a balanced review crew for this change (typically 2-4 specialists).",
+					authorizedRoles: arguments.authorizedRoles,
+					reviewGoal     : arguments.reviewGoal,
+					hints          : hints,
+					architecture   : {
+						fingerprint: arguments.architecture.fingerprint ?: "",
+						summary    : arguments.architecture.summary ?: {},
+						factCount  : factRecords.len(),
+						impactCount: ( arguments.graph.impacts ?: [] ).len()
+					},
+					files: fileRecords
+				},
+				evidence: { facts: factRecords, files: fileRecords }
+			},
+			{ provider: providerName(), model: modelName() }
+		);
+		return { messages: compiled.messages, provenance: compiled.provenance, promptPackage: compiled };
+	}
+
+	private boolean function isRepairablePromptError( required any error ) {
+		var typeName = lCase( toString( arguments.error.type ?: "" ) );
+		var message = lCase( toString( arguments.error.message ?: "" ) );
+		return findNoCase( "promptoutputvalidation", typeName ) > 0 || findNoCase( "json", typeName ) > 0 || findNoCase( "parse", message ) > 0 || findNoCase( "json", message ) > 0;
+	}
+
+	private void function assertDistinctSystem( required string provider ) {
+		if ( !( getCompiler().capabilities( arguments.provider ).distinctSystem ?: true ) ) throw( type = "AIProviderCapabilityException", message = "Provider cannot preserve the immutable prompt system contract" );
+	}
+
+	private any function getCompiler() {
+		if ( !isNull( variables.promptCompiler ?: javacast( "null", "" ) ) ) return variables.promptCompiler;
+		variables.promptCompiler = new app.models.services.PromptCompiler();
+		return variables.promptCompiler;
+	}
+
+	private any function getValidator() {
+		if ( !isNull( variables.promptOutputValidator ?: javacast( "null", "" ) ) ) return variables.promptOutputValidator;
+		variables.promptOutputValidator = new app.models.services.PromptOutputValidator();
+		return variables.promptOutputValidator;
+	}
+
+	private string function providerName() {
+		var resolved = aiProviderResolver.resolve();
+		return resolved.provider ?: "";
+	}
+
+	private string function modelName() {
+		var resolved = aiProviderResolver.resolve();
+		return resolved.model ?: "";
+	}
+
+	private struct function normalizeRawResponse( required any response ) {
+		if ( isStruct( arguments.response ) ) {
+			return duplicate( arguments.response );
+		}
+		if ( isSimpleValue( arguments.response ) ) {
+			return deserializeJSON( arguments.response );
+		}
+		throw(
+			type    = "CrewPlannerException",
+			message = "Crew planner response is not JSON"
+		);
+	}
+
+	private array function normalizeAuthorizedRoles( required any roles ) {
+		var requested = isArray( arguments.roles ) && arguments.roles.len() ? arguments.roles : variables.catalogRoles;
+		return variables.catalogRoles.filter( ( role ) => requested.findNoCase( role ) > 0 );
+	}
+
+	private string function normalizePath( required any value ) {
+		return lCase(
+			replace(
+				trim( toString( arguments.value ) ),
+				"\",
+				"/",
+				"all"
+			)
+		);
+	}
+
+	private numeric function numericPriority( required any value ) {
+		return isNumeric( arguments.value ) ? max( 0, int( val( arguments.value ) ) ) : 0;
+	}
+
+	private numeric function numericLimit( required any value, required numeric fallback ) {
+		return isNumeric( arguments.value ) ? max( 1, int( val( arguments.value ) ) ) : arguments.fallback;
+	}
+
+	private struct function buildParams() {
+		var resolved = aiProviderResolver.resolve();
+		var window = isNumeric( resolved.contextWindow ) ? max( 1024, int( val( resolved.contextWindow ) ) ) : 128000;
+		var capabilities = getCompiler().capabilities( resolved.provider ?: "" );
+		var outputCap = isNumeric( capabilities.maxOutputTokens ?: "" ) ? int( capabilities.maxOutputTokens ) : 1500;
+		var params = {
+			temperature: 0,
+			max_tokens : min( outputCap, min( 1500, max( 256, int( window * .15 ) ) ) )
+		};
+		if ( len( trim( resolved.model ) ) ) {
+			params.model = resolved.model;
+		}
+		structAppend( params, getCompiler().structuredOutput( "crew-planner", resolved.provider ?: "" ), true );
+		return params;
+	}
+
+	private struct function buildOptions( string runId = "" ) {
+		var resolved = aiProviderResolver.resolve();
+		var options = {
+			provider      : resolved.provider,
+			apiKey        : resolved.apiKey,
+			returnFormat  : "json",
+			timeout       : resolved.timeout,
+			conversationId: arguments.runId,
+			tenantId      : arguments.runId,
+			usageMetadata : { runId: arguments.runId, role: "crew-planner" }
+		};
+		if ( len( trim( resolved.baseURL ) ) ) {
+			options.baseURL = resolved.baseURL;
+		}
+		return options;
+	}
+}

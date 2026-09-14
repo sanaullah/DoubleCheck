@@ -1,0 +1,158 @@
+/** Extracts deterministic modernization seams before any LLM call. */
+@singleton
+class {
+	variables.version = "modernization-signals-v3";
+
+	struct function build(required struct inventory, struct schemaPack = {}, struct evidence = {}) {
+		var signals = [];
+		var add = ( string id, string group, string meaning, any refs, numeric confidence = 1, numeric occurrenceCount = 1 ) => {
+			var evidenceRefs = isArray( refs ) ? refs : [ refs ];
+			signals.append( { id: stableHash( "#id#|#jsonSerialize( evidenceRefs )#" ), signalId: id, group: group, meaning: meaning, evidenceRefs: evidenceRefs, confidence: confidence, occurrenceCount: max( 1, occurrenceCount ) } );
+		};
+		for ( var dep in arguments.inventory.dependencies ?: [] ) {
+			var signalCountBeforeDependency = signals.len();
+			var ref = { filePath: dep.filePath ?: "", startLine: dep.startLine ?: 0, endLine: dep.endLine ?: dep.startLine ?: 0, target: dep.target ?: "" };
+			switch ( lCase( dep.kind ?: "" ) ) {
+				case "http": add( "http.outbound", "outbound-integration", "Outbound HTTP integration", ref ); break;
+				case "schedule": add( "schedule.task", "outbound-integration", "Scheduled work entry", ref ); break;
+				case "include": add( "include.chain", "include-call-coupling", "CFML include chain", ref ); break;
+				case "component-construction": add( "component.construction", "include-call-coupling", "Component construction or invocation", ref ); break;
+				case "filesystem": add( "filesystem.io", "outbound-integration", "Filesystem dependency", ref ); break;
+				case "java": add( "java.interop", "outbound-integration", "Java interoperability", ref ); break;
+				case "datasource": add( "datasource.named", "datasource-table-coupling", "Named datasource dependency", ref ); break;
+				case "table-query": add( "sql.table-ref", "datasource-table-coupling", "SQL table reference", ref ); break;
+				case "column-query": add( "sql.column-ref", "datasource-table-coupling", "SQL column reference", ref ); break;
+				case "sql-type-hint": add( "sql.type-hint", "datasource-table-coupling", "CFML SQL type hint", ref ); break;
+				case "sql-proc-call": add( "sql.proc-call", "datasource-table-coupling", "Stored procedure call evidence", ref ); break;
+				case "sql-parameter-mismatch": add( "sql.parameter-mismatch", "cf-sql-parameter-mismatch", "CFML and SQL parameter binding may not match", ref, 0.7 ); break;
+				case "query": add( "sql.query", "datasource-table-coupling", "SQL/query execution", ref ); break;
+				case "scope.session": add( "scope.session-heavy", "security-session", "Session scope coupling", ref ); break;
+				case "scope.application": add( "scope.application-state", "application-lifecycle-state", "Application scope state", ref ); break;
+				case "scope.client": add( "scope.client", "security-session", "Client scope coupling", ref ); break;
+				case "security-session-gate": add( "security.session-gate", "security-session", "Session or authentication gate", ref ); break;
+			}
+			if ( signals.len() > signalCountBeforeDependency ) signals[ signals.len() ].occurrenceCount = max( 1, val( dep.occurrenceCount ?: 1 ) );
+		}
+		for ( var unresolved in arguments.inventory.unresolved ?: [] ) {
+			var ref = { filePath: unresolved.filePath ?: "", startLine: unresolved.startLine ?: 0, endLine: unresolved.endLine ?: unresolved.startLine ?: 0, evidence: unresolved.evidence ?: "" };
+			switch ( lCase( unresolved.kind ?: "" ) ) {
+				case "dynamic-include": add( "include.chain", "include-call-coupling", "Dynamic include cannot be resolved", ref, 0.5 ); break;
+				case "dynamic-component": add( "component.dynamic", "include-call-coupling", "Dynamic component construction requires manual mapping", ref, 0.5 ); break;
+				case "dynamic-evaluate": add( "dynamic.eval", "application-lifecycle-state", "evaluate() requires manual migration review", ref, 1 ); break;
+				case "unparameterized-sql": add( "sql.unparameterized", "datasource-table-coupling", "SQL appears to be string-built or unparameterized", ref, 0.9 ); break;
+				case "dynamic-sql": add( "sql.dynamic-identifier", "cf-sql-parameter-mismatch", "Dynamic SQL identifier cannot be resolved safely", ref, 0.5 ); break;
+				case "dynamic-route": add( "route.dynamic", "route-contract", "Dynamic route evidence requires review", ref, 0.5 ); break;
+			}
+		}
+		for ( var route in arguments.inventory.routeEvidence ?: [] ) {
+			add( "route.evidence", "route-contract", "Legacy route evidence", { filePath: route.filePath ?: "", startLine: route.startLine ?: 0, endLine: route.endLine ?: 0, path: route.legacyPath ?: "" }, route.unresolved ? 0.5 : 1 );
+		}
+		for ( var unit in arguments.inventory.units ?: [] ) {
+			if ( ( unit.unitType ?: "" ) == "application" ) add( "app.lifecycle", "application-lifecycle-state", "Application.cfc lifecycle unit", unit.evidenceRefs ?: [] );
+		}
+		var stackHints = [];
+		for ( var sourceFile in arguments.evidence.files ?: [] ) {
+			if ( reFindNoCase( "(^|/)config/ColdBox[.](?:cfc|bx)$", sourceFile.filePath ?: "" ) ) {
+				add( "coldbox.present", "runtime-hints", "ColdBox configuration is present", { filePath: sourceFile.filePath, startLine: 1, endLine: 1 } );
+				stackHints.append( "coldbox.present" );
+			}
+		}
+		if ( ( arguments.inventory.files ?: [] ).filter( ( item ) => reFindNoCase( "(^|/)application[.](?:cfc|bx)$", item.filePath ?: "" ) ).len() ) stackHints.append( "application.lifecycle" );
+		// Stable ordering prevents prompt drift and makes plan fingerprints useful.
+		signals.sort( ( a, b ) => compareNoCase( a.signalId & ":" & jsonSerialize( a.evidenceRefs ), b.signalId & ":" & jsonSerialize( b.evidenceRefs ) ) );
+		// Bind every signal to the inventory unit(s) whose line range contains it.
+		// Dependencies carry filePath+startLine but no unit id, so this range join
+		// is what turns an orphaned signal list into per-unit / per-phase evidence.
+		// Runs before the groups loop (group entries are references to these same
+		// records) and before the fingerprint, so the hash honestly covers the join.
+		var unitIndex = unitRangeIndex( arguments.inventory.units ?: [] );
+		for ( var signalIndex = 1; signalIndex <= signals.len(); signalIndex++ ) {
+			var refs = signals[ signalIndex ].evidenceRefs ?: [];
+			var ref = isArray( refs ) && refs.len() && isStruct( refs[ 1 ] ) ? refs[ 1 ] : {};
+			var owners = containingUnitIds( unitIndex, ref.filePath ?: "", val( ref.startLine ?: 0 ) );
+			signals[ signalIndex ].unitIds = owners;
+			signals[ signalIndex ].unitId = owners.len() ? owners[ 1 ] : "";
+		}
+		signals = compactSignals( signals );
+		var groups = {};
+		for ( var item in signals ) {
+			if ( !groups.keyExists( item.group ) ) groups[ item.group ] = [];
+			groups[ item.group ].append( item );
+		}
+		return { version: variables.version, signals: signals, groups: groups, stackHints: stackHints, count: signals.len(), fingerprint: stableHash( variables.version & "|" & jsonSerialize( signals ) ) };
+	}
+
+	private array function compactSignals( required array signals ) {
+		var grouped = {};
+		for ( var item in arguments.signals ) {
+			var refs = item.evidenceRefs ?: [];
+			var path = refs.len() && isStruct( refs[ 1 ] ) ? lCase( refs[ 1 ].filePath ?: "" ) : "";
+			var key = lCase( item.signalId ?: "" ) & "|" & path & "|" & ( item.unitIds ?: [] ).toList( "," );
+			if ( !grouped.keyExists( key ) ) {
+				grouped[ key ] = duplicate( item );
+				continue;
+			}
+			grouped[ key ].occurrenceCount += max( 1, val( item.occurrenceCount ?: 1 ) );
+			for ( var ref in refs ) {
+				if ( grouped[ key ].evidenceRefs.len() >= 6 ) break;
+				var refKey = "#ref.filePath ?: ''#:#ref.startLine ?: 0#:#ref.endLine ?: 0#";
+				if ( !grouped[ key ].evidenceRefs.some( ( existing ) => "#existing.filePath ?: ''#:#existing.startLine ?: 0#:#existing.endLine ?: 0#" == refKey ) ) grouped[ key ].evidenceRefs.append( ref );
+			}
+		}
+		var output = grouped.valueArray();
+		output.sort( ( a, b ) => compareNoCase( a.signalId & ":" & ( a.unitId ?: "" ) & ":" & a.id, b.signalId & ":" & ( b.unitId ?: "" ) & ":" & b.id ) );
+		return output;
+	}
+
+	/**
+	 * filePath (lowercased) -> containing units, narrowest first.
+	 * The sort is an explicit TOTAL order (span, then startLine desc, then id)
+	 * rather than relying on comparator-sort stability: identical-span ties are
+	 * reachable (a .cfc classified as both custom-tag and component both span
+	 * 1..N), and a jittery order would make the signal fingerprint — and every
+	 * plan fingerprint derived from it — non-reproducible for identical input.
+	 */
+	private struct function unitRangeIndex( required array units ) {
+		var index = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var unitId = trim( unit.id ?: unit.itemId ?: "" );
+			var path = lCase( trim( unit.filePath ?: "" ) );
+			if ( !len( unitId ) || !len( path ) ) continue;
+			var startLine = val( unit.startLine ?: 0 );
+			var endLine = max( startLine, val( unit.endLine ?: 0 ) );
+			if ( !index.keyExists( path ) ) index[ path ] = [];
+			index[ path ].append( { id: unitId, startLine: startLine, endLine: endLine, span: endLine - startLine } );
+		}
+		for ( var key in index ) {
+			index[ key ].sort( ( a, b ) => {
+				if ( a.span != b.span ) return a.span - b.span;
+				if ( a.startLine != b.startLine ) return b.startLine - a.startLine;
+				return compareNoCase( a.id, b.id );
+			} );
+		}
+		return index;
+	}
+
+	/**
+	 * Every unit containing this line, narrowest first. Returns all containers
+	 * (not just the innermost) because target units claim legacy units at file
+	 * level far more often than function level — keying a rollup on the
+	 * narrowest owner alone would drop roughly half the evidence at the join.
+	 */
+	private array function containingUnitIds( required struct index, required string filePath, required numeric line ) {
+		var path = lCase( trim( arguments.filePath ) );
+		if ( !len( path ) || !arguments.index.keyExists( path ) ) return [];
+		var candidates = arguments.index[ path ];
+		// Signals default startLine to 0; bind those to the file-level unit
+		// (widest span, i.e. the last entry) instead of orphaning them.
+		if ( arguments.line < 1 ) return candidates.len() ? [ candidates[ candidates.len() ].id ] : [];
+		var owners = [];
+		for ( var candidate in candidates ) {
+			if ( candidate.startLine <= arguments.line && arguments.line <= candidate.endLine ) owners.append( candidate.id );
+		}
+		return owners;
+	}
+
+	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
+}

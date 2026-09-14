@@ -1,0 +1,520 @@
+/**
+ * REST: review run CRUD, SSE event stream, result, export, and cancel.
+ *
+ * Primary UI entry for create + live progress.
+ *
+ * @see ReviewRunService
+ * @see ReviewEventService
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="runService" inject="ReviewRunService";
+	property name="rerunService" inject="ReviewRerunService";
+
+	property name="eventService" inject="ReviewEventService";
+
+	property name="reportExportService" inject="ReportExportService";
+
+	property name="modernizationExportService" inject="ModernizationExportService";
+
+	property name="modernizationDecisionService" inject="ModernizationDecisionService";
+
+	property name="modernizationSliceRebuildService" inject="ModernizationSliceRebuildService";
+
+	property name="observabilityTraceService" inject="ObservabilityTraceService";
+
+	property name="pollInterval" inject="coldbox:setting:runEventPollInterval";
+
+	property name="keepAliveInterval" inject="coldbox:setting:runEventKeepAlive";
+
+	property name="streamTimeout" inject="coldbox:setting:runEventStreamTimeout";
+
+	property name="defaultPageSize" inject="coldbox:setting:runPageSize";
+
+	property name="maxPageSize" inject="coldbox:setting:runPageSizeMax";
+
+	property name="securityContextService" inject="SecurityContextService";
+
+	property name="findingReviewService" inject="FindingReviewService";
+
+	function preHandler(
+		event,
+		rc,
+		prc,
+		action,
+		eventArguments
+	) {
+		prc.securityContext = securityContextService.authenticate( event );
+	}
+
+	/**
+	 * List review runs
+	 *
+	 * @tags Runs
+	 * @hint Paginated list of review runs for the current security scope
+	 * @param-page { "name":"page", "in":"query", "required":false, "schema":{"type":"integer","minimum":1} }
+	 * @param-limit { "name":"limit", "in":"query", "required":false, "schema":{"type":"integer","minimum":1,"maximum":100} }
+	 * @response-200 Paginated runs payload
+	 */
+	function index( event, rc, prc ) {
+		var page = isNumeric( rc.page ?: "" ) ? max( 1, int( rc.page ) ) : 1;
+		var limit = isNumeric( rc.limit ?: "" ) ? min( maxPageSize, max( 1, int( rc.limit ) ) ) : defaultPageSize;
+		event.renderData(
+				type = "json",
+				data = runService.listScoped(
+						prc.securityContext,
+						rc.projectId ?: "",
+						page,
+						limit
+					)
+			);
+	}
+
+	/**
+	 * Get one review run
+	 *
+	 * @tags Runs
+	 * @hint Returns run status. Embed result only when includeResult=true — status polls must stay light.
+	 * @param-includeResult { "name":"includeResult", "in":"query", "required":false, "schema":{"type":"boolean"} }
+	 * @response-200 Run memento with optional result
+	 * @response-404 Run not found
+	 */
+	function show( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		var data = run.getMemento();
+		// Status polling hits this endpoint every few seconds. Embedding a full
+		// modernization plan (inventory + signals + samples) OOMs a 512 MB heap.
+		// Callers that need the artifact use GET /runs/:id/result instead.
+		var includeResult = isBoolean( rc.includeResult ?: "" ) ? rc.includeResult : [ "true", "1", "yes", "on" ].contains( lCase( trim( rc.includeResult ?: "" ) ) );
+		if ( includeResult ) {
+			data.result = runService.getResult( run.getId() );
+		}
+		event.renderData( type = "json", data = { data: data } );
+	}
+
+	/**
+	 * Create a review run
+	 *
+	 * @tags Runs
+	 * @hint Queues a working-tree, revision-diff, or full repository review
+	 * @response-202 Run accepted; Location header points to the run
+	 * @response-422 Validation error
+	 */
+	function create( event, rc, prc ) {
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) || !body.count() ) {
+				body = rc;
+			}
+			var run = runService.create( isStruct( body ) ? body : {}, prc.securityContext );
+			var location = "/api/v1/runs/#run.getId()#";
+			event.setHTTPHeader( name = "Location", value = location );
+			event.getResponse().setLocation( location );
+			event.renderData(
+					type       = "json",
+					statusCode = 202,
+					data       = { data: run.getMemento() }
+				);
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		} catch ("ModernizationSchemaPackInputException" error) {
+			validationError( event, error.message );
+		} catch ("ModernizationSchemaPackLimitException" error) {
+			validationError( event, error.message );
+		} catch ("AIConfigurationException" error) {
+			// Modernize is explicitly provider-gated. Surface a client error at
+			// creation time instead of allowing a disabled provider to become a
+			// queued run that can never produce a plan.
+			validationError( event, error.message );
+		}
+	}
+
+	function cancel( event, rc, prc ) {
+		var run = runService.cancelScoped( rc.id ?: "", prc.securityContext );
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		event.renderData(
+				type       = "json",
+				statusCode = 202,
+				data       = { data: run.getMemento() }
+			);
+	}
+
+	function rerun( event, rc, prc ) {
+		var run = rerunService.rerunScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		event.setHTTPHeader( name = "Location", value = "/api/v1/runs/#run.getId()#" );
+		event.renderData(
+				type       = "json",
+				statusCode = 202,
+				data       = { data: run.getMemento() }
+			);
+	}
+
+	function followUp( event, rc, prc ) {
+		try {
+			var run = rerunService.followUpScoped(
+					rc.id ?: "",
+					prc.securityContext,
+					rc.projectId ?: ""
+				);
+			if ( isNull( run ) ) {
+				return notFound( event );
+			}
+			event.setHTTPHeader( name = "Location", value = "/api/v1/runs/#run.getId()#" );
+			event.renderData(
+					type       = "json",
+					statusCode = 202,
+					data       = { data: run.getMemento() }
+				);
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	function continueModernize( event, rc, prc ) {
+		try {
+			var run = rerunService.continueModernizeScoped(
+					rc.id ?: "",
+					prc.securityContext,
+					rc.projectId ?: ""
+				);
+			if ( isNull( run ) ) {
+				return notFound( event );
+			}
+			event.setHTTPHeader( name = "Location", value = "/api/v1/runs/#run.getId()#" );
+			event.renderData(
+					type       = "json",
+					statusCode = 202,
+					data       = { data: run.getMemento() }
+				);
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	function result( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		event.renderData(
+				type = "json",
+				data = {
+					data: {
+						run   : run.getMemento(),
+						result: runService.getResult( run.getId() )
+					}
+				}
+			);
+	}
+
+	function updateModernizationDecision( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) body = {};
+			var decision = modernizationDecisionService.decide( run, rc.itemId ?: "", body, prc.securityContext );
+			decision.result = runService.getResult( run.getId() );
+			event.renderData( type = "json", data = { data: decision } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	function clearModernizationDecision( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+				var body = event.getHTTPContent( json = true );
+				if ( !isStruct( body ) ) body = {};
+				if ( !len( trim( body.itemType ?: rc.itemType ?: "" ) ) ) body.itemType = rc.itemType ?: "";
+				if ( !len( trim( body.itemFingerprint ?: rc.itemFingerprint ?: "" ) ) ) body.itemFingerprint = rc.itemFingerprint ?: "";
+				var cleared = modernizationDecisionService.clear( run, rc.itemId ?: "", body, prc.securityContext );
+			cleared.result = runService.getResult( run.getId() );
+			event.renderData( type = "json", data = { data: cleared } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	function rebuildModernizationPhase( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) body = {};
+			var rebuilt = modernizationSliceRebuildService.rebuild( run, rc.phaseId ?: "", body );
+			event.renderData( type = "json", data = { data: rebuilt } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ModernizationRebuildException" error ) {
+			event.renderData( statusCode = 400, type = "json", data = { error: { code: "modernization_rebuild_failed", message: error.message } } );
+		} catch ( "AIConfigurationException" error ) {
+			event.renderData( statusCode = 503, type = "json", data = { error: { code: "ai_unavailable", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	/**
+	 * Rebuild a single db-finding or db-transition in isolation (no roadmap
+	 * phase scope), for items that don't have a phase to rebuild through.
+	 *
+	 * @tags Runs
+	 * @response-200 Rebuilt item and refreshed plan result
+	 * @response-404 Run or item not found
+	 * @response-409 Plan or item changed since the client last fetched it
+	 */
+	function rebuildModernizationItem( event, rc, prc ) {
+		var run = runService.getScoped( rc.id ?: "", prc.securityContext, rc.projectId ?: "" );
+		if ( isNull( run ) ) return notFound( event );
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) body = {};
+			var rebuilt = modernizationSliceRebuildService.rebuildItem( run, body.itemType ?: rc.itemType ?: "", rc.itemId ?: "", body );
+			event.renderData( type = "json", data = { data: rebuilt } );
+		} catch ( "ModernizationDecisionConflict" error ) {
+			event.renderData( statusCode = 409, type = "json", data = { error: { code: "modernization_conflict", message: error.message } } );
+		} catch ( "ModernizationItemNotFound" error ) {
+			event.renderData( statusCode = 404, type = "json", data = { error: { code: "modernization_item_not_found", message: error.message } } );
+		} catch ( "ModernizationRebuildException" error ) {
+			event.renderData( statusCode = 400, type = "json", data = { error: { code: "modernization_rebuild_failed", message: error.message } } );
+		} catch ( "AIConfigurationException" error ) {
+			event.renderData( statusCode = 503, type = "json", data = { error: { code: "ai_unavailable", message: error.message } } );
+		} catch ( "ValidationException" error ) {
+			validationError( event, error.message );
+		}
+	}
+
+	function updateFindingReview( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		try {
+			var body = event.getHTTPContent( json = true );
+			if ( !isStruct( body ) ) {
+				body = {};
+			}
+			var review = findingReviewService.update(
+					run,
+					rc.fingerprint ?: "",
+					body,
+					prc.securityContext
+				);
+			event.renderData( type = "json", data = { data: review } );
+		} catch ("FindingNotFound" error) {
+			event.renderData(
+					type       = "json",
+					statusCode = 404,
+					data       = { error: { code: "finding_not_found", message: error.message } }
+				);
+		} catch ("FindingReviewConflict" error) {
+			event.renderData(
+					type       = "json",
+					statusCode = 409,
+					data       = { error: { code: "review_conflict", message: error.message } }
+				);
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	function export( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		try {
+			var exportFormat = rc.exportFormat ?: ( rc.format ?: "markdown" );
+			var exportOptions = {};
+			if ( lCase( run.getRunKind() ?: "review" ) == "codegraph" ) {
+				exportOptions = {
+					flowId: rc.flowId ?: ( rc.flow ?: "" )
+				};
+			}
+			var report = lCase( run.getRunKind() ?: "review" ) == "modernize"
+				? modernizationExportService.export( run.getMemento(), runService.getResult( run.getId() ), exportFormat )
+				: reportExportService.export( run.getMemento(), runService.getResult( run.getId() ), exportFormat, exportOptions );
+			structDelete( rc, "format" );
+			event.renderData(
+					type       = "plain",
+					data       = report.content,
+					statusCode = 200,
+					contentType = report.contentType
+				);
+			event.setHTTPHeader(
+					name  = "Content-Disposition",
+					value = "attachment; filename=""#report.fileName#"""
+				);
+			event.setHTTPHeader( name = "X-DoubleCheck-Export-Format", value = report.format );
+		} catch ("ValidationException" error) {
+			validationError( event, error.message );
+		}
+	}
+
+	function eventLog( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		var afterSequence = isNumeric( rc.after ?: "" ) ? max( 0, int( rc.after ) ) : 0;
+		var limit = isNumeric( rc.limit ?: "" ) ? min( 500, max( 1, int( rc.limit ) ) ) : 300;
+		var records = eventService.after(
+				run.getId(),
+				afterSequence,
+				limit
+			);
+		event.renderData(
+				type = "json",
+				data = {
+					data: records.map(
+							( item ) => {
+								return {
+									sequence : item.sequence,
+									eventType: item.eventType,
+									payload  : item.payload,
+									createdAt: item.createdAt ?: ""
+								};
+							}
+						),
+					meta: {
+						runId        : run.getId(),
+						afterSequence: afterSequence,
+						count        : records.len()
+					}
+				}
+			);
+	}
+
+	function traces( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+		var limit = isNumeric( rc.limit ?: "" ) ? min( 1000, max( 1, int( rc.limit ) ) ) : 500;
+		var report = observabilityTraceService.exportTraces( run.getId(), limit );
+		if ( listFindNoCase( "true,1,yes", lCase( toString( rc.download ?: "" ) ) ) ) {
+			event.setHTTPHeader(
+					name  = "Content-Disposition",
+					value = "attachment; filename=""doublecheck-traces-#left( run.getId(), 8 )#.json"""
+				);
+		}
+		event.renderData( type = "json", data = { data: report } );
+	}
+
+	function events( event, rc, prc ) {
+		var run = runService.getScoped(
+				rc.id ?: "",
+				prc.securityContext,
+				rc.projectId ?: ""
+			);
+		if ( isNull( run ) ) {
+			return notFound( event );
+		}
+
+		var lastEventId = event.getHTTPHeader( "Last-Event-ID", rc.lastEventId ?: "0" );
+		if ( isNumeric( rc.after ?: "" ) ) {
+			lastEventId = rc.after;
+		}
+		var startSequence = isNumeric( lastEventId ) ? int( lastEventId ) : 0;
+		var capturedRunId = run.getId();
+		var capturedEvents = eventService;
+		var capturedRuns = runService;
+		var capturedPoll = pollInterval;
+
+		event.noRender();
+		SSE(
+			callback          = ( emitter ) => {
+				var sequence = startSequence;
+				while ( !emitter.isClosed() ) {
+					var events = capturedEvents.after(
+							capturedRunId,
+							sequence,
+							100
+						);
+					for ( var item in events ) {
+						emitter.send(
+								jsonSerialize( item.payload ),
+								item.eventType,
+								item.sequence
+							);
+						sequence = item.sequence;
+					}
+
+					var current = capturedRuns.get( capturedRunId );
+					if ( !isNull( current ) && capturedRuns.isTerminal( current.getStatus() ) && !events.len() ) {
+						emitter.close();
+						break;
+					}
+					sleep( capturedPoll );
+				}
+			},
+			async             = true,
+			retry             = 2000,
+			keepAliveInterval = keepAliveInterval,
+			timeout           = streamTimeout
+		);
+	}
+
+	private void function notFound( required event ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 404,
+				data       = { error: { code: "run_not_found", message: "Review run not found" } }
+			);
+	}
+
+	private void function validationError( required event, required string message ) {
+		arguments.event.renderData(
+				type       = "json",
+				statusCode = 422,
+				data       = { error: { code: "validation_failed", message: arguments.message } }
+			);
+	}
+}

@@ -1,0 +1,359 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"Finding baselines",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"compares findings to the prior succeeded run with the same path and mode",
+					() => {
+						var marker = lCase( createUUID() );
+						var path = "C:/doublecheck-baseline-#marker#";
+						var olderId = "baseline-old-#marker#";
+						var newerId = "baseline-new-#marker#";
+						var olderAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-10,
+								now()
+							),
+							"iso"
+						);
+						var newerAt = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var resultRepository = getInstance( "ReviewResultRepository" );
+
+						try {
+							seedRun(
+								runRepository,
+								resultRepository,
+								olderId,
+								path,
+								"full",
+								"succeeded",
+								olderAt,
+								[
+									finding(
+										"fp-shared",
+										"Shared finding",
+										"a.bx"
+									),
+									finding(
+										"fp-fixed",
+										"Will be fixed",
+										"b.bx"
+									)
+								]
+							);
+							seedRun(
+								runRepository,
+								resultRepository,
+								newerId,
+								path,
+								"full",
+								"succeeded",
+								newerAt,
+								[
+									finding(
+										"fp-shared",
+										"Shared finding",
+										"a.bx"
+									),
+									finding(
+										"fp-new",
+										"Brand new",
+										"c.bx"
+									)
+								]
+							);
+
+							var event = this.get( "/api/v1/runs/#newerId#/result" );
+							expect( event.getResponse() ).toHaveStatus( 200 );
+							var body = jsonDeserialize( event.getRenderedContent() );
+							var result = body.data.result;
+
+							expect( result.baseline.runId ).toBe( olderId );
+							expect( result
+									.baseline
+									.counts
+									.new ).toBe( 1 );
+							expect( result
+									.baseline
+									.counts
+									.unchanged ).toBe( 1 );
+							expect( result
+									.baseline
+									.counts
+									.fixed ).toBe( 1 );
+							expect( result.fixedFindings ).toHaveLength( 1 );
+							expect( result.fixedFindings[ 1 ].fingerprint ).toBe( "fp-fixed" );
+
+							var statuses = {};
+							for ( var item in result.findings ) {
+								statuses[ item.fingerprint ] = item.baselineStatus;
+							}
+							expect( statuses[ "fp-shared" ] ).toBe( "unchanged" );
+							expect( statuses[ "fp-new" ] ).toBe( "new" );
+						} finally {
+							cleanupRuns( [ olderId, newerId] );
+						}
+					}
+				);
+
+				it(
+					"does not baseline across different review modes",
+					() => {
+						var marker = lCase( createUUID() );
+						var path = "C:/doublecheck-baseline-mode-#marker#";
+						var olderId = "baseline-mode-old-#marker#";
+						var newerId = "baseline-mode-new-#marker#";
+						var olderAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-5,
+								now()
+							),
+							"iso"
+						);
+						var newerAt = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var resultRepository = getInstance( "ReviewResultRepository" );
+
+						try {
+							seedRun(
+								runRepository,
+								resultRepository,
+								olderId,
+								path,
+								"working-tree",
+								"succeeded",
+								olderAt,
+								[
+									finding(
+										"fp-a",
+										"A",
+										"a.bx"
+									)
+								]
+							);
+							seedRun(
+								runRepository,
+								resultRepository,
+								newerId,
+								path,
+								"full",
+								"succeeded",
+								newerAt,
+								[
+									finding(
+										"fp-a",
+										"A",
+										"a.bx"
+									)
+								]
+							);
+
+							var body = jsonDeserialize( this.get( "/api/v1/runs/#newerId#/result" ).getRenderedContent() );
+							expect(
+								isNull( body
+										.data
+										.result
+										.baseline )
+							).toBeTrue();
+							expect( body
+									.data
+									.result
+									.findings[ 1 ].keyExists( "baselineStatus" ) ).toBeFalse();
+						} finally {
+							cleanupRuns( [ olderId, newerId] );
+						}
+					}
+				);
+
+				it(
+					"accepts partial baselines and skips failed peers",
+					() => {
+						var marker = lCase( createUUID() );
+						var path = "C:/doublecheck-baseline-status-#marker#";
+						var failedId = "baseline-failed-#marker#";
+						var partialId = "baseline-partial-#marker#";
+						var newerId = "baseline-after-#marker#";
+						var failedAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-20,
+								now()
+							),
+							"iso"
+						);
+						var partialAt = dateTimeFormat(
+							dateAdd(
+								"n",
+								-10,
+								now()
+							),
+							"iso"
+						);
+						var newerAt = dateTimeFormat( now(), "iso" );
+						var runRepository = getInstance( "ReviewRunRepository" );
+						var resultRepository = getInstance( "ReviewResultRepository" );
+
+						try {
+							seedRun(
+								runRepository,
+								resultRepository,
+								failedId,
+								path,
+								"full",
+								"failed",
+								failedAt,
+								[
+									finding(
+										"fp-failed",
+										"Failed peer",
+										"f.bx"
+									)
+								]
+							);
+							seedRun(
+								runRepository,
+								resultRepository,
+								partialId,
+								path,
+								"full",
+								"partial",
+								partialAt,
+								[
+									finding(
+										"fp-partial",
+										"Partial peer",
+										"p.bx"
+									)
+								]
+							);
+							seedRun(
+								runRepository,
+								resultRepository,
+								newerId,
+								path,
+								"full",
+								"succeeded",
+								newerAt,
+								[
+									finding(
+										"fp-partial",
+										"Partial peer",
+										"p.bx"
+									)
+								]
+							);
+
+							var body = jsonDeserialize( this.get( "/api/v1/runs/#newerId#/result" ).getRenderedContent() );
+							expect( body
+									.data
+									.result
+									.baseline
+									.runId ).toBe( partialId );
+							expect( body
+									.data
+									.result
+									.baseline
+									.status ).toBe( "partial" );
+							expect( body
+									.data
+									.result
+									.findings[ 1 ].baselineStatus ).toBe( "unchanged" );
+						} finally {
+							cleanupRuns( [ failedId, partialId, newerId] );
+						}
+					}
+				);
+			}
+		);
+	}
+
+	private struct function finding( required string fingerprint, required string title, required string filePath ) {
+		return {
+			id         : lCase( createUUID() ),
+			fingerprint: arguments.fingerprint,
+			category   : "correctness",
+			ruleId     : "test/#arguments.fingerprint#",
+			severity   : "medium",
+			confidence : .9,
+			title      : arguments.title,
+			message    : arguments.title,
+			filePath   : arguments.filePath,
+			startLine  : 1,
+			endLine    : 1,
+			evidence   : "evidence",
+			suggestion : "fix it",
+			source     : "deterministic"
+		};
+	}
+
+	private void function seedRun(
+		required any runRepository,
+		required any resultRepository,
+		required string runId,
+		required string projectPath,
+		required string mode,
+		required string status,
+		required string createdAt,
+		required array findings
+	) {
+		arguments.runRepository.create(
+				{
+					id          : arguments.runId,
+					projectPath : arguments.projectPath,
+					mode        : arguments.mode,
+					baseRevision: "",
+					headRevision: "",
+					status      : arguments.status,
+					progress    : 100,
+					currentPhase: "completed",
+					message     : "Baseline fixture",
+					createdAt   : arguments.createdAt,
+					updatedAt   : arguments.createdAt
+				}
+			);
+		arguments.resultRepository.replaceFindings( arguments.runId, arguments.findings );
+		arguments.resultRepository.saveSummary(
+				runId              = arguments.runId,
+				summary            = "Baseline fixture summary",
+				languages          = [ "BoxLang"],
+				filesScanned       = arguments.findings.len(),
+				bytesScanned       = 100,
+				findingsCount      = arguments.findings.len(),
+				aiEnabled          = false,
+				reviewScope        = arguments.mode,
+				repositoryRevision = "abc123"
+			);
+	}
+
+	private void function cleanupRuns( required array runIds ) {
+		for ( var runId in arguments.runIds ) {
+			queryExecute(
+				"DELETE FROM review_findings WHERE run_id = :runId",
+				{ runId: runId }
+			);
+			queryExecute(
+				"DELETE FROM review_summaries WHERE run_id = :runId",
+				{ runId: runId }
+			);
+			queryExecute(
+				"DELETE FROM review_runs WHERE id = :runId",
+				{ runId: runId }
+			);
+		}
+	}
+}

@@ -1,0 +1,373 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"AiFlight TraceStoreService",
+			() => {
+				beforeEach(
+					() => {
+						variables.dbFile = getTempDirectory() & "ai-flight-test-#createUUID()#.db";
+						variables.store = new aiFlight.models.TraceStoreService();
+						variables.store.moduleSettings = {
+							dbPath      : variables.dbFile,
+							maxTraces   : 5,
+							previewChars: 2000,
+							environment : "local"
+						};
+						variables.store.onDIComplete();
+						variables.store.ensureSchema();
+					}
+				);
+
+				afterEach(
+					() => {
+						try {
+							if ( fileExists( variables.dbFile ) ) {
+								fileDelete( variables.dbFile );
+							}
+						} catch (any e) {
+
+
+							// ignore locked files on Windows
+						}
+					}
+				);
+
+				it(
+					"creates traces and nested observations then lists them",
+					() => {
+						var trace = variables.store.createTrace(
+								{
+									name        : "chat",
+									provider    : "openai",
+									model       : "test-model",
+									inputPreview: "hi"
+								}
+							);
+						expect( trace.id ).notToBeEmpty();
+						expect( trace.status ).toBe( "running" );
+						// createTrace() was not given a startedAt (the real caller,
+						// AiFlightListener, never supplies one either) so this exercises
+						// the isoNow() fallback and must produce a real parseable date.
+						expect( isDate( trace.startedAt ) ).toBeTrue();
+
+						variables.store.upsertObservation(
+								{
+									traceId    : trace.id,
+									type       : "generation",
+									name       : "chat",
+									status     : "ok",
+									inputText  : "hi",
+									outputText : "hello",
+									sourceEvent: "onAIChatResponse",
+									usage      : {
+										promptTokens    : 3,
+										completionTokens: 2,
+										totalTokens     : 5,
+										cost            : .0012
+									},
+									endTime: dateTimeFormat( now(), "iso" )
+								}
+							);
+
+						variables.store.completeTrace(
+								id            = trace.id,
+								status        = "ok",
+								outputPreview = "hello",
+								durationMs    = 1500,
+								usage         = { promptTokens: 3, completionTokens: 2, totalTokens: 5 }
+							);
+
+						var listed = variables.store.listTraces( limit = 10 );
+						expect( listed ).toHaveLength( 1 );
+						expect( listed[ 1 ].observationCount ).toBe( 1 );
+						expect( listed[ 1 ].durationMs ).toBe( 1500 );
+						expect( val( listed[ 1 ].cost ) ).toBeGT( 0 );
+						expect( listed[ 1 ].environment ).toBe( "local" );
+
+						var detail = variables.store.getTraceDetail( trace.id );
+						expect( detail.observations ).toHaveLength( 1 );
+						expect( detail.observations[ 1 ].type ).toBe( "generation" );
+						expect( detail.status ).toBe( "ok" );
+						expect( detail.totalTokens ).toBe( 5 );
+
+						var stats = variables.store.getStats();
+						expect( stats.traceCount ).toBe( 1 );
+						expect( stats.totalTokens ).toBe( 5 );
+						expect( stats.totalCost ).toBeGT( 0 );
+						// Created moments ago, so it must count toward "today" too.
+						expect( stats.todayTraceCount ).toBe( 1 );
+						expect( stats.todayCost ).toBeGT( 0 );
+						expect( stats.errorCount ).toBe( 0 );
+					}
+				);
+
+				it(
+					"filters by model environment userId obsType duration and minCost",
+					() => {
+						var a = variables.store.createTrace(
+								{
+									name       : "a",
+									model      : "deepseek-v4",
+									userId     : "u1",
+									environment: "staging",
+									status     : "ok"
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									traceId: a.id,
+									type   : "tool",
+									name   : "tool:x",
+									status : "ok",
+									usage  : { cost: .05 }
+								}
+							);
+						variables.store.completeTrace(
+								id         = a.id,
+								status     = "ok",
+								durationMs = 2000
+							);
+
+						var b = variables.store.createTrace(
+								{
+									name       : "b",
+									model      : "gpt-test",
+									userId     : "u2",
+									environment: "local",
+									status     : "ok"
+								}
+							);
+						variables.store.completeTrace(
+								id         = b.id,
+								status     = "ok",
+								durationMs = 100
+							);
+
+						expect( arrayLen( variables.store.listTraces() ) ).toBe( 2 );
+						expect( arrayLen( variables.store.listTraces( model = "deep" ) ) ).toBe( 1, "model prefix" );
+						expect(
+							arrayLen( variables.store.listTraces( environment = "staging" ) )
+						).toBe( 1, "environment" );
+						expect( arrayLen( variables.store.listTraces( userId = "u2" ) ) ).toBe( 1, "userId" );
+						expect(
+							arrayLen( variables.store.listTraces( obsType = "tool" ) )
+						).toBe( 1, "obsType" );
+						expect(
+							arrayLen( variables.store.listTraces( minDurationMs = 1500 ) )
+						).toBe( 1, "minDuration" );
+						expect(
+							arrayLen( variables.store.listTraces( maxDurationMs = 500 ) )
+						).toBe( 1, "maxDuration" );
+						expect( arrayLen( variables.store.listTraces( minCost = .01 ) ) ).toBe( 1, "minCost" );
+					}
+				);
+
+				it(
+					"returns a session by id with member traces",
+					() => {
+						variables.store.createTrace( { name: "t1", sessionId: "sess-x" } );
+						variables.store.createTrace( { name: "t2", sessionId: "sess-x" } );
+						var sess = variables.store.getSession( "sess-x" );
+						expect( sess.id ).toBe( "sess-x" );
+						expect( sess.traceCount ).toBe( 2 );
+						expect( arrayLen( sess.traces ) ).toBe( 2 );
+					}
+				);
+
+				it(
+					"prunes oldest traces beyond maxTraces",
+					() => {
+						for ( var i = 1; i <= 7; i++ ) {
+							variables.store.createTrace( { name: "t#i#" } );
+						}
+						var listed = variables.store.listTraces( limit = 20 );
+						expect( arrayLen( listed ) ).toBeLTE( 5 );
+					}
+				);
+
+				it(
+					"groups traces into sessions by session_id",
+					() => {
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-a" } );
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-a" } );
+						variables.store.createTrace( { name: "generate-response", sessionId: "sess-b" } );
+						var sessions = variables.store.listSessions( limit = 10 );
+						expect( arrayLen( sessions ) ).toBeGTE( 2 );
+						var sessA = sessions.filter( ( s ) => s.id == "sess-a" );
+						expect( arrayLen( sessA ) ).toBe( 1 );
+						expect( sessA[ 1 ].traceCount ).toBe( 2 );
+						expect( arrayLen( sessA[ 1 ].traces ) ).toBe( 2 );
+					}
+				);
+
+				it(
+					"finds latest running trace and running generation for recovery",
+					() => {
+						var old = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "conv-1",
+									status   : "running"
+								}
+							);
+						var fresh = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "conv-1",
+									status   : "running"
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-run",
+									traceId    : fresh.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest"
+								}
+							);
+						var found = variables.store.findLatestRunningTrace( sessionId = "conv-1", name = "generate-response" );
+						expect( found.id ).toBe( fresh.id );
+						var gen = variables.store.findRunningGeneration( fresh.id );
+						expect( gen.id ).toBe( "obs-run" );
+						expect( gen.status ).toBe( "running" );
+						expect( old.id ).notToBe( found.id );
+					}
+				);
+
+				it(
+					"abandons stale running traces and their open observations",
+					() => {
+						variables.store.moduleSettings.maxTraces = 50;
+						variables
+							.store
+							.moduleSettings
+							.staleRunningMinutes = 5;
+						// Absolute timestamps avoid flaky string compares against "now".
+						var staleAt = "2020-01-01T00:00:00Z";
+						var emptyAt = "2020-01-01T00:01:00Z";
+						var freshAt = "2099-01-01T00:00:00Z";
+						var stale = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-stale",
+									status   : "running",
+									startedAt: staleAt
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-stale",
+									traceId    : stale.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest",
+									startTime  : staleAt
+								}
+							);
+						var emptyShell = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-empty",
+									status   : "running",
+									startedAt: emptyAt
+								}
+							);
+						var fresh = variables.store.createTrace(
+								{
+									name     : "generate-response",
+									sessionId: "s-fresh",
+									status   : "running",
+									startedAt: freshAt
+								}
+							);
+						variables.store.upsertObservation(
+								{
+									id         : "obs-fresh",
+									traceId    : fresh.id,
+									type       : "generation",
+									name       : "generate-response",
+									status     : "running",
+									sourceEvent: "onAIChatRequest",
+									startTime  : freshAt
+								}
+							);
+						var abandoned = variables.store.abandonStaleRunningTraces( force = true );
+						expect( abandoned ).toBeGTE( 2 );
+						expect( variables.store.getTrace( stale.id ).status ).toBe( "abandoned" );
+						expect( variables.store.getObservation( "obs-stale" ).status ).toBe( "abandoned" );
+						expect( variables.store.getTrace( emptyShell.id ).status ).toBe( "abandoned" );
+						expect( variables.store.getTrace( fresh.id ).status ).toBe( "running" );
+
+						// Late success after timeout should become ok, not stay as a failure.
+						variables.store.completeTrace(
+								id            = stale.id,
+								status        = "ok",
+								outputPreview = "late reply"
+							);
+						expect( variables.store.getTrace( stale.id ).status ).toBe( "ok" );
+						expect( variables.store.getTrace( stale.id ).errorMessage ).toBe( "" );
+					}
+				);
+
+				it( "upserts feedback on a trace and overwrites the same name", () => {
+					var trace = variables.store.createTrace( { name: "chat", status: "ok" } );
+					var first = variables.store.upsertFeedback( trace.id, "up", "looks good" );
+					expect( first.value ).toBe( "up" );
+					expect( first.comment ).toBe( "looks good" );
+					expect( first.updatedAt ).notToBeEmpty();
+
+					var second = variables.store.upsertFeedback( trace.id, "down", "regressed" );
+					expect( second.value ).toBe( "down" );
+					expect( second.comment ).toBe( "regressed" );
+
+					var detail = variables.store.getTraceDetail( trace.id );
+					expect( detail.feedback.value ).toBe( "down" );
+					expect( detail.feedback.comment ).toBe( "regressed" );
+				} );
+
+				it( "rejects invalid feedback values and missing traces on upsert", () => {
+					var trace = variables.store.createTrace( { name: "chat" } );
+					expect( () => variables.store.upsertFeedback( trace.id, "meh" ) )
+						.toThrow( type = "AiFlight.InvalidFeedback" );
+					expect( variables.store.upsertFeedback( "missing-id", "up" ) ).toBeEmpty();
+				} );
+
+				it( "clears feedback and is idempotent when absent", () => {
+					var trace = variables.store.createTrace( { name: "chat" } );
+					variables.store.upsertFeedback( trace.id, "up" );
+					expect( variables.store.clearFeedback( trace.id ) ).toBeTrue();
+					expect( variables.store.getTraceDetail( trace.id ).feedback ).toBeNull();
+					expect( variables.store.clearFeedback( trace.id ) ).toBeFalse();
+					expect( variables.store.clearFeedback( "missing-id" ) ).toBeFalse();
+				} );
+
+				it( "filters traces by feedback up down any and none", () => {
+					var up = variables.store.createTrace( { name: "up-trace", status: "ok" } );
+					var down = variables.store.createTrace( { name: "down-trace", status: "ok" } );
+					var bare = variables.store.createTrace( { name: "bare", status: "ok" } );
+					variables.store.upsertFeedback( up.id, "up" );
+					variables.store.upsertFeedback( down.id, "down", "nope" );
+
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 1, "up" );
+					expect( arrayLen( variables.store.listTraces( feedback = "down" ) ) ).toBe( 1, "down" );
+					expect( arrayLen( variables.store.listTraces( feedback = "any" ) ) ).toBe( 2, "any" );
+					expect( arrayLen( variables.store.listTraces( feedback = "none" ) ) ).toBe( 1, "none" );
+					expect( variables.store.listTraces( feedback = "none" )[ 1 ].id ).toBe( bare.id );
+				} );
+
+				it( "cascades scores when a trace is deleted", () => {
+					var doomed = variables.store.createTrace( { name: "doomed" } );
+					variables.store.upsertFeedback( doomed.id, "up" );
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 1 );
+					expect( variables.store.deleteTrace( doomed.id ) ).toBeTrue();
+					expect( arrayLen( variables.store.listTraces( feedback = "up" ) ) ).toBe( 0 );
+					expect( variables.store.getTrace( doomed.id ) ).toBeEmpty();
+				} );
+			}
+		);
+	}
+}

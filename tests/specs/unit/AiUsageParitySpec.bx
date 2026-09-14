@@ -1,0 +1,86 @@
+/**
+ * Section 6.3: aiFlight keeps its own trace normalisation, duplicating
+ * token-usage parsing with AiTelemetryExtractor. That duplication is
+ * deliberate — the module is independently distributable — and the plan asks
+ * for it to be mitigated "with a shared fixture parity spec, not shared code".
+ *
+ * This is that spec. Both parsers are fed the same provider payloads. Where
+ * they agree, drift in either one fails here. Where they genuinely differ, the
+ * difference is asserted rather than left to be discovered by a user reading
+ * two screens that disagree about the same run.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Token usage parity: AiTelemetryExtractor vs aiFlight EventNormalizer", () => {
+
+			var extractor = new app.models.services.AiTelemetryExtractor();
+
+			var flightUsage = ( payload ) => {
+				var normalizer = new app.modules.aiFlight.models.EventNormalizer();
+				makePublic( normalizer, "extractUsage" );
+				return normalizer.extractUsage( payload );
+			};
+
+			it( "agrees on OpenAI snake_case usage", () => {
+				var usage = { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 };
+
+				var mine = extractor.extractUsage( { result: { usage: usage } } );
+				var theirs = flightUsage( { usage: usage } );
+
+				expect( mine.promptTokens ).toBe( 120 );
+				expect( mine.completionTokens ).toBe( 30 );
+				expect( mine.totalTokens ).toBe( 150 );
+				expect( theirs.promptTokens ).toBe( mine.promptTokens );
+				expect( theirs.completionTokens ).toBe( mine.completionTokens );
+				expect( theirs.totalTokens ).toBe( mine.totalTokens );
+			} );
+
+			it( "agrees on camelCase usage", () => {
+				var usage = { promptTokens: 7, completionTokens: 11, totalTokens: 18 };
+
+				var mine = extractor.extractUsage( { result: { usage: usage } } );
+				var theirs = flightUsage( { usage: usage } );
+
+				expect( theirs.promptTokens ).toBe( mine.promptTokens );
+				expect( theirs.completionTokens ).toBe( mine.completionTokens );
+				expect( theirs.totalTokens ).toBe( mine.totalTokens );
+			} );
+
+			it( "agrees on deriving a missing total from its parts", () => {
+				var usage = { prompt_tokens: 40, completion_tokens: 60 };
+
+				var mine = extractor.extractUsage( { result: { usage: usage } } );
+				var theirs = flightUsage( { usage: usage } );
+
+				expect( mine.totalTokens ).toBe( 100, "total should be derived when the provider omits it" );
+				expect( theirs.totalTokens ).toBe( mine.totalTokens );
+			} );
+
+			it( "agrees that an absent usage block yields no invented numbers", () => {
+				var mine = extractor.extractUsage( {} );
+				var theirs = flightUsage( {} );
+
+				expect( val( mine.promptTokens ?: 0 ) ).toBe( 0 );
+				expect( val( theirs.promptTokens ?: 0 ) ).toBe( 0 );
+			} );
+
+			it( "DIVERGES on Anthropic-style input_tokens/output_tokens", () => {
+				// A real, currently-live difference, asserted so it is visible rather
+				// than silent: the same run can report tokens in the review UI and
+				// zero in the flight recorder.
+				//
+				// If aiFlight gains support for these keys, this spec fails and
+				// should be promoted to an agreement assertion above.
+				var usage = { input_tokens: 500, output_tokens: 250 };
+
+				var mine = extractor.extractUsage( { result: { usage: usage } } );
+				var theirs = flightUsage( { usage: usage } );
+
+				expect( mine.promptTokens ).toBe( 500, "AiTelemetryExtractor understands Anthropic-style usage" );
+				expect( mine.completionTokens ).toBe( 250 );
+				expect( val( theirs.promptTokens ?: 0 ) ).toBe( 0, "aiFlight does not — recorded so the gap is tracked, not discovered" );
+			} );
+		} );
+	}
+}

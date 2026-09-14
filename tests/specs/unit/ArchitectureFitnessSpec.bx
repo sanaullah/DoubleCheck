@@ -1,0 +1,208 @@
+/**
+ * Architectural invariants, asserted so drift fails CI rather than accumulating.
+ *
+ * Every rule here exists because its absence already caused a defect:
+ * duplicated volatile-key lists produced spurious decision conflicts, and
+ * singletons without `threadsafe` were silently losing injected dependencies.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Architecture fitness", () => {
+
+			var modelRoot = expandPath( "/tests/../app/models" );
+
+			var modelFiles = () => {
+				var found = [];
+				var listed = directoryList( modelRoot, true, "path", "*.bx" );
+				for ( var path in listed ) found.append( path );
+				found.sort( ( a, b ) => compareNoCase( a, b ) );
+				return found;
+			};
+
+			var read = ( path ) => fileRead( path, "UTF-8" );
+			var relative = ( path ) => replace( replace( path, modelRoot, "", "one" ), "\", "/", "all" );
+
+			it( "keeps the fingerprint volatile-key list in exactly one place", () => {
+				// Three copies once existed and two of them had diverged, so
+				// placement and gate evaluation hashed the same item differently
+				// and users saw ModernizationDecisionConflict on unchanged items.
+				// Two halves of one invariant: exactly one file declares the
+				// list, and nobody re-inlines it. Matching field names alone
+				// would flag ModernizationRiskService, which legitimately
+				// computes riskLevel/effortDrivers without owning the list.
+				var declarers = [];
+				var inliners = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					if ( reFindNoCase( "function\s+volatileKeys\s*\(", source ) ) declarers.append( relative( path ) );
+					// The old shape: the whole exclusion list on one line.
+					if ( reFindNoCase( '"itemFingerprint"[^' & char( 10 ) & ']*"effortDrivers"', source ) ) inliners.append( relative( path ) );
+				}
+
+				expect( declarers ).toHaveLength(
+					1,
+					"exactly one file may declare volatileKeys(), found: " & declarers.toList( ", " )
+				);
+				expect( declarers[ 1 ] ).toInclude( "ModernizationIdentityService" );
+				expect( inliners ).toBeEmpty(
+					"the volatile-key list was re-inlined in: " & inliners.toList( ", " )
+				);
+			} );
+
+			it( "declares every injected singleton threadsafe", () => {
+				// WireBox wires setter/property injections *after* placing the
+				// instance in the singleton scope, unlocked. Without threadsafe
+				// another thread can take a half-wired singleton and later
+				// properties read as null — silently, and only sometimes.
+				var offenders = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					var isSingleton = findNoCase( "@singleton", source ) > 0;
+					var injects = reFindNoCase( 'property\s+name="[^"]+"\s+inject=', source ) > 0;
+					var isThreadsafe = reFindNoCase( "class\s+threadsafe", source ) > 0;
+					if ( isSingleton && injects && !isThreadsafe ) offenders.append( relative( path ) );
+				}
+
+				expect( offenders ).toBeEmpty(
+					"singletons with injected properties must be `class threadsafe {`: " & offenders.toList( ", " )
+				);
+			} );
+
+			it( "keeps the deterministic layer free of any gateway", () => {
+				// This is what keeps the deterministic corpus tier runnable
+				// without a provider.
+				var deterministic = [
+					"ModernizationCouplingGraphService.bx",
+					"ModernizationDerivedStructureService.bx",
+					"ModernizationPlacementService.bx",
+					"CouplingGraph.bx",
+					"Cluster.bx",
+					"WaveOrder.bx",
+					"CodeGraphInventoryAdapter.bx",
+					"CodeGraphMetricsService.bx",
+					"CodeGraphRunService.bx"
+				];
+				for ( var path in modelFiles() ) {
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( !deterministic.contains( name ) ) continue;
+					var source = read( path );
+
+					expect( reFindNoCase( 'inject="\w*(Gateway|AgentFactory)', source ) ).toBe(
+						0,
+						name & " must not inject an LLM gateway"
+					);
+				}
+			} );
+
+			it( "holds no service above 900 lines except SchemaService", () => {
+				var offenders = [];
+				for ( var path in modelFiles() ) {
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( name == "SchemaService.bx" ) continue;
+					var lineCount = listToArray( read( path ), char( 10 ), true, true ).len();
+					if ( lineCount > 900 ) offenders.append( relative( path ) & " (" & lineCount & ")" );
+				}
+
+				// Cleared by Step 11, and deliberately not on the list any more:
+				//   ModernizationProposalService  3,444 -> 864, via three splits:
+				//     ModernizationArtifactService (samples/transitions/naming),
+				//     ModernizationShardExecutor (dispatch), and
+				//     ModernizationFragmentMerger (reconciling fragments into one
+				//     plan with stable identity).
+				//   ModernizationPlacementService   983 -> 873, by moving target-path
+				//     shaping to ModernizationTargetPathService. Placement answers
+				//     "which capability owns these units"; path shaping answers
+				//     "where does this file go".
+				//
+				// Still known, each with a destination:
+				//   SpecialistAgentGateway 1976 -> 798, cleared. Nine splits, ending
+				//     with both provider paths (SpecialistAgentInvoker /
+				//     SpecialistChatInvoker). The last 120 lines came from deleting
+				//     delegating wrappers left dead by those moves, once the specs
+				//     were repointed at the real owners.
+				//   ReviewRunService              -> Part 5
+				//   SpecialistReviewService 943 -> 886, cleared. Failure presentation
+				//     (friendlyFailureMessage / previewText / logSpecialistError)
+				//     moved to SpecialistFailurePresenter: orchestrating specialist
+				//     runs and explaining a failure are different jobs.
+				//   ModernizationDerivedStructureService 1496 -> 969. Roadmap and
+				//     architecture synthesis moved to
+				//     ModernizationRoadmapSynthesisService along the line this note
+				//     predicted -- derivation reads the graph, synthesis reads
+				//     derivation. Still 69 over: the remainder is one responsibility
+				//     (graph -> clusters -> waves) with no second seam yet visible,
+				//     so the next cut needs a reason beyond the line count.
+				//   ModernizationShardExecutor (1064) -> extracted by Step 11 from
+				//     ModernizationProposalService. Over on arrival because the
+				//     shard cluster is genuinely large; it is one responsibility
+				//     (dispatch bounded provider calls) so splitting it further
+				//     would be splitting for the metric, not the design. Revisit
+				//     only if a second responsibility appears in it.
+				//
+				// Do NOT let this list grow without a destination beside each entry
+				// -- two exceptions were once added in two consecutive steps, which
+				// is how a rule dies.
+				var known = [ "ReviewRunService", "ModernizationDerivedStructureService", "ModernizationShardExecutor" ];
+				var unexpected = [];
+				for ( var offender in offenders ) {
+					var recognised = false;
+					for ( var allowed in known ) if ( findNoCase( allowed, offender ) ) recognised = true;
+					if ( !recognised ) unexpected.append( offender );
+				}
+
+				expect( unexpected ).toBeEmpty(
+					"new service over 900 lines: " & unexpected.toList( ", " )
+				);
+			} );
+
+			it( "gives target-path derivation exactly one owner", () => {
+				// This is the invariant Step 12 was written for: the proposal
+				// service derived a path and placement canonicalization
+				// independently rewrote it, so two files decided one thing.
+				var owners = [];
+				for ( var path in modelFiles() ) {
+					if ( reFindNoCase( "function\s+deriveTargetPath\s*\(", read( path ) ) ) owners.append( relative( path ) );
+				}
+
+				expect( owners ).toHaveLength(
+					1,
+					"target-path derivation must have one owner, found: " & owners.toList( ", " )
+				);
+				// The owner moved out of PlacementService in Step 11: placement answers
+				// "which capability owns these units", path shaping answers "where does
+				// this file go". Still exactly one owner, which is what the rule is for.
+				expect( owners[ 1 ] ).toInclude( "ModernizationTargetPathService" );
+			} );
+
+			it( "gives cluster membership and wave order one owner each", () => {
+				var clusterOwners = [];
+				var waveOwners = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					if ( reFindNoCase( "function\s+deriveClusters\s*\(", source ) ) clusterOwners.append( relative( path ) );
+					if ( reFindNoCase( "function\s+deriveWaveOrder\s*\(", source ) ) waveOwners.append( relative( path ) );
+				}
+
+				expect( clusterOwners ).toHaveLength( 1 );
+				expect( waveOwners ).toHaveLength( 1 );
+			} );
+
+			it( "gives the coupling graph exactly one computing owner and one answering type", () => {
+				// Step 12's actual test: if two files can answer the same
+				// question, the invariant has two owners again.
+				var computes = [];
+				var answers = [];
+				for ( var path in modelFiles() ) {
+					var source = read( path );
+					var name = listLast( replace( path, "\", "/", "all" ), "/" );
+					if ( reFindNoCase( "function\s+stronglyConnectedComponents", source ) ) computes.append( name );
+					if ( reFindNoCase( "function\s+fanIn\s*\(", source ) ) answers.append( name );
+				}
+
+				expect( computes ).toBe( [ "ModernizationCouplingGraphService.bx" ] );
+				expect( answers ).toBe( [ "CouplingGraph.bx" ] );
+			} );
+		} );
+	}
+}

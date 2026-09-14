@@ -1,0 +1,766 @@
+/**
+ * Renders a persisted Modernize run for local download.
+ *
+ * SARIF represents validation and coverage gates, not modernization proposals
+ * as compiler/security findings.
+ */
+
+@singleton
+class threadsafe {
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="assessmentNarrative" inject="ModernizationAssessmentNarrative";
+	variables.supportedFormats = [ "json", "markdown", "sarif" ];
+
+	function init() {
+		if ( isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) variables.secretRedactionService = new app.models.services.SecretRedactionService();
+		return this;
+	}
+
+	struct function export( required struct run, required struct result, string format = "markdown" ) {
+		var normalized = lCase( trim( arguments.format ) );
+		if ( !variables.supportedFormats.contains( normalized ) ) {
+			throw(
+				type = "ValidationException",
+				message = "Unsupported Modernize export format. Use json, markdown, or sarif."
+			);
+		}
+
+		var runToken = left(
+			reReplace( arguments.run.id ?: "modernization", "[^a-zA-Z0-9]", "", "all" ),
+			12
+		);
+		if ( !len( runToken ) ) runToken = "modernization";
+
+		if ( normalized == "json" ) {
+			return package(
+				normalized,
+				"application/json",
+				"doublecheck-modernization-#runToken#.json",
+				toJson( arguments.run, arguments.result )
+			);
+		}
+		if ( normalized == "sarif" ) {
+			return package(
+				normalized,
+				"application/sarif+json",
+				"doublecheck-modernization-#runToken#.sarif.json",
+				toSarif( arguments.run, arguments.result )
+			);
+		}
+
+		return package(
+			normalized,
+			"text/markdown; charset=utf-8",
+			"doublecheck-modernization-#runToken#.md",
+			toMarkdown( arguments.run, arguments.result )
+		);
+	}
+
+	array function supportedFormats() {
+		return duplicate( variables.supportedFormats );
+	}
+
+	string function toJson( required struct run, required struct result ) {
+		var payload = sanitizeExportValue( duplicate( arguments.result ), "", "" );
+		sortExportCollections( payload );
+		var metadata = isStruct( payload.metadata ?: "" ) ? payload.metadata : {};
+		payload.schemaVersion = payload.schemaVersion ?: ( isArray( payload.target?.placements ?: "" ) ? "modernization-plan-v2" : "modernization-plan-v1" );
+		payload.placementContractVersion = payload.placementContractVersion ?: ( isArray( payload.target?.placements ?: "" ) ? "modernization-placement-v1" : "" );
+		payload.run = {
+			id          : arguments.run.id ?: "",
+			projectPath : arguments.run.projectPath ?: "",
+			mode        : arguments.run.mode ?: "full",
+			runKind     : arguments.run.runKind ?: "modernize",
+			status      : arguments.run.status ?: "",
+			createdAt   : arguments.run.createdAt ?: "",
+			completedAt : arguments.run.completedAt ?: ""
+		};
+		payload.export = {
+			format     : "json",
+			generatedAt: metadata.generatedAt ?: arguments.run.createdAt ?: ""
+		};
+		return jsonSerialize( payload );
+	}
+
+	string function toMarkdown( required struct run, required struct result ) {
+		var lines = [];
+		var coverage = arguments.result.coverage ?: {};
+		var planMetadata = arguments.result.metadata ?: {};
+		var coverageSchema = coverage.schema ?: {};
+		var coverageRoad = coverage.road ?: {};
+		var coverageLlm = coverage.llm ?: {};
+		var schemaEvidence = arguments.result.schemaEvidence ?: {};
+		var inventory = arguments.result.inventory ?: {};
+		var target = arguments.result.target ?: {};
+		var validation = arguments.result.validation ?: {};
+		var decisions = arguments.result.decisions ?: [];
+		var roadmap = arguments.result.roadmapPhases ?: [];
+		var legacyUnits = inventory.units ?: [];
+		var legacyUnitRows = legacyUnitDisplayRows( legacyUnits, inventory.dependencies ?: [] );
+		var targetUnits = target.units ?: [];
+		var placements = target.placements ?: arguments.result.placements ?: [];
+		var routes = arguments.result.routeContracts ?: [];
+		var dbFindings = arguments.result.dbFindings ?: [];
+		var transitions = arguments.result.dbTransitions ?: [];
+		var contexts = target.contexts ?: arguments.result.contexts ?: [];
+		var extracts = target.extracts ?: arguments.result.extracts ?: [];
+		var samples = arguments.result.samples ?: [];
+		var unitLinks = arguments.result.unitLinks ?: [];
+
+		// Order is the whole point of this document (§2.9). Verdict, then what to
+		// do about it, then the roadmap and the register -- and only then the
+		// appendices. Run identifiers and pipeline telemetry are the last thing a
+		// reader needs, so they are the last thing they are shown.
+		lines.append( mdHeading( 1, escapeMarkdown( repositoryName( arguments.run ) ) & " — Modernization Assessment" ) );
+		lines.append( "" );
+
+		appendVerdict( lines, arguments.result, placements );
+		appendStartHere( lines, arguments.result, placements );
+		appendBlockers( lines, arguments.result, placements );
+
+		lines.append( "---" );
+		lines.append( "" );
+
+		appendSolutionPhases( lines, roadmap, routes, targetUnits, samples, dbFindings, transitions, unitLinks );
+		appendPlacementRegister( lines, placements );
+
+		lines.append( mdHeading( 2, "Decisions register" ) );
+		lines.append( "" );
+		var decisionItems = isArray( decisions ) ? decisions : ( isArray( decisions.items ?: "" ) ? decisions.items : [] );
+		if ( decisionItems.len() ) {
+			for ( var decision in decisionItems ) {
+				lines.append( "- `" & escapeMarkdown( decision.itemType ?: "item" ) & "` `" & escapeMarkdown( decision.decision ?: "undecided" ) & "` — " & escapeMarkdown( decision.note ?: "" ) );
+			}
+		} else {
+			lines.append( "No decisions have been recorded against this plan yet." );
+		}
+		lines.append( "" );
+		lines.append( "---" );
+		lines.append( "" );
+
+		var commonLabels = { validationStatus: "Validation", provenanceClass: "Evidence basis", evidenceRefs: "Evidence", evidence: "Evidence" };
+		appendRows( lines, mdHeading( 2, "Appendix A — Legacy catalog" ), legacyUnitRows, [ "id", "path", "kind", "name", "extends", "implements", "access", "returnType", "evidenceRefs" ], commonLabels );
+		appendRows( lines, mdHeading( 2, "Appendix B — Target structure" ), targetUnits, [ "id", "path", "kind", "purpose", "validationStatus", "provenanceClass", "evidenceRefs" ], commonLabels );
+		lines.append( mdHeading( 2, "Appendix C — Routes, database and samples" ) );
+		lines.append( "" );
+		appendRows( lines, mdHeading( 3, "Route contracts" ), routes, [ "legacyPath", "method", "targetRoute", "validationStatus", "provenanceClass", "evidence" ], structAppend( duplicate( commonLabels ), { legacyPath: "Legacy URL", targetRoute: "Target route" }, true ) );
+		appendRows( lines, mdHeading( 3, "Database findings" ), dbFindings, [ "findingId", "category", "severity", "objectRef", "proposedChange", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", proposedChange: "Proposed change" }, true ) );
+		appendRows( lines, mdHeading( 3, "Database transitions" ), transitions, [ "transitionId", "objectRef", "phase", "expandContract", "validationStatus", "provenanceClass", "evidenceRefs" ], structAppend( duplicate( commonLabels ), { objectRef: "Database object", expandContract: "Migration stage" }, true ) );
+		// The placement register above is the single rendering of this dataset.
+		// It previously appeared three more times -- an architecture packaging
+		// summary, a "Contexts and extracts" table and a "Side-app extract
+		// candidates" table -- all projections of the same placements in the v1
+		// vocabulary that no longer exists. One dataset, one section.
+		appendSamples( lines, samples );
+		appendRows( lines, mdHeading( 3, "Assumptions" ), arguments.result.assumptions ?: [], [ "id", "assumption", "reason", "evidenceRefs" ], commonLabels );
+
+		// Appendix D. Everything below this line is about the run, not about the
+		// repository -- which is why it is last (§2.9).
+		lines.append( mdHeading( 2, "Appendix D — Run telemetry, coverage and validation" ) );
+		lines.append( "" );
+		lines.append( "- **Run:** `" & escapeMarkdown( arguments.run.id ?: "" ) & "`" );
+		lines.append( "- **Repository:** `" & escapeMarkdown( arguments.run.projectPath ?: "" ) & "`" );
+		lines.append( "- **Scope:** `" & escapeMarkdown( arguments.run.mode ?: "full" ) & "`" );
+		lines.append( "- **Run status:** `" & escapeMarkdown( arguments.run.status ?: "" ) & "`" );
+		lines.append( "- **Plan state:** `" & escapeMarkdown( arguments.result.planState ?: arguments.result.state ?: "needs-review" ) & "`" );
+		lines.append( "- **Plan fingerprint:** `" & escapeMarkdown( arguments.result.planFingerprint ?: "" ) & "`" );
+		lines.append( "" );
+		lines.append( escapeMarkdown( arguments.result.summary ?: "No modernization summary was generated." ) );
+		lines.append( "" );
+		lines.append( coverageLine( "Application files", coverage.filesScanned ?: coverage.fileCount ?: 0 ) );
+		lines.append( coverageLine( "CFML files", coverage.cfmlFiles ?: coverage.cfmlFileCount ?: 0 ) );
+		lines.append( coverageLine( "On road", coverageRoad.onRoad ?: 0 ) );
+		lines.append( coverageLine( "Not yet sliced", coverageRoad.notYetSliced ?: 0 ) );
+		if ( len( coverageRoad.sourceStackNote ?: "" ) ) lines.append( "- **Source stack note:** " & escapeMarkdown( coverageRoad.sourceStackNote ) );
+		lines.append( coverageLine( "Schema source", coverage.schemaSource ?: schemaEvidence.source ?: "none" ) );
+		lines.append( coverageLine( "Schema coverage", coverage.schemaCoverage ?: coverageSchema.coverage ?: "unknown" ) );
+		lines.append( coverageLine( "Coverage status", coverage.status ?: coverage.coverageStatus ?: "unknown" ) );
+		lines.append( coverageLine( "Provider coverage", coverageLlm.status ?: "unknown" ) );
+		lines.append( coverageLine( "Provider shards completed", coverageLlm.completed ?: 0 ) );
+		lines.append( coverageLine( "Provider shards failed", coverageLlm.failed ?: 0 ) );
+		lines.append( coverageLine( "Provider shards omitted", coverageLlm.omitted ?: coverageLlm.omittedPartitions ?: 0 ) );
+		var gateSummary = arguments.result.gateSummary ?: {};
+		lines.append( coverageLine( "Placement gates", ( gateSummary.failed ?: 0 ) & " failed · " & ( gateSummary.unknown ?: 0 ) & " unknown" ) );
+		if ( isArray( coverageLlm.gaps ?: "" ) ) {
+			for ( var gap in coverageLlm.gaps ) {
+				if ( !isStruct( gap ) ) continue;
+				var gapPaths = isArray( gap.paths ?: "" ) ? gap.paths.toList( ", " ) : "";
+				lines.append( "- **Coverage gap:** " & escapeMarkdown( ( gap.kind ?: "gap" ) & " · " & ( gap.reason ?: gap.status ?: "unknown" ) & ( len( gapPaths ) ? " · " & gapPaths : "" ) ) );
+			}
+		}
+		if ( len( coverage.note ?: "" ) ) lines.append( "- **Coverage note:** " & escapeMarkdown( coverage.note ) );
+		if ( isArray( coverage.banners ?: "" ) ) {
+			for ( var banner in coverage.banners ) {
+				lines.append( "- **Coverage banner:** " & escapeMarkdown( toString( banner ) ) );
+			}
+		}
+		var providerDisclosure = coverage.remoteProviderDisclosure ?: arguments.result.remoteProviderDisclosure ?: planMetadata.remoteProviderDisclosure ?: "";
+		if ( len( providerDisclosure ) ) lines.append( "- **Provider disclosure:** " & escapeMarkdown( providerDisclosure ) );
+		lines.append( "" );
+		lines.append( "- **Validation status:** `" & escapeMarkdown( validation.status ?: validation.overallStatus ?: "unknown" ) & "`" );
+		lines.append( "- **Blocking issues:** `" & ( validation.blockingCount ?: validation.blockers ?: 0 ) & "`" );
+		lines.append( "- **Warnings:** `" & ( validation.warningCount ?: validation.warnings ?: 0 ) & "`" );
+		lines.append( "- **Decisions recorded:** `" & decisionItems.len() & "`" );
+		lines.append( "" );
+		lines.append( "> AI-proposed artifacts are bounded skeletons. Validate them against the immutable evidence snapshot before applying changes." );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	string function toSarif( required struct run, required struct result ) {
+		var plan = sanitizeExportValue( duplicate( arguments.result ), "", "" );
+		var coverage = isStruct( plan.coverage ?: "" ) ? plan.coverage : {};
+		var validation = isStruct( plan.validation ?: "" ) ? plan.validation : {};
+		var messages = isArray( validation.messages ?: "" ) ? validation.messages : [];
+		var gaps = isStruct( coverage.llm ?: "" ) && isArray( coverage.llm.gaps ?: "" )
+			? coverage.llm.gaps
+			: [];
+		var results = [];
+		var rules = {};
+		var planFingerprint = trim( plan.planFingerprint ?: "" );
+
+		for ( var message in messages ) {
+			if ( !isStruct( message ) ) continue;
+			var category = lCase( trim( message.category ?: "validation" ) );
+			var ruleId = "doublecheck/modernization/" & ruleToken( category );
+			rules[ ruleId ] = {
+				id: ruleId,
+				shortDescription: { text: "Modernization " & category & " validation" }
+			};
+			var itemId = trim( message.itemId ?: "" );
+			var item = findPlanItem( plan, itemId );
+			var row = {
+				ruleId: ruleId,
+				level: sarifLevel( message.level ?: message.validationLevel ?: "warning" ),
+				message: { text: toString( message.message ?: "Modernization validation requires review" ) },
+				properties: {
+					category: category,
+					itemId: itemId,
+					validationLevel: message.validationLevel ?: message.level ?: "warning",
+					planState: plan.planState ?: plan.state ?: "needs-review",
+					coverageStatus: coverage.status ?: "unknown"
+				}
+			};
+			var location = sarifLocation( item );
+			if ( location.count() ) row.locations = [ location ];
+			row.fingerprints = {
+				"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|" & ruleId & "|" & itemId & "|" & row.message.text, "SHA-256" ) )
+			};
+			results.append( row );
+		}
+
+		for ( var gapIndex = 1; gapIndex <= gaps.len(); gapIndex++ ) {
+			var gap = gaps[ gapIndex ];
+			if ( !isStruct( gap ) ) continue;
+			var gapRule = "doublecheck/modernization/coverage-gap";
+			rules[ gapRule ] = {
+				id: gapRule,
+				shortDescription: { text: "Modernization coverage gap" }
+			};
+			var paths = isArray( gap.paths ?: "" ) ? gap.paths : [];
+			var gapText = "Coverage gap: " & ( gap.kind ?: "unknown" ) & " (" & ( gap.reason ?: gap.status ?: "unknown" ) & ")";
+			if ( paths.len() ) gapText &= " — " & paths.toList( ", " );
+			var gapRow = {
+				ruleId: gapRule,
+				level: "warning",
+				message: { text: gapText },
+				properties: {
+					kind: gap.kind ?: "unknown",
+					reason: gap.reason ?: gap.status ?: "unknown",
+					status: gap.status ?: "unknown",
+					paths: duplicate( paths ),
+					planState: plan.planState ?: plan.state ?: "needs-review",
+					coverageStatus: coverage.status ?: "unknown"
+				},
+				fingerprints: {
+					"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|coverage-gap|" & gapIndex & "|" & gapText, "SHA-256" ) )
+				}
+			};
+			if ( paths.len() ) {
+				gapRow.locations = [ {
+					physicalLocation: {
+						artifactLocation: { uri: replace( toString( paths[ 1 ] ), "\", "/", "all" ) }
+					}
+				} ];
+			}
+			results.append( gapRow );
+		}
+
+		var placements = isStruct( plan.target ?: "" ) && isArray( plan.target.placements ?: "" ) ? plan.target.placements : [];
+		for ( var placement in placements ) {
+			if ( !isStruct( placement ) ) continue;
+			for ( var gate in ( isArray( placement.gates ?: "" ) ? placement.gates : [] ) ) {
+				if ( !isStruct( gate ) || ![ "fail", "unknown" ].contains( lCase( trim( gate.status ?: "" ) ) ) ) continue;
+				var gateStatus = lCase( trim( gate.status ?: "unknown" ) );
+				var gateId = trim( toString( gate.id ?: "architecture" ) );
+				var gateRule = "doublecheck/modernization/" & ( gateStatus == "fail" ? "placement-gate-failed" : "placement-gate-unknown" );
+				rules[ gateRule ] = {
+					id: gateRule,
+					shortDescription: { text: "Modernization placement gate" }
+				};
+				var placementId = trim( toString( placement.id ?: placement.itemId ?: "" ) );
+				var gateText = "Placement #placementId# — #gateId# gate is #gateStatus#";
+				if ( len( trim( gate.explanation ?: "" ) ) ) gateText &= ": " & gate.explanation;
+				results.append( {
+					ruleId: gateRule,
+					level: gateStatus == "fail" ? "error" : "warning",
+					message: { text: gateText },
+					properties: {
+						placementId: placementId,
+						gateId: gateId,
+						gateStatus: gateStatus,
+						planState: plan.planState ?: plan.state ?: "needs-review"
+					},
+					fingerprints: {
+						"doublecheck/modernization/v1": lCase( hash( planFingerprint & "|placement-gate|" & placementId & "|" & gateId & "|" & gateStatus, "SHA-256" ) )
+					}
+				} );
+			}
+		}
+
+		var ruleList = [];
+		var ruleIds = structKeyArray( rules );
+		ruleIds.sort( "textnocase" );
+		for ( var ruleId in ruleIds ) ruleList.append( rules[ ruleId ] );
+		var payload = {
+			version: "2.1.0",
+			runs: [ {
+				tool: {
+					driver: {
+						name: "DoubleCheck Modernization",
+						informationUri: "https://github.com/ortus-solutions/DoubleCheck",
+						rules: ruleList
+					}
+				},
+				invocations: [ {
+					executionSuccessful: val( validation.blockingCount ?: validation.blocking ?: 0 ) == 0 && !!( coverage.complete ?: false ),
+					properties: {
+						runId: arguments.run.id ?: "",
+						runKind: arguments.run.runKind ?: "modernize",
+						runStatus: arguments.run.status ?: "",
+						planState: plan.planState ?: plan.state ?: "needs-review",
+						planFingerprint: planFingerprint,
+						coverageStatus: coverage.status ?: "unknown",
+						coverageComplete: !!( coverage.complete ?: false ),
+						blockingCount: val( validation.blockingCount ?: validation.blocking ?: 0 ),
+						warningCount: val( validation.warningCount ?: validation.warnings ?: 0 )
+					}
+				} ],
+				results: results,
+				properties: {
+					schemaVersion: plan.schemaVersion ?: "modernization-plan-v1",
+					provider: plan.metadata.providerId ?: "",
+					model: plan.metadata.model ?: ""
+				}
+			} ]
+		};
+		payload[ "$schema" ] = "https://json.schemastore.org/sarif-2.1.0.json";
+		return jsonSerialize( payload );
+	}
+
+	private struct function findPlanItem( required struct plan, required string itemId ) {
+		if ( !len( arguments.itemId ) ) return {};
+		for ( var path in [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "dbTransitions", "routeContracts", "roadmapPhases", "samples" ] ) {
+			var parts = path.listToArray( "." );
+			var owner = parts.len() == 2 ? ( arguments.plan[ parts[ 1 ] ] ?: {} ) : arguments.plan;
+			var key = parts[ parts.len() ];
+			for ( var item in ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ? owner[ key ] : [] ) ) {
+				if ( trim( item.id ?: item.itemId ?: "" ) == arguments.itemId ) return item;
+			}
+		}
+		return {};
+	}
+
+	private struct function sarifLocation( required struct item ) {
+		if ( !arguments.item.count() ) return {};
+		var refs = isArray( arguments.item.evidenceRefs ?: "" )
+			? arguments.item.evidenceRefs
+			: ( isArray( arguments.item.evidence ?: "" ) ? arguments.item.evidence : [] );
+		var path = trim( arguments.item.sourcePath ?: arguments.item.filePath ?: "" );
+		var startLine = 0;
+		var endLine = 0;
+		for ( var ref in refs ) {
+			if ( !isStruct( ref ) ) continue;
+			if ( len( trim( ref.filePath ?: "" ) ) ) path = trim( ref.filePath );
+			startLine = val( ref.startLine ?: 0 );
+			endLine = val( ref.endLine ?: startLine );
+			if ( len( path ) ) break;
+		}
+		if ( !len( path ) ) return {};
+		var physical = {
+			artifactLocation: { uri: replace( path, "\", "/", "all" ) }
+		};
+		if ( startLine > 0 ) {
+			physical.region = {
+				startLine: int( startLine ),
+				endLine: int( max( startLine, endLine ) )
+			};
+		}
+		return { physicalLocation: physical };
+	}
+
+	private string function sarifLevel( required string level ) {
+		var normalized = lCase( trim( arguments.level ) );
+		if ( normalized == "blocking" || normalized == "error" ) return "error";
+		if ( normalized == "warning" ) return "warning";
+		return "note";
+	}
+
+	private string function ruleToken( required string value ) {
+		var token = lCase( reReplace( arguments.value, "[^a-zA-Z0-9._-]", "-", "all" ) );
+		return len( token ) ? token : "validation";
+	}
+
+	private void function appendPlacementRegister( required array lines, required array placements ) {
+		arguments.lines.append( mdHeading( 2, "Architecture placement register" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.placements.len() ) {
+			arguments.lines.append( "- No canonical placement decisions were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		arguments.lines.append( "Every target unit should have exactly one owner. Service extraction remains gated by deployability, data ownership, state isolation, and operational evidence." );
+		arguments.lines.append( "" );
+		appendRows(
+			arguments.lines,
+			"",
+			arguments.placements,
+			// riskLevel / effortSize / effortDrivers / relatedFindingCount are
+			// computed by ModernizationRiskService on every run and shown in the
+			// UI, but were absent from the document a user exports and shares
+			// (section 2.8). A reader deciding what to do first needs the effort
+			// and the risk, not only the recommendation.
+			[ "id", "name", "placementType", "targetUnitIds", "riskLevel", "effortSize", "effortDrivers", "relatedFindingCount", "gateStatus", "decisionRequired", "evidenceBasis", "recommendation", "evidenceRefs" ],
+			{
+				id: "Placement",
+				name: "Capability",
+				placementType: "Recommended target",
+				targetUnitIds: "Target units",
+				riskLevel: "Risk",
+				effortSize: "Effort",
+				effortDrivers: "Effort is driven by",
+				relatedFindingCount: "Related findings",
+				gateStatus: "Gate status",
+				decisionRequired: "Decision required",
+				evidenceBasis: "Evidence basis",
+				recommendation: "Recommendation",
+				evidenceRefs: "Evidence"
+			}
+		);
+		arguments.lines.append( "" );
+	}
+
+	/** Flags picks proposed from feature clustering alone, without an explicit
+	 * runtime/deployment seam, so exported reports do not read as firm as an
+	 * evidence-backed extraction. */
+	private string function evidenceBasisNote( required struct item ) {
+		return lCase( trim( arguments.item.evidenceBasis ?: "" ) ) == "domain-clustering"
+			? " _(worth reviewing -- grouped by shared domain, no deployment seam evidenced yet)_"
+			: "";
+	}
+
+	private void function appendSolutionPhases(
+		required array lines,
+		required array roadmap,
+		required array routes,
+		required array targetUnits,
+		required array samples,
+		required array dbFindings,
+		required array transitions,
+		required array unitLinks
+	) {
+		arguments.lines.append( mdHeading( 2, "Solution road" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.roadmap.len() ) {
+			arguments.lines.append( "No roadmap phases were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		var phaseIndex = 1;
+		for ( var phase in arguments.roadmap ) {
+			var unitIds = toIdSet( phase.unitIds ?: [] );
+			var routeIds = toIdSet( phase.routeIds ?: [] );
+			var findingIds = toIdSet( phase.dbFindingIds ?: [] );
+			var transitionIds = toIdSet( phase.transitionIds ?: [] );
+			var phaseId = toString( phase.id ?: "" );
+			arguments.lines.append( mdHeading( 3, phaseIndex & ". " & escapeMarkdown( phase.name ?: phase.title ?: "Phase" ) ) );
+			arguments.lines.append( "" );
+			arguments.lines.append( "- **Pattern:** `" & escapeMarkdown( phase.pattern ?: "phase" ) & "`" );
+			arguments.lines.append( "- **Provenance:** `" & escapeMarkdown( phase.provenanceClass ?: "unknown" ) & "`" );
+			if ( len( phase.goal ?: "" ) ) arguments.lines.append( "- **Goal:** " & escapeMarkdown( phase.goal ) );
+			if ( len( phase.parityIntent ?: "" ) ) arguments.lines.append( "- **Parity:** " & escapeMarkdown( phase.parityIntent ) );
+			var phaseRoutes = arguments.routes.filter( ( route ) => !routeIds.len() || routeIds.contains( toString( route.id ?: "" ) ) );
+			if ( phaseRoutes.len() ) {
+				arguments.lines.append( "- **Routes:**" );
+				for ( var route in phaseRoutes ) {
+					arguments.lines.append( "  - `" & escapeMarkdown( ( route.method ?: "GET" ) & " " & ( route.legacyPath ?: route.path ?: "?" ) & " → " & ( route.targetRoute ?: route.targetEvent ?: "?" ) ) & "`" );
+					if ( len( route.rollbackNote ?: route.rollback ?: "" ) ) arguments.lines.append( "    - Rollback: " & escapeMarkdown( route.rollbackNote ?: route.rollback ) );
+				}
+			}
+			var phaseTargets = arguments.targetUnits.filter( ( unit ) => !unitIds.len() || unitIds.contains( toString( unit.id ?: "" ) ) );
+			if ( phaseTargets.len() ) {
+				arguments.lines.append( "- **Targets:**" );
+				for ( var unit in phaseTargets ) {
+					arguments.lines.append( "  - `" & escapeMarkdown( unit.targetPath ?: unit.path ?: unit.id ?: "target" ) & "`" );
+				}
+			}
+			var phaseSamples = arguments.samples.filter( ( sample ) => {
+				var related = sample.relatedItemIds ?: [];
+				if ( !isArray( related ) || !related.len() ) return false;
+				for ( var relatedId in related ) {
+					if ( unitIds.contains( toString( relatedId ) ) || toString( relatedId ) == phaseId ) return true;
+				}
+				return false;
+			} );
+			if ( !phaseSamples.len() && phaseTargets.len() ) {
+				var targetPaths = {};
+				for ( var targetUnit in phaseTargets ) targetPaths[ lCase( trim( targetUnit.targetPath ?: targetUnit.path ?: "" ) ) ] = true;
+				phaseSamples = arguments.samples.filter( ( sample ) => structKeyExists( targetPaths, lCase( trim( sample.targetPath ?: sample.path ?: "" ) ) ) );
+			}
+			if ( phaseSamples.len() ) {
+				var sample = phaseSamples[ 1 ];
+				var excerpt = left( toString( sample.code ?: sample.content ?: "" ), 400 );
+				if ( len( trim( excerpt ) ) ) {
+					excerpt = variables.secretRedactionService.redactText( excerpt );
+					excerpt = replace( excerpt, "```", "`` `", "all" );
+					arguments.lines.append( "- **Sample excerpt (`" & escapeMarkdown( sample.targetPath ?: sample.path ?: "sample" ) & "`):**" );
+					arguments.lines.append( "" );
+					arguments.lines.append( "```" & ( sample.language ?: sample.dialect ?: "text" ) );
+					arguments.lines.append( excerpt );
+					arguments.lines.append( "```" );
+				}
+			}
+			var phaseFindings = arguments.dbFindings.filter( ( item ) => !findingIds.len() || findingIds.contains( toString( item.id ?: item.findingId ?: "" ) ) );
+			var phaseTransitions = arguments.transitions.filter( ( item ) => !transitionIds.len() || transitionIds.contains( toString( item.id ?: item.transitionId ?: "" ) ) );
+			if ( phaseFindings.len() || phaseTransitions.len() ) {
+				arguments.lines.append( "- **Slice database:**" );
+				for ( var finding in phaseFindings ) {
+					arguments.lines.append( "  - " & escapeMarkdown( ( finding.category ?: "db" ) & " · " & ( finding.objectRef ?: finding.id ?: "" ) & ": " & ( finding.proposedChange ?: finding.problem ?: "" ) ) );
+				}
+				for ( var transition in phaseTransitions ) {
+					arguments.lines.append( "  - " & escapeMarkdown( ( transition.operation ?: "transition" ) & " · " & ( transition.migrationPath ?: transition.id ?: "" ) ) );
+				}
+			}
+			var exitCriteria = isArray( phase.exitCriteria ?: "" ) ? phase.exitCriteria : ( len( trim( toString( phase.exitCriteria ?: "" ) ) ) ? [ phase.exitCriteria ] : [] );
+			if ( exitCriteria.len() ) {
+				arguments.lines.append( "- **Exit criteria:**" );
+				for ( var criterion in exitCriteria ) arguments.lines.append( "  - " & escapeMarkdown( toString( criterion ) ) );
+			}
+			if ( len( phase.rollback ?: "" ) ) arguments.lines.append( "- **Rollback:** " & escapeMarkdown( phase.rollback ) );
+			if ( len( phase.implementerPrompt ?: "" ) ) {
+				arguments.lines.append( "- **Implementer prompt:**" );
+				arguments.lines.append( "" );
+				arguments.lines.append( "```" );
+				arguments.lines.append( variables.secretRedactionService.redactText( toString( phase.implementerPrompt ) ) );
+				arguments.lines.append( "```" );
+			}
+			arguments.lines.append( "" );
+			phaseIndex++;
+		}
+	}
+
+	private array function toIdSet( required any values ) {
+		var ids = [];
+		if ( !isArray( arguments.values ) ) return ids;
+		for ( var value in arguments.values ) {
+			var token = toString( value );
+			if ( len( token ) && !ids.contains( token ) ) ids.append( token );
+		}
+		return ids;
+	}
+
+	/**
+	 * Inventory units use filePath/unitType/symbolName, not the
+	 * path/kind/name/confidence/provenanceClass shape appendRows was written
+	 * for (that shape matches LLM-proposed target units, not deterministically
+	 * extracted legacy units). Adapts field names and folds in extends/
+	 * implements dependency evidence keyed by filePath, so the Legacy catalog
+	 * section actually renders instead of showing only an id and evidenceRefs.
+	 */
+	private array function legacyUnitDisplayRows( required array units, required array dependencies ) {
+		var extendsByPath = {};
+		var implementsByPath = {};
+		for ( var dep in arguments.dependencies ) {
+			var depPath = dep.filePath ?: "";
+			if ( !len( depPath ) ) continue;
+			if ( dep.kind == "extends" ) {
+				extendsByPath[ depPath ] = dep.target ?: "";
+			} else if ( dep.kind == "implements" ) {
+				if ( !implementsByPath.keyExists( depPath ) ) implementsByPath[ depPath ] = [];
+				implementsByPath[ depPath ].append( dep.target ?: "" );
+			}
+		}
+		return arguments.units.map( ( item ) => {
+				var path = item.filePath ?: "";
+				return {
+					id        : item.id ?: "",
+					path      : path,
+					kind      : item.unitType ?: "",
+					name      : item.symbolName ?: "",
+					extends   : extendsByPath.keyExists( path ) ? extendsByPath[ path ] : "",
+					implements: implementsByPath.keyExists( path ) ? implementsByPath[ path ].toList( ", " ) : "",
+					access    : item.access ?: "",
+					returnType: item.returnType ?: "",
+					evidenceRefs: item.evidenceRefs ?: []
+				};
+			} );
+	}
+
+	private void function appendRows( required array lines, required string heading, required array rows, required array fields, struct fieldLabels = {} ) {
+		arguments.lines.append( arguments.heading );
+		arguments.lines.append( "" );
+		if ( !arguments.rows.len() ) {
+			arguments.lines.append( "No items were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		for ( var row in arguments.rows ) {
+			// Not every collection is a list of objects. `assumptions` in
+			// particular can arrive as plain strings, and structKeyExists on a
+			// string throws — which took down the whole Markdown export rather
+			// than one row.
+			if ( !isStruct( row ) ) {
+				if ( isSimpleValue( row ) && len( trim( toString( row ) ) ) ) {
+					arguments.lines.append( "- " & escapeMarkdown( toString( row ) ) );
+				}
+				continue;
+			}
+			var label = row.name ?: row.path ?: row.objectRef ?: row.id ?: row.findingId ?: row.transitionId ?: "item";
+			arguments.lines.append( mdHeading( 3, escapeMarkdown( label ) ) );
+			for ( var field in arguments.fields ) {
+				if ( !structKeyExists( row, field ) || isNull( row[ field ] ) ) continue;
+				var value = row[ field ];
+				if ( isArray( value ) || isStruct( value ) ) value = jsonSerialize( value );
+				var fieldLabel = arguments.fieldLabels[ field ] ?: field;
+				arguments.lines.append( "- **" & fieldLabel & ":** " & escapeMarkdown( toString( value ) ) );
+			}
+			arguments.lines.append( "" );
+		}
+	}
+
+	private void function appendSamples( required array lines, required array samples ) {
+		arguments.lines.append( mdHeading( 2, "Bounded implementation samples" ) );
+		arguments.lines.append( "" );
+		if ( !arguments.samples.len() ) {
+			arguments.lines.append( "No samples were generated." );
+			arguments.lines.append( "" );
+			return;
+		}
+		var ordered = duplicate( arguments.samples );
+		ordered.sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+		for ( var sample in ordered ) {
+			arguments.lines.append( mdHeading( 3, escapeMarkdown( sample.sampleKind ?: sample.kind ?: "sample" ) & " · " & escapeMarkdown( sample.targetPath ?: sample.path ?: "target" ) ) );
+			arguments.lines.append( "" );
+			arguments.lines.append( "- **Validation level:** `" & escapeMarkdown( sample.validationLevel ?: sample.validationStatus ?: "syntax-unchecked" ) & "`" );
+			arguments.lines.append( "- **Provenance:** `" & escapeMarkdown( sample.provenanceClass ?: "unknown" ) & "`" );
+			arguments.lines.append( "- **Irreversible:** `" & ( sample.irreversible ?: sample.forwardOnly ?: false ) & "`" );
+			if ( isArray( sample.relatedItemIds ?: "" ) && sample.relatedItemIds.len() ) arguments.lines.append( "- **Related items:** `" & escapeMarkdown( arrayToList( sample.relatedItemIds, ", " ) ) & "`" );
+			var code = sample.code ?: sample.content ?: "";
+			if ( len( trim( code ) ) ) {
+				code = variables.secretRedactionService.redactText( toString( code ) );
+				code = replace( code, "```", "`` `", "all" );
+				arguments.lines.append( "" );
+				arguments.lines.append( "```" & ( sample.language ?: sample.dialect ?: "text" ) );
+				arguments.lines.append( code );
+				arguments.lines.append( "```" );
+			}
+			arguments.lines.append( "" );
+		}
+	}
+
+	// Formatting primitives are owned by ModernizationAssessmentNarrative, which
+	// also renders with them. These delegate so there is one implementation.
+	private string function mdHeading( required numeric level, required string text ) {
+		return narrative().mdHeading( arguments.level, arguments.text );
+	}
+
+	private string function coverageLine( required string label, required any value ) {
+		return "- **" & arguments.label & ":** `" & escapeMarkdown( toString( arguments.value ) ) & "`";
+	}
+
+	private struct function package( required string format, required string contentType, required string fileName, required string content ) {
+		return { format: arguments.format, contentType: arguments.contentType, fileName: arguments.fileName, content: arguments.content };
+	}
+
+	private string function escapeMarkdown( required string value ) {
+		return narrative().escapeMarkdown( arguments.value );
+	}
+
+	private any function narrative() {
+		if ( !isNull( variables.assessmentNarrative ?: javacast( "null", "" ) ) ) return variables.assessmentNarrative;
+		variables.assessmentNarrative = new app.models.services.ModernizationAssessmentNarrative();
+		return variables.assessmentNarrative;
+	}
+
+	private string function repositoryName( required struct run ) {
+		return narrative().repositoryName( arguments.run );
+	}
+
+	private void function appendVerdict( required array lines, required struct result, required array placements ) {
+		narrative().appendVerdict( arguments.lines, arguments.result, arguments.placements );
+	}
+
+	private void function appendStartHere( required array lines, required struct result, required array placements ) {
+		narrative().appendStartHere( arguments.lines, arguments.result, arguments.placements );
+	}
+
+	private void function appendBlockers( required array lines, required struct result, required array placements ) {
+		narrative().appendBlockers( arguments.lines, arguments.result, arguments.placements );
+	}
+
+	private string function identityKey( required any value ) {
+		if ( !isStruct( arguments.value ) ) return toString( arguments.value );
+		return lCase( trim( arguments.value.id ?: arguments.value.itemId ?: arguments.value.itemFingerprint ?: arguments.value.targetPath ?: arguments.value.path ?: arguments.value.name ?: jsonSerialize( arguments.value ) ) );
+	}
+
+	private void function sortExportCollections( required struct payload ) {
+		for ( var path in [ "target.units", "target.placements", "target.contexts", "target.extracts", "unitLinks", "dbFindings", "routeContracts", "roadmapPhases", "samples", "assumptions", "decisions", "decisionEvents" ] ) {
+			var parts = path.listToArray( "." );
+			var owner = parts.len() == 2 ? ( arguments.payload[ parts[ 1 ] ] ?: {} ) : arguments.payload;
+			var key = parts[ parts.len() ];
+			if ( isStruct( owner ) && isArray( owner[ key ] ?: "" ) ) owner[ key ].sort( ( first, second ) => compareNoCase( identityKey( first ), identityKey( second ) ) );
+		}
+		if ( isArray( arguments.payload.dbTransitions ?: "" ) ) {
+			arguments.payload.dbTransitions.sort( ( first, second ) => {
+				var orderCompare = val( first.order ?: 0 ) - val( second.order ?: 0 );
+				return orderCompare != 0 ? orderCompare : compareNoCase( identityKey( first ), identityKey( second ) );
+			} );
+		}
+	}
+
+	/** Remove transient/raw inputs and redact all secret-like fields before export. */
+	private any function sanitizeExportValue( required any value, string keyName = "", string path = "" ) {
+		if ( isNull( arguments.value ) ) return javacast( "null", "" );
+		if ( isStruct( arguments.value ) ) {
+			var output = {};
+			for ( var key in arguments.value ) {
+				var childPath = len( arguments.path ) ? arguments.path & "." & key : key;
+				if ( isTransientExportKey( key, childPath ) ) continue;
+				if ( isSensitiveExportKey( key ) ) output[ key ] = "[REDACTED]";
+				else output[ key ] = sanitizeExportValue( arguments.value[ key ], key, childPath );
+			}
+			return output;
+		}
+		if ( isArray( arguments.value ) ) {
+			var outputArray = [];
+			for ( var item in arguments.value ) outputArray.append( sanitizeExportValue( item, arguments.keyName, arguments.path ) );
+			return outputArray;
+		}
+		if ( isNumeric( arguments.value ) || isBoolean( arguments.value ) ) return arguments.value;
+		if ( isSimpleValue( arguments.value ) ) return variables.secretRedactionService.redactText( toString( arguments.value ) );
+		return "[REDACTED UNSUPPORTED VALUE]";
+	}
+
+	private boolean function isTransientExportKey( required string key, required string path ) {
+		if ( [ "inlineContent", "rawContent", "originalText", "providerKey", "apiKey", "api_key" ].contains( arguments.key ) ) return true;
+		return reFindNoCase( "schemaEvidence[.](?:text|sanitizedText|inlineContent|raw)", arguments.path ) > 0;
+	}
+
+	private boolean function isSensitiveExportKey( required string key ) {
+		return reFindNoCase( "(?:password|passwd|secret|token|authorization|private[_-]?key|api[_-]?key)", arguments.key ) > 0;
+	}
+
+	private boolean function isSimpleValue( required any value ) {
+		return !isStruct( arguments.value ) && !isArray( arguments.value ) && !isObject( arguments.value );
+	}
+
+}

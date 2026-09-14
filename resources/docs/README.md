@@ -1,0 +1,43 @@
+# DoubleCheck documentation
+
+Public technical docs for the local desktop review helper.
+
+**This folder is the single documentation source of truth.** It is committed.
+There is no `.docs/` tree. Do not recreate it; `resources/docs/` is the one
+documentation tree in version control. `.superpowers/` is local scratch.
+
+## Start here
+
+| Doc | Purpose |
+|---|---|
+| [application-features.md](application-features.md) | Purpose, shipped features, AI contract, out of scope, **known gaps**, measured language tiers |
+| [technical-flow.md](technical-flow.md) | Technical implementation, project flow, Mermaid diagrams |
+| [plans/codegraph-domain-lens-design.md](plans/codegraph-domain-lens-design.md) | **Approved design** — CodeGraph meaning / Domain lens (LLM-required briefing) |
+| [plans/codegraph-remediation-plan.md](plans/codegraph-remediation-plan.md) | **Live plan** — CodeGraph remediation: verified defect register, capability gaps, ranking and elision enhancements. §2 carries the measured baseline from the completed graph-fidelity work |
+| [plans/modernize-inversion-plan.md](plans/modernize-inversion-plan.md) | **Live plan** — Modernize inversion: Part 0 is the status ledger (Steps 0–10 done, Step 11 `wip`, LLM-tier gates unrun), Part 2 the `file:line` evidence base |
+
+## Reference — open only when the task needs it
+
+| Doc | Scope |
+|---|---|
+| [prompt-system.md](prompt-system.md) | Versioned prompt contract system — implemented and live |
+| [cfml-llm-depth.md](cfml-llm-depth.md) | ColdFusion LLM depth (`cfml-conventions`) |
+| [boxlang-conventions.md](boxlang-conventions.md) | BoxLang/CFML style in this repo |
+| [cold-read-protocol.md](cold-read-protocol.md) | **Runnable session sheet** — can a stranger understand a project from CodeGraph alone? Rules, recording table, prepared unfamiliar-CFML target |
+| [testing-commands.md](testing-commands.md) | `box testbox run`, `node --test tests/js/`, reporters |
+| [open-issues.md](open-issues.md) | Reported but not yet planned |
+| [images/](images/) | UI screenshots used by the public readme |
+
+Install and product summary: [`readme.md`](../../readme.md).
+API contract: [`resources/apidocs/`](../apidocs/).
+Agent working rules: [`AGENTS.md`](../../AGENTS.md).
+
+## Hygiene
+
+1. **Product truth changes here first**, in the same PR as the behaviour change.
+2. **Every feature row needs visible output** — UI, export, or API response. No
+   pointer, no row; it goes in Known gaps instead.
+3. **One live plan per area.** Supersede by deleting, not archiving — a
+   superseded document that stays readable will be read.
+4. New feature notes go in **one** file here. Never `superpowers/` trees, phased
+   rebuild checklists, or dated per-task plan files.

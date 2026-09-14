@@ -1,0 +1,94 @@
+/**
+ * Invariant 3 (section 6.2): one role list.
+ *
+ * A modernization role name is currently written in five places — the manifest's
+ * `lifecycle.active`, its `contracts` map, its `schemas` map, and two separate
+ * allow-lists in ModernizationAgentFactory and ModernizationAgentGateway. That is
+ * the same defect shape as the three volatile-key lists in section 2.7, where two
+ * of three agreed and the third drifted unnoticed.
+ *
+ * The surface is not theoretical: Steps 5, 9 and 10 took the modernization roles
+ * from five to nine, and each one had to be added in every place above plus two
+ * asset files. A role registered in four of five places fails at runtime, on the
+ * one request that happens to use it, not in CI.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "Prompt role registry fitness", () => {
+
+			// expandPath() resolves against the web root (public/), not the project
+			// root, so walk up from this spec the way PromptRegistry does.
+			var specFile = new java:java.io.File( getCurrentTemplatePath() );
+			for ( var up = 1; up <= 4; up++ ) specFile = specFile.getParentFile();
+			var projectRoot = replace( specFile.getAbsolutePath(), "\", "/", "all" );
+			var promptRoot = projectRoot & "/resources/prompts/";
+			var manifest = jsonDeserialize( fileRead( promptRoot & "manifest.json" ) );
+
+			var modernizationRoles = ( name ) => name.left( 14 ) == "modernization-";
+
+			// The two hand-maintained allow-lists, read out of the source rather
+			// than restated here — restating them would just add a sixth list.
+			var allowListFrom = ( relativePath ) => {
+				var source = fileRead( projectRoot & relativePath );
+				var found = {};
+				for ( var match in reMatch( '"modernization-[a-z-]+"', source ) ) {
+					found[ replace( match, '"', "", "all" ) ] = true;
+				}
+				return found;
+			};
+
+			it( "registers every active modernization role in all three manifest maps", () => {
+				for ( var role in manifest.lifecycle.active ) {
+					if ( !modernizationRoles( role ) ) continue;
+					expect( manifest.contracts ).toHaveKey( role, "role `#role#` is active but has no contract entry" );
+
+					var version = manifest.lifecycle.active[ role ];
+					var schemaId = role & "-" & version;
+					expect( manifest.schemas ).toHaveKey( schemaId, "role `#role#` has no schema entry for `#schemaId#`" );
+				}
+			} );
+
+			it( "points every registered role and schema at a file that exists", () => {
+				for ( var role in manifest.contracts ) {
+					if ( !modernizationRoles( role ) ) continue;
+					expect( fileExists( promptRoot & manifest.contracts[ role ] ) ).toBeTrue( "missing role asset for `#role#`: #manifest.contracts[ role ]#" );
+				}
+				for ( var schemaId in manifest.schemas ) {
+					if ( !modernizationRoles( schemaId ) ) continue;
+					expect( fileExists( promptRoot & manifest.schemas[ schemaId ] ) ).toBeTrue( "missing schema asset for `#schemaId#`: #manifest.schemas[ schemaId ]#" );
+				}
+			} );
+
+			it( "holds the same role set in both allow-lists and the manifest", () => {
+				var factoryRoles = allowListFrom( "/app/models/services/ModernizationAgentFactory.bx" );
+				var gatewayRoles = allowListFrom( "/app/models/services/ModernizationAgentGateway.bx" );
+
+				for ( var role in manifest.lifecycle.active ) {
+					if ( !modernizationRoles( role ) ) continue;
+					// A role missing from an allow-list throws ValidationException on
+					// the first request that uses it, not in CI.
+					expect( factoryRoles ).toHaveKey( role, "role `#role#` is registered but absent from ModernizationAgentFactory's allow-list" );
+					expect( gatewayRoles ).toHaveKey( role, "role `#role#` is registered but absent from ModernizationAgentGateway's allow-list" );
+				}
+			} );
+
+			it( "declares an output schema on every modernization role asset", () => {
+				for ( var role in manifest.contracts ) {
+					if ( !modernizationRoles( role ) ) continue;
+					var asset = jsonDeserialize( fileRead( promptRoot & manifest.contracts[ role ] ) );
+					expect( asset ).toHaveKey( "outputSchema", "role asset `#role#` declares no outputSchema" );
+					expect( manifest.schemas ).toHaveKey( asset.outputSchema, "role `#role#` names outputSchema `#asset.outputSchema#`, which the manifest does not register" );
+				}
+			} );
+
+			it( "covers the roles this plan added, so the guard cannot pass vacuously", () => {
+				// If the filter above ever stops matching, every loop iterates zero
+				// times and the suite goes green while checking nothing.
+				for ( var role in [ "modernization-judge", "modernization-narrate", "modernization-critic", "modernization-brief" ] ) {
+					expect( manifest.lifecycle.active ).toHaveKey( role );
+				}
+			} );
+		} );
+	}
+}

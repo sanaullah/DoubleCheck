@@ -1,0 +1,394 @@
+class extends="testbox.system.BaseSpec" {
+	function run() {
+		describe( "Modernization JSON gateway", () => {
+			it( "normalizes fenced JSON and redacts observation errors", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = "```json" & jsonSerialize( { targetUnits: [] } ) & "```";
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				var observations = [];
+				var result = service.run( "run-1", { messages: [ { role: "user", content: "evidence" } ] }, { onObservation: ( item ) => observations.append( item ) } );
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits ).toBeEmpty();
+				expect( chat.callCount() ).toBe( 1 );
+				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
+			} );
+
+			it( "preflights and fits a live-size compiled package before provider execution", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				var compiler = new app.models.services.PromptCompiler();
+				var package = compiler.compile(
+					"modernization-application",
+					{
+						task: { runtime: "boxlang", profile: "modern", roleInstruction: "Map the authorized shard." },
+						evidence: { inventory: [ { filePath: "legacy/index.cfm", content: repeatString( "legacy source" & char( 10 ), 5000 ) } ] },
+						reference: [ { name: "coldbox", excerpt: repeatString( "skill reference" & char( 10 ), 1800 ) } ]
+					}
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+				var result = service.preflight( { messages: package.messages, promptPackage: package, provenance: package.provenance }, { role: "modernization-application" } );
+				expect( result.ok ).toBeTrue();
+				expect( result.promptProvenance.promptCharacters ).toBeLTE( 60000 );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "ignores unrelated runtime objects while preserving the compiled prompt", () => {
+				var schedulerPool = new java:java.util.concurrent.ScheduledThreadPoolExecutor( 1 );
+				try {
+					var service = new app.models.services.ModernizationAgentGateway();
+					service.secretRedactionService = new app.models.services.SecretRedactionService();
+					service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+					var result = asyncRun(
+						() => {
+							var compiler = new app.models.services.PromptCompiler();
+							var compiledPackage = compiler.compile(
+								"modernization-application",
+								{ task: { roleInstruction: "Map the authorized shard." }, evidence: {} }
+							);
+							if ( compiledPackage.messages.len() != 2 || !len( compiledPackage.systemPrompt ?: "" ) ) {
+								throw( type = "AsyncPromptTestException", message = "Compiler lost the prompt before gateway preflight" );
+							}
+							var promptRequest = { messages: compiledPackage.messages, promptPackage: compiledPackage, provenance: compiledPackage.provenance, runtimeHandle: schedulerPool };
+							if ( promptRequest.messages.len() != 2 ) throw( type = "AsyncPromptTestException", message = "Request lost messages before gateway preflight" );
+							return service.preflight( promptRequest, { role: "modernization-application" } );
+						}
+					).get();
+					expect( result.ok ).toBeTrue();
+					expect( result.request.messages[ 1 ].role ).toBe( "system" );
+					expect( result.request.messages[ 1 ].content ).notToBeEmpty();
+				} finally {
+					schedulerPool.shutdownNow();
+				}
+			} );
+
+			it( "fails one preflight without retrying an impossible immutable task", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				var compiler = new app.models.services.PromptCompiler();
+				var package = compiler.compile( "modernization-application", { task: { roleInstruction: repeatString( "immutable", 8000 ) }, evidence: {} } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "openai-compatible", apiKey: "test", model: "scripted", maxPromptCharacters: 60000 } );
+				expect( () => service.preflight( { messages: package.messages, promptPackage: package, provenance: package.provenance }, { role: "modernization-application" } ) ).toThrow( type = "PromptPackageFitException" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "retries with a shrink instruction when provider JSON is truncated", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					responses = [
+						"Failed to parse JSON {""targetUnits"":[{""id"":""tu-1"",""sampleCode"":""component {",
+						jsonSerialize( { targetUnits: [ { id: "tu-1", targetPath: "app/handlers/A.bx" } ], unitLinks: [], routeContracts: [], contexts: [], extracts: [], samples: [] } )
+					]
+				);
+				// First response must throw from normalizeResponse/jsonDeserialize.
+				chat.responses[ 1 ] = '{ "targetUnits": [ { "id": "tu-1", "sampleCode": "component {';
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var observations = [];
+				var result = service.run(
+					"run-truncate",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 3, maxTokensPerTask: 12000 }, onObservation: ( item ) => observations.append( item ) }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits[ 1 ].id ).toBe( "tu-1" );
+				expect( chat.callCount() ).toBe( 2 );
+				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeTrue();
+			} );
+
+			it( "honors a per-call maxRetries:1 override for the truncation-shrink retry", () => {
+				// ModernizationProposalService now passes maxRetries:1 explicitly for the
+				// whole-repo architecture/roadmap roles (previously 0, which made the
+				// shrink-and-retry mitigation below unreachable for them). Prove the
+				// per-call option — not just the service-level default used by the test
+				// above — is what actually governs the retry.
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					responses = [
+						'{ "roadmapPhases": [ { "id": "phase-1", "name": "Truncated',
+						jsonSerialize( { roadmapPhases: [ { id: "phase-1", name: "Foundation" } ], samples: [], assumptions: [] } )
+					]
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var result = service.run(
+					"run-roadmap-truncate",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ maxRetries: 1, budgets: { maxIterations: 3, maxTokensPerTask: 12000 } }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.roadmapPhases[ 1 ].id ).toBe( "phase-1" );
+				expect( chat.callCount() ).toBe( 2 );
+			} );
+
+			it( "returns a bounded provider failure after malformed JSON retries", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "not-json" );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
+				service.maxRetries = 1;
+				var result = service.run( "run-2", { messages: [] }, { budgets: { maxIterations: 2 } } );
+				expect( result.ok ).toBeFalse();
+				expect( chat.callCount() ).toBe( 2 );
+			} );
+
+			it( "classifies a plain Request Timeout body as request_timeout, not truncated JSON", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = "Request Timeout" );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var observations = [];
+				var result = service.run(
+					"run-timeout",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 3, maxTokensPerTask: 12000 }, onObservation: ( item ) => observations.append( item ) }
+				);
+				expect( result.ok ).toBeFalse();
+				expect( result.errorType ).toBe( "request_timeout" );
+				expect( result.retryable ).toBeTrue();
+				expect( findNoCase( "truncated", result.error ?: "" ) ).toBe( 0 );
+				expect( findNoCase( "Failed to parse JSON", result.error ?: "" ) ).toBe( 0 );
+				expect( findNoCase( "timed out", result.error ?: "" ) ).toBeGT( 0 );
+				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeFalse();
+			} );
+
+			it( "classifies deserialize-of-timeout exceptions as request_timeout without shrink retry", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.throwMessage = "Error deserializing response from provider: Failed to parse JSON Request Timeout";
+				chat.throwType = "JSONException";
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 2;
+				service.retryBackoffMs = 0;
+				var observations = [];
+				var result = service.run(
+					"run-timeout-deserialize",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 3, maxTokensPerTask: 12000 }, onObservation: ( item ) => observations.append( item ) }
+				);
+				expect( result.ok ).toBeFalse();
+				expect( result.errorType ).toBe( "request_timeout" );
+				expect( findNoCase( "Failed to parse JSON", result.error ?: "" ) ).toBe( 0 );
+				expect( observations.some( ( item ) => item.stage == "provider-retry-shrink" ) ).toBeFalse();
+			} );
+
+			it( "classifies HTML gateway timeout pages as request_timeout", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					response = "<html><head><title>504 Gateway Time-out</title></head><body>Gateway Timeout</body></html>"
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 1;
+				service.retryBackoffMs = 0;
+				var result = service.run(
+					"run-html-timeout",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{ budgets: { maxIterations: 2, maxTokensPerTask: 12000 } }
+				);
+				expect( result.ok ).toBeFalse();
+				expect( result.errorType ).toBe( "request_timeout" );
+			} );
+
+			it( "classifies BoxFuture TimeoutException as request_timeout", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				makePublic( service, "classifyProviderError" );
+				var result = service.classifyProviderError( {
+					message: "Error invoking method get() for class ortus.boxlang.runtime.async.BoxFuture. Due to: java.util.concurrent.TimeoutException",
+					type: "Application"
+				} );
+				expect( result.errorType ).toBe( "request_timeout" );
+				expect( result.retryable ).toBeTrue();
+			} );
+
+			it( "classifies bx-ai null trim NPE as empty_provider_response", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				makePublic( service, "classifyProviderError" );
+				var result = service.classifyProviderError( {
+					message: "Cannot invoke method [trim()] on a null object",
+					type: "BoxRuntimeException"
+				} );
+				expect( result.errorType ).toBe( "empty_provider_response" );
+				expect( result.retryable ).toBeTrue();
+			} );
+
+			it( "cancels before provider execution", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { ok: true } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
+				service.cancelRun( "run-3" );
+				expect( () => service.run( "run-3", { messages: [] } ) ).toThrow( type = "RunCancelled" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "does not call the provider when the immutable cost budget is exhausted", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { ok: true } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
+				var result = service.run( "run-4", { messages: [] }, { budgets: { maxCostUsd: 0 } } );
+				expect( result.ok ).toBeFalse();
+				expect( result.error ).toBe( "cost-budget-exceeded" );
+				expect( chat.callCount() ).toBe( 0 );
+			} );
+
+			it( "falls back to chat JSON when the optional skill-tool agent path fails", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = jsonSerialize( { targetUnits: [ { id: "tu-1" } ] } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 1;
+				// Missing skill service → tool path unavailable → chat must still succeed.
+				service.skillService = javacast( "null", "" );
+				var observations = [];
+				var result = service.run(
+					"run-5",
+					{ messages: [ { role: "user", content: "plan" } ] },
+					{
+						useSkillAgent: true,
+						onObservation: ( item ) => observations.append( item )
+					}
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload.targetUnits.len() ).toBe( 1 );
+				expect( chat.callCount() ).toBeGTE( 1 );
+				expect( observations.some( ( item ) => item.stage == "skill-tool-fallback" ) ).toBeTrue();
+				expect( observations.some( ( item ) => item.stage == "provider-complete" ) ).toBeTrue();
+			} );
+
+			it( "still succeeds on chat when skill tools are empty and agent mode is requested", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway( response = { roadmapPhases: [] } );
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "" } );
+				service.skillService = javacast( "null", "" );
+				var result = service.run(
+					"run-6",
+					{ messages: [ { role: "system", content: "json" } ] },
+					{ useSkillAgent: true }
+				);
+				expect( result.ok ).toBeTrue();
+				expect( result.payload ).toHaveKey( "roadmapPhases" );
+				expect( chat.callCount() ).toBeGTE( 1 );
+			} );
+
+			it( "builds an allowlisted read_modernization_skill tool when skill service is present", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.skillService = new app.models.services.ModernizationSkillService();
+				var tools = service.buildSkillTools();
+				expect( tools.len() ).toBeGTE( 1 );
+			} );
+
+			it( "derives 30, 90, and 600 second provider timeouts from the remaining run budget", () => {
+				var service = new app.models.services.ModernizationAgentGateway();
+				var resolved = new tests.resources.StubAIProviderResolver( {
+					provider: "openrouter",
+					apiKey  : "redacted-test-key",
+					baseURL : "https://openrouter.ai/api/v1",
+					timeout : 600
+				} ).resolve();
+				makePublic( service, "buildOptions" );
+
+				var thirty = service.buildOptions( resolved, 30000 );
+				var ninety = service.buildOptions( resolved, 90000 );
+				var sixHundred = service.buildOptions( resolved, 600000 );
+				var providerCapped = service.buildOptions( resolved, 900000 );
+
+				expect( thirty.timeout ).toBe( 30 );
+				expect( ninety.timeout ).toBe( 90 );
+				expect( sixHundred.timeout ).toBe( 600 );
+				expect( providerCapped.timeout ).toBe( 600 );
+				expect( sixHundred.provider ).toBe( "openrouter" );
+				expect( sixHundred.returnFormat ).toBe( "json" );
+				expect( sixHundred.baseURL ).toBe( "https://openrouter.ai/api/v1" );
+			} );
+
+			it( "passes messages, model params, JSON format, provider, timeout, and base URL to aiChat", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway(
+					response = { roadmapPhases: [] }
+				);
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( {
+					provider: "openrouter",
+					apiKey  : "redacted-test-key",
+					model   : "test/model",
+					baseURL : "https://openrouter.ai/api/v1",
+					timeout : 600
+				} );
+
+				var messages = [
+					{ role: "system", content: "Return JSON" },
+					{ role: "user", content: "Build a bounded roadmap" }
+				];
+				var result = service.run(
+					"run-options",
+					{ messages: messages, params: { temperature: 0, max_tokens: 2048 } },
+					{ maxDurationMs: 90000, budgets: { maxTokensPerTask: 2048 } }
+				);
+
+				expect( result.ok ).toBeTrue();
+				expect( chat.lastPrompt ).toBe( messages );
+				expect( chat.lastParams.model ).toBe( "test/model" );
+				expect( chat.lastParams.temperature ).toBe( 0 );
+				expect( chat.lastParams.max_tokens ).toBe( 2048 );
+				expect( chat.lastOptions.provider ).toBe( "openrouter" );
+				expect( chat.lastOptions.returnFormat ).toBe( "json" );
+				expect( chat.lastOptions.timeout ).toBeGTE( 89 );
+				expect( chat.lastOptions.timeout ).toBeLTE( 90 );
+				expect( chat.lastOptions.baseURL ).toBe( "https://openrouter.ai/api/v1" );
+			} );
+
+			it( "salvages truncated database JSON into a complete object instead of failing", () => {
+				var chat = new tests.resources.ScriptedModernizationChatGateway();
+				chat.response = '{ "dbFindings": [ { "id": "f1", "objectRef": "songs", "category": "coverage", "severity": "info", "problem": "needs plan", "proposedChange": "expand", "evidenceRefs": [], "confidence": 0.5, "validationStatus": "needs-review" }, { "id": "f2", "objectRef": "playlists", "problem": "incomplete';
+				var service = new app.models.services.ModernizationAgentGateway();
+				service.chatGateway = chat;
+				service.secretRedactionService = new app.models.services.SecretRedactionService();
+				service.aiProviderResolver = new tests.resources.StubAIProviderResolver( { provider: "ollama", apiKey: "", model: "scripted" } );
+				service.maxRetries = 0;
+				service.retryBackoffMs = 0;
+				var result = service.run(
+					"run-db-salvage",
+					{ messages: [ { role: "system", content: "Return JSON" }, { role: "user", content: "db" } ] },
+					{ role: "modernization-database", maxRetries: 0 }
+				);
+				expect( result.ok ).toBeTrue( jsonSerialize( result ) );
+				expect( result.salvaged ).toBeTrue();
+				expect( result.payload.dbFindings.len() ).toBeGTE( 1 );
+				expect( result.payload.dbFindings[ 1 ].id ).toBe( "f1" );
+				expect( result.promptProvenance.truncatedJsonSalvaged ).toBeTrue();
+			} );
+		} );
+	}
+}

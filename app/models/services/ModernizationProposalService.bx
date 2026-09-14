@@ -1,0 +1,870 @@
+/**
+ * Executes modernization roles and merges bounded fragments.
+ * Application mapping is sharded across many small agent calls so large
+ * CFML trees (e.g. CFTunes) do not truncate a single mid-object JSON dump.
+ */
+@singleton
+class threadsafe {
+	property name="agentFactory" inject="ModernizationAgentFactory";
+	property name="agentGateway" inject="ModernizationAgentGateway";
+	property name="secretRedactionService" inject="SecretRedactionService";
+	property name="identityService" inject="ModernizationIdentityService";
+	property name="derivedStructureService" inject="ModernizationDerivedStructureService";
+	property name="roadmapSynthesisService" inject="ModernizationRoadmapSynthesisService";
+	property name="placementService" inject="ModernizationPlacementService";
+	property name="modernizationArtifactService" inject="ModernizationArtifactService";
+	property name="modernizationShardExecutor" inject="ModernizationShardExecutor";
+	property name="modernizationRoadmapShardService" inject="ModernizationRoadmapShardService";
+	property name="modernizationPlanAnnotationService" inject="ModernizationPlanAnnotationService";
+	property name="modernizationFragmentMerger" inject="ModernizationFragmentMerger";
+	property name="modernizationTargetPathService" inject="ModernizationTargetPathService";
+	property name="log" inject="logbox:logger:{this}";
+	variables.cancelledRuns = {};
+	variables.shardExecutorReady = false;
+	variables.roadmapShardsReady = false;
+	variables.maxItems = 200;
+	// Prefer fewer, larger shards so database/architecture/roadmap keep wall-clock.
+	// Callers can still request smaller shards via budgets.applicationShardSize.
+	variables.defaultApplicationShards = 40;
+	// Absolute shard ceiling for both scoped and unscoped runs. Callers can
+	// request less; large inventories expand up to this so maps are not capped
+	// at the historical 40-shard wall that left thousands of paths unmapped.
+	variables.maxApplicationShards = 200;
+	variables.maxScopedApplicationShards = 200;
+	variables.defaultShardSize = 6;
+	// Conservative per-shard wall-clock used when capping planned shards so later
+	// stages (database → architecture → roadmap) are not starved.
+	variables.estimatedShardWallMs = 90000;
+	variables.minLaterStageReserveMs = 300000;
+	variables.maxLaterStageReserveMs = 900000;
+	// Unscoped estates this large get directory-inferred packaging seams when
+	// the architecture role is missing — otherwise the road collapses to one
+	// generic modular-monolith phase.
+	variables.minUnitsForFolderInference = 24;
+	// judge/narrate batching. 3 keeps a batch inside the schemas' maxItems of 4
+	// with room for a retry that returns one extra, and keeps a truncated
+	// response from costing more than three clusters' worth of narration.
+	variables.judgeBatchSize = 3;
+	variables.maxClusterPathsInPrompt = 12;
+	variables.maxBriefSignals = 24;
+	variables.maxInferredArchitectureScopes = 12;
+	// Roadmap shards are sized independently of the application-shard
+	// constants above: they cover already-compacted target-unit groups (from
+	// roadmapSynthesis().synthesisRoadmapGroups()), not raw file shards, and the failure mode
+	// being fixed is the roadmap role trying to describe an entire ~20-group
+	// plan in one call. 24 gives real projects one phase per group while
+	// still collapsing small/no-architecture-group test plans to one shard.
+	variables.defaultRoadmapUnitBatchSize = 24;
+	variables.maxRoadmapShards = 24;
+
+	/**
+	 * Direct unit construction does not run WireBox injection, and several specs
+	 * build this service with `new`. Seed the derived-structure collaborator so
+	 * those paths keep working after the synthesis block moved out.
+	 */
+	private any function roadmapSynthesis() {
+		if ( !isNull( variables.roadmapSynthesisService ?: javacast( "null", "" ) ) ) return variables.roadmapSynthesisService;
+		variables.roadmapSynthesisService = new app.models.services.ModernizationRoadmapSynthesisService();
+		return variables.roadmapSynthesisService;
+	}
+	function init() {
+		if ( isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) {
+			variables.derivedStructureService = new app.models.services.ModernizationDerivedStructureService();
+		}
+		if ( isNull( variables.placementService ?: javacast( "null", "" ) ) ) {
+			variables.placementService = new app.models.services.ModernizationPlacementService();
+		}
+		return this;
+	}
+
+	struct function propose(
+		required string runId,
+		required struct input,
+		required struct evidence,
+		struct options = {}
+	) {
+		if ( !agentGateway.isEnabled() ) return failure( "provider-disabled" );
+		applyModelOverride( arguments.input, arguments.options );
+		var budgets = structKeyExists( arguments.input, "budgets" ) && isStruct( arguments.input.budgets ) ? arguments.input.budgets : {};
+		var maxTasks = isNumeric( budgets.maxTasks ?: "" ) ? max( 1, int( budgets.maxTasks ) ) : 3;
+		var maxDurationMs = isNumeric( budgets.maxDurationMs ?: "" ) ? max( 1000, int( budgets.maxDurationMs ) ) : 180000;
+		var startedAt = isNumeric( arguments.input.startedAt ?: "" ) ? val( arguments.input.startedAt ) : getTickCount();
+		var fragments = {};
+		var errors = [];
+		var notes = [];
+		var totalOutputCharacters = 0;
+		var totalCostUsd = 0;
+		var dbPromptProvenance = {};
+		var samplePolicy = structKeyExists( arguments.input, "samplePolicy" ) && isStruct( arguments.input.samplePolicy ) ? arguments.input.samplePolicy : {};
+		var runtime = { runtime: arguments.input.target.runtime ?: arguments.input.runtime ?: "", profile: arguments.input.target.layoutProfile ?: arguments.input.profile ?: "" };
+
+		// Many small application agents in parallel waves beat one whole-repo JSON
+		// that truncates, and finish inside the wall-clock budget.
+		var appShards = buildApplicationShards( arguments.evidence, budgets );
+		var shardCap = max( 1, appShards.len() );
+		var totalOutputLimit = isNumeric( budgets.maxTokens ?: "" ) ? max( 2048, int( budgets.maxTokens ) * 4 * max( 3, shardCap ) ) : 24000 * max( 3, shardCap );
+		var initialPreflight = preflightInitialRoles( appShards, runtime, arguments.evidence, budgets, maxTasks, arguments.options );
+		if ( !( initialPreflight.ok ?: false ) ) {
+			return failure(
+				initialPreflight.message ?: "modernization prompt preflight failed",
+				[ {
+					role: initialPreflight.role ?: "modernization",
+					message: initialPreflight.message ?: "modernization prompt preflight failed",
+					stage: "prompt-preflight",
+					diagnostics: initialPreflight.diagnostics ?: {}
+				} ]
+			);
+		}
+		var allApplicationPaths = prioritizedLegacyPaths( arguments.evidence );
+		var plannedApplicationPaths = {};
+		for ( var plannedShard in appShards ) {
+			for ( var plannedPath in plannedShard.shardMeta.paths ?: [] ) plannedApplicationPaths[ lCase( plannedPath ) ] = true;
+		}
+		// Paths in the inventory that no shard will cover. Two distinct causes,
+		// reported separately so a reader can tell "we ran out of shards" from
+		// "we had no source text to read".
+		var groundedApplicationPaths = groundedPathSet( arguments.evidence );
+		var shardCapOmissions = [];
+		var ungroundedOmissions = [];
+		for ( var applicationPath in allApplicationPaths ) {
+			if ( plannedApplicationPaths.keyExists( lCase( applicationPath ) ) ) continue;
+			if ( groundedApplicationPaths.count() && !groundedApplicationPaths.keyExists( lCase( normalizeLegacyPath( applicationPath ) ) ) ) {
+				ungroundedOmissions.append( applicationPath );
+			} else {
+				shardCapOmissions.append( applicationPath );
+			}
+		}
+		if ( ungroundedOmissions.len() ) {
+			notes.append( {
+				role: "modernization-application",
+				message: "omitted-ungrounded-paths",
+				severity: "info",
+				reason: "no-context-partition",
+				count: ungroundedOmissions.len(),
+				paths: ungroundedOmissions
+			} );
+			logInfo( "Modernize proposal #arguments.runId#: #ungroundedOmissions.len()# path(s) had no context partition and were not mapped" );
+		}
+		// Captured before the run: a truncated shard can append smaller retry
+		// shards to appShards, and those are retries of already-planned paths
+		// rather than additional planned coverage.
+		var plannedShardTotal = appShards.len();
+		logInfo( "Modernize proposal #arguments.runId#: #plannedShardTotal# application shard(s), concurrency=#( budgets.applicationShardConcurrency ?: 3 )#, maxDurationMs=#maxDurationMs#, maxCostUsd=#( budgets.maxCostUsd ?: '' )#" );
+		var appResult = runApplicationShards( arguments.runId, appShards, runtime, budgets, startedAt, maxDurationMs, totalOutputLimit, arguments.options );
+		var appMerged = appResult.fragment;
+		var appAccepted = appResult.accepted;
+		totalOutputCharacters = appResult.outputCharacters;
+		totalCostUsd = appResult.costUsd;
+		splitProposalMessages( appResult.errors, errors, notes );
+		if ( appAccepted > 0 ) fragments[ "modernization-application" ] = appMerged;
+		logInfo( "Modernize proposal #arguments.runId#: application shards accepted #appAccepted#/#plannedShardTotal#, costUsd=#totalCostUsd#, outputChars=#totalOutputCharacters#" );
+
+		// Database role remains a single call when the task budget allows it.
+		if ( maxTasks >= 2 && isCancelled( arguments.runId, arguments.options ) ) {
+			errors.append( { role: "modernization-database", message: "cancelled-after-partial-acceptance" } );
+		} else if ( maxTasks >= 2 ) {
+			if ( getTickCount() - startedAt >= maxDurationMs ) {
+				errors.append( { role: "modernization-database", message: "budget-exceeded", elapsedMs: getTickCount() - startedAt, maxDurationMs: maxDurationMs } );
+			} else if ( totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: "modernization-database", message: "total-output-budget-exceeded" } );
+			} else if ( isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd >= val( budgets.maxCostUsd ) ) {
+				errors.append( { role: "modernization-database", message: "cost-budget-exceeded" } );
+			} else {
+				var dbBudgets = duplicate( budgets );
+				// Dense schema packs truncate at the default 8k/task ceiling.
+				dbBudgets.maxTokensPerTask = min( 16000, max( 12000, int( budgets.maxTokensPerTask ?: 8000 ) ) );
+				if ( isNumeric( budgets.maxTokens ?: "" ) ) {
+					dbBudgets.maxTokens = max( int( budgets.maxTokens ), dbBudgets.maxTokensPerTask );
+				}
+				var dbRequest = agentFactory.build( "modernization-database", runtime, arguments.evidence, dbBudgets );
+				var dbOptions = copyGatewayOptions( arguments.options );
+				dbOptions.budgets = dbBudgets;
+				dbOptions.startedAt = getTickCount();
+				dbOptions.maxDurationMs = max( 5000, maxDurationMs - ( getTickCount() - startedAt ) );
+				// Two retries: first shrinks the ask, second may still salvage
+				// truncated JSON inside the gateway before we synthesize.
+				dbOptions.maxRetries = 2;
+				dbOptions.role = "modernization-database";
+				var dbResponse = agentGateway.run( arguments.runId, dbRequest, dbOptions );
+				dbPromptProvenance = structKeyExists( dbResponse, "promptProvenance" ) ? dbResponse.promptProvenance : {};
+				totalCostUsd += isNumeric( dbResponse.costUsd ?: "" ) ? val( dbResponse.costUsd ) : 0;
+				if ( !( dbResponse.ok ?: false ) ) {
+					var synthDb = synthesizeDatabaseFragment( arguments.evidence.schemaEvidence ?: {} );
+					if ( ( isArray( synthDb.dbFindings ?: "" ) && synthDb.dbFindings.len() ) || ( isArray( synthDb.dbTransitions ?: "" ) && synthDb.dbTransitions.len() ) ) {
+						fragments[ "modernization-database" ] = synthDb;
+						errors.append( {
+							role: "modernization-database",
+							message: "synthesized-database-from-schema",
+							severity: "info",
+							errorType: dbResponse.errorType ?: inferErrorType( dbResponse.error ?: "" ),
+							providerError: left( toString( dbResponse.error ?: "" ), 240 )
+						} );
+					} else {
+						errors.append( providerRoleError( "modernization-database", dbResponse ) );
+					}
+				} else if ( !validFragment( "modernization-database", dbResponse.payload ?: {} ) ) {
+					errors.append( { role: "modernization-database", message: "malformed-role-output" } );
+				} else {
+					var redactedDb = redactPayload( dbResponse.payload ?: {} );
+					if ( !redactedDb.count() && ( dbResponse.payload ?: {} ).count() ) errors.append( { role: "modernization-database", message: "redaction-failed" } );
+					else {
+						fragments[ "modernization-database" ] = redactedDb;
+						totalOutputCharacters += isNumeric( dbResponse.outputCharacters ?: "" ) ? int( dbResponse.outputCharacters ) : len( jsonSerialize( dbResponse.payload ?: {} ) );
+						if ( dbResponse.salvaged ?: false || ( isStruct( dbPromptProvenance ) && ( dbPromptProvenance.truncatedJsonSalvaged ?: false ) ) ) {
+							errors.append( { role: "modernization-database", message: "salvaged-truncated-database-json", severity: "info" } );
+						}
+					}
+				}
+			}
+		}
+
+		var costExceeded = isNumeric( budgets.maxCostUsd ?: "" ) && totalCostUsd > val( budgets.maxCostUsd );
+		if ( costExceeded ) errors.append( { role: "modernization", message: "cost-budget-exceeded" } );
+		if ( !fragments.count() ) {
+			var firstError = errors.len() ? errors[ 1 ] : {};
+			var firstMessage = firstError.message ?: "no-role-output";
+			if ( firstMessage == "budget-exceeded" && structKeyExists( firstError, "elapsedMs" ) ) firstMessage &= " (elapsedMs=#firstError.elapsedMs#, maxDurationMs=#firstError.maxDurationMs#)";
+			return failure( firstMessage, errors );
+		}
+		var merged = mergeFragments( arguments.input, arguments.evidence, fragments, errors );
+		appendPromptContract( merged, "modernization-database", dbPromptProvenance );
+		// Failed/omitted shard paths stay as retryable gaps — do not invent
+		// retain-legacy stubs that look like successful maps (RC3).
+		appResult.omittedPaths = isArray( appResult.omittedPaths ?: "" ) ? appResult.omittedPaths : [];
+		if ( shardCapOmissions.len() ) appResult.omittedPaths.append( shardCapOmissions, true );
+		if ( ungroundedOmissions.len() ) appResult.omittedPaths.append( ungroundedOmissions, true );
+		merged = ensureApplicationSourceCoverage( merged, arguments.evidence, arguments.input, notes, appResult );
+		merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
+		// Every omission a reader could care about lands in one place. Previously
+		// only shard-cap omissions were counted here, so a run that dropped 52
+		// paths at the context stage still reported `omitted: 0`.
+		var allOmittedPaths = duplicate( shardCapOmissions );
+		if ( ungroundedOmissions.len() ) allOmittedPaths.append( ungroundedOmissions, true );
+		merged.metadata.applicationShards = {
+			accepted: appAccepted,
+			total: plannedShardTotal,
+			resplit: appResult.resplitShards ?: 0,
+			failed: appResult.failed ?: 0,
+			omitted: ( appResult.omitted ?: 0 ) + allOmittedPaths.len(),
+			outcomes: appResult.outcomes ?: [],
+			omittedPaths: allOmittedPaths,
+			omittedShardCap: shardCapOmissions.len(),
+			omittedUngrounded: ungroundedOmissions.len()
+		};
+		merged.coverage = applyGenerationCoverage( merged.coverage ?: {}, merged.metadata.applicationShards );
+		// Architecture and roadmap without application substance would invent
+		// unmapped groupings/phases. Require at least one target, link, route, or
+		// sample before running either.
+		var hasApplicationFragment = fragments.keyExists( "modernization-application" );
+		var hasApplicationSubstance = hasApplicationFragment && applicationFragmentHasSubstance( merged );
+		if ( hasApplicationFragment && !hasApplicationSubstance ) {
+			errors.append( { role: "modernization-application", message: "empty-application-fragment" } );
+		}
+		if ( !hasApplicationFragment || !hasApplicationSubstance ) {
+			var skipMessage = hasApplicationFragment ? "skipped-without-application-substance" : "skipped-without-application-fragment";
+			errors.append( { role: "modernization-roadmap", message: skipMessage } );
+		} else {
+			// The architecture role is gone. It existed to group units into packaging
+			// decisions from a whole-repository view; those decisions now come from
+			// the coupling graph before any model call, so asking a model to invent
+			// them again would be asking it to disagree with the evidence.
+			// Packaging must exist before roadmap sharding. When the architecture
+			// role times out or exceeds schema limits, synthesize path-based
+			// placements now so roadmap phases follow ColdBox module / worker seams
+			// instead of one catch-all road.
+			if ( applicationFragmentHasSubstance( merged ) && roadmapSynthesis().architectureDecisionsMissing( merged ) ) {
+				merged = roadmapSynthesis().applySynthesizedArchitecture( merged, arguments.evidence, notes );
+			}
+
+			var canAffordRoadmap = !isNumeric( budgets.maxCostUsd ?: "" ) || totalCostUsd < val( budgets.maxCostUsd );
+			if ( isCancelled( arguments.runId, arguments.options ) ) {
+				errors.append( { role: "modernization-roadmap", message: "cancelled-after-partial-acceptance" } );
+			} else if ( maxTasks < 3 || getTickCount() - startedAt >= maxDurationMs || totalOutputCharacters >= totalOutputLimit ) {
+				errors.append( { role: "modernization-roadmap", message: "budget-exceeded" } );
+			} else if ( !canAffordRoadmap ) {
+				errors.append( { role: "modernization-roadmap", message: "cost-budget-exceeded" } );
+			} else {
+				logInfo( "Modernize proposal #arguments.runId#: starting roadmap role" );
+				// The roadmap role used to be one whole-plan call, which reliably
+				// truncated on any real project (many target units / architecture
+				// groups all described in one JSON response under the same
+				// token cap as every other role). It is now sharded the same way
+				// modernization-application already is: one small, bounded call
+				// per architecture group (or per unit batch when no groups exist
+				// yet), dispatched concurrently, then reconciled back into a
+				// single ordered roadmap.
+				var roadmapShards = buildRoadmapShards( merged, budgets );
+				if ( !roadmapShards.len() ) {
+					errors.append( { role: "modernization-roadmap", message: "no-roadmap-groups", severity: "info" } );
+				} else {
+					var roadmapResult = runRoadmapShards(
+						arguments.runId,
+						roadmapShards,
+						runtime,
+						budgets,
+						startedAt,
+						maxDurationMs,
+						totalOutputLimit,
+						totalCostUsd,
+						arguments.options
+					);
+					totalCostUsd += roadmapResult.costUsd;
+					totalOutputCharacters += roadmapResult.outputCharacters;
+					splitProposalMessages( roadmapResult.errors, errors, notes );
+					if ( roadmapResult.accepted > 0 ) merged = mergeRoadmap( merged, roadmapResult, samplePolicy, errors );
+					merged.metadata = isStruct( merged.metadata ?: "" ) ? merged.metadata : {};
+					merged.metadata.roadmapShards = {
+						accepted: roadmapResult.accepted,
+						total: roadmapShards.len(),
+						failed: roadmapResult.failed,
+						omitted: roadmapResult.omitted,
+						outcomes: roadmapResult.outcomes
+					};
+					logInfo( "Modernize proposal #arguments.runId#: roadmap shards accepted #roadmapResult.accepted#/#roadmapShards.len()#" );
+				}
+			}
+		}
+		// Architecture packaging must exist before synthesized roadmap groups,
+		// otherwise the road collapses to one generic strangler phase.
+		if ( applicationFragmentHasSubstance( merged ) && roadmapSynthesis().architectureDecisionsMissing( merged ) ) {
+			merged = roadmapSynthesis().applySynthesizedArchitecture( merged, arguments.evidence, notes );
+		}
+		if ( applicationFragmentHasSubstance( merged ) && ( !isArray( merged.roadmapPhases ?: "" ) || !merged.roadmapPhases.len() ) ) {
+			merged = roadmapSynthesis().applySynthesizedRoadmap( merged, notes );
+		}
+		merged.metadata.provider = agentGateway.isEnabled() ? "enabled" : "disabled";
+		merged.metadata.promptVersion = agentFactory.version();
+		merged.metadata.sourceRevision = arguments.input.sourceRevision ?: "";
+		merged.metadata.sourceFingerprint = arguments.input.sourceFingerprint ?: "";
+		merged.metadata.inventoryFingerprint = isStruct( arguments.evidence.inventory ?: "" ) ? ( arguments.evidence.inventory.fingerprint ?: "" ) : "";
+		merged.metadata.contextFingerprint = isStruct( arguments.evidence.context ?: "" ) ? ( arguments.evidence.context.fingerprint ?: "" ) : "";
+		merged.metadata.schemaFingerprint = isStruct( arguments.evidence.schemaEvidence ?: "" )
+			? ( arguments.evidence.schemaEvidence.fingerprint ?: arguments.evidence.schemaEvidence.contentHash ?: "" )
+			: "";
+		merged.metadata.model = appResult.model ?: "";
+		merged.metadata.providerId = appResult.provider ?: "";
+		merged.metadata.promptContracts = isArray( merged.metadata.promptContracts ?: "" ) ? merged.metadata.promptContracts : [];
+		for ( var applicationContract in collectPromptContracts( appResult.outcomes ?: [] ) ) {
+			if ( !merged.metadata.promptContracts.some( ( existing ) => existing.key == applicationContract.key ) ) merged.metadata.promptContracts.append( applicationContract );
+		}
+		merged = annotateProvenance( merged );
+		var finalErrors = [];
+		var finalNotes = duplicate( notes );
+		splitProposalMessages( errors, finalErrors, finalNotes );
+		merged.generationErrors = finalErrors;
+		merged.generationNotes = finalNotes;
+		merged.generationSummary = buildGenerationSummary( merged, fragments, finalErrors, appResult, runId );
+		var partial = finalErrors.len() > 0;
+		logInfo( "Modernize proposal #arguments.runId#: complete partial=#partial#, errors=#finalErrors.len()#, notes=#finalNotes.len()#, targets=#( isStruct( merged.target ?: '' ) && isArray( merged.target.units ?: '' ) ? merged.target.units.len() : 0 )#, phases=#( isArray( merged.roadmapPhases ?: '' ) ? merged.roadmapPhases.len() : 0 )#" );
+		return { ok: true, plan: sortPlan( merged ), partial: partial, errors: finalErrors, notes: finalNotes };
+	}
+
+	private struct function ensureApplicationSourceCoverage(
+		required struct plan,
+		required struct evidence,
+		required struct input,
+		array notes = [],
+		struct appResult = {}
+	) {
+		var inventory = isStruct( arguments.evidence.inventory ?: "" ) ? arguments.evidence.inventory : {};
+		var files = isArray( inventory.files ?: "" ) ? inventory.files : [];
+		var inventoryUnits = isArray( inventory.units ?: "" ) ? inventory.units : [];
+		if ( !files.len() && inventoryUnits.len() ) {
+			var fallbackFiles = {};
+			for ( var inventoryUnit in inventoryUnits ) {
+				var inventoryPath = normalizeEvidencePath( inventoryUnit.filePath ?: "" );
+				if ( len( inventoryPath ) ) fallbackFiles[ inventoryPath ] = { filePath: inventoryPath, lineCount: val( inventoryUnit.endLine ?: 1 ) };
+			}
+			files = fallbackFiles.keyArray().map( ( item ) => fallbackFiles[ item ] );
+		}
+		if ( !files.len() ) return arguments.plan;
+		arguments.plan.target = isStruct( arguments.plan.target ?: "" ) ? arguments.plan.target : { units: [], contexts: [], extracts: [] };
+		arguments.plan.target.units = isArray( arguments.plan.target.units ?: "" ) ? arguments.plan.target.units : [];
+		arguments.plan.unitLinks = isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [];
+		var gapPaths = failedOrOmittedShardPaths( arguments.appResult );
+		var covered = {};
+		for ( var target in arguments.plan.target.units ) {
+			var path = normalizeEvidencePath( target.sourcePath ?: target.sourceFile ?: target.legacyPath ?: "" );
+			if ( len( path ) ) covered[ path ] = true;
+		}
+		for ( var link in arguments.plan.unitLinks ) {
+			var path = normalizeEvidencePath( link.sourcePath ?: link.sourceFile ?: link.filePath ?: "" );
+			if ( len( path ) ) covered[ path ] = true;
+		}
+		var addedPaths = [];
+		var retainedGapPaths = [];
+		for ( var file in files ) {
+			if ( !isStruct( file ) ) continue;
+			var sourcePath = normalizeEvidencePath( file.filePath ?: file.path ?: "" );
+			if ( !len( sourcePath ) || covered.keyExists( sourcePath ) || !isLikelyApplicationSource( sourcePath ) ) continue;
+			// Empty/timeout/budget-omitted shards remain failed gaps for continue/resume.
+			if ( gapPaths.keyExists( lCase( sourcePath ) ) ) {
+				retainedGapPaths.append( sourcePath );
+				continue;
+			}
+			var unitsForPath = inventoryUnits.filter( ( item ) => isStruct( item ) && normalizeEvidencePath( item.filePath ?: "" ) == sourcePath );
+			var representative = unitsForPath.len() ? unitsForPath[ 1 ] : {};
+			var layer = placementService.fallbackLayerForSource( sourcePath, representative );
+			var target = {
+				id: "coverage-" & left( hash( sourcePath, "SHA-256" ), 20 ),
+				sourcePath: sourcePath,
+				layer: layer,
+				purpose: "Coverage fallback for a source path whose LLM shard did not produce a usable mapping",
+				legacyUnitIds: unitsForPath.map( ( item ) => item.id ?: "" ).filter( ( item ) => len( trim( item ) ) ),
+				evidenceRefs: isArray( representative.evidenceRefs ?: "" )
+					? duplicate( representative.evidenceRefs )
+					: [ { filePath: sourcePath, startLine: 1, endLine: max( 1, val( file.lineCount ?: 1 ) ), extractionMethod: "inventory-coverage-fallback" } ],
+				confidence: 0.35,
+				validationStatus: "needs-review",
+				provenanceClass: "deterministically-derived",
+				newProposal: false
+			};
+			target.targetPath = targetPathService().deriveTargetPath(
+				target,
+				sourcePath,
+				lCase( arguments.input.target.runtime ?: "boxlang" ),
+				lCase( arguments.input.target.layoutProfile ?: "modern" )
+			);
+			ensureIdentity( target, "target-unit" );
+			arguments.plan.target.units.append( target );
+			if ( target.legacyUnitIds.len() ) {
+				var link = {
+					id: "coverage-link-" & left( hash( sourcePath, "SHA-256" ), 20 ),
+					legacyUnitId: target.legacyUnitIds[ 1 ],
+					sourcePath: sourcePath,
+					targetUnitId: target.id,
+					relation: "retain-legacy",
+					notes: "LLM shard fallback; verify the target concern before implementation",
+					evidenceRefs: duplicate( target.evidenceRefs ),
+					confidence: 0.35,
+					validationStatus: "needs-review",
+					provenanceClass: "deterministically-derived"
+				};
+				ensureIdentity( link, "unit-link" );
+				arguments.plan.unitLinks.append( link );
+			}
+			covered[ sourcePath ] = true;
+			addedPaths.append( sourcePath );
+		}
+		if ( addedPaths.len() ) {
+			arguments.plan.target.units = placementService.normalizeTargetUnits( arguments.plan.target.units, arguments.input );
+			arguments.notes.append( {
+				role: "modernization-application",
+				message: "inventory-coverage-fallback",
+				severity: "info",
+				count: addedPaths.len(),
+				paths: addedPaths
+			} );
+		}
+		if ( retainedGapPaths.len() ) {
+			arguments.notes.append( {
+				role: "modernization-application",
+				message: "failed-shard-gaps-retained",
+				severity: "info",
+				count: retainedGapPaths.len(),
+				paths: retainedGapPaths
+			} );
+		}
+		return arguments.plan;
+	}
+
+	/** Paths belonging to failed or omitted application shards — retryable gaps, not stubs. */
+	private struct function failedOrOmittedShardPaths( required struct appResult ) {
+		var gapPaths = {};
+		for ( var outcome in ( isArray( arguments.appResult.outcomes ?: "" ) ? arguments.appResult.outcomes : [] ) ) {
+			if ( ![ "failed", "omitted" ].contains( outcome.status ?: "" ) ) continue;
+			for ( var path in ( isArray( outcome.paths ?: "" ) ? outcome.paths : [] ) ) {
+				var normalized = lCase( normalizeEvidencePath( path ) );
+				if ( len( normalized ) ) gapPaths[ normalized ] = true;
+			}
+		}
+		for ( var omittedPath in ( isArray( arguments.appResult.omittedPaths ?: "" ) ? arguments.appResult.omittedPaths : [] ) ) {
+			var normalizedOmitted = lCase( normalizeEvidencePath( omittedPath ) );
+			if ( len( normalizedOmitted ) ) gapPaths[ normalizedOmitted ] = true;
+		}
+		return gapPaths;
+	}
+
+	/**
+	 * Sample, transition and naming utilities now live in
+	 * ModernizationArtifactService (Step 11). These delegate rather than keeping
+	 * a second copy, so there is still exactly one implementation of each and
+	 * the call sites in this file did not have to change.
+	 */
+	/**
+	 * Shard construction and dispatch now live in ModernizationShardExecutor
+	 * (Step 11). Resolution is lazy and *propagates this instance's
+	 * collaborators*, which is what keeps the existing specs working: a spec
+	 * that sets `service.agentGateway = fake` before calling propose() has its
+	 * fake in place by the time the executor is first resolved, so the fake
+	 * still reaches the provider call. The cancellation registry is shared by
+	 * reference so cancelRun() stops in-flight shards.
+	 */
+	private any function shardExecutor() {
+		if ( variables.shardExecutorReady ?: false ) return variables.modernizationShardExecutor;
+		// Propagate on first use whether the instance came from WireBox or was
+		// constructed here -- an injected singleton arrives with its own
+		// collaborators, and a spec's stub would never reach it otherwise.
+		var executor = isNull( variables.modernizationShardExecutor ?: javacast( "null", "" ) )
+			? new app.models.services.ModernizationShardExecutor()
+			: variables.modernizationShardExecutor;
+		if ( !isNull( variables.agentFactory ?: javacast( "null", "" ) ) ) executor.agentFactory = variables.agentFactory;
+		if ( !isNull( variables.agentGateway ?: javacast( "null", "" ) ) ) executor.agentGateway = variables.agentGateway;
+		if ( !isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) executor.secretRedactionService = variables.secretRedactionService;
+		if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) executor.log = variables.log;
+		if ( !isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) executor.derivedStructureService = variables.derivedStructureService;
+		executor.modernizationArtifactService = artifactService();
+		executor.shareRunState( variables.cancelledRuns );
+		variables.modernizationShardExecutor = executor;
+		variables.shardExecutorReady = true;
+		return executor;
+	}
+
+	// Roadmap sharding is its own service; it uses the executor only for the
+	// shared dispatch primitives.
+	private any function roadmapShardService() {
+		if ( variables.roadmapShardsReady ?: false ) return variables.modernizationRoadmapShardService;
+		var service = isNull( variables.modernizationRoadmapShardService ?: javacast( "null", "" ) )
+			? new app.models.services.ModernizationRoadmapShardService()
+			: variables.modernizationRoadmapShardService;
+		if ( !isNull( variables.agentFactory ?: javacast( "null", "" ) ) ) service.agentFactory = variables.agentFactory;
+		if ( !isNull( variables.agentGateway ?: javacast( "null", "" ) ) ) service.agentGateway = variables.agentGateway;
+		if ( !isNull( variables.derivedStructureService ?: javacast( "null", "" ) ) ) service.derivedStructureService = variables.derivedStructureService;
+		if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) service.log = variables.log;
+		if ( !isNull( variables.secretRedactionService ?: javacast( "null", "" ) ) ) service.secretRedactionService = variables.secretRedactionService;
+		service.modernizationArtifactService = artifactService();
+		service.modernizationShardExecutor = shardExecutor();
+		service.shareRunState( variables.cancelledRuns );
+		variables.modernizationRoadmapShardService = service;
+		variables.roadmapShardsReady = true;
+		return service;
+	}
+
+	private array function buildRoadmapShards() {
+		return invoke( roadmapShardService(), "buildRoadmapShards", arguments );
+	}
+
+	private struct function runRoadmapShards() {
+		return invoke( roadmapShardService(), "runRoadmapShards", arguments );
+	}
+
+	private array function buildApplicationShards() {
+		return invoke( shardExecutor(), "buildApplicationShards", arguments );
+	}
+
+	private struct function runApplicationShards() {
+		return invoke( shardExecutor(), "runApplicationShards", arguments );
+	}
+
+	private struct function groundedPathSet() {
+		return invoke( shardExecutor(), "groundedPathSet", arguments );
+	}
+
+	private array function prioritizedLegacyPaths() {
+		return invoke( shardExecutor(), "prioritizedLegacyPaths", arguments );
+	}
+
+	private boolean function isLikelyApplicationSource() {
+		return invoke( shardExecutor(), "isLikelyApplicationSource", arguments );
+	}
+
+	private string function ensureShardExecutor() {
+		return invoke( shardExecutor(), "ensureShardExecutor", arguments );
+	}
+
+	private struct function dispatchShardTask() {
+		return invoke( shardExecutor(), "dispatchShardTask", arguments );
+	}
+
+	private struct function awaitShardTask() {
+		return invoke( shardExecutor(), "awaitShardTask", arguments );
+	}
+
+	/**
+	 * Generation summary, coverage roll-up, provenance and ordering moved to
+	 * ModernizationPlanAnnotationService (Step 11). Delegating keeps the call
+	 * sites here unchanged.
+	 */
+	private any function annotationService() {
+		if ( !isNull( variables.modernizationPlanAnnotationService ?: javacast( "null", "" ) ) ) return variables.modernizationPlanAnnotationService;
+		variables.modernizationPlanAnnotationService = new app.models.services.ModernizationPlanAnnotationService();
+		return variables.modernizationPlanAnnotationService;
+	}
+
+	private struct function sortPlan() {
+		return invoke( annotationService(), "sortPlan", arguments );
+	}
+
+	private struct function annotateProvenance() {
+		return invoke( annotationService(), "annotateProvenance", arguments );
+	}
+
+	private struct function failure() {
+		return invoke( annotationService(), "failure", arguments );
+	}
+
+	private struct function applyGenerationCoverage() {
+		return invoke( annotationService(), "applyGenerationCoverage", arguments );
+	}
+
+	private struct function buildGenerationSummary() {
+		return invoke( annotationService(), "buildGenerationSummary", arguments );
+	}
+
+	private struct function synthesizeDatabaseFragment() {
+		return invoke( artifactService(), "synthesizeDatabaseFragment", arguments );
+	}
+
+	/**
+	 * Fragment merging moved to ModernizationFragmentMerger (Step 11). These
+	 * delegate so the call sites in propose() did not have to change.
+	 */
+	private any function targetPathService() {
+		if ( !isNull( variables.modernizationTargetPathService ?: javacast( "null", "" ) ) ) return variables.modernizationTargetPathService;
+		variables.modernizationTargetPathService = new app.models.services.ModernizationTargetPathService();
+		return variables.modernizationTargetPathService;
+	}
+
+	private any function fragmentMerger() {
+		if ( !isNull( variables.modernizationFragmentMerger ?: javacast( "null", "" ) ) ) return variables.modernizationFragmentMerger;
+		variables.modernizationFragmentMerger = new app.models.services.ModernizationFragmentMerger();
+		return variables.modernizationFragmentMerger;
+	}
+
+	private struct function mergeFragments( required struct input, required struct evidence, required struct fragments, required array errors ) {
+		return fragmentMerger().mergeFragments( arguments.input, arguments.evidence, arguments.fragments, arguments.errors );
+	}
+
+	private struct function mergeRoadmap( required struct plan, required struct roadmap, struct samplePolicy = {}, array errors = [] ) {
+		return fragmentMerger().mergeRoadmap( arguments.plan, arguments.roadmap, arguments.samplePolicy, arguments.errors );
+	}
+
+	private boolean function applicationFragmentHasSubstance( required struct plan ) {
+		return fragmentMerger().applicationFragmentHasSubstance( arguments.plan );
+	}
+
+	private any function artifactService() {
+		if ( !isNull( variables.modernizationArtifactService ?: javacast( "null", "" ) ) ) return variables.modernizationArtifactService;
+		variables.modernizationArtifactService = new app.models.services.ModernizationArtifactService();
+		return variables.modernizationArtifactService;
+	}
+
+	private string function pathHaystackForUnits( required array units ) {
+		return artifactService().pathHaystackForUnits( arguments.units );
+	}
+
+	private boolean function objectMatchesHaystack( required any objectName, required string haystack ) {
+		return artifactService().objectMatchesHaystack( arguments.objectName, arguments.haystack );
+	}
+
+	private array function objectNamesForDbItem( required struct item ) {
+		return artifactService().objectNamesForDbItem( arguments.item );
+	}
+
+	private string function normalizeLegacyPath( required any path ) {
+		return artifactService().normalizeLegacyPath( arguments.path );
+	}
+
+	private string function scalarString( required any value ) {
+		return artifactService().scalarString( arguments.value );
+	}
+
+	private array function dedupeById( required array items ) {
+		return artifactService().dedupeById( arguments.items );
+	}
+
+	private string function normalizeEvidencePath( required any path ) {
+		return artifactService().normalizeEvidencePath( arguments.path );
+	}
+
+	private struct function copyGatewayOptions( struct options = {} ) {
+		return artifactService().copyGatewayOptions( arguments.options );
+	}
+
+	private struct function exceptionDiagnostics( required any error ) {
+		return artifactService().exceptionDiagnostics( arguments.error );
+	}
+
+	private array function boundedArray( required any value, required numeric limit ) {
+		return artifactService().boundedArray( arguments.value, arguments.limit );
+	}
+
+	private array function boundedStructArray( required any value, required numeric limit, array errors = [], string collection = "items" ) {
+		return artifactService().boundedStructArray( arguments.value, arguments.limit, arguments.errors, arguments.collection );
+	}
+
+	private boolean function validFragment( required string role, required any payload ) {
+		return artifactService().validFragment( arguments.role, arguments.payload );
+	}
+
+	private struct function providerRoleError( required string role, required struct response, numeric shard = 0 ) {
+		return artifactService().providerRoleError( arguments.role, arguments.response, arguments.shard );
+	}
+
+	private string function inferErrorType( required string message ) {
+		return artifactService().inferErrorType( arguments.message );
+	}
+
+	void function cancelRun( required string runId ) {
+		variables.cancelledRuns[ arguments.runId ] = true;
+		agentGateway.cancelRun( arguments.runId );
+	}
+
+	/**
+	 * Judge and narrate the derived structure.
+	 *
+	 * This is the model's whole job after the inversion. The boundaries are
+	 * already drawn by ModernizationDerivedStructureService from coupling
+	 * evidence, so neither role is asked to find one: `judge` argues with a
+	 * fixed boundary, `narrate` puts language on it. Both are optional — a run
+	 * with no provider configured keeps the derived structure exactly as it is,
+	 * which is the no-key path the product promises.
+	 *
+	 * Clusters go out in small batches rather than one call per cluster: the
+	 * per-call overhead dominates at this payload size, and the schemas cap a
+	 * batch at 4 so a truncated response loses one batch, not the run.
+	 */
+	private void function applyModelOverride( required struct input, required struct options ) {
+		if ( structKeyExists( arguments.options, "model" ) && len( trim( arguments.options.model ?: "" ) ) ) return;
+		if ( !structKeyExists( arguments.input, "execution" ) || !isStruct( arguments.input.execution ) ) return;
+		var overrideModel = trim( arguments.input.execution.model ?: "" );
+		if ( len( overrideModel ) ) arguments.options.model = overrideModel;
+	}
+
+	/**
+	 * Copies only gateway-supported option keys. Callback closures are retained
+	 * by reference so BoxLang never attempts to recursively duplicate their
+	 * captured worker/executor state during live runs.
+	 */
+
+
+	private struct function preflightInitialRoles(
+		required array appShards,
+		required struct runtime,
+		required struct evidence,
+		required struct budgets,
+		required numeric maxTasks,
+		struct options = {}
+	) {
+		var activeRole = "modernization-application";
+		var activeOperation = "build-request";
+		var activeShard = 0;
+		try {
+			for ( var shardIndex = 1; shardIndex <= arguments.appShards.len(); shardIndex++ ) {
+				activeRole = "modernization-application";
+				activeShard = shardIndex;
+				activeOperation = "build-request";
+				var applicationRequest = agentFactory.build( "modernization-application", arguments.runtime, arguments.appShards[ shardIndex ], arguments.budgets );
+				activeOperation = "copy-options";
+				var requestOptions = copyGatewayOptions( arguments.options );
+				requestOptions.role = "modernization-application";
+				requestOptions.budgets = duplicate( arguments.budgets );
+				activeOperation = "fit-package";
+				agentGateway.preflight( applicationRequest, requestOptions );
+			}
+			if ( arguments.maxTasks >= 2 ) {
+				activeRole = "modernization-database";
+				activeShard = 0;
+				activeOperation = "build-request";
+				var databaseRequest = agentFactory.build( "modernization-database", arguments.runtime, arguments.evidence, arguments.budgets );
+				activeOperation = "copy-options";
+				var databaseOptions = copyGatewayOptions( arguments.options );
+				databaseOptions.role = "modernization-database";
+				databaseOptions.budgets = duplicate( arguments.budgets );
+				activeOperation = "fit-package";
+				agentGateway.preflight( databaseRequest, databaseOptions );
+			}
+			return { ok: true };
+		} catch ( any error ) {
+			var diagnostics = exceptionDiagnostics( error );
+			diagnostics.operation = activeOperation;
+			if ( activeShard > 0 ) diagnostics.shard = activeShard;
+			return {
+				ok: false,
+				role: activeRole,
+				message: left( error.message ?: "modernization prompt preflight failed", 500 ),
+				diagnostics: diagnostics
+			};
+		}
+	}
+
+
+
+	private void function splitProposalMessages( required array incoming, required array errors, required array notes ) {
+		for ( var item in arguments.incoming ) {
+			if ( !isStruct( item ) ) continue;
+			if ( isInformationalProposalMessage( item ) ) arguments.notes.append( item );
+			else arguments.errors.append( item );
+		}
+	}
+
+	private boolean function isInformationalProposalMessage( required struct item ) {
+		var message = lCase( trim( arguments.item.message ?: "" ) );
+		var severity = lCase( trim( arguments.item.severity ?: "" ) );
+		if ( severity == "info" || severity == "note" ) return true;
+		if ( findNoCase( "synthesized-", message ) == 1 ) return true;
+		if ( message == "cost-reserved-for-roadmap" ) return true;
+		if ( message == "ignored-non-object-items" ) return true;
+		return false;
+	}
+
+	private void function logInfo( required string message ) {
+		try {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				variables.log.info( arguments.message );
+			}
+		} catch ( any ignored ) {}
+	}
+
+	private void function appendModernizationLog( required string level, required string message ) {
+		// Kept for compatibility; logInfo delegates to the injected LogBox logger.
+	}
+
+
+
+
+
+	private struct function redactPayload(required struct payload) {
+		try {
+			var redacted = secretRedactionService.redactStructured( arguments.payload );
+			return isStruct( redacted ) ? redacted : {};
+		} catch ( any ignored ) {
+			// Never persist a provider payload that could not pass redaction;
+			// retaining raw output would violate the local privacy boundary.
+			return {};
+		}
+	}
+
+	private void function ensureIdentity(required struct item, required string kind) {
+		var id = trim( scalarString( arguments.item.id ?: "" ) );
+		if ( !len( id ) ) id = trim( scalarString( arguments.item.itemId ?: "" ) );
+		if ( !len( id ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
+		else arguments.item.id = id;
+		var fingerprint = trim( scalarString( arguments.item.itemFingerprint ?: "" ) );
+		if ( !len( fingerprint ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+		else arguments.item.itemFingerprint = fingerprint;
+	}
+	private boolean function isCancelled(required string runId, required struct options) {
+		return variables.cancelledRuns.keyExists( arguments.runId ) || ( structKeyExists( arguments.options, "isCancelled" ) && isCustomFunction( arguments.options.isCancelled ) && arguments.options.isCancelled() );
+	}
+	private array function collectPromptContracts( required array outcomes ) {
+		var contracts = [];
+		for ( var outcome in arguments.outcomes ) {
+			if ( !isStruct( outcome.promptProvenance ?: "" ) || !outcome.promptProvenance.count() ) continue;
+			var provenance = duplicate( outcome.promptProvenance );
+			var key = ( provenance.promptId ?: "" ) & "|" & ( provenance.promptVersion ?: provenance.contractVersion ?: "" ) & "|" & ( provenance.promptHash ?: "" );
+			if ( !contracts.some( ( item ) => item.key == key ) ) contracts.append( { key: "modernization-application|" & key, provenance: provenance, role: "modernization-application" } );
+		}
+		return contracts;
+	}
+
+	private void function appendPromptContract( required struct plan, required string role, required any provenance ) {
+		if ( !isStruct( arguments.provenance ) || !arguments.provenance.count() ) return;
+		arguments.plan.metadata = isStruct( arguments.plan.metadata ?: "" ) ? arguments.plan.metadata : {};
+		arguments.plan.metadata.promptContracts = isArray( arguments.plan.metadata.promptContracts ?: "" ) ? arguments.plan.metadata.promptContracts : [];
+		var item = { key: arguments.role & "|" & ( arguments.provenance.promptId ?: "" ) & "|" & ( arguments.provenance.promptHash ?: "" ), provenance: duplicate( arguments.provenance ), role: arguments.role };
+		if ( !arguments.plan.metadata.promptContracts.some( ( existing ) => existing.key == item.key ) ) arguments.plan.metadata.promptContracts.append( item );
+	}
+
+
+}

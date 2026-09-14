@@ -1,0 +1,166 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe(
+			"Observability trace export",
+			() => {
+				it(
+					"projects the full run lifecycle into a Langfuse-style trace report",
+					() => {
+						var eventService = createStub().$(
+								"after",
+								[
+									{
+										sequence : 10,
+										eventType: "run.status",
+										payload  : {
+											timestamp: "2026-07-25T12:00:00Z",
+											data     : {
+												run: {
+													status      : "running",
+													currentPhase: "queued",
+													progress    : 0,
+													message     : "Run accepted"
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:00Z"
+									},
+									{
+										sequence : 13,
+										eventType: "review.indexed",
+										payload  : {
+											timestamp: "2026-07-25T12:00:03Z",
+											data     : {
+												detail: {
+													filesScanned: 12,
+													languages   : [ "BoxLang"],
+													scope       : "full"
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:03Z"
+									},
+									{
+										sequence : 14,
+										eventType: "run.completed",
+										payload  : {
+											timestamp: "2026-07-25T12:00:04Z",
+											data     : {
+												run: {
+													status      : "succeeded",
+													currentPhase: "completed",
+													progress    : 100,
+													message     : "12 files reviewed"
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:04Z"
+									},
+									{
+										sequence : 11,
+										eventType: "review.specialist.observe",
+										payload  : {
+											timestamp: "2026-07-25T12:00:01Z",
+											data     : {
+												detail: {
+													role   : "security",
+													taskId : "task-1",
+													stage  : "provider-llm-done",
+													observe: {
+														kind           : "llm",
+														observationType: "generation",
+														title          : "LLM generation round 1",
+														input          : "prompt text",
+														output         : "model text",
+														preview        : "model text",
+														model          : "test-model",
+														durationMs     : 120,
+														usage          : {
+															promptTokens    : 10,
+															completionTokens: 5,
+															totalTokens     : 15
+														},
+														modelParameters: { provider: "openai-compatible" },
+														meta           : { round: 1 }
+													}
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:01Z"
+									},
+									{
+										sequence : 12,
+										eventType: "review.specialist.observe",
+										payload  : {
+											timestamp: "2026-07-25T12:00:02Z",
+											data     : {
+												detail: {
+													role   : "security",
+													observe: {
+														kind           : "fallback",
+														observationType: "event",
+														title          : "Chat fallback after agent error",
+														preview        : "provider error",
+														output         : "provider error",
+														meta           : {}
+													}
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:02Z"
+									},
+									{
+										sequence : 15,
+										eventType: "review.specialist.observe",
+										payload  : {
+											timestamp: "2026-07-25T12:00:05Z",
+											data     : {
+												detail: {
+													role   : "security",
+													observe: {
+														kind           : "fallback",
+														observationType: "event",
+														title          : "Incomplete JSON; retrying",
+														preview        : "partial JSON",
+														output         : "partial JSON",
+														meta           : {
+															reason           : "invalid-json",
+															previousMaxTokens: 2048,
+															retryMaxTokens   : 3072
+														}
+													}
+												}
+											}
+										},
+										createdAt: "2026-07-25T12:00:05Z"
+									}
+								]
+							);
+						var service = prepareMock( new app.models.services.ObservabilityTraceService() );
+						service.$property(
+								"eventService",
+								"variables",
+								eventService
+							);
+						var report = service.exportTraces( "run-1", 100 );
+						expect( report.version ).toBe( "doublecheck-traces-v1" );
+						expect( report.style ).toBe( "langfuse-inspired" );
+						expect( report.scope ).toBe( "full-run" );
+						expect( report.runId ).toBe( "run-1" );
+						expect( report.observations.len() ).toBe( 6 );
+						expect( report.summary.generations ).toBe( 1 );
+						expect( report.summary.fallbacks ).toBe( 1 );
+						expect( report.summary.retries ).toBe( 1 );
+						expect( report.summary.phases ).toBe( 3 );
+						expect( report.summary.totalTokens ).toBe( 15 );
+						expect( report.summary.totalDurationMs ).toBe( 120 );
+						expect( report.observations[ 4 ].input ).toBe( "prompt text" );
+						expect( report.observations[ 4 ].output ).toBe( "model text" );
+						expect( report.observations[ 2 ].name ).toBe( "Files indexed" );
+					}
+				);
+			}
+		);
+	}
+}

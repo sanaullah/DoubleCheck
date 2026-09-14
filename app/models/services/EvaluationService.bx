@@ -1,0 +1,291 @@
+/**
+ * Runs the seeded evaluation corpus against the review engine for quality gates.
+ *
+ * @see QualityGateService
+ */
+
+@singleton
+class {
+
+	struct function loadCorpus( required string corpusPath ) {
+		var root = createObject( "java", "java.io.File" ).init( arguments.corpusPath ).getCanonicalFile();
+		if ( !root.isDirectory() ) {
+			throw(
+				type    = "EvaluationCorpusException",
+				message = "Evaluation corpus directory does not exist"
+			);
+		}
+		var manifestFile = containedFile( root, "manifest.json" );
+		if ( !manifestFile.isFile() ) {
+			throw(
+				type    = "EvaluationCorpusException",
+				message = "Evaluation corpus manifest is missing"
+			);
+		}
+		var manifest = jsonDeserialize( fileRead( manifestFile.getCanonicalPath(), "UTF-8" ) );
+		if ( !isStruct( manifest ) || !isArray( manifest.cases ?: "" ) || !isStruct( manifest.thresholds ?: "" ) ) {
+			throw(
+				type    = "EvaluationCorpusException",
+				message = "Evaluation corpus manifest is invalid"
+			);
+		}
+
+		var loadedCases = [];
+		for ( var corpusCase in manifest.cases ) {
+			var files = [];
+			for ( var fileDefinition in corpusCase.files ) {
+				var sourceFile = containedFile( root, fileDefinition.source );
+				if ( !sourceFile.isFile() ) {
+					throw(
+						type    = "EvaluationCorpusException",
+						message = "Evaluation source file is missing"
+					);
+				}
+				var content = fileRead( sourceFile.getCanonicalPath(), "UTF-8" );
+				var lines = listToArray(
+					content,
+					char( 10 ),
+					true,
+					true
+				).map(
+						( line ) => replace(
+							line,
+							char( 13 ),
+							"",
+							"all"
+						)
+					);
+				files.append(
+						{
+							filePath: replace(
+								fileDefinition.filePath,
+								"\",
+								"/",
+								"all"
+							),
+							language   : fileDefinition.language,
+							content    : content,
+							contentHash: lCase( hash( content, "SHA-256" ) ),
+							lines      : lines
+						}
+					);
+			}
+			loadedCases.append(
+					{
+						id          : corpusCase.id,
+						files       : files,
+						expected    : corpusCase.expected,
+						fakeResponse: corpusCase.fakeResponse
+					}
+				);
+		}
+		return {
+			version       : manifest.version,
+			language      : manifest.language ?: "BoxLang",
+			capabilityTier: manifest.capabilityTier ?: "deterministic",
+			thresholds    : manifest.thresholds,
+			cases         : loadedCases
+		};
+	}
+
+	struct function evaluate(
+		required array expected,
+		required array actual,
+		required array files,
+		required struct thresholds
+	) {
+		var expectedKeys = {};
+		for ( var item in arguments.expected ) {
+			expectedKeys[ findingKey( item ) ] = true;
+		}
+		var matched = {};
+		var truePositives = 0;
+		var falsePositives = 0;
+		for ( var finding in arguments.actual ) {
+			var key = findingKey( finding );
+			if ( expectedKeys.keyExists( key ) && !matched.keyExists( key ) ) {
+				matched[ key ] = true;
+				truePositives++;
+			} else {
+				falsePositives++;
+			}
+		}
+		var falseNegatives = arguments.expected.len() - truePositives;
+		var precision = safeDivide(
+			truePositives,
+			truePositives + falsePositives,
+			1
+		);
+		var recall = safeDivide(
+			truePositives,
+			truePositives + falseNegatives,
+			1
+		);
+		var f1 = safeDivide(
+			2 * precision * recall,
+			precision + recall,
+			1
+		);
+		var evaluationFiles = arguments.files;
+		var validCitations = arguments
+			.actual
+			.filter(
+				( finding ) => citationIsValid( finding, evaluationFiles )
+			)
+			.len();
+		var citationValidity = safeDivide(
+			validCitations,
+			arguments.actual.len(),
+			1
+		);
+		var uniqueFingerprints = {};
+		for ( var finding in arguments.actual ) {
+			uniqueFingerprints[ finding.fingerprint ?: findingKey( finding ) ] = true;
+		}
+		var duplicateRate = arguments.actual.len() ? 1 - ( uniqueFingerprints.count() / arguments.actual.len() ) : 0;
+		var totalLines = 0;
+		for ( var file in arguments.files ) {
+			totalLines += file.lines.len();
+		}
+		var falsePositivesPerThousandLines = safeDivide(
+			falsePositives * 1000,
+			totalLines,
+			0
+		);
+		var metrics = {
+			truePositives                 : truePositives,
+			falsePositives                : falsePositives,
+			falseNegatives                : falseNegatives,
+			precision                     : precision,
+			recall                        : recall,
+			f1                            : f1,
+			citationValidity              : citationValidity,
+			duplicateRate                 : duplicateRate,
+			falsePositivesPerThousandLines: falsePositivesPerThousandLines,
+			findingsEvaluated             : arguments.actual.len(),
+			expectedFindings              : arguments.expected.len()
+		};
+		var failures = [];
+		checkMinimum(
+			failures,
+			"precision",
+			metrics.precision,
+			arguments.thresholds.minPrecision
+		);
+		checkMinimum(
+			failures,
+			"recall",
+			metrics.recall,
+			arguments.thresholds.minRecall
+		);
+		checkMinimum(
+			failures,
+			"f1",
+			metrics.f1,
+			arguments.thresholds.minF1
+		);
+		checkMinimum(
+			failures,
+			"citationValidity",
+			metrics.citationValidity,
+			arguments.thresholds.minCitationValidity
+		);
+		checkMaximum(
+			failures,
+			"duplicateRate",
+			metrics.duplicateRate,
+			arguments.thresholds.maxDuplicateRate
+		);
+		checkMaximum(
+			failures,
+			"falsePositivesPerThousandLines",
+			metrics.falsePositivesPerThousandLines,
+			arguments.thresholds.maxFalsePositivesPerThousandLines
+		);
+		return {
+			passed  : !failures.len(),
+			metrics : metrics,
+			failures: failures
+		};
+	}
+
+	private any function containedFile( required any root, required string relativePath ) {
+		var candidate = createObject( "java", "java.io.File" ).init( arguments.root, arguments.relativePath ).getCanonicalFile();
+		var rootPrefix = arguments.root.getCanonicalPath() & createObject( "java", "java.io.File" ).separator;
+		if ( !candidate.getCanonicalPath().startsWith( rootPrefix ) ) {
+			throw(
+				type    = "EvaluationCorpusException",
+				message = "Evaluation corpus path escapes its root"
+			);
+		}
+		return candidate;
+	}
+
+	private boolean function citationIsValid( required struct finding, required array files ) {
+		for ( var file in arguments.files ) {
+			if (
+				lCase( file.filePath ) !=
+					lCase(
+						replace(
+							arguments.finding.filePath,
+							"\",
+							"/",
+							"all"
+						)
+					)
+			) {
+				continue;
+			}
+			return arguments.finding.startLine >= 1 && arguments.finding.startLine <= file.lines.len() &&
+						arguments.finding.endLine >= arguments.finding.startLine &&
+					arguments.finding.endLine <= file.lines.len() &&
+				trim( arguments.finding.evidence ) == trim( file.lines[ arguments.finding.startLine ] );
+		}
+		return false;
+	}
+
+	private string function findingKey( required struct finding ) {
+		return lCase(
+			"#arguments.finding.ruleId#|#"#replace(
+				arguments.finding.filePath,
+				"\",
+				"/",
+				"all"
+			)#|"##"#arguments.finding.startLine#|"##"#arguments.finding.endLine ?: arguments.finding.startLine#"#"
+		);
+	}
+
+	private numeric function safeDivide(
+		required numeric numerator,
+		required numeric denominator,
+		required numeric zeroValue
+	) {
+		return arguments.denominator ? arguments.numerator / arguments.denominator : arguments.zeroValue;
+	}
+
+	private void function checkMinimum(
+		required array failures,
+		required string name,
+		required numeric actual,
+		required numeric expected
+	) {
+		if ( arguments.actual < arguments.expected ) {
+			arguments.failures.append(
+					"#arguments.name# #arguments.actual# is below #arguments.expected#"
+				);
+		}
+	}
+
+	private void function checkMaximum(
+		required array failures,
+		required string name,
+		required numeric actual,
+		required numeric expected
+	) {
+		if ( arguments.actual > arguments.expected ) {
+			arguments.failures.append(
+					"#arguments.name# #arguments.actual# exceeds #arguments.expected#"
+				);
+		}
+	}
+}

@@ -1,0 +1,458 @@
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+		describe( "CodeGraphMetricsService", () => {
+
+			var metrics = new app.models.services.CodeGraphMetricsService();
+			var coupling = new app.models.services.ModernizationCouplingGraphService();
+			var adapter = new app.models.services.CodeGraphInventoryAdapter();
+
+			it( "reads fan-in from CouplingGraph rather than recomputing it", () => {
+				var reviewGraph = {
+					symbols: [],
+					files: [ "app/models/Hub.cfc", "app/models/A.cfc", "app/models/B.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d2", sourceFile: "app/models/B.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 }
+					]
+				};
+				var inventory = adapter.adapt( reviewGraph );
+				var graph = coupling.build( inventory );
+				var snapshot = metrics.assemble( reviewGraph );
+
+				var hub = snapshot.nodes.filter( ( node ) => node.path == "app/models/Hub.cfc" )[ 1 ];
+				expect( hub.fanIn ).toBe( graph.fanIn( "app/models/Hub.cfc" ) );
+				expect( hub.fanIn ).toBe( 2 );
+				expect( hub.fanOut ).toBe( graph.fanOut( "app/models/Hub.cfc" ) );
+			} );
+
+			it( "marks both members of a two-file cycle as inCycle", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/models/Order.cfc", "app/models/Invoice.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/Order.cfc", kind: "constructs", target: "Invoice", targetFile: "app/models/Invoice.cfc", line: 5 },
+						{ id: "d2", sourceFile: "app/models/Invoice.cfc", kind: "constructs", target: "Order", targetFile: "app/models/Order.cfc", line: 8 }
+					]
+				} );
+
+				var order = snapshot.nodes.filter( ( node ) => node.path == "app/models/Order.cfc" )[ 1 ];
+				var invoice = snapshot.nodes.filter( ( node ) => node.path == "app/models/Invoice.cfc" )[ 1 ];
+				expect( order.inCycle ).toBeTrue();
+				expect( invoice.inCycle ).toBeTrue();
+				expect( snapshot.cycles ).toHaveLength( 1 );
+			} );
+
+			it( "does not treat Application.bx or tests/ files as orphans", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [
+						"Application.bx",
+						"tests/OrdersSpec.bx",
+						"app/models/Lonely.cfc",
+						"public/index.cfm"
+					],
+					dependencies: []
+				} );
+
+				var orphanPaths = snapshot.orphans.map( ( item ) => item.path );
+				expect( orphanPaths ).toInclude( "app/models/Lonely.cfc" );
+				expect( orphanPaths ).notToInclude( "Application.bx" );
+				expect( orphanPaths ).notToInclude( "tests/OrdersSpec.bx" );
+				expect( orphanPaths ).notToInclude( "public/index.cfm" );
+			} );
+
+			it( "flags models→handlers as a layer violation and not the reverse", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/models/OrderService.cfc", "app/handlers/Orders.bx" ],
+					dependencies: [
+						{ id: "bad", sourceFile: "app/models/OrderService.cfc", kind: "constructs", target: "Orders", targetFile: "app/handlers/Orders.bx", line: 4 },
+						{ id: "ok", sourceFile: "app/handlers/Orders.bx", kind: "injects", target: "OrderService", targetFile: "app/models/OrderService.cfc", line: 6 }
+					]
+				} );
+
+				expect( snapshot.layerViolations ).toHaveLength( 1 );
+				expect( snapshot.layerViolations[ 1 ].from ).toBe( "app/models/OrderService.cfc" );
+				expect( snapshot.layerViolations[ 1 ].to ).toBe( "app/handlers/Orders.bx" );
+				expect( snapshot.layerViolations[ 1 ].fromLayer ).toBe( "application-models" );
+				expect( snapshot.layerViolations[ 1 ].toLayer ).toBe( "http-handlers" );
+			} );
+
+			it( "ranks hotspots byte-stably", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "s1", filePath: "app/models/Hub.cfc", kind: "function", name: "a", line: 2 },
+						{ id: "s2", filePath: "app/models/Hub.cfc", kind: "function", name: "b", line: 8 }
+					],
+					files: [ "app/models/Hub.cfc", "app/models/A.cfc", "app/models/B.cfc", "app/models/C.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d2", sourceFile: "app/models/B.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d3", sourceFile: "app/models/C.cfc", kind: "extends", target: "Hub", targetFile: "app/models/Hub.cfc", line: 1 },
+						{ id: "d4", sourceFile: "app/models/Hub.cfc", kind: "constructs", target: "A", targetFile: "app/models/A.cfc", line: 10 }
+					]
+				};
+
+				var first = metrics.assemble( reviewGraph );
+				var second = metrics.assemble( reviewGraph );
+				expect( jsonSerialize( first.hotspots ) ).toBe( jsonSerialize( second.hotspots ) );
+				expect( first.hotspots[ 1 ].path ).toBe( "app/models/Hub.cfc" );
+				expect( first.hotspots[ 1 ].hotspotScore ).toBeGTE( first.hotspots[ 2 ].hotspotScore );
+			} );
+
+			it( "surfaces bounded co-change metrics without changing structural ownership", () => {
+				var snapshot = metrics.assemble(
+					{
+						symbols: [],
+						files: [ "app/models/Order.cfc", "app/models/Invoice.cfc" ],
+						dependencies: [
+							{ id: "d1", sourceFile: "app/models/Order.cfc", kind: "constructs", targetFile: "app/models/Invoice.cfc", line: 5 }
+						]
+					},
+					{
+						coChange: {
+							enabled        : true,
+							available      : true,
+							degraded       : false,
+							commits        : 4,
+							filesChanged   : 2,
+							pairCount      : 1,
+							files          : {
+								"app/models/order.cfc": { changeCount: 4, authors: [ "A" ], lastTouched: "2026-08-01T00:00:00Z" },
+								"app/models/invoice.cfc": { changeCount: 2, authors: [ "A", "B" ], lastTouched: "2026-08-02T00:00:00Z" }
+							},
+							affinityWeights: { "app/models/order.cfc": { "app/models/invoice.cfc": 0.5 } }
+						}
+					}
+				);
+				var order = snapshot.nodes.filter( ( node ) => node.path == "app/models/Order.cfc" )[ 1 ];
+				var cluster = snapshot.clusters[ 1 ];
+				expect( order.churnCount ).toBe( 4 );
+				expect( snapshot.hotspotFormula ).toInclude( "churnCount" );
+				expect( snapshot.coChange.available ).toBeTrue();
+				expect( cluster.coChange.authorCount ).toBe( 2 );
+				expect( cluster.coChange.lastTouched ).toBe( "2026-08-02T00:00:00Z" );
+			} );
+
+			it( "sets truncated when every presenter cap is hit", () => {
+				var files = [];
+				var deps = [];
+				for ( var i = 1; i <= 8; i++ ) {
+					files.append( "app/models/F#i#.cfc" );
+					files.append( "app/handlers/H#i#.bx" );
+					deps.append( {
+						id: "v#i#",
+						sourceFile: "app/models/F#i#.cfc",
+						kind: "constructs",
+						target: "H#i#",
+						targetFile: "app/handlers/H#i#.bx",
+						line: 1
+					} );
+				}
+				// Disconnected orphans to fill orphan cap.
+				for ( var j = 1; j <= 5; j++ ) {
+					files.append( "app/models/Orphan#j#.cfc" );
+				}
+
+				var snapshot = metrics.assemble(
+					{ symbols: [], files: files, dependencies: deps },
+					{
+						maxClusters        : 2,
+						maxHotspots        : 2,
+						maxOrphans         : 2,
+						maxLayerViolations : 2,
+						maxNodes           : 20,
+						maxEdges           : 1
+					}
+				);
+
+				expect( snapshot.truncated ).toBeTrue();
+				expect( snapshot.truncationReasons ).toInclude( "maxClusters" );
+				expect( snapshot.truncationReasons ).toInclude( "maxHotspots" );
+				expect( snapshot.truncationReasons ).toInclude( "maxOrphans" );
+				expect( snapshot.truncationReasons ).toInclude( "maxLayerViolations" );
+				expect( snapshot.truncationReasons ).toInclude( "maxNodes" );
+				expect( snapshot.truncationReasons ).toInclude( "maxEdges" );
+				expect( snapshot.clusters ).toHaveLength( 2 );
+				expect( snapshot.hotspots ).toHaveLength( 2 );
+				expect( snapshot.orphans ).toHaveLength( 2 );
+				expect( snapshot.layerViolations ).toHaveLength( 2 );
+				expect( snapshot.nodes.len() ).toBeLTE( 20 );
+				var visibleIds = {};
+				for ( var node in snapshot.nodes ) visibleIds[ lCase( node.id ) ] = true;
+				for ( var hotspot in snapshot.hotspots ) expect( visibleIds ).toHaveKey( lCase( hotspot.id ) );
+				for ( var orphan in snapshot.orphans ) expect( visibleIds ).toHaveKey( lCase( orphan.id ) );
+				for ( var violation in snapshot.layerViolations ) {
+					expect( visibleIds ).toHaveKey( lCase( violation.from ) );
+					expect( visibleIds ).toHaveKey( lCase( violation.to ) );
+				}
+				for ( var flow in snapshot.flows ) {
+					for ( var step in flow.steps ) expect( visibleIds ).toHaveKey( lCase( step ) );
+				}
+			} );
+
+			it( "assigns entry role to handler paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "app/handlers/Orders.bx" ],
+					dependencies: []
+				} );
+
+				var handler = snapshot.nodes.filter( ( node ) => node.path == "app/handlers/Orders.bx" )[ 1 ];
+				expect( handler ).toHaveKey( "role" );
+				expect( handler.role ).toBe( "entry" );
+			} );
+
+			it( "distinguishes reachable, test-only, and unreachable files", () => {
+				var snapshot = metrics.assemble( {
+					files: [
+						"app/handlers/Main.bx", "app/models/Live.bx", "app/models/TestOnly.bx",
+						"app/models/Dead.bx", "tests/MainSpec.bx"
+					],
+					symbols: [
+						{ id: "entry", filePath: "app/handlers/Main.bx", kind: "handler-action", name: "index", line: 1 }
+					],
+					dependencies: [
+						{ id: "live", sourceFile: "app/handlers/Main.bx", kind: "calls", target: "Live", targetFile: "app/models/Live.bx", line: 2 },
+						{ id: "test", sourceFile: "tests/MainSpec.bx", kind: "calls", target: "TestOnly", targetFile: "app/models/TestOnly.bx", line: 3 }
+					]
+				} );
+				var byPath = {};
+				for ( var item in snapshot.unreachable ) byPath[ lCase( item.path ) ] = item.reason;
+
+				expect( snapshot.reachability.available ).toBeTrue();
+				expect( byPath ).notToHaveKey( "app/models/live.bx" );
+				expect( byPath[ "app/models/testonly.bx" ] ).toBe( "test-only" );
+				expect( byPath[ "app/models/dead.bx" ] ).toBe( "unreachable" );
+			} );
+
+			it( "assigns persistence role to DAO-ish model paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [
+						"app/models/repositories/OrderRepository.bx",
+						"app/models/OrderDAO.cfc"
+					],
+					dependencies: []
+				} );
+
+				var repository = snapshot.nodes.filter( ( node ) => node.path == "app/models/repositories/OrderRepository.bx" )[ 1 ];
+				var dao = snapshot.nodes.filter( ( node ) => node.path == "app/models/OrderDAO.cfc" )[ 1 ];
+				expect( repository.role ).toBe( "persistence" );
+				expect( dao.role ).toBe( "persistence" );
+			} );
+
+			it( "assigns client rather than entry to public JavaScript assets", () => {
+				var snapshot = metrics.assemble( { files: [ "public/assets/app.js" ], symbols: [], dependencies: [] } );
+				var node = snapshot.nodes.filter( ( item ) => lCase( item.path ) == "public/assets/app.js" )[ 1 ];
+				expect( node.role ).toBe( "client" );
+				expect( node.language ).toBe( "JavaScript" );
+			} );
+
+			it( "assigns test role to test paths", () => {
+				var snapshot = metrics.assemble( {
+					symbols: [],
+					files: [ "tests/specs/unit/OrdersSpec.bx" ],
+					dependencies: []
+				} );
+
+				var spec = snapshot.nodes.filter( ( node ) => node.path == "tests/specs/unit/OrdersSpec.bx" )[ 1 ];
+				expect( spec.role ).toBe( "test" );
+			} );
+
+			it( "extracts handler to service to model flow with steps", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "ha-index", filePath: "app/handlers/Orders.bx", kind: "handler-action", name: "index", line: 5 }
+					],
+					files: [
+						"app/handlers/Orders.bx",
+						"app/models/OrderService.cfc",
+						"app/models/Order.cfc"
+					],
+					dependencies: [
+						{
+							id: "d1",
+							sourceFile: "app/handlers/Orders.bx",
+							kind: "injects",
+							target: "OrderService",
+							targetFile: "app/models/OrderService.cfc",
+							line: 6
+						},
+						{
+							id: "d2",
+							sourceFile: "app/models/OrderService.cfc",
+							kind: "calls",
+							target: "Order",
+							targetFile: "app/models/Order.cfc",
+							line: 12
+						}
+					]
+				};
+
+				var snapshot = metrics.assemble( reviewGraph );
+				expect( snapshot ).toHaveKey( "flows" );
+				expect( snapshot.flows ).toBeArray();
+				expect( snapshot.flows.len() ).toBeGTE( 1 );
+
+				var flow = snapshot.flows.filter( ( item ) => {
+					return item.entrySymbol == "index" && findNoCase( "orders.bx", item.entryFile );
+				} )[ 1 ];
+				expect( flow ).notToBeNull();
+				expect( flow ).toHaveKey( "id" );
+				expect( left( flow.id, 5 ) ).toBe( "flow-" );
+				expect( flow.steps.len() ).toBe( 3 );
+				expect( flow.steps[ 1 ] ).toMatch( "orders\.bx" );
+				expect( flow.steps[ 2 ] ).toMatch( "orderservice" );
+				expect( flow.steps[ 3 ] ).toMatch( "order\.cfc" );
+				expect( flow.sinkFile ).toMatch( "order\.cfc" );
+				expect( flow.sinkFile ).notToBe( flow.entryFile );
+				expect( flow.edgeKinds.len() ).toBe( 2 );
+				expect( flow.edgeKinds ).toInclude( "injects" );
+				expect( flow.edgeKinds ).toInclude( "calls" );
+			} );
+
+			it( "extracts cyclic handler to service flow when service calls back", () => {
+				var reviewGraph = {
+					symbols: [
+						{ id: "ha-index", filePath: "app/handlers/Orders.bx", kind: "handler-action", name: "index", line: 5 }
+					],
+					files: [
+						"app/handlers/Orders.bx",
+						"app/models/OrderService.cfc"
+					],
+					dependencies: [
+						{
+							id: "d1",
+							sourceFile: "app/handlers/Orders.bx",
+							kind: "injects",
+							target: "OrderService",
+							targetFile: "app/models/OrderService.cfc",
+							line: 6
+						},
+						{
+							id: "d2",
+							sourceFile: "app/models/OrderService.cfc",
+							kind: "calls",
+							target: "Orders",
+							targetFile: "app/handlers/Orders.bx",
+							line: 12
+						}
+					]
+				};
+
+				var snapshot = metrics.assemble( reviewGraph );
+				expect( snapshot.flows.len() ).toBeGTE( 1 );
+
+				var flow = snapshot.flows.filter( ( item ) => {
+					return item.entrySymbol == "index" && findNoCase( "orders.bx", item.entryFile );
+				} )[ 1 ];
+				expect( flow ).notToBeNull();
+				expect( flow.steps.len() ).toBe( 2 );
+				expect( flow.sinkFile ).toMatch( "orderservice" );
+				expect( flow.edgeKinds.len() ).toBe( 1 );
+				expect( flow.edgeKinds ).toInclude( "injects" );
+			} );
+
+			it( "caps flows per cluster without a hidden global flow cap", () => {
+				var inventory = { units: [], dependencies: [] };
+				var dependencies = [];
+				var clusterOf = {};
+				for ( var i = 1; i <= 25; i++ ) {
+					var handler = "app/handlers/H#i#.bx";
+					inventory.units.append( { id: "h#i#", unitType: "handler-action", filePath: handler, symbolName: "index" } );
+					dependencies.append( { sourceFile: handler, kind: "table-query", target: "table_#i#", targetFile: "" } );
+					clusterOf[ lCase( handler ) ] = "cluster-#i#";
+				}
+				var truncation = { truncated: false, reasons: [] };
+				var flows = new app.models.services.CodeGraphFlowService().extract(
+					inventory,
+					{ getNodes: () => [] },
+					{ flowMaxDepth: 3, maxFlowsPerCluster: 1, maxFlows: 1 },
+					{ dependencies: dependencies },
+					truncation,
+					{},
+					clusterOf
+				);
+
+				expect( flows ).toHaveLength( 25 );
+				expect( truncation.reasons ).notToInclude( "maxFlows" );
+			} );
+
+			it( "ranks a typed sink ahead of longer depth-exhausted branches", () => {
+				var handler = "app/handlers/Orders.bx";
+				var dependencies = [
+					{ sourceFile: handler, kind: "calls", targetFile: "app/models/Repository.bx" },
+					{ sourceFile: "app/models/Repository.bx", kind: "table-query", target: "orders", targetFile: "" }
+				];
+				for ( var i = 1; i <= 4; i++ ) {
+					dependencies.append( { sourceFile: handler, kind: "calls", targetFile: "app/services/Branch#i#.bx" } );
+					dependencies.append( { sourceFile: "app/services/Branch#i#.bx", kind: "calls", targetFile: "app/services/Branch#i#Tail.bx" } );
+					dependencies.append( { sourceFile: "app/services/Branch#i#Tail.bx", kind: "calls", targetFile: "app/services/Branch#i#End.bx" } );
+				}
+				var flows = new app.models.services.CodeGraphFlowService().extract(
+					{ units: [ { id: "orders", unitType: "handler-action", filePath: handler, symbolName: "index" } ] },
+					{ getNodes: () => [] },
+					{ flowMaxDepth: 3, maxFlowsPerCluster: 1 },
+					{ dependencies: dependencies },
+					{ truncated: false, reasons: [] },
+					{},
+					{ "app/handlers/orders.bx": "orders" }
+				);
+
+				expect( flows ).toHaveLength( 1 );
+				expect( flows[ 1 ].sinkKind ).toBe( "table-read" );
+				expect( flows[ 1 ].sinkFile ).toBe( "table:orders" );
+			} );
+
+			it( "keeps fingerprint stable under key-order shuffle of identical content", () => {
+				var reviewGraph = {
+					symbols: [ { id: "s1", filePath: "app/models/A.cfc", kind: "class", name: "A", line: 1 } ],
+					files: [ "app/models/A.cfc", "app/models/B.cfc" ],
+					dependencies: [
+						{ id: "d1", sourceFile: "app/models/A.cfc", kind: "extends", target: "B", targetFile: "app/models/B.cfc", line: 2 }
+					]
+				};
+				var first = metrics.assemble( reviewGraph );
+				var second = metrics.assemble( {
+					dependencies: reviewGraph.dependencies,
+					files: reviewGraph.files,
+					symbols: reviewGraph.symbols
+				} );
+
+				expect( first.fingerprint ).toBe( second.fingerprint );
+				// Pinned deliberately: the version must move whenever the snapshot's
+				// shape changes, and this assertion is what forces that to be a
+				// decision rather than an oversight. v3 added `rankRationale` to
+				// hotspot entries so Q16 can answer "and why". v4 made `roleCounts`
+				// count files only — it had been counting routes, tables, config keys
+				// and events as files, reporting 252 `shared` for a repository with
+				// five config files, and that number leads the canvas role legend.
+				//
+				// This assertion did its job on the v4 bump: it failed, which is the
+				// point. Do not relax it into reading the version from the service.
+				expect( first.version ).toBe( "codegraph-snapshot-v5" );
+				expect( len( first.fingerprint ) ).toBe( 64 );
+			} );
+
+			it( "keeps fingerprint stable when blank lines only shift source positions", () => {
+				var first = metrics.assemble( {
+					symbols: [ { id: "s1", filePath: "app/models/A.bx", kind: "function", name: "run", line: 2, endLine: 4 } ],
+					files: [ { filePath: "app/models/A.bx", lineCount: 4 } ],
+					dependencies: []
+				} );
+				var shifted = metrics.assemble( {
+					symbols: [ { id: "s1", filePath: "app/models/A.bx", kind: "function", name: "run", line: 12, endLine: 14 } ],
+					files: [ { filePath: "app/models/A.bx", lineCount: 14 } ],
+					dependencies: []
+				} );
+
+				expect( first.nodes[ 1 ].lineCount ).notToBe( shifted.nodes[ 1 ].lineCount );
+				expect( first.fingerprint ).toBe( shifted.fingerprint );
+			} );
+
+		} );
+	}
+
+}

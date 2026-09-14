@@ -1,0 +1,1041 @@
+/**
+ * Derived structure for Modernize: clusters, architecture decisions and roadmap
+ * phases computed from evidence rather than invented by a model.
+ *
+ * This is the promotion the plan is named for. Every function here already
+ * existed inside ModernizationProposalService as the fallback path used when
+ * the provider under-delivered; it is moved verbatim so the diff is a move, not
+ * a rewrite, and re-pointed at the coupling graph in a separate change.
+ *
+ * Deterministic by contract: no gateway, no agent factory, no provider. That is
+ * what keeps the deterministic corpus tier runnable without a key, and it is
+ * asserted by ArchitectureFitnessSpec.
+ *
+ * @see ModernizationCouplingGraphService
+ * @see ModernizationProposalService
+ */
+@singleton
+class threadsafe {
+
+	property name="identityService" inject="ModernizationIdentityService";
+	// Placement owns the stayInMonolith derivation; this service asks rather
+	// than re-deriving. Both are deterministic, so the no-gateway invariant holds.
+	property name="placementService" inject="ModernizationPlacementService";
+	property name="log" inject="logbox:logger:{this}";
+
+	// Configuration, not state. These were class-body constants on
+	// ModernizationProposalService and carry the same values.
+	variables.maxRoadmapShards             = 24;
+	variables.minUnitsForFolderInference   = 24;
+	variables.maxInferredArchitectureScopes = 12;
+
+	// --- clustering weights -------------------------------------------------
+	// Relative, not absolute: only their ratio matters to modularity. Sharing a
+	// table is stronger evidence of one domain than a single call is, because a
+	// call can be a utility reference while co-written state cannot be split.
+	variables.sharedTableWeight = 2.0;
+	variables.sharedScopeWeight = 1.5;
+
+	// A table touched by more than this many files is infrastructure -- an audit
+	// log, a users table, a settings row -- and says nothing about where a seam
+	// runs. Counting it as coupling would drag every domain into one cluster,
+	// which is the degeneracy this algorithm exists to avoid.
+	variables.maxCoAccessFanout = 12;
+
+	variables.maxLouvainPasses = 20;
+
+	function init() {
+		if ( isNull( variables.identityService ?: javacast( "null", "" ) ) ) {
+			variables.identityService = new app.models.services.ModernizationIdentityService();
+		}
+		if ( isNull( variables.placementService ?: javacast( "null", "" ) ) ) {
+			variables.placementService = new app.models.services.ModernizationPlacementService();
+		}
+		return this;
+	}
+
+	/**
+	 * When the provider roadmap is skipped (cost/time), still emit mapped phases
+	 * from retained target/route ids so the Solution Road is usable.
+	 */
+	public array function deriveClusters( required any graph, required array units, array scopePaths = [], struct coChangeWeights = {} ) {
+		var nodes = arguments.graph.getNodes();
+		if ( !nodes.len() ) return clusterUnitsForArchitecture( arguments.units, arguments.scopePaths );
+
+		// --- communities from weighted modularity ----------------------------
+		var affinity = buildAffinityGraph( arguments.graph, nodes, arguments.coChangeWeights );
+		var community = louvainCommunities( affinity );
+		community = mergeCycleCommunities( arguments.graph, community );
+
+		var groups = {};
+		for ( var node in nodes ) {
+			var root = community[ node.id ] ?: node.id;
+			if ( !groups.keyExists( root ) ) groups[ root ] = [];
+			groups[ root ].append( node.id );
+		}
+
+		var unitsByFile = {};
+		for ( var unit in arguments.units ) {
+			var filePath = normalizeEvidencePath( unit.filePath ?: "" );
+			if ( !len( filePath ) ) continue;
+			if ( !unitsByFile.keyExists( filePath ) ) unitsByFile[ filePath ] = [];
+			unitsByFile[ filePath ].append( trim( scalarString( unit.id ?: unit.itemId ?: "" ) ) );
+		}
+
+		var rootKeys = structKeyArray( groups );
+		arraySort( rootKeys, "textnocase" );
+
+		var clusters = [];
+		for ( var root in rootKeys ) {
+			var members = groups[ root ];
+			members.sort( ( a, b ) => compareNoCase( a, b ) );
+			var unitIds = [];
+			for ( var filePath in members ) {
+				for ( var unitId in ( unitsByFile[ filePath ] ?: [] ) ) {
+					if ( len( unitId ) && !unitIds.contains( unitId ) ) unitIds.append( unitId );
+				}
+			}
+			if ( !unitIds.len() ) continue;
+
+			// Membership is derived; naming stays folder-shaped, which is what
+			// folders are actually good for. featureDomainKey wants a unit.
+			var domainKey = featureDomainKey( { sourcePath: members[ 1 ] } );
+			if ( !len( domainKey ) ) domainKey = featureFolderFromPath( members[ 1 ] );
+			if ( !len( domainKey ) ) domainKey = sanitizeDomainToken( listLast( members[ 1 ], "/" ) );
+			if ( !len( domainKey ) ) domainKey = "main-app";
+
+			clusters.append( {
+				id           : "ctx-derived-" & left( identityService.itemId( "cluster", { files: members } ), 16 ),
+				domainKey    : domainKey,
+				name         : featureDomainLabel( domainKey ),
+				placementType: "main-app",
+				purpose      : "Derived from coupling evidence: structural edges, table co-access and shared scope state.",
+				rationale    : "",
+				targetUnitIds: unitIds,
+				filePaths    : members,
+				boundaryEvidence: {}
+			} );
+		}
+
+		return disambiguateClusterNames( classifyDerivedClusters( arguments.graph, clusters ) );
+	}
+
+	/**
+	 * Derive migration order from the cluster DAG.
+	 *
+	 * A cluster depends on what it calls: if anything in A references anything
+	 * in B, B has to exist in its new shape before A can move. Wave is longest-
+	 * path depth over those dependencies, so a cluster never shares a wave with
+	 * something it depends on — ordering becomes a property of the graph rather
+	 * than of shard arrival order.
+	 *
+	 * Cluster-level cycles are possible even after file-level cycles are merged:
+	 * A can call B in one file while B calls A in another, with no single file
+	 * cycle. Those are condensed for ordering **and reported**, never silently
+	 * broken — a cycle between clusters is a real finding about the system.
+	 */
+	public WaveOrder function deriveWaveOrder( required any graph, required array clusters ) {
+		var clusterOf = {};
+		for ( var cluster in arguments.clusters ) {
+			for ( var filePath in cluster.filePaths ) clusterOf[ filePath ] = cluster.id;
+		}
+
+		var dependsOn = {};
+		var blocks = {};
+		for ( var cluster in arguments.clusters ) {
+			dependsOn[ cluster.id ] = {};
+			blocks[ cluster.id ] = {};
+		}
+
+		for ( var edge in arguments.graph.getEdges() ) {
+			var from = clusterOf[ edge.fromFile ] ?: "";
+			var to = clusterOf[ edge.toFile ] ?: "";
+			if ( !len( from ) || !len( to ) || from == to ) continue;
+			dependsOn[ from ][ to ] = true;
+			blocks[ to ][ from ] = true;
+		}
+
+		var cycles = clusterCycles( dependsOn );
+
+		// Condense each cycle to its lexicographically smallest member so the
+		// ordering pass runs over a genuine DAG.
+		var representative = {};
+		for ( var clusterId in dependsOn ) representative[ clusterId ] = clusterId;
+		for ( var cycle in cycles ) {
+			var target = cycle[ 1 ];
+			for ( var member in cycle ) representative[ member ] = target;
+		}
+
+		var condensed = {};
+		for ( var clusterId in dependsOn ) {
+			var source = representative[ clusterId ];
+			if ( !condensed.keyExists( source ) ) condensed[ source ] = {};
+			for ( var target in dependsOn[ clusterId ] ) {
+				var mapped = representative[ target ];
+				if ( mapped != source ) condensed[ source ][ mapped ] = true;
+			}
+		}
+
+		// Longest-path depth: a cluster sits one wave after its deepest
+		// dependency. Memoised, with a visiting guard as a belt-and-braces
+		// backstop in case condensation ever misses something.
+		var depth = {};
+		var visiting = {};
+		var resolveDepth = ( id ) => {
+			if ( depth.keyExists( arguments.id ) ) return depth[ arguments.id ];
+			if ( visiting.keyExists( arguments.id ) ) return 0;
+			visiting[ arguments.id ] = true;
+			var deepest = -1;
+			for ( var target in ( condensed[ arguments.id ] ?: {} ) ) {
+				var candidate = resolveDepth( target );
+				if ( candidate > deepest ) deepest = candidate;
+			}
+			structDelete( visiting, arguments.id );
+			depth[ arguments.id ] = deepest + 1;
+			return depth[ arguments.id ];
+		};
+
+		var order = [];
+		var clusterIds = structKeyArray( dependsOn );
+		arraySort( clusterIds, "textnocase" );
+		var maxWave = 0;
+		for ( var clusterId in clusterIds ) {
+			var wave = resolveDepth( representative[ clusterId ] );
+			if ( wave > maxWave ) maxWave = wave;
+			var dependencyIds = structKeyArray( dependsOn[ clusterId ] );
+			arraySort( dependencyIds, "textnocase" );
+			var blockedIds = structKeyArray( blocks[ clusterId ] );
+			arraySort( blockedIds, "textnocase" );
+			order.append( {
+				clusterId  : clusterId,
+				wave       : wave,
+				dependsOn  : dependencyIds,
+				blocks     : blockedIds,
+				inCycleWith : cycleMembersOf( cycles, clusterId )
+			} );
+		}
+
+		return new app.models.domain.WaveOrder( {
+			version     : "modernization-wave-v1",
+			order       : order,
+			maxWave     : maxWave,
+			cycles      : cycles,
+			criticalPath: longestChain( condensed, depth )
+		} );
+	}
+
+	/** Tarjan over the cluster dependency map. Same shape as the file-level one. */
+	private array function clusterCycles( required struct dependsOn ) {
+		var index = {};
+		var lowLink = {};
+		var onStack = {};
+		var stack = [];
+		var counter = 0;
+		var components = [];
+
+		var roots = structKeyArray( arguments.dependsOn );
+		arraySort( roots, "textnocase" );
+
+		for ( var root in roots ) {
+			if ( index.keyExists( root ) ) continue;
+			var frames = [ { node: root, next: 1 } ];
+			index[ root ] = counter;
+			lowLink[ root ] = counter;
+			counter++;
+			stack.append( root );
+			onStack[ root ] = true;
+
+			while ( frames.len() ) {
+				var frame = frames[ frames.len() ];
+				var current = frame.node;
+				var neighbours = structKeyArray( arguments.dependsOn[ current ] ?: {} );
+				arraySort( neighbours, "textnocase" );
+
+				if ( frame.next <= neighbours.len() ) {
+					var neighbour = neighbours[ frame.next ];
+					frame.next++;
+					if ( !arguments.dependsOn.keyExists( neighbour ) ) continue;
+					if ( !index.keyExists( neighbour ) ) {
+						index[ neighbour ] = counter;
+						lowLink[ neighbour ] = counter;
+						counter++;
+						stack.append( neighbour );
+						onStack[ neighbour ] = true;
+						frames.append( { node: neighbour, next: 1 } );
+					} else if ( onStack.keyExists( neighbour ) && onStack[ neighbour ] ) {
+						if ( index[ neighbour ] < lowLink[ current ] ) lowLink[ current ] = index[ neighbour ];
+					}
+					continue;
+				}
+
+				frames.deleteAt( frames.len() );
+				if ( frames.len() ) {
+					var parent = frames[ frames.len() ].node;
+					if ( lowLink[ current ] < lowLink[ parent ] ) lowLink[ parent ] = lowLink[ current ];
+				}
+
+				if ( lowLink[ current ] == index[ current ] ) {
+					var component = [];
+					while ( stack.len() ) {
+						var popped = stack[ stack.len() ];
+						stack.deleteAt( stack.len() );
+						onStack[ popped ] = false;
+						component.append( popped );
+						if ( popped == current ) break;
+					}
+					if ( component.len() > 1 ) {
+						component.sort( ( a, b ) => compareNoCase( a, b ) );
+						components.append( component );
+					}
+				}
+			}
+		}
+
+		components.sort( ( a, b ) => compareNoCase( a.toList( "|" ), b.toList( "|" ) ) );
+		return components;
+	}
+
+	private array function cycleMembersOf( required array cycles, required string clusterId ) {
+		for ( var cycle in arguments.cycles ) {
+			if ( cycle.contains( arguments.clusterId ) ) return cycle;
+		}
+		return [];
+	}
+
+	/**
+	 * The longest dependency chain — what actually sets the length of the
+	 * migration. Shortening anything off this path saves nothing.
+	 */
+	private array function longestChain( required struct condensed, required struct depth ) {
+		var deepest = "";
+		var best = -1;
+		var ids = structKeyArray( arguments.depth );
+		arraySort( ids, "textnocase" );
+		for ( var id in ids ) {
+			if ( arguments.depth[ id ] > best ) {
+				best = arguments.depth[ id ];
+				deepest = id;
+			}
+		}
+		if ( !len( deepest ) ) return [];
+
+		var chain = [ deepest ];
+		var current = deepest;
+		while ( true ) {
+			var next = "";
+			var nextDepth = -1;
+			var targets = structKeyArray( arguments.condensed[ current ] ?: {} );
+			arraySort( targets, "textnocase" );
+			for ( var target in targets ) {
+				var candidate = arguments.depth[ target ] ?: 0;
+				if ( candidate > nextDepth ) {
+					nextDepth = candidate;
+					next = target;
+				}
+			}
+			if ( !len( next ) || chain.contains( next ) ) break;
+			chain.append( next );
+			current = next;
+		}
+		// Dependencies first: the chain is built from dependent to dependency.
+		var ordered = [];
+		for ( var step = chain.len(); step >= 1; step-- ) ordered.append( chain[ step ] );
+		return ordered;
+	}
+
+	/**
+	 * One weighted undirected graph combining all three kinds of coupling.
+	 *
+	 * Modularity needs weights, not just connectivity — that is the whole point.
+	 * Connectivity alone makes every cluster a connected component, so one
+	 * utility call merges two unrelated domains. Weighting lets a single call
+	 * across a boundary be outvoted by dense coupling inside one.
+	 */
+	private struct function buildAffinityGraph( required any graph, required array nodes, struct coChangeWeights = {} ) {
+		var adjacency = {};
+		for ( var node in arguments.nodes ) adjacency[ node.id ] = {};
+
+		var link = ( a, b, weight ) => {
+			if ( arguments.a == arguments.b ) return;
+			if ( !adjacency.keyExists( arguments.a ) || !adjacency.keyExists( arguments.b ) ) return;
+			adjacency[ arguments.a ][ arguments.b ] = ( adjacency[ arguments.a ][ arguments.b ] ?: 0 ) + arguments.weight;
+			adjacency[ arguments.b ][ arguments.a ] = ( adjacency[ arguments.b ][ arguments.a ] ?: 0 ) + arguments.weight;
+		};
+
+		// Structural edges, weighted by resolution provenance. Direction is
+		// dropped: for "do these belong together" a call is symmetric evidence.
+		for ( var edge in arguments.graph.getEdges() ) link( edge.fromFile, edge.toFile, edge.weight );
+
+		var metrics = arguments.graph.getMetrics();
+
+		for ( var resource in ( metrics.coAccess ?: {} ) ) {
+			if ( left( resource, 6 ) != "table:" ) continue;
+			var sharing = metrics.coAccess[ resource ];
+			// Infrastructure tables carry no seam signal (see maxCoAccessFanout).
+			if ( sharing.len() > variables.maxCoAccessFanout ) continue;
+			for ( var i = 1; i <= sharing.len(); i++ ) {
+				for ( var j = i + 1; j <= sharing.len(); j++ ) link( sharing[ i ], sharing[ j ], variables.sharedTableWeight );
+			}
+		}
+
+		for ( var scope in ( metrics.sharedState ?: {} ) ) {
+			var touching = metrics.sharedState[ scope ];
+			if ( touching.len() > variables.maxCoAccessFanout ) continue;
+			for ( var a = 1; a <= touching.len(); a++ ) {
+				for ( var b = a + 1; b <= touching.len(); b++ ) link( touching[ a ], touching[ b ], variables.sharedScopeWeight );
+			}
+		}
+
+		// Optional temporal evidence. Structural coupling remains the default;
+		// this term is deliberately small and normalized by commit fan-out so a
+		// sweeping commit cannot manufacture a domain boundary.
+		var nodeByKey = {};
+		for ( var node in arguments.nodes ) nodeByKey[ lCase( replace( trim( toString( node.id ?: "" ) ), "\\", "/", "all" ) ) ] = node.id;
+		for ( var sourceKey in arguments.coChangeWeights ) {
+			var sourceId = nodeByKey[ lCase( replace( sourceKey, "\\", "/", "all" ) ) ] ?: "";
+			if ( !len( sourceId ) ) continue;
+			for ( var targetKey in ( isStruct( arguments.coChangeWeights[ sourceKey ] ?: "" ) ? arguments.coChangeWeights[ sourceKey ] : {} ) ) {
+				var targetId = nodeByKey[ lCase( replace( targetKey, "\\", "/", "all" ) ) ] ?: "";
+				if ( len( targetId ) && sourceId != targetId ) link( sourceId, targetId, max( 0, val( arguments.coChangeWeights[ sourceKey ][ targetKey ] ?: 0 ) ) );
+			}
+		}
+
+		var degree = {};
+		var totalWeight = 0;
+		for ( var nodeId in adjacency ) {
+			var sum = 0;
+			for ( var peer in adjacency[ nodeId ] ) sum += adjacency[ nodeId ][ peer ];
+			degree[ nodeId ] = sum;
+			totalWeight += sum;
+		}
+		// Each undirected link was counted from both ends.
+		return { adjacency: adjacency, degree: degree, totalWeight: totalWeight / 2 };
+	}
+
+	/**
+	 * Louvain local-moving: repeatedly move each node into the neighbouring
+	 * community that most improves modularity, until nothing moves.
+	 *
+	 * Single level rather than the full recursive aggregation. At the scale this
+	 * runs on it converges to the same answer for the shapes that matter, and it
+	 * stays readable — which is worth more here than the last fraction of
+	 * modularity.
+	 *
+	 * Determinism is a hard requirement: nodes are visited in sorted order,
+	 * ties break toward the lexicographically smaller community, and a community
+	 * is finally named for its smallest member. Identical input must give a
+	 * byte-identical plan or fingerprints churn.
+	 */
+	private struct function louvainCommunities( required struct affinity ) {
+		var adjacency = arguments.affinity.adjacency;
+		var degree = arguments.affinity.degree;
+		var m = arguments.affinity.totalWeight;
+
+		var nodeIds = structKeyArray( adjacency );
+		arraySort( nodeIds, "textnocase" );
+
+		var community = {};
+		var communityDegree = {};
+		for ( var nodeId in nodeIds ) {
+			community[ nodeId ] = nodeId;
+			communityDegree[ nodeId ] = degree[ nodeId ];
+		}
+		// With no weighted edges at all, every node is its own community.
+		if ( m <= 0 ) return community;
+
+		var passes = 0;
+		var moved = true;
+		while ( moved && passes < variables.maxLouvainPasses ) {
+			moved = false;
+			passes++;
+			for ( var nodeId in nodeIds ) {
+				var current = community[ nodeId ];
+				var k = degree[ nodeId ];
+				communityDegree[ current ] = communityDegree[ current ] - k;
+
+				var weightTo = {};
+				for ( var peer in adjacency[ nodeId ] ) {
+					var peerCommunity = community[ peer ];
+					weightTo[ peerCommunity ] = ( weightTo[ peerCommunity ] ?: 0 ) + adjacency[ nodeId ][ peer ];
+				}
+				if ( !weightTo.keyExists( current ) ) weightTo[ current ] = 0;
+
+				var candidates = structKeyArray( weightTo );
+				arraySort( candidates, "textnocase" );
+
+				var best = current;
+				var bestGain = ( weightTo[ current ] ?: 0 ) - ( ( communityDegree[ current ] ?: 0 ) * k ) / ( 2 * m );
+				for ( var candidate in candidates ) {
+					var gain = weightTo[ candidate ] - ( ( communityDegree[ candidate ] ?: 0 ) * k ) / ( 2 * m );
+					// Strictly greater, so equal-gain ties keep the sorted-order
+					// incumbent and the result cannot oscillate.
+					if ( gain > bestGain + 0.000001 ) {
+						best = candidate;
+						bestGain = gain;
+					}
+				}
+
+				community[ nodeId ] = best;
+				communityDegree[ best ] = ( communityDegree[ best ] ?: 0 ) + k;
+				if ( best != current ) moved = true;
+			}
+		}
+
+		return relabelBySmallestMember( community );
+	}
+
+	/**
+	 * A dependency cycle cannot be cut, so its members must share a cluster
+	 * whatever modularity prefers. Structure beats statistics here: proposing a
+	 * boundary through a cycle would be proposing something impossible.
+	 */
+	private struct function mergeCycleCommunities( required any graph, required struct community ) {
+		var output = duplicate( arguments.community );
+		for ( var cycle in ( arguments.graph.getMetrics().cycles ?: [] ) ) {
+			var target = "";
+			for ( var member in cycle ) {
+				if ( !output.keyExists( member ) ) continue;
+				if ( !len( target ) || compareNoCase( output[ member ], target ) < 0 ) target = output[ member ];
+			}
+			if ( !len( target ) ) continue;
+			var absorbed = {};
+			for ( var member in cycle ) if ( output.keyExists( member ) ) absorbed[ output[ member ] ] = true;
+			for ( var nodeId in output ) if ( absorbed.keyExists( output[ nodeId ] ) ) output[ nodeId ] = target;
+		}
+		return relabelBySmallestMember( output );
+	}
+
+	/** Name each community for its smallest member so ids never churn. */
+	private struct function relabelBySmallestMember( required struct community ) {
+		var smallest = {};
+		for ( var nodeId in arguments.community ) {
+			var key = arguments.community[ nodeId ];
+			if ( !smallest.keyExists( key ) || compareNoCase( nodeId, smallest[ key ] ) < 0 ) smallest[ key ] = nodeId;
+		}
+		var output = {};
+		for ( var nodeId in arguments.community ) output[ nodeId ] = smallest[ arguments.community[ nodeId ] ];
+		return output;
+	}
+
+	/**
+	 * Decide what each derived cluster is, from what the graph can prove.
+	 *
+	 * A cluster is only a candidate to leave the monolith when nothing crosses
+	 * its boundary — no structural edge, no shared table, no shared scope. Among
+	 * those, one that already talks to the outside world (HTTP, scheduled work)
+	 * has evidence of being a service; one that does not is a module.
+	 *
+	 * Anything else stays. `stay` is a first-class answer here, not a failure to
+	 * decide.
+	 */
+	private array function classifyDerivedClusters( required any graph, required array clusters ) {
+		var metrics = arguments.graph.getMetrics();
+		var output = [];
+
+		// A single cluster spanning the whole system has nothing crossing its
+		// boundary, which makes "isolated" vacuously true. There is no seam to
+		// extract *to*, so it stays. Without this, a system so coupled that it
+		// collapses into one cluster would read as trivially extractable — the
+		// exact inversion of the right answer, and the failure mode false-seam
+		// is built to catch.
+		var singleCluster = arguments.clusters.len() <= 1;
+
+		for ( var cluster in arguments.clusters ) {
+			var members = cluster.filePaths;
+			var crossing = arguments.graph.edgesCrossing( members ).len();
+
+			var sharedOutside = [];
+			for ( var resource in ( metrics.coAccess ?: {} ) ) {
+				if ( left( resource, 6 ) != "table:" ) continue;
+				var sharing = metrics.coAccess[ resource ];
+				var inside = false;
+				var outside = false;
+				for ( var filePath in sharing ) {
+					if ( members.contains( filePath ) ) inside = true;
+					else outside = true;
+				}
+				if ( inside && outside ) sharedOutside.append( resource );
+			}
+
+			var scopesOutside = [];
+			for ( var scope in ( metrics.sharedState ?: {} ) ) {
+				var touching = metrics.sharedState[ scope ];
+				var insideScope = false;
+				var outsideScope = false;
+				for ( var filePath in touching ) {
+					if ( members.contains( filePath ) ) insideScope = true;
+					else outsideScope = true;
+				}
+				if ( insideScope && outsideScope ) scopesOutside.append( scope );
+			}
+
+			var inCycleWithOutside = false;
+			for ( var filePath in members ) {
+				for ( var member in arguments.graph.cycleMembersFor( filePath ) ) {
+					if ( !members.contains( member ) ) inCycleWithOutside = true;
+				}
+			}
+
+			var isolated = crossing == 0
+				&& !sharedOutside.len()
+				&& !scopesOutside.len()
+				&& !inCycleWithOutside
+				&& !singleCluster;
+
+			cluster.boundaryEvidence = {
+				crossingEdges       : crossing,
+				sharedTablesOutside : sharedOutside,
+				sharedScopesOutside : scopesOutside,
+				inCycleWithOutside  : inCycleWithOutside,
+				spansWholeSystem    : singleCluster,
+				isolated            : isolated
+			};
+
+			if ( singleCluster ) {
+				cluster.placementType = "main-app";
+				cluster.rationale = "Everything in scope resolves to one cluster: coupling reaches across every candidate boundary, so there is no seam to extract along.";
+			} else if ( !isolated ) {
+				cluster.placementType = "main-app";
+				cluster.rationale = "Coupled to the rest of the system: "
+					& crossing & " crossing edge(s), "
+					& sharedOutside.len() & " shared table(s), "
+					& scopesOutside.len() & " shared scope(s)"
+					& ( inCycleWithOutside ? ", and part of a dependency cycle that leaves the boundary" : "" )
+					& ". Extracting it would split state that is written in both places.";
+			} else {
+				// Separable either way. What decides service vs module is
+				// whether this boundary already talks to the outside world:
+				// something with its own outbound integration is behaving like
+				// a service already, and saying so is a stronger claim than
+				// "could be a module", so it needs stronger evidence.
+				var externalFiles = [];
+				for ( var filePath in ( metrics.externalIntegration ?: [] ) ) {
+					if ( members.contains( filePath ) ) externalFiles.append( filePath );
+				}
+				cluster.boundaryEvidence.externalIntegration = externalFiles;
+
+				if ( externalFiles.len() ) {
+					cluster.placementType = "external-service";
+					cluster.rationale = "Nothing crosses this boundary, and it already owns an outbound integration ("
+						& externalFiles.len() & " file(s)), so it is behaving as a service inside the monolith.";
+				} else {
+					cluster.placementType = "coldbox-module";
+					cluster.rationale = "No structural edge, shared table or shared scope crosses this boundary, but it has no outbound integration of its own — separable as a module rather than a service.";
+				}
+			}
+			output.append( cluster );
+		}
+
+		return output;
+	}
+
+	public array function clusterUnitsForArchitecture( required array units, required array scopePaths ) {
+		var clusters = [];
+		var assigned = {};
+		var appendCluster = ( id, domainKey, name, placementType, purpose, rationale, unitIds ) => {
+			if ( !arguments.unitIds.len() ) return;
+			clusters.append( {
+				id: arguments.id,
+				domainKey: arguments.domainKey,
+				name: arguments.name,
+				placementType: arguments.placementType,
+				purpose: arguments.purpose,
+				rationale: arguments.rationale,
+				targetUnitIds: duplicate( arguments.unitIds )
+			} );
+			for ( var unitId in arguments.unitIds ) assigned[ unitId ] = true;
+		};
+		var scopes = [];
+		for ( var scopePath in arguments.scopePaths ) {
+			var needle = lCase( reReplace( replace( trim( toString( scopePath ) ), "\", "/", "all" ), "/+$", "" ) );
+			if ( len( needle ) ) scopes.append( needle );
+		}
+		if ( !scopes.len() ) {
+			// Small unscoped plans stay modular-monolith-first. Large estates
+			// (full-repo modernize) infer top feature folders so packaging and
+			// roadmap seams survive architecture timeouts instead of one hollow
+			// default phase covering thousands of units.
+			if ( arguments.units.len() >= variables.minUnitsForFolderInference ) {
+				scopes = inferArchitectureScopesFromUnits( arguments.units );
+			}
+			if ( !scopes.len() ) {
+				appendCluster(
+					"ctx-modular-monolith-default",
+					"main-app",
+					"ColdBox modular monolith (default)",
+					"main-app",
+					"Keep mapped behavior in one deployable while source-backed feature seams are validated.",
+					"Conservative default because no explicit extraction boundary was established",
+					arguments.units.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) )
+				);
+				return clusters;
+			}
+		}
+		for ( var scopeIndex = 1; scopeIndex <= scopes.len(); scopeIndex++ ) {
+			var scopeNeedle = scopes[ scopeIndex ];
+			var matched = [];
+			for ( var unit in arguments.units ) {
+				var unitId = trim( unit.id ?: unit.itemId ?: "" );
+				if ( !len( unitId ) || assigned.keyExists( unitId ) ) continue;
+				var source = lCase( normalizeLegacyPath( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" ) );
+				if ( !len( source ) ) continue;
+				if ( source == scopeNeedle || left( source, len( scopeNeedle ) + 1 ) == scopeNeedle & "/" || find( "/" & scopeNeedle & "/", "/" & source & "/" ) ) {
+					matched.append( unitId );
+				}
+			}
+			if ( !matched.len() ) continue;
+			var placementType = "main-app";
+			var name = "Main app: " & listLast( scopeNeedle, "/" );
+			var purpose = "Mapped behavior under #scopeNeedle# stays in the modular monolith.";
+			var rationale = "Path-clustered packaging while architecture provider packaging is unavailable.";
+			if ( findNoCase( "/hosting/", "/" & scopeNeedle & "/" ) || reFindNoCase( "(^|/)\d*hosting/", scopeNeedle ) ) {
+				placementType = "external-service";
+				name = "Side application candidate: " & listLast( scopeNeedle, "/" );
+				purpose = "Separate hosting/Application tree — candidate small app or microservice boundary.";
+				rationale = "Distinct hosting root under #scopeNeedle# looks like a separate deployable, not an in-process ColdBox module.";
+			} else if ( findNoCase( "_scheduled", scopeNeedle ) || findNoCase( "scheduled", scopeNeedle ) || findNoCase( "/jobs/", "/" & scopeNeedle & "/" ) || findNoCase( "/workers/", "/" & scopeNeedle & "/" ) ) {
+				placementType = "background-worker";
+				name = "Scheduled / background workers: " & listLast( scopeNeedle, "/" );
+				purpose = "Background and scheduled scripts become workers/tasks in a jobs host or main-app scheduler.";
+				rationale = "Scheduled-script folders are background-worker candidates, not ColdBox UI modules or microservices.";
+			} else if ( findNoCase( "/modules/", "/" & scopeNeedle & "/" ) || findNoCase( "modules/", scopeNeedle ) || listLen( scopeNeedle, "/" ) >= 2 ) {
+				// Nested scoped feature directories are module candidates; bare
+				// top-level roots stay main-app unless modules/ is explicit.
+				placementType = "coldbox-module";
+				name = "ColdBox module candidate: " & listLast( scopeNeedle, "/" );
+				purpose = "Cohesive feature folder suitable for a ColdBox module boundary.";
+				rationale = "Directory cohesion under #scopeNeedle# supports coldbox-module packaging.";
+			}
+			appendCluster(
+				"ctx-scope-" & scopeIndex,
+				reReplace( scopeNeedle, "[^a-zA-Z0-9]+", "-", "all" ),
+				name,
+				placementType,
+				purpose,
+				rationale,
+				matched
+			);
+		}
+		var leftover = [];
+		for ( var unit in arguments.units ) {
+			var unitId = trim( unit.id ?: unit.itemId ?: "" );
+			if ( len( unitId ) && !assigned.keyExists( unitId ) ) leftover.append( unitId );
+		}
+		if ( leftover.len() || !clusters.len() ) {
+			appendCluster(
+				"ctx-modular-monolith-default",
+				"main-app",
+				"ColdBox modular monolith (default)",
+				"main-app",
+				"Keep remaining mapped behavior in one deployable while source-backed feature seams are validated.",
+				clusters.len()
+					? "Residual units without a scoped folder seam stay in the main app."
+					: "Conservative default because no explicit extraction boundary was established",
+				leftover.len() ? leftover : arguments.units.map( ( item ) => item.id ?: item.itemId ?: "" ).filter( ( id ) => len( trim( id ) ) )
+			);
+		}
+		return clusters;
+	}
+
+	/**
+	 * Rank feature folders by unit count for unscoped large estates. Caps the
+	 * set so roadmap sharding stays bounded while still surfacing ColdBox-module
+	 * and scheduled-worker candidates (modules/*, _scheduled*, /jobs/, /workers/).
+	 */
+	private array function inferArchitectureScopesFromUnits( required array units ) {
+		var counts = {};
+		for ( var unit in arguments.units ) {
+			if ( !isStruct( unit ) ) continue;
+			var source = lCase( normalizeLegacyPath( unit.sourcePath ?: unit.sourceFile ?: unit.legacyPath ?: "" ) );
+			var folder = featureFolderFromPath( source );
+			if ( !len( folder ) ) continue;
+			counts[ folder ] = ( counts[ folder ] ?: 0 ) + 1;
+		}
+		var ranked = [];
+		for ( var folder in counts ) {
+			ranked.append( { folder: folder, count: counts[ folder ] } );
+		}
+		ranked.sort( ( a, b ) => {
+			if ( a.count != b.count ) return b.count - a.count;
+			return compareNoCase( a.folder, b.folder );
+		} );
+		var selected = [];
+		for ( var item in ranked ) {
+			if ( selected.len() >= variables.maxInferredArchitectureScopes ) break;
+			var forceKeep = reFindNoCase( "/modules/|(^|/)modules/|_scheduled|scheduled|/jobs/|/workers/", item.folder );
+			if ( item.count >= 3 || forceKeep ) selected.append( item.folder );
+		}
+		return selected;
+	}
+
+	private string function featureFolderFromPath( required string path ) {
+		var lower = lCase( arguments.path );
+		if ( !len( lower ) ) return "";
+		var modulesMatch = reMatchNoCase( "modules/[^/]+", lower );
+		if ( isArray( modulesMatch ) && modulesMatch.len() ) return modulesMatch[ 1 ];
+		var hostingAt = reFindNoCase( "\d*hosting/", lower );
+		if ( hostingAt ) {
+			var hostingSlice = mid( lower, hostingAt );
+			var hostingParts = listToArray( hostingSlice, "/" );
+			if ( hostingParts.len() >= 2 ) return hostingParts[ 1 ] & "/" & hostingParts[ 2 ];
+		}
+		var parts = listToArray( lower, "/" );
+		// Common CF/legacy roots keep an extra path segment so feature folders
+		// (root/feature/...) cluster separately from the root itself.
+		if ( parts.len() >= 3 && [ "web", "weboffice", "legacy", "src", "app", "cf", "cfm" ].contains( parts[ 1 ] ) ) {
+			return parts[ 1 ] & "/" & parts[ 2 ];
+		}
+		if ( parts.len() >= 2 ) return parts[ 1 ] & "/" & parts[ 2 ];
+		return parts.len() ? parts[ 1 ] : "";
+	}
+
+	/**
+	 * Reclassify provider/synthesized placements so folder spam is not treated as
+	 * ColdBox modules, and separate Application/hosting trees surface as
+	 * external-service (side-app / small application) candidates.
+	 */
+	public string function classifyPackagingType(
+		required string name,
+		required string domainKey,
+		required string currentType,
+		array sourcePaths = [],
+		numeric unitCount = 0
+	) {
+		var pathBlob = arguments.sourcePaths.toList( " " );
+		var blob = lCase( trim( arguments.name ) & " " & trim( arguments.domainKey ) & " " & pathBlob );
+		var current = lCase( trim( arguments.currentType ) );
+		if ( !len( current ) ) current = "main-app";
+		// Shared / worker / static folders are never UI modules or microservices.
+		if ( reFindNoCase( "_scheduled|scheduledscripts|/jobs/|/workers/", blob ) ) {
+			// Integration-heavy job folders (payments, mail APIs, webhooks, CRM
+			// / inventory connectors) may later become a separate jobs host.
+			return reFindNoCase( "payment|autopay|billing|invoice|webhook|oauth|smtp|mail.?api|/integrations?/|inventory|crm", blob ) ? "scheduled-service" : "background-worker";
+		}
+		if ( reFindNoCase( "\btemp\b|copyfiles|commonfiles|comingsoon|\bjs\b|/js/|webmanagementwelcome|message.?template", blob ) ) {
+			return "main-app";
+		}
+		var hasApplicationEntrypoint = arguments.sourcePaths.some( ( path ) => reFindNoCase( "(^|/|\\)application\.(cfc|cfm|bx)$", path ) );
+		// *hosting*/AppName trees with their own Application.* look like side-apps.
+		var hostingRoot = reFindNoCase( "(^|/|\\)\d*hosting/[a-z0-9_-]+", blob ) || reFindNoCase( "(^|/|\\)hosting/[a-z0-9_-]+", blob );
+		if ( hostingRoot && ( hasApplicationEntrypoint || reFindNoCase( "application bootstrap|side application|orders application|hosting/", blob ) ) ) {
+			return "external-service";
+		}
+		if ( current == "external-service" && ( hasApplicationEntrypoint || hostingRoot || reFindNoCase( "microservice|side.?app|external.?service|separate deploy", blob ) ) ) {
+			return "external-service";
+		}
+		if ( [ "background-worker", "scheduled-service" ].contains( current ) ) return current;
+		if ( reFindNoCase( "/modules/|moduleconfig\.(cfc|cfm|bx)", blob ) ) {
+			return "coldbox-module";
+		}
+		if ( current == "coldbox-module" ) {
+			if ( arguments.unitCount > 120 && !reFindNoCase( "/modules/", blob ) ) return "main-app";
+			// Keep nested feature directories; demote bare "module candidate" labels
+			// that lack path evidence of a real feature or modules/ package.
+			var nestedFeature = arguments.sourcePaths.some( ( path ) => {
+				var normalized = reReplace( replace( trim( toString( path ) ), "\", "/", "all" ), "^(\./)+", "" );
+				return listLen( normalized, "/" ) >= 2;
+			} );
+			if ( nestedFeature ) return "coldbox-module";
+			if ( reFindNoCase( "module candidate", arguments.name ) ) return "main-app";
+			return "coldbox-module";
+		}
+		return "main-app";
+	}
+
+	private boolean function isCentralPath( required string path ) {
+		var lower = lCase( arguments.path );
+		return reFindNoCase( "application\.|coldbox\.|/config/|\\config\\|router\.|/routes|/layouts?/|/interceptors?/|wirebox|security|auth|session", lower ) > 0;
+	}
+
+	private string function architectureDomainKey( required string path, required struct unit ) {
+		var parts = listToArray( replace( arguments.path, "\", "/", "all" ), "/" );
+		for ( var i = 1; i <= parts.len(); i++ ) {
+			var piece = lCase( trim( parts[ i ] ) );
+			if ( !len( piece ) ) continue;
+			if ( listFindNoCase( "handlers,views,modules_app,modules,controllers", piece ) && i < parts.len() ) {
+				return sanitizeDomainToken( parts[ i + 1 ] );
+			}
+			if ( piece == "models" && i < parts.len() ) {
+				var next = lCase( trim( parts[ i + 1 ] ) );
+				if ( next == "services" && i + 1 < parts.len() ) return sanitizeDomainToken( parts[ i + 2 ] );
+				return sanitizeDomainToken( parts[ i + 1 ] );
+			}
+			if ( piece == "services" && i < parts.len() ) return sanitizeDomainToken( parts[ i + 1 ] );
+		}
+		var purpose = lCase( trim( arguments.unit.purpose ?: "" ) );
+		if ( len( purpose ) ) {
+			var token = listFirst( reReplace( purpose, "[^a-z0-9]+", "-", "all" ), "-" );
+			if ( len( token ) >= 3 ) return token;
+		}
+		return "";
+	}
+
+	private string function sanitizeDomainToken( required string value ) {
+		var token = reReplaceNoCase( trim( arguments.value ), "\.(bx|cfc|cfm|bxm)$", "" );
+		token = reReplaceNoCase( token, "(service|handler|controller|gateway)$", "" );
+		token = reReplace( lCase( token ), "[^a-z0-9]+", "", "all" );
+		token = reReplaceNoCase( token, "ies$", "y" );
+		if ( len( token ) > 4 && right( token, 1 ) == "s" ) token = left( token, len( token ) - 1 );
+		return len( token ) >= 3 ? token : "";
+	}
+
+
+	// ------------------------------------------------------------------
+	// Helpers copied from ModernizationProposalService.
+	//
+	// The synthesis block called these six, and all six are still used
+	// 11-50 times by the code that stays behind, so they could not simply
+	// move. They are stateless normalisation and identity wrappers rather
+	// than invariants -- none of them owns a decision -- so a copy does not
+	// create the two-owner problem that section 2.7 documents.
+	//
+	// Consolidate when Step 11 splits ModernizationProposalService and the
+	// remaining caller set is small enough to repoint.
+	// ------------------------------------------------------------------
+
+	private string function scalarString( required any value ) {
+		if ( isSimpleValue( arguments.value ) ) return toString( arguments.value );
+		if ( isArray( arguments.value ) ) {
+			for ( var item in arguments.value ) if ( isSimpleValue( item ) && len( trim( toString( item ) ) ) ) return trim( toString( item ) );
+			return "";
+		}
+		return "";
+	}
+
+	private string function normalizeLegacyPath( required any path ) {
+		return replace( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ), "//", "/", "all" );
+	}
+
+	private string function normalizeEvidencePath( required any path ) {
+		return lCase( replace( trim( scalarString( arguments.path ) ), "\", "/", "all" ) );
+	}
+
+	private array function dedupeById( required array items ) {
+		var seen = {};
+		var output = [];
+		for ( var item in arguments.items ) {
+			if ( !isStruct( item ) ) continue;
+			var id = trim( item.id ?: item.itemId ?: "" );
+			if ( len( id ) && seen.keyExists( id ) ) continue;
+			if ( len( id ) ) seen[ id ] = true;
+			output.append( item );
+		}
+		return output;
+	}
+
+	private void function ensureIdentity( required struct item, required string kind ) {
+		var id = trim( scalarString( arguments.item.id ?: "" ) );
+		if ( !len( id ) ) id = trim( scalarString( arguments.item.itemId ?: "" ) );
+		if ( !len( id ) ) arguments.item.id = identityService.itemId( arguments.kind, arguments.item );
+		else arguments.item.id = id;
+		var fingerprint = trim( scalarString( arguments.item.itemFingerprint ?: "" ) );
+		if ( !len( fingerprint ) ) arguments.item.itemFingerprint = identityService.itemFingerprint( arguments.kind, arguments.item );
+		else arguments.item.itemFingerprint = fingerprint;
+	}
+
+	private void function logInfo( required string message ) {
+		try {
+			if ( !isNull( variables.log ?: javacast( "null", "" ) ) ) {
+				variables.log.info( arguments.message );
+			}
+		} catch ( any ignored ) {}
+	}
+
+	public string function featureDomainKey( required struct unit ) {
+		var path = normalizeLegacyPath( arguments.unit.sourcePath ?: "" );
+		if ( !len( trim( path ) ) ) path = normalizeLegacyPath( arguments.unit.targetPath ?: "" );
+		var segments = [];
+		for ( var segment in listToArray( path, "/" ) ) {
+			var cleaned = trim( segment );
+			if ( len( cleaned ) ) segments.append( cleaned );
+		}
+		// Last segment is the file itself, not a domain.
+		if ( segments.len() ) segments.deleteAt( segments.len() );
+		if ( !segments.len() ) return "";
+		// A container folder says nothing about the feature; reach one level in.
+		var containers = [ "app", "src", "cfc", "com", "lib", "libs", "includes", "include", "core", "shared", "common", "handlers", "views", "models", "services", "layouts" ];
+		var first = lCase( segments[ 1 ] );
+		if ( containers.contains( first ) && segments.len() >= 2 ) return lCase( segments[ 1 ] & "/" & segments[ 2 ] );
+		return first;
+	}
+
+	/** Human label for a feature-directory key. */
+	/**
+	 * Make cluster names distinguishable.
+	 *
+	 * Names come from the folder a cluster's files sit in, which is fine until a
+	 * folder holds several unrelated capabilities. On CFTunes that produced
+	 * twelve placements all called "Cfc Model" and six called "Guitar" -- the
+	 * cards were genuinely different (Album+Song, Artist, Genre, Playlist) but
+	 * the workspace showed a wall of identical labels with no way to tell them
+	 * apart.
+	 *
+	 * A colliding cluster is renamed for the file it is actually about: the
+	 * shortest-path member, which is the one nearest the top of the tree and so
+	 * the most representative of the group. Deterministic -- members are already
+	 * sorted, ties break on the lexicographically smaller path -- because an
+	 * unstable name would churn plan fingerprints on every run.
+	 */
+	private array function disambiguateClusterNames( required array clusters ) {
+		var counts = {};
+		for ( var cluster in arguments.clusters ) {
+			var name = trim( toString( cluster.name ?: "" ) );
+			if ( !len( name ) ) continue;
+			counts[ name ] = val( counts[ name ] ?: 0 ) + 1;
+		}
+
+		var used = {};
+		for ( var cluster in arguments.clusters ) {
+			var currentName = trim( toString( cluster.name ?: "" ) );
+			if ( !len( currentName ) || val( counts[ currentName ] ?: 0 ) < 2 ) {
+				if ( len( currentName ) ) used[ lCase( currentName ) ] = true;
+				continue;
+			}
+
+			var members = isArray( cluster.filePaths ?: "" ) ? cluster.filePaths : [];
+			if ( !members.len() ) continue;
+			var best = "";
+			for ( var filePath in members ) {
+				var candidate = trim( toString( filePath ) );
+				if ( !len( candidate ) ) continue;
+				if ( !len( best ) ) { best = candidate; continue; }
+				var here = listLen( candidate, "/" );
+				var there = listLen( best, "/" );
+				// Shallowest wins; a tie falls to the smaller path so the choice is
+				// reproducible run to run.
+				if ( here < there || ( here == there && compareNoCase( candidate, best ) < 0 ) ) best = candidate;
+			}
+			if ( !len( best ) ) continue;
+
+			var stem = listFirst( listLast( best, "/" ), "." );
+			var label = featureDomainLabel( sanitizeDomainToken( stem ) );
+			if ( !len( trim( label ) ) ) continue;
+			// Keep the folder as context when the stem alone would still collide.
+			if ( used.keyExists( lCase( label ) ) ) label = currentName & " · " & label;
+			cluster.name = label;
+			used[ lCase( label ) ] = true;
+		}
+		return arguments.clusters;
+	}
+
+	public string function featureDomainLabel( required string key ) {
+		if ( !len( trim( arguments.key ) ) ) return "Remaining application slices";
+		var words = [];
+		for ( var segment in listToArray( arguments.key, "/" ) ) {
+			// Split camelCase and separator-delimited folder names into words.
+			var spaced = reReplace( segment, "([a-z0-9])([A-Z])", "\1 \2", "all" );
+			spaced = reReplace( spaced, "[_\-\.]+", " ", "all" );
+			for ( var word in listToArray( spaced, " " ) ) {
+				var cleaned = trim( word );
+				// right( value, 0 ) throws "Count cannot be zero" in BoxLang, so a
+			// single-character word must not take the general path. Reachable
+			// from any one-letter folder, and from camelCase splitting like
+			// "aService" -> "a Service".
+			if ( len( cleaned ) == 1 ) words.append( uCase( cleaned ) );
+			else if ( len( cleaned ) > 1 ) words.append( uCase( left( cleaned, 1 ) ) & lCase( right( cleaned, len( cleaned ) - 1 ) ) );
+			}
+		}
+		if ( !words.len() ) return "Remaining application slices";
+		return words.toList( " " );
+	}
+}

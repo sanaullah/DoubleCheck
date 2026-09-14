@@ -1,0 +1,67 @@
+/**
+ * Derives the snapshot reuse key.
+ *
+ * Split out because this plan's most repeated failure is a cache key that does
+ * not cover everything shaping the stored rows — it has now happened three times
+ * in this subsystem alone. A key with one owner is one place to check when the
+ * next extraction step changes.
+ *
+ * @see CodeGraphRunService
+ */
+@singleton
+class threadsafe {
+
+	property name="metricsService" inject="CodeGraphMetricsService";
+
+	/**
+	 * Fallback only. The live value comes from `CodeGraphMetricsService`, which
+	 * owns the snapshot shape.
+	 *
+	 * This was a second copy of the version literal and it had already drifted:
+	 * pinned at `v2` while snapshots were being written as `v3`, so the shape
+	 * change that produced v3 did not move the reuse key and a clean-tree run
+	 * could adopt a v2-shaped snapshot as if it were current. Exactly the failure
+	 * this file's header says it exists to prevent, in this file.
+	 */
+	variables.snapshotVersionFallback = "codegraph-snapshot-v5";
+
+	/**
+	 * @indexService Supplies the parser version signature; may be an empty string.
+	 * @files        Scanned files, used only by the per-file fallback.
+	 * @settings     Every cap and policy that shapes the snapshot.
+	 */
+	string function build( required any indexService, required array files, required struct settings ) {
+		var parserVersion = "";
+		if ( !isSimpleValue( arguments.indexService ) ) {
+			try {
+				parserVersion = arguments.indexService.parserVersionSignature();
+			} catch ( any ignored ) {
+				try {
+					if ( arguments.files.len() ) parserVersion = arguments.indexService.parserVersionFor( arguments.files );
+				} catch ( any ignoredFallback ) {
+					parserVersion = "";
+				}
+			}
+		}
+		// Must track the parser versions in the parsers themselves: a stale literal
+		// here silently reuses snapshots built by an older extractor.
+		if ( !len( trim( parserVersion ) ) ) parserVersion = "boxlang-ast-parser-v12|cfml-symbol-parser-v12|javascript-symbol-parser-v6";
+
+		var payload = duplicate( arguments.settings );
+		payload.parserVersion = parserVersion;
+		payload.snapshotVersion = snapshotVersion();
+		return lCase( hash( jsonSerialize( payload ), "SHA-256" ) );
+	}
+
+	/** The snapshot shape this key must cover, from the service that owns it. */
+	string function snapshotVersion() {
+		try {
+			var live = trim( toString( metricsService.snapshotVersion() ) );
+			if ( len( live ) ) return live;
+		} catch ( any unavailable ) {
+			// Fall through: a key built from the fallback is stale-safe as long as
+			// the fallback tracks the live version, which a spec asserts.
+		}
+		return variables.snapshotVersionFallback;
+	}
+}

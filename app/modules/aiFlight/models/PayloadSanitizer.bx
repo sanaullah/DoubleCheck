@@ -1,0 +1,81 @@
+/**
+ * Strip secrets from intercept payloads before persistence.
+ */
+
+@singleton
+class {
+	property name="secretKeys" type="array";
+
+	function init() {
+		variables.secretKeys = [
+			"apikey",
+			"api_key",
+			"authorization",
+			"password",
+			"secret",
+			"token",
+			"access_token",
+			"refresh_token",
+			"private_key",
+			"client_secret"
+		];
+		return this;
+	}
+
+	/**
+	 * Deep-sanitize a value for JSON storage.
+	 */
+	any function sanitize( required any value, numeric depth = 0 ) {
+		if ( arguments.depth > 8 ) {
+			return "[max-depth]";
+		}
+		if ( isNull( arguments.value ) ) {
+			return javacast( "null", "" );
+		}
+		if ( isSimpleValue( arguments.value ) ) {
+			return arguments.value;
+		}
+		if ( isArray( arguments.value ) ) {
+			var out = [];
+			for ( var item in arguments.value ) {
+				out.append( sanitize( item, arguments.depth + 1 ) );
+			}
+			return out;
+		}
+		if ( isStruct( arguments.value ) ) {
+			var cleaned = {};
+			for ( var key in arguments.value ) {
+				if ( isSecretKey( key ) ) {
+					cleaned[ key ] = "[redacted]";
+				} else {
+					try {
+						cleaned[ key ] = sanitize( arguments.value[ key ], arguments.depth + 1 );
+					} catch (any e) {
+						cleaned[ key ] = "[unserializable]";
+					}
+				}
+			}
+			return cleaned;
+		}
+		try {
+			return toString( arguments.value );
+		} catch (any e) {
+			return "[object]";
+		}
+	}
+
+	boolean function isSecretKey( required string key ) {
+		var normalized = reReplace(
+			lCase( arguments.key ),
+			"[^a-z0-9_]",
+			"",
+			"all"
+		);
+		for ( var secret in variables.secretKeys ) {
+			if ( normalized == secret || findNoCase( secret, normalized ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+}

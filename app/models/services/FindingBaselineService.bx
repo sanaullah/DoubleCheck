@@ -1,0 +1,149 @@
+/**
+ * Compute-on-read baseline: labels findings new/unchanged/fixed vs prior same path+mode run.
+ */
+
+@singleton
+class {
+
+	/**
+	 * Classify current findings against a prior baseline finding set.
+	 */
+	struct function classify(
+		required array currentFindings,
+		required array baselineFindings,
+		required struct baselineMeta
+	) {
+		var baselineFingerprints = {};
+		var baselineByFingerprint = {};
+		for ( var prior in arguments.baselineFindings ) {
+			var priorKey = fingerprintKey( prior );
+			if ( !len( priorKey ) ) {
+				continue;
+			}
+			baselineFingerprints[ priorKey ] = true;
+			if ( !structKeyExists( baselineByFingerprint, priorKey ) ) {
+				baselineByFingerprint[ priorKey ] = prior;
+			}
+		}
+
+		var currentFingerprints = {};
+		var enriched = [];
+		var newCount = 0;
+		var unchangedCount = 0;
+
+		for ( var finding in arguments.currentFindings ) {
+			var key = fingerprintKey( finding );
+			if ( len( key ) ) {
+				currentFingerprints[ key ] = true;
+			}
+			var status = ( len( key ) && structKeyExists( baselineFingerprints, key ) ) ? "unchanged" : "new";
+			if ( status == "unchanged" ) {
+				unchangedCount++;
+			} else {
+				newCount++;
+			}
+			enriched.append( copyFinding( finding, status ) );
+		}
+
+		var fixedFindings = [];
+		var fixedKeys = structKeyArray( baselineFingerprints );
+		for ( var i = 1; i <= fixedKeys.len(); i++ ) {
+			var fingerprint = fixedKeys[ i ];
+			if ( !structKeyExists( currentFingerprints, fingerprint ) ) {
+				var source = baselineByFingerprint[ fingerprint ];
+				fixedFindings.append(
+						{
+							fingerprint: fingerprint,
+							title      : stringValue( source.title ?: "" ),
+							filePath   : stringValue( source.filePath ?: "" ),
+							ruleId     : stringValue( source.ruleId ?: "" ),
+							severity   : stringValue( source.severity ?: "" )
+						}
+					);
+			}
+		}
+
+		return {
+			baseline: {
+				runId    : stringValue( arguments.baselineMeta.runId ?: "" ),
+				status   : stringValue( arguments.baselineMeta.status ?: "" ),
+				createdAt: stringValue( arguments.baselineMeta.createdAt ?: "" ),
+				counts   : {
+					new      : newCount,
+					unchanged: unchangedCount,
+					fixed    : fixedFindings.len()
+				}
+			},
+			findings     : enriched,
+			fixedFindings: fixedFindings
+		};
+	}
+
+	/**
+	 * Attach baseline comparison fields to a result struct.
+	 * Pass baselineMeta with runId/status/createdAt, or omit/empty for no baseline.
+	 */
+	struct function applyToResult( required struct result, struct baselineMeta = {}, array baselineFindings = [] ) {
+		if ( !len( trim( stringValue( arguments.baselineMeta.runId ?: "" ) ) ) ) {
+			arguments.result[ "baseline" ] = javacast( "null", "" );
+			arguments.result[ "fixedFindings" ] = [];
+			return arguments.result;
+		}
+
+		var classified = classify(
+			currentFindings  = arguments.result.findings ?: [],
+			baselineFindings = arguments.baselineFindings,
+			baselineMeta     = arguments.baselineMeta
+		);
+		arguments.result[ "baseline" ] = classified.baseline;
+		arguments.result[ "findings" ] = classified.findings;
+		arguments.result[ "fixedFindings" ] = classified.fixedFindings;
+		return arguments.result;
+	}
+
+	private string function fingerprintKey( required any finding ) {
+		if ( !isStruct( arguments.finding ) ) {
+			return "";
+		}
+		return lCase(
+			trim( stringValue( arguments.finding.fingerprint ?: "" ) )
+		);
+	}
+
+	private struct function copyFinding( required struct finding, required string baselineStatus ) {
+		var copied = {
+			id            : stringValue( arguments.finding.id ?: "" ),
+			fingerprint   : stringValue( arguments.finding.fingerprint ?: "" ),
+			category      : stringValue( arguments.finding.category ?: "" ),
+			ruleId        : stringValue( arguments.finding.ruleId ?: "" ),
+			severity      : stringValue( arguments.finding.severity ?: "" ),
+			confidence    : val( arguments.finding.confidence ?: 0 ),
+			title         : stringValue( arguments.finding.title ?: "" ),
+			message       : stringValue( arguments.finding.message ?: "" ),
+			filePath      : stringValue( arguments.finding.filePath ?: "" ),
+			startLine     : int( val( arguments.finding.startLine ?: 0 ) ),
+			endLine       : int( val( arguments.finding.endLine ?: 0 ) ),
+			evidence      : stringValue( arguments.finding.evidence ?: "" ),
+			suggestion    : stringValue( arguments.finding.suggestion ?: "" ),
+			source        : stringValue( arguments.finding.source ?: "" ),
+			baselineStatus: arguments.baselineStatus
+		};
+		if ( isStruct( arguments.finding.playbook ?: "" ) ) {
+			copied.playbook = arguments.finding.playbook;
+		}
+		if ( isStruct( arguments.finding.fixPatch ?: "" ) ) {
+			copied.fixPatch = arguments.finding.fixPatch;
+		}
+		return copied;
+	}
+
+	private string function stringValue( required any value ) {
+		if ( isNull( arguments.value ) ) {
+			return "";
+		}
+		if ( isSimpleValue( arguments.value ) ) {
+			return toString( arguments.value );
+		}
+		return "";
+	}
+}

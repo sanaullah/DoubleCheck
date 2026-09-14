@@ -1,0 +1,191 @@
+/** Produces explicit repository, inventory, schema, and LLM coverage math. */
+@singleton
+class {
+	variables.version = "modernization-coverage-v1";
+
+	struct function assess(
+		struct scan = {},
+		struct inventory = {},
+		struct schemaPack = {},
+		struct context = {},
+		struct llm = {}
+	) {
+		var scanData = arguments.scan ?: {};
+		var files = scanData.files ?: [];
+		var skipped = scanData.skipped ?: {};
+		var indexedBytes = 0;
+		for ( var item in files ) indexedBytes += val( item.sizeBytes ?: len( item.content ?: "" ) );
+		var candidateCount = isNumeric( scanData.candidateCount ?: "" ) ? val( scanData.candidateCount ) : 0;
+		if ( candidateCount <= 0 && isNumeric( scanData.candidates ?: "" ) ) candidateCount = val( scanData.candidates );
+		if ( candidateCount <= 0 ) candidateCount = files.len() + sumSkipped( skipped );
+		var supported = {};
+		var supportedLanguages = {};
+		var unsupported = 0;
+		for ( var item in files ) {
+			var language = item.language ?: "";
+			var extension = lCase( listLast( item.filePath ?: item.path ?: "", "." ) );
+			if ( len( extension ) ) supported[ extension ] = ( supported[ extension ] ?: 0 ) + 1;
+			if ( len( language ) ) supportedLanguages[ language ] = ( supportedLanguages[ language ] ?: 0 ) + 1;
+			else unsupported++;
+		}
+		var repository = {
+			candidates: candidateCount,
+			indexed: files.len(),
+			bytes: indexedBytes,
+			skipped: sumSkipped( skipped ),
+			oversized: val( skipped.oversized ?: 0 ),
+			truncation: val( skipped.limit ?: 0 ) > 0 || ( scanData.truncated ?: false ) || ( scanData.discoveryTruncated ?: false ),
+			supportedExtensions: supported,
+			supportedLanguages: supportedLanguages,
+			candidateLanguages: isStruct( scanData.candidateLanguages ?: "" ) ? scanData.candidateLanguages : {},
+			unsupported: val( skipped.unsupported ?: unsupported ),
+			scope: scanData.scope ?: "full"
+		};
+		var cfmlCandidates = val( repository.candidateLanguages.CFML ?: 0 ) + val( repository.candidateLanguages.BoxLang ?: 0 );
+		var cfmlIndexed = val( supportedLanguages.CFML ?: 0 ) + val( supportedLanguages.BoxLang ?: 0 );
+		repository.modernizationLanguagesComplete = cfmlCandidates > 0 && cfmlIndexed >= cfmlCandidates;
+		repository.jsTruncated = repository.truncation && val( repository.candidateLanguages.JavaScript ?: 0 ) > val( supportedLanguages.JavaScript ?: 0 );
+		var inventoryFiles = inventory.files ?: [];
+		var cfml = {
+			files: inventoryFiles.len(),
+			deepFiles: val( inventory.summary.deepFiles ?: inventoryFiles.len() ),
+			shallowFiles: val( inventory.summary.shallowFiles ?: 0 ),
+			structureComplete: inventory.summary.structureComplete ?: true,
+			detailCoverage: inventory.summary.detailCoverage ?: "complete",
+			unitsExtracted: ( inventory.units ?: [] ).len(),
+			unresolved: ( inventory.unresolved ?: [] ).len(),
+			truncated: inventory.truncated ?: false,
+			noScope: inventory.noModernizationScope ?: false
+		};
+		var schema = {
+			source: schemaPack.source ?: ( schemaPack.sourceKind ?: "absent" ),
+			format: schemaPack.format ?: "absent",
+			coverage: schemaPack.coverage ?: "absent",
+			objects: {
+				tables: ( schemaPack.tables ?: [] ).len(),
+				columns: ( schemaPack.columns ?: [] ).len(),
+				constraints: ( schemaPack.constraints ?: [] ).len(),
+				indexes: ( schemaPack.indexes ?: [] ).len(),
+				routines: ( schemaPack.routines ?: [] ).len()
+			},
+			unresolved: val( schemaPack.unresolvedCount ?: ( schemaPack.unresolved ?: [] ).len() ),
+			vendor: schemaPack.vendor ?: "",
+			vendorConfidence: val( schemaPack.vendorConfidence ?: 0 )
+		};
+		var partitions = [];
+		if ( isArray( context.partitions ?: "" ) ) partitions = context.partitions;
+		else if ( isArray( context.files ?: "" ) ) partitions = context.files;
+		else if ( isArray( llm.partitions ?: "" ) ) partitions = llm.partitions;
+		var contextSummary = context.summary ?: {};
+		var planned = val( llm.planned ?: context.planned ?: ( isArray( partitions ) ? partitions.len() : 0 ) );
+		var completed = val( llm.completed ?: context.completed ?: ( isArray( partitions ) ? countStatus( partitions, "completed" ) : 0 ) );
+		var failed = val( llm.failed ?: context.failed ?: ( isArray( partitions ) ? countStatus( partitions, "failed" ) : 0 ) );
+		var llmCoverage = {
+			planned: planned,
+			completed: completed,
+			failed: failed,
+			truncated: context.truncated ?: false,
+			partitions: isArray( partitions ) ? partitions.len() : planned,
+			contextCharacters: val( context.characters ?: contextSummary.characters ?: 0 ),
+			files: val( contextSummary.files ?: ( isArray( partitions ) ? partitions.len() : 0 ) ),
+			lineCount: val( contextSummary.lineCount ?: 0 ),
+			omittedPartitions: val( contextSummary.omittedPartitions ?: 0 ),
+			omittedPaths: isArray( contextSummary.omittedPaths ?: "" ) ? duplicate( contextSummary.omittedPaths ) : [],
+			gaps: isArray( llm.gaps ?: "" ) ? duplicate( llm.gaps ) : []
+		};
+		llmCoverage.complete = llmCoverage.failed == 0 && llmCoverage.omittedPartitions == 0 && !llmCoverage.truncated && llmCoverage.completed >= llmCoverage.planned;
+		llmCoverage.status = llmCoverage.complete ? "complete" : "incomplete";
+		var scannerUncertain = repository.truncation || cfml.truncated || cfml.unresolved > 0;
+		var routeObserved = ( inventory.routeEvidence ?: [] ).len() > 0;
+		var lifecycleObserved = false;
+		for ( var unit in inventory.units ?: [] ) {
+			if ( lCase( trim( unit.unitType ?: unit.kind ?: "" ) ) == "application" ) {
+				lifecycleObserved = true;
+				break;
+			}
+		}
+		var observations = {
+			routes: observationState( routeObserved, scannerUncertain ),
+			schema: observationState( schema.coverage != "absent", schema.unresolved > 0 ),
+			lifecycle: observationState( lifecycleObserved, scannerUncertain )
+		};
+		var banners = [];
+		if ( repository.truncation ) banners.append( "Repository inventory is partial because scan budgets were reached." );
+		if ( !schemaPack.len() || schema.coverage == "absent" ) banners.append( "Schema findings are inference-limited; attach a schema pack for stronger proposals." );
+		if ( cfml.noScope ) banners.append( "No CFML scope was found; modernization enrichment is not available." );
+		if ( cfml.shallowFiles > 0 ) banners.append( "All #cfml.files# CFML files are structurally indexed; deep symbol, route, and dependency evidence was sampled from #cfml.deepFiles# representative files." );
+		if ( llmCoverage.truncated ) banners.append( "LLM context was bounded and some evidence ranges were omitted." );
+		var schemaCoverageLabel = schema.coverage == "absent" ? "inference-limited" : schema.coverage;
+		var complete = !repository.truncation && !cfml.truncated && llmCoverage.complete;
+		return { version: variables.version, repository: repository, filesScanned: repository.indexed, cfmlFiles: cfml.files, cfmlInventory: cfml, schema: schema, schemaCoverage: schemaCoverageLabel, llm: llmCoverage, observations: observations, banners: banners, truncated: repository.truncation || cfml.truncated || llmCoverage.truncated, status: complete ? "complete" : "incomplete", complete: complete, fingerprint: stableHash( variables.version & "|" & jsonSerialize( { repository: repository, cfml: cfml, schema: schema, llm: llmCoverage, observations: observations } ) ) };
+	}
+
+	/**
+	 * Adds onRoad / notYetSliced counts and optional ColdBox source-stack note.
+	 */
+	struct function enrichRoadCoverage( required struct coverage, required struct plan ) {
+		var result = duplicate( arguments.coverage );
+		var inventoryUnits = [];
+		if ( isStruct( arguments.plan.inventory ?: "" ) && isArray( arguments.plan.inventory.units ?: "" ) ) {
+			inventoryUnits = arguments.plan.inventory.units;
+		}
+		var onRoadIds = {};
+		var unitLinks = isArray( arguments.plan.unitLinks ?: "" ) ? arguments.plan.unitLinks : [];
+		for ( var link in unitLinks ) {
+			var legacyId = trim( link.legacyUnitId ?: link.sourceUnitId ?: "" );
+			if ( len( legacyId ) ) onRoadIds[ legacyId ] = true;
+		}
+		var targetUnits = [];
+		if ( isStruct( arguments.plan.target ?: "" ) && isArray( arguments.plan.target.units ?: "" ) ) {
+			targetUnits = arguments.plan.target.units;
+		}
+		for ( var unit in targetUnits ) {
+			var legacyIds = isArray( unit.legacyUnitIds ?: "" ) ? unit.legacyUnitIds : [];
+			for ( var legacyUnitId in legacyIds ) {
+				var id = trim( legacyUnitId );
+				if ( len( id ) ) onRoadIds[ id ] = true;
+			}
+		}
+		var onRoad = 0;
+		for ( var inventoryUnit in inventoryUnits ) {
+			var inventoryId = trim( inventoryUnit.id ?: inventoryUnit.itemId ?: "" );
+			if ( len( inventoryId ) && onRoadIds.keyExists( inventoryId ) ) onRoad++;
+		}
+		var total = inventoryUnits.len();
+		var sourceStackNote = "";
+		var signals = isArray( arguments.plan.signals ?: "" ) ? arguments.plan.signals : [];
+		for ( var signal in signals ) {
+			var code = lCase( trim( signal.code ?: signal.id ?: signal.name ?: "" ) );
+			if ( findNoCase( "coldbox.present", code ) || code == "coldbox.present" ) {
+				sourceStackNote = "Existing ColdBox signals detected — prefer coexist / in-place deepen rather than greenfield-only advice.";
+				break;
+			}
+		}
+		var notYetSliced = max( 0, total - onRoad );
+		result.road = {
+			onRoad         : onRoad,
+			notYetSliced   : notYetSliced,
+			sourceStackNote: sourceStackNote
+		};
+		// The top-level status/complete flags are a provider-shard-completion
+		// heuristic (see assess()): a shard can report "completed" while still
+		// silently dropping individual units. road.onRoad/notYetSliced is the
+		// one signal actually cross-referenced against inventory, so call out
+		// the gap explicitly whenever shard status alone would read as done.
+		if ( total > 0 && notYetSliced > 0 && ( arguments.coverage.complete ?: false ) ) {
+			if ( !isArray( result.banners ?: "" ) ) result.banners = [];
+			result.banners.append(
+				"Provider coverage reads complete, but #notYetSliced# of #total# legacy unit(s) are not yet linked to the target plan."
+			);
+		}
+		return result;
+	}
+
+	private numeric function sumSkipped(required struct skipped) { var total = 0; for ( var key in arguments.skipped ) total += val( arguments.skipped[ key ] ?: 0 ); return total; }
+	private numeric function countStatus(required array items, required string status) { var count = 0; for ( var item in arguments.items ) if ( ( item.status ?: "" ) == arguments.status ) count++; return count; }
+	private struct function observationState( required boolean observed, required boolean uncertain ) {
+		if ( arguments.observed ) return { state: "observed", provenanceClass: "source-observed" };
+		return { state: arguments.uncertain ? "needs-review" : "not-observed", provenanceClass: "not-observed" };
+	}
+	private string function stableHash(required string value) { return lCase( hash( arguments.value, "SHA-256" ) ); }
+}

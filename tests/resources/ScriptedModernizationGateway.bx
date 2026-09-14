@@ -1,0 +1,80 @@
+/** Deterministic provider double for ModernizationProposalService specs. */
+import java:java.util.concurrent.atomic.AtomicInteger;
+
+class {
+	property name="responses" type="struct";
+	property name="enabled" type="boolean" default="true";
+	property name="calls" type="numeric" default="0";
+	property name="cancelled" type="array";
+	property name="roleIndexes" type="struct";
+	property name="requests" type="array";
+	property name="optionsLog" type="array";
+	property name="preflightFailureRole" type="string" default="";
+	property name="preflightRequests" type="array";
+
+	function init( struct responses = {}, boolean enabled = true, string preflightFailureRole = "" ) {
+		variables.responses = duplicate( arguments.responses );
+		variables.enabled = arguments.enabled;
+		variables.callCounter = new AtomicInteger( 0 );
+		variables.calls = 0;
+		variables.cancelled = [];
+		variables.roleIndexes = {};
+		variables.requests = [];
+		variables.optionsLog = [];
+		variables.preflightFailureRole = arguments.preflightFailureRole;
+		variables.preflightRequests = [];
+		return this;
+	}
+
+	boolean function isEnabled() { return variables.enabled; }
+
+	struct function preflight( required struct request, struct options = {} ) {
+		variables.preflightRequests.append( arguments.request );
+		if ( len( variables.preflightFailureRole ) ) {
+			throw(
+				type = "PromptPackageFitException",
+				message = "scripted prompt cannot fit",
+				data = { cap: 60000, role: variables.preflightFailureRole },
+				detail = jsonSerialize( { cap: 60000, role: variables.preflightFailureRole } )
+			);
+		}
+		return { ok: true, request: arguments.request, diagnostics: {} };
+	}
+
+	struct function run( required string runId, required struct agentRequest, struct options = {} ) {
+		variables.calls = variables.callCounter.incrementAndGet();
+		variables.requests.append( duplicate( arguments.agentRequest ) );
+		variables.optionsLog.append( duplicate( arguments.options ) );
+		if ( variables.cancelled.contains( arguments.runId ) ) throw( type = "RunCancelled", message = "scripted cancellation" );
+		var role = structKeyExists( arguments.agentRequest, "role" ) ? arguments.agentRequest.role : "";
+		if ( variables.responses.keyExists( role ) ) {
+			var response = variables.responses[ role ];
+			if ( isArray( response ) ) {
+				if ( structKeyExists( arguments.agentRequest, "shardIndex" ) && isNumeric( arguments.agentRequest.shardIndex ) ) {
+					var shardIndex = int( arguments.agentRequest.shardIndex );
+					response = shardIndex <= response.len() ? response[ shardIndex ] : response[ response.len() ];
+				} else {
+					var index = 0;
+					lock name="scripted-mod-role-#role#" type="exclusive" timeout="5" {
+						index = ( variables.roleIndexes[ role ] ?: 0 ) + 1;
+						variables.roleIndexes[ role ] = index;
+					}
+					response = index <= response.len() ? response[ index ] : response[ response.len() ];
+				}
+			}
+			if ( isStruct( response ) && structKeyExists( response, "throw" ) && response.throw ) return { ok: false, payload: {}, attempt: 1, provider: "scripted", model: "scripted", error: structKeyExists( response, "message" ) ? response.message : "scripted failure" };
+			return { ok: true, payload: isStruct( response ) ? duplicate( response ) : response, attempt: 1, provider: "scripted", model: "scripted" };
+		}
+		return { ok: true, payload: {}, attempt: 1, provider: "scripted", model: "scripted" };
+	}
+
+	void function cancelRun( required string runId ) { variables.cancelled.append( arguments.runId ); }
+	numeric function callCount() { return variables.callCounter.get(); }
+	array function requestLog() { return variables.requests; }
+	array function optionsHistory() { return variables.optionsLog; }
+	array function preflightLog() { return variables.preflightRequests; }
+	any function failPreflightFor( required string role ) {
+		variables.preflightFailureRole = arguments.role;
+		return this;
+	}
+}

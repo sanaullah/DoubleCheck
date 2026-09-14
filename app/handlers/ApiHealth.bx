@@ -1,0 +1,45 @@
+/**
+ * REST: liveness/readiness including SQLite health check.
+ */
+class extends="coldbox.system.RestHandler" {
+	property name="appVersion" inject="coldbox:setting:appVersion";
+
+	property name="log" inject="logbox:logger:{this}";
+
+	/**
+	 * Health check
+	 *
+	 * @tags Health
+	 * @hint Liveness including SQLite connectivity
+	 * @response-200 Service healthy
+	 */
+	function index( event, rc, prc ) {
+		var database = { status: "up" };
+		try {
+			queryExecute( "SELECT 1 AS healthy" );
+		} catch (any error) {
+			log.error(
+					"SQLite health check failed",
+					{
+						type      : error.type ?: "",
+						message   : error.message ?: "",
+						stackTrace: error.stackTrace ?: ""
+					}
+				);
+			database = { status: "down", message: "SQLite unavailable" };
+		}
+		var healthy = database.status == "up";
+		event.renderData(
+				type       = "json",
+				statusCode = healthy ? 200 : 503,
+				data       = {
+					data: {
+						status   : healthy ? "ok" : "degraded",
+						version  : appVersion,
+						timestamp: dateTimeFormat( now(), "iso" ),
+						checks   : { database: database }
+					}
+				}
+			);
+	}
+}

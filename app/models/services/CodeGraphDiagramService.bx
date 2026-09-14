@@ -1,0 +1,385 @@
+/**
+ * Deterministic SVG renderers for CodeGraph.
+ *
+ * Split from ReportExportService because packaging an export (content type,
+ * filename, envelope) and drawing a diagram are different jobs, and the export
+ * service crossed the project's own size ceiling when the third renderer landed.
+ *
+ * Every renderer here is a fixed grid — three columns for the module map, one
+ * column per participant for a flow, one cell per pair for the matrix — so none
+ * needs a layout engine and none has to be kept in step with the live canvas.
+ * Light paper palette and local font stacks only: an export that fetches a
+ * webfont when opened is not a local-only artefact.
+ *
+ * @see ReportExportService
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * A real cluster diagram: boxes for domains, lines for the dependencies
+	 * between them.
+	 *
+	 * The previous implementation drew a white rectangle and listed node paths as
+	 * `<text>` lines — a bulleted list wearing SVG clothing, with no boxes, no
+	 * edges and no layout. At editorial density (12 clusters) a deterministic grid
+	 * needs no layout engine, so this stays a small self-contained function rather
+	 * than a second renderer to keep in step with the canvas.
+	 *
+	 * Light paper/ink palette because exports get pasted into pull requests and
+	 * documents; the canvas stays dark and consistent with itself.
+	 */
+	string function toCodeGraphSvg( required struct snapshot ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var clusterEdges = isArray( arguments.snapshot.clusterEdges ?: "" ) ? arguments.snapshot.clusterEdges : [];
+		var hash = char( 35 );
+
+		var visible = [];
+		for ( var cluster in clusters ) {
+			if ( !isStruct( cluster ) ) continue;
+			visible.append( cluster );
+			if ( visible.len() >= 12 ) break;
+		}
+		if ( !visible.len() ) {
+			return '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" role="img" aria-label="DoubleCheck CodeGraph: no clusters">'
+				& '<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>'
+				& '<text x="24" y="64" font-family="' & fontStack() & '" font-size="15" fill="' & hash & '475569">No clusters in this snapshot.</text>'
+				& '</svg>';
+		}
+
+		// Every coordinate on a 4px grid, three columns, deterministic order.
+		var columns = 3;
+		var boxWidth = 208;
+		var boxHeight = 88;
+		var gapX = 40;
+		var gapY = 40;
+		var marginX = 32;
+		var marginY = 72;
+		var rows = ceiling( visible.len() / columns );
+		var width = marginX * 2 + ( columns * boxWidth ) + ( ( columns - 1 ) * gapX );
+		var height = marginY + ( rows * boxHeight ) + ( ( rows - 1 ) * gapY ) + 40;
+
+		var centreOf = {};
+		var boxes = [];
+		for ( var index = 1; index <= visible.len(); index++ ) {
+			var cluster = visible[ index ];
+			var column = ( index - 1 ) % columns;
+			var row = int( ( index - 1 ) / columns );
+			var x = marginX + ( column * ( boxWidth + gapX ) );
+			var y = marginY + ( row * ( boxHeight + gapY ) );
+			centreOf[ toString( cluster.id ?: "" ) ] = { x: x + int( boxWidth / 2 ), y: y + int( boxHeight / 2 ) };
+			boxes.append( { x: x, y: y, cluster: cluster } );
+		}
+
+		var lines = [
+			'<svg xmlns="http://www.w3.org/2000/svg" width="' & width & '" height="' & height & '" viewBox="0 0 ' & width & ' ' & height & '" role="img" aria-label="DoubleCheck CodeGraph cluster diagram">',
+			'<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>',
+			'<text x="32" y="40" font-family="' & fontStack() & '" font-size="19" fill="' & hash & '0f172a">' & xmlEscape( arguments.snapshot.projectName ?: "CodeGraph" ) & ' — module map</text>',
+			'<text x="32" y="60" font-family="' & fontStack() & '" font-size="12" fill="' & hash & '64748b">' & visible.len() & ' of ' & clusters.len() & ' modules · ' & clusterEdges.len() & ' dependencies</text>'
+		];
+
+		// Edges first so boxes sit above them.
+		for ( var edge in clusterEdges ) {
+			if ( !isStruct( edge ) ) continue;
+			var from = centreOf[ toString( edge.from ?: "" ) ] ?: "";
+			var to = centreOf[ toString( edge.to ?: "" ) ] ?: "";
+			if ( !isStruct( from ) || !isStruct( to ) ) continue;
+			lines.append(
+				'<line x1="' & from.x & '" y1="' & from.y & '" x2="' & to.x & '" y2="' & to.y
+				& '" stroke="' & hash & 'cbd5e1" stroke-width="1"/>'
+			);
+		}
+
+		for ( var box in boxes ) {
+			var label = trim( toString( box.cluster.label ?: box.cluster.id ?: "module" ) );
+			var fileCount = val( box.cluster.fileCount ?: 0 );
+			lines.append(
+				'<rect x="' & box.x & '" y="' & box.y & '" width="' & boxWidth & '" height="' & boxHeight
+				& '" rx="8" fill="' & hash & 'f8fafc" stroke="' & hash & '94a3b8" stroke-width="1"/>'
+			);
+			lines.append(
+				'<text x="' & ( box.x + 16 ) & '" y="' & ( box.y + 32 ) & '" font-family="' & fontStack()
+				& '" font-size="14" fill="' & hash & '0f172a">' & xmlEscape( truncateLabel( label, 24 ) ) & '</text>'
+			);
+			lines.append(
+				'<text x="' & ( box.x + 16 ) & '" y="' & ( box.y + 56 ) & '" font-family="' & monoStack()
+				& '" font-size="11" fill="' & hash & '64748b">' & fileCount & ' file' & ( fileCount == 1 ? '' : 's' ) & '</text>'
+			);
+		}
+
+		if ( clusters.len() > visible.len() ) {
+			lines.append(
+				'<text x="32" y="' & ( height - 16 ) & '" font-family="' & fontStack() & '" font-size="12" fill="' & hash & '64748b">+'
+				& ( clusters.len() - visible.len() ) & ' more modules not drawn</text>'
+			);
+		}
+		lines.append( "</svg>" );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	/**
+	 * One request flow as a sequence diagram.
+	 *
+	 * CodeGraph's headline promise is "how does a request move", and `flows[]`
+	 * already carries `steps`, `stepSymbols`, `edgeKinds`, `sinkKind` and
+	 * `routeId` — everything the canonical rendering needs. Its layout is trivial
+	 * (participants are columns, hops are rows) so it needs no layout engine.
+	 *
+	 * A hop whose owning symbol could not be resolved renders as the file with
+	 * "(file level)" rather than a guessed symbol name: the same honesty rule the
+	 * inspector follows.
+	 */
+	string function toCodeGraphSequence( required struct snapshot, struct options = {} ) {
+		var flows = isArray( arguments.snapshot.flows ?: "" ) ? arguments.snapshot.flows : [];
+		var wanted = trim( toString( arguments.options.flowId ?: "" ) );
+		var hash = char( 35 );
+		var flow = "";
+		for ( var candidate in flows ) {
+			if ( !isStruct( candidate ) ) continue;
+			if ( !len( wanted ) || toString( candidate.id ?: "" ) == wanted ) {
+				flow = candidate;
+				break;
+			}
+		}
+		if ( !isStruct( flow ) ) {
+			return '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" role="img" aria-label="DoubleCheck CodeGraph: no flow">'
+				& '<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>'
+				& '<text x="24" y="64" font-family="' & fontStack() & '" font-size="15" fill="' & hash & '475569">No process flow in this snapshot.</text>'
+				& '</svg>';
+		}
+
+		var steps = isArray( flow.steps ?: "" ) ? flow.steps : [];
+		var kinds = isArray( flow.edgeKinds ?: "" ) ? flow.edgeKinds : [];
+		var symbols = isArray( flow.stepSymbols ?: "" ) ? flow.stepSymbols : [];
+		if ( steps.len() < 2 ) {
+			return '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" role="img" aria-label="DoubleCheck CodeGraph: flow too short">'
+				& '<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>'
+				& '<text x="24" y="64" font-family="' & fontStack() & '" font-size="15" fill="' & hash & '475569">This flow has fewer than two participants.</text>'
+				& '</svg>';
+		}
+
+		var columnWidth = 232;
+		var marginX = 32;
+		var headerY = 88;
+		var rowHeight = 56;
+		var width = marginX * 2 + ( steps.len() * columnWidth );
+		var height = headerY + ( ( steps.len() - 1 ) * rowHeight ) + 72;
+
+		var lines = [
+			'<svg xmlns="http://www.w3.org/2000/svg" width="' & width & '" height="' & height & '" viewBox="0 0 ' & width & ' ' & height & '" role="img" aria-label="DoubleCheck CodeGraph process flow">',
+			'<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>',
+			'<text x="32" y="36" font-family="' & fontStack() & '" font-size="19" fill="' & hash & '0f172a">' & xmlEscape( participantLabel( steps[ 1 ] ) ) & ' — process flow</text>',
+			'<text x="32" y="56" font-family="' & monoStack() & '" font-size="11" fill="' & hash & '64748b">' & steps.len() & ' participants · sink ' & xmlEscape( toString( flow.sinkKind ?: "unknown" ) ) & '</text>'
+		];
+
+		// Participant columns and their lifelines.
+		for ( var index = 1; index <= steps.len(); index++ ) {
+			var centreX = marginX + ( ( index - 1 ) * columnWidth ) + int( columnWidth / 2 );
+			lines.append(
+				'<text x="' & centreX & '" y="' & ( headerY - 16 ) & '" text-anchor="middle" font-family="' & monoStack()
+				& '" font-size="11" fill="' & hash & '0f172a">' & xmlEscape( truncateLabel( participantLabel( steps[ index ] ), 28 ) ) & '</text>'
+			);
+			lines.append(
+				'<line x1="' & centreX & '" y1="' & headerY & '" x2="' & centreX & '" y2="' & ( height - 40 )
+				& '" stroke="' & hash & 'e2e8f0" stroke-width="1"/>'
+			);
+		}
+
+		// One row per hop.
+		for ( var hop = 1; hop < steps.len(); hop++ ) {
+			var fromX = marginX + ( ( hop - 1 ) * columnWidth ) + int( columnWidth / 2 );
+			var toX = marginX + ( hop * columnWidth ) + int( columnWidth / 2 );
+			var y = headerY + ( hop * rowHeight );
+			var kind = hop <= kinds.len() ? toString( kinds[ hop ] ) : "";
+			var owner = hop <= symbols.len() ? trim( toString( symbols[ hop ] ) ) : "";
+			lines.append( '<line x1="' & fromX & '" y1="' & y & '" x2="' & ( toX - 8 ) & '" y2="' & y & '" stroke="' & hash & '475569" stroke-width="1"/>' );
+			lines.append( '<path d="M ' & ( toX - 8 ) & ' ' & ( y - 4 ) & ' L ' & toX & ' ' & y & ' L ' & ( toX - 8 ) & ' ' & ( y + 4 ) & ' Z" fill="' & hash & '475569"/>' );
+			lines.append(
+				'<text x="' & int( ( fromX + toX ) / 2 ) & '" y="' & ( y - 8 ) & '" text-anchor="middle" font-family="' & fontStack()
+				& '" font-size="11" fill="' & hash & '0f172a">' & xmlEscape( kind ) & '</text>'
+			);
+			lines.append(
+				'<text x="' & int( ( fromX + toX ) / 2 ) & '" y="' & ( y + 16 ) & '" text-anchor="middle" font-family="' & monoStack()
+				& '" font-size="10" fill="' & hash & '64748b">' & xmlEscape( len( owner ) ? owner : "(file level)" ) & '</text>'
+			);
+		}
+
+		lines.append( "</svg>" );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	/** `route:/api/v1/x` and `table:orders` read better than their raw ids. */
+	private string function participantLabel( required any step ) {
+		var value = trim( toString( arguments.step ?: "" ) );
+		if ( left( value, 6 ) == "route:" ) return mid( value, 7, len( value ) );
+		if ( left( value, 6 ) == "table:" ) return mid( value, 7, len( value ) );
+		return listLast( value, "/" );
+	}
+
+	/**
+	 * Dependency Structure Matrix: the module graph as a square grid.
+	 *
+	 * A box-and-arrow diagram stops being readable well before a real codebase
+	 * stops having modules. A DSM is the adjacency matrix drawn directly, so
+	 * density costs a cell rather than a crossing line — which is why IDEs and
+	 * architecture tools reach for it at exactly this scale. Cycles read as marks
+	 * on both sides of the diagonal.
+	 *
+	 * Row and column order is the cluster id order, held stable so two exports of
+	 * the same snapshot are comparable.
+	 */
+	string function toCodeGraphMatrix( required struct snapshot ) {
+		var clusters = isArray( arguments.snapshot.clusters ?: "" ) ? arguments.snapshot.clusters : [];
+		var clusterEdges = isArray( arguments.snapshot.clusterEdges ?: "" ) ? arguments.snapshot.clusterEdges : [];
+		var hash = char( 35 );
+
+		var visible = [];
+		for ( var cluster in clusters ) {
+			if ( !isStruct( cluster ) ) continue;
+			visible.append( cluster );
+			if ( visible.len() >= 24 ) break;
+		}
+		if ( !visible.len() ) {
+			return '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120" role="img" aria-label="DoubleCheck CodeGraph: no clusters">'
+				& '<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>'
+				& '<text x="24" y="64" font-family="' & fontStack() & '" font-size="15" fill="' & hash & '475569">No clusters in this snapshot.</text>'
+				& '</svg>';
+		}
+
+		var indexOf = {};
+		for ( var index = 1; index <= visible.len(); index++ ) indexOf[ toString( visible[ index ].id ?: "" ) ] = index;
+
+		var weights = {};
+		for ( var edge in clusterEdges ) {
+			if ( !isStruct( edge ) ) continue;
+			var fromIndex = indexOf[ toString( edge.from ?: "" ) ] ?: 0;
+			var toIndex = indexOf[ toString( edge.to ?: "" ) ] ?: 0;
+			if ( !fromIndex || !toIndex ) continue;
+			weights[ fromIndex & ":" & toIndex ] = val( edge.weight ?: edge.edgeCount ?: 1 );
+		}
+
+		var cell = 24;
+		var labelWidth = 176;
+		var headerHeight = 96;
+		var marginX = 32;
+		var gridWidth = visible.len() * cell;
+		var width = marginX + labelWidth + gridWidth + 32;
+		var height = headerHeight + gridWidth + 40;
+
+		var lines = [
+			'<svg xmlns="http://www.w3.org/2000/svg" width="' & width & '" height="' & height & '" viewBox="0 0 ' & width & ' ' & height & '" role="img" aria-label="DoubleCheck CodeGraph dependency structure matrix">',
+			'<rect width="100%" height="100%" fill="' & hash & 'ffffff"/>',
+			'<text x="32" y="36" font-family="' & fontStack() & '" font-size="19" fill="' & hash & '0f172a">Dependency structure matrix</text>',
+			'<text x="32" y="56" font-family="' & monoStack() & '" font-size="11" fill="' & hash & '64748b">row depends on column · ' & visible.len() & ' of ' & clusters.len() & ' modules</text>'
+		];
+
+		var gridX = marginX + labelWidth;
+		for ( var row = 1; row <= visible.len(); row++ ) {
+			var y = headerHeight + ( ( row - 1 ) * cell );
+			lines.append(
+				'<text x="' & ( gridX - 8 ) & '" y="' & ( y + 16 ) & '" text-anchor="end" font-family="' & monoStack()
+				& '" font-size="10" fill="' & hash & '0f172a">' & xmlEscape( truncateLabel( trim( toString( visible[ row ].label ?: visible[ row ].id ?: "" ) ), 22 ) ) & '</text>'
+			);
+			for ( var column = 1; column <= visible.len(); column++ ) {
+				var x = gridX + ( ( column - 1 ) * cell );
+				var weight = weights[ row & ":" & column ] ?: 0;
+				var fill = row == column ? hash & 'e2e8f0' : ( weight > 0 ? hash & '334155' : hash & 'ffffff' );
+				lines.append(
+					'<rect x="' & x & '" y="' & y & '" width="' & cell & '" height="' & cell
+					& '" fill="' & fill & '" stroke="' & hash & 'e2e8f0" stroke-width="1"/>'
+				);
+			}
+		}
+
+		if ( clusters.len() > visible.len() ) {
+			lines.append(
+				'<text x="32" y="' & ( height - 16 ) & '" font-family="' & fontStack() & '" font-size="12" fill="' & hash & '64748b">+'
+				& ( clusters.len() - visible.len() ) & ' more modules not drawn</text>'
+			);
+		}
+		lines.append( "</svg>" );
+		return arrayToList( lines, char( 10 ) );
+	}
+
+	/** Local stacks only: an export that fetches a webfont on open is not local-only. */
+	private string function fontStack() {
+		return "IBM Plex Sans, Segoe UI, system-ui, sans-serif";
+	}
+
+	private string function monoStack() {
+		return "IBM Plex Mono, Consolas, monospace";
+	}
+
+	private string function truncateLabel( required string label, required numeric maximum ) {
+		return len( arguments.label ) > arguments.maximum ? left( arguments.label, arguments.maximum - 1 ) & "…" : arguments.label;
+	}
+
+	/**
+	 * The symbol index in a SCIP-shaped JSON document.
+	 *
+	 * SCIP replaced LSIF as the de-facto interchange for symbol and reference
+	 * graphs, so emitting its shape makes this index usable by other local tools
+	 * without importing a runtime dependency or implying support for languages
+	 * DoubleCheck does not analyse.
+	 *
+	 * Export only. Nothing reads this back, and pretending otherwise would be a
+	 * second ingestion path to keep correct.
+	 */
+	string function toScipDocument( required struct snapshot, required array symbolNodes, required array symbolEdges ) {
+		var documents = {};
+		for ( var node in arguments.symbolNodes ) {
+			if ( !isStruct( node ) ) continue;
+			var path = trim( toString( node.path ?: "" ) );
+			if ( !len( path ) ) continue;
+			if ( !documents.keyExists( path ) ) documents[ path ] = { relativePath: path, occurrences: [], symbols: [] };
+			documents[ path ].symbols.append( {
+				symbol       : scipSymbol( node ),
+				displayName  : trim( toString( node.symbolName ?: "" ) ),
+				kind         : trim( toString( node.kind ?: "symbol" ) ),
+				// Kythe's distinction: a definition is a binding, a reference is not.
+				relationships: []
+			} );
+			documents[ path ].occurrences.append( {
+				range      : [ val( node.line ?: 0 ), 0, val( node.endLine ?: node.line ?: 0 ), 0 ],
+				symbol     : scipSymbol( node ),
+				symbolRoles: 1
+			} );
+		}
+		for ( var edge in arguments.symbolEdges ) {
+			if ( !isStruct( edge ) ) continue;
+			var source = trim( toString( edge.from ?: "" ) );
+			if ( !len( source ) ) continue;
+			for ( var path in documents ) {
+				for ( var symbol in documents[ path ].symbols ) {
+					if ( symbol.symbol != source ) continue;
+					symbol.relationships.append( { symbol: trim( toString( edge.to ?: "" ) ), isReference: true, kind: trim( toString( edge.kind ?: "" ) ) } );
+				}
+			}
+		}
+		var ordered = structKeyArray( documents );
+		ordered.sort( ( a, b ) => compareNoCase( a, b ) );
+		var payload = [];
+		for ( var path in ordered ) payload.append( documents[ path ] );
+		return jsonSerialize( {
+			metadata: {
+				version           : "scip-shaped-v1",
+				toolInfo          : { name: "doublecheck-codegraph", version: toString( arguments.snapshot.version ?: "" ) },
+				projectRoot       : toString( arguments.snapshot.projectPath ?: "" ),
+				textDocumentEncoding: "UTF8"
+			},
+			documents: payload
+		} );
+	}
+
+	/** Stable, path-qualified symbol identity. */
+	private string function scipSymbol( required struct node ) {
+		return trim( toString( arguments.node.id ?: "" ) );
+	}
+
+	private string function xmlEscape( required any value ) {
+		var escaped = replace( toString( arguments.value ?: "" ), "&", "&amp;", "all" );
+		escaped = replace( escaped, "<", "&lt;", "all" );
+		escaped = replace( escaped, ">", "&gt;", "all" );
+		return replace( escaped, char( 34 ), "&quot;", "all" );
+	}
+}

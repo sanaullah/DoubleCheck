@@ -1,0 +1,115 @@
+/**
+ * Structural centrality over the file graph.
+ *
+ * Retention and attention are different questions. `hotspotScore` mixes structure
+ * with git churn, which is right for an editorial "look here first" list and
+ * wrong for deciding what the graph contains — that is BD-3, and this service is
+ * the split.
+ *
+ * @see CodeGraphMetricsService
+ */
+@singleton
+class threadsafe {
+
+	/**
+	 * Structural centrality over the file graph, for deciding what the graph keeps.
+	 *
+	 * `hotspotScore` mixes structure with git churn, which is right for an editorial
+	 * "look here first" list and wrong for deciding membership: it is an opinion
+	 * about attention, and retention is a question about structure. Splitting them
+	 * is BD-3.
+	 *
+	 * Power iteration with a fixed count and no convergence-epsilon exit, rounded on
+	 * the way out, so the same input always produces the same ranking — determinism
+	 * is contract here, and an early exit on a floating-point threshold is exactly
+	 * how that breaks across machines.
+	 */
+	struct function rank( required any graph, required array nodes ) {
+		var damping = 0.85;
+		var iterations = 20;
+		var ids = [];
+		var rank = {};
+		for ( var node in arguments.nodes ) {
+			var key = normalizePath( node.id ?: node.path ?: "" );
+			if ( !len( key ) ) continue;
+			ids.append( key );
+			rank[ key ] = 1;
+		}
+		if ( !ids.len() ) return {};
+
+		var outbound = {};
+		var inbound = {};
+		for ( var edge in arguments.graph.getEdges() ) {
+			var from = normalizePath( edge.fromFile ?: "" );
+			var to = normalizePath( edge.toFile ?: "" );
+			if ( !rank.keyExists( from ) || !rank.keyExists( to ) || from == to ) continue;
+			outbound[ from ] = ( outbound[ from ] ?: 0 ) + 1;
+			if ( !inbound.keyExists( to ) ) inbound[ to ] = [];
+			inbound[ to ].append( from );
+		}
+
+		var total = ids.len();
+		var base = ( 1 - damping ) / total;
+		for ( var pass = 1; pass <= iterations; pass++ ) {
+			var next = {};
+			// Rank that would otherwise vanish from files nothing references is spread
+			// evenly, so a dangling node cannot quietly drain the whole graph.
+			var dangling = 0;
+			for ( var id in ids ) if ( !( outbound[ id ] ?: 0 ) ) dangling += rank[ id ];
+			var spread = damping * dangling / total;
+			for ( var id in ids ) {
+				var incoming = 0;
+				for ( var source in ( inbound[ id ] ?: [] ) ) incoming += rank[ source ] / max( 1, outbound[ source ] ?: 1 );
+				next[ id ] = base + spread + ( damping * incoming );
+			}
+			rank = next;
+		}
+		for ( var id in ids ) rank[ id ] = round4( rank[ id ] );
+		return rank;
+	}
+
+
+	/** Why a file ranks where it does, in the terms a reader can check. */
+	string function rankRationale(
+		required numeric fanIn,
+		required numeric fanOut,
+		required numeric churn,
+		required boolean inCycle,
+		required numeric crossingEdgeCount
+	) {
+		var parts = [];
+		parts.append( "#arguments.fanIn# caller#arguments.fanIn == 1 ? "" : "s"#" );
+		if ( arguments.fanOut > 0 ) parts.append( "#arguments.fanOut# dependenc#arguments.fanOut == 1 ? "y" : "ies"#" );
+		if ( arguments.churn > 0 ) parts.append( "#arguments.churn# commit#arguments.churn == 1 ? "" : "s"#" );
+		if ( arguments.inCycle ) parts.append( "in a cycle" );
+		if ( arguments.crossingEdgeCount > 0 ) parts.append( "#arguments.crossingEdgeCount# crossing edge#arguments.crossingEdgeCount == 1 ? "" : "s"#" );
+		return arrayToList( parts, " · " );
+	}
+
+	numeric function hotspotScore(
+		required numeric fanIn,
+		required numeric fanOut,
+		required numeric churn,
+		required boolean inCycle,
+		required numeric crossingEdgeCount
+	) {
+		return ( max( 1, arguments.fanIn ) + ( 0.5 * max( 0, arguments.fanOut ) ) ) *
+			max( 1, arguments.churn ) *
+			( arguments.inCycle ? 2 : 1 ) +
+			arguments.crossingEdgeCount;
+	}
+
+	string function hotspotFormula() {
+		return "((max(1,fanIn) + 0.5*fanOut) * max(1,churnCount) * cycleMultiplier) + crossingEdges; churnCount=1 when Git history is unavailable";
+	}
+
+	private numeric function round4( required numeric value ) {
+		return round( arguments.value * 10000 ) / 10000;
+	}
+
+	private string function normalizePath( required any path ) {
+		var value = lCase( replace( trim( toString( arguments.path ?: "" ) ), "\", "/", "all" ) );
+		while ( find( "//", value ) ) value = replace( value, "//", "/", "all" );
+		return value;
+	}
+}

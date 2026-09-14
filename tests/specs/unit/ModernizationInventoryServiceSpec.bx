@@ -1,0 +1,253 @@
+class extends="testbox.system.BaseSpec" {
+    function run() {
+        describe( "ModernizationInventoryService", () => {
+            it( "extracts CFML units, dependencies, routes, and unresolved evidence", () => {
+                var service = new app.models.services.ModernizationInventoryService();
+                var result = service.build( { files: [
+                    { filePath: "Application.cfc", language: "ColdFusion", content: "component { function onApplicationStart() {} }", contentHash: "a" },
+                    { filePath: "index.cfm", language: "ColdFusion", content: '<cfinclude template="header.cfm"><form action="/orders.cfm"><cfhttp url="https://example.invalid">', contentHash: "b" },
+                    { filePath: "Order.cfc", language: "ColdFusion", content: 'component { function getOrder() { return queryExecute("SELECT id FROM orders"); } }', contentHash: "c" }
+                ] } );
+                expect( result.noModernizationScope ).toBeFalse();
+                expect( result.units.len() ).toBeGT( 2 );
+                expect( result.units.map( ( item ) => item.unitType ) ).toInclude( "application" );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "include" );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "http" );
+                expect( result.routeEvidence.len() ).toBe( 1 );
+                expect( result.routeEvidence[ 1 ].method ).toBe( "GET" );
+            } );
+
+            it( "normalizes Windows paths before classifying nested Application files", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "dashboard" & char( 92 ) & "Application.cfc",
+                        language: "ColdFusion",
+                        content: "component { function onRequestStart() {} }",
+                        contentHash: "nested-application"
+                    }
+                ] } );
+                expect( result.files[ 1 ].filePath ).toBe( "dashboard/Application.cfc" );
+                expect( result.units.filter( ( item ) => item.unitType == "application" ) ).toHaveLength( 1 );
+                expect( result.units[ 1 ].filePath ).toBe( "dashboard/Application.cfc" );
+            } );
+
+            it( "captures extends and implements from tag and script components", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "TagGateway.cfc",
+                        language: "ColdFusion",
+                        content: '<cfcomponent extends="app.models.BaseGateway" implements="app.models.IGateway,app.models.ILoggable">' & char( 10 )
+                            & '<cffunction name="find"></cffunction>' & char( 10 )
+                            & '</cfcomponent>',
+                        contentHash: "tag-gateway"
+                    },
+                    {
+                        filePath: "ScriptCart.cfc",
+                        language: "ColdFusion",
+                        content: 'component extends="app.models.BaseModel" {' & char( 10 )
+                            & '    function total() { return 0; }' & char( 10 )
+                            & '}',
+                        contentHash: "script-cart"
+                    }
+                ] } );
+                var extendsTargets = result.dependencies.filter( ( item ) => item.kind == "extends" ).map( ( item ) => item.target );
+                var implementsTargets = result.dependencies.filter( ( item ) => item.kind == "implements" ).map( ( item ) => item.target );
+
+                expect( extendsTargets ).toInclude( "app.models.BaseGateway" );
+                expect( extendsTargets ).toInclude( "app.models.BaseModel" );
+                expect( implementsTargets ).toInclude( "app.models.IGateway" );
+                expect( implementsTargets ).toInclude( "app.models.ILoggable" );
+            } );
+
+            it( "extracts a cffunction name and extends when attributes wrap across lines", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "WrappedGateway.cfc",
+                        language: "ColdFusion",
+                        content: '<cfcomponent' & char( 10 )
+                            & '    extends="app.models.BaseGateway">' & char( 10 )
+                            & '<cffunction' & char( 10 )
+                            & '    name="findUser">' & char( 10 )
+                            & '</cffunction>' & char( 10 )
+                            & '</cfcomponent>',
+                        contentHash: "wrapped-gateway"
+                    }
+                ] } );
+                var functionNames = result.units.filter( ( item ) => item.unitType == "function" ).map( ( item ) => item.symbolName );
+                var extendsTargets = result.dependencies.filter( ( item ) => item.kind == "extends" ).map( ( item ) => item.target );
+
+                expect( functionNames ).toInclude( "findUser" );
+                expect( extendsTargets ).toInclude( "app.models.BaseGateway" );
+            } );
+
+            it( "keeps opaque components and function signatures visible", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    { filePath: "Opaque.cfc", language: "ColdFusion", content: "component { /* unsupported dynamic body */ }", contentHash: "opaque" },
+                    { filePath: "Orders.cfc", language: "ColdFusion", content: "component { public string function list(required string status, numeric page=1) { return ''; } }", contentHash: "orders" }
+                ] } );
+                expect( result.units.map( ( item ) => item.unitType ) ).toInclude( "component" );
+                var listUnit = result.units.filter( ( item ) => item.symbolName == "list" )[ 1 ];
+                expect( listUnit.signature ).toInclude( "list(" );
+                expect( listUnit.parameters.len() ).toBeGT( 0 );
+            } );
+
+            it( "ignores comments and non-navigation attributes when extracting routes and schedules", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "portal.cfm",
+                        language: "ColdFusion",
+                        content: '<!--- Available on the GSA schedule --->' & char( 10 )
+                            & '<cffile action="write" file="report.txt">' & char( 10 )
+                            & '<cfpdf action="read" source="report.pdf">' & char( 10 )
+                            & '<link href="assets/site.css" rel="stylesheet">' & char( 10 )
+                            & '<a href="dashboard/index.cfm">Dashboard</a>',
+                        contentHash: "portal"
+                    }
+                ] } );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).notToInclude( "schedule" );
+                expect( result.routeEvidence.len() ).toBe( 1 );
+                expect( result.routeEvidence[ 1 ].legacyPath ).toBe( "dashboard/index.cfm" );
+                expect( result.routeEvidence[ 1 ].routeKind ).toBe( "anchor" );
+            } );
+
+            it( "does not extract functions from CFML comments and preserves live line numbers", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "Application.cfc",
+                        language: "ColdFusion",
+                        content: '<cffunction name="onApplicationStart"></cffunction>' & char( 10 )
+                            & '<!---' & char( 10 )
+                            & '<cffunction name="onError">' & char( 10 )
+                            & '</cffunction>' & char( 10 )
+                            & '--->' & char( 10 )
+                            & 'public void function onRequestStart() {}',
+                        contentHash: "commented-lifecycle"
+                    }
+                ] } );
+                var functions = result.units.filter( ( item ) => listFindNoCase( "function,lifecycle-hook", item.unitType ) );
+				// v6 extends SQL analysis past the line a query opens on, so
+			// multi-line tag queries yield their table references. The version
+			// feeds the inventory fingerprint, which is what stops a cached v5
+			// inventory — one with no tables — being reused as if current.
+			expect( result.version ).toBe( "cfml-inventory-conservative-v6" );
+                expect( functions.map( ( item ) => item.symbolName ) ).toBe( [ "onApplicationStart", "onRequestStart" ] );
+                // Application.cfc lifecycle methods are tagged distinctly (Phase 3).
+                expect( functions.every( ( item ) => item.unitType == "lifecycle-hook" ) ).toBeTrue();
+                expect( functions.filter( ( item ) => item.symbolName == "onRequestStart" )[ 1 ].startLine ).toBe( 6 );
+			} );
+
+			it( "keeps real component construction, resolves targets, and drops builtin/JavaScript new calls", () => {
+				var result = new app.models.services.ModernizationInventoryService().build( { files: [
+					{ filePath: "dashboard/components/crime.cfc", language: "ColdFusion", content: "component {}", contentHash: "crime" },
+					{ filePath: "webportal/Application.cfc", language: "ColdFusion", content: "component {}", contentHash: "webportal-application" },
+					{ filePath: "includes/header.cfm", language: "ColdFusion", content: "<h1>Header</h1>", contentHash: "header" },
+					{ filePath: "Base.cfc", language: "ColdFusion", content: '<cfcomponent extends="crime">' & char( 10 ) & "</cfcomponent>", contentHash: "base" },
+					{
+						filePath: "dashboard/index.cfm",
+						language: "ColdFusion",
+						content: 'new Array(); new Query(); new i(); new GStreetviewPanorama(); new Http(); new Ext.Viewport(); new crime(); new opengovdashboard.webportal.Application();' & char( 10 )
+							& 'createObject("component", "dashboard.components.crime");' & char( 10 )
+							& 'createObject("component", application.settings.cfcPath & "crime");' & char( 10 )
+							& 'createObject("component", "' & char( 35 ) & 'application.settings.cfcPath' & char( 35 ) & 'crime");' & char( 10 )
+							& '<cfobject component="crime">' & char( 10 )
+							& '<cfinvoke component="crime">' & char( 10 )
+							& '<cfinclude template="header.cfm">' & char( 10 )
+							& 'createObject("component", "missing")',
+						contentHash: "dashboard-index"
+					}
+				] } );
+
+				var constructions = result.dependencies.filter( ( item ) => item.kind == "component-construction" );
+				var targets = constructions.map( ( item ) => item.target );
+				expect( targets ).toInclude( "crime" );
+				expect( targets ).toInclude( "dashboard.components.crime" );
+				expect( targets ).toInclude( "opengovdashboard.webportal.Application" );
+				expect( targets ).toInclude( "missing" );
+				expect( targets ).notToInclude( "Array" );
+				expect( targets ).notToInclude( "Query" );
+				expect( targets ).notToInclude( "i" );
+				expect( targets ).notToInclude( "GStreetviewPanorama" );
+				expect( targets ).notToInclude( "Http" );
+				expect( targets ).notToInclude( "Ext.Viewport" );
+				expect( targets ).notToInclude( "extends" );
+
+				var dotted = constructions.filter( ( item ) => item.target == "dashboard.components.crime" )[ 1 ];
+				expect( dotted.targetFile ).toBe( "dashboard/components/crime.cfc" );
+				expect( dotted.resolution ).toBe( "dotted-path" );
+				var bare = constructions.filter( ( item ) => item.target == "crime" && structKeyExists( item, "targetFile" ) )[ 1 ];
+				expect( bare.targetFile ).toBe( "dashboard/components/crime.cfc" );
+				expect( bare.resolution ).toBe( "stem" );
+				var dottedApplication = constructions.filter( ( item ) => item.target == "opengovdashboard.webportal.Application" )[ 1 ];
+				expect( dottedApplication.targetFile ).toBe( "webportal/Application.cfc" );
+				var unresolved = constructions.filter( ( item ) => item.target == "missing" )[ 1 ];
+				expect( structKeyExists( unresolved, "targetFile" ) ).toBeFalse();
+				expect( result.unresolved.filter( ( item ) => item.kind == "dynamic-component" ).len() ).toBeGT( 0 );
+
+				var include = result.dependencies.filter( ( item ) => item.kind == "include" )[ 1 ];
+				expect( include.targetFile ).toBe( "includes/header.cfm" );
+				expect( include.resolution ).toBe( "basename" );
+				var extendsDependency = result.dependencies.filter( ( item ) => item.kind == "extends" )[ 1 ];
+				expect( extendsDependency.target ).toBe( "crime" );
+				expect( result.dependencies.filter( ( item ) => item.target == "extends" ) ).toBeEmpty();
+			} );
+
+            it( "extracts the declared name from tag and script remote methods", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [
+                    {
+                        filePath: "Api.cfc",
+                        language: "ColdFusion",
+                        content: '<cffunction name="loadCrime" access="remote"></cffunction>' & char( 10 )
+                            & 'remote struct function saveCrime() { return {}; }',
+                        contentHash: "api"
+                    }
+                ] } );
+                expect( result.routeEvidence.map( ( item ) => item.legacyPath ) ).toInclude( "remote:loadCrime" );
+                expect( result.routeEvidence.map( ( item ) => item.legacyPath ) ).toInclude( "remote:saveCrime" );
+            } );
+
+            it( "returns a typed result for an empty CFML scope", () => {
+                var result = new app.models.services.ModernizationInventoryService().build( { files: [ { filePath: "main.bx", language: "BoxLang", content: "class {}" } ] } );
+                expect( result.type ).toBe( "NoModernizationScope" );
+                expect( result.noModernizationScope ).toBeTrue();
+            } );
+
+			it( "keeps every CFML file structurally visible while bounding deep extraction", () => {
+				var result = new app.models.services.ModernizationInventoryService().build( {
+					maxDeepFiles: 1,
+					files: [
+						{ filePath: "app/Application.cfc", language: "ColdFusion", content: "component { function onApplicationStart() {} }", contentHash: "app", lineCount: 1 },
+						{ filePath: "orders/list.cfm", language: "ColdFusion", content: "<cfquery>SELECT id FROM orders</cfquery>", contentHash: "orders", lineCount: 1 },
+						{ filePath: "admin/index.cfm", language: "ColdFusion", content: '<a href="users.cfm">Users</a>', contentHash: "admin", lineCount: 1 }
+					]
+				} );
+
+				expect( result.files ).toHaveLength( 3 );
+				expect( result.units.filter( ( item ) => listFindNoCase( "application,page", item.unitType ) ) ).toHaveLength( 3 );
+				expect( result.summary.deepFiles ).toBe( 1 );
+				expect( result.summary.shallowFiles ).toBe( 2 );
+				expect( result.summary.structureComplete ).toBeTrue();
+				expect( result.summary.detailCoverage ).toBe( "bounded" );
+				expect( result.files.filter( ( item ) => item.detailCoverage == "structural" ) ).toHaveLength( 2 );
+			} );
+
+            it( "indexes the compact legacy-shop fixture with unresolved evidence", () => {
+                var root = createObject( "java", "java.io.File" ).init( expandPath( "/tests/fixtures/modernization/legacy-shop" ) ).getCanonicalFile();
+                var files = [];
+                var listing = directoryList( root.getPath(), true, "query" );
+                for ( var row = 1; row <= listing.recordCount; row++ ) {
+                    if ( lCase( listing.type[ row ] ?: "" ) != "file" ) continue;
+                    var file = createObject( "java", "java.io.File" ).init( listing.directory[ row ] & createObject( "java", "java.io.File" ).separator & listing.name[ row ] ).getCanonicalFile();
+                    var relative = replace( root.toPath().relativize( file.toPath() ).toString(), "\", "/", "all" );
+                    files.append( { filePath: relative, language: "ColdFusion", content: fileRead( file.getPath() ), contentHash: lCase( hash( fileRead( file.getPath() ), "SHA-256" ) ) } );
+                }
+                var result = new app.models.services.ModernizationInventoryService().build( { files: files, scope: "full" } );
+                expect( result.units.len() ).toBeGT( 3 );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "query" );
+                expect( result.dependencies.map( ( item ) => item.kind ) ).toInclude( "http" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "unparameterized-sql" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "dynamic-evaluate" );
+                expect( result.unresolved.map( ( item ) => item.kind ) ).toInclude( "dynamic-component" );
+            } );
+        } );
+    }
+}

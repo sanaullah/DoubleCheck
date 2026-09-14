@@ -1,0 +1,86 @@
+/**
+ * End-to-end cover for the review pipeline (ReviewRunService.executeRun).
+ *
+ * This spec exists because nothing else exercises it. Two separate attempts to
+ * extract the pipeline into its own service produced a fully green suite and a
+ * completely broken review: one died as "Run was cancelled" from a malformed
+ * lifecycle closure, the other failed silently. A 585-spec suite could not see
+ * either, because every other spec stubs the pipeline or tests around it.
+ *
+ * It drives the real path -- create() enqueues and the worker executes
+ * asynchronously -- and waits for a terminal state, rather than calling
+ * executeRun() directly. Calling it directly races the worker: whichever
+ * claims first wins, and the loser returns immediately on a null claim, which
+ * looks like success while proving nothing.
+ *
+ * Anyone refactoring executeRun should run THIS before believing the suite.
+ */
+class extends="coldbox.system.testing.BaseTestCase" {
+
+	function run() {
+		describe( "review pipeline end to end", () => {
+
+			// The pipeline needs real CFML on disk to scan.
+			var fixturePath = expandPath( "/tests/../resources/evaluation-corpus/modernization-v1/cases/separable-domain" );
+			var terminal = [ "succeeded", "partial", "failed", "cancelled" ];
+
+			var runToCompletion = () => {
+				var runService = getInstance( "ReviewRunService" );
+				var queries = getInstance( "ReviewRunQueryService" );
+				var runId = runService.create( {
+					projectPath: fixturePath,
+					runKind    : "review",
+					mode       : "full"
+				} ).getId();
+
+				// Bounded wait: the fixture is three small files, so a healthy
+				// pipeline finishes well inside this. Timing out is itself a
+				// failure worth reporting.
+				var waited = 0;
+				var status = "";
+				while ( waited < 60000 ) {
+					var current = queries.get( runId );
+					status = isNull( current ) ? "" : ( current.getStatus() ?: "" );
+					if ( terminal.contains( status ) ) break;
+					sleep( 500 );
+					waited += 500;
+				}
+				return { runId: runId, status: status, waitedMs: waited };
+			};
+
+			it( "carries a queued run to a terminal state with a persisted summary", () => {
+				var outcome = runToCompletion();
+
+				expect( terminal ).toInclude(
+					outcome.status,
+					"run never reached a terminal state (waited #outcome.waitedMs#ms, last status '#outcome.status#')"
+				);
+				// A healthy review ends succeeded or partial. "failed" and
+				// "cancelled" are both real breakage: the first extraction attempt
+				// threw inside the pipeline, which the catch converts to
+				// *cancelled* -- so accepting that status would have let the very
+				// bug this spec exists for slip straight through.
+				expect( [ "succeeded", "partial" ] ).toInclude(
+					outcome.status,
+					"review ended '#outcome.status#'; expected succeeded or partial"
+				);
+
+				var result = getInstance( "ReviewRunQueryService" ).getResult( outcome.runId );
+				expect( trim( toString( result.summary ?: "" ) ) ).notToBeEmpty(
+					"the pipeline completed without persisting a summary"
+				);
+				expect( val( result.filesScanned ?: 0 ) ).toBeGT(
+					0,
+					"zero files scanned on a fixture that contains CFML"
+				);
+			} );
+
+			it( "advances the run past the queued phase", () => {
+				var outcome = runToCompletion();
+				var after = getInstance( "ReviewRunQueryService" ).get( outcome.runId );
+				expect( after.getCurrentPhase() ).notToBe( "queued" );
+				expect( val( after.getProgress() ?: 0 ) ).toBeGT( 0 );
+			} );
+		} );
+	}
+}

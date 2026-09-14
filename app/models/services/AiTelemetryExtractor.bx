@@ -1,0 +1,307 @@
+/**
+ * Turns a bx-ai agent context into the observation fields DoubleCheck records:
+ * token usage, prompt/response text, tool calls, and the observation type.
+ *
+ * Split from SpecialistAgentGateway (Part 5), which was the largest file in
+ * app/models. This is a pure transform — no provider call, no run state, no
+ * injections — so it moved verbatim.
+ *
+ * Checked against the installed bx-ai (3.3.2+17) before moving:
+ * FlightRecorderMiddleware records its own per-interaction trace keyed on
+ * seq/type/toolName/arguments/result. That is a different shape from these
+ * observations, so adopting it would be a contract change, not a refactor.
+ * These extractors are therefore a move, not a delete.
+ *
+ * Text is redacted to a length+digest by telemetryScalar before it is recorded:
+ * observations must never carry raw prompt or response content.
+ */
+@singleton
+class threadsafe {
+	public string function observationTypeFor( required string kind ) {
+		switch ( arguments.kind ) {
+			case "llm":
+				return "generation";
+			case "tool":
+				return "tool";
+			case "prompt":
+
+			case "response":
+
+			case "agent":
+				return "span";
+			case "fallback":
+				return "event";
+			default:
+				return "event";
+		}
+	}
+
+	public string function safeText( required any body ) {
+		if ( isNull( arguments.body ) ) {
+			return "";
+		}
+		if ( isSimpleValue( arguments.body ) ) {
+			return telemetryScalar( toString( arguments.body ) );
+		}
+		if ( isArray( arguments.body ) ) {
+			return summarizeMessages( arguments.body );
+		}
+		if ( isStruct( arguments.body ) ) {
+			var lines = [];
+			for ( var key in arguments.body ) {
+				var value = arguments.body[ key ];
+				if ( isNull( value ) ) {
+					lines.append( key & " = " );
+				} else if ( isSimpleValue( value ) ) {
+					lines.append( key & " = " & telemetryScalar( toString( value ) ) );
+				} else if ( isArray( value ) ) {
+					lines.append( key & " = [array:" & arrayLen( value ) & "]" );
+				} else if ( isStruct( value ) ) {
+					lines.append( key & " = [struct]" );
+				} else {
+					lines.append( key & " = [object]" );
+				}
+			}
+			return lines.toList( char( 10 ) );
+		}
+		try {
+			return left( toString( arguments.body ), 400 );
+		} catch (any ignoreBody) {
+			return "[unserializable payload]";
+		}
+	}
+
+	public struct function extractUsage( required any ctx ) {
+		var usage = {};
+		if ( isNull( arguments.ctx ) || !isStruct( arguments.ctx ) ) {
+			return usage;
+		}
+		var source = {};
+		if ( structKeyExists( arguments.ctx, "result" ) && isStruct( arguments.ctx.result ) ) {
+			if (
+				structKeyExists( arguments.ctx.result, "usage" ) &&
+					isStruct( arguments
+							.ctx
+							.result
+							.usage )
+			) {
+				source = arguments
+					.ctx
+					.result
+					.usage;
+			}
+		} else if ( structKeyExists( arguments.ctx, "response" ) && isStruct( arguments.ctx.response ) ) {
+			if (
+				structKeyExists( arguments.ctx.response, "usage" ) &&
+					isStruct( arguments
+							.ctx
+							.response
+							.usage )
+			) {
+				source = arguments
+					.ctx
+					.response
+					.usage;
+			}
+		} else if ( structKeyExists( arguments.ctx, "usage" ) && isStruct( arguments.ctx.usage ) ) {
+			source = arguments.ctx.usage;
+		}
+		if ( !source.count() ) {
+			return usage;
+		}
+		var prompt = source.prompt_tokens ?: source.promptTokens ?: source.input_tokens ?: "";
+		var completion = source.completion_tokens ?: source.completionTokens ?: source.output_tokens ?: "";
+		var total = source.total_tokens ?: source.totalTokens ?: "";
+		if ( isNumeric( prompt ) ) {
+			usage.promptTokens = int( val( prompt ) );
+		}
+		if ( isNumeric( completion ) ) {
+			usage.completionTokens = int( val( completion ) );
+		}
+		if ( isNumeric( total ) ) {
+			usage.totalTokens = int( val( total ) );
+		} else if ( usage.keyExists( "promptTokens" ) || usage.keyExists( "completionTokens" ) ) {
+			usage.totalTokens = int( val( usage.promptTokens ?: 0 ) ) + int( val( usage.completionTokens ?: 0 ) );
+		}
+		return usage;
+	}
+
+	public string function extractLlmInput( required any ctx ) {
+		if ( isNull( arguments.ctx ) || !isStruct( arguments.ctx ) ) {
+			return "";
+		}
+		if ( structKeyExists( arguments.ctx, "messages" ) ) {
+			var fromMessages = summarizeMessages( arguments.ctx.messages );
+			if ( len( fromMessages ) ) {
+				return fromMessages;
+			}
+		}
+		if (
+			structKeyExists( arguments.ctx, "dataPacket" ) && isStruct( arguments.ctx.dataPacket ) &&
+				structKeyExists( arguments.ctx.dataPacket, "messages" )
+		) {
+			var fromPacket = summarizeMessages( arguments
+					.ctx
+					.dataPacket
+					.messages );
+			if ( len( fromPacket ) ) {
+				return fromPacket;
+			}
+		}
+		if ( structKeyExists( arguments.ctx, "chatRequest" ) ) {
+			try {
+				var requestMessages = arguments
+					.ctx
+					.chatRequest
+					.getMessages();
+				var fromRequest = summarizeMessages( requestMessages );
+				if ( len( fromRequest ) ) {
+					return fromRequest;
+				}
+			} catch (any ignoreRequest) {
+
+			}
+		}
+		return safeText( arguments.ctx.dataPacket ?: {} );
+	}
+
+	public string function extractLlmOutput( required any ctx ) {
+		if ( isNull( arguments.ctx ) || !isStruct( arguments.ctx ) ) {
+			return "";
+		}
+		if ( structKeyExists( arguments.ctx, "response" ) && !isNull( arguments.ctx.response ) ) {
+			var fromResponse = safeText( arguments.ctx.response );
+			if ( len( fromResponse ) ) {
+				return fromResponse;
+			}
+		}
+		if ( structKeyExists( arguments.ctx, "result" ) && !isNull( arguments.ctx.result ) ) {
+			var result = arguments.ctx.result;
+			if ( isStruct( result ) ) {
+				if ( structKeyExists( result, "choices" ) && isArray( result.choices ) && result.choices.len() ) {
+					var choice = result.choices[ 1 ];
+					if ( isStruct( choice ) && structKeyExists( choice, "message" ) ) {
+						var message = choice.message;
+						if ( isStruct( message ) && structKeyExists( message, "content" ) ) {
+							return safeText( message.content );
+						}
+						return safeText( message );
+					}
+					return safeText( choice );
+				}
+				if ( structKeyExists( result, "content" ) ) {
+					return safeText( result.content );
+				}
+				if ( structKeyExists( result, "error" ) ) {
+					return "error: " & safeText( result.error );
+				}
+			}
+			return safeText( result );
+		}
+		return "";
+	}
+
+	public struct function extractToolInfo( required any ctx ) {
+		var info = {
+			name  : "unknown",
+			args  : "",
+			result: "",
+			id    : ""
+		};
+		if ( isNull( arguments.ctx ) || !isStruct( arguments.ctx ) ) {
+			return info;
+		}
+		if ( structKeyExists( arguments.ctx, "toolName" ) && len( toString( arguments.ctx.toolName ?: "" ) ) ) {
+			info.name = toString( arguments.ctx.toolName );
+		}
+		if ( structKeyExists( arguments.ctx, "toolArgs" ) ) {
+			info.args = safeText( arguments.ctx.toolArgs );
+		}
+		if ( structKeyExists( arguments.ctx, "toolCallId" ) ) {
+			info.id = toString( arguments.ctx.toolCallId ?: "" );
+		}
+		if ( structKeyExists( arguments.ctx, "result" ) ) {
+			info.result = safeText( arguments.ctx.result );
+		}
+		if ( structKeyExists( arguments.ctx, "toolCall" ) && isStruct( arguments.ctx.toolCall ) ) {
+			var toolCall = arguments.ctx.toolCall;
+			info.id = toString( toolCall.id ?: info.id );
+			if ( structKeyExists( toolCall, "function" ) && isStruct( toolCall.function ) ) {
+				info.name = toString( toolCall.function.name ?: info.name );
+				if ( structKeyExists( toolCall.function, "arguments" ) ) {
+					info.args = safeText( toolCall.function.arguments );
+				}
+			}
+		}
+		if ( info.name == "unknown" && structKeyExists( arguments.ctx, "tool" ) && !isNull( arguments.ctx.tool ) ) {
+			try {
+				info.name = toString( arguments
+						.ctx
+						.tool
+						.getName() );
+			} catch (any ignoreName) {
+				try {
+					info.name = toString(
+						arguments
+								.ctx
+								.tool
+								.name ?:
+							"unknown"
+					);
+				} catch (any ignoreProp) {
+
+				}
+			}
+		}
+		if ( !len( info.args ) && structKeyExists( arguments.ctx, "tool" ) ) {
+			info.args = safeText( arguments.ctx.toolArgs ?: "" );
+		}
+		return info;
+	}
+
+	public string function summarizeMessages( required any messages ) {
+		if ( isSimpleValue( arguments.messages ) ) {
+			return toString( arguments.messages );
+		}
+		if ( !isArray( arguments.messages ) ) {
+			return safeText( arguments.messages );
+		}
+		var lines = [];
+		var count = 0;
+		for ( var message in arguments.messages ) {
+			count++;
+			if ( count > 12 ) {
+				lines.append( "[truncated more messages]" );
+				break;
+			}
+			if ( isStruct( message ) ) {
+				var role = isSimpleValue( message.role ?: "" ) ? message.role : "message";
+				var content = "";
+				if ( structKeyExists( message, "content" ) ) {
+					content = isSimpleValue( message.content ) ? telemetryScalar( toString( message.content ) ) : safeText( message.content );
+				} else if ( structKeyExists( message, "parts" ) ) {
+					content = safeText( message.parts );
+				} else {
+					content = safeText( message );
+				}
+				if ( structKeyExists( message, "tool_calls" ) ) {
+					content = len( content )
+						? ( content & char( 10 ) & "tool_calls: " & safeText( message.tool_calls ) )
+						: ( "tool_calls: " & safeText( message.tool_calls ) );
+				}
+				lines.append( "[" & role & "] " & content );
+			} else if ( isSimpleValue( message ) ) {
+				lines.append( telemetryScalar( toString( message ) ) );
+			} else {
+				lines.append( safeText( message ) );
+			}
+		}
+		return lines.toList( char( 10 ) );
+	}
+
+	public string function telemetryScalar( required string value ) {
+		return "[redacted-text length=#len( arguments.value )# sha256=#lCase( hash( arguments.value, 'SHA-256' ) )#]";
+	}
+
+}
+

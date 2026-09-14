@@ -1,0 +1,203 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function beforeAll() {
+		super.beforeAll();
+	}
+
+	function afterAll() {
+		super.afterAll();
+	}
+
+	function run() {
+		describe(
+			"CFML LLM depth",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"allowlists cfml-conventions and builds a specialist definition",
+					() => {
+						var normalized = getInstance( "ReviewPolicyService" ).normalize( {
+									policy: { allowedRoles: [ "cfml-conventions"] }
+								} );
+						expect( normalized.policy.allowedRoles ).toInclude( "cfml-conventions" );
+
+						var definition = getInstance( "SpecialistAgentFactory" ).definition(
+								{
+									id    : "task-cfml-1",
+									role  : "cfml-conventions",
+									budget: {
+										maxTokens    : 1000,
+										maxIterations: 4
+									}
+								}
+							);
+						expect( definition.role ).toBe( "cfml-conventions" );
+						expect( definition.instructions ).toInclude( "modernization" );
+						expect( definition.instructions ).toInclude( "evaluate" );
+					}
+				);
+
+				it(
+					"selects cfml-conventions when CFML files are present without BoxLang symbols",
+					() => {
+						var plan = getInstance( "ReviewPlannerService" ).plan(
+								emptyArchitectureModel(),
+								emptyGraph(),
+								[
+									cfmlFile( "views/legacy.cfm",
+										"<cfset x = 1>" & char( 10 ) & "<cfset y = 2>" & char( 10 ) & "<cfset z = 3>" )
+								],
+								{},
+								{ maxTasks: 6 }
+							);
+						var selected = plan.getMemento().summary.selectedRoles;
+						expect( selected ).toInclude( "cfml-conventions" );
+						expect( selected ).notToInclude( "boxlang-conventions" );
+						expect( plan.getMemento().summary.contextFileCount ).toBeGT( 0 );
+						expect( plan
+								.getMemento()
+								.tasks
+								.filter( ( task ) => task.role == "cfml-conventions" )[ 1 ]
+								.context
+								.files
+								.len() ).toBeGT( 0 );
+					}
+				);
+
+				it(
+					"omits cfml-conventions for BoxLang-only files",
+					() => {
+						var model = getInstance( "ArchitectureModelService" ).build(
+								boxlangGraph(),
+								boxlangFiles(),
+								"cfml-depth-boxlang-only"
+							);
+						var plan = getInstance( "ReviewPlannerService" ).plan(
+								model,
+								boxlangGraph(),
+								boxlangFiles()
+							);
+						expect( plan.getMemento().summary.selectedRoles ).toInclude( "boxlang-conventions" );
+						expect( plan.getMemento().summary.selectedRoles ).notToInclude( "cfml-conventions" );
+					}
+				);
+
+				it(
+					"keeps cfml-conventions under a tight maxTasks budget",
+					() => {
+						var plan = getInstance( "ReviewPlannerService" ).plan(
+								emptyArchitectureModel(),
+								emptyGraph(),
+								[ cfmlFile( "model/Legacy.cfc", "component { function run() {} }" )],
+								{},
+								{ maxTasks: 3 }
+							);
+						var selected = plan.getMemento().summary.selectedRoles;
+						expect( selected ).toInclude( "security" );
+						expect( selected ).toInclude( "correctness" );
+						expect( selected ).toInclude( "cfml-conventions" );
+						expect( plan.getMemento().summary.taskCount ).toBe( 3 );
+					}
+				);
+
+				it(
+					"authorizes CFML file ranges when the BoxLang graph has no symbols",
+					() => {
+						var pack = getInstance( "ContextPackService" ).build(
+								emptyGraph(),
+								[
+									cfmlFile( "views/legacy.cfm",
+										"<cfset x = 1>" & char( 10 ) & "<cfset y = 2>" & char( 10 ) & "<cfset z = 3>" )
+								]
+							);
+						expect( pack.files ).toHaveLength( 1 );
+						expect( pack.files[ 1 ].filePath ).toBe( "views/legacy.cfm" );
+						expect( pack.files[ 1 ].ranges.len() ).toBeGT( 0 );
+					}
+				);
+			}
+		);
+	}
+
+	private any function emptyArchitectureModel() {
+		return new app.models.domain.ArchitectureModel(
+			{
+				version           : "architecture-model-v1",
+				fingerprint       : "empty-cfml-depth",
+				repositoryRevision: "",
+				facts             : [],
+				components        : [],
+				summary           : {
+					factCount      : 0,
+					dependencyFacts: 0,
+					componentCount : 0,
+					inferredFacts  : 0
+				}
+			}
+		);
+	}
+
+	private struct function emptyGraph() {
+		return {
+			summary: {
+				symbolCount    : 0,
+				dependencyCount: 0,
+				impactCount    : 0
+			},
+			symbols     : [],
+			dependencies: [],
+			impacts     : []
+		};
+	}
+
+	private struct function boxlangGraph() {
+		return {
+			summary: {
+				symbolCount    : 1,
+				dependencyCount: 0,
+				impactCount    : 0
+			},
+			symbols: [
+				{
+					id      : "service-class",
+					filePath: "app/models/ReviewService.bx",
+					kind    : "class",
+					name    : "ReviewService",
+					line    : 1,
+					evidence: "class"
+				}
+			],
+			dependencies: [],
+			impacts     : []
+		};
+	}
+
+	private array function boxlangFiles() {
+		return [
+			cfmlFile(
+				"app/models/ReviewService.bx",
+				"class { function review() { return true; } }",
+				"BoxLang"
+			)
+		];
+	}
+
+	private struct function cfmlFile( required string filePath, required string content, string language = "CFML" ) {
+		var lines = listToArray(
+			arguments.content,
+			char( 10 ),
+			true,
+			true
+		);
+		return {
+			filePath   : arguments.filePath,
+			language   : arguments.language,
+			contentHash: lCase( hash( arguments.content, "SHA-256" ) ),
+			content    : arguments.content,
+			lines      : lines,
+			sizeBytes  : len( arguments.content ),
+			lineCount  : lines.len()
+		};
+	}
+}

@@ -1,0 +1,187 @@
+class extends   ="coldbox.system.testing.BaseTestCase" appMapping="/app" {
+
+	function run() {
+		describe(
+			"Finding review lifecycle",
+			() => {
+				beforeEach( () => setup() );
+
+				it(
+					"persists decisions, returns audit history, and rejects stale updates",
+					() => {
+						var marker = lCase( createUUID() );
+						var runId = "finding-review-#marker#";
+						var path = "C:/finding-review/#marker#";
+						var fingerprint = "fp-#marker#";
+						try {
+							seedRun(
+								runId,
+								path,
+								fingerprint,
+								dateTimeFormat( now(), "iso" )
+							);
+
+							var initial = jsonDeserialize( this.get( "/api/v1/runs/#runId#/result" ).getRenderedContent() )
+								.data
+								.result
+								.findings[ 1 ].review;
+							expect( initial.state ).toBe( "new" );
+							expect( initial.version ).toBe( 0 );
+
+							var run = getInstance( "ReviewRunRepository" ).find( runId );
+							var service = getInstance( "FindingReviewService" );
+							var saved = service.update(
+									run,
+									fingerprint,
+									{
+										reviewState    : "acknowledged",
+										note           : "Confirmed by the team",
+										expectedVersion: 0
+									},
+									{ principalId: "test-user" }
+								);
+							expect( saved.state ).toBe( "acknowledged" );
+							expect( saved.version ).toBe( 1 );
+							expect( saved.history ).toHaveLength( 1 );
+							expect( saved.history[ 1 ].note ).toBe( "Confirmed by the team" );
+
+							expect(
+								() => {
+									service.update(
+											run,
+											fingerprint,
+											{
+												reviewState    : "resolved",
+												expectedVersion: 0
+											},
+											{ principalId: "test-user" }
+										);
+								}
+							).toThrow( type = "FindingReviewConflict" );
+						} finally {
+							cleanup( runId, path );
+						}
+					}
+				);
+
+				it(
+					"automatically reopens a resolved fingerprint in a later run",
+					() => {
+						var marker = lCase( createUUID() );
+						var olderId = "finding-resolved-#marker#";
+						var newerId = "finding-returned-#marker#";
+						var path = "C:/finding-reopen/#marker#";
+						var fingerprint = "fp-returned-#marker#";
+						try {
+							seedRun(
+								olderId,
+								path,
+								fingerprint,
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										-5,
+										now()
+									),
+									"iso"
+								)
+							);
+							getInstance( "FindingReviewService" ).update(
+									getInstance( "ReviewRunRepository" ).find( olderId ),
+									fingerprint,
+									{ reviewState: "resolved", expectedVersion: 0 },
+									{ principalId: "test-user" }
+								);
+							seedRun(
+								newerId,
+								path,
+								fingerprint,
+								dateTimeFormat(
+									dateAdd(
+										"n",
+										1,
+										now()
+									),
+									"iso"
+								)
+							);
+							var newerRun = getInstance( "ReviewRunRepository" ).find( newerId );
+							getInstance( "FindingReviewService" ).reopenResolvedForRun( newerRun,
+									getInstance( "ReviewResultRepository" ).getResult( newerId ).findings );
+							var result = getInstance( "ReviewRunService" ).getResult( newerId );
+							expect( result.findings[ 1 ].review.state ).toBe( "reopened" );
+							expect( result.findings[ 1 ].review.version ).toBe( 2 );
+							expect( result.findings[ 1 ].review.history ).toHaveLength( 2 );
+						} finally {
+							cleanup( olderId, path );
+							cleanup( newerId, path );
+						}
+					}
+				);
+			}
+		);
+	}
+
+	private void function seedRun(
+		required string runId,
+		required string projectPath,
+		required string fingerprint,
+		required string createdAt
+	) {
+		getInstance( "ReviewRunRepository" ).create(
+				{
+					id          : arguments.runId,
+					projectPath : arguments.projectPath,
+					mode        : "full",
+					baseRevision: "",
+					headRevision: "",
+					status      : "succeeded",
+					progress    : 100,
+					currentPhase: "completed",
+					message     : "Review fixture",
+					createdAt   : arguments.createdAt,
+					updatedAt   : arguments.createdAt
+				}
+			);
+		getInstance( "ReviewResultRepository" ).replaceFindings(
+				arguments.runId,
+				[
+					{
+						id         : lCase( createUUID() ),
+						fingerprint: arguments.fingerprint,
+						category   : "correctness",
+						ruleId     : "test/review",
+						severity   : "medium",
+						confidence : .9,
+						title      : "Lifecycle finding",
+						message    : "Lifecycle finding",
+						filePath   : "example.bx",
+						startLine  : 1,
+						endLine    : 1,
+						evidence   : "evidence",
+						suggestion : "fix it",
+						source     : "deterministic"
+					}
+				]
+			);
+	}
+
+	private void function cleanup( required string runId, required string projectPath ) {
+		queryExecute(
+			"DELETE FROM finding_review_events WHERE project_path = :projectPath",
+			{ projectPath: arguments.projectPath }
+		);
+		queryExecute(
+			"DELETE FROM finding_reviews WHERE project_path = :projectPath",
+			{ projectPath: arguments.projectPath }
+		);
+		queryExecute(
+			"DELETE FROM review_findings WHERE run_id = :runId",
+			{ runId: arguments.runId }
+		);
+		queryExecute(
+			"DELETE FROM review_runs WHERE id = :runId",
+			{ runId: arguments.runId }
+		);
+	}
+}
